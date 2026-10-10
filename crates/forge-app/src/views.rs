@@ -851,15 +851,10 @@ pub fn details(
                 );
             }
             if focused && pane.cursor == Some(vis) {
-                let focus_color = if ui.visuals().dark_mode {
-                    Color32::WHITE
-                } else {
-                    Color32::from_rgb(20, 66, 125)
-                };
                 painter.rect_stroke(
                     rect.shrink(1.0),
                     3.0,
-                    Stroke::new(2.0, focus_color),
+                    Stroke::new(2.0, theme::focus_ring(ui.visuals().dark_mode)),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -1138,15 +1133,10 @@ pub fn grid(
                         p.rect_filled(inner, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
                     }
                     if focused && pane.cursor == Some(vis) {
-                        let focus_color = if ui.visuals().dark_mode {
-                            Color32::WHITE
-                        } else {
-                            Color32::from_rgb(20, 66, 125)
-                        };
                         p.rect_stroke(
                             inner,
                             6.0,
-                            Stroke::new(2.0, focus_color),
+                            Stroke::new(2.0, theme::focus_ring(ui.visuals().dark_mode)),
                             egui::StrokeKind::Inside,
                         );
                     }

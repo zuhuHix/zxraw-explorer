@@ -37,19 +37,8 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
     v.window_stroke = Stroke::new(1.0, border);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
     // Keep selected list rows opaque, with text colors that retain WCAG AA contrast.
-    v.selection.bg_fill = if dark {
-        Color32::from_rgb(39, 85, 139)
-    } else {
-        Color32::from_rgb(216, 231, 255)
-    };
-    v.selection.stroke = Stroke::new(
-        1.0,
-        if dark {
-            Color32::WHITE
-        } else {
-            Color32::from_rgb(17, 36, 58)
-        },
-    );
+    v.selection.bg_fill = selection_fill(dark);
+    v.selection.stroke = Stroke::new(1.0, selection_text(dark));
     v.hyperlink_color = ACCENT;
     let r = CornerRadius::same(4);
     v.widgets.noninteractive.corner_radius = r;
@@ -79,4 +68,78 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
 
 pub fn muted(ui: &egui::Ui) -> Color32 {
     ui.visuals().weak_text_color()
+}
+
+/// Fill behind selected rows and tiles.
+pub fn selection_fill(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(39, 85, 139)
+    } else {
+        Color32::from_rgb(216, 231, 255)
+    }
+}
+
+/// Text color on selected rows and tiles (WCAG AA against `selection_fill`).
+pub fn selection_text(dark: bool) -> Color32 {
+    if dark {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(17, 36, 58)
+    }
+}
+
+/// Keyboard focus ring drawn around the cursor row or tile.
+pub fn focus_ring(dark: bool) -> Color32 {
+    if dark {
+        Color32::WHITE
+    } else {
+        Color32::from_rgb(20, 66, 125)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Panel background the list views draw on, per theme (see `apply`).
+    const PANEL_DARK: Color32 = Color32::from_rgb(30, 31, 35);
+    const PANEL_LIGHT: Color32 = Color32::from_rgb(243, 244, 246);
+
+    /// WCAG 2.x contrast ratio between two opaque colors (1.0 ..= 21.0).
+    fn contrast_ratio(a: Color32, b: Color32) -> f64 {
+        fn luminance(c: Color32) -> f64 {
+            let linear = |channel: u8| {
+                let s = f64::from(channel) / 255.0;
+                if s <= 0.03928 {
+                    s / 12.92
+                } else {
+                    ((s + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+        }
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn selected_row_text_meets_wcag_aa() {
+        for dark in [true, false] {
+            let ratio = contrast_ratio(selection_text(dark), selection_fill(dark));
+            assert!(ratio >= 4.5, "selection text ratio {ratio:.2} (dark={dark})");
+        }
+    }
+
+    #[test]
+    fn focus_ring_meets_non_text_contrast_on_selection_and_panel() {
+        for (dark, panel) in [(true, PANEL_DARK), (false, PANEL_LIGHT)] {
+            for background in [selection_fill(dark), panel] {
+                let ratio = contrast_ratio(focus_ring(dark), background);
+                assert!(
+                    ratio >= 3.0,
+                    "focus ring ratio {ratio:.2} on {background:?} (dark={dark})"
+                );
+            }
+        }
+    }
 }
