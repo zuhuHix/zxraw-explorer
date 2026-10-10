@@ -1,0 +1,20 @@
+[package]
+name = "forge-media"
+description = "Image/RAW/video metadata extraction and thumbnail pipelines for Forge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+forge-core.workspace = true
+forge-jobs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

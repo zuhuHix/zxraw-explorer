@@ -1,0 +1,22 @@
+[package]
+name = "forge-core"
+description = "Platform-independent filesystem engine for Forge: listing, file operations, renaming, hashing, duplicates, search queries, ingest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+regex.workspace = true
+chrono.workspace = true
+blake3.workspace = true
+xxhash-rust.workspace = true
+forge-jobs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

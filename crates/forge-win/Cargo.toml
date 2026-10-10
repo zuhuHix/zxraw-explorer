@@ -1,0 +1,13 @@
+[package]
+name = "forge-win"
+description = "Windows shell integration (Recycle Bin, ShellExecute, drives, properties) for Forge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

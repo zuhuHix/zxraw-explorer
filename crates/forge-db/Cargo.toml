@@ -1,0 +1,19 @@
+[package]
+name = "forge-db"
+description = "SQLite index, metadata cache, ratings/tags/collections and app state for Forge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+rusqlite.workspace = true
+chrono.workspace = true
+forge-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "forge-cli"
+description = "Command-line companion for Forge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+forge-core.workspace = true
+forge-jobs.workspace = true
+
+[[bin]]
+name = "forge-cli"
+path = "src/main.rs"

@@ -1,0 +1,33 @@
+[package]
+name = "forge-app"
+description = "Forge desktop application (egui/eframe UI)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+chrono.workspace = true
+directories.workspace = true
+lru.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
+regex.workspace = true
+forge-core.workspace = true
+forge-jobs.workspace = true
+forge-db.workspace = true
+forge-media.workspace = true
+forge-win.workspace = true

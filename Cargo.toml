@@ -1,0 +1,86 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/forge-core",
+    "crates/forge-jobs",
+    "crates/forge-db",
+    "crates/forge-media",
+    "crates/forge-win",
+    "crates/forge-app",
+    "crates/forge-cli",
+]
+default-members = ["crates/forge-app", "crates/forge-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zuhuHix/forge"
+rust-version = "1.90"
+
+[workspace.dependencies]
+# internal
+forge-core = { path = "crates/forge-core" }
+forge-jobs = { path = "crates/forge-jobs" }
+forge-db = { path = "crates/forge-db" }
+forge-media = { path = "crates/forge-media" }
+forge-win = { path = "crates/forge-win" }
+
+# shared
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+regex = "1.13"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+directories = "6.0"
+blake3 = "1.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+lru = "0.18"
+tempfile = "3.27"
+clap = { version = "4.6", features = ["derive"] }
+
+# storage
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# media
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "gif", "bmp"] }
+kamadak-exif = "0.6"
+
+# archives
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+
+# ui
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "accesskit", "persistence"] }
+egui = "0.36"
+egui_extras = { version = "0.36", features = ["image"] }
+rfd = "0.17"
+
+# windows
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
+    "Win32_System_RestartManager",
+    "Win32_Security",
+] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Media decoding is unbearably slow unoptimized; keep deps fast in dev builds.
+opt-level = 2

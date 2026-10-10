@@ -1,0 +1,12 @@
+[package]
+name = "forge-jobs"
+description = "Bounded worker pools, cancellation tokens and progress reporting for Forge background work."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
