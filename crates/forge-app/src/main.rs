@@ -23,7 +23,10 @@ mod testhook;
 mod theme;
 mod thumbs;
 mod tools_ui;
+mod viewer;
+mod viewer_host;
 mod views;
+mod watcher;
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 

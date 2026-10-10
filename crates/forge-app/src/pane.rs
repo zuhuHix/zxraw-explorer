@@ -51,6 +51,8 @@ pub struct Pane {
     pub scroll_to_cursor: bool,
     /// Name to select once loading finishes (e.g. the folder we navigated up from).
     pending_select: Option<String>,
+    /// Like `pending_select`, but only moves the cursor (refresh keeps the selection).
+    pending_select_keep: Option<String>,
     pub editing_path: Option<String>,
     pub show_hidden: bool,
     pub show_system: bool,
@@ -79,6 +81,7 @@ impl Pane {
             last_sort: Instant::now(),
             scroll_to_cursor: false,
             pending_select: None,
+            pending_select_keep: None,
             editing_path: None,
             show_hidden: false,
             show_system: false,
@@ -141,11 +144,14 @@ impl Pane {
         }
     }
 
+    /// Re-list the folder, keeping the selection and the cursor item (if it still exists).
     pub fn refresh(&mut self) {
         let keep: Vec<PathBuf> = self.selected.iter().cloned().collect();
+        let cursor = self.cursor_entry().map(|e| e.name.clone());
         let p = self.path.clone();
         self.load_path(p);
         self.selected.extend(keep);
+        self.pending_select_keep = cursor;
     }
 
     fn load_path(&mut self, path: PathBuf) {
@@ -158,6 +164,7 @@ impl Pane {
         self.cursor = None;
         self.anchor = None;
         self.pending_select = None;
+        self.pending_select_keep = None;
         self.load = LoadState::Loading {
             since: Instant::now(),
         };
@@ -220,6 +227,12 @@ impl Pane {
         if changed && !self.is_loading() {
             if let Some(name) = self.pending_select.take() {
                 self.select_name(&name);
+            }
+            if let Some(name) = self.pending_select_keep.take() {
+                self.cursor = self
+                    .visible
+                    .iter()
+                    .position(|&i| self.entries[i].name.eq_ignore_ascii_case(&name));
             }
         }
         changed

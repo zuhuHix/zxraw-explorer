@@ -61,6 +61,7 @@ pub struct Actions {
     pub ingest: crate::ingest_ui::IngestState,
     pub tools: crate::tools_ui::ToolsState,
     pub settings_ui: crate::settings_ui::SettingsUi,
+    pub watcher: crate::watcher::FolderWatcher,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -96,6 +97,7 @@ impl Actions {
             ingest: Default::default(),
             tools: Default::default(),
             settings_ui: Default::default(),
+            watcher: crate::watcher::FolderWatcher::new(ctx.clone()),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -208,19 +210,33 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             if !paths.is_empty() {
                 let cut = cmd == Cmd::Cut;
                 app.toast(format!("{} {} item(s)", if cut { "Cut" } else { "Copied" }, paths.len()));
+                // Also publish to the Windows clipboard so Explorer and other apps can paste.
+                let effect = if cut { forge_win::ClipboardEffect::Move } else { forge_win::ClipboardEffect::Copy };
+                let p2 = paths.clone();
+                app.ops.spawn_shell("Copy to clipboard", move || forge_win::set_files(&p2, effect));
                 app.ops.clipboard = Some(FileClipboard { paths, cut });
             }
         }
         Cmd::Paste => {
-            if let Some(cb) = app.ops.clipboard.take() {
-                let kind = if cb.cut { OpKind::Move } else { OpKind::Copy };
-                crate::ops_ui::start_transfer(app, cb.paths.clone(), dir, kind);
-                // A cut is consumed by pasting; a copy can be pasted again.
-                if !cb.cut {
-                    app.ops.clipboard = Some(cb);
-                }
-            } else {
-                app.toast("Clipboard is empty");
+            // The Windows clipboard is the source of truth (files copied in Explorer paste
+            // here); fall back to the in-app clipboard if it holds no file list.
+            let system = forge_win::get_files().ok().flatten();
+            let (paths, cut) = match system {
+                Some((paths, effect)) => (paths, effect == forge_win::ClipboardEffect::Move),
+                None => match &app.ops.clipboard {
+                    Some(cb) => (cb.paths.clone(), cb.cut),
+                    None => {
+                        app.toast("Clipboard is empty");
+                        return;
+                    }
+                },
+            };
+            let kind = if cut { OpKind::Move } else { OpKind::Copy };
+            crate::ops_ui::start_transfer(app, paths.clone(), dir, kind);
+            // A cut is consumed by pasting (like Explorer); a copy can be pasted again.
+            if cut {
+                app.ops.clipboard = None;
+                std::thread::spawn(move || forge_win::clear_if_owned_files(&paths));
             }
         }
         Cmd::CopyToOtherPane | Cmd::MoveToOtherPane => {
@@ -384,7 +400,20 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             Err(e) => app.toast_err(e),
         }
     }
-    let mut changed = app.ops.thumbs.begin_frame(folders);
+    app.ops.watcher.sync(&folders);
+    let tabs = &app.tabs;
+    let due = app.ops.watcher.due(|d| {
+        tabs.iter()
+            .flat_map(|t| std::iter::once(&t.left).chain(t.right.as_ref()))
+            .find(|p| p.path == d)
+            .map(|p| p.entries.len())
+            .unwrap_or(0)
+    });
+    for d in &due {
+        app.ops.thumbs.invalidate_dir(d);
+        app.refresh_all_showing(d);
+    }
+    let mut changed = app.ops.thumbs.begin_frame(folders) || !due.is_empty();
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     while let Ok(ev) = app.ops.rx.try_recv() {
         changed = true;

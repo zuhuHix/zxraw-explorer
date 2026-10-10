@@ -25,6 +25,20 @@ pub struct ConflictQuestion {
 
 /// Start a copy or move of `sources` into `dest` as a background job.
 pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
+    // Items already in `dest`: moving them there is a no-op, and copying them there must
+    // never be offered as "replace the file with itself" — Explorer makes a renamed copy.
+    let in_dest = |p: &PathBuf| p.parent().is_some_and(|d| forge_core::paths::paths_equal(d, &dest));
+    let (same, sources): (Vec<PathBuf>, Vec<PathBuf>) = sources.into_iter().partition(in_dest);
+    if !same.is_empty() && kind == OpKind::Copy {
+        start_transfer_with(app, same, dest.clone(), kind, ConflictPolicy::KeepBoth);
+    }
+    if sources.is_empty() {
+        return;
+    }
+    start_transfer_with(app, sources, dest, kind, ConflictPolicy::Ask);
+}
+
+fn start_transfer_with(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind, policy: ConflictPolicy) {
     if sources.is_empty() {
         return;
     }
@@ -40,7 +54,7 @@ pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, 
     let title2 = title.clone();
     app.ops.jobs.spawn("transfer", title, move |job| {
         let opts = OpOptions {
-            policy: ConflictPolicy::Ask,
+            policy,
             verify,
             force_copy_for_move: false,
         };

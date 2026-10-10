@@ -72,6 +72,7 @@ pub struct ZxrawApp {
     pub focus_filter: bool,
     pub ops: crate::actions::Actions,
     pub testhook: crate::testhook::TestHook,
+    pub viewer: Option<crate::viewer::Viewer>,
     applied_theme: Option<(bool, f32)>,
     type_ahead: (String, Instant),
     last_session_save: Instant,
@@ -98,6 +99,7 @@ impl ZxrawApp {
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
             testhook: crate::testhook::TestHook::from_env(),
+            viewer: None,
             settings,
         };
         app.restore_session(session);
@@ -313,6 +315,8 @@ impl ZxrawApp {
             ThumbsBigger => self.settings.thumb_size = (self.settings.thumb_size * 1.2).min(512.0),
             ThumbsSmaller => self.settings.thumb_size = (self.settings.thumb_size / 1.2).max(64.0),
             CommandPalette => self.palette = Some(crate::palette::Palette::default()),
+            CullMode => crate::viewer_host::open(self, crate::viewer::ViewerMode::Cull),
+            CompareImages => crate::viewer_host::open(self, crate::viewer::ViewerMode::Compare),
             BookmarkFolder => {
                 let p = self.pane().path.clone();
                 if !self.settings.bookmarks.contains(&p) {
@@ -373,6 +377,12 @@ impl ZxrawApp {
                 // Explicit user action: following a junction/symlink is fine here.
                 self.pane_mut().navigate(e.path.clone())
             }
+            // Photos open in the built-in viewer (Esc returns); other files use their
+            // default Windows app. "Open with…" is always available for photos too.
+            _ if matches!(e.media_kind(), forge_core::MediaKind::Image | forge_core::MediaKind::Raw) => {
+                self.pane_mut().set_pending_select(e.name.clone());
+                crate::viewer_host::open(self, crate::viewer::ViewerMode::Single);
+            }
             _ => crate::actions::open_file(self, &e.path),
         }
     }
@@ -382,7 +392,7 @@ impl ZxrawApp {
     // -----------------------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.palette.is_some() || crate::actions::modal_open(self) {
+        if self.viewer.is_some() || self.palette.is_some() || crate::actions::modal_open(self) {
             return;
         }
         let text_focus = ctx.memory(|m| m.focused().is_some());
@@ -774,6 +784,12 @@ impl eframe::App for ZxrawApp {
 
         self.handle_keys(&ctx);
 
+        if crate::viewer_host::show(self, ui) {
+            crate::actions::modals(self, ui);
+            self.toasts_ui(&ctx);
+            crate::testhook::tick(self, &ctx);
+            return;
+        }
         let title = format!("{} — ZXraw Explorer", self.pane().path.display());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
