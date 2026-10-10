@@ -8,7 +8,7 @@ use egui::RichText;
 use forge_core::model::EntryKind;
 use forge_db::{
     Collection, CollectionId, CollectionKind, Db, FileRecord, NewFile, RelinkReport, SavedSearch,
-    SearchOptions,
+    SearchOptions, SearchScope,
 };
 
 use crate::app::ZxrawApp;
@@ -41,6 +41,7 @@ pub struct CollectionsUi {
     relink_preview_count: Option<u64>,
     relink_preview_running: bool,
     relink_preview_error: Option<String>,
+    relink_confirm: bool,
 }
 
 impl Default for CollectionsUi {
@@ -72,6 +73,7 @@ impl Default for CollectionsUi {
             relink_preview_count: None,
             relink_preview_running: false,
             relink_preview_error: None,
+            relink_confirm: false,
         }
     }
 }
@@ -788,22 +790,21 @@ fn render_detail(ui: &mut egui::Ui, state: &CollectionsUi, commands: &mut Vec<Ui
                 let row = &rows[index];
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        let name = if row.present {
-                            row.name.clone()
+                        if row.present {
+                            let response =
+                                ui.selectable_label(false, RichText::new(&row.name));
+                            if response.clicked() {
+                                navigate = Some(row.path.clone());
+                            }
+                            response.on_hover_text(row.path.display().to_string());
                         } else {
-                            format!("{}  ·  offline / missing", row.name)
-                        };
-                        let name_color = if row.present {
-                            ui.visuals().text_color()
-                        } else {
-                            ui.visuals().weak_text_color()
-                        };
-                        let response =
-                            ui.selectable_label(false, RichText::new(name).color(name_color));
-                        if response.clicked() {
-                            navigate = Some(row.path.clone());
+                            // Offline/missing rows keep their last known path but cannot be opened.
+                            ui.label(
+                                RichText::new(format!("{}  ·  offline / missing", row.name))
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .on_hover_text("Not available on this machine right now");
                         }
-                        response.on_hover_text(row.path.display().to_string());
                         ui.label(RichText::new(row.path.display().to_string()).small().weak());
                     });
                     if manual {
@@ -1055,12 +1056,10 @@ fn render_relink_dialog(
                 if ui
                     .add_enabled(ready, egui::Button::new("Preview matches"))
                     .clicked()
-                {
-                    if let (Some(old), Some(new)) =
+                    && let (Some(old), Some(new)) =
                         (state.relink_old.clone(), state.relink_new.clone())
-                    {
-                        commands.push(UiCommand::PreviewRelink { old, new });
-                    }
+                {
+                    commands.push(UiCommand::PreviewRelink { old, new });
                 }
                 if state.relink_preview_running {
                     ui.spinner();
@@ -1073,20 +1072,36 @@ fn render_relink_dialog(
                 ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
             }
             ui.separator();
+            let count = state.relink_preview_count.unwrap_or(0);
+            let can_relink = count > 0 && !state.operation_pending;
             ui.horizontal(|ui| {
-                let count = state.relink_preview_count.unwrap_or(0);
-                let can_relink = count > 0 && !state.operation_pending;
-                if ui
-                    .add_enabled(
-                        can_relink,
-                        egui::Button::new(format!("Relink {count} item(s)…")),
-                    )
-                    .clicked()
-                {
-                    if let (Some(old), Some(new)) =
-                        (state.relink_old.clone(), state.relink_new.clone())
+                if state.relink_confirm {
+                    ui.label(format!(
+                        "Rewrite {count} indexed path(s) from the old folder to the new one?"
+                    ));
+                    if ui
+                        .add_enabled(!state.operation_pending, egui::Button::new("Confirm relink"))
+                        .clicked()
                     {
-                        commands.push(UiCommand::ConfirmRelink { old, new });
+                        if let (Some(old), Some(new)) =
+                            (state.relink_old.clone(), state.relink_new.clone())
+                        {
+                            commands.push(UiCommand::ConfirmRelink { old, new });
+                        }
+                        state.relink_confirm = false;
+                    }
+                    if ui.button("Back").clicked() {
+                        state.relink_confirm = false;
+                    }
+                } else {
+                    if ui
+                        .add_enabled(
+                            can_relink,
+                            egui::Button::new(format!("Relink {count} item(s)…")),
+                        )
+                        .clicked()
+                    {
+                        state.relink_confirm = true;
                     }
                 }
                 if ui.button("Close").clicked() {
@@ -1096,6 +1111,9 @@ fn render_relink_dialog(
         });
     if close_requested {
         open = false;
+    }
+    if !open {
+        state.relink_confirm = false;
     }
     state.relink_open = open;
 }
@@ -1181,20 +1199,19 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 let state = &mut app.ops.collections_ui;
                 state.relink_old = Some(path);
-                state.relink_preview_count = None;
-                state.relink_preview_error = None;
+                clear_relink_preview(state);
             }
         }
         UiCommand::ChooseRelinkNew => {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 let state = &mut app.ops.collections_ui;
                 state.relink_new = Some(path);
-                state.relink_preview_count = None;
-                state.relink_preview_error = None;
+                clear_relink_preview(state);
             }
         }
         UiCommand::PreviewRelink { old, new } => start_relink_preview(app, ctx, old, new),
         UiCommand::ConfirmRelink { old, new } => {
+            clear_relink_preview(&mut app.ops.collections_ui);
             start_operation(app, ctx, OperationFlags::RELINK, move |db| {
                 let report: RelinkReport =
                     db.relink(&old, &new, None).map_err(|e| e.to_string())?;
@@ -1319,12 +1336,18 @@ fn start_relink_preview(app: &mut ZxrawApp, ctx: &egui::Context, old: PathBuf, n
     let _ = std::thread::Builder::new()
         .name("collections-relink-preview".into())
         .spawn(move || {
+            // Scope the SQL to the old folder's subtree; the exact prefix check below
+            // still decides which rows relink() will actually rewrite.
             let result = db
                 .search_str(
                     "is:offline OR is:online",
                     &SearchOptions {
                         include_offline: true,
                         limit: None,
+                        scope: Some(SearchScope {
+                            path: old.clone(),
+                            recursive: true,
+                        }),
                         ..Default::default()
                     },
                 )
@@ -1342,6 +1365,12 @@ fn start_relink_preview(app: &mut ZxrawApp, ctx: &egui::Context, old: PathBuf, n
             });
             ctx.request_repaint();
         });
+}
+
+fn clear_relink_preview(state: &mut CollectionsUi) {
+    state.relink_preview_count = None;
+    state.relink_preview_error = None;
+    state.relink_confirm = false;
 }
 
 fn filtered_collections<'a>(collections: &'a [Collection], query: &str) -> Vec<&'a Collection> {
