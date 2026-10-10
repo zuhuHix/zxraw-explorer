@@ -21,11 +21,13 @@ pub struct FolderWatcher {
     /// dir -> time of the most recent event
     pending: HashMap<PathBuf, Instant>,
     last_refresh: HashMap<PathBuf, Instant>,
+    ctx: egui::Context,
 }
 
 impl FolderWatcher {
     pub fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = unbounded();
+        let repaint = ctx.clone();
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 // Ignore pure access events; everything else may change the listing.
@@ -37,7 +39,7 @@ impl FolderWatcher {
                         let _ = tx.send(parent.to_path_buf());
                     }
                 }
-                ctx.request_repaint_after(DEBOUNCE);
+                repaint.request_repaint_after(DEBOUNCE);
             }
         })
         .map_err(|e| tracing::warn!("folder watcher unavailable: {e}"))
@@ -48,6 +50,7 @@ impl FolderWatcher {
             watched: HashSet::new(),
             pending: HashMap::new(),
             last_refresh: HashMap::new(),
+            ctx,
         }
     }
 
@@ -79,6 +82,7 @@ impl FolderWatcher {
             }
         }
         let mut out = Vec::new();
+        let mut next_wake: Option<Duration> = None;
         self.pending.retain(|dir, last_event| {
             let gap = if size_of(dir) > 20_000 { MIN_GAP_LARGE } else { MIN_GAP };
             let quiet = now.duration_since(*last_event) >= DEBOUNCE;
@@ -87,17 +91,26 @@ impl FolderWatcher {
                 out.push(dir.clone());
                 false
             } else {
+                // Not eligible yet: make sure the UI wakes up when it will be, otherwise a
+                // throttled change would sit here until some unrelated repaint.
+                let until_quiet = DEBOUNCE.saturating_sub(now.duration_since(*last_event));
+                let until_spaced = self
+                    .last_refresh
+                    .get(dir)
+                    .map(|t| gap.saturating_sub(now.duration_since(*t)))
+                    .unwrap_or_default();
+                let wait = until_quiet.max(until_spaced).max(Duration::from_millis(10));
+                next_wake = Some(next_wake.map_or(wait, |w| w.min(wait)));
                 true
             }
         });
+        if let Some(w) = next_wake {
+            self.ctx.request_repaint_after(w);
+        }
         for d in &out {
             self.last_refresh.insert(d.clone(), now);
         }
         out
-    }
-
-    pub fn has_pending(&self) -> bool {
-        !self.pending.is_empty()
     }
 }
 

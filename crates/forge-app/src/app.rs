@@ -400,12 +400,9 @@ impl ZxrawApp {
         ctx.input_mut(|i| {
             for &c in Cmd::ALL {
                 if let Some(sc) = c.shortcut() {
-                    // Text editing keys belong to the focused text field.
-                    let editing_key = matches!(
-                        c,
-                        Cmd::SelectAll | Cmd::Copy | Cmd::Cut | Cmd::Paste | Cmd::Recycle | Cmd::Undo | Cmd::SwitchPane | Cmd::DeletePermanently
-                    );
-                    if text_focus && editing_key {
+                    // While typing, keys belong to the text field: only commands that cannot
+                    // touch files or the selection are allowed through.
+                    if text_focus && !allowed_while_typing(c) {
                         continue;
                     }
                     if consume_exact(i, &sc) {
@@ -880,6 +877,31 @@ impl ZxrawApp {
     }
 }
 
+/// Commands that stay active while a text field has keyboard focus. Everything else
+/// (ratings, delete, copy/paste of files, selection) would act on the file list behind the
+/// field the user is typing in.
+fn allowed_while_typing(c: Cmd) -> bool {
+    matches!(
+        c,
+        Cmd::CommandPalette
+            | Cmd::NewTab
+            | Cmd::CloseTab
+            | Cmd::NextTab
+            | Cmd::PrevTab
+            | Cmd::Refresh
+            | Cmd::FocusAddress
+            | Cmd::FocusFilter
+            | Cmd::Search
+            | Cmd::Settings
+            | Cmd::ShowJobs
+            | Cmd::ToggleDualPane
+            | Cmd::TogglePreview
+            | Cmd::ZoomIn
+            | Cmd::ZoomOut
+            | Cmd::ZoomReset
+    )
+}
+
 /// Like `InputState::consume_shortcut`, but Shift/Alt must match exactly: egui's logical
 /// matching would let Shift+F6 (move) trigger F6 (copy), or Shift+Delete trigger Delete.
 /// Keys that need Shift on common layouts (`+`) keep logical matching.
@@ -935,6 +957,14 @@ mod key_tests {
         let mut i = press(Key::Delete, egui::Modifiers::COMMAND);
         assert!(!consume_exact(&mut i, &recycle));
         assert!(consume_exact(&mut i, &reject));
+    }
+
+    #[test]
+    fn file_commands_are_blocked_while_typing() {
+        for c in [Cmd::Rate1, Cmd::Recycle, Cmd::DeletePermanently, Cmd::Copy, Cmd::Paste, Cmd::SelectAll, Cmd::MarkReject, Cmd::Undo, Cmd::Rename] {
+            assert!(!allowed_while_typing(c), "{c:?} must not fire while typing");
+        }
+        assert!(allowed_while_typing(Cmd::CommandPalette));
     }
 
     #[test]
