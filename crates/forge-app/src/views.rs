@@ -477,6 +477,7 @@ pub fn grid(
                         Vec2::splat(thumb_size),
                     );
                     let mut drew = false;
+                    let mut badge_rect = img_rect;
                     if entry.kind == EntryKind::File
                         && matches!(entry.media_kind(), MediaKind::Image | MediaKind::Raw | MediaKind::Video)
                     {
@@ -485,6 +486,7 @@ pub fn grid(
                             let scale = (thumb_size / sz.x).min(thumb_size / sz.y);
                             let r = Rect::from_center_size(img_rect.center(), sz * scale);
                             p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                            badge_rect = r;
                             if entry.media_kind() == MediaKind::Video {
                                 p.text(r.left_bottom() + vec2(4.0, -4.0), Align2::LEFT_BOTTOM, "▶", FontId::proportional(14.0), Color32::WHITE);
                             }
@@ -503,7 +505,7 @@ pub fn grid(
                         );
                     }
                     if let Some(a) = thumbs.annotation(&entry.path) {
-                        draw_annotation(&p, img_rect, a);
+                        draw_annotation(&p, badge_rect, a);
                     }
                     let text_rect = Rect::from_min_max(
                         pos2(rect.left() + 4.0, img_rect.bottom() + 4.0),

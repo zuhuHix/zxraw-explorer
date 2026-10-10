@@ -6,9 +6,13 @@ use egui::{RichText, Ui};
 
 use forge_core::ops::OpKind;
 
+use forge_core::query::{ColorLabel, PickState};
+use forge_db::AnnotationChange;
+
 use crate::app::ZxrawApp;
 use crate::commands::Cmd;
 use crate::modal::{self, Confirm, ConfirmKind, Modal, Outcome, Prompt, PromptKind};
+use crate::media_meta::{self, MediaMeta};
 use crate::preview::{self, TextPreview};
 use crate::settings::{Paths, Settings};
 use crate::views::ThumbProvider;
@@ -47,11 +51,28 @@ pub struct Actions {
     pub show_jobs: bool,
     pub batch_rename: Option<crate::batch_rename::BatchRename>,
     pub text_preview: TextPreview,
+    pub meta: media_meta::MetaLoader,
     pub jobs: forge_jobs::JobRegistry,
     pub tx: crossbeam_channel::Sender<Event>,
     rx: crossbeam_channel::Receiver<Event>,
     pub ctx: egui::Context,
     pub thumbs: crate::thumbs::ThumbManager,
+    pub library: crate::library::Library,
+}
+
+/// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
+pub struct GridProvider<'a> {
+    thumbs: &'a mut crate::thumbs::ThumbManager,
+    annotations: &'a std::collections::HashMap<PathBuf, crate::views::Annotation>,
+}
+
+impl ThumbProvider for GridProvider<'_> {
+    fn thumb(&mut self, ui: &egui::Ui, e: &forge_core::FileEntry, size: u32) -> Option<egui::TextureHandle> {
+        self.thumbs.thumb(ui, e, size)
+    }
+    fn annotation(&self, path: &Path) -> Option<crate::views::Annotation> {
+        self.annotations.get(path).copied().filter(|a| *a != Default::default())
+    }
 }
 
 impl Actions {
@@ -65,9 +86,11 @@ impl Actions {
             show_jobs: false,
             batch_rename: None,
             text_preview: TextPreview::default(),
+            meta: Default::default(),
             jobs: forge_jobs::JobRegistry::new(),
             tx,
             rx,
+            library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
                 paths.cache.join("thumbs"),
@@ -90,8 +113,11 @@ impl Actions {
         });
     }
 
-    pub fn thumb_provider(&mut self) -> &mut dyn ThumbProvider {
-        &mut self.thumbs
+    pub fn grid_provider(&mut self) -> GridProvider<'_> {
+        GridProvider {
+            thumbs: &mut self.thumbs,
+            annotations: &self.library.annotations,
+        }
     }
 }
 
@@ -201,6 +227,49 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             crate::ops_ui::start_transfer(app, paths, other, kind);
         }
         Cmd::ShowJobs => app.ops.show_jobs = !app.ops.show_jobs,
+        Cmd::Rate0 | Cmd::Rate1 | Cmd::Rate2 | Cmd::Rate3 | Cmd::Rate4 | Cmd::Rate5 => {
+            let r = [Cmd::Rate0, Cmd::Rate1, Cmd::Rate2, Cmd::Rate3, Cmd::Rate4, Cmd::Rate5]
+                .iter()
+                .position(|c| *c == cmd)
+                .unwrap_or(0) as u8;
+            annotate_targets(app, AnnotationChange { rating: Some(r), ..Default::default() });
+        }
+        Cmd::LabelRed | Cmd::LabelYellow | Cmd::LabelGreen | Cmd::LabelBlue | Cmd::LabelPurple | Cmd::LabelNone => {
+            let label = match cmd {
+                Cmd::LabelRed => Some(ColorLabel::Red),
+                Cmd::LabelYellow => Some(ColorLabel::Yellow),
+                Cmd::LabelGreen => Some(ColorLabel::Green),
+                Cmd::LabelBlue => Some(ColorLabel::Blue),
+                Cmd::LabelPurple => Some(ColorLabel::Purple),
+                _ => None,
+            };
+            annotate_targets(app, AnnotationChange { label: Some(label), ..Default::default() });
+        }
+        Cmd::MarkPick | Cmd::MarkReject | Cmd::Unflag => {
+            let pick = match cmd {
+                Cmd::MarkPick => PickState::Pick,
+                Cmd::MarkReject => PickState::Reject,
+                _ => PickState::None,
+            };
+            annotate_targets(app, AnnotationChange { pick: Some(pick), ..Default::default() });
+        }
+        Cmd::IndexFolder => {
+            let Some(db) = app.ops.library.db.clone() else {
+                app.toast_err("Library database is not available");
+                return;
+            };
+            let tx = app.ops.tx.clone();
+            let ctx = app.ops.ctx.clone();
+            crate::library::start_index_job(&app.ops.jobs, db, dir, move |msg| {
+                let _ = tx.send(Event::Toast(msg));
+                ctx.request_repaint();
+            });
+            app.toast("Indexing started — see Operations");
+        }
+        Cmd::Search => {
+            app.ops.library.search.open = true;
+            app.ops.library.search.focus = true;
+        }
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
@@ -227,6 +296,20 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         }
         other => app.toast(format!("“{}” is not available yet", other.label())),
     }
+}
+
+fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
+    let targets: Vec<PathBuf> = app
+        .pane()
+        .action_targets()
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+    if targets.is_empty() {
+        app.toast("Select files to rate or label");
+        return;
+    }
+    app.ops.library.annotate(targets, change);
 }
 
 pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
@@ -271,6 +354,15 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         .get(app.active)
         .map(|t| std::iter::once(t.left.path.clone()).chain(t.right.as_ref().map(|r| r.path.clone())).collect())
         .unwrap_or_default();
+    for f in &folders {
+        app.ops.library.ensure_dir(f);
+    }
+    for n in app.ops.library.poll() {
+        match n {
+            Ok(t) => app.toast(t),
+            Err(e) => app.toast_err(e),
+        }
+    }
     let mut changed = app.ops.thumbs.begin_frame(folders);
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     while let Ok(ev) = app.ops.rx.try_recv() {
@@ -342,6 +434,7 @@ pub fn shutdown(app: &mut ZxrawApp) {
 
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::ops_ui::jobs_window(app, ui.ctx());
+    crate::search_ui::window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }
@@ -433,6 +526,34 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
     };
     preview::header(ui, &e);
     ui.separator();
+    if preview::is_media(&e) {
+        // Large preview from the thumbnail pipeline (largest bucket).
+        let w = ui.available_width().min(512.0);
+        if let Some(tex) = app.ops.thumbs.thumb(ui, &e, w as u32) {
+            let sz = tex.size_vec2();
+            let scale = (w / sz.x).min(w / sz.y);
+            ui.vertical_centered(|ui| ui.image((tex.id(), sz * scale)));
+        } else {
+            ui.add_space(8.0);
+            ui.vertical_centered(|ui| ui.spinner());
+        }
+        ui.add_space(6.0);
+        egui::ScrollArea::vertical().id_salt("preview-meta").show(ui, |ui| {
+            preview::info_grid(ui, &e);
+            ui.separator();
+            match app.ops.meta.get(&e, ui.ctx()) {
+                Some(Ok(MediaMeta::Image(m))) => media_meta::image_grid(ui, &m),
+                Some(Ok(MediaMeta::Video(m))) => media_meta::video_grid(ui, &m),
+                Some(Err(err)) => {
+                    ui.label(RichText::new(format!("Metadata unavailable: {err}")).weak());
+                }
+                None => {
+                    ui.spinner();
+                }
+            }
+        });
+        return;
+    }
     preview::info_grid(ui, &e);
     if TextPreview::is_text(&e) {
         ui.separator();

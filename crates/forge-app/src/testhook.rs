@@ -2,6 +2,7 @@
 //!
 //! * `ZXRAW_CMDS=ViewGrid,ToggleDualPane` — run commands (by `Cmd` variant name) once the
 //!   first folder has loaded.
+//! * `ZXRAW_SELECT=name.jpg` — select that entry in the focused pane before the commands.
 //! * `ZXRAW_SCREENSHOT=out.png` — after the UI settles, capture the rendered frame via
 //!   egui's own screenshot path (works even where OS screen capture can't see GPU
 //!   swapchains), save it, and exit.
@@ -15,6 +16,7 @@ use crate::commands::Cmd;
 pub struct TestHook {
     screenshot: Option<PathBuf>,
     cmds: Vec<Cmd>,
+    select: Option<String>,
     frames: u32,
     ran_cmds: bool,
     requested: bool,
@@ -30,12 +32,13 @@ impl TestHook {
         Self {
             screenshot: std::env::var_os("ZXRAW_SCREENSHOT").map(PathBuf::from),
             cmds,
+            select: std::env::var("ZXRAW_SELECT").ok(),
             ..Default::default()
         }
     }
 
     pub fn active(&self) -> bool {
-        self.screenshot.is_some() || !self.cmds.is_empty()
+        self.screenshot.is_some() || !self.cmds.is_empty() || self.select.is_some()
     }
 }
 
@@ -48,6 +51,10 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     hook.frames += 1;
     if !hook.ran_cmds && !loading && hook.frames > 5 {
         hook.ran_cmds = true;
+        if let Some(name) = hook.select.take() {
+            app.pane_mut().select_name(&name);
+        }
+        let hook = &mut app.testhook;
         let cmds = std::mem::take(&mut hook.cmds);
         for c in cmds {
             app.run(c, ctx);

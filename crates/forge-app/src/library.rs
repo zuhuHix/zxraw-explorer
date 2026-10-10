@@ -1,0 +1,366 @@
+//! The persistent library: SQLite database (opened off the UI thread), per-folder
+//! annotations (ratings/labels/picks), indexing + metadata extraction jobs, and search.
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use forge_core::query::{ColorLabel, PickState};
+use forge_db::{AnnotationChange, Db, FileRecord, SearchOptions};
+use forge_jobs::{JobHandle, JobRegistry};
+
+use crate::views::Annotation;
+
+pub enum LibMsg {
+    Opened(Result<Arc<Db>, String>, Option<String>),
+    DirAnnotations(PathBuf, HashMap<PathBuf, Annotation>),
+    SearchResults { query: String, result: Result<Vec<FileRecord>, String> },
+    Error(String),
+}
+
+pub struct Library {
+    pub db: Option<Arc<Db>>,
+    pub open_error: Option<String>,
+    tx: Sender<LibMsg>,
+    rx: Receiver<LibMsg>,
+    ctx: egui::Context,
+    /// Annotations of the folders currently shown, keyed by full path.
+    pub annotations: HashMap<PathBuf, Annotation>,
+    loaded_dirs: HashSet<PathBuf>,
+    /// Edits made before the database finished opening; flushed once it is ready.
+    queued: Vec<(Vec<PathBuf>, AnnotationChange)>,
+    /// Single writer thread so edits reach the database in the order they were made.
+    writer: Option<Sender<(Vec<PathBuf>, AnnotationChange)>>,
+    pub search: SearchState,
+}
+
+#[derive(Default)]
+pub struct SearchState {
+    pub open: bool,
+    pub query: String,
+    pub running: bool,
+    pub last_query: String,
+    pub results: Vec<FileRecord>,
+    pub error: Option<String>,
+    pub focus: bool,
+}
+
+pub fn to_view(rating: u8, label: Option<ColorLabel>, pick: PickState) -> Annotation {
+    Annotation {
+        rating,
+        label: label.and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l)).map(|i| i as u8),
+        pick: match pick {
+            PickState::Pick => 1,
+            PickState::Reject => -1,
+            PickState::None => 0,
+        },
+    }
+}
+
+impl Library {
+    pub fn open(path: PathBuf, ctx: egui::Context) -> Self {
+        let (tx, rx) = unbounded();
+        let t = tx.clone();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let r = Db::open(&path);
+            let msg = match r {
+                Ok(db) => {
+                    let recovered = db
+                        .recovered_corrupt_file()
+                        .map(|p: &Path| format!("The library database was damaged and has been reset. The old file was kept as {}", p.display()));
+                    LibMsg::Opened(Ok(Arc::new(db)), recovered)
+                }
+                Err(e) => LibMsg::Opened(Err(e.to_string()), None),
+            };
+            let _ = t.send(msg);
+            c.request_repaint();
+        });
+        Self {
+            db: None,
+            open_error: None,
+            tx,
+            rx,
+            ctx,
+            annotations: HashMap::new(),
+            loaded_dirs: HashSet::new(),
+            queued: Vec::new(),
+            writer: None,
+            search: SearchState::default(),
+        }
+    }
+
+    /// Drain messages; returns user-facing notices (toasts).
+    pub fn poll(&mut self) -> Vec<Result<String, String>> {
+        let mut notices = Vec::new();
+        while let Ok(m) = self.rx.try_recv() {
+            match m {
+                LibMsg::Opened(Ok(db), recovered) => {
+                    self.writer = Some(spawn_writer(db.clone(), self.tx.clone()));
+                    self.db = Some(db);
+                    for (paths, change) in std::mem::take(&mut self.queued) {
+                        self.persist(paths, change);
+                    }
+                    if let Some(r) = recovered {
+                        notices.push(Err(r));
+                    }
+                    // Reload annotations for folders requested before the DB was ready.
+                    let dirs: Vec<PathBuf> = self.loaded_dirs.drain().collect();
+                    for d in dirs {
+                        self.ensure_dir(&d);
+                    }
+                }
+                LibMsg::Opened(Err(e), _) => {
+                    if !self.queued.is_empty() {
+                        notices.push(Err(format!("{} rating/label change(s) could not be saved", self.queued.len())));
+                        self.queued.clear();
+                    }
+                    notices.push(Err(format!("Library database unavailable: {e}")));
+                    self.open_error = Some(e);
+                }
+                LibMsg::DirAnnotations(_dir, map) => {
+                    self.annotations.extend(map);
+                }
+                LibMsg::SearchResults { query, result } => {
+                    if query == self.search.last_query {
+                        self.search.running = false;
+                        match result {
+                            Ok(r) => {
+                                self.search.results = r;
+                                self.search.error = None;
+                            }
+                            Err(e) => {
+                                self.search.results.clear();
+                                self.search.error = Some(e);
+                            }
+                        }
+                    }
+                }
+                LibMsg::Error(e) => notices.push(Err(e)),
+            }
+        }
+        notices
+    }
+
+    /// Load annotations for `dir` once (async).
+    pub fn ensure_dir(&mut self, dir: &Path) {
+        if !self.loaded_dirs.insert(dir.to_path_buf()) {
+            return;
+        }
+        let Some(db) = self.db.clone() else { return };
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            if let Ok(rows) = db.children(&dir, false) {
+                let map = rows
+                    .into_iter()
+                    .filter(|r| r.rating > 0 || r.label.is_some() || r.pick != PickState::None)
+                    .map(|r| (r.path.clone(), to_view(r.rating, r.label, r.pick)))
+                    .collect();
+                let _ = tx.send(LibMsg::DirAnnotations(dir, map));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Apply an annotation change to files (optimistically updates the local cache, then
+    /// persists in the background). Files are added to the database if not indexed yet.
+    pub fn annotate(&mut self, paths: Vec<PathBuf>, change: AnnotationChange) {
+        for p in &paths {
+            let a = self.annotations.entry(p.clone()).or_default();
+            if let Some(r) = change.rating {
+                a.rating = r;
+            }
+            if let Some(l) = change.label {
+                *a = Annotation {
+                    label: l.and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l)).map(|i| i as u8),
+                    ..*a
+                };
+            }
+            if let Some(pk) = change.pick {
+                a.pick = to_view(0, None, pk).pick;
+            }
+        }
+        if self.db.is_none() {
+            if self.open_error.is_some() {
+                let _ = self.tx.send(LibMsg::Error("Library database is not available; change not saved".into()));
+            } else {
+                self.queued.push((paths, change));
+            }
+            return;
+        }
+        self.persist(paths, change);
+    }
+
+    fn persist(&self, paths: Vec<PathBuf>, change: AnnotationChange) {
+        if let Some(w) = &self.writer {
+            let _ = w.send((paths, change));
+        }
+    }
+
+    pub fn run_search(&mut self) {
+        let Some(db) = self.db.clone() else {
+            self.search.error = Some("Library database is not available".into());
+            return;
+        };
+        let q = self.search.query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.search.last_query = q.clone();
+        self.search.running = true;
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let opts = SearchOptions {
+                limit: Some(5000),
+                ..Default::default()
+            };
+            let result = db.search_str(&q, &opts).map_err(|e| e.to_string());
+            let _ = tx.send(LibMsg::SearchResults { query: q, result });
+            ctx.request_repaint();
+        });
+    }
+}
+
+/// Index `root` (adding it as an index root) and then extract media metadata, as one
+/// cancellable job. Safe to re-run: the indexer resumes from its checkpoint.
+pub fn start_index_job(jobs: &JobRegistry, db: Arc<Db>, root: PathBuf, notify: impl Fn(String) + Send + 'static) -> JobHandle {
+    let title = format!("Indexing {}", root.display());
+    jobs.spawn("index", title, move |job| {
+        let root_id = db.add_index_root(&root).map_err(|e| e.to_string())?;
+        job.progress.set_current("Scanning folders…");
+        let mut indexer = forge_db::Indexer::new(&db)
+            .cancel_token(job.cancel.clone())
+            .progress(job.progress.clone())
+            .volume_resolver(|p| {
+                let mut v = forge_db::VolumeInfo::from_path_root(p);
+                v.serial = forge_win::volume_serial(Path::new(&v.root)).ok().map(|s| format!("{s:08X}"));
+                Some(v)
+            });
+        let report = indexer.index_root(root_id).map_err(|e| e.to_string())?;
+        job.log(format!("{report:?}"));
+        if job.cancel.is_cancelled() {
+            return Ok(());
+        }
+        extract_metadata(&db, job);
+        notify(format!("Indexed {}", root.display()));
+        Ok(())
+    })
+}
+
+/// Fill image/video metadata for indexed files that lack it. Failures are recorded as
+/// empty metadata so they are not retried forever; videos are skipped (not marked) when
+/// ffprobe is unavailable, so they get picked up once it is installed.
+pub fn extract_metadata(db: &Db, job: &JobHandle) {
+    let ff = forge_media::FfTools::global();
+    let mut attempted: HashSet<i64> = HashSet::new();
+    job.progress.set_current("Reading photo and video metadata…");
+    loop {
+        if job.cancel.check().is_err() {
+            return;
+        }
+        let Ok(batch) = db.files_needing_meta(500) else { return };
+        let fresh: Vec<FileRecord> = batch.into_iter().filter(|r| !attempted.contains(&r.id)).collect();
+        if fresh.is_empty() {
+            return;
+        }
+        job.progress.add_total_items(fresh.len() as u64);
+        for r in fresh {
+            attempted.insert(r.id);
+            if job.cancel.check().is_err() {
+                return;
+            }
+            match r.media_kind {
+                forge_core::MediaKind::Video => {
+                    if ff.ffprobe.is_none() {
+                        job.progress.add_items(1);
+                        continue;
+                    }
+                    let m = ff.probe(&r.path).map(|v| video_to_db(&v)).unwrap_or_default();
+                    let _ = db.upsert_video_meta(r.id, &m);
+                }
+                _ => {
+                    let m = forge_media::read_image_metadata(&r.path)
+                        .map(|i| image_to_db(&i))
+                        .unwrap_or_default();
+                    let _ = db.upsert_image_meta(r.id, &m);
+                }
+            }
+            job.progress.add_items(1);
+        }
+    }
+}
+
+pub fn image_to_db(m: &forge_media::ImageMetadata) -> forge_db::ImageMeta {
+    let (w, h) = m.display_dimensions().unzip();
+    forge_db::ImageMeta {
+        width: w,
+        height: h,
+        camera_make: m.make.clone(),
+        camera_model: m.model.clone(),
+        lens: m.lens.clone(),
+        focal_length: m.focal_length_mm,
+        aperture: m.aperture,
+        shutter: m.exposure_time_s,
+        iso: m.iso,
+        exposure_comp: m.exposure_compensation,
+        taken_at: m.capture_timestamp.map(|s| s * 1000 + m.capture_millis.unwrap_or(0) as i64),
+        gps_lat: m.gps_lat,
+        gps_lon: m.gps_lon,
+        orientation: m.orientation,
+        color_space: m.color_space.clone(),
+        bit_depth: m.bit_depth.map(|b| b as u16),
+    }
+}
+
+pub fn video_to_db(v: &forge_media::VideoMetadata) -> forge_db::VideoMeta {
+    forge_db::VideoMeta {
+        duration: v.duration_s,
+        width: v.width,
+        height: v.height,
+        fps: v.fps,
+        vfr: v.vfr,
+        codec: v.codec.clone(),
+        bit_depth: v.bit_depth.map(|b| b as u16),
+        chroma: v.chroma_subsampling.clone(),
+        bitrate: v.bitrate,
+        audio_streams: Some(v.audio.len() as u32),
+        hdr: v.hdr.map(|h| format!("{h:?}").to_lowercase()),
+        rotation: Some(v.rotation as i32),
+        timecode: v.timecode.clone(),
+        camera: v.make.clone().map(|m| format!("{m} {}", v.model.clone().unwrap_or_default()).trim().to_string()),
+        recorded_at: None,
+    }
+}
+
+fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<(Vec<PathBuf>, AnnotationChange)> {
+    let (wtx, wrx) = unbounded::<(Vec<PathBuf>, AnnotationChange)>();
+    std::thread::Builder::new()
+        .name("library-writer".into())
+        .spawn(move || {
+            for (paths, change) in wrx {
+                let r = (|| -> Result<(), String> {
+                    let entries: Vec<_> = paths
+                        .iter()
+                        .filter_map(|p| forge_core::listing::entry_for_path(p).ok())
+                        .collect();
+                    db.upsert_entries(&entries).map_err(|e| e.to_string())?;
+                    let ids: Vec<_> = db
+                        .file_ids(&paths)
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .map(|(_, id)| id)
+                        .collect();
+                    db.annotate(&ids, &change).map(|_| ()).map_err(|e| e.to_string())
+                })();
+                if let Err(e) = r {
+                    let _ = tx.send(LibMsg::Error(format!("Saving rating failed: {e}")));
+                }
+            }
+        })
+        .expect("spawn library writer");
+    wtx
+}

@@ -1,4 +1,4 @@
-//! UI side of the thumbnail pipeline: turns `forge_media` results into GPU textures,
+﻿//! UI side of the thumbnail pipeline: turns `forge_media` results into GPU textures,
 //! bounded by a byte budget, with per-frame upload limits so scrolling stays smooth.
 
 use std::collections::{HashMap, HashSet};
@@ -111,7 +111,7 @@ impl ThumbManager {
         let n = self.ready.len().min(MAX_UPLOADS_PER_FRAME);
         let batch: Vec<_> = self.ready.drain(..n).collect();
         for (key, img) in batch {
-            self.upload(ctx, key, &img);
+            let _ = self.upload(ctx, key, &img);
         }
         if !self.ready.is_empty() {
             ctx.request_repaint();

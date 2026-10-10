@@ -105,8 +105,18 @@ impl ZxrawApp {
         if let Some(arg) = std::env::args_os().nth(1) {
             let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
             if p.exists() {
-                app.run(Cmd::NewTab, &cc.egui_ctx);
-                app.navigate(p);
+                // Reuse a restored tab already showing this folder instead of piling up tabs.
+                let existing = app
+                    .tabs
+                    .iter()
+                    .position(|t| forge_core::paths::paths_equal(&t.left.path, &p));
+                match existing {
+                    Some(i) => app.active = i,
+                    None => {
+                        app.run(Cmd::NewTab, &cc.egui_ctx);
+                        app.navigate(p);
+                    }
+                }
             }
         }
         app
@@ -388,7 +398,7 @@ impl ZxrawApp {
                     if text_focus && editing_key {
                         continue;
                     }
-                    if i.consume_shortcut(&sc) {
+                    if consume_exact(i, &sc) {
                         cmds.push(c);
                     }
                 }
@@ -699,7 +709,7 @@ impl ZxrawApp {
                 }
                 None => match pane.view {
                     ViewMode::Details => views::details(ui, pane, focused, id),
-                    ViewMode::Grid => views::grid(ui, pane, focused, id, thumb_size, ops.thumb_provider()),
+                    ViewMode::Grid => views::grid(ui, pane, focused, id, thumb_size, &mut ops.grid_provider()),
                 },
             }
         };
@@ -851,5 +861,73 @@ impl ZxrawApp {
                 }
             });
         ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+/// Like `InputState::consume_shortcut`, but Shift/Alt must match exactly: egui's logical
+/// matching would let Shift+F6 (move) trigger F6 (copy), or Shift+Delete trigger Delete.
+/// Keys that need Shift on common layouts (`+`) keep logical matching.
+fn consume_exact(i: &mut egui::InputState, sc: &egui::KeyboardShortcut) -> bool {
+    if matches!(sc.logical_key, Key::Plus | Key::Equals | Key::Minus) {
+        return i.consume_shortcut(sc);
+    }
+    let mut hit = false;
+    i.events.retain(|e| match e {
+        egui::Event::Key { key, pressed: true, modifiers, .. }
+            if !hit && *key == sc.logical_key && modifiers.matches_exact(sc.modifiers) =>
+        {
+            hit = true;
+            false
+        }
+        _ => true,
+    });
+    hit
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    fn press(key: Key, modifiers: egui::Modifiers) -> egui::InputState {
+        let mut i = egui::InputState::default();
+        i.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        i.modifiers = modifiers;
+        i
+    }
+
+    #[test]
+    fn shift_variants_do_not_trigger_plain_shortcuts() {
+        let copy = Cmd::CopyToOtherPane.shortcut().unwrap();
+        let mv = Cmd::MoveToOtherPane.shortcut().unwrap();
+        let mut i = press(Key::F6, egui::Modifiers::SHIFT);
+        assert!(!consume_exact(&mut i, &copy));
+        assert!(consume_exact(&mut i, &mv));
+
+        let recycle = Cmd::Recycle.shortcut().unwrap();
+        let perm = Cmd::DeletePermanently.shortcut().unwrap();
+        let mut i = press(Key::Delete, egui::Modifiers::SHIFT);
+        assert!(!consume_exact(&mut i, &recycle));
+        assert!(consume_exact(&mut i, &perm));
+
+        let reject = Cmd::MarkReject.shortcut().unwrap();
+        let mut i = press(Key::Delete, egui::Modifiers::COMMAND);
+        assert!(!consume_exact(&mut i, &recycle));
+        assert!(consume_exact(&mut i, &reject));
+    }
+
+    #[test]
+    fn shortcuts_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for c in Cmd::ALL {
+            if let Some(sc) = c.shortcut() {
+                assert!(seen.insert((sc.logical_key, sc.modifiers.shift, sc.modifiers.alt, sc.modifiers.command)), "duplicate shortcut for {c:?}");
+            }
+        }
     }
 }
