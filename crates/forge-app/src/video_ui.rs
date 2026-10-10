@@ -735,6 +735,25 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
 }
 
 /// Opens the proxy dialog for selected video files (or the cursor video if none is selected).
+/// Move a finished temp file to `output` without ever replacing an existing file.
+/// `std::fs::rename` replaces on Windows, so a hard link (which fails if the target exists)
+/// is tried first; file systems without hard links (FAT/exFAT) fall back to a checked rename.
+fn place_no_replace(temp: &Path, output: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temp, output) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(temp);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+        Err(_) => {
+            if output.exists() {
+                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "output already exists"));
+            }
+            std::fs::rename(temp, output)
+        }
+    }
+}
+
 pub fn generate_proxies(app: &mut ZxrawApp) {
     let targets = app.pane().action_targets();
     let entries = &app.pane().entries;
@@ -974,12 +993,7 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                         }
                     }
                 }
-                let space = proxy_space_sufficient(
-                    &dialog.sources,
-                    dialog.destination.as_deref(),
-                    estimate,
-                    dialog.preset.bitrate(),
-                );
+                let space = proxy_space_sufficient(&dialog.sources, estimate, dialog.preset.bitrate());
                 match space {
                     Some(true) => ui.label("Free space check: enough space reported on every target volume."),
                     Some(false) => ui.colored_label(
@@ -997,14 +1011,10 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                     dialog.sources.len(),
                     dialog.preset.label(),
                 ));
-                let space = dialog.estimate.as_ref().map(|estimate| {
-                    proxy_space_sufficient(
-                        &dialog.sources,
-                        dialog.destination.as_deref(),
-                        estimate,
-                        dialog.preset.bitrate(),
-                    )
-                }).unwrap_or(None);
+                let space = dialog
+                    .estimate
+                    .as_ref()
+                    .and_then(|estimate| proxy_space_sufficient(&dialog.sources, estimate, dialog.preset.bitrate()));
                 if space != Some(true) {
                     ui.checkbox(
                         &mut dialog.continue_without_space_check,
@@ -1213,7 +1223,7 @@ fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
                             );
                             job.log(line.clone());
                             skipped.push(line);
-                        } else if let Err(error) = std::fs::rename(&temp, &output) {
+                        } else if let Err(error) = place_no_replace(&temp, &output) {
                             let _ = std::fs::remove_file(&temp);
                             let line = format!(
                                 "{}: could not finalize {}: {error}",
@@ -1387,7 +1397,7 @@ fn run_proxy_child(
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1400,6 +1410,20 @@ fn run_proxy_child(
         .stdout
         .take()
         .ok_or_else(|| "ffmpeg progress pipe was unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "ffmpeg error pipe was unavailable".to_string())?;
+    // Keep the last non-empty stderr line so failures say why FFmpeg stopped. The pipe is
+    // drained to EOF even when the line is unused, so FFmpeg can never block on a full pipe.
+    let error_reader = std::thread::spawn(move || {
+        BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .last()
+            .unwrap_or_default()
+    });
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     let reader = std::thread::Builder::new()
         .name("proxy-progress-reader".into())
@@ -1436,6 +1460,7 @@ fn run_proxy_child(
             let _ = child.kill();
             let _ = child.wait();
             let _ = reader.join();
+            let _ = error_reader.join();
             return Err("operation cancelled".into());
         }
         match child.try_wait() {
@@ -1452,10 +1477,13 @@ fn run_proxy_child(
                             .set_current(format!("{name} · {:.0}%", fraction * 100.0));
                     }
                 }
+                let detail = error_reader.join().unwrap_or_default();
                 return if status.success() {
                     Ok(())
-                } else {
+                } else if detail.is_empty() {
                     Err(format!("ffmpeg exited with {status}"))
+                } else {
+                    Err(format!("ffmpeg exited with {status}: {}", detail.trim()))
                 };
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(100)),
@@ -1463,6 +1491,7 @@ fn run_proxy_child(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = reader.join();
+                let _ = error_reader.join();
                 return Err(format!("could not poll ffmpeg: {error}"));
             }
         }
@@ -1486,9 +1515,10 @@ fn estimated_output_bytes(target_bitrate_bps: u64, duration_s: f64) -> u64 {
         .clamp(0.0, u64::MAX as f64) as u64
 }
 
+/// Sums the estimated output per target volume and compares it with that volume's free space.
+/// `None` means at least one source has no probed duration or no known volume.
 fn proxy_space_sufficient(
     sources: &[PathBuf],
-    _custom_destination: Option<&Path>,
     estimate: &ProxyEstimate,
     bitrate: u64,
 ) -> Option<bool> {
@@ -1496,7 +1526,7 @@ fn proxy_space_sufficient(
         return None;
     }
     let mut volumes: HashMap<String, (u64, u64)> = HashMap::new();
-    for (index, source) in sources.iter().enumerate() {
+    for index in 0..sources.len() {
         let duration = estimate.durations_s[index]?;
         let space = estimate.free_spaces[index].as_ref()?;
         let key = normalized_path(&space.root);
@@ -1504,7 +1534,6 @@ fn proxy_space_sufficient(
         let entry = volumes.entry(key).or_insert((space.free_bytes, 0));
         entry.0 = entry.0.min(space.free_bytes);
         entry.1 = entry.1.saturating_add(need);
-        let _ = source;
     }
     (!volumes.is_empty()).then(|| volumes.values().all(|(free, need)| need <= free))
 }
@@ -1855,14 +1884,15 @@ fn sequence_name(path: &Path) -> Option<SequenceName> {
             kind: FilenameGroupKind::Take,
         });
     }
-    if let Some(rest) = stem.strip_prefix("GX")
+    // GX is HEVC and GH is AVC; both use the same chapter scheme (GX01 0123 = chapter 1, take 0123).
+    if let Some(rest) = stem.strip_prefix("GX").or_else(|| stem.strip_prefix("GH"))
         && rest.len() == 6
         && rest.bytes().all(|b| b.is_ascii_digit())
     {
         let chapter = parse_digits(&rest[..2])?;
         let take = &rest[2..];
         return Some(SequenceName {
-            key: format!("gopro-gx-{take}"),
+            key: format!("gopro-{take}"),
             ordinal: chapter,
             kind: FilenameGroupKind::Chapter,
         });
@@ -2133,6 +2163,21 @@ fn format_timecode_at(start: &str, offset_s: f64, fps: f64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn placing_a_proxy_never_replaces_an_existing_file() {
+        let d = tempfile::tempdir().unwrap();
+        let temp = d.path().join("clip.partial");
+        let out = d.path().join("clip_proxy.mp4");
+        std::fs::write(&temp, b"new").unwrap();
+        std::fs::write(&out, b"existing").unwrap();
+        assert!(super::place_no_replace(&temp, &out).is_err());
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing");
+        std::fs::remove_file(&out).unwrap();
+        super::place_no_replace(&temp, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"new");
+        assert!(!temp.exists());
+    }
+
     use super::*;
     use tempfile::TempDir;
 
@@ -2199,6 +2244,19 @@ mod tests {
                 .filter(|group| group.kind == ClipGroupKind::Take)
                 .all(|group| group.files.len() == 2)
         );
+    }
+
+    #[test]
+    fn gopro_avc_chapters_group_with_hevc_naming_and_takes_stay_separate() {
+        let entries = ["GH010456.MP4", "GH020456.MP4", "GH010457.MP4"]
+            .into_iter()
+            .map(|name| entry(name, None))
+            .collect::<Vec<_>>();
+        let groups = group_clips(&entries);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].kind, ClipGroupKind::Chapter);
+        assert_eq!(groups[0].files.len(), 2);
+        assert!(groups[0].files[0].to_string_lossy().ends_with("GH010456.MP4"));
     }
 
     #[test]
@@ -2275,11 +2333,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            proxy_space_sufficient(&sources, None, &estimate, 2_000_000),
+            proxy_space_sufficient(&sources, &estimate, 2_000_000),
             Some(true)
         );
         assert_eq!(
-            proxy_space_sufficient(&sources, None, &estimate, 8_000_000),
+            proxy_space_sufficient(&sources, &estimate, 8_000_000),
             Some(false)
         );
     }
