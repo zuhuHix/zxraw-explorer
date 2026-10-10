@@ -77,6 +77,14 @@ pub enum Cmd {
     Unflag,
     IndexFolder,
     OpenIn,
+    Collections,
+    AddToCollection,
+    GenerateProxies,
+    ContactSheet,
+    BrowseArchive,
+    CreateArchive,
+    SplitFile,
+    JoinFiles,
 }
 
 impl Cmd {
@@ -153,6 +161,14 @@ impl Cmd {
         Cmd::Unflag,
         Cmd::IndexFolder,
         Cmd::OpenIn,
+        Cmd::Collections,
+        Cmd::AddToCollection,
+        Cmd::GenerateProxies,
+        Cmd::ContactSheet,
+        Cmd::BrowseArchive,
+        Cmd::CreateArchive,
+        Cmd::SplitFile,
+        Cmd::JoinFiles,
     ];
 
     pub fn label(self) -> &'static str {
@@ -230,6 +246,14 @@ impl Cmd {
             Unflag => "Clear pick/reject",
             IndexFolder => "Index this folder for search",
             OpenIn => "Open in external app…",
+            Collections => "Collections & saved searches",
+            AddToCollection => "Add to collection…",
+            GenerateProxies => "Generate video proxies…",
+            ContactSheet => "Create contact sheet…",
+            BrowseArchive => "Browse archive",
+            CreateArchive => "Create zip archive…",
+            SplitFile => "Split file into parts…",
+            JoinFiles => "Join split parts…",
         }
     }
 

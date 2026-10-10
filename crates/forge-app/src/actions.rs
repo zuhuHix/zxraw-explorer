@@ -109,6 +109,9 @@ pub struct Actions {
     pub tools: crate::tools_ui::ToolsState,
     pub settings_ui: crate::settings_ui::SettingsUi,
     pub watcher: crate::watcher::FolderWatcher,
+    pub collections_ui: crate::collections_ui::CollectionsUi,
+    pub video_ui: crate::video_ui::VideoUi,
+    pub extra_tools: crate::extra_tools_ui::ExtraToolsUi,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -146,6 +149,9 @@ impl Actions {
             tools: Default::default(),
             settings_ui: Default::default(),
             watcher: crate::watcher::FolderWatcher::new(ctx.clone()),
+            collections_ui: Default::default(),
+            video_ui: Default::default(),
+            extra_tools: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -342,6 +348,14 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Ingest => app.ops.ingest.open = true,
         Cmd::Settings => app.ops.settings_ui.open = true,
         Cmd::OpenIn => crate::settings_ui::open_in(app),
+        Cmd::Collections => app.ops.collections_ui.open = true,
+        Cmd::AddToCollection => crate::collections_ui::add_selection(app),
+        Cmd::GenerateProxies => crate::video_ui::generate_proxies(app),
+        Cmd::ContactSheet => crate::extra_tools_ui::contact_sheet(app),
+        Cmd::BrowseArchive => crate::extra_tools_ui::browse_archive(app),
+        Cmd::CreateArchive => crate::extra_tools_ui::create_archive(app),
+        Cmd::SplitFile => crate::extra_tools_ui::split_file(app),
+        Cmd::JoinFiles => crate::extra_tools_ui::join_files(app),
         Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {
             use crate::tools_ui::Tool;
             let tool = match cmd {
@@ -595,6 +609,9 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::ingest_ui::window(app, ui.ctx());
     crate::tools_ui::windows(app, ui.ctx());
     crate::settings_ui::window(app, ui.ctx());
+    crate::collections_ui::window(app, ui.ctx());
+    crate::video_ui::window(app, ui.ctx());
+    crate::extra_tools_ui::window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }
@@ -703,13 +720,18 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
             ui.separator();
             match app.ops.meta.get(&e, ui.ctx()) {
                 Some(Ok(MediaMeta::Image(m))) => media_meta::image_grid(ui, &m),
-                Some(Ok(MediaMeta::Video(m))) => media_meta::video_grid(ui, &m),
+                Some(Ok(MediaMeta::Video(m))) => {
+                    media_meta::video_grid(ui, &m);
+                }
                 Some(Err(err)) => {
                     ui.label(RichText::new(format!("Metadata unavailable: {err}")).weak());
                 }
                 None => {
                     ui.spinner();
                 }
+            }
+            if e.media_kind() == forge_core::MediaKind::Video {
+                crate::video_ui::preview(app, ui, &e);
             }
         });
         return;
