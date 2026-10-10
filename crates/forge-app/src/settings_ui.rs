@@ -1,19 +1,2091 @@
-//! Settings window and external-tool integration ("Open in Lightroom/Resolve…") (WP-L4).
-//! Owned by its sub-agent; the lead wires it in.
+//! Application settings and external-tool integration.
+
+use std::ffi::OsString;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use egui::{Color32, RichText};
+use forge_db::{Db, ExclusionKind, Exclusions, IndexRoot};
 
 use crate::app::ZxrawApp;
+use crate::commands::Cmd;
+use crate::settings::{ExternalTool, Settings, ThemeChoice, ViewMode};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SettingsPage {
+    #[default]
+    Appearance,
+    Browsing,
+    Performance,
+    FileOperations,
+    Video,
+    Library,
+    ExternalTools,
+    Privacy,
+    Shortcuts,
+}
+
+impl SettingsPage {
+    const ALL: [(Self, &'static str); 9] = [
+        (Self::Appearance, "Appearance"),
+        (Self::Browsing, "Browsing"),
+        (Self::Performance, "Performance"),
+        (Self::FileOperations, "File operations"),
+        (Self::Video, "Video"),
+        (Self::Library, "Library"),
+        (Self::ExternalTools, "External tools"),
+        (Self::Privacy, "Privacy"),
+        (Self::Shortcuts, "Keyboard shortcuts"),
+    ];
+}
 
 #[derive(Default)]
+enum ProbeStatus {
+    #[default]
+    Unknown,
+    Checking,
+    Found(PathBuf),
+    Missing,
+}
+
+struct ToolDraft {
+    editing: Option<usize>,
+    name: String,
+    exe: PathBuf,
+    args: String,
+    extensions: String,
+    error: Option<String>,
+}
+
+impl ToolDraft {
+    fn new(editing: Option<usize>, tool: ExternalTool) -> Self {
+        Self {
+            editing,
+            name: tool.name,
+            exe: tool.exe,
+            args: tool.args.join("\n"),
+            extensions: tool.extensions.join(", "),
+            error: None,
+        }
+    }
+
+    fn build_tool(&self) -> Result<ExternalTool, String> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("Enter a name for this application.".into());
+        }
+        if self.exe.as_os_str().is_empty() {
+            return Err("Choose the application's executable.".into());
+        }
+        let args = self
+            .args
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect();
+        let extensions = parse_extensions(&self.extensions);
+        Ok(ExternalTool {
+            name: name.to_owned(),
+            exe: self.exe.clone(),
+            args,
+            extensions,
+        })
+    }
+}
+
+struct LibrarySnapshot {
+    roots: Vec<IndexRoot>,
+    exclusions: Exclusions,
+}
+
+enum SettingsMessage {
+    CacheUsage {
+        generation: u64,
+        result: Result<u64, String>,
+    },
+    CacheCleared {
+        generation: u64,
+        result: Result<u64, String>,
+    },
+    Probe {
+        generation: u64,
+        path: Option<PathBuf>,
+    },
+    Detected(Vec<ExternalTool>),
+    LibrarySnapshot {
+        generation: u64,
+        result: Result<LibrarySnapshot, String>,
+    },
+    Integrity(Result<Vec<String>, String>),
+}
+
+#[derive(Clone)]
+enum SettingsIntent {
+    PickFfmpegFolder,
+    UseFfmpegPath,
+    PickLibraryRoot,
+    RemoveLibraryRoot(i64),
+    AddExclusion(ExclusionKind, String),
+    RemoveExclusion(ExclusionKind, String),
+    Reindex(PathBuf),
+    CheckIntegrity,
+    DetectApps,
+    BrowseToolExecutable,
+}
+
 pub struct SettingsUi {
     pub open: bool,
+    page: SettingsPage,
+    was_open: bool,
+    picker_open: bool,
+    picker_targets: Vec<PathBuf>,
+    picker_dir: PathBuf,
+    clear_cache_confirm: bool,
+    cache_usage: Option<u64>,
+    cache_error: Option<String>,
+    cache_loading: bool,
+    cache_generation: u64,
+    probe_status: ProbeStatus,
+    probe_generation: u64,
+    detecting_apps: bool,
+    detected_apps: Option<Vec<ExternalTool>>,
+    tool_draft: Option<ToolDraft>,
+    roots: Vec<IndexRoot>,
+    exclusions: Exclusions,
+    library_loading: bool,
+    library_loaded: bool,
+    library_error: Option<String>,
+    library_generation: u64,
+    exclusion_kind: ExclusionKind,
+    exclusion_value: String,
+    integrity_checking: bool,
+    integrity_result: Option<Result<Vec<String>, String>>,
+    tx: Sender<SettingsMessage>,
+    rx: Receiver<SettingsMessage>,
 }
 
+impl Default for SettingsUi {
+    fn default() -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            open: false,
+            page: SettingsPage::Appearance,
+            was_open: false,
+            picker_open: false,
+            picker_targets: Vec::new(),
+            picker_dir: PathBuf::new(),
+            clear_cache_confirm: false,
+            cache_usage: None,
+            cache_error: None,
+            cache_loading: false,
+            cache_generation: 0,
+            probe_status: ProbeStatus::Unknown,
+            probe_generation: 0,
+            detecting_apps: false,
+            detected_apps: None,
+            tool_draft: None,
+            roots: Vec::new(),
+            exclusions: Exclusions::default(),
+            library_loading: false,
+            library_loaded: false,
+            library_error: None,
+            library_generation: 0,
+            exclusion_kind: ExclusionKind::Folder,
+            exclusion_value: String::new(),
+            integrity_checking: false,
+            integrity_result: None,
+            tx,
+            rx,
+        }
+    }
+}
+
+/// Drawn every frame by the main app. Background work reports through the local channel;
+/// user-visible failures are also forwarded into the app's normal event/toast queue.
 pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
-    let _ = (app, ctx);
+    drain_messages(app, ctx);
+    start_open_tasks(app, ctx);
+
+    if app.ops.settings_ui.open {
+        show_settings_window(app, ctx);
+    }
+    if app.ops.settings_ui.picker_open {
+        show_open_in_picker(app, ctx);
+    }
+    if app.ops.settings_ui.clear_cache_confirm {
+        show_cache_confirmation(app, ctx);
+    }
 }
 
-/// `Cmd::OpenIn`: show the "Open in…" picker for the current selection (external tools
-/// such as Lightroom, Photoshop, DaVinci Resolve). Drawn by [`window`].
+fn start_open_tasks(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let newly_opened = {
+        let state = &mut app.ops.settings_ui;
+        if !state.open {
+            state.was_open = false;
+            false
+        } else if state.was_open {
+            false
+        } else {
+            state.was_open = true;
+            true
+        }
+    };
+
+    if newly_opened {
+        start_cache_scan(
+            &mut app.ops.settings_ui,
+            app.paths.cache.join("thumbs"),
+            ctx,
+        );
+        start_probe_check(
+            &mut app.ops.settings_ui,
+            app.settings.ffmpeg_dir.clone(),
+            ctx,
+        );
+    }
+
+    if app.ops.settings_ui.open
+        && !app.ops.settings_ui.library_loaded
+        && !app.ops.settings_ui.library_loading
+        && let Some(db) = app.ops.library.db.clone()
+    {
+        refresh_library(&mut app.ops.settings_ui, db, ctx);
+    }
+}
+
+fn drain_messages(app: &mut ZxrawApp, ctx: &egui::Context) {
+    while let Ok(message) = app.ops.settings_ui.rx.try_recv() {
+        let state = &mut app.ops.settings_ui;
+        match message {
+            SettingsMessage::CacheUsage { generation, result }
+                if generation == state.cache_generation =>
+            {
+                state.cache_loading = false;
+                match result {
+                    Ok(bytes) => {
+                        state.cache_usage = Some(bytes);
+                        state.cache_error = None;
+                    }
+                    Err(error) => state.cache_error = Some(error),
+                }
+            }
+            SettingsMessage::CacheCleared { generation, result }
+                if generation == state.cache_generation =>
+            {
+                state.cache_loading = false;
+                match result {
+                    Ok(bytes) => {
+                        state.cache_usage = Some(bytes);
+                        state.cache_error = None;
+                        app.ops.thumbs.service().clear_memory();
+                        let _ = app.ops.tx.send(crate::actions::Event::Toast(
+                            "Thumbnail cache cleared".into(),
+                        ));
+                    }
+                    Err(error) => {
+                        state.cache_error = Some(error.clone());
+                        let _ = app.ops.tx.send(crate::actions::Event::Error(format!(
+                            "Could not clear thumbnail cache: {error}"
+                        )));
+                    }
+                }
+            }
+            SettingsMessage::Probe { generation, path } if generation == state.probe_generation => {
+                state.probe_status = path.map_or(ProbeStatus::Missing, ProbeStatus::Found);
+            }
+            SettingsMessage::Detected(tools) => {
+                state.detecting_apps = false;
+                state.detected_apps = Some(tools);
+            }
+            SettingsMessage::LibrarySnapshot { generation, result }
+                if generation == state.library_generation =>
+            {
+                state.library_loading = false;
+                state.library_loaded = true;
+                match result {
+                    Ok(snapshot) => {
+                        state.roots = snapshot.roots;
+                        state.exclusions = snapshot.exclusions;
+                        state.library_error = None;
+                    }
+                    Err(error) => {
+                        state.library_error = Some(error.clone());
+                        let _ = app.ops.tx.send(crate::actions::Event::Error(format!(
+                            "Could not read library settings: {error}"
+                        )));
+                    }
+                }
+            }
+            SettingsMessage::Integrity(result) => {
+                state.integrity_checking = false;
+                if let Err(error) = &result {
+                    let _ = app.ops.tx.send(crate::actions::Event::Error(format!(
+                        "Database integrity check failed: {error}"
+                    )));
+                }
+                state.integrity_result = Some(result);
+            }
+            _ => {}
+        }
+        ctx.request_repaint();
+    }
+}
+
+fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let old_hidden = app.settings.show_hidden;
+    let old_system = app.settings.show_system;
+    let mut intents = Vec::new();
+    let db_ready = app.ops.library.db.is_some();
+    let db_open_error = app.ops.library.open_error.clone();
+    let db_path = app
+        .ops
+        .library
+        .db
+        .as_ref()
+        .and_then(|db| db.path())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| app.paths.data.join("forge.db"));
+
+    {
+        let (settings, state) = (&mut app.settings, &mut app.ops.settings_ui);
+        let mut open = state.open;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .default_size([850.0, 690.0])
+            .min_size([710.0, 470.0])
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_min_width(154.0);
+                        ui.add_space(4.0);
+                        for (page, label) in SettingsPage::ALL {
+                            if ui.selectable_label(state.page == page, label).clicked() {
+                                state.page = page;
+                            }
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("settings-content")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                match state.page {
+                                    SettingsPage::Appearance => appearance_page(ui, settings),
+                                    SettingsPage::Browsing => browsing_page(ui, settings),
+                                    SettingsPage::Performance => {
+                                        performance_page(ui, settings, state)
+                                    }
+                                    SettingsPage::FileOperations => {
+                                        file_operations_page(ui, settings)
+                                    }
+                                    SettingsPage::Video => {
+                                        video_page(ui, settings, state, &mut intents)
+                                    }
+                                    SettingsPage::Library => library_page(
+                                        ui,
+                                        state,
+                                        db_ready,
+                                        db_open_error.as_deref(),
+                                        &db_path,
+                                        &mut intents,
+                                    ),
+                                    SettingsPage::ExternalTools => {
+                                        external_tools_page(ui, settings, state, &mut intents)
+                                    }
+                                    SettingsPage::Privacy => privacy_page(ui),
+                                    SettingsPage::Shortcuts => shortcuts_page(ui, ctx),
+                                }
+                            });
+                        });
+                });
+            });
+        state.open = open;
+    }
+
+    if old_hidden != app.settings.show_hidden || old_system != app.settings.show_system {
+        for tab in &mut app.tabs {
+            for pane in std::iter::once(&mut tab.left).chain(tab.right.iter_mut()) {
+                pane.show_hidden = app.settings.show_hidden;
+                pane.show_system = app.settings.show_system;
+                pane.rebuild_visible();
+            }
+        }
+    }
+
+    handle_intents(app, ctx, intents);
+}
+
+fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
+    page_heading(
+        ui,
+        "Appearance",
+        "Adjust how ZXraw Explorer looks on this computer.",
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("Theme");
+        egui::ComboBox::from_id_salt("settings-theme")
+            .selected_text(theme_label(settings.theme))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.theme, ThemeChoice::Dark, "Dark");
+                ui.selectable_value(&mut settings.theme, ThemeChoice::Light, "Light");
+                ui.selectable_value(&mut settings.theme, ThemeChoice::System, "System");
+            });
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("UI scale");
+        ui.add(
+            egui::Slider::new(&mut settings.ui_scale, 0.75..=1.5)
+                .step_by(0.05)
+                .suffix("×"),
+        );
+    });
+    ui.label(
+        RichText::new("Changes take effect immediately.")
+            .weak()
+            .small(),
+    );
+}
+
+fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
+    page_heading(
+        ui,
+        "Browsing",
+        "Choose which files appear and how new folders are shown.",
+    );
+    ui.add_space(10.0);
+    ui.checkbox(&mut settings.show_hidden, "Show hidden files");
+    ui.checkbox(&mut settings.show_system, "Show system files");
+    ui.checkbox(
+        &mut settings.confirm_recycle,
+        "Confirm before moving items to the Recycle Bin",
+    );
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.label("Default view for new tabs");
+        egui::ComboBox::from_id_salt("settings-default-view")
+            .selected_text(match settings.default_view {
+                ViewMode::Details => "Details",
+                ViewMode::Grid => "Thumbnail grid",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.default_view, ViewMode::Details, "Details");
+                ui.selectable_value(&mut settings.default_view, ViewMode::Grid, "Thumbnail grid");
+            });
+    });
+}
+
+fn performance_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut SettingsUi) {
+    page_heading(
+        ui,
+        "Performance",
+        "Set the memory and disk budgets used for generated thumbnails.",
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("Thumbnail memory cache");
+        ui.add(egui::Slider::new(&mut settings.thumb_mem_cache_mb, 32..=8192).suffix(" MB"));
+    });
+    ui.horizontal(|ui| {
+        ui.label("Thumbnail disk cache limit");
+        ui.add(egui::Slider::new(&mut settings.thumb_disk_cache_mb, 0..=65536).suffix(" MB"));
+    });
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        ui.label("Current disk usage");
+        if state.cache_loading {
+            ui.spinner();
+            ui.label("Scanning thumbnail cache…");
+        } else if let Some(error) = &state.cache_error {
+            ui.colored_label(ui.visuals().error_fg_color, format!("Unavailable: {error}"));
+        } else if let Some(bytes) = state.cache_usage {
+            ui.label(forge_core::model::format_size(bytes));
+        } else {
+            ui.label("Not measured yet");
+        }
+    });
+    if ui.button("Clear thumbnail cache…").clicked() {
+        state.clear_cache_confirm = true;
+    }
+    ui.label(
+        RichText::new("Cached previews are regenerated as you browse.")
+            .weak()
+            .small(),
+    );
+}
+
+fn file_operations_page(ui: &mut egui::Ui, settings: &mut Settings) {
+    page_heading(
+        ui,
+        "File operations",
+        "Choose whether copied files are checked after they are written.",
+    );
+    ui.add_space(10.0);
+    ui.checkbox(
+        &mut settings.verify_copies,
+        "Verify copies with a BLAKE3 checksum",
+    );
+}
+
+fn video_page(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    state: &SettingsUi,
+    intents: &mut Vec<SettingsIntent>,
+) {
+    page_heading(
+        ui,
+        "Video",
+        "ZXraw Explorer uses external FFmpeg tools for video metadata and previews.",
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.label("FFmpeg folder");
+        ui.label(
+            RichText::new(
+                settings
+                    .ffmpeg_dir
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "Search PATH".into()),
+            )
+            .weak(),
+        );
+    });
+    ui.horizontal(|ui| {
+        if ui.button("Choose folder…").clicked() {
+            intents.push(SettingsIntent::PickFfmpegFolder);
+        }
+        if settings.ffmpeg_dir.is_some() && ui.button("Use PATH").clicked() {
+            intents.push(SettingsIntent::UseFfmpegPath);
+        }
+    });
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("ffprobe status");
+        match &state.probe_status {
+            ProbeStatus::Unknown | ProbeStatus::Checking => {
+                ui.spinner();
+                ui.label("Checking…");
+            }
+            ProbeStatus::Found(path) => {
+                ui.colored_label(Color32::from_rgb(99, 190, 127), "ffprobe found:");
+                ui.label(path.display().to_string());
+            }
+            ProbeStatus::Missing => {
+                ui.colored_label(ui.visuals().error_fg_color, "ffprobe not found");
+            }
+        }
+    });
+}
+
+fn library_page(
+    ui: &mut egui::Ui,
+    state: &mut SettingsUi,
+    db_ready: bool,
+    db_open_error: Option<&str>,
+    db_path: &Path,
+    intents: &mut Vec<SettingsIntent>,
+) {
+    page_heading(
+        ui,
+        "Library",
+        "Manage folders included in search and the paths skipped during indexing.",
+    );
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label("Database");
+        ui.label(RichText::new(db_path.display().to_string()).weak());
+    });
+
+    if !db_ready {
+        if let Some(error) = db_open_error {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Database unavailable: {error}"),
+            );
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Opening database…");
+            });
+        }
+        return;
+    }
+
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.heading("Indexed folders");
+        if ui
+            .add_enabled(!state.library_loading, egui::Button::new("Add folder…"))
+            .clicked()
+        {
+            intents.push(SettingsIntent::PickLibraryRoot);
+        }
+        if state.library_loading {
+            ui.spinner();
+        }
+    });
+    if let Some(error) = &state.library_error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    } else if state.roots.is_empty() && !state.library_loading {
+        ui.label(RichText::new("No folders are indexed yet.").weak());
+    }
+    for root in &state.roots {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(root.path.display().to_string());
+                    ui.label(
+                        RichText::new(if root.last_complete_at.is_some() {
+                            "Indexed before"
+                        } else {
+                            "Not indexed yet"
+                        })
+                        .weak()
+                        .small(),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(!state.library_loading, egui::Button::new("Remove"))
+                        .clicked()
+                    {
+                        intents.push(SettingsIntent::RemoveLibraryRoot(root.id));
+                    }
+                    if ui
+                        .add_enabled(!state.library_loading, egui::Button::new("Re-index"))
+                        .clicked()
+                    {
+                        intents.push(SettingsIntent::Reindex(root.path.clone()));
+                    }
+                });
+            });
+        });
+    }
+
+    ui.add_space(8.0);
+    ui.heading("Index exclusions");
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("settings-exclusion-kind")
+            .selected_text(exclusion_kind_label(state.exclusion_kind))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut state.exclusion_kind,
+                    ExclusionKind::Folder,
+                    "Folder path",
+                );
+                ui.selectable_value(&mut state.exclusion_kind, ExclusionKind::Ext, "Extension");
+                ui.selectable_value(&mut state.exclusion_kind, ExclusionKind::Name, "Name");
+            });
+        let hint = match state.exclusion_kind {
+            ExclusionKind::Folder => r"Folder path, e.g. D:\Archive\Temp",
+            ExclusionKind::Ext => "Extension, e.g. tmp",
+            ExclusionKind::Name => "File or folder name, e.g. node_modules",
+        };
+        ui.add(
+            egui::TextEdit::singleline(&mut state.exclusion_value)
+                .hint_text(hint)
+                .desired_width(250.0),
+        );
+        if ui
+            .add_enabled(
+                !state.library_loading && !state.exclusion_value.trim().is_empty(),
+                egui::Button::new("Add"),
+            )
+            .clicked()
+        {
+            intents.push(SettingsIntent::AddExclusion(
+                state.exclusion_kind,
+                std::mem::take(&mut state.exclusion_value),
+            ));
+        }
+    });
+    exclusion_rows(
+        ui,
+        state,
+        ExclusionKind::Folder,
+        &state.exclusions.folders,
+        intents,
+    );
+    exclusion_rows(
+        ui,
+        state,
+        ExclusionKind::Ext,
+        &state.exclusions.exts,
+        intents,
+    );
+    exclusion_rows(
+        ui,
+        state,
+        ExclusionKind::Name,
+        &state.exclusions.names,
+        intents,
+    );
+
+    ui.add_space(10.0);
+    if ui
+        .add_enabled(
+            !state.integrity_checking,
+            egui::Button::new("Check database integrity"),
+        )
+        .clicked()
+    {
+        intents.push(SettingsIntent::CheckIntegrity);
+    }
+    if state.integrity_checking {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Checking database…");
+        });
+    } else if let Some(result) = &state.integrity_result {
+        match result {
+            Ok(lines) if lines.is_empty() => {
+                ui.colored_label(
+                    Color32::from_rgb(99, 190, 127),
+                    "Database integrity check passed.",
+                );
+            }
+            Ok(lines) => {
+                ui.colored_label(ui.visuals().error_fg_color, lines.join("\n"));
+            }
+            Err(error) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        }
+    }
+}
+
+fn exclusion_rows(
+    ui: &mut egui::Ui,
+    state: &SettingsUi,
+    kind: ExclusionKind,
+    values: &[String],
+    intents: &mut Vec<SettingsIntent>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    egui::Grid::new(format!("exclusion-rows-{kind:?}"))
+        .num_columns(3)
+        .striped(true)
+        .show(ui, |ui| {
+            for value in values {
+                ui.label(exclusion_kind_label(kind));
+                ui.label(value);
+                if ui
+                    .add_enabled(!state.library_loading, egui::Button::new("Remove"))
+                    .clicked()
+                {
+                    intents.push(SettingsIntent::RemoveExclusion(kind, value.clone()));
+                }
+                ui.end_row();
+            }
+        });
+}
+
+fn external_tools_page(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    state: &mut SettingsUi,
+    intents: &mut Vec<SettingsIntent>,
+) {
+    page_heading(
+        ui,
+        "External tools",
+        "Send selected files to another application. Commands are launched with separate arguments, never through a shell.",
+    );
+    ui.add_space(8.0);
+    let mut add_new = false;
+    let mut edit_at = None;
+    let mut remove_at = None;
+    ui.horizontal(|ui| {
+        if ui.button("Add application").clicked() {
+            add_new = true;
+        }
+        if ui
+            .add_enabled(
+                !state.detecting_apps,
+                egui::Button::new("Detect installed apps"),
+            )
+            .clicked()
+        {
+            intents.push(SettingsIntent::DetectApps);
+        }
+        if state.detecting_apps {
+            ui.spinner();
+            ui.label("Checking common install folders…");
+        }
+    });
+
+    if settings.external_tools.is_empty() {
+        ui.label(RichText::new("No external applications have been configured.").weak());
+    } else {
+        for (index, tool) in settings.external_tools.iter().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.strong(&tool.name);
+                        ui.label(RichText::new(tool.exe.display().to_string()).weak().small());
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove_at = Some(index);
+                        }
+                        if ui.small_button("Edit").clicked() {
+                            edit_at = Some(index);
+                        }
+                    });
+                });
+                let filters = if tool.extensions.is_empty() {
+                    "All file types".to_owned()
+                } else {
+                    format!("Extensions: {}", tool.extensions.join(", "))
+                };
+                ui.label(RichText::new(filters).weak().small());
+                ui.label(
+                    RichText::new(format!("{} argument template(s)", tool.args.len()))
+                        .weak()
+                        .small(),
+                );
+            });
+        }
+    }
+
+    if let Some(detected) = &state.detected_apps {
+        ui.add_space(8.0);
+        ui.heading("Detected applications");
+        if detected.is_empty() {
+            ui.label(
+                RichText::new("No supported applications were found in the usual install folders.")
+                    .weak(),
+            );
+        }
+        let mut add_detected = None;
+        for (index, tool) in detected.iter().enumerate() {
+            let exists = settings
+                .external_tools
+                .iter()
+                .any(|existing| same_executable(&existing.exe, &tool.exe));
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.strong(&tool.name);
+                    ui.label(RichText::new(tool.exe.display().to_string()).weak().small());
+                });
+                if exists {
+                    ui.label(RichText::new("Already added").weak());
+                } else if ui.button("Add").clicked() {
+                    add_detected = Some(index);
+                }
+            });
+        }
+        if let Some(index) = add_detected {
+            settings.external_tools.push(detected[index].clone());
+        }
+    }
+
+    if let Some(index) = remove_at {
+        settings.external_tools.remove(index);
+        if let Some(draft) = &mut state.tool_draft {
+            match draft.editing {
+                Some(editing) if editing == index => state.tool_draft = None,
+                Some(editing) if editing > index => draft.editing = Some(editing - 1),
+                _ => {}
+            }
+        }
+    }
+    if let Some(index) = edit_at
+        && let Some(tool) = settings.external_tools.get(index).cloned()
+    {
+        state.tool_draft = Some(ToolDraft::new(Some(index), tool));
+    }
+    if add_new {
+        state.tool_draft = Some(ToolDraft::new(
+            None,
+            ExternalTool {
+                name: String::new(),
+                exe: PathBuf::new(),
+                args: vec!["{files}".into()],
+                extensions: Vec::new(),
+            },
+        ));
+    }
+
+    let mut save: Option<(Option<usize>, ExternalTool)> = None;
+    let mut cancel = false;
+    if let Some(draft) = &mut state.tool_draft {
+        ui.add_space(10.0);
+        ui.separator();
+        ui.heading(if draft.editing.is_some() {
+            "Edit application"
+        } else {
+            "New application"
+        });
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.name)
+                    .hint_text("e.g. Lightroom Classic")
+                    .desired_width(280.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Executable");
+            let exe_label = if draft.exe.as_os_str().is_empty() {
+                "Choose an .exe file…".to_owned()
+            } else {
+                draft.exe.display().to_string()
+            };
+            ui.label(RichText::new(exe_label).weak());
+            if ui.button("Browse…").clicked() {
+                intents.push(SettingsIntent::BrowseToolExecutable);
+            }
+        });
+        ui.label("Arguments: one argument per line. Use {files} for the selected files and {dir} for the current folder.");
+        ui.add(
+            egui::TextEdit::multiline(&mut draft.args)
+                .desired_rows(3)
+                .desired_width(ui.available_width())
+                .code_editor(),
+        );
+        ui.horizontal(|ui| {
+            ui.label("Extensions");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.extensions)
+                    .hint_text("jpg, raw, mp4 — leave empty for all files")
+                    .desired_width(ui.available_width() - 100.0),
+            );
+        });
+        if let Some(error) = &draft.error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Save application").clicked() {
+                match draft.build_tool() {
+                    Ok(tool) => save = Some((draft.editing, tool)),
+                    Err(error) => draft.error = Some(error),
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    }
+    if let Some((editing, tool)) = save {
+        if let Some(index) = editing {
+            if let Some(existing) = settings.external_tools.get_mut(index) {
+                *existing = tool;
+            }
+        } else {
+            settings.external_tools.push(tool);
+        }
+        state.tool_draft = None;
+    } else if cancel {
+        state.tool_draft = None;
+    }
+}
+
+fn privacy_page(ui: &mut egui::Ui) {
+    page_heading(
+        ui,
+        "Privacy",
+        "Your files and settings stay on this computer.",
+    );
+    ui.add_space(14.0);
+    ui.group(|ui| {
+        ui.label(RichText::new("No telemetry; nothing leaves this computer.").strong());
+        ui.label(
+            RichText::new(
+                "ZXraw Explorer does not send usage data or file information to a server.",
+            )
+            .weak(),
+        );
+    });
+}
+
+fn shortcuts_page(ui: &mut egui::Ui, ctx: &egui::Context) {
+    page_heading(
+        ui,
+        "Keyboard shortcuts",
+        "The shortcuts available in the current build.",
+    );
+    ui.add_space(8.0);
+    egui::Grid::new("settings-shortcuts")
+        .num_columns(2)
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Command");
+            ui.strong("Shortcut");
+            ui.end_row();
+            for cmd in Cmd::ALL {
+                ui.label(cmd.label());
+                let text = cmd.shortcut_text(ctx);
+                ui.label(if text.is_empty() { "—" } else { &text });
+                ui.end_row();
+            }
+        });
+}
+
+fn show_cache_confirmation(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let mut open = app.ops.settings_ui.clear_cache_confirm;
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Window::new("Clear thumbnail cache?")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label("Cached thumbnails will be removed from disk and regenerated as needed.");
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("Clear cache").clicked() {
+                    confirmed = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+    if cancelled {
+        open = false;
+    }
+    app.ops.settings_ui.clear_cache_confirm = open && !confirmed;
+    if confirmed {
+        clear_cache_background(app, ctx);
+    }
+}
+
+fn show_open_in_picker(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let mut open = app.ops.settings_ui.picker_open;
+    let targets = app.ops.settings_ui.picker_targets.clone();
+    let folder = app.ops.settings_ui.picker_dir.clone();
+    let applicable: Vec<ExternalTool> = app
+        .settings
+        .external_tools
+        .iter()
+        .filter(|tool| tool_applies(tool, &targets))
+        .cloned()
+        .collect();
+    let configured = !app.settings.external_tools.is_empty();
+    let mut chosen: Option<ExternalTool> = None;
+    let mut settings_clicked = false;
+    egui::Window::new("Open in external app")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(440.0)
+        .show(ctx, |ui| {
+            if !configured {
+                ui.label("No external applications are configured yet.");
+                ui.add_space(8.0);
+                if ui.button("Open Settings › External tools").clicked() {
+                    settings_clicked = true;
+                }
+            } else if targets.is_empty() {
+                ui.label("Select one or more files to open them in an external application.");
+            } else if applicable.is_empty() {
+                ui.label("No configured application accepts the selected file types.");
+                if ui.button("Review External tools settings").clicked() {
+                    settings_clicked = true;
+                }
+            } else {
+                ui.label(format!("Send {} selected item(s) to:", targets.len()));
+                ui.add_space(6.0);
+                for tool in &applicable {
+                    let label = if tool.extensions.is_empty() {
+                        tool.name.clone()
+                    } else {
+                        format!("{}  ·  {}", tool.name, tool.extensions.join(", "))
+                    };
+                    if ui.button(label).clicked() {
+                        chosen = Some(tool.clone());
+                    }
+                    ui.label(RichText::new(tool.exe.display().to_string()).weak().small());
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Selected paths are passed as arguments; they are never executed.")
+                    .weak()
+                    .small(),
+            );
+        });
+    app.ops.settings_ui.picker_open = open && chosen.is_none() && !settings_clicked;
+    if settings_clicked {
+        app.ops.settings_ui.page = SettingsPage::ExternalTools;
+        app.ops.settings_ui.open = true;
+    }
+    if let Some(tool) = chosen {
+        start_tool_launch(app, tool, targets, folder, ctx);
+    }
+}
+
+fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<SettingsIntent>) {
+    for intent in intents {
+        match intent {
+            SettingsIntent::PickFfmpegFolder => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose FFmpeg folder")
+                    .pick_folder()
+                {
+                    app.settings.ffmpeg_dir = Some(path);
+                    rebuild_thumb_manager(app);
+                    start_probe_check(
+                        &mut app.ops.settings_ui,
+                        app.settings.ffmpeg_dir.clone(),
+                        ctx,
+                    );
+                }
+            }
+            SettingsIntent::UseFfmpegPath => {
+                app.settings.ffmpeg_dir = None;
+                rebuild_thumb_manager(app);
+                start_probe_check(&mut app.ops.settings_ui, None, ctx);
+            }
+            SettingsIntent::PickLibraryRoot => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Add indexed folder")
+                    .pick_folder()
+                {
+                    add_library_root(app, path, ctx);
+                }
+            }
+            SettingsIntent::RemoveLibraryRoot(id) => {
+                mutate_library(app, ctx, move |db| {
+                    db.remove_index_root(id)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            }
+            SettingsIntent::AddExclusion(kind, value) => {
+                mutate_library(app, ctx, move |db| {
+                    db.add_exclusion(kind, &value)
+                        .map_err(|error| error.to_string())
+                });
+            }
+            SettingsIntent::RemoveExclusion(kind, value) => {
+                mutate_library(app, ctx, move |db| {
+                    db.remove_exclusion(kind, &value)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                });
+            }
+            SettingsIntent::Reindex(root) => {
+                if let Some(db) = app.ops.library.db.clone() {
+                    let tx = app.ops.tx.clone();
+                    let repaint = ctx.clone();
+                    crate::library::start_index_job(&app.ops.jobs, db, root, move |message| {
+                        let _ = tx.send(crate::actions::Event::Toast(message));
+                        repaint.request_repaint();
+                    });
+                }
+            }
+            SettingsIntent::CheckIntegrity => check_integrity(app, ctx),
+            SettingsIntent::DetectApps => detect_apps_background(&mut app.ops.settings_ui, ctx),
+            SettingsIntent::BrowseToolExecutable => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Choose application executable")
+                    .add_filter("Applications", &["exe"])
+                    .pick_file()
+                    && let Some(draft) = &mut app.ops.settings_ui.tool_draft
+                {
+                    draft.exe = path;
+                    draft.error = None;
+                }
+            }
+        }
+    }
+}
+
+fn add_library_root(app: &mut ZxrawApp, path: PathBuf, ctx: &egui::Context) {
+    mutate_library(app, ctx, move |db| {
+        if !path.is_dir() {
+            return Err(format!("{} is not an available folder", path.display()));
+        }
+        db.add_index_root(&path)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+}
+
+fn rebuild_thumb_manager(app: &mut ZxrawApp) {
+    app.ops.thumbs = crate::thumbs::ThumbManager::new(
+        app.paths.cache.join("thumbs"),
+        app.settings.thumb_mem_cache_mb,
+        app.settings.ffmpeg_dir.as_deref(),
+    );
+}
+
+fn mutate_library(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    operation: impl FnOnce(&Db) -> Result<(), String> + Send + 'static,
+) {
+    let Some(db) = app.ops.library.db.clone() else {
+        app.toast_err("Library database is not available");
+        return;
+    };
+    let state = &mut app.ops.settings_ui;
+    state.library_loading = true;
+    state.library_loaded = false;
+    state.library_error = None;
+    state.library_generation = state.library_generation.wrapping_add(1);
+    let generation = state.library_generation;
+    let tx = state.tx.clone();
+    let event_tx = app.ops.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = operation(&db).and_then(|()| read_library_snapshot(&db));
+        if let Err(error) = &result {
+            let _ = event_tx.send(crate::actions::Event::Error(format!(
+                "Could not update library settings: {error}"
+            )));
+        }
+        let _ = tx.send(SettingsMessage::LibrarySnapshot { generation, result });
+        repaint.request_repaint();
+    });
+}
+
+fn refresh_library(state: &mut SettingsUi, db: Arc<Db>, ctx: &egui::Context) {
+    state.library_loading = true;
+    state.library_error = None;
+    state.library_generation = state.library_generation.wrapping_add(1);
+    let generation = state.library_generation;
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = read_library_snapshot(&db);
+        let _ = tx.send(SettingsMessage::LibrarySnapshot { generation, result });
+        repaint.request_repaint();
+    });
+}
+
+fn read_library_snapshot(db: &Db) -> Result<LibrarySnapshot, String> {
+    let roots = db.index_roots().map_err(|error| error.to_string())?;
+    let exclusions = db.exclusions().map_err(|error| error.to_string())?;
+    Ok(LibrarySnapshot { roots, exclusions })
+}
+
+fn check_integrity(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let Some(db) = app.ops.library.db.clone() else {
+        app.toast_err("Library database is not available");
+        return;
+    };
+    let state = &mut app.ops.settings_ui;
+    state.integrity_checking = true;
+    state.integrity_result = None;
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = db.integrity_check().map_err(|error| error.to_string());
+        let _ = tx.send(SettingsMessage::Integrity(result));
+        repaint.request_repaint();
+    });
+}
+
+fn start_cache_scan(state: &mut SettingsUi, root: PathBuf, ctx: &egui::Context) {
+    state.cache_generation = state.cache_generation.wrapping_add(1);
+    state.cache_loading = true;
+    state.cache_error = None;
+    let generation = state.cache_generation;
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = disk_usage(&root).map_err(|error| error.to_string());
+        let _ = tx.send(SettingsMessage::CacheUsage { generation, result });
+        repaint.request_repaint();
+    });
+}
+
+fn clear_cache_background(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let state = &mut app.ops.settings_ui;
+    state.cache_generation = state.cache_generation.wrapping_add(1);
+    state.cache_loading = true;
+    state.cache_error = None;
+    let generation = state.cache_generation;
+    let root = app.paths.cache.join("thumbs");
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let result = clear_cache_contents(&root)
+            .and_then(|()| disk_usage(&root))
+            .map_err(|error| error.to_string());
+        let _ = tx.send(SettingsMessage::CacheCleared { generation, result });
+        repaint.request_repaint();
+    });
+}
+
+fn start_probe_check(state: &mut SettingsUi, configured: Option<PathBuf>, ctx: &egui::Context) {
+    state.probe_generation = state.probe_generation.wrapping_add(1);
+    state.probe_status = ProbeStatus::Checking;
+    let generation = state.probe_generation;
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let tools = forge_media::FfTools::discover_with(configured.as_deref());
+        let _ = tx.send(SettingsMessage::Probe {
+            generation,
+            path: tools.ffprobe,
+        });
+        repaint.request_repaint();
+    });
+}
+
+fn detect_apps_background(state: &mut SettingsUi, ctx: &egui::Context) {
+    state.detecting_apps = true;
+    state.detected_apps = None;
+    let tx = state.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        let tools = detect_apps_in(&install_roots_from_env());
+        let _ = tx.send(SettingsMessage::Detected(tools));
+        repaint.request_repaint();
+    });
+}
+
+fn detect_apps_in(roots: &InstallRoots) -> Vec<ExternalTool> {
+    APP_CATALOG
+        .iter()
+        .filter_map(|app| {
+            let exe = app.candidates.iter().find_map(|candidate| {
+                let base_roots = match candidate.root {
+                    InstallRootKind::ProgramFiles => &roots.program_files,
+                    InstallRootKind::ProgramFilesX86 => &roots.program_files_x86,
+                    InstallRootKind::LocalPrograms => &roots.local_programs,
+                };
+                base_roots
+                    .iter()
+                    .find_map(|root| find_pattern(root, candidate.parts))
+            })?;
+            Some(ExternalTool {
+                name: app.name.to_owned(),
+                exe,
+                args: vec!["{files}".into()],
+                extensions: app
+                    .extensions
+                    .iter()
+                    .map(|extension| (*extension).to_owned())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn install_roots_from_env() -> InstallRoots {
+    let mut roots = InstallRoots::default();
+    for key in ["ProgramW6432", "ProgramFiles"] {
+        if let Some(root) = std::env::var_os(key).map(PathBuf::from) {
+            push_unique_path(&mut roots.program_files, root);
+        }
+    }
+    if let Some(root) = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from) {
+        push_unique_path(&mut roots.program_files_x86, root);
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+        roots.local_programs.push(local.join("Programs"));
+    }
+    roots
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, new: PathBuf) {
+    let key = new.to_string_lossy().to_lowercase();
+    if !paths
+        .iter()
+        .any(|path| path.to_string_lossy().to_lowercase() == key)
+    {
+        paths.push(new);
+    }
+}
+
+#[derive(Default)]
+struct InstallRoots {
+    program_files: Vec<PathBuf>,
+    program_files_x86: Vec<PathBuf>,
+    local_programs: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum InstallRootKind {
+    ProgramFiles,
+    ProgramFilesX86,
+    LocalPrograms,
+}
+
+struct AppCandidate {
+    root: InstallRootKind,
+    parts: &'static [&'static str],
+}
+
+struct AppDefinition {
+    name: &'static str,
+    extensions: &'static [&'static str],
+    candidates: &'static [AppCandidate],
+}
+
+const APP_CATALOG: &[AppDefinition] = &[
+    AppDefinition {
+        name: "Adobe Lightroom Classic",
+        extensions: &[
+            "jpg", "jpeg", "tif", "tiff", "dng", "cr2", "cr3", "nef", "nrw", "arw", "raf", "orf",
+            "rw2", "pef", "raw",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Adobe", "Adobe Lightroom Classic*", "Lightroom.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Adobe", "Adobe Lightroom Classic*", "Lightroom.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Adobe", "Adobe Lightroom Classic*", "Lightroom.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Adobe Photoshop",
+        extensions: &[
+            "jpg", "jpeg", "png", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "psd", "psb",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Adobe", "Adobe Photoshop*", "Photoshop.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Adobe", "Adobe Photoshop*", "Photoshop.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Adobe", "Adobe Photoshop*", "Photoshop.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Adobe Premiere Pro",
+        extensions: &[
+            "mp4", "mov", "mxf", "avi", "mkv", "mpg", "mpeg", "mts", "m2ts",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Adobe", "Adobe Premiere Pro*", "Adobe Premiere Pro.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Adobe", "Adobe Premiere Pro*", "Adobe Premiere Pro.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Adobe", "Adobe Premiere Pro*", "Adobe Premiere Pro.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Adobe After Effects",
+        extensions: &["aep", "aepx", "mp4", "mov", "avi", "mxf"],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &[
+                    "Adobe",
+                    "Adobe After Effects*",
+                    "Support Files",
+                    "AfterFX.exe",
+                ],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &[
+                    "Adobe",
+                    "Adobe After Effects*",
+                    "Support Files",
+                    "AfterFX.exe",
+                ],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &[
+                    "Adobe",
+                    "Adobe After Effects*",
+                    "Support Files",
+                    "AfterFX.exe",
+                ],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Capture One",
+        extensions: &[
+            "jpg", "jpeg", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
+            "raw",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Capture One", "Capture One.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Capture One", "Capture One*", "CaptureOne.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Capture One", "Capture One.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Capture One", "Capture One*", "CaptureOne.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Capture One", "Capture One.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Capture One", "Capture One*", "CaptureOne.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "DaVinci Resolve",
+        extensions: &[
+            "mp4", "mov", "mxf", "avi", "mkv", "mpg", "mpeg", "wav", "tif", "tiff", "dng",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Blackmagic Design", "DaVinci Resolve", "Resolve.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Blackmagic Design", "DaVinci Resolve", "Resolve.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Blackmagic Design", "DaVinci Resolve", "Resolve.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Affinity Photo",
+        extensions: &[
+            "jpg", "jpeg", "png", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "psd",
+            "afphoto",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Affinity", "Photo 2", "Photo.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Serif", "Affinity Photo 2", "Photo.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Serif", "Affinity Photo", "Photo.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Affinity", "Photo 2", "Photo.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "darktable",
+        extensions: &[
+            "jpg", "jpeg", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
+            "raw",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["darktable", "bin", "darktable.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["darktable", "bin", "darktable.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["darktable", "bin", "darktable.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["darktable", "darktable.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "RawTherapee",
+        extensions: &[
+            "jpg", "jpeg", "tif", "tiff", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
+            "raw",
+        ],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["RawTherapee*", "rawtherapee.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["RawTherapee*", "bin", "rawtherapee.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["RawTherapee", "*", "rawtherapee.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["RawTherapee", "*", "rawtherapee.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["RawTherapee*", "rawtherapee.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["RawTherapee*", "rawtherapee.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "GIMP",
+        extensions: &["jpg", "jpeg", "png", "gif", "tif", "tiff", "xcf", "psd"],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["GIMP *", "bin", "gimp-*.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["GIMP *", "bin", "gimp-*.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["GIMP *", "bin", "gimp-*.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "VEGAS Pro",
+        extensions: &["mp4", "mov", "mxf", "avi", "mkv", "mpg", "mpeg", "wav"],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["VEGAS", "VEGAS Pro*", "vegas*.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["VEGAS", "VEGAS Pro*", "vegas*.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["VEGAS", "VEGAS Pro*", "vegas*.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Blender",
+        extensions: &["blend", "fbx", "obj", "stl", "glb", "gltf", "abc"],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Blender Foundation", "Blender *", "blender.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Blender Foundation", "Blender *", "blender.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Blender Foundation", "Blender *", "blender.exe"],
+            },
+        ],
+    },
+    AppDefinition {
+        name: "Audacity",
+        extensions: &["wav", "mp3", "flac", "aiff", "aif", "ogg", "m4a"],
+        candidates: &[
+            AppCandidate {
+                root: InstallRootKind::ProgramFiles,
+                parts: &["Audacity", "Audacity.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::ProgramFilesX86,
+                parts: &["Audacity", "Audacity.exe"],
+            },
+            AppCandidate {
+                root: InstallRootKind::LocalPrograms,
+                parts: &["Audacity", "Audacity.exe"],
+            },
+        ],
+    },
+];
+
+fn find_pattern(base: &Path, parts: &[&str]) -> Option<PathBuf> {
+    let (part, rest) = parts.split_first()?;
+    if part.contains('*') {
+        let mut matches = fs::read_dir(base)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let expected_type = if rest.is_empty() {
+                    file_type.is_file()
+                } else {
+                    file_type.is_dir()
+                };
+                (expected_type && wildcard_segment_match(&name, part)).then_some(path)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|path| path.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        return matches.into_iter().find_map(|path| {
+            if rest.is_empty() {
+                Some(path)
+            } else {
+                find_pattern(&path, rest)
+            }
+        });
+    }
+
+    let path = base.join(part);
+    if rest.is_empty() {
+        path.is_file().then_some(path)
+    } else if path.is_dir() {
+        find_pattern(&path, rest)
+    } else {
+        None
+    }
+}
+
+fn wildcard_segment_match(value: &str, pattern: &str) -> bool {
+    let value = value.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return value == pattern;
+    };
+    value.starts_with(prefix)
+        && value.ends_with(suffix)
+        && value.len() >= prefix.len() + suffix.len()
+}
+
+fn tool_applies(tool: &ExternalTool, paths: &[PathBuf]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    if tool.extensions.is_empty() {
+        return true;
+    }
+    paths.iter().all(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                tool.extensions
+                    .iter()
+                    .any(|candidate| normalize_extension(candidate).eq_ignore_ascii_case(extension))
+            })
+    })
+}
+
+fn normalize_extension(extension: &str) -> String {
+    extension
+        .trim()
+        .trim_start_matches('*')
+        .trim_start_matches('.')
+        .to_lowercase()
+}
+
+fn parse_extensions(input: &str) -> Vec<String> {
+    let mut extensions = Vec::new();
+    for extension in input
+        .split(',')
+        .map(normalize_extension)
+        .filter(|s| !s.is_empty())
+    {
+        if !extensions.iter().any(|existing| existing == &extension) {
+            extensions.push(extension);
+        }
+    }
+    extensions
+}
+
+fn expand_args(template: &[String], files: &[PathBuf], dir: &Path) -> Vec<OsString> {
+    let mut expanded = Vec::new();
+    for argument in template {
+        if argument == "{files}" {
+            expanded.extend(files.iter().map(|path| path.as_os_str().to_os_string()));
+        } else if argument == "{dir}" {
+            expanded.push(dir.as_os_str().to_os_string());
+        } else if argument.contains("{files}") {
+            for file in files {
+                let with_files = argument.replace("{files}", &file.to_string_lossy());
+                expanded.push(replace_dir(&with_files, dir));
+            }
+        } else {
+            expanded.push(replace_dir(argument, dir));
+        }
+    }
+    expanded
+}
+
+fn replace_dir(argument: &str, dir: &Path) -> OsString {
+    if argument == "{dir}" {
+        dir.as_os_str().to_os_string()
+    } else if argument.contains("{dir}") {
+        OsString::from(argument.replace("{dir}", &dir.to_string_lossy()))
+    } else {
+        OsString::from(argument)
+    }
+}
+
+fn same_executable(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+fn start_tool_launch(
+    app: &ZxrawApp,
+    tool: ExternalTool,
+    targets: Vec<PathBuf>,
+    folder: PathBuf,
+    ctx: &egui::Context,
+) {
+    let args = expand_args(&tool.args, &targets, &folder);
+    let tx = app.ops.tx.clone();
+    let repaint = ctx.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = forge_win::launch(&tool.exe, &args, Some(&folder)) {
+            let _ = tx.send(crate::actions::Event::Error(format!(
+                "Could not open in {}: {error}",
+                tool.name
+            )));
+        } else {
+            let _ = tx.send(crate::actions::Event::Toast(format!(
+                "Opened in {}",
+                tool.name
+            )));
+        }
+        repaint.request_repaint();
+    });
+}
+
+fn clear_cache_contents(root: &Path) -> io::Result<()> {
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "thumbnail cache path is not a regular directory",
+        ));
+    }
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            if fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                fs::remove_dir(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        } else if file_type.is_dir() {
+            // std::fs::remove_dir_all removes nested symlinks instead of following them.
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn disk_usage(root: &Path) -> io::Result<u64> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "thumbnail cache path is not a regular directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
+
+    fn walk(directory: &Path) -> io::Result<u64> {
+        let mut bytes = 0u64;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                bytes = bytes.saturating_add(walk(&entry.path())?);
+            } else if file_type.is_file() {
+                bytes = bytes.saturating_add(entry.metadata()?.len());
+            }
+        }
+        Ok(bytes)
+    }
+
+    walk(root)
+}
+
+fn theme_label(theme: ThemeChoice) -> &'static str {
+    match theme {
+        ThemeChoice::Dark => "Dark",
+        ThemeChoice::Light => "Light",
+        ThemeChoice::System => "System",
+    }
+}
+
+fn exclusion_kind_label(kind: ExclusionKind) -> &'static str {
+    match kind {
+        ExclusionKind::Folder => "Folder",
+        ExclusionKind::Ext => "Extension",
+        ExclusionKind::Name => "Name",
+    }
+}
+
+fn page_heading(ui: &mut egui::Ui, title: &str, description: &str) {
+    ui.heading(title);
+    ui.label(RichText::new(description).weak());
+    ui.separator();
+}
+
+/// `Cmd::OpenIn`: show the picker for the current selection. The selected files are only
+/// passed as arguments to the configured tool; they are never executed by ZXraw Explorer.
 pub fn open_in(app: &mut ZxrawApp) {
-    let _ = app;
+    let targets = app.pane().action_targets();
+    let directory = app.pane().path.clone();
+    let state = &mut app.ops.settings_ui;
+    state.picker_targets = targets;
+    state.picker_dir = directory;
+    state.picker_open = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestTree(PathBuf);
+
+    impl TestTree {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("zxraw-settings-ui-{}-{nonce}", std::process::id()));
+            fs::create_dir_all(&path).expect("create test tree");
+            Self(path)
+        }
+
+        fn file(&self, relative: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().expect("parent directory"))
+                .expect("create app directory");
+            fs::write(&path, b"fake executable").expect("write fake executable");
+            path
+        }
+    }
+
+    impl Drop for TestTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn files_expand_to_separate_unchanged_arguments() {
+        let files = [
+            PathBuf::from(r"C:\Photos\family portrait.jpg"),
+            PathBuf::from(r#"C:\Photos\quoted"name.jpg"#),
+            PathBuf::from(r"C:\Photos\-leading-dash.jpg"),
+            PathBuf::from(r"C:\Photos\café-雪.jpg"),
+        ];
+        let directory = PathBuf::from(r"C:\Photos\Current Set");
+        let args = expand_args(
+            &["--import".into(), "{files}".into(), "--from={dir}".into()],
+            &files,
+            &directory,
+        );
+
+        assert_eq!(args[0], OsString::from("--import"));
+        assert_eq!(
+            &args[1..5],
+            files
+                .iter()
+                .map(|path| path.as_os_str().to_os_string())
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        assert_eq!(
+            args[5],
+            OsString::from(format!("--from={}", directory.display()))
+        );
+    }
+
+    #[test]
+    fn extension_filter_is_case_insensitive_and_requires_all_targets_to_match() {
+        let tool = ExternalTool {
+            name: "Photos".into(),
+            exe: PathBuf::from("Photos.exe"),
+            args: vec!["{files}".into()],
+            extensions: vec![".JPG".into(), "raw".into()],
+        };
+        assert!(tool_applies(
+            &tool,
+            &[PathBuf::from("portrait.JPG"), PathBuf::from("camera.raw")]
+        ));
+        assert!(!tool_applies(
+            &tool,
+            &[PathBuf::from("portrait.jpg"), PathBuf::from("clip.mp4")]
+        ));
+        assert!(!tool_applies(&tool, &[]));
+    }
+
+    #[test]
+    fn detection_matches_versioned_install_directories_in_a_fake_tree() {
+        let tree = TestTree::new();
+        let photoshop = tree.file("Program Files/Adobe/Adobe Photoshop 2025/Photoshop.exe");
+        let blender = tree.file("Local/Blender Foundation/Blender 4.2/blender.exe");
+        let roots = InstallRoots {
+            program_files: vec![tree.0.join("Program Files")],
+            program_files_x86: Vec::new(),
+            local_programs: vec![tree.0.join("Local")],
+        };
+
+        let found = detect_apps_in(&roots);
+        let photoshop_tool = found.iter().find(|tool| tool.name == "Adobe Photoshop");
+        let blender_tool = found.iter().find(|tool| tool.name == "Blender");
+        assert_eq!(
+            photoshop_tool.map(|tool| tool.exe.as_path()),
+            Some(photoshop.as_path())
+        );
+        assert_eq!(
+            blender_tool.map(|tool| tool.exe.as_path()),
+            Some(blender.as_path())
+        );
+    }
 }
