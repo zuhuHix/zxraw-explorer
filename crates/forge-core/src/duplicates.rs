@@ -157,16 +157,26 @@ pub fn find_duplicates(
         });
     }
 
-    // Stage 2: partial hash.
+    // Stage 2: partial hash. Dominated by per-file open latency (antivirus scanning of
+    // cold files can cost ~10 ms each), so files are opened on several threads at once.
     ctx.progress.set_current("comparing file starts and ends");
     let mut by_partial: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
-    for (size, files) in by_size {
-        for p in files {
-            ctx.cancel.check()?;
-            match hashing::partial_hash(&p) {
-                Ok(h) => by_partial.entry((size, h)).or_default().push(p),
-                Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
-            }
+    let items: Vec<(u64, PathBuf)> = by_size
+        .into_iter()
+        .flat_map(|(size, files)| files.into_iter().map(move |p| (size, p)))
+        .collect();
+    let hashed = par_map(&items, io_threads(8), |(_, p)| {
+        if ctx.cancel.is_cancelled() {
+            return Err(CoreError::Cancelled);
+        }
+        hashing::partial_hash(p)
+    });
+    ctx.cancel.check()?;
+    for ((size, p), r) in items.into_iter().zip(hashed) {
+        match r {
+            Ok(h) => by_partial.entry((size, h)).or_default().push(p),
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
         }
     }
     by_partial.retain(|_, v| v.len() > 1);
@@ -180,13 +190,19 @@ pub fn find_duplicates(
         .sum();
     ctx.progress.add_total_bytes(total);
     let mut by_full: HashMap<(u64, Digest), Vec<PathBuf>> = HashMap::new();
-    for ((size, _), files) in by_partial {
-        for p in files {
-            match hashing::hash_file(&p, ctx.cancel, Some(ctx.progress)) {
-                Ok(h) => by_full.entry((size, h)).or_default().push(p),
-                Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-                Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
-            }
+    let items: Vec<(u64, PathBuf)> = by_partial
+        .into_iter()
+        .flat_map(|((size, _), files)| files.into_iter().map(move |p| (size, p)))
+        .collect();
+    // Fewer threads here: these are full reads, and too many would thrash spinning disks.
+    let hashed = par_map(&items, io_threads(4), |(_, p)| {
+        hashing::hash_file(p, ctx.cancel, Some(ctx.progress))
+    });
+    for ((size, p), r) in items.into_iter().zip(hashed) {
+        match r {
+            Ok(h) => by_full.entry((size, h)).or_default().push(p),
+            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+            Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
         }
     }
     by_full.retain(|_, v| v.len() > 1);
@@ -217,6 +233,46 @@ pub fn find_duplicates(
     report.groups = groups;
     report.errors = errors;
     Ok(report)
+}
+
+fn io_threads(max: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, max)
+}
+
+/// Map `f` over `items` on up to `threads` scoped threads; results keep input order.
+fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if items.len() < 64 || threads <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut out: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    let chunks: Vec<Vec<(usize, R)>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads.min(items.len()))
+            .map(|_| {
+                s.spawn(|| {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        local.push((i, f(item)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("duplicate scan worker panicked"))
+            .collect()
+    });
+    for (i, r) in chunks.into_iter().flatten() {
+        out[i] = Some(r);
+    }
+    out.into_iter().map(|r| r.expect("every index produced")).collect()
 }
 
 fn split_by_bytes(
@@ -422,5 +478,16 @@ mod tests {
                 r.join("full").join("e4")
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod par_tests {
+    #[test]
+    fn par_map_keeps_order_and_covers_all() {
+        let items: Vec<usize> = (0..10_000).collect();
+        let out = super::par_map(&items, 8, |x| x * 2);
+        assert_eq!(out.len(), items.len());
+        assert!(out.iter().enumerate().all(|(i, v)| *v == i * 2));
     }
 }
