@@ -134,6 +134,12 @@ pub struct IngestedFile {
     pub dest: PathBuf,
     pub size: u64,
     pub hash: Digest,
+    /// Source modification time captured when its contents were verified, in Unix ns.
+    #[serde(default)]
+    pub source_mtime_ns: Option<u64>,
+    /// Destination modification time captured when its contents were verified, in Unix ns.
+    #[serde(default)]
+    pub dest_mtime_ns: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -333,6 +339,20 @@ fn key_of(p: &Path) -> String {
     if cfg!(windows) { s.to_lowercase() } else { s }
 }
 
+fn modified_ns(md: &fs::Metadata) -> Option<u64> {
+    md.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos()
+        .try_into()
+        .ok()
+}
+
+fn same_file_stamp(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.len() == b.len() && modified_ns(a) == modified_ns(b)
+}
+
 /// Build a previewable plan. Reads source metadata and hashes only where a same-size file
 /// already exists at a candidate destination. Writes nothing.
 pub fn plan_ingest(
@@ -514,7 +534,7 @@ pub fn execute_ingest(plan: &IngestPlan, ctx: &JobCtx<'_>) -> Result<IngestRepor
         }
         ctx.progress.add_items(1);
         ctx.progress.set_current(item.source.display().to_string());
-        let src_md = match fs::metadata(&item.source) {
+        let src_md = match fs::symlink_metadata(&item.source) {
             Ok(m) => m,
             Err(_) => {
                 report.missing.push(item.source.clone());
@@ -526,20 +546,74 @@ pub fn execute_ingest(plan: &IngestPlan, ctx: &JobCtx<'_>) -> Result<IngestRepor
                 continue;
             }
         };
+        if node_kind(&src_md) != NodeKind::File {
+            report.failed.push(OpIssue::new(
+                &item.source,
+                "source is no longer a regular file",
+            ));
+            ctx.progress.add_error();
+            continue;
+        }
         if item.status == IngestStatus::AlreadyImported {
-            match (item.source_hash, fs::metadata(&item.dest)) {
-                (Some(h), Ok(dm)) if dm.len() == item.size && src_md.len() == item.size => {
-                    report.already_present.push(IngestedFile {
-                        source: item.source.clone(),
-                        dest: item.dest.clone(),
-                        size: item.size,
-                        hash: h,
+            let verified = (|| -> Result<IngestedFile> {
+                let dest_before =
+                    fs::symlink_metadata(&item.dest).map_err(|e| CoreError::io(&item.dest, e))?;
+                if node_kind(&dest_before) != NodeKind::File
+                    || src_md.len() != item.size
+                    || dest_before.len() != item.size
+                {
+                    return Err(CoreError::Invalid(
+                        "source or destination changed since planning".into(),
+                    ));
+                }
+
+                // Planning only identified the candidate. Re-read both current files before
+                // accounting for an already-imported item.
+                let source_hash = hashing::hash_file(&item.source, ctx.cancel, Some(ctx.progress))?;
+                let dest_hash = hashing::hash_file(&item.dest, ctx.cancel, Some(ctx.progress))?;
+                if source_hash != dest_hash {
+                    return Err(CoreError::VerifyFailed {
+                        path: item.dest.clone(),
+                        detail: "source and existing destination have different BLAKE3 hashes"
+                            .into(),
                     });
                 }
-                _ => report.failed.push(OpIssue::new(
-                    &item.source,
-                    "destination changed since planning; re-plan the ingest",
-                )),
+
+                let source_after = fs::symlink_metadata(&item.source)
+                    .map_err(|e| CoreError::io(&item.source, e))?;
+                let dest_after =
+                    fs::symlink_metadata(&item.dest).map_err(|e| CoreError::io(&item.dest, e))?;
+                if node_kind(&source_after) != NodeKind::File
+                    || node_kind(&dest_after) != NodeKind::File
+                    || !same_file_stamp(&src_md, &source_after)
+                    || !same_file_stamp(&dest_before, &dest_after)
+                {
+                    return Err(CoreError::Invalid(
+                        "source or destination changed while verifying".into(),
+                    ));
+                }
+
+                Ok(IngestedFile {
+                    source: item.source.clone(),
+                    dest: item.dest.clone(),
+                    size: item.size,
+                    hash: source_hash,
+                    source_mtime_ns: modified_ns(&source_after),
+                    dest_mtime_ns: modified_ns(&dest_after),
+                })
+            })();
+            match verified {
+                Ok(file) => report.already_present.push(file),
+                Err(CoreError::Cancelled) => {
+                    report.cancelled = true;
+                    break;
+                }
+                Err(e) => {
+                    report
+                        .failed
+                        .push(OpIssue::new(&item.source, e.to_string()));
+                    ctx.progress.add_error();
+                }
             }
             continue;
         }
@@ -561,12 +635,71 @@ pub fn execute_ingest(plan: &IngestPlan, ctx: &JobCtx<'_>) -> Result<IngestRepor
         };
         match ops::copy_file_atomic(&item.source, &item.dest, opts, ctx) {
             Ok(out) => {
+                let Some(hash) = out.source_hash else {
+                    report.failed.push(OpIssue::new(
+                        &item.source,
+                        "verified copy did not return a content hash",
+                    ));
+                    ctx.progress.add_error();
+                    continue;
+                };
+                let source_after = match fs::symlink_metadata(&item.source) {
+                    Ok(md) if node_kind(&md) == NodeKind::File => md,
+                    Ok(_) => {
+                        report.failed.push(OpIssue::new(
+                            &item.source,
+                            "source changed type while it was copied",
+                        ));
+                        ctx.progress.add_error();
+                        continue;
+                    }
+                    Err(e) => {
+                        report.failed.push(OpIssue::new(
+                            &item.source,
+                            CoreError::io(&item.source, e).to_string(),
+                        ));
+                        ctx.progress.add_error();
+                        continue;
+                    }
+                };
+                let dest_after = match fs::symlink_metadata(&item.dest) {
+                    Ok(md) if node_kind(&md) == NodeKind::File => md,
+                    Ok(_) => {
+                        report.failed.push(OpIssue::new(
+                            &item.source,
+                            "destination changed type after the copy",
+                        ));
+                        ctx.progress.add_error();
+                        continue;
+                    }
+                    Err(e) => {
+                        report.failed.push(OpIssue::new(
+                            &item.source,
+                            CoreError::io(&item.dest, e).to_string(),
+                        ));
+                        ctx.progress.add_error();
+                        continue;
+                    }
+                };
+                if !same_file_stamp(&src_md, &source_after)
+                    || source_after.len() != out.bytes
+                    || dest_after.len() != out.bytes
+                {
+                    report.failed.push(OpIssue::new(
+                        &item.source,
+                        "source or destination changed while it was copied",
+                    ));
+                    ctx.progress.add_error();
+                    continue;
+                }
                 report.bytes += out.bytes;
                 report.verified.push(IngestedFile {
                     source: item.source.clone(),
                     dest: item.dest.clone(),
                     size: out.bytes,
-                    hash: out.source_hash.expect("hash requested"),
+                    hash,
+                    source_mtime_ns: modified_ns(&source_after),
+                    dest_mtime_ns: modified_ns(&dest_after),
                 });
             }
             Err(CoreError::Cancelled) => {
@@ -640,13 +773,13 @@ pub struct FormatCheck {
 }
 
 /// Is every file under `source_roots` (system clutter excluded) backed by a verified
-/// destination from one of `reports`, and does that destination still exist with the right
-/// size? With `deep`, both the source and destination are re-hashed and compared with the
-/// recorded hash (slow, but proves the copy is intact right now).
+/// destination from one of `reports`, and are both files still unchanged? Every check
+/// re-reads and hashes the source and destination, even when `deep` is false. The boolean
+/// remains for API compatibility; a size-only result is never reported as safe.
 pub fn safe_to_format(
     source_roots: &[PathBuf],
     reports: &[&IngestReport],
-    deep: bool,
+    _deep: bool,
     ctx: &JobCtx<'_>,
 ) -> Result<FormatCheck> {
     let mut known: HashMap<String, &IngestedFile> = HashMap::new();
@@ -668,18 +801,42 @@ pub fn safe_to_format(
             check.unverified.push(OpIssue::new(&src, "not imported"));
             continue;
         };
-        if f.size != size {
+        let source_md = match fs::symlink_metadata(&src) {
+            Ok(md) if node_kind(&md) == NodeKind::File => md,
+            Ok(_) => {
+                check
+                    .unverified
+                    .push(OpIssue::new(&src, "source is no longer a regular file"));
+                continue;
+            }
+            Err(e) => {
+                check
+                    .unverified
+                    .push(OpIssue::new(&src, CoreError::io(&src, e).to_string()));
+                continue;
+            }
+        };
+        if f.size != size || source_md.len() != f.size {
             check
                 .unverified
                 .push(OpIssue::new(&src, "source changed since it was imported"));
             continue;
         }
-        match fs::metadata(&f.dest) {
-            Ok(m) if m.len() == f.size => {}
+        let source_mtime = modified_ns(&source_md);
+        if f.source_mtime_ns.is_none() || source_mtime != f.source_mtime_ns {
+            check.unverified.push(OpIssue::new(
+                &src,
+                "source modification time changed or was unavailable",
+            ));
+            continue;
+        }
+        let dest_md = match fs::symlink_metadata(&f.dest) {
+            Ok(md) if node_kind(&md) == NodeKind::File => md,
             Ok(_) => {
-                check
-                    .unverified
-                    .push(OpIssue::new(&src, "destination size differs"));
+                check.unverified.push(OpIssue::new(
+                    &src,
+                    "destination is no longer a regular file",
+                ));
                 continue;
             }
             Err(_) => {
@@ -688,24 +845,67 @@ pub fn safe_to_format(
                     .push(OpIssue::new(&src, "destination file is missing"));
                 continue;
             }
+        };
+        if dest_md.len() != f.size {
+            check
+                .unverified
+                .push(OpIssue::new(&src, "destination size differs"));
+            continue;
         }
-        if deep {
-            for (which, p) in [("source", &src), ("destination", &f.dest)] {
-                match hashing::hash_file(p, ctx.cancel, Some(ctx.progress)) {
-                    Ok(h) if h == f.hash => {}
-                    Ok(_) => {
-                        check
-                            .unverified
-                            .push(OpIssue::new(&src, format!("{which} content changed")));
-                        break;
-                    }
-                    Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-                    Err(e) => {
-                        check.unverified.push(OpIssue::new(&src, e.to_string()));
-                        break;
-                    }
+        let dest_mtime = modified_ns(&dest_md);
+        if f.dest_mtime_ns.is_none() || dest_mtime != f.dest_mtime_ns {
+            check.unverified.push(OpIssue::new(
+                &src,
+                "destination modification time changed or was unavailable",
+            ));
+            continue;
+        }
+
+        let mut hashes_match = true;
+        for (which, p) in [("source", &src), ("destination", &f.dest)] {
+            match hashing::hash_file(p, ctx.cancel, Some(ctx.progress)) {
+                Ok(h) if h == f.hash => {}
+                Ok(_) => {
+                    check
+                        .unverified
+                        .push(OpIssue::new(&src, format!("{which} content changed")));
+                    hashes_match = false;
+                    break;
+                }
+                Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                Err(e) => {
+                    check.unverified.push(OpIssue::new(&src, e.to_string()));
+                    hashes_match = false;
+                    break;
                 }
             }
+        }
+        if !hashes_match {
+            continue;
+        }
+
+        // Detect changes during the two hash reads as well as changes made since the
+        // report's verification timestamps were captured.
+        let source_after = fs::symlink_metadata(&src).ok();
+        let dest_after = fs::symlink_metadata(&f.dest).ok();
+        if !source_after.as_ref().is_some_and(|md| {
+            node_kind(md) == NodeKind::File
+                && same_file_stamp(&source_md, md)
+                && modified_ns(md) == f.source_mtime_ns
+        }) {
+            check
+                .unverified
+                .push(OpIssue::new(&src, "source changed while it was checked"));
+        }
+        if !dest_after.as_ref().is_some_and(|md| {
+            node_kind(md) == NodeKind::File
+                && same_file_stamp(&dest_md, md)
+                && modified_ns(md) == f.dest_mtime_ns
+        }) {
+            check.unverified.push(OpIssue::new(
+                &src,
+                "destination changed while it was checked",
+            ));
         }
     }
     check.safe = check.unverified.is_empty();
@@ -861,6 +1061,103 @@ mod tests {
             .unwrap();
         assert_eq!(it.status, IngestStatus::Renamed);
         assert!(it.dest.ends_with("IMG_0002 (2).CR3"));
+    }
+
+    #[test]
+    fn already_imported_execution_rejects_same_size_destination_changes() {
+        let c = card();
+        let source = c.card.join("DCIM/100CANON/IMG_0001.CR3");
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let spec = IngestSpec {
+            folder_template: String::new(),
+            write_manifest: false,
+            ..IngestSpec::new(vec![source.clone()], c.dest.clone())
+        };
+
+        let first = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        execute_ingest(&first, &ctx).unwrap();
+        let existing = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        assert_eq!(existing.items[0].status, IngestStatus::AlreadyImported);
+
+        // Keep the size unchanged so the old size-only execution check accepts it.
+        fs::write(&existing.items[0].dest, b"bad-one").unwrap();
+        let report = execute_ingest(&existing, &ctx).unwrap();
+        assert!(report.already_present.is_empty(), "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn shallow_format_check_rehashes_content_changed_after_report() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let c = card();
+        let source = c.card.join("DCIM/100CANON/IMG_0001.CR3");
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let spec = IngestSpec {
+            folder_template: String::new(),
+            write_manifest: false,
+            ..IngestSpec::new(vec![source.clone()], c.dest.clone())
+        };
+        let plan = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        let report = execute_ingest(&plan, &ctx).unwrap();
+        let dest = report.verified[0].dest.clone();
+        let source_mtime =
+            UNIX_EPOCH + Duration::from_nanos(report.verified[0].source_mtime_ns.unwrap());
+        let dest_mtime =
+            UNIX_EPOCH + Duration::from_nanos(report.verified[0].dest_mtime_ns.unwrap());
+
+        // Both sides still have the same size and each other, but no longer match the
+        // content hash recorded by the verified copy. Restore both mtimes to isolate the
+        // hash check from the separate modification-time check.
+        fs::write(&source, b"new-one").unwrap();
+        fs::write(&dest, b"new-one").unwrap();
+        for (path, modified) in [(&source, source_mtime), (&dest, dest_mtime)] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        }
+        assert_eq!(
+            modified_ns(&fs::symlink_metadata(&source).unwrap()),
+            report.verified[0].source_mtime_ns
+        );
+        assert_eq!(
+            modified_ns(&fs::symlink_metadata(&dest).unwrap()),
+            report.verified[0].dest_mtime_ns
+        );
+        let check = safe_to_format(std::slice::from_ref(&source), &[&report], false, &ctx).unwrap();
+        assert!(!check.safe, "{check:?}");
+    }
+
+    #[test]
+    fn shallow_format_check_flags_source_mtime_changed_after_report() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let c = card();
+        let source = c.card.join("DCIM/100CANON/IMG_0001.CR3");
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let spec = IngestSpec {
+            folder_template: String::new(),
+            write_manifest: false,
+            ..IngestSpec::new(vec![source.clone()], c.dest.clone())
+        };
+        let plan = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        let report = execute_ingest(&plan, &ctx).unwrap();
+        let future = UNIX_EPOCH + Duration::from_secs(1_900_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(future))
+            .unwrap();
+
+        let check = safe_to_format(std::slice::from_ref(&source), &[&report], false, &ctx).unwrap();
+        assert!(!check.safe, "{check:?}");
     }
 
     #[test]

@@ -16,8 +16,8 @@ pub fn recycle(paths: &[PathBuf]) -> Result<()> {
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
     use windows::Win32::UI::Shell::{
         FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
-        FOFX_RECYCLEONDELETE,
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+        FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IShellItem,
+        SHCreateItemFromParsingName,
     };
     use windows::core::PCWSTR;
 

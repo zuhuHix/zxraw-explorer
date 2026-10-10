@@ -99,6 +99,10 @@ pub struct Indexer<'a> {
     progress: Arc<Progress>,
     volume_resolver: Option<VolumeResolver<'a>>,
     on_batch: Option<BatchHook<'a>>,
+    #[cfg(test)]
+    fail_read_dirs: HashSet<PathBuf>,
+    #[cfg(test)]
+    fail_metadata_paths: HashSet<PathBuf>,
 }
 
 impl<'a> Indexer<'a> {
@@ -110,6 +114,10 @@ impl<'a> Indexer<'a> {
             progress: Progress::new(),
             volume_resolver: None,
             on_batch: None,
+            #[cfg(test)]
+            fail_read_dirs: HashSet::new(),
+            #[cfg(test)]
+            fail_metadata_paths: HashSet::new(),
         }
     }
 
@@ -143,6 +151,62 @@ impl<'a> Indexer<'a> {
 
     pub fn progress_handle(&self) -> Arc<Progress> {
         self.progress.clone()
+    }
+
+    #[cfg(test)]
+    fn fail_read_dir_for_test(mut self, path: &Path) -> Self {
+        self.fail_read_dirs.insert(path.to_path_buf());
+        self
+    }
+
+    #[cfg(test)]
+    fn fail_metadata_for_test(mut self, path: &Path) -> Self {
+        self.fail_metadata_paths.insert(path.to_path_buf());
+        self
+    }
+
+    fn read_dir(&self, dir: &Path) -> std::io::Result<fs::ReadDir> {
+        #[cfg(test)]
+        if self.fail_read_dirs.contains(dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected read_dir failure",
+            ));
+        }
+        fs::read_dir(dir)
+    }
+
+    fn entry_metadata(&self, entry: &fs::DirEntry, _path: &Path) -> std::io::Result<fs::Metadata> {
+        #[cfg(test)]
+        if self.fail_metadata_paths.contains(_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected metadata failure",
+            ));
+        }
+        entry.metadata()
+    }
+
+    /// Mark rows under an entry as observed despite an enumeration error. When the entry's
+    /// own metadata failed, include its row too because it may be an unreadable directory.
+    fn mark_entries_seen(&self, path: &Path, scan_id: i64, include_self: bool) -> Result<()> {
+        let path_s = path_str(path);
+        let (lo, hi) = subtree_bounds(&path_s);
+        self.db.with_conn(|c| {
+            if include_self {
+                c.execute(
+                    "UPDATE files SET seen_scan = ?4
+                     WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+                    params![path_s, lo, hi, scan_id],
+                )?;
+            } else {
+                c.execute(
+                    "UPDATE files SET seen_scan = ?3 WHERE path >= ?1 AND path < ?2",
+                    params![lo, hi, scan_id],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     fn volume_for(&self, path: &Path) -> Result<VolumeId> {
@@ -285,7 +349,7 @@ impl<'a> Indexer<'a> {
                 return Ok(report);
             }
             self.progress.set_current(path_str(&dir));
-            let rd = match fs::read_dir(&dir) {
+            let rd = match self.read_dir(&dir) {
                 Ok(rd) => rd,
                 Err(e) => {
                     report.errors += 1;
@@ -294,15 +358,7 @@ impl<'a> Indexer<'a> {
                     tracing::debug!("index: cannot list {}: {e}", dir.display());
                     // Keep what we knew about this folder's contents: refresh their
                     // scan id so the end-of-pass sweep does not mark them missing.
-                    let d = path_str(&dir);
-                    self.db.with_conn(|c| {
-                        let (lo, hi) = subtree_bounds(&d);
-                        c.execute(
-                            "UPDATE files SET seen_scan = ?3 WHERE path >= ?1 AND path < ?2",
-                            params![lo, hi, scan_id],
-                        )?;
-                        Ok(())
-                    })?;
+                    self.mark_entries_seen(&dir, scan_id, false)?;
                     continue;
                 }
             };
@@ -336,6 +392,9 @@ impl<'a> Indexer<'a> {
                         report.errors += 1;
                         self.progress.add_error();
                         last_error = Some(format!("{}: {e}", dir.display()));
+                        // An iterator error has no usable entry path. Preserve this whole
+                        // directory's known contents because enumeration was incomplete.
+                        self.mark_entries_seen(&dir, scan_id, false)?;
                         continue;
                     }
                 };
@@ -344,12 +403,15 @@ impl<'a> Indexer<'a> {
                 if exclusions.excludes_name(&name_lc) {
                     continue;
                 }
-                let md = match de.metadata() {
+                let md = match self.entry_metadata(&de, &path) {
                     Ok(md) => md,
                     Err(e) => {
                         report.errors += 1;
                         self.progress.add_error();
                         last_error = Some(format!("{}: {e}", path.display()));
+                        // The row may represent a file or an unreadable directory; preserve
+                        // its previous metadata and any descendants during the sweep.
+                        self.mark_entries_seen(&path, scan_id, true)?;
                         continue;
                     }
                 };
@@ -500,16 +562,20 @@ impl<'a> Indexer<'a> {
         };
         let exclusions = self.db.exclusions()?;
         let mut rows = vec![new_file(&dir_path, EntryKind::Dir, &md)];
-        let rd = fs::read_dir(&dir_path).map_err(|e| DbError::io(&dir_path, e))?;
+        let rd = self
+            .read_dir(&dir_path)
+            .map_err(|e| DbError::io(&dir_path, e))?;
         for de in rd {
             self.cancel.check()?;
-            let Ok(de) = de else { continue };
+            let de = de.map_err(|e| DbError::io(&dir_path, e))?;
             let path = de.path();
             let name_lc = de.file_name().to_string_lossy().to_lowercase();
             if exclusions.excludes_name(&name_lc) {
                 continue;
             }
-            let Ok(md) = de.metadata() else { continue };
+            let md = self
+                .entry_metadata(&de, &path)
+                .map_err(|e| DbError::io(&path, e))?;
             let kind = kind_of(&md);
             let excluded = match kind {
                 EntryKind::Dir => exclusions.excludes_folder(&path_str(&path).to_lowercase()),
@@ -619,4 +685,65 @@ fn is_reparse_point(md: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_reparse_point(_md: &fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed_tree() -> (tempfile::TempDir, Db, i64, PathBuf, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let dir = root.join("sub");
+        let file = dir.join("keep.jpg");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, b"present").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let root_id = db.add_index_root(&root).unwrap();
+        let initial = Indexer::new(&db).index_root(root_id).unwrap();
+        assert_eq!(initial.marked_missing, 0);
+        (tmp, db, root_id, root, dir, file)
+    }
+
+    #[test]
+    fn metadata_error_does_not_mark_existing_file_missing_in_full_scan() {
+        let (_tmp, db, root_id, _root, _dir, file) = indexed_tree();
+
+        let report = Indexer::new(&db)
+            .fail_metadata_for_test(&file)
+            .index_root(root_id)
+            .unwrap();
+
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.marked_missing, 0);
+        assert!(db.file_by_path(&file).unwrap().unwrap().present);
+    }
+
+    #[test]
+    fn metadata_error_does_not_mark_existing_file_missing_in_reconcile() {
+        let (_tmp, db, _root_id, _root, dir, file) = indexed_tree();
+
+        let result = Indexer::new(&db)
+            .fail_metadata_for_test(&file)
+            .reconcile_dir(&dir);
+
+        assert!(result.is_err());
+        assert!(db.file_by_path(&file).unwrap().unwrap().present);
+    }
+
+    #[test]
+    fn unreadable_directory_preserves_its_existing_subtree() {
+        let (_tmp, db, root_id, _root, dir, file) = indexed_tree();
+
+        let report = Indexer::new(&db)
+            .fail_read_dir_for_test(&dir)
+            .index_root(root_id)
+            .unwrap();
+
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.marked_missing, 0);
+        assert!(db.file_by_path(&dir).unwrap().unwrap().present);
+        assert!(db.file_by_path(&file).unwrap().unwrap().present);
+    }
 }

@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+mod clipboard;
 pub mod drives;
 pub mod files;
 pub mod process;
@@ -22,6 +23,9 @@ pub mod restart;
 pub mod shell;
 pub mod watch;
 
+pub use clipboard::{
+    ClipboardEffect, clear_if_owned_files, clipboard_sequence, get_files, set_files,
+};
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use files::{hard_link_count, is_removable, set_attributes, volume_serial};
 pub use process::launch;
