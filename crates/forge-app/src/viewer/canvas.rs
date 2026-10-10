@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Painter, Pos2, Rect, Sense, Stroke,
-    Ui, Vec2, pos2, vec2,
+    Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Painter, Pos2, Rect, Sense, Stroke, Ui,
+    Vec2, pos2, vec2,
 };
 
 use super::cull::{self, AnnotationStore};
@@ -26,9 +26,7 @@ impl Viewer {
         let ph = vec2(ph[0] as f32, ph[1] as f32);
         // Use EXIF dimensions when they agree with the placeholder's aspect ratio, so the
         // zoom level doesn't jump when the screen preview replaces the placeholder.
-        if !video
-            && let Some((w, h)) = self.meta.get(item).and_then(|m| m.dims)
-        {
+        if !video && let Some((w, h)) = self.meta.get(item).and_then(|m| m.dims) {
             let (w, h) = (w as f32, h as f32);
             if w > 0.0 && h > 0.0 && ((w / h) / (ph.x / ph.y) - 1.0).abs() < 0.02 {
                 return Some(vec2(w, h));
@@ -86,7 +84,11 @@ impl Viewer {
         if let Some(nat) = self.natural_of(item) {
             if resp.hovered() {
                 let (scroll, zd, hover) = ui.input(|i| {
-                    (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos())
+                    (
+                        i.smooth_scroll_delta.y,
+                        i.zoom_delta(),
+                        i.pointer.hover_pos(),
+                    )
                 });
                 if let Some(h) = hover {
                     if (zd - 1.0).abs() > 1e-4 {
@@ -129,7 +131,13 @@ impl Viewer {
                 // Still loading.
                 let c = rect.center();
                 spinner(p, c - vec2(0.0, 14.0), 11.0);
-                p.text(c + vec2(0.0, 14.0), Align2::CENTER_TOP, &name, FontId::proportional(13.0), MUTED);
+                p.text(
+                    c + vec2(0.0, 14.0),
+                    Align2::CENTER_TOP,
+                    &name,
+                    FontId::proportional(13.0),
+                    MUTED,
+                );
                 p.ctx().request_repaint_after(Duration::from_millis(30));
                 return;
             }
@@ -161,15 +169,43 @@ impl Viewer {
         let body_g = p.layout(body, FontId::proportional(12.5), MUTED, w - 40.0);
         let h = 110.0 + body_g.size().y;
         let card = Rect::from_center_size(rect.center(), vec2(w, h)).intersect(rect.shrink(8.0));
-        p.rect(card, CornerRadius::same(10), BAR_BG, Stroke::new(1.0, BAR_BORDER), egui::StrokeKind::Inside);
+        p.rect(
+            card,
+            CornerRadius::same(10),
+            BAR_BG,
+            Stroke::new(1.0, BAR_BORDER),
+            egui::StrokeKind::Inside,
+        );
         let mut y = card.top() + 18.0;
-        p.text(pos2(card.center().x, y), Align2::CENTER_TOP, icon, FontId::proportional(26.0), icon_col);
+        p.text(
+            pos2(card.center().x, y),
+            Align2::CENTER_TOP,
+            icon,
+            FontId::proportional(26.0),
+            icon_col,
+        );
         y += 36.0;
-        p.text(pos2(card.center().x, y), Align2::CENTER_TOP, title, FontId::proportional(15.0), TEXT);
+        p.text(
+            pos2(card.center().x, y),
+            Align2::CENTER_TOP,
+            title,
+            FontId::proportional(15.0),
+            TEXT,
+        );
         y += 24.0;
-        p.text(pos2(card.center().x, y), Align2::CENTER_TOP, &name, FontId::proportional(12.0), style::FAINT.gamma_multiply(1.5));
+        p.text(
+            pos2(card.center().x, y),
+            Align2::CENTER_TOP,
+            &name,
+            FontId::proportional(12.0),
+            style::FAINT.gamma_multiply(1.5),
+        );
         y += 20.0;
-        p.galley(pos2(card.center().x - body_g.size().x / 2.0, y), body_g, MUTED);
+        p.galley(
+            pos2(card.center().x - body_g.size().x / 2.0, y),
+            body_g,
+            MUTED,
+        );
     }
 
     /// Small pills on the canvas: video, burst, loading, sharpness.
@@ -177,44 +213,94 @@ impl Viewer {
         let inner = rect.shrink(12.0);
         let mut tl = inner.left_top();
         let is_video = self.loader.placeholder_size(item).is_some_and(|(_, v)| v)
-            || self.loader.natural(item).is_some() && self.meta.get(item).is_some_and(|m| m.is_video);
+            || self.loader.natural(item).is_some()
+                && self.meta.get(item).is_some_and(|m| m.is_video);
         if is_video {
-            let r = style::pill(p, tl, Align2::LEFT_TOP, "▶ Video · representative frame", TEXT, OVERLAY_BG, 12.0);
+            let r = style::pill(
+                p,
+                tl,
+                Align2::LEFT_TOP,
+                "▶ Video · representative frame",
+                TEXT,
+                OVERLAY_BG,
+                12.0,
+            );
             tl.y = r.bottom() + 6.0;
         }
         if let Some(e) = self.loader.error((item, Level::Screen))
             && self.loader.natural(item).is_none()
         {
             let msg = match e {
-                DecodeError::Failed(m) | DecodeError::Unsupported(m) => format!("Full preview unavailable: {m}"),
+                DecodeError::Failed(m) | DecodeError::Unsupported(m) => {
+                    format!("Full preview unavailable: {m}")
+                }
                 _ => "Full preview unavailable".into(),
             };
-            style::pill(p, tl, Align2::LEFT_TOP, &msg, style::REJECT, OVERLAY_BG, 12.0);
+            style::pill(
+                p,
+                tl,
+                Align2::LEFT_TOP,
+                &msg,
+                style::REJECT,
+                OVERLAY_BG,
+                12.0,
+            );
         }
         let mut tr = inner.right_top();
         // Single/cull show the burst chip in the header; compare labels each panel.
         if self.mode == ViewerMode::Compare
             && let Some(Some((pos, len))) = self.bursts.get(item)
         {
-            let r = style::pill(p, tr, Align2::RIGHT_TOP, &format!("Burst {pos}/{len}"), TEXT, ACCENT.gamma_multiply(0.55), 12.0);
+            let r = style::pill(
+                p,
+                tr,
+                Align2::RIGHT_TOP,
+                &format!("Burst {pos}/{len}"),
+                TEXT,
+                ACCENT.gamma_multiply(0.55),
+                12.0,
+            );
             tr.y = r.bottom() + 6.0;
         }
         let loading = [Level::Screen, Level::Full, Level::Quick]
             .iter()
             .any(|&l| self.loader.loading((item, l)));
         if loading {
-            let r = style::pill(p, tr, Align2::RIGHT_TOP, "      Loading", MUTED, OVERLAY_BG, 12.0);
+            let r = style::pill(
+                p,
+                tr,
+                Align2::RIGHT_TOP,
+                "      Loading",
+                MUTED,
+                OVERLAY_BG,
+                12.0,
+            );
             spinner(p, pos2(r.left() + 12.0, r.center().y), 5.0);
             p.ctx().request_repaint_after(Duration::from_millis(30));
         }
         if self.show_sharpness {
             let text = match self.loader.sharpness(item) {
                 Some(s) => format!("Sharpness ≈ {:.2} · estimate", s.score),
-                None if self.loader.natural(item).is_some() && self.meta.get(item).is_some_and(|m| m.is_video) => "Sharpness: n/a for video".into(),
+                None if self.loader.natural(item).is_some()
+                    && self.meta.get(item).is_some_and(|m| m.is_video) =>
+                {
+                    "Sharpness: n/a for video".into()
+                }
                 None => "Sharpness: estimating…".into(),
             };
-            let col = self.loader.sharpness(item).map_or(MUTED, |s| sharp_color(s.score));
-            let r = style::pill(p, inner.right_bottom(), Align2::RIGHT_BOTTOM, &format!("   {text}"), TEXT, OVERLAY_BG, 12.0);
+            let col = self
+                .loader
+                .sharpness(item)
+                .map_or(MUTED, |s| sharp_color(s.score));
+            let r = style::pill(
+                p,
+                inner.right_bottom(),
+                Align2::RIGHT_BOTTOM,
+                &format!("   {text}"),
+                TEXT,
+                OVERLAY_BG,
+                12.0,
+            );
             p.circle_filled(pos2(r.left() + 9.0, r.center().y), 3.5, col);
         }
     }
@@ -223,12 +309,27 @@ impl Viewer {
     // Single / cull
     // -----------------------------------------------------------------------
 
-    pub(super) fn single_canvas(&mut self, ui: &mut Ui, rect: Rect, store: &mut dyn AnnotationStore) {
+    pub(super) fn single_canvas(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        store: &mut dyn AnnotationStore,
+    ) {
         self.panel_rects = vec![rect];
         if self.items.is_empty() || self.visible.is_empty() {
             let p = ui.painter_at(rect);
-            let msg = if self.items.is_empty() { "No photos to show" } else { "No photos match this filter" };
-            p.text(rect.center(), Align2::CENTER_CENTER, msg, FontId::proportional(15.0), MUTED);
+            let msg = if self.items.is_empty() {
+                "No photos to show"
+            } else {
+                "No photos match this filter"
+            };
+            p.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                msg,
+                FontId::proportional(15.0),
+                MUTED,
+            );
             return;
         }
         let item = self.cur;
@@ -251,7 +352,10 @@ impl Viewer {
         let m = self.meta.get(item);
         let nat = self.loader.natural(item);
         if let Some([w, h]) = nat.or_else(|| m.and_then(|m| m.dims).map(|(w, h)| [w, h])) {
-            rows.push(("Dimensions", format!("{w} × {h}  ({:.1} MP)", w as f64 * h as f64 / 1e6)));
+            rows.push((
+                "Dimensions",
+                format!("{w} × {h}  ({:.1} MP)", w as f64 * h as f64 / 1e6),
+            ));
         }
         match m {
             None => rows.push(("", "Reading metadata…".into())),
@@ -269,7 +373,11 @@ impl Viewer {
                     rows.push(("Aperture", format!("ƒ/{}", trim_num(v))));
                 }
                 if let Some(v) = &m.shutter {
-                    let v = if v.ends_with('s') { v.clone() } else { format!("{v} s") };
+                    let v = if v.ends_with('s') {
+                        v.clone()
+                    } else {
+                        format!("{v} s")
+                    };
                     rows.push(("Shutter", v));
                 }
                 if let Some(v) = m.iso {
@@ -332,8 +440,17 @@ impl Viewer {
             h += n.size().y + 8.0;
         }
         let pad = 12.0;
-        let r = Rect::from_min_size(rect.left_top() + vec2(12.0, 12.0), vec2(kw + vw + pad * 2.0, h + pad * 2.0 - 5.0));
-        p.rect(r, CornerRadius::same(8), OVERLAY_BG, Stroke::new(1.0, BAR_BORDER), egui::StrokeKind::Inside);
+        let r = Rect::from_min_size(
+            rect.left_top() + vec2(12.0, 12.0),
+            vec2(kw + vw + pad * 2.0, h + pad * 2.0 - 5.0),
+        );
+        p.rect(
+            r,
+            CornerRadius::same(8),
+            OVERLAY_BG,
+            Stroke::new(1.0, BAR_BORDER),
+            egui::StrokeKind::Inside,
+        );
         let mut y = r.top() + pad;
         for (kg, vg) in galleys {
             let rh = vg.size().y.max(kg.size().y);
@@ -350,7 +467,12 @@ impl Viewer {
     // Compare
     // -----------------------------------------------------------------------
 
-    pub(super) fn compare_canvas(&mut self, ui: &mut Ui, rect: Rect, store: &mut dyn AnnotationStore) {
+    pub(super) fn compare_canvas(
+        &mut self,
+        ui: &mut Ui,
+        rect: Rect,
+        store: &mut dyn AnnotationStore,
+    ) {
         let n = self.compare.panels.len();
         if n == 0 {
             self.single_canvas(ui, rect, store);
@@ -381,7 +503,11 @@ impl Viewer {
         for (k, pr) in rects.into_iter().enumerate() {
             let item = self.compare.panels[k];
             let inner = pr.shrink(2.0);
-            let mut view = if self.compare.sync { self.compare.shared } else { self.compare.views[k] };
+            let mut view = if self.compare.sync {
+                self.compare.shared
+            } else {
+                self.compare.views[k]
+            };
             let resp = self.draw_item(ui, inner, item, &mut view, Id::new(("viewer_cmp", k)));
             if self.compare.sync {
                 self.compare.shared = view;
@@ -398,7 +524,11 @@ impl Viewer {
             p.rect_stroke(
                 pr.shrink(1.0),
                 CornerRadius::same(3),
-                if active { Stroke::new(2.0, ACCENT) } else { Stroke::new(1.0, BAR_BORDER) },
+                if active {
+                    Stroke::new(2.0, ACCENT)
+                } else {
+                    Stroke::new(1.0, BAR_BORDER)
+                },
                 egui::StrokeKind::Inside,
             );
             let pos = self.visible.binary_search(&item).map(|p| p + 1).ok();
@@ -406,7 +536,15 @@ impl Viewer {
                 Some(p) => format!("{}  ·  {}", p, self.file_name(item)),
                 None => self.file_name(item),
             };
-            style::pill(&p, inner.left_bottom() + vec2(10.0, -40.0), Align2::LEFT_BOTTOM, &title, if active { TEXT } else { MUTED }, OVERLAY_BG, 12.0);
+            style::pill(
+                &p,
+                inner.left_bottom() + vec2(10.0, -40.0),
+                Align2::LEFT_BOTTOM,
+                &title,
+                if active { TEXT } else { MUTED },
+                OVERLAY_BG,
+                12.0,
+            );
             cull_badge(&p, inner, store.get(self.path(item)));
         }
     }
@@ -444,17 +582,46 @@ impl Viewer {
             self.compare.split_x = ((pp.x - rect.left()) / rect.width()).clamp(0.02, 0.98);
         }
         let p = ui.painter_at(rect);
-        let col = if hr.hovered() || hr.dragged() { ACCENT } else { Color32::from_white_alpha(200) };
-        p.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], Stroke::new(2.0, col));
+        let col = if hr.hovered() || hr.dragged() {
+            ACCENT
+        } else {
+            Color32::from_white_alpha(200)
+        };
+        p.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(2.0, col),
+        );
         let c = pos2(x, rect.center().y);
         p.circle(c, 13.0, OVERLAY_BG, Stroke::new(1.5, col));
-        p.text(c, Align2::CENTER_CENTER, "◀▶", FontId::proportional(10.0), col);
+        p.text(
+            c,
+            Align2::CENTER_CENTER,
+            "◀▶",
+            FontId::proportional(10.0),
+            col,
+        );
         let inner = rect.shrink(12.0);
         let ta = format!("Before · {}", self.file_name(a));
         let tb = format!("After · {}", self.file_name(b));
         let act = self.compare.active;
-        style::pill(&p, inner.left_top(), Align2::LEFT_TOP, &ta, if act == 0 { TEXT } else { MUTED }, OVERLAY_BG, 12.0);
-        style::pill(&p, inner.right_top() + vec2(0.0, 28.0), Align2::RIGHT_TOP, &tb, if act == 1 { TEXT } else { MUTED }, OVERLAY_BG, 12.0);
+        style::pill(
+            &p,
+            inner.left_top(),
+            Align2::LEFT_TOP,
+            &ta,
+            if act == 0 { TEXT } else { MUTED },
+            OVERLAY_BG,
+            12.0,
+        );
+        style::pill(
+            &p,
+            inner.right_top() + vec2(0.0, 28.0),
+            Align2::RIGHT_TOP,
+            &tb,
+            if act == 1 { TEXT } else { MUTED },
+            OVERLAY_BG,
+            12.0,
+        );
         let left_half = Rect::from_min_max(rect.min, pos2(x, rect.max.y));
         cull_badge(&ui.painter_at(left_half), rect, store.get(self.path(a)));
         let pr = ui.painter_at(right);
@@ -483,7 +650,9 @@ impl Viewer {
         let one = 1.0 / self.loader_ppp();
         let anchor = hover.filter(|h| rect.contains(*h)).unwrap_or(rect.center());
         let view = match self.mode {
-            ViewerMode::Compare if self.compare.sync || self.compare.split => &mut self.compare.shared,
+            ViewerMode::Compare if self.compare.sync || self.compare.split => {
+                &mut self.compare.shared
+            }
             ViewerMode::Compare => &mut self.compare.views[self.compare.active],
             _ => &mut self.view,
         };
@@ -504,14 +673,21 @@ impl Viewer {
                 } else {
                     *self.compare.views.get(a)?
                 };
-                (*self.compare.panels.get(a)?, self.panel_rects.get(a)?.shrink(2.0), v)
+                (
+                    *self.compare.panels.get(a)?,
+                    self.panel_rects.get(a)?.shrink(2.0),
+                    v,
+                )
             }
             _ if self.items.is_empty() => return None,
             _ => (self.cur, self.last_canvas, self.view),
         };
         let nat = self.natural_of(item)?;
         let one = 1.0 / self.loader_ppp();
-        Some((view.percent(nat, rect, one), matches!(view.zoom, super::Zoom::Fit)))
+        Some((
+            view.percent(nat, rect, one),
+            matches!(view.zoom, super::Zoom::Fit),
+        ))
     }
 
     fn loader_ppp(&self) -> f32 {
@@ -559,11 +735,21 @@ fn sharp_color(score: f32) -> Color32 {
 
 /// Large rating/pick/label badge in the bottom-left of a canvas (cull & compare).
 fn cull_badge(p: &Painter, rect: Rect, a: cull::Annotation) {
-    cull_badge_at(p, rect.left_bottom() + vec2(12.0, -12.0), Align2::LEFT_BOTTOM, a);
+    cull_badge_at(
+        p,
+        rect.left_bottom() + vec2(12.0, -12.0),
+        Align2::LEFT_BOTTOM,
+        a,
+    );
 }
 
 fn cull_badge_right(p: &Painter, rect: Rect, a: cull::Annotation) {
-    cull_badge_at(p, rect.right_bottom() + vec2(-12.0, -12.0), Align2::RIGHT_BOTTOM, a);
+    cull_badge_at(
+        p,
+        rect.right_bottom() + vec2(-12.0, -12.0),
+        Align2::RIGHT_BOTTOM,
+        a,
+    );
 }
 
 fn cull_badge_at(p: &Painter, anchor: Pos2, align: Align2, a: cull::Annotation) {
@@ -571,16 +757,39 @@ fn cull_badge_at(p: &Painter, anchor: Pos2, align: Align2, a: cull::Annotation) 
     let mut job = LayoutJob::default();
     let f = FontId::proportional(15.0);
     let r = a.rating.min(5) as usize;
-    job.append(&"★".repeat(r), 0.0, TextFormat::simple(f.clone(), style::STAR));
-    job.append(&"★".repeat(5 - r), 0.0, TextFormat::simple(f.clone(), Color32::from_white_alpha(45)));
+    job.append(
+        &"★".repeat(r),
+        0.0,
+        TextFormat::simple(f.clone(), style::STAR),
+    );
+    job.append(
+        &"★".repeat(5 - r),
+        0.0,
+        TextFormat::simple(f.clone(), Color32::from_white_alpha(45)),
+    );
     if let Some(t) = cull::pick_text(a.pick) {
         let sym = if a.pick > 0 { "  ⚑ " } else { "  ✖ " };
-        job.append(sym, 0.0, TextFormat::simple(FontId::proportional(13.0), style::pick_color(a.pick)));
-        job.append(t, 0.0, TextFormat::simple(FontId::proportional(13.0), style::pick_color(a.pick)));
+        job.append(
+            sym,
+            0.0,
+            TextFormat::simple(FontId::proportional(13.0), style::pick_color(a.pick)),
+        );
+        job.append(
+            t,
+            0.0,
+            TextFormat::simple(FontId::proportional(13.0), style::pick_color(a.pick)),
+        );
     }
-    let label_col = a.label.and_then(|l| style::LABEL_COLORS.get(l as usize)).copied();
+    let label_col = a
+        .label
+        .and_then(|l| style::LABEL_COLORS.get(l as usize))
+        .copied();
     if label_col.is_some() {
-        job.append("      ", 0.0, TextFormat::simple(FontId::proportional(13.0), TEXT));
+        job.append(
+            "      ",
+            0.0,
+            TextFormat::simple(FontId::proportional(13.0), TEXT),
+        );
     }
     let g = p.layout_job(job);
     let pad = vec2(10.0, 5.0);
@@ -588,7 +797,12 @@ fn cull_badge_at(p: &Painter, anchor: Pos2, align: Align2, a: cull::Annotation) 
     p.rect_filled(r, CornerRadius::same(8), OVERLAY_BG);
     p.galley(r.min + pad, g, TEXT);
     if let Some(c) = label_col {
-        p.circle(pos2(r.right() - 16.0, r.center().y), 5.5, c, Stroke::new(1.0, Color32::from_black_alpha(150)));
+        p.circle(
+            pos2(r.right() - 16.0, r.center().y),
+            5.5,
+            c,
+            Stroke::new(1.0, Color32::from_black_alpha(150)),
+        );
     }
 }
 

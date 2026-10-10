@@ -715,7 +715,7 @@ impl ZxrawApp {
                     Vec::new()
                 }
                 None => match pane.view {
-                    ViewMode::Details => views::details(ui, pane, focused, id),
+                    ViewMode::Details => views::details(ui, pane, focused, id, &ops.grid_provider()),
                     ViewMode::Grid => views::grid(ui, pane, focused, id, thumb_size, &mut ops.grid_provider()),
                 },
             }

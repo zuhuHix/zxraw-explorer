@@ -43,7 +43,9 @@ impl SidebarState {
                     let changed = {
                         let mut g = d.lock();
                         let changed = g.len() != list.len()
-                            || g.iter().zip(&list).any(|(a, b)| a.root != b.root || a.available != b.available || a.free != b.free);
+                            || g.iter().zip(&list).any(|(a, b)| {
+                                a.root != b.root || a.available != b.available || a.free != b.free
+                            });
                         *g = list;
                         changed
                     };
@@ -60,13 +62,24 @@ impl SidebarState {
     }
 }
 
-fn nav_item(app: &mut ZxrawApp, ui: &mut Ui, icon: &str, label: &str, path: &PathBuf, sub: Option<String>) -> egui::Response {
+fn nav_item(
+    app: &mut ZxrawApp,
+    ui: &mut Ui,
+    icon: &str,
+    label: &str,
+    path: &PathBuf,
+    sub: Option<String>,
+) -> egui::Response {
     let current = &app.pane().path == path;
     let text = match &sub {
         Some(s) => format!("{icon}  {label}   {s}"),
         None => format!("{icon}  {label}"),
     };
-    let r = ui.add(egui::Button::selectable(current, text).frame_when_inactive(false).min_size(egui::vec2(ui.available_width(), 0.0)));
+    let r = ui.add(
+        egui::Button::selectable(current, text)
+            .frame_when_inactive(false)
+            .min_size(egui::vec2(ui.available_width(), 0.0)),
+    );
     let r = r.on_hover_text(path.to_string_lossy());
     if r.clicked() {
         app.navigate(path.clone());
@@ -84,75 +97,123 @@ fn nav_item(app: &mut ZxrawApp, ui: &mut Ui, icon: &str, label: &str, path: &Pat
 }
 
 pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        ui.add_space(4.0);
-        section(ui, "Quick access");
-        for (name, path) in app.sidebar.known.clone() {
-            nav_item(app, ui, "★", &name, &path, None);
-        }
+    let collections = app.ops.collections_ui.sidebar_collections().to_vec();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.add_space(4.0);
+            section(ui, "Quick access");
+            for (name, path) in app.sidebar.known.clone() {
+                nav_item(app, ui, "★", &name, &path, None);
+            }
 
-        if !app.settings.bookmarks.is_empty() {
+            if !app.settings.bookmarks.is_empty() {
+                ui.add_space(6.0);
+                section(ui, "Bookmarks");
+                let mut remove = None;
+                for (i, path) in app.settings.bookmarks.clone().iter().enumerate() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    let r = nav_item(app, ui, "🔖", &name, path, None);
+                    r.context_menu(|ui| {
+                        if ui.button("Remove bookmark").clicked() {
+                            remove = Some(i);
+                            ui.close();
+                        }
+                        if i > 0 && ui.button("Move up").clicked() {
+                            app.settings.bookmarks.swap(i, i - 1);
+                            ui.close();
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    app.settings.bookmarks.remove(i);
+                }
+            }
+
             ui.add_space(6.0);
-            section(ui, "Bookmarks");
-            let mut remove = None;
-            for (i, path) in app.settings.bookmarks.clone().iter().enumerate() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                let r = nav_item(app, ui, "🔖", &name, path, None);
-                r.context_menu(|ui| {
-                    if ui.button("Remove bookmark").clicked() {
-                        remove = Some(i);
-                        ui.close();
-                    }
-                    if i > 0 && ui.button("Move up").clicked() {
-                        app.settings.bookmarks.swap(i, i - 1);
-                        ui.close();
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                app.settings.bookmarks.remove(i);
-            }
-        }
-
-        ui.add_space(6.0);
-        section(ui, "Drives");
-        let drives = app.sidebar.drives.lock().clone();
-        for d in drives {
-            let label = if d.label.is_empty() {
-                format!("{} ({})", d.kind, d.root.display())
+            section(ui, "Collections");
+            if collections.is_empty() {
+                ui.label(RichText::new("No collections yet").weak());
             } else {
-                format!("{} ({})", d.label, d.root.display().to_string().trim_end_matches('\\'))
-            };
-            let icon = match d.kind {
-                "Removable" => "💾",
-                "Network" => "🖧",
-                "Optical" => "💿",
-                _ => "🖴",
-            };
-            if !d.available {
-                ui.label(RichText::new(format!("{icon}  {label}  (unavailable)")).color(theme::muted(ui)));
-                continue;
+                for collection in collections.iter().take(8) {
+                    let marker = match collection.kind {
+                        forge_db::CollectionKind::Manual => "▤",
+                        forge_db::CollectionKind::Smart => "⌕",
+                    };
+                    if ui
+                        .selectable_label(false, format!("{marker}  {}", collection.name))
+                        .clicked()
+                    {
+                        crate::collections_ui::open_collection(app, collection.id);
+                    }
+                }
+                if collections.len() > 8 {
+                    ui.label(
+                        RichText::new(format!("+ {} more", collections.len() - 8))
+                            .weak()
+                            .small(),
+                    );
+                }
             }
-            nav_item(app, ui, icon, &label, &d.root, None);
-            if d.total > 0 {
-                let used = 1.0 - d.free as f32 / d.total as f32;
-                let bar = egui::ProgressBar::new(used)
-                    .desired_height(3.0)
-                    .desired_width(ui.available_width() - 8.0)
-                    .fill(if used > 0.9 { ui.visuals().error_fg_color } else { theme::ACCENT });
-                ui.add(bar).on_hover_text(format!(
-                    "{} free of {}",
-                    forge_core::model::format_size(d.free),
-                    forge_core::model::format_size(d.total)
-                ));
+            if ui.small_button("Manage collections…").clicked() {
+                app.ops.collections_ui.open = true;
             }
-        }
-    });
+
+            ui.add_space(6.0);
+            section(ui, "Drives");
+            let drives = app.sidebar.drives.lock().clone();
+            for d in drives {
+                let label = if d.label.is_empty() {
+                    format!("{} ({})", d.kind, d.root.display())
+                } else {
+                    format!(
+                        "{} ({})",
+                        d.label,
+                        d.root.display().to_string().trim_end_matches('\\')
+                    )
+                };
+                let icon = match d.kind {
+                    "Removable" => "💾",
+                    "Network" => "🖧",
+                    "Optical" => "💿",
+                    _ => "🖴",
+                };
+                if !d.available {
+                    ui.label(
+                        RichText::new(format!("{icon}  {label}  (unavailable)"))
+                            .color(theme::muted(ui)),
+                    );
+                    continue;
+                }
+                nav_item(app, ui, icon, &label, &d.root, None);
+                if d.total > 0 {
+                    let used = 1.0 - d.free as f32 / d.total as f32;
+                    let bar = egui::ProgressBar::new(used)
+                        .desired_height(3.0)
+                        .desired_width(ui.available_width() - 8.0)
+                        .fill(if used > 0.9 {
+                            ui.visuals().error_fg_color
+                        } else {
+                            theme::ACCENT
+                        });
+                    ui.add(bar).on_hover_text(format!(
+                        "{} free of {}",
+                        forge_core::model::format_size(d.free),
+                        forge_core::model::format_size(d.total)
+                    ));
+                }
+            }
+        });
 }
 
 fn section(ui: &mut Ui, title: &str) {
-    ui.label(RichText::new(title.to_uppercase()).small().strong().color(theme::muted(ui)));
+    ui.label(
+        RichText::new(title.to_uppercase())
+            .small()
+            .strong()
+            .color(theme::muted(ui)),
+    );
 }

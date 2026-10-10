@@ -6,6 +6,7 @@ mod batch_rename;
 mod breadcrumb;
 mod collections_ui;
 mod commands;
+mod crash;
 mod extra_tools_ui;
 mod fonts;
 mod ingest_ui;
@@ -34,6 +35,35 @@ mod watcher;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 fn main() -> eframe::Result {
+    if let Some(argument) = std::env::args_os().nth(1) {
+        let register = argument == "--register-context-menu";
+        let unregister = argument == "--unregister-context-menu";
+        if register || unregister {
+            let result = if register {
+                std::env::current_exe()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exe| {
+                        forge_win::register_context_menu(exe).map_err(anyhow::Error::from)
+                    })
+            } else {
+                forge_win::unregister_context_menu().map_err(anyhow::Error::from)
+            };
+            match result {
+                Ok(()) => {
+                    println!(
+                        "Explorer context menu {}.",
+                        if register { "registered" } else { "removed" }
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    eprintln!("Could not update the Explorer context menu: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let paths = settings::Paths::resolve();
 
     // Rolling daily log file; file paths are only logged at debug level.
@@ -46,8 +76,24 @@ fn main() -> eframe::Result {
         .init();
 
     let default_hook = std::panic::take_hook();
+    let crash_dir = paths.data.join("crashes");
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("panic: {info}");
+        let message = crash::panic_message(info.payload());
+        let location = info.location().map(|location| {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        });
+        crash::write_crash_report(
+            &crash_dir,
+            &message,
+            location.as_deref(),
+            &std::backtrace::Backtrace::force_capture(),
+        );
         default_hook(info);
     }));
     tracing::info!("ZXraw Explorer {} starting", env!("CARGO_PKG_VERSION"));
@@ -57,6 +103,14 @@ fn main() -> eframe::Result {
             .with_title("ZXraw Explorer")
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([640.0, 400.0])
+            .with_icon(egui::IconData {
+                rgba: image::load_from_memory(include_bytes!("../../../assets/zxraw.png"))
+                    .expect("embedded application icon PNG must be valid")
+                    .to_rgba8()
+                    .into_raw(),
+                width: 256,
+                height: 256,
+            })
             .with_drag_and_drop(true),
         persist_window: true,
         ..Default::default()

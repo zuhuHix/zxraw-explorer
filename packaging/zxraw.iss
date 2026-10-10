@@ -1,0 +1,35 @@
+#define AppVersion "0.1.0"
+#define PayloadDir "..\dist\ZXraw-Explorer-" + AppVersion + "-x64"
+
+[Setup]
+AppId={{752ECE11-5EAF-4D3E-94A0-F91B8804168B}
+AppName=ZXraw Explorer
+AppVersion={#AppVersion}
+AppPublisher=ZXraw Explorer contributors
+DefaultDirName={localappdata}\Programs\ZXraw Explorer
+DefaultGroupName=ZXraw Explorer
+PrivilegesRequired=lowest
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+OutputDir=..\dist
+OutputBaseFilename=ZXraw-Explorer-{#AppVersion}-Setup-x64
+UninstallDisplayIcon={app}\zxraw.exe
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+DisableProgramGroupPage=yes
+
+[Tasks]
+Name: "contextmenu"; Description: "Add &Open in ZXraw Explorer to folder and drive menus"; Flags: unchecked
+
+[Files]
+Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{autoprograms}\ZXraw Explorer"; Filename: "{app}\zxraw.exe"
+
+[Run]
+Filename: "{app}\zxraw.exe"; Parameters: "--register-context-menu"; Description: "Register Explorer context menu"; Flags: runhidden postinstall skipifsilent waituntilterminated; Tasks: contextmenu
+
+[UninstallRun]
+Filename: "{app}\zxraw.exe"; Parameters: "--unregister-context-menu"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveZXrawExplorerContextMenu"

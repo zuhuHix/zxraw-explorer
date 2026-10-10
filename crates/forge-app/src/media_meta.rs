@@ -63,123 +63,170 @@ fn kv(ui: &mut Ui, k: &str, v: Option<String>) {
 }
 
 pub fn image_grid(ui: &mut Ui, m: &forge_media::ImageMetadata) {
-    egui::Grid::new("exif").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-        kv(
-            ui,
-            "Dimensions",
-            m.display_dimensions()
-                .map(|(w, h)| format!("{w} × {h}  ({:.1} MP)", (w as f64 * h as f64) / 1e6)),
-        );
-        let camera = match (&m.make, &m.model) {
-            (Some(mk), Some(md)) if md.starts_with(mk.as_str()) => Some(md.clone()),
-            (Some(mk), Some(md)) => Some(format!("{mk} {md}")),
-            (a, b) => a.clone().or(b.clone()),
-        };
-        kv(ui, "Camera", camera);
-        kv(ui, "Lens", m.lens.clone());
-        kv(
-            ui,
-            "Focal length",
-            m.focal_length_mm.map(|f| match m.focal_length_35mm {
-                Some(e) if e as f64 != f.round() => format!("{f:.0} mm  ({e} mm equiv.)"),
-                _ => format!("{f:.0} mm"),
-            }),
-        );
-        kv(ui, "Aperture", m.aperture.map(|a| format!("f/{a:.1}")));
-        kv(ui, "Shutter", m.shutter.clone().map(|s| format!("{s} s")));
-        kv(ui, "ISO", m.iso.map(|i| i.to_string()));
-        kv(
-            ui,
-            "Exposure comp.",
-            m.exposure_compensation.filter(|e| *e != 0.0).map(|e| format!("{e:+.1} EV")),
-        );
-        kv(ui, "Taken", m.date_taken.clone());
-        kv(ui, "Color space", m.color_space.clone());
-        kv(ui, "Bit depth", m.bit_depth.map(|b| format!("{b}-bit")));
-        kv(ui, "GPS", m.gps_lat.zip(m.gps_lon).map(|(a, o)| format!("{a:.5}, {o:.5}")));
-        if let Some(x) = &m.xmp {
-            kv(ui, "XMP rating", x.rating.map(|r| "★".repeat(r.clamp(0, 5) as usize)));
-            kv(ui, "XMP label", x.label.clone());
-            kv(ui, "Keywords", (!x.keywords.is_empty()).then(|| x.keywords.join(", ")));
-            kv(ui, "Title", x.title.clone());
-        }
-    });
+    egui::Grid::new("exif")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            kv(
+                ui,
+                "Dimensions",
+                m.display_dimensions()
+                    .map(|(w, h)| format!("{w} × {h}  ({:.1} MP)", (w as f64 * h as f64) / 1e6)),
+            );
+            let camera = match (&m.make, &m.model) {
+                (Some(mk), Some(md)) if md.starts_with(mk.as_str()) => Some(md.clone()),
+                (Some(mk), Some(md)) => Some(format!("{mk} {md}")),
+                (a, b) => a.clone().or(b.clone()),
+            };
+            kv(ui, "Camera", camera);
+            kv(ui, "Lens", m.lens.clone());
+            kv(
+                ui,
+                "Focal length",
+                m.focal_length_mm.map(|f| match m.focal_length_35mm {
+                    Some(e) if e as f64 != f.round() => format!("{f:.0} mm  ({e} mm equiv.)"),
+                    _ => format!("{f:.0} mm"),
+                }),
+            );
+            kv(ui, "Aperture", m.aperture.map(|a| format!("f/{a:.1}")));
+            kv(ui, "Shutter", m.shutter.clone().map(|s| format!("{s} s")));
+            kv(ui, "ISO", m.iso.map(|i| i.to_string()));
+            kv(
+                ui,
+                "Exposure comp.",
+                m.exposure_compensation
+                    .filter(|e| *e != 0.0)
+                    .map(|e| format!("{e:+.1} EV")),
+            );
+            kv(ui, "Taken", m.date_taken.clone());
+            kv(ui, "Color space", m.color_space.clone());
+            kv(ui, "Bit depth", m.bit_depth.map(|b| format!("{b}-bit")));
+            kv(
+                ui,
+                "GPS",
+                m.gps_lat
+                    .zip(m.gps_lon)
+                    .map(|(a, o)| format!("{a:.5}, {o:.5}")),
+            );
+            if let Some(x) = &m.xmp {
+                kv(
+                    ui,
+                    "XMP rating",
+                    x.rating.map(|r| "★".repeat(r.clamp(0, 5) as usize)),
+                );
+                kv(ui, "XMP label", x.label.clone());
+                kv(
+                    ui,
+                    "Keywords",
+                    (!x.keywords.is_empty()).then(|| x.keywords.join(", ")),
+                );
+                kv(ui, "Title", x.title.clone());
+            }
+        });
     if !m.exif_tags.is_empty() {
         ui.collapsing(format!("All EXIF tags ({})", m.exif_tags.len()), |ui| {
-            egui::Grid::new("alltags").num_columns(2).striped(true).show(ui, |ui| {
-                for t in &m.exif_tags {
-                    ui.label(RichText::new(&t.name).small().color(ui.visuals().weak_text_color()));
-                    ui.label(RichText::new(&t.value).small());
-                    ui.end_row();
-                }
-            });
+            egui::Grid::new("alltags")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    for t in &m.exif_tags {
+                        ui.label(
+                            RichText::new(&t.name)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        ui.label(RichText::new(&t.value).small());
+                        ui.end_row();
+                    }
+                });
         });
     }
 }
 
 pub fn video_grid(ui: &mut Ui, m: &forge_media::VideoMetadata) {
-    egui::Grid::new("vmeta").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-        kv(ui, "Duration", m.duration_s.map(format_duration));
-        kv(
-            ui,
-            "Resolution",
-            m.width.zip(m.height).map(|(w, h)| {
-                if m.rotation != 0 {
-                    format!("{w} × {h}  (rotated {}°)", m.rotation)
-                } else {
-                    format!("{w} × {h}")
-                }
-            }),
-        );
-        kv(
-            ui,
-            "Frame rate",
-            m.fps.map(|f| format!("{f:.3} fps{}", if m.vfr { "  (variable)" } else { "" })),
-        );
-        kv(
-            ui,
-            "Codec",
-            m.codec.clone().map(|c| match &m.profile {
-                Some(p) => format!("{c} ({p})"),
-                None => c,
-            }),
-        );
-        kv(ui, "Bit depth", m.bit_depth.map(|b| format!("{b}-bit")));
-        kv(ui, "Chroma", m.chroma_subsampling.clone());
-        kv(ui, "Bitrate", m.bitrate.map(|b| format!("{:.1} Mb/s", b as f64 / 1e6)));
-        kv(
-            ui,
-            "HDR",
-            m.hdr.map(|h| format!("{h:?}{}", if m.dolby_vision { " + Dolby Vision" } else { "" })),
-        );
-        kv(
-            ui,
-            "Color",
-            m.color_primaries
-                .clone()
-                .map(|p| format!("{p} / {}", m.color_transfer.clone().unwrap_or_default())),
-        );
-        kv(ui, "Timecode", m.timecode.clone());
-        kv(ui, "Recorded", m.creation_time.clone());
-        kv(
-            ui,
-            "Camera",
-            m.make.clone().map(|mk| format!("{mk} {}", m.model.clone().unwrap_or_default())),
-        );
-        kv(ui, "Container", m.container.clone());
-        for (i, a) in m.audio.iter().enumerate() {
+    egui::Grid::new("vmeta")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            kv(ui, "Duration", m.duration_s.map(format_duration));
             kv(
                 ui,
-                &format!("Audio {}", i + 1),
-                Some(format!(
-                    "{} {}ch {} Hz",
-                    a.codec.clone().unwrap_or_default(),
-                    a.channels.unwrap_or(0),
-                    a.sample_rate.unwrap_or(0)
-                )),
+                "Resolution",
+                m.width.zip(m.height).map(|(w, h)| {
+                    if m.rotation != 0 {
+                        format!("{w} × {h}  (rotated {}°)", m.rotation)
+                    } else {
+                        format!("{w} × {h}")
+                    }
+                }),
             );
-        }
-    });
+            kv(
+                ui,
+                "Frame rate",
+                m.fps
+                    .map(|f| format!("{f:.3} fps{}", if m.vfr { "  (variable)" } else { "" })),
+            );
+            kv(
+                ui,
+                "Codec",
+                m.codec.clone().map(|c| match &m.profile {
+                    Some(p) => format!("{c} ({p})"),
+                    None => c,
+                }),
+            );
+            kv(ui, "Bit depth", m.bit_depth.map(|b| format!("{b}-bit")));
+            kv(ui, "Chroma", m.chroma_subsampling.clone());
+            kv(
+                ui,
+                "Bitrate",
+                m.bitrate.map(|b| format!("{:.1} Mb/s", b as f64 / 1e6)),
+            );
+            kv(
+                ui,
+                "HDR",
+                m.hdr.map(|h| {
+                    format!(
+                        "{h:?}{}",
+                        if m.dolby_vision {
+                            " + Dolby Vision"
+                        } else {
+                            ""
+                        }
+                    )
+                }),
+            );
+            kv(
+                ui,
+                "Color",
+                m.color_primaries
+                    .clone()
+                    .map(|p| format!("{p} / {}", m.color_transfer.clone().unwrap_or_default())),
+            );
+            kv(ui, "Timecode", m.timecode.clone());
+            kv(ui, "Recorded", m.creation_time.clone());
+            kv(
+                ui,
+                "Camera",
+                m.make
+                    .clone()
+                    .map(|mk| format!("{mk} {}", m.model.clone().unwrap_or_default())),
+            );
+            kv(ui, "Container", m.container.clone());
+            for (i, a) in m.audio.iter().enumerate() {
+                kv(
+                    ui,
+                    &format!("Audio {}", i + 1),
+                    Some(format!(
+                        "{} {}ch {} Hz",
+                        a.codec.clone().unwrap_or_default(),
+                        a.channels.unwrap_or(0),
+                        a.sample_rate.unwrap_or(0)
+                    )),
+                );
+            }
+        });
 }
 
 pub fn format_duration(s: f64) -> String {

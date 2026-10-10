@@ -700,7 +700,11 @@ fn launch_action(
             });
             ("compare-folders", title, handle)
         }
-        DeferredAction::RecycleDuplicates { targets, bytes, checks } => {
+        DeferredAction::RecycleDuplicates {
+            targets,
+            bytes,
+            checks,
+        } => {
             let title = format!(
                 "Moving {} duplicate copy/copies to the Recycle Bin",
                 targets.len()
@@ -711,7 +715,8 @@ fn launch_action(
             let handle = jobs.spawn("recycle-duplicates", title.clone(), move |job| {
                 job.progress.add_total_items(targets.len() as u64);
                 job.progress.add_total_bytes(bytes);
-                job.progress.set_current("Re-verifying duplicates before removal");
+                job.progress
+                    .set_current("Re-verifying duplicates before removal");
                 let (verified, skipped) = verify_recycle(&checks, &job.cancel);
                 for line in &skipped {
                     job.log(line.clone());
@@ -1412,13 +1417,19 @@ struct RecycleCheck {
     remove: Vec<PathBuf>,
 }
 
-fn recycle_checks(groups: &[DuplicateGroup], selected: &BTreeSet<(usize, usize)>) -> Vec<RecycleCheck> {
+fn recycle_checks(
+    groups: &[DuplicateGroup],
+    selected: &BTreeSet<(usize, usize)>,
+) -> Vec<RecycleCheck> {
     groups
         .iter()
         .enumerate()
         .filter_map(|(gi, g)| {
-            let (remove, keep): (Vec<(usize, &PathBuf)>, Vec<(usize, &PathBuf)>) =
-                g.files.iter().enumerate().partition(|(fi, _)| selected.contains(&(gi, *fi)));
+            let (remove, keep): (Vec<(usize, &PathBuf)>, Vec<(usize, &PathBuf)>) = g
+                .files
+                .iter()
+                .enumerate()
+                .partition(|(fi, _)| selected.contains(&(gi, *fi)));
             (!remove.is_empty()).then(|| RecycleCheck {
                 size: g.size,
                 hash: g.hash,
@@ -1430,8 +1441,15 @@ fn recycle_checks(groups: &[DuplicateGroup], selected: &BTreeSet<(usize, usize)>
 }
 
 /// Does `path` still hold exactly the group's content?
-fn still_matches(path: &Path, size: u64, hash: Option<forge_core::hashing::Digest>, cancel: &forge_jobs::CancelToken) -> bool {
-    let Ok(md) = std::fs::symlink_metadata(path) else { return false };
+fn still_matches(
+    path: &Path,
+    size: u64,
+    hash: Option<forge_core::hashing::Digest>,
+    cancel: &forge_jobs::CancelToken,
+) -> bool {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
     if !md.is_file() || md.len() != size {
         return false;
     }
@@ -1444,14 +1462,21 @@ fn still_matches(path: &Path, size: u64, hash: Option<forge_core::hashing::Diges
 /// Returns the paths that are safe to recycle and a description of anything skipped. A
 /// group is skipped entirely unless at least one kept copy still matches; individual
 /// removal candidates that no longer match are skipped (they are no longer duplicates).
-fn verify_recycle(checks: &[RecycleCheck], cancel: &forge_jobs::CancelToken) -> (Vec<PathBuf>, Vec<String>) {
+fn verify_recycle(
+    checks: &[RecycleCheck],
+    cancel: &forge_jobs::CancelToken,
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut ok = Vec::new();
     let mut skipped = Vec::new();
     for c in checks {
         if cancel.is_cancelled() {
             break;
         }
-        if !c.keep.iter().any(|k| still_matches(k, c.size, c.hash, cancel)) {
+        if !c
+            .keep
+            .iter()
+            .any(|k| still_matches(k, c.size, c.hash, cancel))
+        {
             skipped.push(format!(
                 "Skipped group of {} file(s): no kept copy still has the original content",
                 c.remove.len() + c.keep.len()
@@ -1462,7 +1487,10 @@ fn verify_recycle(checks: &[RecycleCheck], cancel: &forge_jobs::CancelToken) -> 
             if still_matches(r, c.size, c.hash, cancel) {
                 ok.push(r.clone());
             } else {
-                skipped.push(format!("Skipped {}: changed or missing since the scan", r.display()));
+                skipped.push(format!(
+                    "Skipped {}: changed or missing since the scan",
+                    r.display()
+                ));
             }
         }
     }
@@ -2288,8 +2316,14 @@ mod tests {
         for p in [&a, &b, &c] {
             std::fs::write(p, b"same content").unwrap();
         }
-        let hash = forge_core::hashing::hash_file(&a, &forge_jobs::CancelToken::new(), None).unwrap();
-        let check = RecycleCheck { size: 12, hash: Some(hash), keep: vec![a.clone()], remove: vec![b.clone(), c.clone()] };
+        let hash =
+            forge_core::hashing::hash_file(&a, &forge_jobs::CancelToken::new(), None).unwrap();
+        let check = RecycleCheck {
+            size: 12,
+            hash: Some(hash),
+            keep: vec![a.clone()],
+            remove: vec![b.clone(), c.clone()],
+        };
         let cancel = forge_jobs::CancelToken::new();
 
         // Normal case: both removal candidates verified.

@@ -272,7 +272,9 @@ fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(&T) -> R + 
     for (i, r) in chunks.into_iter().flatten() {
         out[i] = Some(r);
     }
-    out.into_iter().map(|r| r.expect("every index produced")).collect()
+    out.into_iter()
+        .map(|r| r.expect("every index produced"))
+        .collect()
 }
 
 fn split_by_bytes(

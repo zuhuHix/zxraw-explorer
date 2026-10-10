@@ -128,7 +128,9 @@ pub fn next_matching(
     if forward {
         (pos + 1..visible.len()).find(|&p| pred(visible[p]))
     } else {
-        (0..pos.min(visible.len())).rev().find(|&p| pred(visible[p]))
+        (0..pos.min(visible.len()))
+            .rev()
+            .find(|&p| pred(visible[p]))
     }
 }
 
@@ -178,7 +180,11 @@ pub fn change_for(action: CullAction, current: Annotation) -> AnnotationChange {
     match action {
         CullAction::Rate(r) => c.rating = Some(r.min(5)),
         CullAction::ToggleLabel(l) => {
-            c.label = Some(if current.label == Some(l) { None } else { Some(l) })
+            c.label = Some(if current.label == Some(l) {
+                None
+            } else {
+                Some(l)
+            })
         }
         CullAction::Pick => c.pick = Some(1),
         CullAction::Reject => c.pick = Some(-1),
@@ -189,7 +195,10 @@ pub fn change_for(action: CullAction, current: Annotation) -> AnnotationChange {
 
 /// Auto-advance applies to ratings and pick/reject decisions, not to labels or unflag.
 pub fn advances(action: CullAction) -> bool {
-    matches!(action, CullAction::Rate(_) | CullAction::Pick | CullAction::Reject)
+    matches!(
+        action,
+        CullAction::Rate(_) | CullAction::Pick | CullAction::Reject
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +361,10 @@ mod tests {
         assert_eq!(format_count(999), "999");
         assert_eq!(format_count(2431), "2,431");
         assert_eq!(format_count(1_234_567), "1,234,567");
-        assert_eq!(header_text(122, 2431, ann(3, 1)), "123 / 2,431 · ★★★☆☆ · Pick");
+        assert_eq!(
+            header_text(122, 2431, ann(3, 1)),
+            "123 / 2,431 · ★★★☆☆ · Pick"
+        );
         assert_eq!(header_text(0, 1, ann(0, 0)), "1 / 1 · ☆☆☆☆☆");
     }
 }

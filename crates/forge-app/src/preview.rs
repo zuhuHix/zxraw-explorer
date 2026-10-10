@@ -54,7 +54,9 @@ impl TextPreview {
 fn read_text_head(p: &Path, max: usize) -> Result<String, String> {
     let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(max);
-    f.take(max as u64).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    f.take(max as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
     if buf.iter().take(4096).filter(|b| **b == 0).count() > 0 {
         return Err("Binary file".into());
     }
@@ -63,45 +65,68 @@ fn read_text_head(p: &Path, max: usize) -> Result<String, String> {
 }
 
 pub fn info_grid(ui: &mut Ui, e: &FileEntry) {
-    egui::Grid::new("info").num_columns(2).spacing([12.0, 4.0]).striped(true).show(ui, |ui| {
-        let row = |ui: &mut Ui, k: &str, v: String| {
-            ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
-            ui.label(v);
-            ui.end_row();
-        };
-        row(ui, "Type", views::type_label(e));
-        if e.kind == EntryKind::File {
-            row(ui, "Size", format!("{} ({} bytes)", format_size(e.size), e.size));
-        }
-        row(ui, "Modified", views::format_time(e.modified));
-        row(ui, "Created", views::format_time(e.created));
-        let mut attrs = Vec::new();
-        if e.readonly {
-            attrs.push("read-only");
-        }
-        if e.hidden {
-            attrs.push("hidden");
-        }
-        if e.system {
-            attrs.push("system");
-        }
-        if e.kind == EntryKind::Link {
-            attrs.push("link / junction");
-        }
-        if !attrs.is_empty() {
-            row(ui, "Attributes", attrs.join(", "));
-        }
-        row(ui, "Location", e.path.parent().map(|p| p.display().to_string()).unwrap_or_default());
-    });
+    egui::Grid::new("info")
+        .num_columns(2)
+        .spacing([12.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            let row = |ui: &mut Ui, k: &str, v: String| {
+                ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
+                ui.label(v);
+                ui.end_row();
+            };
+            row(ui, "Type", views::type_label(e));
+            if e.kind == EntryKind::File {
+                row(
+                    ui,
+                    "Size",
+                    format!("{} ({} bytes)", format_size(e.size), e.size),
+                );
+            }
+            row(ui, "Modified", views::format_time(e.modified));
+            row(ui, "Created", views::format_time(e.created));
+            let mut attrs = Vec::new();
+            if e.readonly {
+                attrs.push("read-only");
+            }
+            if e.hidden {
+                attrs.push("hidden");
+            }
+            if e.system {
+                attrs.push("system");
+            }
+            if e.kind == EntryKind::Link {
+                attrs.push("link / junction");
+            }
+            if !attrs.is_empty() {
+                row(ui, "Attributes", attrs.join(", "));
+            }
+            row(
+                ui,
+                "Location",
+                e.path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            );
+        });
 }
 
 pub fn header(ui: &mut Ui, e: &FileEntry) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(views::icon_for(e)).size(22.0).color(views::icon_color(e)));
+        ui.label(
+            RichText::new(views::icon_for(e))
+                .size(22.0)
+                .color(views::icon_color(e)),
+        );
         ui.add(egui::Label::new(RichText::new(&e.name).strong().size(14.0)).wrap());
     });
 }
 
 pub fn is_media(e: &FileEntry) -> bool {
-    e.kind == EntryKind::File && matches!(e.media_kind(), MediaKind::Image | MediaKind::Raw | MediaKind::Video)
+    e.kind == EntryKind::File
+        && matches!(
+            e.media_kind(),
+            MediaKind::Image | MediaKind::Raw | MediaKind::Video
+        )
 }

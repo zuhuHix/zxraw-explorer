@@ -73,8 +73,21 @@ pub const AUDIO_EXTS: &[&str] = &[
 pub const SIDECAR_EXTS: &[&str] = &["xmp", "thm", "pp3", "dop", "cos", "on1", "aae"];
 pub const ARCHIVE_EXTS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst"];
 pub const PROJECT_EXTS: &[&str] = &[
-    "drp", "prproj", "aep", "veg", "blend", "aup3", "fcpxml", "lrcat", "cocatalog", "psb", "afphoto",
-    "kdenlive", "otio", "edl", "xml",
+    "drp",
+    "prproj",
+    "aep",
+    "veg",
+    "blend",
+    "aup3",
+    "fcpxml",
+    "lrcat",
+    "cocatalog",
+    "psb",
+    "afphoto",
+    "kdenlive",
+    "otio",
+    "edl",
+    "xml",
 ];
 pub const DOCUMENT_EXTS: &[&str] = &[
     "pdf", "txt", "md", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "csv", "rtf", "odt", "json",

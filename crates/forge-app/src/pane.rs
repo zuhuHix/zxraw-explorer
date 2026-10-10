@@ -124,7 +124,10 @@ impl Pane {
     }
     pub fn back(&mut self) {
         if let Some(p) = self.back.pop() {
-            let came_from = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let came_from = self
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
             self.forward.push(self.path.clone());
             self.load_path(p);
             self.pending_select = came_from;
@@ -138,7 +141,10 @@ impl Pane {
     }
     pub fn up(&mut self) {
         if let Some(parent) = self.path.parent().map(Path::to_path_buf) {
-            let came_from = self.path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let came_from = self
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
             self.navigate(parent);
             self.pending_select = came_from;
         }
@@ -254,7 +260,8 @@ impl Pane {
             self.sort.descending = !self.sort.descending;
         } else {
             self.sort.key = key;
-            self.sort.descending = matches!(key, SortKey::Size | SortKey::Modified | SortKey::Created);
+            self.sort.descending =
+                matches!(key, SortKey::Size | SortKey::Modified | SortKey::Created);
         }
         self.resort();
     }
@@ -317,9 +324,15 @@ impl Pane {
 
     /// Selected paths, or the cursor item if nothing is selected.
     pub fn action_targets(&self) -> Vec<PathBuf> {
-        let sel: Vec<PathBuf> = self.selected_entries().iter().map(|e| e.path.clone()).collect();
+        let sel: Vec<PathBuf> = self
+            .selected_entries()
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
         if sel.is_empty() {
-            self.cursor_entry().map(|e| vec![e.path.clone()]).unwrap_or_default()
+            self.cursor_entry()
+                .map(|e| vec![e.path.clone()])
+                .unwrap_or_default()
         } else {
             sel
         }
@@ -421,7 +434,11 @@ impl Pane {
         let n = self.visible.len();
         for k in 0..n {
             let v = (start + k) % n;
-            if self.entries[self.visible[v]].name.to_lowercase().starts_with(&p) {
+            if self.entries[self.visible[v]]
+                .name
+                .to_lowercase()
+                .starts_with(&p)
+            {
                 self.click(v, false, false);
                 self.scroll_to_cursor = true;
                 return;

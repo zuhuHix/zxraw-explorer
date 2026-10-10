@@ -7,7 +7,8 @@ use crossbeam_channel::{Sender, bounded};
 use egui::{RichText, Ui};
 use forge_core::model::format_size;
 use forge_core::ops::{
-    self, ConflictDecision, ConflictInfo, ConflictPolicy, JobCtx, OpKind, OpOptions, OpReport, Resolution,
+    self, ConflictDecision, ConflictInfo, ConflictPolicy, JobCtx, OpKind, OpOptions, OpReport,
+    Resolution,
 };
 use forge_jobs::{JobHandle, JobState};
 
@@ -33,10 +34,20 @@ struct ClipboardMoveCompletion {
 pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
     // Items already in `dest`: moving them there is a no-op, and copying them there must
     // never be offered as "replace the file with itself" — Explorer makes a renamed copy.
-    let in_dest = |p: &PathBuf| p.parent().is_some_and(|d| forge_core::paths::paths_equal(d, &dest));
+    let in_dest = |p: &PathBuf| {
+        p.parent()
+            .is_some_and(|d| forge_core::paths::paths_equal(d, &dest))
+    };
     let (same, sources): (Vec<PathBuf>, Vec<PathBuf>) = sources.into_iter().partition(in_dest);
     if !same.is_empty() && kind == OpKind::Copy {
-        start_transfer_with(app, same, dest.clone(), kind, ConflictPolicy::KeepBoth, None);
+        start_transfer_with(
+            app,
+            same,
+            dest.clone(),
+            kind,
+            ConflictPolicy::KeepBoth,
+            None,
+        );
     }
     if sources.is_empty() {
         return;
@@ -90,11 +101,17 @@ fn start_transfer_with(
         return;
     }
     let verify = app.settings.verify_copies;
-    let verb = if kind == OpKind::Copy { "Copying" } else { "Moving" };
+    let verb = if kind == OpKind::Copy {
+        "Copying"
+    } else {
+        "Moving"
+    };
     let title = format!(
         "{verb} {} item(s) to {}",
         sources.len(),
-        dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dest.display().to_string())
+        dest.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dest.display().to_string())
     );
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -141,14 +158,25 @@ fn start_transfer_with(
             loop {
                 match rrx.recv_timeout(Duration::from_millis(200)) {
                     Ok(r) => return r,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {
+                        continue;
+                    }
                     _ => return Resolution::once(ConflictDecision::Cancel),
                 }
             }
         };
         let report = ops::execute(&plan, job, &mut resolver);
         let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
-        finish_report(job, &report, &tx, &[dest.clone()], sources.iter().filter_map(|s| s.parent().map(Path::to_path_buf)).collect());
+        finish_report(
+            job,
+            &report,
+            &tx,
+            &[dest.clone()],
+            sources
+                .iter()
+                .filter_map(|s| s.parent().map(Path::to_path_buf))
+                .collect(),
+        );
         if let Some(completion) = completion {
             let _ = tx.send(Event::MoveFinished {
                 sources: completion.sources,
@@ -162,7 +190,13 @@ fn start_transfer_with(
     });
 }
 
-fn finish_report(job: &JobHandle, report: &OpReport, tx: &Sender<Event>, dests: &[PathBuf], mut sources: Vec<PathBuf>) {
+fn finish_report(
+    job: &JobHandle,
+    report: &OpReport,
+    tx: &Sender<Event>,
+    dests: &[PathBuf],
+    mut sources: Vec<PathBuf>,
+) {
     sources.sort();
     sources.dedup();
     for d in dests.iter().chain(sources.iter()) {
@@ -208,85 +242,127 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let n = targets.len();
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
-    app.ops.jobs.spawn("delete", format!("Permanently deleting {n} item(s)"), move |job| {
-        let report = ops::delete_permanently(&targets, &JobCtx::from_job(job));
-        let parents: Vec<PathBuf> = targets.iter().filter_map(|t| t.parent().map(Path::to_path_buf)).collect();
-        finish_report(job, &report, &tx, &[], parents);
-        ctx.request_repaint();
-        Ok(())
-    });
+    app.ops.jobs.spawn(
+        "delete",
+        format!("Permanently deleting {n} item(s)"),
+        move |job| {
+            let report = ops::delete_permanently(&targets, &JobCtx::from_job(job));
+            let parents: Vec<PathBuf> = targets
+                .iter()
+                .filter_map(|t| t.parent().map(Path::to_path_buf))
+                .collect();
+            finish_report(job, &report, &tx, &[], parents);
+            ctx.request_repaint();
+            Ok(())
+        },
+    );
 }
 
 pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
-    app.ops.jobs.spawn("undo", format!("Undoing {} change(s)", records.len()), move |job| {
-        let mut errors = Vec::new();
-        for r in records.iter().rev() {
-            if let Err(e) = ops::undo(r) {
-                errors.push(format!("{}: {e}", r.describe()));
-                job.progress.add_error();
-            }
-            let touched: Vec<PathBuf> = match r {
-                ops::UndoRecord::Renamed { from, to } | ops::UndoRecord::Moved { from, to } => vec![from.clone(), to.clone()],
-                ops::UndoRecord::CreatedFolder { path } | ops::UndoRecord::CreatedFile { path } | ops::UndoRecord::Copied { path, .. } => vec![path.clone()],
-            };
-            for p in touched {
-                if let Some(d) = p.parent() {
-                    let _ = tx.send(Event::Changed(d.to_path_buf()));
+    app.ops.jobs.spawn(
+        "undo",
+        format!("Undoing {} change(s)", records.len()),
+        move |job| {
+            let mut errors = Vec::new();
+            for r in records.iter().rev() {
+                if let Err(e) = ops::undo(r) {
+                    errors.push(format!("{}: {e}", r.describe()));
+                    job.progress.add_error();
+                }
+                let touched: Vec<PathBuf> = match r {
+                    ops::UndoRecord::Renamed { from, to } | ops::UndoRecord::Moved { from, to } => {
+                        vec![from.clone(), to.clone()]
+                    }
+                    ops::UndoRecord::CreatedFolder { path }
+                    | ops::UndoRecord::CreatedFile { path }
+                    | ops::UndoRecord::Copied { path, .. } => vec![path.clone()],
+                };
+                for p in touched {
+                    if let Some(d) = p.parent() {
+                        let _ = tx.send(Event::Changed(d.to_path_buf()));
+                    }
                 }
             }
-        }
-        if errors.is_empty() {
-            let _ = tx.send(Event::Toast(format!("Undid {} change(s)", records.len())));
-        } else {
-            let _ = tx.send(Event::Report { title: "Undo was incomplete".into(), lines: errors });
-        }
-        ctx.request_repaint();
-        Ok(())
-    });
+            if errors.is_empty() {
+                let _ = tx.send(Event::Toast(format!("Undid {} change(s)", records.len())));
+            } else {
+                let _ = tx.send(Event::Report {
+                    title: "Undo was incomplete".into(),
+                    lines: errors,
+                });
+            }
+            ctx.request_repaint();
+            Ok(())
+        },
+    );
 }
 
 /// Conflict dialog. Returns true while a question is being shown.
 pub fn conflict_dialog(app: &mut ZxrawApp, ctx: &egui::Context) -> bool {
-    let Some(q) = app.ops.conflicts.front_mut() else { return false };
+    let Some(q) = app.ops.conflicts.front_mut() else {
+        return false;
+    };
     let mut answer = None;
     egui::Modal::new(egui::Id::new("conflict")).show(ctx, |ui| {
         ui.set_width(520.0);
         ui.heading("File already exists");
         ui.label(RichText::new(&q.job_title).weak());
         ui.add_space(6.0);
-        let name = q.info.dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let name = q
+            .info
+            .dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         ui.label(format!("The destination already contains “{name}”."));
         ui.add_space(4.0);
-        egui::Grid::new("cmp").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
-            ui.label("");
-            ui.label(RichText::new("Size").strong());
-            ui.label(RichText::new("Modified").strong());
-            ui.end_row();
-            let newer = |a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>| a.zip(b).is_some_and(|(a, b)| a > b);
-            ui.label("Incoming");
-            ui.label(format_size(q.info.source_size));
-            ui.label(format!(
-                "{}{}",
-                views::format_time(q.info.source_modified),
-                if newer(q.info.source_modified, q.info.dest_modified) { "  (newer)" } else { "" }
-            ));
-            ui.end_row();
-            ui.label("Existing");
-            ui.label(format_size(q.info.dest_size));
-            ui.label(format!(
-                "{}{}",
-                views::format_time(q.info.dest_modified),
-                if newer(q.info.dest_modified, q.info.source_modified) { "  (newer)" } else { "" }
-            ));
-            ui.end_row();
-        });
+        egui::Grid::new("cmp")
+            .num_columns(3)
+            .spacing([16.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("");
+                ui.label(RichText::new("Size").strong());
+                ui.label(RichText::new("Modified").strong());
+                ui.end_row();
+                let newer = |a: Option<std::time::SystemTime>, b: Option<std::time::SystemTime>| {
+                    a.zip(b).is_some_and(|(a, b)| a > b)
+                };
+                ui.label("Incoming");
+                ui.label(format_size(q.info.source_size));
+                ui.label(format!(
+                    "{}{}",
+                    views::format_time(q.info.source_modified),
+                    if newer(q.info.source_modified, q.info.dest_modified) {
+                        "  (newer)"
+                    } else {
+                        ""
+                    }
+                ));
+                ui.end_row();
+                ui.label("Existing");
+                ui.label(format_size(q.info.dest_size));
+                ui.label(format!(
+                    "{}{}",
+                    views::format_time(q.info.dest_modified),
+                    if newer(q.info.dest_modified, q.info.source_modified) {
+                        "  (newer)"
+                    } else {
+                        ""
+                    }
+                ));
+                ui.end_row();
+            });
         ui.add_space(8.0);
         ui.checkbox(&mut q.apply_all, "Do this for all remaining conflicts");
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            if ui.button("Keep both").on_hover_text("The incoming file gets a new name like “name (2)”").clicked() {
+            if ui
+                .button("Keep both")
+                .on_hover_text("The incoming file gets a new name like “name (2)”")
+                .clicked()
+            {
                 answer = Some(ConflictDecision::KeepBoth);
             }
             if ui.button("Skip").clicked() {
@@ -297,7 +373,11 @@ pub fn conflict_dialog(app: &mut ZxrawApp, ctx: &egui::Context) -> bool {
             }
             let replace = egui::Button::new(RichText::new("Replace").color(egui::Color32::WHITE))
                 .fill(egui::Color32::from_rgb(170, 60, 50));
-            if ui.add(replace).on_hover_text("The existing file is overwritten. This cannot be undone.").clicked() {
+            if ui
+                .add(replace)
+                .on_hover_text("The existing file is overwritten. This cannot be undone.")
+                .clicked()
+            {
                 answer = Some(ConflictDecision::Overwrite);
             }
             if ui.button("Cancel operation").clicked() {
@@ -326,12 +406,14 @@ pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
             if jobs.is_empty() {
                 ui.label(RichText::new("No operations yet.").weak());
             }
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for j in jobs.iter().rev() {
-                    job_row(ui, j);
-                    ui.separator();
-                }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| {
+                    for j in jobs.iter().rev() {
+                        job_row(ui, j);
+                        ui.separator();
+                    }
+                });
             if ui.button("Clear finished").clicked() {
                 app.ops.jobs.clear_finished();
             }
@@ -350,7 +432,10 @@ fn job_row(ui: &mut Ui, j: &JobHandle) {
                     j.cancel.cancel();
                 }
                 let paused = state == JobState::Paused;
-                if ui.small_button(if paused { "Resume" } else { "Pause" }).clicked() {
+                if ui
+                    .small_button(if paused { "Resume" } else { "Pause" })
+                    .clicked()
+                {
                     j.cancel.set_paused(!paused);
                 }
             }
@@ -396,7 +481,9 @@ fn job_row(ui: &mut Ui, j: &JobHandle) {
         ui.label(RichText::new(&snap.current).small().weak());
     }
     if snap.errors > 0 {
-        ui.label(RichText::new(format!("{} error(s)", snap.errors)).color(ui.visuals().error_fg_color));
+        ui.label(
+            RichText::new(format!("{} error(s)", snap.errors)).color(ui.visuals().error_fg_color),
+        );
     }
     let log = j.log_lines();
     if !log.is_empty() {

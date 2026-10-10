@@ -50,7 +50,10 @@ fn camera_name(make: Option<&str>, model: Option<&str>) -> Option<String> {
         (Some(mk), Some(md)) => {
             // "Canon" + "Canon EOS R5" → "Canon EOS R5"
             let first = mk.split_whitespace().next().unwrap_or(mk);
-            if md.to_ascii_lowercase().starts_with(&first.to_ascii_lowercase()) {
+            if md
+                .to_ascii_lowercase()
+                .starts_with(&first.to_ascii_lowercase())
+            {
                 Some(md.to_string())
             } else {
                 Some(format!("{mk} {md}"))
@@ -149,14 +152,14 @@ fn read_summary_inner(
 }
 
 /// Burst membership per item: `Some((position 1-based, group length))` for groups > 1.
-pub fn burst_positions(metas: &[Option<Arc<MetaSummary>>], max_gap_secs: f64) -> Vec<Option<(u32, u32)>> {
+pub fn burst_positions(
+    metas: &[Option<Arc<MetaSummary>>],
+    max_gap_secs: f64,
+) -> Vec<Option<(u32, u32)>> {
     let items: Vec<BurstItem> = metas
         .iter()
         .map(|m| BurstItem {
-            capture_time: m
-                .as_ref()
-                .and_then(|m| m.capture_time)
-                .unwrap_or(f64::NAN),
+            capture_time: m.as_ref().and_then(|m| m.capture_time).unwrap_or(f64::NAN),
             camera: m.as_ref().and_then(|m| m.camera.clone()),
         })
         .collect();
@@ -375,7 +378,10 @@ mod tests {
         };
         let metas = vec![m(0.0), m(0.3), m(0.6), m(100.0), None];
         let b = burst_positions(&metas, 1.0);
-        assert_eq!(b, vec![Some((1, 3)), Some((2, 3)), Some((3, 3)), None, None]);
+        assert_eq!(
+            b,
+            vec![Some((1, 3)), Some((2, 3)), Some((3, 3)), None, None]
+        );
     }
 
     #[test]

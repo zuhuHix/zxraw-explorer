@@ -95,24 +95,26 @@ impl Palette {
                 self.selected = 0;
             }
             ui.add_space(4.0);
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for (i, (_, c)) in items.iter().enumerate() {
-                    let sel = i == self.selected;
-                    ui.horizontal(|ui| {
-                        let r = ui.add(
-                            egui::Button::selectable(sel, c.label())
-                                .min_size(egui::vec2(380.0, 0.0)),
-                        );
-                        if sel && (up || down) {
-                            r.scroll_to_me(None);
-                        }
-                        if r.clicked() {
-                            chosen = Some(*c);
-                        }
-                        ui.label(RichText::new(c.shortcut_text(ui.ctx())).weak().small());
-                    });
-                }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for (i, (_, c)) in items.iter().enumerate() {
+                        let sel = i == self.selected;
+                        ui.horizontal(|ui| {
+                            let r = ui.add(
+                                egui::Button::selectable(sel, c.label())
+                                    .min_size(egui::vec2(380.0, 0.0)),
+                            );
+                            if sel && (up || down) {
+                                r.scroll_to_me(None);
+                            }
+                            if r.clicked() {
+                                chosen = Some(*c);
+                            }
+                            ui.label(RichText::new(c.shortcut_text(ui.ctx())).weak().small());
+                        });
+                    }
+                });
         });
         if modal.should_close() {
             self.open = false;
@@ -133,6 +135,9 @@ mod tests {
         assert!(fuzzy_score("Find duplicates…", "dup").is_some());
         assert!(fuzzy_score("Find duplicates…", "fd").is_some());
         assert!(fuzzy_score("Refresh", "xyz").is_none());
-        assert!(fuzzy_score("New tab", "nt").unwrap() > fuzzy_score("Next tab", "nt").unwrap_or(-100) - 10);
+        assert!(
+            fuzzy_score("New tab", "nt").unwrap()
+                > fuzzy_score("Next tab", "nt").unwrap_or(-100) - 10
+        );
     }
 }

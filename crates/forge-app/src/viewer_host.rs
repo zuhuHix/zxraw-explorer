@@ -106,7 +106,8 @@ pub fn show(app: &mut ZxrawApp, ui: &mut egui::Ui) -> bool {
         // Return to the browser with the last viewed file under the cursor.
         let last = v.items().get(last_index).cloned();
         app.viewer = None;
-        if let Some(p) = last.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())) {
+        if let Some(p) = last.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        {
             app.pane_mut().select_name(&p);
         }
     }

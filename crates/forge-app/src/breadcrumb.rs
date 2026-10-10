@@ -74,7 +74,10 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
                         if i > 0 {
                             ui.label(RichText::new(" › ").weak());
                         }
-                        if ui.add(egui::Button::new(label.as_str()).frame_when_inactive(false)).clicked() {
+                        if ui
+                            .add(egui::Button::new(label.as_str()).frame_when_inactive(false))
+                            .clicked()
+                        {
                             nav = Some(target.clone());
                         }
                     }
@@ -82,7 +85,10 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
                         app.navigate(t);
                     }
                     // Click on the blank part of the bar to edit.
-                    let rest = ui.allocate_response(egui::vec2(ui.available_width(), 20.0), egui::Sense::click());
+                    let rest = ui.allocate_response(
+                        egui::vec2(ui.available_width(), 20.0),
+                        egui::Sense::click(),
+                    );
                     if rest.clicked() {
                         app.pane_mut().editing_path = Some(path.to_string_lossy().into_owned());
                         app.focus_address = true;
@@ -123,7 +129,11 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
     let tab = r.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab));
 
     // Autocomplete popup.
-    let comps = if r.has_focus() { completions(&text) } else { Vec::new() };
+    let comps = if r.has_focus() {
+        completions(&text)
+    } else {
+        Vec::new()
+    };
     if tab {
         if let Some(first) = comps.first() {
             text = format!("{first}\\");

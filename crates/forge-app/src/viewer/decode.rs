@@ -340,13 +340,19 @@ mod tests {
 
         let bad = dir.join("bad.jpg");
         std::fs::write(&bad, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]).unwrap();
-        assert!(matches!(decode(&bad, Some(100), &l, &ff, &c), Err(DecodeError::Failed(_))));
+        assert!(matches!(
+            decode(&bad, Some(100), &l, &ff, &c),
+            Err(DecodeError::Failed(_))
+        ));
         let empty = dir.join("empty.png");
         std::fs::write(&empty, []).unwrap();
         assert!(decode(&empty, Some(100), &l, &ff, &c).is_err());
 
         c.cancel();
-        assert_eq!(decode(&p, None, &l, &ff, &c).err(), Some(DecodeError::Cancelled));
+        assert_eq!(
+            decode(&p, None, &l, &ff, &c).err(),
+            Some(DecodeError::Cancelled)
+        );
 
         let big = bound_pixels(
             Decoded {

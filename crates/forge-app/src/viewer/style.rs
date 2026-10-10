@@ -46,7 +46,11 @@ pub fn pill(
     let galley = p.layout_no_wrap(text.to_string(), FontId::proportional(size), fg);
     let pad = vec2(7.0, 3.0);
     let r = align.anchor_size(anchor, galley.size() + pad * 2.0);
-    p.rect_filled(r, CornerRadius::same(((r.height() / 2.0) as u8).min(10)), bg);
+    p.rect_filled(
+        r,
+        CornerRadius::same(((r.height() / 2.0) as u8).min(10)),
+        bg,
+    );
     p.galley(r.min + pad, galley, fg);
     r
 }
@@ -67,14 +71,31 @@ pub fn draw_annotation(p: &Painter, r: Rect, a: Annotation, scale: f32) {
     }
     if let Some(c) = a.label.and_then(|l| LABEL_COLORS.get(l as usize)) {
         let c0 = r.right_top() + vec2(-8.0, 8.0) * scale;
-        p.circle(c0, 4.5 * scale, *c, Stroke::new(1.0, Color32::from_black_alpha(160)));
+        p.circle(
+            c0,
+            4.5 * scale,
+            *c,
+            Stroke::new(1.0, Color32::from_black_alpha(160)),
+        );
     }
     match a.pick {
         1 => {
-            p.text(r.left_top() + vec2(4.0, 2.0) * scale, Align2::LEFT_TOP, "⚑", FontId::proportional(13.0 * scale), PICK);
+            p.text(
+                r.left_top() + vec2(4.0, 2.0) * scale,
+                Align2::LEFT_TOP,
+                "⚑",
+                FontId::proportional(13.0 * scale),
+                PICK,
+            );
         }
         -1 => {
-            p.text(r.left_top() + vec2(4.0, 2.0) * scale, Align2::LEFT_TOP, "✖", FontId::proportional(12.0 * scale), REJECT);
+            p.text(
+                r.left_top() + vec2(4.0, 2.0) * scale,
+                Align2::LEFT_TOP,
+                "✖",
+                FontId::proportional(12.0 * scale),
+                REJECT,
+            );
         }
         _ => {}
     }
@@ -88,5 +109,9 @@ pub fn human_size(n: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", U[i]) }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
 }

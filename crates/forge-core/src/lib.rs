@@ -22,6 +22,7 @@ pub mod ops;
 pub mod paths;
 pub mod query;
 pub mod rename;
+pub mod split;
 
 pub use error::{CoreError, Result};
 pub use model::{EntryKind, FileEntry, MediaKind};

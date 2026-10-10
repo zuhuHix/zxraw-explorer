@@ -658,7 +658,13 @@ impl Drop for Loader {
     }
 }
 
-fn upload(ctx: &egui::Context, path: &std::path::Path, level: Level, d: Decoded, max_tex: usize) -> Tex {
+fn upload(
+    ctx: &egui::Context,
+    path: &std::path::Path,
+    level: Level,
+    d: Decoded,
+    max_tex: usize,
+) -> Tex {
     let opts = if level == Level::Full {
         // Crisp pixels when inspecting beyond 100 %.
         TextureOptions {
@@ -686,7 +692,8 @@ fn upload(ctx: &egui::Context, path: &std::path::Path, level: Level, d: Decoded,
             while x < w {
                 let tw = ms.min(w - x);
                 let sub: RgbaImage = image::imageops::crop_imm(&d.rgba, x, y, tw, th).to_image();
-                let ci = ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], sub.as_raw());
+                let ci =
+                    ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], sub.as_raw());
                 let r = Rect::from_min_max(
                     pos2(x as f32 / w as f32, y as f32 / h as f32),
                     pos2((x + tw) as f32 / w as f32, (y + th) as f32 / h as f32),

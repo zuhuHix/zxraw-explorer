@@ -56,7 +56,9 @@ impl FolderWatcher {
 
     /// Keep the watch set equal to `dirs` (the folders on screen).
     pub fn sync(&mut self, dirs: &[PathBuf]) {
-        let Some(w) = self.watcher.as_mut() else { return };
+        let Some(w) = self.watcher.as_mut() else {
+            return;
+        };
         let want: HashSet<PathBuf> = dirs.iter().cloned().collect();
         for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
             let _ = w.unwatch(&gone);
@@ -84,9 +86,16 @@ impl FolderWatcher {
         let mut out = Vec::new();
         let mut next_wake: Option<Duration> = None;
         self.pending.retain(|dir, last_event| {
-            let gap = if size_of(dir) > 20_000 { MIN_GAP_LARGE } else { MIN_GAP };
+            let gap = if size_of(dir) > 20_000 {
+                MIN_GAP_LARGE
+            } else {
+                MIN_GAP
+            };
             let quiet = now.duration_since(*last_event) >= DEBOUNCE;
-            let spaced = self.last_refresh.get(dir).is_none_or(|t| now.duration_since(*t) >= gap);
+            let spaced = self
+                .last_refresh
+                .get(dir)
+                .is_none_or(|t| now.duration_since(*t) >= gap);
             if quiet && spaced {
                 out.push(dir.clone());
                 false

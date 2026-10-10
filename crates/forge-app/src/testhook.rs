@@ -27,7 +27,12 @@ impl TestHook {
         let cmds = std::env::var("ZXRAW_CMDS")
             .unwrap_or_default()
             .split(',')
-            .filter_map(|n| Cmd::ALL.iter().find(|c| format!("{c:?}") == n.trim()).copied())
+            .filter_map(|n| {
+                Cmd::ALL
+                    .iter()
+                    .find(|c| format!("{c:?}") == n.trim())
+                    .copied()
+            })
             .collect();
         Self {
             screenshot: std::env::var_os("ZXRAW_SCREENSHOT").map(PathBuf::from),

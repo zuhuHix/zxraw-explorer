@@ -29,9 +29,7 @@ use egui::{Key, Pos2, Rect, Ui};
 use forge_jobs::Priority;
 
 #[allow(unused_imports)] // re-exported for the host app
-pub use cull::{
-    Annotation, AnnotationChange, AnnotationStore, CullAction, Filter, MemoryStore,
-};
+pub use cull::{Annotation, AnnotationChange, AnnotationStore, CullAction, Filter, MemoryStore};
 pub use loader::LoaderConfig as ViewerConfig;
 pub use zoom::{ViewState, Zoom};
 
@@ -64,14 +62,26 @@ pub const HELP: &[(&str, &str, &str)] = &[
     ("F", "Fit to screen", "Zoom"),
     ("Drag", "Pan", "Zoom"),
     ("0 – 5", "Set star rating", "Cull"),
-    ("6 / 7 / 8 / 9", "Toggle red / yellow / green / blue label", "Cull"),
+    (
+        "6 / 7 / 8 / 9",
+        "Toggle red / yellow / green / blue label",
+        "Cull",
+    ),
     ("Shift+6 or V", "Toggle purple label", "Cull"),
     ("P / X / U", "Pick / reject / unflag", "Cull"),
     ("A", "Auto-advance after rating on/off", "Cull"),
     ("Tab / Shift+Tab", "Next / previous active panel", "Compare"),
-    ("← / →", "Replace active panel with previous / next photo", "Compare"),
+    (
+        "← / →",
+        "Replace active panel with previous / next photo",
+        "Compare",
+    ),
     ("S", "Synchronized zoom & pan on/off", "Compare"),
-    ("B", "Before/after split slider (exactly two photos)", "Compare"),
+    (
+        "B",
+        "Before/after split slider (exactly two photos)",
+        "Compare",
+    ),
     ("I", "Info overlay (EXIF)", "View"),
     ("G", "Sharpness guidance badge", "View"),
     ("T", "Filmstrip on/off", "View"),
@@ -451,7 +461,11 @@ impl Viewer {
     fn init_compare(&mut self, count: Option<usize>) {
         let vis = &self.visible;
         let n = count
-            .unwrap_or(if self.items.len() <= 4 { self.items.len() } else { 2 })
+            .unwrap_or(if self.items.len() <= 4 {
+                self.items.len()
+            } else {
+                2
+            })
             .clamp(1, 4)
             .min(vis.len().max(1));
         let p = cull::reselect(vis, self.cur).unwrap_or(0);
@@ -586,7 +600,11 @@ impl Viewer {
                 }
                 Key::S if self.mode == ViewerMode::Compare && !ctrl => {
                     self.compare.sync = !self.compare.sync;
-                    self.toast(if self.compare.sync { "Sync zoom & pan: on" } else { "Sync zoom & pan: off" });
+                    self.toast(if self.compare.sync {
+                        "Sync zoom & pan: on"
+                    } else {
+                        "Sync zoom & pan: off"
+                    });
                 }
                 Key::B if self.mode == ViewerMode::Compare && !ctrl => {
                     if self.items.len() == 2 && self.compare.panels.len() == 2 {
@@ -602,19 +620,30 @@ impl Viewer {
                 Key::I if !ctrl => self.show_info = !self.show_info,
                 Key::G if !ctrl => {
                     self.show_sharpness = !self.show_sharpness;
-                    self.toast(if self.show_sharpness { "Sharpness guidance: on (estimate)" } else { "Sharpness guidance: off" });
+                    self.toast(if self.show_sharpness {
+                        "Sharpness guidance: on (estimate)"
+                    } else {
+                        "Sharpness guidance: off"
+                    });
                 }
                 Key::T if !ctrl => self.show_filmstrip = !self.show_filmstrip,
                 Key::A if !ctrl && self.mode == ViewerMode::Cull => {
                     self.auto_advance = !self.auto_advance;
-                    self.toast(if self.auto_advance { "Auto-advance: on" } else { "Auto-advance: off" });
+                    self.toast(if self.auto_advance {
+                        "Auto-advance: on"
+                    } else {
+                        "Auto-advance: off"
+                    });
                 }
                 k if !ctrl && self.mode != ViewerMode::Single => {
                     if let Some(a) = cull::action_for_key(k, m.shift) {
                         self.apply_cull(a, store);
                     }
                 }
-                k if !ctrl && self.mode == ViewerMode::Single && cull::action_for_key(k, m.shift).is_some() => {
+                k if !ctrl
+                    && self.mode == ViewerMode::Single
+                    && cull::action_for_key(k, m.shift).is_some() =>
+                {
                     self.toast("Switch to Cull mode (Ctrl+2) to rate and flag");
                 }
                 _ => {}

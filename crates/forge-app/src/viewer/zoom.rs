@@ -53,10 +53,17 @@ pub fn clamp_center(center: Vec2, scaled: Vec2, view: Vec2) -> Vec2 {
             0.5
         } else {
             let half = v / (2.0 * size);
-            if c.is_finite() { c.clamp(half, 1.0 - half) } else { 0.5 }
+            if c.is_finite() {
+                c.clamp(half, 1.0 - half)
+            } else {
+                0.5
+            }
         }
     };
-    vec2(axis(center.x, scaled.x, view.x), axis(center.y, scaled.y, view.y))
+    vec2(
+        axis(center.x, scaled.x, view.x),
+        axis(center.y, scaled.y, view.y),
+    )
 }
 
 /// Allowed scale range for an image in a view.

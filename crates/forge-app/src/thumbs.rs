@@ -1,4 +1,4 @@
-﻿//! UI side of the thumbnail pipeline: turns `forge_media` results into GPU textures,
+//! UI side of the thumbnail pipeline: turns `forge_media` results into GPU textures,
 //! bounded by a byte budget, with per-frame upload limits so scrolling stays smooth.
 
 use std::collections::{HashMap, HashSet};
@@ -91,8 +91,15 @@ impl ThumbManager {
     }
 
     fn upload(&mut self, ctx: &egui::Context, key: Key, img: &ThumbImage) -> egui::TextureHandle {
-        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.rgba);
-        let tex = ctx.load_texture(format!("thumb:{}:{}", key.0.display(), key.1), ci, egui::TextureOptions::LINEAR);
+        let ci = egui::ColorImage::from_rgba_unmultiplied(
+            [img.width as usize, img.height as usize],
+            &img.rgba,
+        );
+        let tex = ctx.load_texture(
+            format!("thumb:{}:{}", key.0.display(), key.1),
+            ci,
+            egui::TextureOptions::LINEAR,
+        );
         self.tex_bytes += img.byte_size();
         if let Some((_, old)) = self.textures.push(key, tex.clone()) {
             self.tex_bytes = self.tex_bytes.saturating_sub(tex_size(&old));
@@ -146,7 +153,12 @@ fn tex_size(t: &egui::TextureHandle) -> usize {
 }
 
 impl ThumbProvider for ThumbManager {
-    fn thumb(&mut self, ui: &egui::Ui, entry: &FileEntry, size: u32) -> Option<egui::TextureHandle> {
+    fn thumb(
+        &mut self,
+        ui: &egui::Ui,
+        entry: &FileEntry,
+        size: u32,
+    ) -> Option<egui::TextureHandle> {
         let px = (size as f32 * ui.ctx().pixels_per_point()).round() as u32;
         let bucket = bucket_for(px);
         let key = (entry.path.clone(), bucket);
@@ -170,11 +182,14 @@ impl ThumbProvider for ThumbManager {
                 forge_media::RequestStatus::MemoryHit(img) => {
                     return Some(self.upload(ui.ctx(), key, &img));
                 }
-                forge_media::RequestStatus::Queued | forge_media::RequestStatus::AlreadyInFlight => {
+                forge_media::RequestStatus::Queued
+                | forge_media::RequestStatus::AlreadyInFlight => {
                     self.pending.insert(key);
                 }
                 // Queue full / stale: try again on a later frame.
-                _ => ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)),
+                _ => ui
+                    .ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
         fallback

@@ -194,10 +194,7 @@ pub fn natural_cmp(a: &str, b: &str) -> Ordering {
                 }
             }
             (Some(x), Some(y)) => {
-                let o = x
-                    .to_lowercase()
-                    .cmp(y.to_lowercase())
-                    .then(Ordering::Equal);
+                let o = x.to_lowercase().cmp(y.to_lowercase()).then(Ordering::Equal);
                 if o != Ordering::Equal {
                     return o;
                 }

@@ -133,11 +133,13 @@ pub fn show(modal: &mut Modal, ctx: &egui::Context) -> Outcome {
             ui.set_width(560.0);
             ui.heading(title.as_str());
             ui.add_space(6.0);
-            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                for l in lines.iter() {
-                    ui.label(RichText::new(l).monospace().small());
-                }
-            });
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .show(ui, |ui| {
+                    for l in lines.iter() {
+                        ui.label(RichText::new(l).monospace().small());
+                    }
+                });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Copy report").clicked() {

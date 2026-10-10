@@ -11,8 +11,8 @@ use forge_db::AnnotationChange;
 
 use crate::app::ZxrawApp;
 use crate::commands::Cmd;
-use crate::modal::{self, Confirm, ConfirmKind, Modal, Outcome, Prompt, PromptKind};
 use crate::media_meta::{self, MediaMeta};
+use crate::modal::{self, Confirm, ConfirmKind, Modal, Outcome, Prompt, PromptKind};
 use crate::preview::{self, TextPreview};
 use crate::settings::{Paths, Settings};
 use crate::views::ThumbProvider;
@@ -23,11 +23,17 @@ pub enum Event {
     Error(String),
     /// A folder's contents changed; refresh panes showing it.
     Changed(PathBuf),
-    Report { title: String, lines: Vec<String> },
+    Report {
+        title: String,
+        lines: Vec<String>,
+    },
     Conflict(crate::ops_ui::ConflictQuestion),
     Undo(UndoEntry),
     /// Our Copy/Cut reached the Windows clipboard (`Ok(sequence)`) or failed.
-    ClipboardPublished { generation: u64, result: Result<u32, String> },
+    ClipboardPublished {
+        generation: u64,
+        result: Result<u32, String>,
+    },
     /// Paste: the Windows clipboard as read off the UI thread.
     PasteSystemRead {
         destination: PathBuf,
@@ -73,9 +79,17 @@ enum PasteSource {
 /// Which clipboard a paste should use. The newest copy wins: our in-app clipboard while
 /// its publish to Windows is still pending or is still what Windows holds; the Windows
 /// clipboard once something else has been copied since (e.g. in Explorer).
-fn choose_paste_source(in_app: Option<&FileClipboard>, system_sequence: u32, system_has_files: bool) -> PasteSource {
+fn choose_paste_source(
+    in_app: Option<&FileClipboard>,
+    system_sequence: u32,
+    system_has_files: bool,
+) -> PasteSource {
     let Some(cb) = in_app else {
-        return if system_has_files { PasteSource::System } else { PasteSource::Empty };
+        return if system_has_files {
+            PasteSource::System
+        } else {
+            PasteSource::Empty
+        };
     };
     let ours = match cb.published {
         None => return PasteSource::InApp,
@@ -121,11 +135,19 @@ pub struct GridProvider<'a> {
 }
 
 impl ThumbProvider for GridProvider<'_> {
-    fn thumb(&mut self, ui: &egui::Ui, e: &forge_core::FileEntry, size: u32) -> Option<egui::TextureHandle> {
+    fn thumb(
+        &mut self,
+        ui: &egui::Ui,
+        e: &forge_core::FileEntry,
+        size: u32,
+    ) -> Option<egui::TextureHandle> {
         self.thumbs.thumb(ui, e, size)
     }
     fn annotation(&self, path: &Path) -> Option<crate::views::Annotation> {
-        self.annotations.get(path).copied().filter(|a| *a != Default::default())
+        self.annotations
+            .get(path)
+            .copied()
+            .filter(|a| *a != Default::default())
     }
 }
 
@@ -164,7 +186,11 @@ impl Actions {
 
     /// Run a short shell action on a background thread (COM calls can block on slow
     /// shell extensions; they must never freeze the UI).
-    pub fn spawn_shell(&self, what: &'static str, f: impl FnOnce() -> Result<(), forge_win::WinError> + Send + 'static) {
+    pub fn spawn_shell(
+        &self,
+        what: &'static str,
+        f: impl FnOnce() -> Result<(), forge_win::WinError> + Send + 'static,
+    ) {
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         std::thread::spawn(move || {
@@ -193,17 +219,27 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::NewFolder => {
             let name = forge_core::paths::unique_name(&dir, "New folder");
             let name = forge_core::paths::name_of(&name);
-            app.ops.modal = Some(Modal::Prompt(Prompt::new(PromptKind::NewFolder { dir }, "New folder", name)));
+            app.ops.modal = Some(Modal::Prompt(Prompt::new(
+                PromptKind::NewFolder { dir },
+                "New folder",
+                name,
+            )));
         }
         Cmd::NewFile => {
             let name = forge_core::paths::unique_name(&dir, "New file.txt");
             let name = forge_core::paths::name_of(&name);
-            app.ops.modal = Some(Modal::Prompt(Prompt::new(PromptKind::NewFile { dir }, "New file", name)));
+            app.ops.modal = Some(Modal::Prompt(Prompt::new(
+                PromptKind::NewFile { dir },
+                "New file",
+                name,
+            )));
         }
         Cmd::Rename => {
             if let Some(e) = app.pane().cursor_entry().cloned() {
                 app.ops.modal = Some(Modal::Prompt(Prompt::new(
-                    PromptKind::Rename { path: e.path.clone() },
+                    PromptKind::Rename {
+                        path: e.path.clone(),
+                    },
                     "Rename",
                     e.name.clone(),
                 )));
@@ -233,9 +269,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             }
             if app.settings.confirm_recycle {
                 app.ops.modal = Some(Modal::Confirm(Confirm {
-                    body: format!("Move {} item(s) to the Recycle Bin?
+                    body: format!(
+                        "Move {} item(s) to the Recycle Bin?
 
-{}", targets.len(), modal::describe_items(&targets)),
+{}",
+                        targets.len(),
+                        modal::describe_items(&targets)
+                    ),
                     kind: ConfirmKind::Recycle(targets),
                     title: "Delete".into(),
                     confirm_label: "Move to Recycle Bin".into(),
@@ -248,24 +288,41 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Properties => {
             let t = app.pane().action_targets();
             let p = t.into_iter().next().unwrap_or_else(|| dir.clone());
-            app.ops.spawn_shell("Properties", move || forge_win::show_properties(&p));
+            app.ops
+                .spawn_shell("Properties", move || forge_win::show_properties(&p));
         }
         Cmd::OpenWith => {
             if let Some(p) = app.pane().action_targets().into_iter().next() {
-                app.ops.spawn_shell("Open with", move || forge_win::open_with_dialog(&p));
+                app.ops
+                    .spawn_shell("Open with", move || forge_win::open_with_dialog(&p));
             }
         }
         Cmd::RevealInExplorer => {
-            let p = app.pane().action_targets().into_iter().next().unwrap_or(dir);
-            app.ops.spawn_shell("Show in Explorer", move || forge_win::reveal_in_explorer(&p));
+            let p = app
+                .pane()
+                .action_targets()
+                .into_iter()
+                .next()
+                .unwrap_or(dir);
+            app.ops.spawn_shell("Show in Explorer", move || {
+                forge_win::reveal_in_explorer(&p)
+            });
         }
         Cmd::Copy | Cmd::Cut => {
             let paths = app.pane().action_targets();
             if !paths.is_empty() {
                 let cut = cmd == Cmd::Cut;
-                app.toast(format!("{} {} item(s)", if cut { "Cut" } else { "Copied" }, paths.len()));
+                app.toast(format!(
+                    "{} {} item(s)",
+                    if cut { "Cut" } else { "Copied" },
+                    paths.len()
+                ));
                 // Also publish to the Windows clipboard so Explorer and other apps can paste.
-                let effect = if cut { forge_win::ClipboardEffect::Move } else { forge_win::ClipboardEffect::Copy };
+                let effect = if cut {
+                    forge_win::ClipboardEffect::Move
+                } else {
+                    forge_win::ClipboardEffect::Copy
+                };
                 app.ops.clipboard_generation += 1;
                 let generation = app.ops.clipboard_generation;
                 let (tx, ctx, p2) = (app.ops.tx.clone(), app.ops.ctx.clone(), paths.clone());
@@ -292,7 +349,11 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             std::thread::spawn(move || {
                 let sequence = forge_win::clipboard_sequence();
                 let files = forge_win::get_files().ok().flatten();
-                let _ = tx.send(Event::PasteSystemRead { destination: dir, sequence, files });
+                let _ = tx.send(Event::PasteSystemRead {
+                    destination: dir,
+                    sequence,
+                    files,
+                });
                 ctx.request_repaint();
             });
         }
@@ -302,18 +363,40 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 return;
             };
             let paths = app.pane().action_targets();
-            let kind = if cmd == Cmd::CopyToOtherPane { OpKind::Copy } else { OpKind::Move };
+            let kind = if cmd == Cmd::CopyToOtherPane {
+                OpKind::Copy
+            } else {
+                OpKind::Move
+            };
             crate::ops_ui::start_transfer(app, paths, other, kind);
         }
         Cmd::ShowJobs => app.ops.show_jobs = !app.ops.show_jobs,
         Cmd::Rate0 | Cmd::Rate1 | Cmd::Rate2 | Cmd::Rate3 | Cmd::Rate4 | Cmd::Rate5 => {
-            let r = [Cmd::Rate0, Cmd::Rate1, Cmd::Rate2, Cmd::Rate3, Cmd::Rate4, Cmd::Rate5]
-                .iter()
-                .position(|c| *c == cmd)
-                .unwrap_or(0) as u8;
-            annotate_targets(app, AnnotationChange { rating: Some(r), ..Default::default() });
+            let r = [
+                Cmd::Rate0,
+                Cmd::Rate1,
+                Cmd::Rate2,
+                Cmd::Rate3,
+                Cmd::Rate4,
+                Cmd::Rate5,
+            ]
+            .iter()
+            .position(|c| *c == cmd)
+            .unwrap_or(0) as u8;
+            annotate_targets(
+                app,
+                AnnotationChange {
+                    rating: Some(r),
+                    ..Default::default()
+                },
+            );
         }
-        Cmd::LabelRed | Cmd::LabelYellow | Cmd::LabelGreen | Cmd::LabelBlue | Cmd::LabelPurple | Cmd::LabelNone => {
+        Cmd::LabelRed
+        | Cmd::LabelYellow
+        | Cmd::LabelGreen
+        | Cmd::LabelBlue
+        | Cmd::LabelPurple
+        | Cmd::LabelNone => {
             let label = match cmd {
                 Cmd::LabelRed => Some(ColorLabel::Red),
                 Cmd::LabelYellow => Some(ColorLabel::Yellow),
@@ -322,7 +405,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 Cmd::LabelPurple => Some(ColorLabel::Purple),
                 _ => None,
             };
-            annotate_targets(app, AnnotationChange { label: Some(label), ..Default::default() });
+            annotate_targets(
+                app,
+                AnnotationChange {
+                    label: Some(label),
+                    ..Default::default()
+                },
+            );
         }
         Cmd::MarkPick | Cmd::MarkReject | Cmd::Unflag => {
             let pick = match cmd {
@@ -330,7 +419,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 Cmd::MarkReject => PickState::Reject,
                 _ => PickState::None,
             };
-            annotate_targets(app, AnnotationChange { pick: Some(pick), ..Default::default() });
+            annotate_targets(
+                app,
+                AnnotationChange {
+                    pick: Some(pick),
+                    ..Default::default()
+                },
+            );
         }
         Cmd::IndexFolder => {
             let Some(db) = app.ops.library.db.clone() else {
@@ -364,7 +459,12 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 Cmd::ChecksumFiles => Tool::Checksums,
                 _ => Tool::CompareFolders,
             };
-            let sel: Vec<PathBuf> = app.pane().selected_entries().iter().map(|e| e.path.clone()).collect();
+            let sel: Vec<PathBuf> = app
+                .pane()
+                .selected_entries()
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
             let other = app.tab().other().map(|p| p.path.clone());
             app.ops.tools.open(tool, dir, sel, other);
         }
@@ -377,13 +477,17 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
             Some(UndoEntry::Rename(pairs)) => {
                 let r = forge_core::rename::undo(&pairs);
-                let dirs: std::collections::BTreeSet<PathBuf> =
-                    pairs.iter().filter_map(|(_, o)| o.parent().map(Path::to_path_buf)).collect();
+                let dirs: std::collections::BTreeSet<PathBuf> = pairs
+                    .iter()
+                    .filter_map(|(_, o)| o.parent().map(Path::to_path_buf))
+                    .collect();
                 for d in dirs {
                     app.refresh_all_showing(&d);
                 }
                 match r.status {
-                    forge_core::rename::RenameStatus::Completed => app.toast(format!("Undid rename of {} item(s)", pairs.len())),
+                    forge_core::rename::RenameStatus::Completed => {
+                        app.toast(format!("Undid rename of {} item(s)", pairs.len()))
+                    }
                     other => app.toast_err(format!("Undo failed: {other:?}")),
                 }
             }
@@ -414,7 +518,12 @@ fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
     app.ops.library.annotate(targets, change);
 }
 
-fn paste_with(app: &mut ZxrawApp, dest: PathBuf, sequence: u32, files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>) {
+fn paste_with(
+    app: &mut ZxrawApp,
+    dest: PathBuf,
+    sequence: u32,
+    files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>,
+) {
     match choose_paste_source(app.ops.clipboard.as_ref(), sequence, files.is_some()) {
         PasteSource::Empty => app.toast("Clipboard is empty"),
         PasteSource::System => {
@@ -428,14 +537,22 @@ fn paste_with(app: &mut ZxrawApp, dest: PathBuf, sequence: u32, files: Option<(V
             }
         }
         PasteSource::InApp => {
-            let Some(cb) = app.ops.clipboard.as_ref() else { return };
+            let Some(cb) = app.ops.clipboard.as_ref() else {
+                return;
+            };
             let (paths, cut, generation) = (cb.paths.clone(), cb.cut, cb.generation);
             let published = match cb.published {
                 Some(Ok(seq)) => Some(seq),
                 _ => None,
             };
             if cut {
-                if !crate::ops_ui::start_clipboard_move(app, paths, dest, Some(generation), published) {
+                if !crate::ops_ui::start_clipboard_move(
+                    app,
+                    paths,
+                    dest,
+                    Some(generation),
+                    published,
+                ) {
                     app.toast("Nothing to move: the items are already in this folder");
                 }
             } else {
@@ -447,28 +564,35 @@ fn paste_with(app: &mut ZxrawApp, dest: PathBuf, sequence: u32, files: Option<(V
 
 pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let n = targets.len();
-    let dirs: Vec<PathBuf> = targets.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+    let dirs: Vec<PathBuf> = targets
+        .iter()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
-    app.ops.jobs.spawn("delete", format!("Deleting {n} item(s)"), move |h| {
-        h.progress.add_total_items(n as u64);
-        let r = forge_win::recycle(&targets);
-        h.progress.add_items(n as u64);
-        let mut seen = std::collections::HashSet::new();
-        for d in dirs {
-            if seen.insert(d.clone()) {
-                let _ = tx.send(Event::Changed(d));
+    app.ops
+        .jobs
+        .spawn("delete", format!("Deleting {n} item(s)"), move |h| {
+            h.progress.add_total_items(n as u64);
+            let r = forge_win::recycle(&targets);
+            h.progress.add_items(n as u64);
+            let mut seen = std::collections::HashSet::new();
+            for d in dirs {
+                if seen.insert(d.clone()) {
+                    let _ = tx.send(Event::Changed(d));
+                }
             }
-        }
-        let msg = match &r {
-            Ok(()) => Event::Toast(format!("Moved {n} item(s) to the Recycle Bin")),
-            Err(forge_win::WinError::Aborted { .. }) => Event::Toast("Delete was cancelled; some items were not deleted".into()),
-            Err(e) => Event::Error(format!("Delete failed: {e}")),
-        };
-        let _ = tx.send(msg);
-        ctx.request_repaint();
-        r.map_err(|e| e.to_string())
-    });
+            let msg = match &r {
+                Ok(()) => Event::Toast(format!("Moved {n} item(s) to the Recycle Bin")),
+                Err(forge_win::WinError::Aborted { .. }) => {
+                    Event::Toast("Delete was cancelled; some items were not deleted".into())
+                }
+                Err(e) => Event::Error(format!("Delete failed: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+            r.map_err(|e| e.to_string())
+        });
 }
 
 pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
@@ -478,14 +602,19 @@ pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: 
 
 pub fn open_file(app: &mut ZxrawApp, path: &Path) {
     let p = path.to_path_buf();
-    app.ops.spawn_shell("Open", move || forge_win::open_default(&p));
+    app.ops
+        .spawn_shell("Open", move || forge_win::open_default(&p));
 }
 
 pub fn poll(app: &mut ZxrawApp) -> bool {
     let folders: Vec<PathBuf> = app
         .tabs
         .get(app.active)
-        .map(|t| std::iter::once(t.left.path.clone()).chain(t.right.as_ref().map(|r| r.path.clone())).collect())
+        .map(|t| {
+            std::iter::once(t.left.path.clone())
+                .chain(t.right.as_ref().map(|r| r.path.clone()))
+                .collect()
+        })
         .unwrap_or_default();
     for f in &folders {
         app.ops.library.ensure_dir(f);
@@ -529,20 +658,35 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             }
             Event::Conflict(q) => app.ops.conflicts.push_back(q),
             Event::ClipboardPublished { generation, result } => {
-                if let Some(cb) = app.ops.clipboard.as_mut().filter(|cb| cb.generation == generation) {
+                if let Some(cb) = app
+                    .ops
+                    .clipboard
+                    .as_mut()
+                    .filter(|cb| cb.generation == generation)
+                {
                     cb.published = Some(result.as_ref().map(|s| *s).map_err(|_| ()));
                 }
                 if let Err(e) = result {
                     tracing::warn!("publishing files to the Windows clipboard failed: {e}");
                 }
             }
-            Event::PasteSystemRead { destination, sequence, files } => paste_with(app, destination, sequence, files),
-            Event::MoveFinished { sources, ok, clipboard_generation, expected_sequence } => {
+            Event::PasteSystemRead {
+                destination,
+                sequence,
+                files,
+            } => paste_with(app, destination, sequence, files),
+            Event::MoveFinished {
+                sources,
+                ok,
+                clipboard_generation,
+                expected_sequence,
+            } => {
                 // A cut is consumed only by a complete, successful move (like Explorer); a
                 // failed or cancelled move leaves it on the clipboard to retry.
                 if ok {
                     if clipboard_generation.is_some()
-                        && app.ops.clipboard.as_ref().map(|cb| cb.generation) == clipboard_generation
+                        && app.ops.clipboard.as_ref().map(|cb| cb.generation)
+                            == clipboard_generation
                     {
                         app.ops.clipboard = None;
                     }
@@ -567,7 +711,8 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
 pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
     let running = app.ops.jobs.running_count();
     let label = if running > 0 {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(250));
         let fr = app
             .ops
             .jobs
@@ -587,7 +732,14 @@ pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
         app.ops.show_jobs = !app.ops.show_jobs;
     }
     if let Some(cb) = &app.ops.clipboard {
-        ui.label(RichText::new(format!("📋 {} {}", cb.paths.len(), if cb.cut { "cut" } else { "copied" })).weak());
+        ui.label(
+            RichText::new(format!(
+                "📋 {} {}",
+                cb.paths.len(),
+                if cb.cut { "cut" } else { "copied" }
+            ))
+            .weak(),
+        );
     }
 }
 
@@ -595,7 +747,9 @@ pub fn shutdown(app: &mut ZxrawApp) {
     // Cancel running jobs; copies clean up their partial files on cancel.
     app.ops.jobs.cancel_all();
     for q in app.ops.conflicts.drain(..) {
-        let _ = q.reply.send(forge_core::ops::Resolution::once(forge_core::ops::ConflictDecision::Cancel));
+        let _ = q.reply.send(forge_core::ops::Resolution::once(
+            forge_core::ops::ConflictDecision::Cancel,
+        ));
     }
     let t0 = std::time::Instant::now();
     while app.ops.jobs.running_count() > 0 && t0.elapsed() < std::time::Duration::from_secs(3) {
@@ -626,11 +780,16 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
                 for d in dirs {
                     app.refresh_all_showing(&d);
                 }
-                app.ops.modal = Some(Modal::Report { title: "Batch rename".into(), lines: report });
+                app.ops.modal = Some(Modal::Report {
+                    title: "Batch rename".into(),
+                    lines: report,
+                });
             }
         }
     }
-    let Some(mut m) = app.ops.modal.take() else { return };
+    let Some(mut m) = app.ops.modal.take() else {
+        return;
+    };
     match modal::show(&mut m, ui.ctx()) {
         Outcome::None => app.ops.modal = Some(m),
         Outcome::Cancel => {}
@@ -652,22 +811,34 @@ fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                 return Some(Modal::Prompt(p));
             }
             let (res, dir) = match &p.kind {
-                PromptKind::NewFolder { dir } => (std::fs::create_dir(dir.join(&name)), dir.clone()),
+                PromptKind::NewFolder { dir } => {
+                    (std::fs::create_dir(dir.join(&name)), dir.clone())
+                }
                 PromptKind::NewFile { dir } => (
-                    std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&name)).map(|_| ()),
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(dir.join(&name))
+                        .map(|_| ()),
                     dir.clone(),
                 ),
                 PromptKind::Rename { path } => {
                     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
                     let target = dir.join(&name);
-                    let case_only = target != *path && forge_core::paths::paths_equal(&target, path);
+                    let case_only =
+                        target != *path && forge_core::paths::paths_equal(&target, path);
                     let res = if target.exists() && !case_only {
-                        Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "a file with that name already exists"))
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "a file with that name already exists",
+                        ))
                     } else {
                         std::fs::rename(path, &target)
                     };
                     if res.is_ok() {
-                        app.ops.undo.push(UndoEntry::Rename(vec![(target.clone(), path.clone())]));
+                        app.ops
+                            .undo
+                            .push(UndoEntry::Rename(vec![(target.clone(), path.clone())]));
                     }
                     (res, dir)
                 }
@@ -715,25 +886,27 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
             ui.vertical_centered(|ui| ui.spinner());
         }
         ui.add_space(6.0);
-        egui::ScrollArea::vertical().id_salt("preview-meta").show(ui, |ui| {
-            preview::info_grid(ui, &e);
-            ui.separator();
-            match app.ops.meta.get(&e, ui.ctx()) {
-                Some(Ok(MediaMeta::Image(m))) => media_meta::image_grid(ui, &m),
-                Some(Ok(MediaMeta::Video(m))) => {
-                    media_meta::video_grid(ui, &m);
+        egui::ScrollArea::vertical()
+            .id_salt("preview-meta")
+            .show(ui, |ui| {
+                preview::info_grid(ui, &e);
+                ui.separator();
+                match app.ops.meta.get(&e, ui.ctx()) {
+                    Some(Ok(MediaMeta::Image(m))) => media_meta::image_grid(ui, &m),
+                    Some(Ok(MediaMeta::Video(m))) => {
+                        media_meta::video_grid(ui, &m);
+                    }
+                    Some(Err(err)) => {
+                        ui.label(RichText::new(format!("Metadata unavailable: {err}")).weak());
+                    }
+                    None => {
+                        ui.spinner();
+                    }
                 }
-                Some(Err(err)) => {
-                    ui.label(RichText::new(format!("Metadata unavailable: {err}")).weak());
+                if e.media_kind() == forge_core::MediaKind::Video {
+                    crate::video_ui::preview(app, ui, &e);
                 }
-                None => {
-                    ui.spinner();
-                }
-            }
-            if e.media_kind() == forge_core::MediaKind::Video {
-                crate::video_ui::preview(app, ui, &e);
-            }
-        });
+            });
         return;
     }
     preview::info_grid(ui, &e);
@@ -779,15 +952,33 @@ mod clipboard_tests {
         assert_eq!(choose_paste_source(None, 5, true), PasteSource::System);
         assert_eq!(choose_paste_source(None, 5, false), PasteSource::Empty);
         // Our publish is still pending: never paste stale Explorer paths.
-        assert_eq!(choose_paste_source(Some(&cb(None, 4)), 4, true), PasteSource::InApp);
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 4, true),
+            PasteSource::InApp
+        );
         // Published and still current: ours.
-        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, true), PasteSource::InApp);
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, true),
+            PasteSource::InApp
+        );
         // Something was copied in Explorer afterwards: theirs.
-        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, true), PasteSource::System);
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, true),
+            PasteSource::System
+        );
         // Text copied afterwards (no files): fall back to ours rather than doing nothing.
-        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, false), PasteSource::InApp);
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, false),
+            PasteSource::InApp
+        );
         // Publish failed: compare against the sequence from before our copy.
-        assert_eq!(choose_paste_source(Some(&cb(Some(Err(())), 4)), 4, true), PasteSource::InApp);
-        assert_eq!(choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, true), PasteSource::System);
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 4, true),
+            PasteSource::InApp
+        );
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, true),
+            PasteSource::System
+        );
     }
 }

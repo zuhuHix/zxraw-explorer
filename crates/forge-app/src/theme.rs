@@ -36,8 +36,20 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
     v.faint_bg_color = faint;
     v.window_stroke = Stroke::new(1.0, border);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
-    v.selection.bg_fill = ACCENT.linear_multiply(if dark { 0.45 } else { 0.30 });
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    // Keep selected list rows opaque, with text colors that retain WCAG AA contrast.
+    v.selection.bg_fill = if dark {
+        Color32::from_rgb(39, 85, 139)
+    } else {
+        Color32::from_rgb(216, 231, 255)
+    };
+    v.selection.stroke = Stroke::new(
+        1.0,
+        if dark {
+            Color32::WHITE
+        } else {
+            Color32::from_rgb(17, 36, 58)
+        },
+    );
     v.hyperlink_color = ACCENT;
     let r = CornerRadius::same(4);
     v.widgets.noninteractive.corner_radius = r;
