@@ -110,6 +110,7 @@ pub fn type_label(e: &FileEntry) -> String {
 const CONTEXT_FILE: &[Option<Cmd>] = &[
     Some(Cmd::Open),
     Some(Cmd::OpenWith),
+    Some(Cmd::OpenIn),
     Some(Cmd::RevealInExplorer),
     None,
     Some(Cmd::Cut),

@@ -76,6 +76,7 @@ pub enum Cmd {
     MarkReject,
     Unflag,
     IndexFolder,
+    OpenIn,
 }
 
 impl Cmd {
@@ -151,6 +152,7 @@ impl Cmd {
         Cmd::MarkReject,
         Cmd::Unflag,
         Cmd::IndexFolder,
+        Cmd::OpenIn,
     ];
 
     pub fn label(self) -> &'static str {
@@ -227,6 +229,7 @@ impl Cmd {
             MarkReject => "Mark as reject",
             Unflag => "Clear pick/reject",
             IndexFolder => "Index this folder for search",
+            OpenIn => "Open in external app…",
         }
     }
 

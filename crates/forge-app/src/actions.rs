@@ -58,6 +58,9 @@ pub struct Actions {
     pub ctx: egui::Context,
     pub thumbs: crate::thumbs::ThumbManager,
     pub library: crate::library::Library,
+    pub ingest: crate::ingest_ui::IngestState,
+    pub tools: crate::tools_ui::ToolsState,
+    pub settings_ui: crate::settings_ui::SettingsUi,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -90,6 +93,9 @@ impl Actions {
             jobs: forge_jobs::JobRegistry::new(),
             tx,
             rx,
+            ingest: Default::default(),
+            tools: Default::default(),
+            settings_ui: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -266,6 +272,21 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             });
             app.toast("Indexing started — see Operations");
         }
+        Cmd::Ingest => app.ops.ingest.open = true,
+        Cmd::Settings => app.ops.settings_ui.open = true,
+        Cmd::OpenIn => crate::settings_ui::open_in(app),
+        Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {
+            use crate::tools_ui::Tool;
+            let tool = match cmd {
+                Cmd::FolderSize => Tool::FolderSize,
+                Cmd::FindDuplicates => Tool::Duplicates,
+                Cmd::ChecksumFiles => Tool::Checksums,
+                _ => Tool::CompareFolders,
+            };
+            let sel: Vec<PathBuf> = app.pane().selected_entries().iter().map(|e| e.path.clone()).collect();
+            let other = app.tab().other().map(|p| p.path.clone());
+            app.ops.tools.open(tool, dir, sel, other);
+        }
         Cmd::Search => {
             app.ops.library.search.open = true;
             app.ops.library.search.focus = true;
@@ -435,6 +456,9 @@ pub fn shutdown(app: &mut ZxrawApp) {
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::ops_ui::jobs_window(app, ui.ctx());
     crate::search_ui::window(app, ui.ctx());
+    crate::ingest_ui::window(app, ui.ctx());
+    crate::tools_ui::windows(app, ui.ctx());
+    crate::settings_ui::window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }
