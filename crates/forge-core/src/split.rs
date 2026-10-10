@@ -461,23 +461,25 @@ fn create_temp(final_path: &Path) -> Result<(PathBuf, File, TempGuard)> {
 }
 
 fn publish_temp(temp: &Path, final_path: &Path) -> Result<()> {
-    #[cfg(windows)]
+    // std::fs::rename replaces an existing destination on Windows and POSIX, and hard links
+    // are unavailable on FAT32. Reserve the name exclusively first; the rename then only
+    // replaces our own empty placeholder, so a file created after the earlier existence
+    // check is never clobbered.
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(final_path)
     {
-        // Windows rename fails when the destination already exists, giving us an atomic
-        // no-clobber publish while also working on FAT32 volumes (which lack hard links).
-        fs::rename(temp, final_path).map_err(|e| CoreError::io(final_path, e))
-    }
-    #[cfg(not(windows))]
-    {
-        // POSIX rename replaces an existing path. A same-volume hard link is atomic and
-        // fails if the destination exists; removing the temp name completes the publish.
-        fs::hard_link(temp, final_path).map_err(|e| CoreError::io(final_path, e))?;
-        if let Err(e) = fs::remove_file(temp) {
-            let _ = fs::remove_file(final_path);
-            return Err(CoreError::io(temp, e));
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::AlreadyExists(final_path.to_path_buf()));
         }
-        Ok(())
+        Err(e) => return Err(CoreError::io(final_path, e)),
     }
+    fs::rename(temp, final_path).map_err(|e| {
+        let _ = fs::remove_file(final_path);
+        CoreError::io(final_path, e)
+    })
 }
 
 fn read_retry(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
@@ -752,6 +754,21 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".forge-partial-")
         }));
+    }
+
+    #[test]
+    fn publish_never_replaces_an_existing_destination() {
+        let temp = TempDir::new().unwrap();
+        let final_path = temp.path().join("taken.bin");
+        let staged = temp.path().join("staged.tmp");
+        fs::write(&final_path, b"someone else's file").unwrap();
+        fs::write(&staged, b"new data").unwrap();
+        assert!(matches!(
+            publish_temp(&staged, &final_path),
+            Err(CoreError::AlreadyExists(_))
+        ));
+        assert_eq!(fs::read(&final_path).unwrap(), b"someone else's file");
+        assert!(staged.exists());
     }
 
     #[test]

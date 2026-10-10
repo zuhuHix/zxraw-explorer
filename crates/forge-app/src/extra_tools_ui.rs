@@ -143,17 +143,17 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 
     if let Some(state) = &mut tools.archive {
-        if let Some(rx) = &state.list_result {
-            if let Ok(result) = rx.try_recv() {
-                match result {
-                    Ok(entries) => {
-                        state.entries = entries;
-                        state.list_result = None;
-                    }
-                    Err(error) => {
-                        state.notice = Some(error);
-                        state.list_result = None;
-                    }
+        if let Some(rx) = &state.list_result
+            && let Ok(result) = rx.try_recv()
+        {
+            match result {
+                Ok(entries) => {
+                    state.entries = entries;
+                    state.list_result = None;
+                }
+                Err(error) => {
+                    state.notice = Some(error);
+                    state.list_result = None;
                 }
             }
         }
@@ -207,7 +207,6 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
                         destination,
                         entries,
                         selected_names,
-                        selected_only,
                     );
                     state.extract_job = Some(job);
                     state.notice = Some(if selected_only {
@@ -1211,15 +1210,13 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
             });
             if !state.entries.is_empty() {
                 ui.horizontal(|ui| {
-                    ui.strong("Entry");
-                    ui.add_space(250.0);
-                    ui.strong("Size");
-                    ui.add_space(36.0);
-                    ui.strong("Packed");
-                    ui.add_space(28.0);
-                    ui.strong("Modified");
-                    ui.add_space(44.0);
-                    ui.strong("Safety");
+                    // Same width as the row checkbox so the headers line up with the cells.
+                    ui.add_space(ui.spacing().icon_width);
+                    table_cell(ui, ARCHIVE_NAME_W, RichText::new("Entry").strong());
+                    table_cell(ui, ARCHIVE_SIZE_W, RichText::new("Size").strong());
+                    table_cell(ui, ARCHIVE_SIZE_W, RichText::new("Packed").strong());
+                    table_cell(ui, ARCHIVE_DATE_W, RichText::new("Modified").strong());
+                    table_cell(ui, ARCHIVE_SAFETY_W, RichText::new("Safety").strong());
                 });
                 egui::ScrollArea::vertical().max_height(380.0).show_rows(
                     ui,
@@ -1237,26 +1234,25 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
                                         state.selected.remove(&entry.name);
                                     }
                                 }
-                                ui.add_sized(
-                                    [330.0, 22.0],
-                                    egui::Label::new(if entry.is_dir {
+                                table_cell(
+                                    ui,
+                                    ARCHIVE_NAME_W,
+                                    if entry.is_dir {
                                         RichText::new(format!("📁 {}", entry.name)).strong()
                                     } else {
                                         RichText::new(&entry.name)
-                                    })
-                                    .truncate(),
+                                    },
                                 );
-                                ui.add_sized(
-                                    [88.0, 22.0],
-                                    egui::Label::new(format_size(entry.size)).truncate(),
+                                table_cell(ui, ARCHIVE_SIZE_W, RichText::new(format_size(entry.size)));
+                                table_cell(
+                                    ui,
+                                    ARCHIVE_SIZE_W,
+                                    RichText::new(format_size(entry.compressed_size)),
                                 );
-                                ui.add_sized(
-                                    [88.0, 22.0],
-                                    egui::Label::new(format_size(entry.compressed_size)).truncate(),
-                                );
-                                ui.add_sized(
-                                    [140.0, 22.0],
-                                    egui::Label::new(format_system_time(entry.modified)).truncate(),
+                                table_cell(
+                                    ui,
+                                    ARCHIVE_DATE_W,
+                                    RichText::new(format_system_time(entry.modified)),
                                 );
                                 let safety = if !entry.safe_name {
                                     "Unsafe name"
@@ -1267,7 +1263,7 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
                                 } else {
                                     "Safe"
                                 };
-                                ui.add_sized([112.0, 22.0], egui::Label::new(safety).truncate());
+                                table_cell(ui, ARCHIVE_SAFETY_W, RichText::new(safety));
                             });
                         }
                     },
@@ -1319,6 +1315,20 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
     state.open = open;
 }
 
+const ARCHIVE_NAME_W: f32 = 330.0;
+const ARCHIVE_SIZE_W: f32 = 88.0;
+const ARCHIVE_DATE_W: f32 = 140.0;
+const ARCHIVE_SAFETY_W: f32 = 112.0;
+
+/// One fixed-width, left-aligned, truncated table cell; shared by header and rows.
+fn table_cell(ui: &mut Ui, width: f32, text: RichText) {
+    ui.scope(|ui| {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+        ui.add(egui::Label::new(text).truncate());
+    });
+}
+
 fn start_extract_archive(
     jobs: &JobRegistry,
     event_tx: &crossbeam_channel::Sender<Event>,
@@ -1327,8 +1337,9 @@ fn start_extract_archive(
     destination: PathBuf,
     entries: Vec<ArchiveEntry>,
     selected_names: HashSet<String>,
-    selected_only: bool,
 ) -> JobHandle {
+    // Only the "Extract selected" button supplies names; "Extract all" passes an empty set.
+    let selected_only = !selected_names.is_empty();
     let archive = archive.to_path_buf();
     let title = if selected_only {
         format!("Extracting selected entries from {}", archive.display())
@@ -1849,5 +1860,51 @@ mod tests {
         assert!(titled.height > plain.height);
         assert!(sheet_layout(usize::MAX, usize::MAX, u32::MAX, 9, true).width <= 16_384);
         assert!(sheet_layout(usize::MAX, usize::MAX, u32::MAX, 9, true).height <= 16_384);
+    }
+
+    /// Renders a real sheet from the demo photos into `%TEMP%`; run with `--ignored`.
+    #[test]
+    #[ignore = "writes a demo contact sheet from C:\\tmp\\forge-demo\\Photos"]
+    fn demo_contact_sheet_from_photos() {
+        let dir = Path::new(r"C:\tmp\forge-demo\Photos");
+        let mut paths: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("jpg")))
+            .collect();
+        paths.sort();
+        let sources: Vec<SheetSource> = paths
+            .into_iter()
+            .enumerate()
+            .map(|(i, path)| SheetSource {
+                path,
+                rating: Some((i % 5) as u8 + 1),
+            })
+            .collect();
+        let output_dir = std::env::temp_dir().join("zxraw-contact-sheet-demo");
+        let _ = fs::remove_dir_all(&output_dir);
+        let options = SheetOptions {
+            columns: 6,
+            rows: 6,
+            thumbnail_size: 128,
+            captions_file_name: true,
+            captions_rating: true,
+            captions_exif: true,
+            page_title: "Forge demo photos".into(),
+            dark_background: true,
+            format: SheetFormat::Png,
+            output_dir: output_dir.clone(),
+            output_stem: "contact-sheet".into(),
+        };
+        let cancel = forge_jobs::CancelToken::new();
+        let progress = forge_jobs::Progress::default();
+        let pages = build_contact_sheets(
+            &sources,
+            &options,
+            &JobCtx::new(&cancel, &progress),
+        )
+        .unwrap();
+        assert_eq!(pages.len(), 1);
+        println!("contact sheet: {}", pages[0].display());
     }
 }
