@@ -3,7 +3,7 @@
 //! Everything here is *lexical* (no filesystem access) unless stated otherwise, so it can be
 //! used on paths that do not exist yet and is cheap enough for the UI thread.
 //!
-//! Validation rules are Windows rules on every platform: Forge is a Windows file manager and
+//! Validation rules are Windows rules on every platform: ZXraw Explorer is a Windows file manager and
 //! names it creates should stay valid when the data is later copied to an NTFS/exFAT volume.
 
 use std::ffi::OsStr;

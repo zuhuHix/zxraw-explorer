@@ -7,7 +7,7 @@ use std::time::Duration;
 use egui::{RichText, Ui};
 use parking_lot::Mutex;
 
-use crate::app::ForgeApp;
+use crate::app::ZxrawApp;
 use crate::theme;
 use crate::views::DragPaths;
 
@@ -60,7 +60,7 @@ impl SidebarState {
     }
 }
 
-fn nav_item(app: &mut ForgeApp, ui: &mut Ui, icon: &str, label: &str, path: &PathBuf, sub: Option<String>) -> egui::Response {
+fn nav_item(app: &mut ZxrawApp, ui: &mut Ui, icon: &str, label: &str, path: &PathBuf, sub: Option<String>) -> egui::Response {
     let current = &app.pane().path == path;
     let text = match &sub {
         Some(s) => format!("{icon}  {label}   {s}"),
@@ -83,7 +83,7 @@ fn nav_item(app: &mut ForgeApp, ui: &mut Ui, icon: &str, label: &str, path: &Pat
     r
 }
 
-pub fn show(app: &mut ForgeApp, ui: &mut Ui) {
+pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(4.0);
         section(ui, "Quick access");

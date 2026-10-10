@@ -1,4 +1,7 @@
-# Forge — Architecture
+# ZXraw Explorer — Architecture
+
+The product is called **ZXraw Explorer**. Internal crates keep the `forge-*` prefix from the
+project's working name; it never appears in the UI.
 
 ## Decisions
 
@@ -10,14 +13,14 @@
 | Hashing | BLAKE3 (verification/duplicates), xxh3 (quick partial-hash prefilter) | BLAKE3 is fast and cryptographically strong; xxh3 is cheap for staging. |
 | Images | `image` crate (JPEG/PNG/TIFF/WebP/GIF/BMP) + WIC fallback (Phase 3) | Pure Rust decoders for the common path; WIC adds HEIC/AVIF/RAW codecs the user has installed. |
 | RAW | Embedded JPEG previews extracted via EXIF/TIFF IFD parsing (`kamadak-exif`) | Every mainstream RAW embeds a full-size or large JPEG preview. We do not develop RAWs (explicit non-goal). |
-| Video | **External `ffprobe`/`ffmpeg` executables**, discovered on PATH or configured | No linking → no LGPL/GPL redistribution obligations in our binary, crash isolation (a codec crash kills a child process, not Forge), hard timeouts. Forge works fully without them; video metadata/thumbnails degrade gracefully. |
+| Video | **External `ffprobe`/`ffmpeg` executables**, discovered on PATH or configured | No linking → no LGPL/GPL redistribution obligations in our binary, crash isolation (a codec crash kills a child process, not the app), hard timeouts. ZXraw Explorer works fully without them; video metadata/thumbnails degrade gracefully. |
 | Archives | `zip` crate for browse/extract/create; path traversal checked | 7z/RAR: not yet (documented limitation). |
 | Windows shell | `windows` crate 0.62 | Recycle Bin (`IFileOperation`), ShellExecute/"Open with", drive enumeration, Properties dialog. |
 
 ## Crates
 
 ```
-forge-app   (bin "forge")   egui UI, interaction state, session restore
+forge-app   (bin "zxraw")   egui UI, interaction state, session restore
    ├── forge-core           platform-independent FS engine
    │     model, listing, paths, ops, rename, hashing, duplicates,
    │     disk_usage, compare, query, ingest, archive
@@ -25,7 +28,7 @@ forge-app   (bin "forge")   egui UI, interaction state, session restore
    ├── forge-media          image/RAW/video metadata, thumbnail pipeline, thumbnail disk cache
    ├── forge-win            Windows-only shell integration (no-ops / errors elsewhere)
    └── forge-jobs           CancelToken, Progress, bounded priority WorkerPool, JobRegistry
-forge-cli   (bin "forge-cli") hashing, duplicates, rename preview, ingest from the terminal
+forge-cli   (bin "zxraw-cli") hashing, duplicates, rename preview, ingest from the terminal
 ```
 
 Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) ← `forge-app`.
@@ -50,10 +53,10 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
 
 ## Data locations
 
-* Settings/session: `%APPDATA%\Forge\config\` (JSON, atomic write-rename)
-* Database: `%LOCALAPPDATA%\Forge\data\forge.db`
-* Thumbnail cache: `%LOCALAPPDATA%\Forge\cache\thumbs\` (keyed by path hash + size + mtime)
-* Logs: `%LOCALAPPDATA%\Forge\logs\` (rotating; paths are logged at debug level only)
+* Settings/session: `%APPDATA%\ZXraw Explorer\config\` (JSON, atomic write-rename)
+* Database: `%LOCALAPPDATA%\ZXraw Explorer\data\forge.db`
+* Thumbnail cache: `%LOCALAPPDATA%\ZXraw Explorer\cache\thumbs\` (keyed by path hash + size + mtime)
+* Logs: `%LOCALAPPDATA%\ZXraw Explorer\data\logs\zxraw.log.*` (rotating; paths are logged at debug level only)
 
 ## Safety invariants
 

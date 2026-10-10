@@ -1,4 +1,4 @@
-//! Forge filesystem engine. Platform-independent; Windows specifics live in `forge-win`.
+//! ZXraw Explorer filesystem engine. Platform-independent; Windows specifics live in `forge-win`.
 //!
 //! Module ownership (see docs/ARCHITECTURE.md):
 //! * `model`, `listing`, `paths`, `error` — shared types & directory enumeration

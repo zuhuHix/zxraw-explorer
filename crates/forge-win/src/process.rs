@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use crate::{Result, WinError};
 
 /// Starts `exe` with `args` as an argument vector (no shell is involved), optionally in
-/// working directory `cwd`. The process is detached: its handle is dropped and Forge does
+/// working directory `cwd`. The process is detached: its handle is dropped and ZXraw Explorer does
 /// not wait for it or kill it. Standard streams are connected to nothing.
 ///
 /// Batch scripts (`.bat`, `.cmd`) are refused: Windows runs them through `cmd.exe`, where

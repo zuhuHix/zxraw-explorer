@@ -12,7 +12,7 @@ use forge_core::ops::{
 use forge_jobs::{JobHandle, JobState};
 
 use crate::actions::{Event, UndoEntry};
-use crate::app::ForgeApp;
+use crate::app::ZxrawApp;
 use crate::views;
 
 /// A conflict waiting for the user, with the channel the job thread is blocked on.
@@ -24,7 +24,7 @@ pub struct ConflictQuestion {
 }
 
 /// Start a copy or move of `sources` into `dest` as a background job.
-pub fn start_transfer(app: &mut ForgeApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
+pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
     if sources.is_empty() {
         return;
     }
@@ -123,7 +123,7 @@ fn finish_report(job: &JobHandle, report: &OpReport, tx: &Sender<Event>, dests: 
     }
 }
 
-pub fn delete_permanently(app: &mut ForgeApp, targets: Vec<PathBuf>) {
+pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let n = targets.len();
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -136,7 +136,7 @@ pub fn delete_permanently(app: &mut ForgeApp, targets: Vec<PathBuf>) {
     });
 }
 
-pub fn undo_ops(app: &mut ForgeApp, records: Vec<ops::UndoRecord>) {
+pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
     app.ops.jobs.spawn("undo", format!("Undoing {} change(s)", records.len()), move |job| {
@@ -167,7 +167,7 @@ pub fn undo_ops(app: &mut ForgeApp, records: Vec<ops::UndoRecord>) {
 }
 
 /// Conflict dialog. Returns true while a question is being shown.
-pub fn conflict_dialog(app: &mut ForgeApp, ctx: &egui::Context) -> bool {
+pub fn conflict_dialog(app: &mut ZxrawApp, ctx: &egui::Context) -> bool {
     let Some(q) = app.ops.conflicts.front_mut() else { return false };
     let mut answer = None;
     egui::Modal::new(egui::Id::new("conflict")).show(ctx, |ui| {
@@ -234,7 +234,7 @@ pub fn conflict_dialog(app: &mut ForgeApp, ctx: &egui::Context) -> bool {
     true
 }
 
-pub fn jobs_window(app: &mut ForgeApp, ctx: &egui::Context) {
+pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     let mut open = app.ops.show_jobs;
     egui::Window::new("Operations")
         .open(&mut open)

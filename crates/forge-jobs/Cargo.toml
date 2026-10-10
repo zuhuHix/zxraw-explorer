@@ -1,6 +1,6 @@
 [package]
 name = "forge-jobs"
-description = "Bounded worker pools, cancellation tokens and progress reporting for Forge background work."
+description = "Bounded worker pools, cancellation tokens and progress reporting for ZXraw Explorer background work."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

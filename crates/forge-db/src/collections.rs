@@ -444,7 +444,7 @@ impl Db {
     pub fn import_collections(&self, data: &CollectionsExport) -> Result<ImportReport> {
         if data.format != EXPORT_FORMAT {
             return Err(DbError::Invalid(format!(
-                "not a Forge collections file (format '{}')",
+                "not a ZXraw Explorer collections file (format '{}')",
                 data.format
             )));
         }

@@ -58,7 +58,7 @@ pub struct Toast {
     pub until: Instant,
 }
 
-pub struct ForgeApp {
+pub struct ZxrawApp {
     pub paths: Paths,
     pub settings: Settings,
     pub tabs: Vec<Tab>,
@@ -77,7 +77,7 @@ pub struct ForgeApp {
     last_session_save: Instant,
 }
 
-impl ForgeApp {
+impl ZxrawApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
         crate::fonts::install(&cc.egui_ctx);
         let settings: Settings = settings::load_json(&paths.config.join("settings.json"));
@@ -724,7 +724,7 @@ impl ForgeApp {
     }
 }
 
-impl eframe::App for ForgeApp {
+impl eframe::App for ZxrawApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut changed = false;
         for t in &mut self.tabs {
@@ -734,7 +734,7 @@ impl eframe::App for ForgeApp {
             }
         }
         changed |= crate::actions::poll(self);
-        if changed || self.tabs.iter().any(|t| t.left.is_loading()) {
+        if changed || self.ops.thumbs.busy() || self.tabs.iter().any(|t| t.left.is_loading()) {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         if self.last_session_save.elapsed() > Duration::from_secs(30) {
@@ -764,7 +764,7 @@ impl eframe::App for ForgeApp {
 
         self.handle_keys(&ctx);
 
-        let title = format!("{} — Forge", self.pane().path.display());
+        let title = format!("{} — ZXraw Explorer", self.pane().path.display());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         egui::Panel::top("tabs").show(ui, |ui| {
@@ -832,7 +832,7 @@ impl eframe::App for ForgeApp {
     }
 }
 
-impl ForgeApp {
+impl ZxrawApp {
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         self.toasts.retain(|t| t.until > Instant::now());
         if self.toasts.is_empty() {

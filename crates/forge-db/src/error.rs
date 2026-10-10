@@ -18,7 +18,7 @@ pub enum DbError {
     #[error("invalid search query: {0}")]
     Query(#[from] ParseError),
     #[error(
-        "database schema version {found} is newer than this build of Forge supports ({supported})"
+        "database schema version {found} is newer than this build of ZXraw Explorer supports ({supported})"
     )]
     NewerSchema { found: i64, supported: i64 },
     #[error("not found: {0}")]

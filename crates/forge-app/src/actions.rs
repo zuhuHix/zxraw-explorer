@@ -6,12 +6,12 @@ use egui::{RichText, Ui};
 
 use forge_core::ops::OpKind;
 
-use crate::app::ForgeApp;
+use crate::app::ZxrawApp;
 use crate::commands::Cmd;
 use crate::modal::{self, Confirm, ConfirmKind, Modal, Outcome, Prompt, PromptKind};
 use crate::preview::{self, TextPreview};
 use crate::settings::{Paths, Settings};
-use crate::views::{NoThumbs, ThumbProvider};
+use crate::views::ThumbProvider;
 
 /// Results reported back to the UI thread from background work.
 pub enum Event {
@@ -51,11 +51,11 @@ pub struct Actions {
     pub tx: crossbeam_channel::Sender<Event>,
     rx: crossbeam_channel::Receiver<Event>,
     pub ctx: egui::Context,
-    no_thumbs: NoThumbs,
+    pub thumbs: crate::thumbs::ThumbManager,
 }
 
 impl Actions {
-    pub fn new(_paths: &Paths, _settings: &Settings, ctx: egui::Context) -> Self {
+    pub fn new(paths: &Paths, settings: &Settings, ctx: egui::Context) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             modal: None,
@@ -69,7 +69,11 @@ impl Actions {
             tx,
             rx,
             ctx,
-            no_thumbs: NoThumbs,
+            thumbs: crate::thumbs::ThumbManager::new(
+                paths.cache.join("thumbs"),
+                settings.thumb_mem_cache_mb,
+                settings.ffmpeg_dir.as_deref(),
+            ),
         }
     }
 
@@ -87,15 +91,15 @@ impl Actions {
     }
 
     pub fn thumb_provider(&mut self) -> &mut dyn ThumbProvider {
-        &mut self.no_thumbs
+        &mut self.thumbs
     }
 }
 
-pub fn modal_open(app: &ForgeApp) -> bool {
+pub fn modal_open(app: &ZxrawApp) -> bool {
     app.ops.modal.is_some() || app.ops.batch_rename.is_some() || !app.ops.conflicts.is_empty()
 }
 
-pub fn run(app: &mut ForgeApp, cmd: Cmd, _ctx: &egui::Context) {
+pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
     let dir = app.pane().path.clone();
     match cmd {
         Cmd::NewFolder => {
@@ -225,7 +229,7 @@ pub fn run(app: &mut ForgeApp, cmd: Cmd, _ctx: &egui::Context) {
     }
 }
 
-pub fn recycle(app: &mut ForgeApp, targets: Vec<PathBuf>) {
+pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let n = targets.len();
     let dirs: Vec<PathBuf> = targets.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
     let tx = app.ops.tx.clone();
@@ -251,24 +255,33 @@ pub fn recycle(app: &mut ForgeApp, targets: Vec<PathBuf>) {
     });
 }
 
-pub fn transfer(app: &mut ForgeApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
+pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
     let kind = if copy { OpKind::Copy } else { OpKind::Move };
     crate::ops_ui::start_transfer(app, paths, target, kind);
 }
 
-pub fn open_file(app: &mut ForgeApp, path: &Path) {
+pub fn open_file(app: &mut ZxrawApp, path: &Path) {
     let p = path.to_path_buf();
     app.ops.spawn_shell("Open", move || forge_win::open_default(&p));
 }
 
-pub fn poll(app: &mut ForgeApp) -> bool {
-    let mut changed = false;
+pub fn poll(app: &mut ZxrawApp) -> bool {
+    let folders: Vec<PathBuf> = app
+        .tabs
+        .get(app.active)
+        .map(|t| std::iter::once(t.left.path.clone()).chain(t.right.as_ref().map(|r| r.path.clone())).collect())
+        .unwrap_or_default();
+    let mut changed = app.ops.thumbs.begin_frame(folders);
+    changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     while let Ok(ev) = app.ops.rx.try_recv() {
         changed = true;
         match ev {
             Event::Toast(t) => app.toast(t),
             Event::Error(e) => app.toast_err(e),
-            Event::Changed(d) => app.refresh_all_showing(&d),
+            Event::Changed(d) => {
+                app.ops.thumbs.invalidate_dir(&d);
+                app.refresh_all_showing(&d);
+            }
             Event::Report { title, lines } => {
                 if app.ops.modal.is_none() {
                     app.ops.modal = Some(Modal::Report { title, lines });
@@ -288,7 +301,7 @@ pub fn poll(app: &mut ForgeApp) -> bool {
     changed
 }
 
-pub fn status_widgets(app: &mut ForgeApp, ui: &mut Ui) {
+pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
     let running = app.ops.jobs.running_count();
     let label = if running > 0 {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
@@ -315,7 +328,7 @@ pub fn status_widgets(app: &mut ForgeApp, ui: &mut Ui) {
     }
 }
 
-pub fn shutdown(app: &mut ForgeApp) {
+pub fn shutdown(app: &mut ZxrawApp) {
     // Cancel running jobs; copies clean up their partial files on cancel.
     app.ops.jobs.cancel_all();
     for q in app.ops.conflicts.drain(..) {
@@ -327,7 +340,7 @@ pub fn shutdown(app: &mut ForgeApp) {
     }
 }
 
-pub fn modals(app: &mut ForgeApp, ui: &mut Ui) {
+pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::ops_ui::jobs_window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
@@ -360,7 +373,7 @@ pub fn modals(app: &mut ForgeApp, ui: &mut Ui) {
 }
 
 /// Apply an accepted dialog. Returns the dialog again (with an error) if it must stay open.
-fn accept(app: &mut ForgeApp, m: Modal) -> Option<Modal> {
+fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
     match m {
         Modal::Prompt(mut p) => {
             let name = p.text.trim().to_string();
@@ -412,7 +425,7 @@ fn accept(app: &mut ForgeApp, m: Modal) -> Option<Modal> {
     }
 }
 
-pub fn preview_panel(app: &mut ForgeApp, ui: &mut Ui) {
+pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
     let Some(e) = app.pane().cursor_entry().cloned() else {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| ui.label(RichText::new("Select a file to preview").weak()));
@@ -439,6 +452,6 @@ pub fn preview_panel(app: &mut ForgeApp, ui: &mut Ui) {
     }
 }
 
-fn delete_permanently(app: &mut ForgeApp, targets: Vec<PathBuf>) {
+fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     crate::ops_ui::delete_permanently(app, targets);
 }

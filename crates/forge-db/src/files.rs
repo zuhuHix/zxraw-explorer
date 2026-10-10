@@ -638,7 +638,7 @@ impl Db {
     }
 
     /// Rewrite the path prefix `old` → `new` for a folder (and everything below it) or a
-    /// single file, e.g. after a drive letter changed or a folder was moved outside Forge.
+    /// single file, e.g. after a drive letter changed or a folder was moved outside ZXraw Explorer.
     /// Restrict to one volume with `volume`. Where a row already exists at the new path
     /// (because the new location was indexed meanwhile), the old row's annotations, tags
     /// and collection memberships are merged into it and the old row is removed.

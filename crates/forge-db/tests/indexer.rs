@@ -217,7 +217,7 @@ fn annotations_survive_missing_and_relink() {
     let coll = db.create_manual_collection("Keepers").unwrap();
     db.add_to_collection(coll, &[id2, id1]).unwrap();
 
-    // The folder moves away outside Forge; a pass marks everything missing.
+    // The folder moves away outside ZXraw Explorer; a pass marks everything missing.
     fs::create_dir_all(new.parent().unwrap()).unwrap();
     fs::rename(&old, &new).unwrap();
     let rep = Indexer::new(&db).index_root(rid).unwrap();

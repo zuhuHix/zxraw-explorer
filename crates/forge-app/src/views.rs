@@ -571,11 +571,3 @@ pub fn draw_annotation(p: &egui::Painter, img_rect: Rect, a: Annotation) {
         _ => {}
     }
 }
-
-/// Shared empty-thumbnail provider used before the media pipeline is available.
-pub struct NoThumbs;
-impl ThumbProvider for NoThumbs {
-    fn thumb(&mut self, _ui: &Ui, _e: &FileEntry, _s: u32) -> Option<egui::TextureHandle> {
-        None
-    }
-}

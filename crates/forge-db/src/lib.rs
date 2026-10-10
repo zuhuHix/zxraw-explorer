@@ -1,4 +1,4 @@
-//! SQLite persistence for Forge: file index, media metadata, ratings/labels/tags,
+//! SQLite persistence for ZXraw Explorer: file index, media metadata, ratings/labels/tags,
 //! collections, saved searches, thumbnail-cache index, indexing state and settings.
 //!
 //! * One [`Db`] wraps one SQLite connection behind a mutex (`Db: Send + Sync`), so it can
@@ -59,7 +59,7 @@ pub(crate) fn path_str(p: &Path) -> String {
     }
 }
 
-/// Handle to the Forge database.
+/// Handle to the ZXraw Explorer database.
 pub struct Db {
     conn: Mutex<Connection>,
     path: Option<PathBuf>,

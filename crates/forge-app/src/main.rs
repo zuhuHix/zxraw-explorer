@@ -16,6 +16,7 @@ mod settings;
 mod sidebar;
 mod testhook;
 mod theme;
+mod thumbs;
 mod views;
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -24,10 +25,10 @@ fn main() -> eframe::Result {
     let paths = settings::Paths::resolve();
 
     // Rolling daily log file; file paths are only logged at debug level.
-    let file = tracing_appender::rolling::daily(&paths.logs, "forge.log");
+    let file = tracing_appender::rolling::daily(&paths.logs, "zxraw.log");
     let (writer, _guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_env("FORGE_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(EnvFilter::try_from_env("ZXRAW_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer().with_writer(writer).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
@@ -37,11 +38,11 @@ fn main() -> eframe::Result {
         tracing::error!("panic: {info}");
         default_hook(info);
     }));
-    tracing::info!("Forge {} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("ZXraw Explorer {} starting", env!("CARGO_PKG_VERSION"));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Forge")
+            .with_title("ZXraw Explorer")
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([640.0, 400.0])
             .with_drag_and_drop(true),
@@ -49,8 +50,8 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "Forge",
+        "ZXraw Explorer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ForgeApp::new(cc, paths)))),
+        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths)))),
     )
 }

@@ -1,12 +1,12 @@
 [package]
 name = "forge-app"
-description = "Forge desktop application (egui/eframe UI)."
+description = "ZXraw Explorer desktop application (egui/eframe UI)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "forge"
+name = "zxraw"
 path = "src/main.rs"
 
 [dependencies]

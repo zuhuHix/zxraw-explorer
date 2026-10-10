@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Key, RichText, Ui};
 
-use crate::app::ForgeApp;
+use crate::app::ZxrawApp;
 
 fn segments(path: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
@@ -55,7 +55,7 @@ fn completions(text: &str) -> Vec<String> {
     v
 }
 
-pub fn address_bar(app: &mut ForgeApp, ui: &mut Ui) {
+pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
     let editing = app.pane().editing_path.is_some() || app.focus_address;
     if !editing {
         let path = app.pane().path.clone();

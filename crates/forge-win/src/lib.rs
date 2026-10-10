@@ -1,4 +1,4 @@
-//! Windows shell integration for Forge.
+//! Windows shell integration for ZXraw Explorer.
 //!
 //! Every public function compiles on every platform. On non-Windows targets the
 //! fallible functions return [`WinError::Unsupported`] and the infallible ones return an

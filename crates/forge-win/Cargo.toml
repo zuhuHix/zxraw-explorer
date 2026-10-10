@@ -1,6 +1,6 @@
 [package]
 name = "forge-win"
-description = "Windows shell integration (Recycle Bin, ShellExecute, drives, properties) for Forge."
+description = "Windows shell integration (Recycle Bin, ShellExecute, drives, properties) for ZXraw Explorer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

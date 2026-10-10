@@ -1,14 +1,14 @@
 //! Automation hook for UI verification and screenshots in docs/CI.
 //!
-//! * `FORGE_CMDS=ViewGrid,ToggleDualPane` — run commands (by `Cmd` variant name) once the
+//! * `ZXRAW_CMDS=ViewGrid,ToggleDualPane` — run commands (by `Cmd` variant name) once the
 //!   first folder has loaded.
-//! * `FORGE_SCREENSHOT=out.png` — after the UI settles, capture the rendered frame via
+//! * `ZXRAW_SCREENSHOT=out.png` — after the UI settles, capture the rendered frame via
 //!   egui's own screenshot path (works even where OS screen capture can't see GPU
 //!   swapchains), save it, and exit.
 
 use std::path::PathBuf;
 
-use crate::app::ForgeApp;
+use crate::app::ZxrawApp;
 use crate::commands::Cmd;
 
 #[derive(Default)]
@@ -22,13 +22,13 @@ pub struct TestHook {
 
 impl TestHook {
     pub fn from_env() -> Self {
-        let cmds = std::env::var("FORGE_CMDS")
+        let cmds = std::env::var("ZXRAW_CMDS")
             .unwrap_or_default()
             .split(',')
             .filter_map(|n| Cmd::ALL.iter().find(|c| format!("{c:?}") == n.trim()).copied())
             .collect();
         Self {
-            screenshot: std::env::var_os("FORGE_SCREENSHOT").map(PathBuf::from),
+            screenshot: std::env::var_os("ZXRAW_SCREENSHOT").map(PathBuf::from),
             cmds,
             ..Default::default()
         }
@@ -39,7 +39,7 @@ impl TestHook {
     }
 }
 
-pub fn tick(app: &mut ForgeApp, ctx: &egui::Context) {
+pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     if !app.testhook.active() {
         return;
     }

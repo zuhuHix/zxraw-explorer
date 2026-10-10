@@ -1,6 +1,6 @@
 [package]
 name = "forge-media"
-description = "Image/RAW/video metadata extraction and thumbnail pipelines for Forge."
+description = "Image/RAW/video metadata extraction and thumbnail pipelines for ZXraw Explorer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

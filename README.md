@@ -1,4 +1,4 @@
-# Forge
+# ZXraw Explorer
 
 A fast, local-first Windows file manager in Rust, built for photographers, videographers
 and everyone else who lives in File Explorer.
@@ -11,13 +11,13 @@ and everyone else who lives in File Explorer.
 Requirements: Windows 10/11 x64, Rust ≥ 1.90 (MSVC toolchain).
 
 ```powershell
-cargo build --release          # target\release\forge.exe and forge-cli.exe
+cargo build --release          # target\release\zxraw.exe and zxraw-cli.exe
 cargo test --workspace
 cargo run -p forge-app         # launch the UI (debug)
 ```
 
 Optional: put `ffmpeg.exe` and `ffprobe.exe` on `PATH` (or configure their location in
-Settings) to enable video thumbnails and technical metadata. Forge does not bundle FFmpeg.
+Settings) to enable video thumbnails and technical metadata. ZXraw Explorer does not bundle FFmpeg.
 
 ## Docs
 

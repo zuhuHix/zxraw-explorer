@@ -103,7 +103,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn resolve() -> Self {
-        let pd = directories::ProjectDirs::from("", "", "Forge");
+        let pd = directories::ProjectDirs::from("", "", "ZXraw Explorer");
         let (config, data, cache) = match &pd {
             Some(p) => (
                 p.config_dir().to_path_buf(),
@@ -111,7 +111,7 @@ impl Paths {
                 p.cache_dir().to_path_buf(),
             ),
             None => {
-                let t = std::env::temp_dir().join("Forge");
+                let t = std::env::temp_dir().join("ZXraw Explorer");
                 (t.join("config"), t.join("data"), t.join("cache"))
             }
         };

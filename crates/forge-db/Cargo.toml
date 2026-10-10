@@ -1,6 +1,6 @@
 [package]
 name = "forge-db"
-description = "SQLite index, metadata cache, ratings/tags/collections and app state for Forge."
+description = "SQLite index, metadata cache, ratings/tags/collections and app state for ZXraw Explorer."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

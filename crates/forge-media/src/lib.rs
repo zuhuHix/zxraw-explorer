@@ -1,4 +1,4 @@
-//! Forge media pipeline: still-image / RAW / video metadata, embedded RAW previews,
+//! ZXraw Explorer media pipeline: still-image / RAW / video metadata, embedded RAW previews,
 //! thumbnail generation with memory + disk caches, and culling analysis helpers.
 //!
 //! * [`image_meta`] — EXIF (kamadak-exif + own CR3/RAF/ORF/RW2 container handling) and XMP.
