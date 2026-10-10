@@ -11,9 +11,12 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
-rusqlite.workspace = true
+# `functions`: REGEXP and Unicode-aware lower() for the query compiler.
+rusqlite = { workspace = true, features = ["functions"] }
 chrono.workspace = true
+regex.workspace = true
 forge-core.workspace = true
+forge-jobs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

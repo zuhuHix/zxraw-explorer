@@ -25,6 +25,7 @@ eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 rfd.workspace = true
+image = { workspace = true, features = ["png"] }
 regex.workspace = true
 forge-core.workspace = true
 forge-jobs.workspace = true

@@ -11,6 +11,9 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
+crossbeam-channel.workspace = true
+lru.workspace = true
+blake3.workspace = true
 image.workspace = true
 kamadak-exif.workspace = true
 forge-core.workspace = true
@@ -18,3 +21,4 @@ forge-jobs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+

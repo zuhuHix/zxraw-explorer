@@ -17,6 +17,7 @@ chrono.workspace = true
 blake3.workspace = true
 xxhash-rust.workspace = true
 forge-jobs.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

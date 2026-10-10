@@ -28,9 +28,10 @@ pub fn entry_for_path(path: &Path) -> Result<FileEntry> {
 
 fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata) -> FileEntry {
     let ft = md.file_type();
-    let kind = if ft.is_symlink() || is_reparse_point(md) {
-        // Junctions report as dirs with the reparse attribute; treat as links so recursive
-        // operations never descend into them implicitly.
+    // On Windows `is_symlink` is true for name-surrogate reparse points: symlinks and
+    // junctions. Cloud placeholders (OneDrive files-on-demand) are reparse points too but are
+    // ordinary files/folders to the user, so the raw reparse attribute is not used here.
+    let kind = if ft.is_symlink() {
         EntryKind::Link
     } else if ft.is_dir() {
         EntryKind::Dir
@@ -61,16 +62,6 @@ fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata
 fn attrs(md: &fs::Metadata) -> u32 {
     use std::os::windows::fs::MetadataExt;
     md.file_attributes()
-}
-
-#[cfg(windows)]
-fn is_reparse_point(md: &fs::Metadata) -> bool {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    attrs(md) & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-#[cfg(not(windows))]
-fn is_reparse_point(_md: &fs::Metadata) -> bool {
-    false
 }
 
 #[cfg(windows)]
@@ -268,6 +259,29 @@ mod tests {
         sort_entries(&mut all, SortSpec::default());
         assert!(all[0].is_dir());
         assert_eq!(all[1].ext, "txt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_links() {
+        let d = tempfile::tempdir().unwrap();
+        let target = d.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let j = d.path().join("junction");
+        let ok = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&j)
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return; // mklink unavailable in this environment
+        }
+        let e = entry_for_path(&j).unwrap();
+        assert_eq!(e.kind, EntryKind::Link);
+        assert!(link_targets_dir(&j));
+        assert_eq!(entry_for_path(&target).unwrap().kind, EntryKind::Dir);
     }
 
     #[test]
