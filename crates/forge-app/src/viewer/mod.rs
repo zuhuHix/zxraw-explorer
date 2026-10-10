@@ -130,9 +130,11 @@ pub struct Viewer {
     ppp: f32,
     toast: Option<(String, Instant)>,
     close: bool,
+    input_blocked: bool,
 }
 
 impl Viewer {
+    #[allow(dead_code)] // Standalone viewer API used by the demo and embedders.
     pub fn new(items: Vec<PathBuf>, start: usize, mode: ViewerMode, ctx: &egui::Context) -> Self {
         Self::with_config(items, start, mode, ctx, ViewerConfig::default())
     }
@@ -184,6 +186,7 @@ impl Viewer {
             ppp: ctx.pixels_per_point(),
             toast: None,
             close: false,
+            input_blocked: false,
         };
         if mode == ViewerMode::Compare {
             v.init_compare(None);
@@ -203,8 +206,15 @@ impl Viewer {
         &self.items
     }
 
+    #[allow(dead_code)] // Host API.
     pub fn current_index(&self) -> usize {
         self.cur
+    }
+
+    /// Prevents viewer keyboard and pointer controls from acting behind an app modal.
+    #[allow(dead_code)] // Host API; the standalone demo has no app modals.
+    pub fn set_input_blocked(&mut self, blocked: bool) {
+        self.input_blocked = blocked;
     }
 
     /// Changes the decoded-texture memory budget (bytes; default 512 MB).
@@ -234,6 +244,9 @@ impl Viewer {
     /// user exits.
     pub fn show(&mut self, ui: &mut Ui, store: &mut dyn AnnotationStore) -> ViewerOutcome {
         let ctx = ui.ctx().clone();
+        if self.input_blocked {
+            ui.disable();
+        }
         self.ppp = ctx.pixels_per_point();
         self.loader.pump();
         if self.meta.pump() {
@@ -241,15 +254,19 @@ impl Viewer {
         }
         // The viewer is keyboard-driven: keep egui focus navigation (arrows/Tab/Space on
         // focused buttons) from stealing our keys.
-        ctx.memory_mut(|m| {
-            if let Some(id) = m.focused() {
-                m.surrender_focus(id);
-            }
-        });
+        if !self.input_blocked {
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+        }
         if self.filter_dirty && self.mode != ViewerMode::Cull {
             self.refilter(store);
         }
-        self.handle_keys(&ctx, store);
+        if !self.input_blocked {
+            self.handle_keys(&ctx, store);
+        }
 
         let full = ui.available_rect_before_wrap();
         ui.painter().rect_filled(full, 0.0, style::CANVAS_BG);
@@ -514,7 +531,7 @@ impl Viewer {
     // -----------------------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context, store: &mut dyn AnnotationStore) {
-        if ctx.egui_wants_keyboard_input() {
+        if self.input_blocked || ctx.egui_wants_keyboard_input() {
             return;
         }
         let events = ctx.input(|i| i.events.clone());
@@ -673,4 +690,55 @@ fn is_digit(k: Key) -> bool {
             | Key::Num8
             | Key::Num9
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocked_input_preserves_focus_annotations_and_close_state_with_empty_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.png");
+        let ctx = egui::Context::default();
+        let focus = egui::Id::new("modal-test-focus");
+
+        let mut viewer = Viewer::new(vec![path.clone()], 0, ViewerMode::Cull, &ctx);
+        let mut store = MemoryStore::default();
+        viewer.set_filter(Filter::Picks, &store);
+        viewer.set_input_blocked(true);
+
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::Key {
+                    key: egui::Key::Num5,
+                    physical_key: Some(egui::Key::Num5),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let mut outcome = ViewerOutcome::Open;
+        let mut focus_after = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            ctx.memory_mut(|memory| memory.request_focus(focus));
+            outcome = viewer.show(ui, &mut store);
+            focus_after = ctx.memory(|memory| memory.focused());
+        });
+        output.textures_delta.clear();
+
+        assert!(viewer.visible.is_empty());
+        assert_eq!(outcome, ViewerOutcome::Open);
+        assert_eq!(store.get(&path), Annotation::default());
+        assert_eq!(focus_after, Some(focus));
+    }
 }

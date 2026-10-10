@@ -26,6 +26,21 @@ pub enum Event {
     Report { title: String, lines: Vec<String> },
     Conflict(crate::ops_ui::ConflictQuestion),
     Undo(UndoEntry),
+    /// Our Copy/Cut reached the Windows clipboard (`Ok(sequence)`) or failed.
+    ClipboardPublished { generation: u64, result: Result<u32, String> },
+    /// Paste: the Windows clipboard as read off the UI thread.
+    PasteSystemRead {
+        destination: PathBuf,
+        sequence: u32,
+        files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>,
+    },
+    /// A clipboard-originated move finished (`ok` = everything moved, not cancelled).
+    MoveFinished {
+        sources: Vec<PathBuf>,
+        ok: bool,
+        clipboard_generation: Option<u64>,
+        expected_sequence: Option<u32>,
+    },
 }
 
 /// Operations that can genuinely be reverted. Copies, overwrites and permanent deletes are
@@ -41,6 +56,37 @@ pub enum UndoEntry {
 pub struct FileClipboard {
     pub paths: Vec<PathBuf>,
     pub cut: bool,
+    generation: u64,
+    /// Windows clipboard sequence before we published (to detect later external copies).
+    baseline_sequence: u32,
+    /// `None` while publishing; `Some(Ok(seq))` once on the Windows clipboard.
+    published: Option<Result<u32, ()>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasteSource {
+    InApp,
+    System,
+    Empty,
+}
+
+/// Which clipboard a paste should use. The newest copy wins: our in-app clipboard while
+/// its publish to Windows is still pending or is still what Windows holds; the Windows
+/// clipboard once something else has been copied since (e.g. in Explorer).
+fn choose_paste_source(in_app: Option<&FileClipboard>, system_sequence: u32, system_has_files: bool) -> PasteSource {
+    let Some(cb) = in_app else {
+        return if system_has_files { PasteSource::System } else { PasteSource::Empty };
+    };
+    let ours = match cb.published {
+        None => return PasteSource::InApp,
+        Some(Ok(seq)) => seq,
+        Some(Err(())) => cb.baseline_sequence,
+    };
+    if system_sequence != ours && system_has_files {
+        PasteSource::System
+    } else {
+        PasteSource::InApp
+    }
 }
 
 pub struct Actions {
@@ -48,6 +94,7 @@ pub struct Actions {
     pub undo: Vec<UndoEntry>,
     pub conflicts: std::collections::VecDeque<crate::ops_ui::ConflictQuestion>,
     pub clipboard: Option<FileClipboard>,
+    clipboard_generation: u64,
     pub show_jobs: bool,
     pub batch_rename: Option<crate::batch_rename::BatchRename>,
     pub text_preview: TextPreview,
@@ -87,6 +134,7 @@ impl Actions {
             undo: Vec::new(),
             conflicts: Default::default(),
             clipboard: None,
+            clipboard_generation: 0,
             show_jobs: false,
             batch_rename: None,
             text_preview: TextPreview::default(),
@@ -212,32 +260,35 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 app.toast(format!("{} {} item(s)", if cut { "Cut" } else { "Copied" }, paths.len()));
                 // Also publish to the Windows clipboard so Explorer and other apps can paste.
                 let effect = if cut { forge_win::ClipboardEffect::Move } else { forge_win::ClipboardEffect::Copy };
-                let p2 = paths.clone();
-                app.ops.spawn_shell("Copy to clipboard", move || forge_win::set_files(&p2, effect));
-                app.ops.clipboard = Some(FileClipboard { paths, cut });
+                app.ops.clipboard_generation += 1;
+                let generation = app.ops.clipboard_generation;
+                let (tx, ctx, p2) = (app.ops.tx.clone(), app.ops.ctx.clone(), paths.clone());
+                std::thread::spawn(move || {
+                    let result = forge_win::set_files(&p2, effect)
+                        .map(|()| forge_win::clipboard_sequence())
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(Event::ClipboardPublished { generation, result });
+                    ctx.request_repaint();
+                });
+                app.ops.clipboard = Some(FileClipboard {
+                    paths,
+                    cut,
+                    generation,
+                    baseline_sequence: forge_win::clipboard_sequence(),
+                    published: None,
+                });
             }
         }
         Cmd::Paste => {
-            // The Windows clipboard is the source of truth (files copied in Explorer paste
-            // here); fall back to the in-app clipboard if it holds no file list.
-            let system = forge_win::get_files().ok().flatten();
-            let (paths, cut) = match system {
-                Some((paths, effect)) => (paths, effect == forge_win::ClipboardEffect::Move),
-                None => match &app.ops.clipboard {
-                    Some(cb) => (cb.paths.clone(), cb.cut),
-                    None => {
-                        app.toast("Clipboard is empty");
-                        return;
-                    }
-                },
-            };
-            let kind = if cut { OpKind::Move } else { OpKind::Copy };
-            crate::ops_ui::start_transfer(app, paths.clone(), dir, kind);
-            // A cut is consumed by pasting (like Explorer); a copy can be pasted again.
-            if cut {
-                app.ops.clipboard = None;
-                std::thread::spawn(move || forge_win::clear_if_owned_files(&paths));
-            }
+            // Opening the Windows clipboard can block briefly (another app holding it), so
+            // read it off the UI thread; `paste_with` decides once the result arrives.
+            let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+            std::thread::spawn(move || {
+                let sequence = forge_win::clipboard_sequence();
+                let files = forge_win::get_files().ok().flatten();
+                let _ = tx.send(Event::PasteSystemRead { destination: dir, sequence, files });
+                ctx.request_repaint();
+            });
         }
         Cmd::CopyToOtherPane | Cmd::MoveToOtherPane => {
             let Some(other) = app.tab().other().map(|p| p.path.clone()) else {
@@ -349,6 +400,37 @@ fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
     app.ops.library.annotate(targets, change);
 }
 
+fn paste_with(app: &mut ZxrawApp, dest: PathBuf, sequence: u32, files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>) {
+    match choose_paste_source(app.ops.clipboard.as_ref(), sequence, files.is_some()) {
+        PasteSource::Empty => app.toast("Clipboard is empty"),
+        PasteSource::System => {
+            let Some((paths, effect)) = files else { return };
+            if effect == forge_win::ClipboardEffect::Move {
+                if !crate::ops_ui::start_clipboard_move(app, paths, dest, None, Some(sequence)) {
+                    app.toast("Nothing to move: the items are already in this folder");
+                }
+            } else {
+                crate::ops_ui::start_transfer(app, paths, dest, OpKind::Copy);
+            }
+        }
+        PasteSource::InApp => {
+            let Some(cb) = app.ops.clipboard.as_ref() else { return };
+            let (paths, cut, generation) = (cb.paths.clone(), cb.cut, cb.generation);
+            let published = match cb.published {
+                Some(Ok(seq)) => Some(seq),
+                _ => None,
+            };
+            if cut {
+                if !crate::ops_ui::start_clipboard_move(app, paths, dest, Some(generation), published) {
+                    app.toast("Nothing to move: the items are already in this folder");
+                }
+            } else {
+                crate::ops_ui::start_transfer(app, paths, dest, OpKind::Copy);
+            }
+        }
+    }
+}
+
 pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let n = targets.len();
     let dirs: Vec<PathBuf> = targets.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
@@ -432,6 +514,31 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 }
             }
             Event::Conflict(q) => app.ops.conflicts.push_back(q),
+            Event::ClipboardPublished { generation, result } => {
+                if let Some(cb) = app.ops.clipboard.as_mut().filter(|cb| cb.generation == generation) {
+                    cb.published = Some(result.as_ref().map(|s| *s).map_err(|_| ()));
+                }
+                if let Err(e) = result {
+                    tracing::warn!("publishing files to the Windows clipboard failed: {e}");
+                }
+            }
+            Event::PasteSystemRead { destination, sequence, files } => paste_with(app, destination, sequence, files),
+            Event::MoveFinished { sources, ok, clipboard_generation, expected_sequence } => {
+                // A cut is consumed only by a complete, successful move (like Explorer); a
+                // failed or cancelled move leaves it on the clipboard to retry.
+                if ok {
+                    if clipboard_generation.is_some()
+                        && app.ops.clipboard.as_ref().map(|cb| cb.generation) == clipboard_generation
+                    {
+                        app.ops.clipboard = None;
+                    }
+                    if let Some(seq) = expected_sequence {
+                        std::thread::spawn(move || {
+                            forge_win::clear_if_owned_files(&sources, Some(seq));
+                        });
+                    }
+                }
+            }
             Event::Undo(u) => {
                 app.ops.undo.push(u);
                 if app.ops.undo.len() > 50 {
@@ -628,4 +735,37 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
 
 fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     crate::ops_ui::delete_permanently(app, targets);
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    fn cb(published: Option<Result<u32, ()>>, baseline: u32) -> FileClipboard {
+        FileClipboard {
+            paths: vec![PathBuf::from(r"C:\a.jpg")],
+            cut: true,
+            generation: 1,
+            baseline_sequence: baseline,
+            published,
+        }
+    }
+
+    #[test]
+    fn paste_source_prefers_newest_copy() {
+        // Nothing copied in-app: the Windows clipboard decides.
+        assert_eq!(choose_paste_source(None, 5, true), PasteSource::System);
+        assert_eq!(choose_paste_source(None, 5, false), PasteSource::Empty);
+        // Our publish is still pending: never paste stale Explorer paths.
+        assert_eq!(choose_paste_source(Some(&cb(None, 4)), 4, true), PasteSource::InApp);
+        // Published and still current: ours.
+        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, true), PasteSource::InApp);
+        // Something was copied in Explorer afterwards: theirs.
+        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, true), PasteSource::System);
+        // Text copied afterwards (no files): fall back to ours rather than doing nothing.
+        assert_eq!(choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, false), PasteSource::InApp);
+        // Publish failed: compare against the sequence from before our copy.
+        assert_eq!(choose_paste_source(Some(&cb(Some(Err(())), 4)), 4, true), PasteSource::InApp);
+        assert_eq!(choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, true), PasteSource::System);
+    }
 }

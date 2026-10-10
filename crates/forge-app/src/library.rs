@@ -15,8 +15,21 @@ use crate::views::Annotation;
 pub enum LibMsg {
     Opened(Result<Arc<Db>, String>, Option<String>),
     DirAnnotations(PathBuf, HashMap<PathBuf, Annotation>),
-    SearchResults { query: String, result: Result<Vec<FileRecord>, String> },
+    AuthoritativeAnnotations {
+        versions: HashMap<PathBuf, u64>,
+        annotations: HashMap<PathBuf, Annotation>,
+    },
+    SearchResults {
+        query: String,
+        result: Result<Vec<FileRecord>, String>,
+    },
     Error(String),
+}
+
+struct AnnotationWrite {
+    paths: Vec<PathBuf>,
+    change: AnnotationChange,
+    versions: HashMap<PathBuf, u64>,
 }
 
 pub struct Library {
@@ -28,10 +41,15 @@ pub struct Library {
     /// Annotations of the folders currently shown, keyed by full path.
     pub annotations: HashMap<PathBuf, Annotation>,
     loaded_dirs: HashSet<PathBuf>,
+    /// Paths edited locally are protected from any async directory snapshot. They remain
+    /// protected for this process lifetime; failed writes are reconciled from the DB below.
+    locally_edited: HashSet<PathBuf>,
+    annotation_versions: HashMap<PathBuf, u64>,
+    next_annotation_version: u64,
     /// Edits made before the database finished opening; flushed once it is ready.
-    queued: Vec<(Vec<PathBuf>, AnnotationChange)>,
+    queued: Vec<AnnotationWrite>,
     /// Single writer thread so edits reach the database in the order they were made.
-    writer: Option<Sender<(Vec<PathBuf>, AnnotationChange)>>,
+    writer: Option<Sender<AnnotationWrite>>,
     pub search: SearchState,
 }
 
@@ -49,7 +67,9 @@ pub struct SearchState {
 pub fn to_view(rating: u8, label: Option<ColorLabel>, pick: PickState) -> Annotation {
     Annotation {
         rating,
-        label: label.and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l)).map(|i| i as u8),
+        label: label
+            .and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l))
+            .map(|i| i as u8),
         pick: match pick {
             PickState::Pick => 1,
             PickState::Reject => -1,
@@ -85,6 +105,9 @@ impl Library {
             ctx,
             annotations: HashMap::new(),
             loaded_dirs: HashSet::new(),
+            locally_edited: HashSet::new(),
+            annotation_versions: HashMap::new(),
+            next_annotation_version: 0,
             queued: Vec::new(),
             writer: None,
             search: SearchState::default(),
@@ -99,8 +122,8 @@ impl Library {
                 LibMsg::Opened(Ok(db), recovered) => {
                     self.writer = Some(spawn_writer(db.clone(), self.tx.clone()));
                     self.db = Some(db);
-                    for (paths, change) in std::mem::take(&mut self.queued) {
-                        self.persist(paths, change);
+                    for write in std::mem::take(&mut self.queued) {
+                        self.persist(write);
                     }
                     if let Some(r) = recovered {
                         notices.push(Err(r));
@@ -113,14 +136,28 @@ impl Library {
                 }
                 LibMsg::Opened(Err(e), _) => {
                     if !self.queued.is_empty() {
-                        notices.push(Err(format!("{} rating/label change(s) could not be saved", self.queued.len())));
+                        notices.push(Err(format!(
+                            "{} rating/label change(s) could not be saved",
+                            self.queued.len()
+                        )));
                         self.queued.clear();
                     }
                     notices.push(Err(format!("Library database unavailable: {e}")));
                     self.open_error = Some(e);
                 }
                 LibMsg::DirAnnotations(_dir, map) => {
-                    self.annotations.extend(map);
+                    merge_loaded_annotations(&mut self.annotations, &self.locally_edited, map);
+                }
+                LibMsg::AuthoritativeAnnotations {
+                    versions,
+                    annotations,
+                } => {
+                    merge_authoritative_annotations(
+                        &mut self.annotations,
+                        &self.annotation_versions,
+                        versions,
+                        annotations,
+                    );
                 }
                 LibMsg::SearchResults { query, result } => {
                     if query == self.search.last_query {
@@ -168,14 +205,22 @@ impl Library {
     /// Apply an annotation change to files (optimistically updates the local cache, then
     /// persists in the background). Files are added to the database if not indexed yet.
     pub fn annotate(&mut self, paths: Vec<PathBuf>, change: AnnotationChange) {
+        self.next_annotation_version = self.next_annotation_version.wrapping_add(1).max(1);
+        let version = self.next_annotation_version;
+        let mut versions = HashMap::new();
         for p in &paths {
+            self.locally_edited.insert(p.clone());
+            self.annotation_versions.insert(p.clone(), version);
+            versions.insert(p.clone(), version);
             let a = self.annotations.entry(p.clone()).or_default();
             if let Some(r) = change.rating {
                 a.rating = r;
             }
             if let Some(l) = change.label {
                 *a = Annotation {
-                    label: l.and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l)).map(|i| i as u8),
+                    label: l
+                        .and_then(|l| ColorLabel::ALL.iter().position(|x| *x == l))
+                        .map(|i| i as u8),
                     ..*a
                 };
             }
@@ -183,20 +228,27 @@ impl Library {
                 a.pick = to_view(0, None, pk).pick;
             }
         }
+        let write = AnnotationWrite {
+            paths,
+            change,
+            versions,
+        };
         if self.db.is_none() {
             if self.open_error.is_some() {
-                let _ = self.tx.send(LibMsg::Error("Library database is not available; change not saved".into()));
+                let _ = self.tx.send(LibMsg::Error(
+                    "Library database is not available; change not saved".into(),
+                ));
             } else {
-                self.queued.push((paths, change));
+                self.queued.push(write);
             }
             return;
         }
-        self.persist(paths, change);
+        self.persist(write);
     }
 
-    fn persist(&self, paths: Vec<PathBuf>, change: AnnotationChange) {
+    fn persist(&self, write: AnnotationWrite) {
         if let Some(w) = &self.writer {
-            let _ = w.send((paths, change));
+            let _ = w.send(write);
         }
     }
 
@@ -227,7 +279,12 @@ impl Library {
 
 /// Index `root` (adding it as an index root) and then extract media metadata, as one
 /// cancellable job. Safe to re-run: the indexer resumes from its checkpoint.
-pub fn start_index_job(jobs: &JobRegistry, db: Arc<Db>, root: PathBuf, notify: impl Fn(String) + Send + 'static) -> JobHandle {
+pub fn start_index_job(
+    jobs: &JobRegistry,
+    db: Arc<Db>,
+    root: PathBuf,
+    notify: impl Fn(String) + Send + 'static,
+) -> JobHandle {
     let title = format!("Indexing {}", root.display());
     jobs.spawn("index", title, move |job| {
         let root_id = db.add_index_root(&root).map_err(|e| e.to_string())?;
@@ -237,7 +294,9 @@ pub fn start_index_job(jobs: &JobRegistry, db: Arc<Db>, root: PathBuf, notify: i
             .progress(job.progress.clone())
             .volume_resolver(|p| {
                 let mut v = forge_db::VolumeInfo::from_path_root(p);
-                v.serial = forge_win::volume_serial(Path::new(&v.root)).ok().map(|s| format!("{s:08X}"));
+                v.serial = forge_win::volume_serial(Path::new(&v.root))
+                    .ok()
+                    .map(|s| format!("{s:08X}"));
                 Some(v)
             });
         let report = indexer.index_root(root_id).map_err(|e| e.to_string())?;
@@ -256,30 +315,32 @@ pub fn start_index_job(jobs: &JobRegistry, db: Arc<Db>, root: PathBuf, notify: i
 /// ffprobe is unavailable, so they get picked up once it is installed.
 pub fn extract_metadata(db: &Db, job: &JobHandle) {
     let ff = forge_media::FfTools::global();
-    let mut attempted: HashSet<i64> = HashSet::new();
-    job.progress.set_current("Reading photo and video metadata…");
+    let include_video = ff.ffprobe.is_some();
+    let mut after_id = 0;
+    job.progress
+        .set_current("Reading photo and video metadata…");
     loop {
         if job.cancel.check().is_err() {
             return;
         }
-        let Ok(batch) = db.files_needing_meta(500) else { return };
-        let fresh: Vec<FileRecord> = batch.into_iter().filter(|r| !attempted.contains(&r.id)).collect();
-        if fresh.is_empty() {
+        let Ok(batch) = db.files_needing_meta_after(after_id, 500, include_video) else {
+            return;
+        };
+        if batch.is_empty() {
             return;
         }
-        job.progress.add_total_items(fresh.len() as u64);
-        for r in fresh {
-            attempted.insert(r.id);
+        after_id = batch.last().expect("non-empty metadata batch").id;
+        job.progress.add_total_items(batch.len() as u64);
+        for r in batch {
             if job.cancel.check().is_err() {
                 return;
             }
             match r.media_kind {
                 forge_core::MediaKind::Video => {
-                    if ff.ffprobe.is_none() {
-                        job.progress.add_items(1);
-                        continue;
-                    }
-                    let m = ff.probe(&r.path).map(|v| video_to_db(&v)).unwrap_or_default();
+                    let m = ff
+                        .probe(&r.path)
+                        .map(|v| video_to_db(&v))
+                        .unwrap_or_default();
                     let _ = db.upsert_video_meta(r.id, &m);
                 }
                 _ => {
@@ -307,7 +368,9 @@ pub fn image_to_db(m: &forge_media::ImageMetadata) -> forge_db::ImageMeta {
         shutter: m.exposure_time_s,
         iso: m.iso,
         exposure_comp: m.exposure_compensation,
-        taken_at: m.capture_timestamp.map(|s| s * 1000 + m.capture_millis.unwrap_or(0) as i64),
+        taken_at: m
+            .capture_timestamp
+            .map(|s| s * 1000 + m.capture_millis.unwrap_or(0) as i64),
         gps_lat: m.gps_lat,
         gps_lon: m.gps_lon,
         orientation: m.orientation,
@@ -331,17 +394,75 @@ pub fn video_to_db(v: &forge_media::VideoMetadata) -> forge_db::VideoMeta {
         hdr: v.hdr.map(|h| format!("{h:?}").to_lowercase()),
         rotation: Some(v.rotation as i32),
         timecode: v.timecode.clone(),
-        camera: v.make.clone().map(|m| format!("{m} {}", v.model.clone().unwrap_or_default()).trim().to_string()),
+        camera: v.make.clone().map(|m| {
+            format!("{m} {}", v.model.clone().unwrap_or_default())
+                .trim()
+                .to_string()
+        }),
         recorded_at: None,
     }
 }
 
-fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<(Vec<PathBuf>, AnnotationChange)> {
-    let (wtx, wrx) = unbounded::<(Vec<PathBuf>, AnnotationChange)>();
+fn merge_loaded_annotations(
+    target: &mut HashMap<PathBuf, Annotation>,
+    locally_edited: &HashSet<PathBuf>,
+    loaded: HashMap<PathBuf, Annotation>,
+) {
+    for (path, annotation) in loaded {
+        if !locally_edited.contains(&path) {
+            target.insert(path, annotation);
+        }
+    }
+}
+
+fn merge_authoritative_annotations(
+    target: &mut HashMap<PathBuf, Annotation>,
+    current_versions: &HashMap<PathBuf, u64>,
+    failed_versions: HashMap<PathBuf, u64>,
+    authoritative: HashMap<PathBuf, Annotation>,
+) {
+    for (path, annotation) in authoritative {
+        if current_versions.get(&path) == failed_versions.get(&path) {
+            target.insert(path, annotation);
+        }
+    }
+}
+
+fn authoritative_annotations(
+    db: &Db,
+    paths: &[PathBuf],
+) -> Result<HashMap<PathBuf, Annotation>, String> {
+    let ids: HashMap<PathBuf, i64> = db
+        .file_ids(paths)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    paths
+        .iter()
+        .map(|path| {
+            let annotation = match ids.get(path) {
+                Some(id) => db.annotation(*id).map_err(|e| e.to_string())?,
+                None => forge_db::Annotation::default(),
+            };
+            Ok((
+                path.clone(),
+                to_view(annotation.rating, annotation.label, annotation.pick),
+            ))
+        })
+        .collect()
+}
+
+fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
+    let (wtx, wrx) = unbounded::<AnnotationWrite>();
     std::thread::Builder::new()
         .name("library-writer".into())
         .spawn(move || {
-            for (paths, change) in wrx {
+            for AnnotationWrite {
+                paths,
+                change,
+                versions,
+            } in wrx
+            {
                 let r = (|| -> Result<(), String> {
                     let entries: Vec<_> = paths
                         .iter()
@@ -354,13 +475,93 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<(Vec<PathBuf>, Annota
                         .into_iter()
                         .map(|(_, id)| id)
                         .collect();
-                    db.annotate(&ids, &change).map(|_| ()).map_err(|e| e.to_string())
+                    db.annotate(&ids, &change)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
                 })();
                 if let Err(e) = r {
                     let _ = tx.send(LibMsg::Error(format!("Saving rating failed: {e}")));
+                    match authoritative_annotations(&db, &paths) {
+                        Ok(annotations) => {
+                            let _ = tx.send(LibMsg::AuthoritativeAnnotations {
+                                versions,
+                                annotations,
+                            });
+                        }
+                        Err(reload_error) => {
+                            let _ = tx.send(LibMsg::Error(format!(
+                                "Reloading saved ratings failed: {reload_error}"
+                            )));
+                        }
+                    }
                 }
             }
         })
         .expect("spawn library writer");
     wtx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn annotation(rating: u8) -> Annotation {
+        Annotation {
+            rating,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn directory_load_does_not_overwrite_optimistic_edits() {
+        let edited = PathBuf::from(r"C:\photos\edited.jpg");
+        let untouched = PathBuf::from(r"C:\photos\untouched.jpg");
+        let mut cache = HashMap::from([(edited.clone(), annotation(5))]);
+        let locally_edited = HashSet::from([edited.clone()]);
+        let loaded = HashMap::from([
+            (edited.clone(), annotation(1)),
+            (untouched.clone(), annotation(2)),
+        ]);
+
+        merge_loaded_annotations(&mut cache, &locally_edited, loaded);
+
+        assert_eq!(cache.get(&edited).unwrap().rating, 5);
+        assert_eq!(cache.get(&untouched).unwrap().rating, 2);
+    }
+
+    #[test]
+    fn failed_write_reload_only_replaces_the_version_that_failed() {
+        let edited = PathBuf::from(r"C:\photos\edited.jpg");
+        let mut cache = HashMap::from([(edited.clone(), annotation(5))]);
+        let current_versions = HashMap::from([(edited.clone(), 2)]);
+        let failed_versions = HashMap::from([(edited.clone(), 1)]);
+        let authoritative = HashMap::from([(edited.clone(), annotation(3))]);
+
+        merge_authoritative_annotations(
+            &mut cache,
+            &current_versions,
+            failed_versions,
+            authoritative,
+        );
+
+        assert_eq!(cache.get(&edited).unwrap().rating, 5);
+    }
+
+    #[test]
+    fn failed_write_reload_restores_authoritative_value_when_version_is_current() {
+        let edited = PathBuf::from(r"C:\photos\edited.jpg");
+        let mut cache = HashMap::from([(edited.clone(), annotation(5))]);
+        let current_versions = HashMap::from([(edited.clone(), 2)]);
+        let failed_versions = HashMap::from([(edited.clone(), 2)]);
+        let authoritative = HashMap::from([(edited.clone(), annotation(3))]);
+
+        merge_authoritative_annotations(
+            &mut cache,
+            &current_versions,
+            failed_versions,
+            authoritative,
+        );
+
+        assert_eq!(cache.get(&edited).unwrap().rating, 3);
+    }
 }

@@ -23,6 +23,12 @@ pub struct ConflictQuestion {
     pub apply_all: bool,
 }
 
+struct ClipboardMoveCompletion {
+    sources: Vec<PathBuf>,
+    generation: Option<u64>,
+    expected_sequence: Option<u32>,
+}
+
 /// Start a copy or move of `sources` into `dest` as a background job.
 pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
     // Items already in `dest`: moving them there is a no-op, and copying them there must
@@ -30,15 +36,56 @@ pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, 
     let in_dest = |p: &PathBuf| p.parent().is_some_and(|d| forge_core::paths::paths_equal(d, &dest));
     let (same, sources): (Vec<PathBuf>, Vec<PathBuf>) = sources.into_iter().partition(in_dest);
     if !same.is_empty() && kind == OpKind::Copy {
-        start_transfer_with(app, same, dest.clone(), kind, ConflictPolicy::KeepBoth);
+        start_transfer_with(app, same, dest.clone(), kind, ConflictPolicy::KeepBoth, None);
     }
     if sources.is_empty() {
         return;
     }
-    start_transfer_with(app, sources, dest, kind, ConflictPolicy::Ask);
+    start_transfer_with(app, sources, dest, kind, ConflictPolicy::Ask, None);
 }
 
-fn start_transfer_with(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind, policy: ConflictPolicy) {
+/// Start a move originating from the system or in-app file clipboard. The clipboard is
+/// consumed only after this job reports a complete, uncancelled move.
+pub fn start_clipboard_move(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    dest: PathBuf,
+    generation: Option<u64>,
+    expected_sequence: Option<u32>,
+) -> bool {
+    let clipboard_sources = sources.clone();
+    let in_dest = |path: &PathBuf| {
+        path.parent()
+            .is_some_and(|parent| forge_core::paths::paths_equal(parent, &dest))
+    };
+    let sources: Vec<PathBuf> = sources.into_iter().filter(|path| !in_dest(path)).collect();
+    if sources.is_empty() {
+        return false;
+    }
+    let completion = ClipboardMoveCompletion {
+        sources: clipboard_sources,
+        generation,
+        expected_sequence,
+    };
+    start_transfer_with(
+        app,
+        sources,
+        dest,
+        OpKind::Move,
+        ConflictPolicy::Ask,
+        Some(completion),
+    );
+    true
+}
+
+fn start_transfer_with(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    dest: PathBuf,
+    kind: OpKind,
+    policy: ConflictPolicy,
+    completion: Option<ClipboardMoveCompletion>,
+) {
     if sources.is_empty() {
         return;
     }
@@ -58,11 +105,22 @@ fn start_transfer_with(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf,
             verify,
             force_copy_for_move: false,
         };
-        let plan = ops::plan(kind, &sources, &dest, opts, &job.cancel).map_err(|e| {
-            let _ = tx.send(Event::Error(e.to_string()));
-            ctx.request_repaint();
-            e.to_string()
-        })?;
+        let plan = match ops::plan(kind, &sources, &dest, opts, &job.cancel) {
+            Ok(plan) => plan,
+            Err(e) => {
+                let _ = tx.send(Event::Error(e.to_string()));
+                if let Some(completion) = completion {
+                    let _ = tx.send(Event::MoveFinished {
+                        sources: completion.sources,
+                        ok: false,
+                        clipboard_generation: completion.generation,
+                        expected_sequence: completion.expected_sequence,
+                    });
+                }
+                ctx.request_repaint();
+                return Err(e.to_string());
+            }
+        };
         job.progress.add_total_items(plan.files + plan.links);
         job.progress.add_total_bytes(plan.bytes);
 
@@ -89,7 +147,16 @@ fn start_transfer_with(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf,
             }
         };
         let report = ops::execute(&plan, job, &mut resolver);
+        let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
         finish_report(job, &report, &tx, &[dest.clone()], sources.iter().filter_map(|s| s.parent().map(Path::to_path_buf)).collect());
+        if let Some(completion) = completion {
+            let _ = tx.send(Event::MoveFinished {
+                sources: completion.sources,
+                ok: move_ok,
+                clipboard_generation: completion.generation,
+                expected_sequence: completion.expected_sequence,
+            });
+        }
         ctx.request_repaint();
         Ok(())
     });

@@ -56,6 +56,92 @@ pub fn is_video(path: &Path) -> bool {
     media_kind_for_ext(&ext_of(path)) == MediaKind::Video
 }
 
+pub fn is_jpeg(path: &Path) -> bool {
+    matches!(ext_of(path).as_str(), "jpg" | "jpeg" | "jpe")
+}
+
+/// Whether the JPEG has a dimensionally suitable EXIF thumbnail for a Quick decode.
+/// The thumbnail bytes themselves are decoded by forge_media's shared thumbnail pipeline.
+pub fn has_jpeg_thumbnail(path: &Path, min_edge: u32) -> bool {
+    if !is_jpeg(path) {
+        return false;
+    }
+    let Ok(metadata) = forge_media::read_image_metadata(path) else {
+        return false;
+    };
+    let (Some(main_w), Some(main_h)) = (metadata.width, metadata.height) else {
+        return false;
+    };
+    let ifd1_value = |name: &str| {
+        metadata
+            .exif_tags
+            .iter()
+            .find(|tag| tag.name == name && tag.group.ends_with("/1"))
+            .and_then(|tag| {
+                let digits: String = tag
+                    .value
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse::<u32>().ok()
+            })
+    };
+    if ifd1_value("JPEGInterchangeFormat").is_none()
+        || ifd1_value("JPEGInterchangeFormatLength").is_none()
+    {
+        return false;
+    }
+    let (Some(thumb_w), Some(thumb_h)) = (ifd1_value("ImageWidth"), ifd1_value("ImageLength"))
+    else {
+        return false;
+    };
+    if thumb_w == 0 || thumb_h == 0 || main_w == 0 || main_h == 0 {
+        return false;
+    }
+    let thumb_ar = thumb_w as f64 / thumb_h as f64;
+    let main_ar = main_w as f64 / main_h as f64;
+    thumb_w.max(thumb_h) >= min_edge && (thumb_ar / main_ar - 1.0).abs() < 0.03
+}
+
+/// Estimated decoded RGBA bytes, read from the image header before starting a decode.
+/// Unknown formats are charged as an exclusive decode by returning `u64::MAX`.
+pub fn estimated_input_bytes(path: &Path, video_edge: u32) -> u64 {
+    if is_video(path) {
+        let edge = video_edge.clamp(64, 4096) as u64;
+        return edge.saturating_mul(edge).saturating_mul(4);
+    }
+    let Ok(reader) = ImageReader::open(path) else {
+        return u64::MAX;
+    };
+    let Ok(reader) = reader.with_guessed_format() else {
+        return u64::MAX;
+    };
+    reader
+        .into_dimensions()
+        .map(|(w, h)| (w as u64).saturating_mul(h as u64).saturating_mul(4))
+        .unwrap_or(u64::MAX)
+}
+
+/// Makes a Quick tier from an already decoded Screen tier without cloning the Screen pixels.
+pub fn quick_from_screen(screen: &Decoded, max_edge: u32) -> Decoded {
+    let (w, h) = screen.rgba.dimensions();
+    let long = w.max(h);
+    let rgba = if long <= max_edge {
+        screen.rgba.clone()
+    } else {
+        let scale = max_edge as f64 / long as f64;
+        let tw = ((w as f64 * scale).round() as u32).clamp(1, max_edge);
+        let th = ((h as f64 * scale).round() as u32).clamp(1, max_edge);
+        image::imageops::resize(&screen.rgba, tw, th, image::imageops::FilterType::Triangle)
+    };
+    Decoded {
+        rgba,
+        natural: screen.natural,
+        video: screen.video,
+    }
+}
+
 fn check(cancel: &CancelToken) -> Result<(), DecodeError> {
     if cancel.is_cancelled() {
         Err(DecodeError::Cancelled)
@@ -239,6 +325,18 @@ mod tests {
         assert_eq!(d.rgba.dimensions(), (100, 67));
         let d = decode(&p, None, &l, &ff, &c).unwrap();
         assert_eq!(d.rgba.dimensions(), (300, 200));
+        assert_eq!(estimated_input_bytes(&p, 2560), 300 * 200 * 4);
+
+        let quick = quick_from_screen(
+            &Decoded {
+                rgba: RgbaImage::new(1200, 600),
+                natural: [1200, 600],
+                video: false,
+            },
+            512,
+        );
+        assert_eq!(quick.rgba.dimensions(), (512, 256));
+        assert_eq!(quick.natural, [1200, 600]);
 
         let bad = dir.join("bad.jpg");
         std::fs::write(&bad, [0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3]).unwrap();

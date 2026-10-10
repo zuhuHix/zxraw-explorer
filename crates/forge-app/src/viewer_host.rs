@@ -80,8 +80,10 @@ pub fn open(app: &mut ZxrawApp, mode: ViewerMode) {
         app.toast("No photos or videos in this folder");
         return;
     }
-    let mut cfg = crate::viewer::ViewerConfig::default();
-    cfg.budget_bytes = (app.settings.thumb_mem_cache_mb as usize).max(128) * 1024 * 1024;
+    let mut cfg = crate::viewer::ViewerConfig {
+        budget_bytes: (app.settings.thumb_mem_cache_mb as usize).max(128) * 1024 * 1024,
+        ..Default::default()
+    };
     if let Some(dir) = &app.settings.ffmpeg_dir {
         cfg.ff = forge_media::FfTools::discover_with(Some(dir));
     }
@@ -90,7 +92,11 @@ pub fn open(app: &mut ZxrawApp, mode: ViewerMode) {
 
 /// Draw the viewer if open. Returns true when it occupied the window this frame.
 pub fn show(app: &mut ZxrawApp, ui: &mut egui::Ui) -> bool {
-    let Some(v) = app.viewer.as_mut() else { return false };
+    let blocked = crate::actions::modal_open(app) || app.palette.is_some();
+    let Some(v) = app.viewer.as_mut() else {
+        return false;
+    };
+    v.set_input_blocked(blocked);
     let mut store = LibraryStore(&mut app.ops.library);
     let outcome = egui::CentralPanel::default()
         .frame(egui::Frame::NONE)

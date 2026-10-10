@@ -897,6 +897,30 @@ impl Db {
             )
         })
     }
+
+    /// Present image/RAW/video files with missing or stale metadata, after `after_id`.
+    /// Results are ordered by id so callers can walk the queue without refetching a batch.
+    /// When video metadata tools are unavailable, `include_video` can be false to leave
+    /// video rows eligible for a later pass while still progressing through images.
+    pub fn files_needing_meta_after(
+        &self,
+        after_id: i64,
+        limit: u32,
+        include_video: bool,
+    ) -> Result<Vec<FileRecord>> {
+        self.with_conn(|c| {
+            query_records(
+                c,
+                "f.present = 1 AND f.kind = 'file' AND f.id > ?1 AND (?2 OR f.media_kind <> 'video') AND (
+                    (f.media_kind IN ('image', 'raw') AND NOT EXISTS (
+                        SELECT 1 FROM image_meta m WHERE m.file_id = f.id AND m.source_mtime IS f.mtime))
+                 OR (f.media_kind = 'video' AND NOT EXISTS (
+                        SELECT 1 FROM video_meta m WHERE m.file_id = f.id AND m.source_mtime IS f.mtime)))
+                 ORDER BY f.id LIMIT ?3",
+                params![after_id, include_video, limit as i64],
+            )
+        })
+    }
 }
 
 /// Move user data from row `from` to row `to`, then delete `from`.
@@ -1040,6 +1064,52 @@ mod tests {
         let need = db.files_needing_meta(10).unwrap();
         assert_eq!(need.len(), 1);
         assert_eq!(need[0].id, ids[0]);
+    }
+
+    #[test]
+    fn metadata_cursor_skips_unavailable_videos_without_hiding_later_images() {
+        let db = Db::open_in_memory().unwrap();
+        let mut files = Vec::with_capacity(610);
+        for i in 0..600 {
+            files.push(nf(&format!(r"C:\queue\video-{i:03}.mp4"), 1, i));
+        }
+        for i in 0..10 {
+            files.push(nf(&format!(r"C:\queue\image-{i:02}.jpg"), 1, 700 + i));
+        }
+        let ids = db.upsert_files(&files).unwrap();
+
+        // This is the queue configuration used when ffprobe is absent. The cursor
+        // skips videos entirely and still reaches the images after them.
+        let images = db.files_needing_meta_after(0, 500, false).unwrap();
+        assert_eq!(images.len(), 10);
+        assert!(images.iter().all(|r| r.media_kind == MediaKind::Image));
+        assert_eq!(images.first().unwrap().id, ids[600]);
+
+        for image in &images {
+            db.upsert_image_meta(image.id, &ImageMeta::default())
+                .unwrap();
+        }
+        let still_needing_meta = db.files_needing_meta(1000).unwrap();
+        assert_eq!(still_needing_meta.len(), 600);
+        assert!(
+            still_needing_meta
+                .iter()
+                .all(|r| r.media_kind == MediaKind::Video)
+        );
+
+        // With video support, id-cursor batches cover the complete queue once.
+        let mut after_id = 0;
+        let mut found = Vec::new();
+        loop {
+            let batch = db.files_needing_meta_after(after_id, 500, true).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            after_id = batch.last().unwrap().id;
+            found.extend(batch.into_iter().map(|r| r.id));
+        }
+        assert_eq!(found.len(), 600);
+        assert!(found.windows(2).all(|ids| ids[0] < ids[1]));
     }
 
     #[test]

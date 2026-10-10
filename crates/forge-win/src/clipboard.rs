@@ -150,41 +150,49 @@ pub fn clipboard_sequence() -> u32 {
     0
 }
 
-/// Empties the clipboard if its current ordered path list exactly matches `paths`.
+/// Empties the clipboard if its sequence (when provided) and ordered path list match.
 ///
 /// Clipboard errors are ignored because this helper is intended for best-effort cut cleanup.
 #[cfg(windows)]
-pub fn clear_if_owned_files(paths: &[PathBuf]) {
+pub fn clear_if_owned_files(paths: &[PathBuf], expected_sequence: Option<u32>) -> Option<u32> {
     use windows::Win32::System::DataExchange::{
         EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
     };
     use windows::Win32::System::Ole::CF_HDROP;
 
     if paths.is_empty() {
-        return;
+        return None;
     }
     let Ok(window) = ClipboardOwnerWindow::new() else {
-        return;
+        return None;
     };
     let Ok(_clipboard) = open_clipboard_retry(Some(window.hwnd)) else {
-        return;
+        return None;
     };
+    if expected_sequence.is_some_and(|expected| clipboard_sequence() != expected) {
+        return None;
+    }
     if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_err() {
-        return;
+        return None;
     }
     let Ok(handle) = (unsafe { GetClipboardData(CF_HDROP.0 as u32) }) else {
-        return;
+        return None;
     };
     let Ok(current) = read_hdrop(handle) else {
-        return;
+        return None;
     };
     if current == paths {
-        let _ = unsafe { EmptyClipboard() };
+        unsafe { EmptyClipboard() }.ok()?;
+        Some(clipboard_sequence())
+    } else {
+        None
     }
 }
 
 #[cfg(not(windows))]
-pub fn clear_if_owned_files(_paths: &[PathBuf]) {}
+pub fn clear_if_owned_files(_paths: &[PathBuf], _expected_sequence: Option<u32>) -> Option<u32> {
+    None
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -623,6 +631,21 @@ mod tests {
         let before = clipboard_sequence();
         set_files(&[PathBuf::from(r"C:\sequence.txt")], ClipboardEffect::Copy).unwrap();
         assert_ne!(clipboard_sequence(), before);
+    }
+
+    #[test]
+    fn clear_if_owned_files_does_not_clear_a_changed_sequence() {
+        let _guard = ClipboardTestGuard::new();
+        let paths = vec![PathBuf::from(r"C:\owned.txt")];
+        set_files(&paths, ClipboardEffect::Move).unwrap();
+        let owned_sequence = clipboard_sequence();
+        set_test_text("external replacement").unwrap();
+
+        assert_eq!(clear_if_owned_files(&paths, Some(owned_sequence)), None);
+        assert_eq!(
+            read_test_text().unwrap().as_deref(),
+            Some("external replacement")
+        );
     }
 
     #[test]

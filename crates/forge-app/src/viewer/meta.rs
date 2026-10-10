@@ -1,10 +1,11 @@
 //! Background metadata reader: key EXIF for the info overlay and capture times for burst
-//! grouping. Runs on its own thread so it never competes with the decode queue; the item
-//! being viewed is read first (priority channel), then everything else in order outward
-//! from the start position.
+//! grouping. A single shared worker scans one viewer generation at a time, so closing and
+//! reopening the viewer cannot create an unbounded number of blocked filesystem threads.
+//! Reads are synchronous: an OS read already blocked on a network path cannot be interrupted.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -59,8 +60,33 @@ fn camera_name(make: Option<&str>, model: Option<&str>) -> Option<String> {
     }
 }
 
+#[allow(dead_code)] // Synchronous metadata helper for non-cancellable callers.
 pub fn read_summary(path: &std::path::Path, probe_video: bool, ff: &FfTools) -> MetaSummary {
+    read_summary_inner(path, probe_video, ff, || false).unwrap_or_default()
+}
+
+fn read_summary_stoppable(
+    path: &std::path::Path,
+    probe_video: bool,
+    ff: &FfTools,
+    stop: &AtomicBool,
+) -> Option<MetaSummary> {
+    read_summary_inner(path, probe_video, ff, || stop.load(Ordering::Acquire))
+}
+
+fn read_summary_inner(
+    path: &std::path::Path,
+    probe_video: bool,
+    ff: &FfTools,
+    stopped: impl Fn() -> bool,
+) -> Option<MetaSummary> {
+    if stopped() {
+        return None;
+    }
     let file_size = std::fs::metadata(path).ok().map(|m| m.len());
+    if stopped() {
+        return None;
+    }
     if is_video(path) {
         let mut s = MetaSummary {
             is_video: true,
@@ -68,6 +94,9 @@ pub fn read_summary(path: &std::path::Path, probe_video: bool, ff: &FfTools) -> 
             ..Default::default()
         };
         if probe_video && ff.has_ffprobe() {
+            if stopped() {
+                return None;
+            }
             match ff.probe(path) {
                 Ok(m) => {
                     s.camera = camera_name(m.make.as_deref(), m.model.as_deref());
@@ -83,9 +112,12 @@ pub fn read_summary(path: &std::path::Path, probe_video: bool, ff: &FfTools) -> 
                 Err(e) => s.error = Some(e.to_string()),
             }
         }
-        return s;
+        return Some(s);
     }
-    match forge_media::read_image_metadata(path) {
+    if stopped() {
+        return None;
+    }
+    Some(match forge_media::read_image_metadata(path) {
         Ok(m) => MetaSummary {
             camera: camera_name(m.make.as_deref(), m.model.as_deref()),
             lens: m.lens.clone(),
@@ -113,7 +145,7 @@ pub fn read_summary(path: &std::path::Path, probe_video: bool, ff: &FfTools) -> 
             error: Some(e.to_string()),
             ..Default::default()
         },
-    }
+    })
 }
 
 /// Burst membership per item: `Some((position 1-based, group length))` for groups > 1.
@@ -150,20 +182,55 @@ pub struct MetaScanner {
     pub done: usize,
 }
 
+struct MetaJob {
+    paths: Arc<Vec<PathBuf>>,
+    start: usize,
+    ff: FfTools,
+    prio: Receiver<usize>,
+    tx: Sender<(usize, MetaSummary, bool)>,
+    stop: Arc<AtomicBool>,
+    ctx: egui::Context,
+}
+
+fn shared_meta_queue() -> &'static Sender<MetaJob> {
+    static QUEUE: OnceLock<Sender<MetaJob>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = unbounded::<MetaJob>();
+        let spawn = std::thread::Builder::new()
+            .name("viewer-meta".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    if !job.stop.load(Ordering::Acquire) {
+                        scan(
+                            job.paths, job.start, job.ff, job.prio, job.tx, job.stop, job.ctx,
+                        );
+                    }
+                }
+            });
+        if let Err(e) = spawn {
+            tracing::error!("viewer: cannot start shared metadata thread: {e}");
+        }
+        tx
+    })
+}
+
 impl MetaScanner {
     pub fn new(paths: Arc<Vec<PathBuf>>, start: usize, ff: FfTools, ctx: egui::Context) -> Self {
         let (prio_tx, prio_rx) = unbounded::<usize>();
         let (tx, rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let n = paths.len();
-        {
-            let stop = stop.clone();
-            let spawn = std::thread::Builder::new()
-                .name("viewer-meta".into())
-                .spawn(move || scan(paths, start, ff, prio_rx, tx, stop, ctx));
-            if let Err(e) = spawn {
-                tracing::error!("viewer: cannot start metadata thread: {e}");
-            }
+        let job = MetaJob {
+            paths,
+            start,
+            ff,
+            prio: prio_rx,
+            tx,
+            stop: stop.clone(),
+            ctx,
+        };
+        if shared_meta_queue().send(job).is_err() {
+            tracing::error!("viewer: shared metadata thread is unavailable");
         }
         Self {
             prio: prio_tx,
@@ -254,13 +321,20 @@ fn scan(
         }
         seen[i] = true;
         let p = &paths[i];
+        // Check before every metadata operation. An individual filesystem call remains
+        // synchronous and cannot be interrupted once the OS blocks inside it.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            read_summary(p, full, &ff)
+            read_summary_stoppable(p, full, &ff, &stop)
         }))
-        .unwrap_or_else(|_| MetaSummary {
-            error: Some("metadata reader crashed on this file".into()),
-            ..Default::default()
+        .unwrap_or_else(|_| {
+            Some(MetaSummary {
+                error: Some("metadata reader crashed on this file".into()),
+                ..Default::default()
+            })
         });
+        let Some(r) = r else {
+            return;
+        };
         if tx.send((i, r, full)).is_err() {
             return;
         }
@@ -302,5 +376,13 @@ mod tests {
         let metas = vec![m(0.0), m(0.3), m(0.6), m(100.0), None];
         let b = burst_positions(&metas, 1.0);
         assert_eq!(b, vec![Some((1, 3)), Some((2, 3)), Some((3, 3)), None, None]);
+    }
+
+    #[test]
+    fn stopped_scanner_does_not_start_another_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-read.jpg");
+        let stop = AtomicBool::new(true);
+        assert!(read_summary_stoppable(&path, false, &FfTools::default(), &stop).is_none());
     }
 }
