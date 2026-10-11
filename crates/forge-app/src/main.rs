@@ -97,19 +97,25 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     tracing::info!("ZXraw Explorer {} starting", env!("CARGO_PKG_VERSION"));
+    if let Some(report) = crash::pending_crash_report(&paths) {
+        tracing::warn!(
+            "the previous session ended with a crash; report saved at {}",
+            report.display()
+        );
+    }
 
+    let icon = image::load_from_memory(include_bytes!("../../../assets/zxraw.png"))
+        .expect("embedded application icon PNG must be valid")
+        .to_rgba8();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ZXraw Explorer")
             .with_inner_size([1360.0, 840.0])
             .with_min_inner_size([640.0, 400.0])
             .with_icon(egui::IconData {
-                rgba: image::load_from_memory(include_bytes!("../../../assets/zxraw.png"))
-                    .expect("embedded application icon PNG must be valid")
-                    .to_rgba8()
-                    .into_raw(),
-                width: 256,
-                height: 256,
+                width: icon.width(),
+                height: icon.height(),
+                rgba: icon.into_raw(),
             })
             .with_drag_and_drop(true),
         persist_window: true,

@@ -11,7 +11,7 @@ const VERB: &str = "ZXrawExplorer";
 
 /// Register "Open in ZXraw Explorer" for folders, drives, and directory backgrounds.
 ///
-/// Only the current user's `HKCU\\Software\\Classes` tree is modified.
+/// Only the current user's `HKCU\Software\Classes` tree is modified.
 pub fn register_context_menu(exe: impl AsRef<Path>) -> Result<()> {
     #[cfg(windows)]
     {

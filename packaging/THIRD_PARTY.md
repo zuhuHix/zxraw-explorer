@@ -20,7 +20,7 @@ crate manifests used by this workspace:
 | windows | MIT OR Apache-2.0 |
 | clap | MIT OR Apache-2.0 |
 | notify | CC0-1.0 |
-| zip | MIT OR Apache-2.0 |
+| zip | MIT |
 | embed-resource | MIT |
 
 This is not a complete notice for every transitive dependency. Regenerate the

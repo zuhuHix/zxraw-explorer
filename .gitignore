@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 /bench-data
+
+# Local release staging and installer output
+/dist

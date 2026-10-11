@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
-    [string]$TargetDir = $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target\l12" }),
-    [string]$OutputDir = "dist"
+    [string]$TargetDir = $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }),
+    [string]$OutputDir = "dist",
+    [switch]$SkipTests
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,9 +26,13 @@ try {
     & cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit code $LASTEXITCODE" }
 
-    Write-Host "Running workspace tests..."
-    & cargo test --workspace
-    if ($LASTEXITCODE -ne 0) { throw "cargo test --workspace failed with exit code $LASTEXITCODE" }
+    if ($SkipTests) {
+        Write-Warning "Skipping workspace tests (-SkipTests); do not publish this build without a passing test run."
+    } else {
+        Write-Host "Running workspace tests..."
+        & cargo test --workspace
+        if ($LASTEXITCODE -ne 0) { throw "cargo test --workspace failed with exit code $LASTEXITCODE" }
+    }
 
     $manifest = Get-Content -Raw (Join-Path $repoRoot "Cargo.toml")
     $versionMatch = [regex]::Match($manifest, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
