@@ -168,3 +168,11 @@ $p.WaitForExit()
 `--flat-files`, `--tree-files`, `--tree-leaf-dirs`, `--jpeg-count`, `--jpeg-width`,
 `--jpeg-height`, and `--hash-bytes` allow smaller exploratory datasets for `generate`;
 published results must record any non-default values.
+
+### UI test hook isolation
+
+Any run with `ZXRAW_SCREENSHOT`, `ZXRAW_CMDS` or `ZXRAW_SELECT` set uses a throwaway profile
+(`%TEMP%\zxraw-test-profile`: settings, session, library database, caches) so automated runs
+never modify the user's real data. Set `ZXRAW_PROFILE_DIR` to choose the profile explicitly.
+Commands run once the first listing finishes (or after 30 s), the capture happens ~90 frames
+after the commands, and a run closes itself after 120 s at most.

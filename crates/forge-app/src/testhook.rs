@@ -6,6 +6,11 @@
 //! * `ZXRAW_SCREENSHOT=out.png` — after the UI settles, capture the rendered frame via
 //!   egui's own screenshot path (works even where OS screen capture can't see GPU
 //!   swapchains), save it, and exit.
+//! * `ZXRAW_PROFILE_DIR=dir` — profile (settings, session, library, caches) to use. Any
+//!   automated run without it uses `%TEMP%\zxraw-test-profile`, never the user's profile.
+//!
+//! Timing: commands run once the first listing finishes (or after 30 s regardless); the
+//! capture happens ~90 frames *after* the commands; a run is closed after 120 s at most.
 
 use std::path::PathBuf;
 
@@ -19,7 +24,17 @@ pub struct TestHook {
     select: Option<String>,
     frames: u32,
     ran_cmds: bool,
+    frames_after_cmds: u32,
     requested: bool,
+    started: Option<std::time::Instant>,
+}
+
+/// True when the environment asks for an automated run (checked before the app starts so
+/// the profile can be isolated).
+pub fn env_requests_automation() -> bool {
+    ["ZXRAW_SCREENSHOT", "ZXRAW_CMDS", "ZXRAW_SELECT"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
 }
 
 impl TestHook {
@@ -54,7 +69,14 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let loading = app.tabs.iter().any(|t| t.left.is_loading());
     let hook = &mut app.testhook;
     hook.frames += 1;
-    if !hook.ran_cmds && !loading && hook.frames > 5 {
+    let elapsed = hook.started.get_or_insert_with(std::time::Instant::now).elapsed();
+    if elapsed > std::time::Duration::from_secs(120) {
+        tracing::error!("test hook: giving up after 120 s without a screenshot");
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+    let listing_done = !loading || elapsed > std::time::Duration::from_secs(30);
+    if !hook.ran_cmds && listing_done && hook.frames > 5 {
         hook.ran_cmds = true;
         if let Some(name) = hook.select.take() {
             app.pane_mut().select_name(&name);
@@ -66,8 +88,11 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         }
     }
     let hook = &mut app.testhook;
+    if hook.ran_cmds {
+        hook.frames_after_cmds += 1;
+    }
     // Give async listings/thumbnails a moment to land, then capture.
-    if hook.ran_cmds && hook.frames > 90 && !hook.requested {
+    if hook.ran_cmds && hook.frames_after_cmds > 90 && !hook.requested {
         if hook.screenshot.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
             hook.requested = true;

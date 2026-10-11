@@ -104,7 +104,15 @@ pub struct Paths {
 impl Paths {
     pub fn resolve() -> Self {
         let pd = directories::ProjectDirs::from("", "", "ZXraw Explorer");
-        let (config, data, cache) = match &pd {
+        // Automated UI runs (screenshot hook) must never touch the user's real settings,
+        // session or library: they get a throwaway profile unless one is given explicitly.
+        let profile = std::env::var_os("ZXRAW_PROFILE_DIR").map(PathBuf::from).or_else(|| {
+            crate::testhook::env_requests_automation()
+                .then(|| std::env::temp_dir().join("zxraw-test-profile"))
+        });
+        let (config, data, cache) = match (&profile, &pd) {
+            (Some(root), _) => (root.join("config"), root.join("data"), root.join("cache")),
+            (None, pd) => match pd {
             Some(p) => (
                 p.config_dir().to_path_buf(),
                 p.data_local_dir().to_path_buf(),
@@ -114,6 +122,7 @@ impl Paths {
                 let t = std::env::temp_dir().join("ZXraw Explorer");
                 (t.join("config"), t.join("data"), t.join("cache"))
             }
+            },
         };
         let logs = data.join("logs");
         for d in [&config, &data, &cache, &logs] {
