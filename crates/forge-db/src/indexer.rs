@@ -291,14 +291,7 @@ impl<'a> Indexer<'a> {
         // Resume or start a pass.
         let state = self.db.index_state(root.id)?;
         let (scan_id, mut stack, resumed) = match state {
-            Some(s)
-                if matches!(
-                    s.status,
-                    ScanStatus::Running | ScanStatus::Interrupted | ScanStatus::Unavailable
-                ) && !s.pending.is_empty() =>
-            {
-                (s.scan_id, s.pending, true)
-            }
+            Some(s) if s.is_resumable() => (s.scan_id, s.pending, true),
             _ => (now_ms(), vec![root_path.clone()], false),
         };
         report.resumed = resumed;

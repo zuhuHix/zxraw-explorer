@@ -83,6 +83,13 @@ impl ScanStatus {
             ScanStatus::Unavailable => "unavailable",
         }
     }
+    /// Whether a pass that ended in this state can continue from its checkpoint.
+    pub fn is_resumable(self) -> bool {
+        matches!(
+            self,
+            ScanStatus::Running | ScanStatus::Interrupted | ScanStatus::Unavailable
+        )
+    }
     fn parse(s: &str) -> Self {
         match s {
             "running" => ScanStatus::Running,
@@ -106,6 +113,13 @@ pub struct IndexState {
     pub items_seen: u64,
     pub errors: u64,
     pub last_error: Option<String>,
+}
+
+impl IndexState {
+    /// An unfinished pass with folders left to list: the next run continues it.
+    pub fn is_resumable(&self) -> bool {
+        self.status.is_resumable() && !self.pending.is_empty()
+    }
 }
 
 impl Db {
@@ -334,6 +348,27 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_unfinished_passes_with_folders_left_are_resumable() {
+        let state = |status, pending: &[&str]| IndexState {
+            root_id: 1,
+            scan_id: 1,
+            status,
+            started_at: 0,
+            updated_at: 0,
+            finished_at: None,
+            pending: pending.iter().map(PathBuf::from).collect(),
+            items_seen: 0,
+            errors: 0,
+            last_error: None,
+        };
+        assert!(state(ScanStatus::Running, &[r"C:\a"]).is_resumable());
+        assert!(state(ScanStatus::Interrupted, &[r"C:\a"]).is_resumable());
+        assert!(state(ScanStatus::Unavailable, &[r"C:\a"]).is_resumable());
+        assert!(!state(ScanStatus::Running, &[]).is_resumable());
+        assert!(!state(ScanStatus::Complete, &[r"C:\a"]).is_resumable());
+    }
 
     #[test]
     fn kv_settings() {

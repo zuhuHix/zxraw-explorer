@@ -144,7 +144,7 @@ struct ImportPrompt {
 }
 
 #[derive(Clone)]
-enum EditKind {
+pub(crate) enum EditKind {
     CreateManual { add_files: Vec<NewFile> },
     CreateSmart,
     CreateSavedSearch,
@@ -153,7 +153,7 @@ enum EditKind {
 }
 
 #[derive(Clone)]
-struct EditDialog {
+pub(crate) struct EditDialog {
     kind: EditKind,
     name: String,
     query: String,
@@ -178,12 +178,12 @@ impl EditDialog {
 }
 
 #[derive(Clone)]
-enum DeleteTarget {
+pub(crate) enum DeleteTarget {
     Collection { id: CollectionId, name: String },
     SavedSearch { name: String },
 }
 
-enum UiCommand {
+pub(crate) enum UiCommand {
     AddFiles {
         collection_id: CollectionId,
         files: Vec<NewFile>,
@@ -341,6 +341,57 @@ pub fn add_selection(app: &mut ZxrawApp) {
     state.picker_files = files;
     state.picker_filter.clear();
     state.picker_open = true;
+}
+
+/// Test hook: a manual collection holding the current selection, created through the same
+/// save path as the picker's "New collection" button.
+pub(crate) fn create_manual_from_selection(app: &mut ZxrawApp, ctx: &egui::Context, name: &str) {
+    let targets: std::collections::HashSet<PathBuf> =
+        app.pane().action_targets().into_iter().collect();
+    let add_files: Vec<NewFile> = app
+        .pane()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File && targets.contains(&entry.path))
+        .map(NewFile::from)
+        .collect();
+    let form = EditDialog {
+        kind: EditKind::CreateManual { add_files },
+        name: name.to_string(),
+        query: String::new(),
+    };
+    start_save_edit(app, ctx, form);
+}
+
+/// Test hook: nothing queued or loading, so the window shows settled state.
+pub(crate) fn testhook_idle(app: &ZxrawApp) -> bool {
+    let state = &app.ops.collections_ui;
+    !state.operation_pending
+        && !state.catalog_loading
+        && !state.rows_loading
+        && !state.relink_preview_running
+}
+
+/// Test hook: names of the rows the open collection shows, once they have loaded for `id`.
+pub(crate) fn testhook_shown_rows(app: &ZxrawApp, id: CollectionId) -> Option<Vec<String>> {
+    let state = &app.ops.collections_ui;
+    let shows = matches!(&state.detail, Some(Detail::Collection { id: shown, .. }) if *shown == id);
+    (shows && !state.rows_loading).then(|| state.rows.iter().map(|row| row.name.clone()).collect())
+}
+
+/// Test hook: `Ok(Some(count))` once the relink preview has finished.
+pub(crate) fn testhook_relink_preview(app: &ZxrawApp) -> Result<Option<u64>, String> {
+    let state = &app.ops.collections_ui;
+    if let Some(error) = &state.relink_preview_error {
+        return Err(error.clone());
+    }
+    Ok(if state.relink_preview_running { None } else { state.relink_preview_count })
+}
+
+/// Test hook: the old and new folders chosen in the relink dialog, once both are set.
+pub(crate) fn testhook_relink_paths(app: &ZxrawApp) -> Option<(PathBuf, PathBuf)> {
+    let state = &app.ops.collections_ui;
+    Some((state.relink_old.clone()?, state.relink_new.clone()?))
 }
 
 /// Open the management window on a collection. Used by the sidebar.
@@ -1362,7 +1413,7 @@ fn render_import_dialog(
     }
 }
 
-fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) {
+pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) {
     match command {
         UiCommand::AddFiles {
             collection_id,
@@ -1458,6 +1509,15 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             start_operation(app, ctx, OperationFlags::RELINK, move |db| {
                 let report: RelinkReport =
                     db.relink(&old, &new, None).map_err(|e| e.to_string())?;
+                // Relink moves the rows but not their presence flags. Re-list the new folders
+                // so the files that exist there come back online; missing ones stay offline.
+                let indexer = forge_db::Indexer::new(&db)
+                    .volume_resolver(crate::library::volume_info);
+                for dir in db.folders_under(&new).map_err(|e| e.to_string())? {
+                    indexer
+                        .reconcile_dir(&dir)
+                        .map_err(|e| format!("relinked, but could not refresh {}: {e}", dir.display()))?;
+                }
                 Ok(relink_summary(&report))
             });
             app.ops.collections_ui.relink_open = false;

@@ -2,7 +2,7 @@
 //! saved searches, and portable JSON export/import (path based).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use forge_core::model::EntryKind;
 use forge_core::query::Query;
@@ -114,13 +114,40 @@ pub enum SmartCollectionConflictChoice {
 }
 
 const EXPORT_FORMAT: &str = "forge-collections";
+/// Maximum JSON payload accepted by the library import path.
+pub const MAX_COLLECTION_IMPORT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IMPORTED_COLLECTIONS: usize = 10_000;
+const MAX_IMPORTED_ITEMS: usize = 250_000;
+const MAX_IMPORTED_TEXT_BYTES: usize = 4_096;
+const MAX_IMPORTED_PATH_BYTES: usize = 32 * 1024;
 
 fn valid_name(name: &str) -> Result<String> {
     let n = name.trim();
     if n.is_empty() {
         return Err(DbError::Invalid("collection name is empty".into()));
     }
+    if n.len() > MAX_IMPORTED_TEXT_BYTES {
+        return Err(DbError::Invalid("collection name is too long".into()));
+    }
     Ok(n.to_string())
+}
+
+fn validate_import_path(path: &Path) -> Result<()> {
+    let text = path.to_string_lossy();
+    let normalized = text.replace('/', "\\").to_lowercase();
+    if text.len() > MAX_IMPORTED_PATH_BYTES
+        || !path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        || normalized.starts_with("\\\\?\\")
+        || normalized.starts_with("\\\\.\\")
+    {
+        return Err(DbError::Invalid(format!(
+            "unsafe or invalid collection item path: {text}"
+        )));
+    }
+    Ok(())
 }
 
 fn insert_collection_tx(
@@ -481,10 +508,31 @@ impl Db {
                 data.version
             )));
         }
+        if data.collections.len() > MAX_IMPORTED_COLLECTIONS {
+            return Err(DbError::Invalid("too many collections in import".into()));
+        }
+        let mut total_items = 0usize;
         for c in &data.collections {
             valid_name(&c.name)?;
+            if c.query
+                .as_ref()
+                .is_some_and(|query| query.len() > MAX_IMPORTED_TEXT_BYTES)
+            {
+                return Err(DbError::Invalid("collection query is too long".into()));
+            }
             if c.kind == CollectionKind::Smart {
                 Query::parse(c.query.as_deref().unwrap_or(""))?;
+            }
+            total_items = total_items
+                .checked_add(c.items.len())
+                .ok_or_else(|| DbError::Invalid("too many collection items in import".into()))?;
+            if total_items > MAX_IMPORTED_ITEMS {
+                return Err(DbError::Invalid(
+                    "too many collection items in import".into(),
+                ));
+            }
+            for path in &c.items {
+                validate_import_path(path)?;
             }
         }
         self.with_tx(|tx| {
@@ -619,6 +667,11 @@ impl Db {
     }
 
     pub fn import_collections_json(&self, json: &str) -> Result<ImportReport> {
+        if json.len() > MAX_COLLECTION_IMPORT_BYTES {
+            return Err(DbError::Invalid(
+                "collections import exceeds the size limit".into(),
+            ));
+        }
         let data: CollectionsExport = serde_json::from_str(json)?;
         self.import_collections(&data)
     }
@@ -700,6 +753,78 @@ mod tests {
         assert!(files.iter().all(|f| !f.present));
         assert!(db.delete_collection(c).unwrap());
         assert!(db.collections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_malformed_oversized_and_traversal_without_partial_writes() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_manual_collection("Before").unwrap();
+
+        assert!(db.import_collections_json("{broken").is_err());
+        assert!(
+            db.import_collections_json(&" ".repeat(MAX_COLLECTION_IMPORT_BYTES + 1))
+                .is_err()
+        );
+
+        let hostile = CollectionsExport {
+            format: EXPORT_FORMAT.into(),
+            version: 1,
+            exported_at: 0,
+            collections: vec![CollectionExport {
+                name: "Would be partial".into(),
+                kind: CollectionKind::Manual,
+                query: None,
+                items: vec![
+                    PathBuf::from(r"C:\photos\safe.jpg"),
+                    PathBuf::from(r"C:\photos\..\escape.jpg"),
+                ],
+            }],
+        };
+        let json = serde_json::to_string(&hostile).unwrap();
+        assert!(db.import_collections_json(&json).is_err());
+        assert_eq!(
+            db.collections()
+                .unwrap()
+                .iter()
+                .map(|collection| collection.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Before"]
+        );
+        assert_eq!(db.stats().unwrap().files, 0);
+    }
+
+    #[test]
+    fn export_import_round_trip_keeps_manual_paths() {
+        let source = Db::open_in_memory().unwrap();
+        let id = source.create_manual_collection("Favorites").unwrap();
+        let files = source
+            .upsert_files(&[nf(r"C:\photos\one.jpg"), nf(r"C:\photos\two.jpg")])
+            .unwrap();
+        source.add_to_collection(id, &files).unwrap();
+        let json = source.export_collections_json(&[id]).unwrap();
+
+        let target = Db::open_in_memory().unwrap();
+        let report = target.import_collections_json(&json).unwrap();
+        assert_eq!(report.collections_created, 1);
+        assert_eq!(report.items_placeholder, 2);
+        let collection = target.collection_by_name("favorites").unwrap().unwrap();
+        let members = target
+            .collection_files(
+                collection.id,
+                &SearchOptions {
+                    include_offline: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one.jpg", "two.jpg"]
+        );
+        assert!(members.iter().all(|row| !row.present));
     }
 
     #[test]

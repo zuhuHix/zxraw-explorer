@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use forge_core::query::{ColorLabel, PickState};
-use forge_db::{AnnotationChange, Db, FileRecord, SearchOptions};
+use forge_db::{AnnotationChange, Db, FileRecord, IndexRoot, IndexState, SearchOptions};
 use forge_jobs::{JobHandle, JobRegistry};
 use forge_media::{SidecarOutcome, SidecarUpdate, update_sidecar};
 
+use crate::app::ZxrawApp;
 use crate::views::Annotation;
 
 pub enum LibMsg {
@@ -69,6 +70,8 @@ pub struct Library {
     /// Mirror annotation changes into `.xmp` sidecars (set from the settings every frame).
     xmp_sync: bool,
     pub search: SearchState,
+    /// Set once interrupted index passes have been looked at for this session.
+    pub resume_checked: bool,
 }
 
 #[derive(Default)]
@@ -130,6 +133,7 @@ impl Library {
             writer: None,
             xmp_sync: false,
             search: SearchState::default(),
+            resume_checked: false,
         }
     }
 
@@ -358,22 +362,102 @@ pub fn start_index_job(
         let mut indexer = forge_db::Indexer::new(&db)
             .cancel_token(job.cancel.clone())
             .progress(job.progress.clone())
-            .volume_resolver(|p| {
-                let mut v = forge_db::VolumeInfo::from_path_root(p);
-                v.serial = forge_win::volume_serial(Path::new(&v.root))
-                    .ok()
-                    .map(|s| format!("{s:08X}"));
-                Some(v)
-            });
+            .volume_resolver(volume_info);
         let report = indexer.index_root(root_id).map_err(|e| e.to_string())?;
         job.log(format!("{report:?}"));
         if job.cancel.is_cancelled() {
             return Ok(());
         }
         extract_metadata(&db, job);
-        notify(format!("Indexed {}", root.display()));
+        if report.resumed {
+            notify(format!("Resumed and finished indexing {}", root.display()));
+        } else {
+            notify(format!("Indexed {}", root.display()));
+        }
         Ok(())
     })
+}
+
+/// Volume identity for indexing: the root plus the volume serial, so a drive keeps one row
+/// even when its letter changes. Shared by index jobs and relink reconciles.
+pub fn volume_info(path: &Path) -> Option<forge_db::VolumeInfo> {
+    let mut v = forge_db::VolumeInfo::from_path_root(path);
+    v.serial = forge_win::volume_serial(Path::new(&v.root))
+        .ok()
+        .map(|s| format!("{s:08X}"));
+    Some(v)
+}
+
+/// What startup does with an index pass that an earlier run left unfinished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumePlan {
+    /// Continue the pass from its checkpoint.
+    Resume(PathBuf),
+    /// The folder is gone, so the pass cannot continue: forget its checkpoint.
+    Drop(PathBuf),
+}
+
+/// Decides how to pick up one index root at startup. `None` means nothing is pending
+/// (disabled root, no pass, or a pass that already completed).
+pub fn plan_resume(
+    root: &IndexRoot,
+    state: Option<&IndexState>,
+    folder_reachable: bool,
+) -> Option<ResumePlan> {
+    if !root.enabled || !state.is_some_and(IndexState::is_resumable) {
+        return None;
+    }
+    Some(if folder_reachable {
+        ResumePlan::Resume(root.path.clone())
+    } else {
+        ResumePlan::Drop(root.path.clone())
+    })
+}
+
+/// Restarts every interrupted index pass in the background, as its own job, so startup
+/// never waits for it. Runs once per session as soon as the library is open.
+pub fn resume_on_start(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let library = &mut app.ops.library;
+    if library.resume_checked {
+        return;
+    }
+    let Some(db) = library.db.clone() else {
+        return;
+    };
+    library.resume_checked = true;
+    let roots = match db.index_roots() {
+        Ok(roots) => roots,
+        Err(e) => {
+            app.toast_err(format!("Could not read indexed folders: {e}"));
+            return;
+        }
+    };
+    for root in roots {
+        let state = db.index_state(root.id).ok().flatten();
+        let reachable = std::fs::symlink_metadata(&root.path).is_ok_and(|m| m.is_dir());
+        match plan_resume(&root, state.as_ref(), reachable) {
+            Some(ResumePlan::Resume(path)) => {
+                app.toast(format!(
+                    "Resuming interrupted indexing of {}",
+                    path.display()
+                ));
+                let tx = app.ops.tx.clone();
+                let c = ctx.clone();
+                start_index_job(&app.ops.jobs, db.clone(), path, move |m| {
+                    let _ = tx.send(crate::actions::Event::Toast(m));
+                    c.request_repaint();
+                });
+            }
+            Some(ResumePlan::Drop(path)) => {
+                let _ = db.reset_index_state(root.id);
+                app.toast_err(format!(
+                    "Interrupted indexing of {} was dropped: the folder is no longer available",
+                    path.display()
+                ));
+            }
+            None => {}
+        }
+    }
 }
 
 /// Fill image/video metadata for indexed files that lack it. Failures are recorded as
@@ -713,6 +797,49 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
 mod tests {
     use super::*;
     use forge_media::MediaError;
+
+    fn pass(status: forge_db::ScanStatus, pending: &[&str]) -> IndexState {
+        IndexState {
+            root_id: 1,
+            scan_id: 1,
+            status,
+            started_at: 0,
+            updated_at: 0,
+            finished_at: None,
+            pending: pending.iter().map(PathBuf::from).collect(),
+            items_seen: 0,
+            errors: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn startup_resumes_only_enabled_unfinished_passes_whose_folder_exists() {
+        use forge_db::ScanStatus::{Complete, Running};
+        let root = IndexRoot {
+            id: 1,
+            path: PathBuf::from(r"C:\shoot"),
+            enabled: true,
+            added_at: 0,
+            last_complete_at: None,
+        };
+        let unfinished = pass(Running, &[r"C:\shoot\day1"]);
+        assert_eq!(
+            plan_resume(&root, Some(&unfinished), true),
+            Some(ResumePlan::Resume(root.path.clone()))
+        );
+        assert_eq!(
+            plan_resume(&root, Some(&unfinished), false),
+            Some(ResumePlan::Drop(root.path.clone()))
+        );
+        assert_eq!(plan_resume(&root, Some(&pass(Complete, &[])), true), None);
+        assert_eq!(plan_resume(&root, None, true), None);
+        let disabled = IndexRoot {
+            enabled: false,
+            ..root.clone()
+        };
+        assert_eq!(plan_resume(&disabled, Some(&unfinished), true), None);
+    }
 
     fn annotation(rating: u8) -> Annotation {
         Annotation {
