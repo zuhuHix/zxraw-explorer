@@ -17,7 +17,11 @@ const MIN_GAP_LARGE: Duration = Duration::from_secs(4);
 pub struct FolderWatcher {
     watcher: Option<RecommendedWatcher>,
     rx: Receiver<PathBuf>,
+    /// Directories shown by panes.
     watched: HashSet<PathBuf>,
+    /// Directories registered with notify, including parents so a shown folder's
+    /// external deletion can be noticed.
+    registered: HashSet<PathBuf>,
     /// dir -> time of the most recent event
     pending: HashMap<PathBuf, Instant>,
     last_refresh: HashMap<PathBuf, Instant>,
@@ -35,6 +39,7 @@ impl FolderWatcher {
                     return;
                 }
                 for p in ev.paths {
+                    let _ = tx.send(p.clone());
                     if let Some(parent) = p.parent() {
                         let _ = tx.send(parent.to_path_buf());
                     }
@@ -48,6 +53,7 @@ impl FolderWatcher {
             watcher,
             rx,
             watched: HashSet::new(),
+            registered: HashSet::new(),
             pending: HashMap::new(),
             last_refresh: HashMap::new(),
             ctx,
@@ -60,18 +66,35 @@ impl FolderWatcher {
             return;
         };
         let want: HashSet<PathBuf> = dirs.iter().cloned().collect();
-        for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
+        let mut register = want.clone();
+        register.extend(
+            want.iter()
+                .filter_map(|dir| dir.parent().map(Path::to_path_buf)),
+        );
+        for gone in self
+            .registered
+            .difference(&register)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             let _ = w.unwatch(&gone);
-            self.watched.remove(&gone);
-            self.pending.remove(&gone);
+            self.registered.remove(&gone);
         }
-        for new in want.difference(&self.watched).cloned().collect::<Vec<_>>() {
+        for new in register
+            .difference(&self.registered)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             // Unwatchable folders (some network shares, removed drives) just don't
             // auto-refresh; F5 still works.
             if w.watch(&new, RecursiveMode::NonRecursive).is_ok() {
-                self.watched.insert(new);
+                self.registered.insert(new);
             }
         }
+        for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
+            self.pending.remove(&gone);
+        }
+        self.watched = want;
     }
 
     /// Folders that should be refreshed now. `size_of` gives the entry count for a dir so
@@ -81,6 +104,17 @@ impl FolderWatcher {
         while let Ok(dir) = self.rx.try_recv() {
             if self.watched.contains(&dir) {
                 self.pending.insert(dir, now);
+            } else {
+                // When the directory being shown is deleted, Windows may report only an
+                // event in its parent. Refresh the pane whose root disappeared so the UI
+                // can show its normal listing error instead of remaining stale.
+                for removed in self
+                    .watched
+                    .iter()
+                    .filter(|shown| shown.parent() == Some(dir.as_path()) && !shown.is_dir())
+                {
+                    self.pending.insert(removed.clone(), now);
+                }
             }
         }
         let mut out = Vec::new();
@@ -142,5 +176,23 @@ mod tests {
         }
         assert_eq!(got.len(), 1, "expected one refresh for the watched folder");
         assert!(forge_core::paths::paths_equal(&got[0], &dir));
+    }
+
+    #[test]
+    fn detects_external_deletion_of_a_shown_folder() {
+        let parent = tempfile::tempdir().unwrap();
+        let shown = parent.path().join("shown");
+        std::fs::create_dir(&shown).unwrap();
+        let mut watcher = FolderWatcher::new(egui::Context::default());
+        watcher.sync(std::slice::from_ref(&shown));
+        std::fs::remove_dir(&shown).unwrap();
+
+        let started = Instant::now();
+        let mut due = Vec::new();
+        while started.elapsed() < Duration::from_secs(5) && due.is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+            due = watcher.due(|_| 0);
+        }
+        assert_eq!(due, vec![shown]);
     }
 }

@@ -264,6 +264,16 @@ pub struct SyncPlan {
     pub bytes_to_copy: u64,
     /// Entries deliberately left alone, with the reason (shown in the preview).
     pub skipped: Vec<OpIssue>,
+    /// File metadata observed while building each copy action. Execution checks these
+    /// snapshots again so a stale preview cannot silently overwrite changed files.
+    pub expected: Vec<SyncExpectation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncExpectation {
+    pub rel: PathBuf,
+    pub left: SideInfo,
+    pub right: Option<SideInfo>,
 }
 
 impl SyncPlan {
@@ -282,16 +292,25 @@ pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMo
     let mut mkdirs = Vec::new();
     let mut copies = Vec::new();
     let mut skipped = Vec::new();
+    let mut expected = Vec::new();
     let mut deleted_dirs: Vec<&Path> = Vec::new();
     let mut bytes = 0;
-    let mut copy = |rel: &Path, overwrite: bool, size: u64, copies: &mut Vec<SyncAction>| {
-        bytes += size;
-        copies.push(SyncAction::Copy {
-            rel: rel.to_path_buf(),
-            overwrite,
-            bytes: size,
-        });
-    };
+    let mut copy =
+        |entry: &CompareEntry, overwrite: bool, size: u64, copies: &mut Vec<SyncAction>| {
+            if let Some(left) = entry.left {
+                expected.push(SyncExpectation {
+                    rel: entry.rel.clone(),
+                    left,
+                    right: entry.right,
+                });
+            }
+            bytes += size;
+            copies.push(SyncAction::Copy {
+                rel: entry.rel.clone(),
+                overwrite,
+                bytes: size,
+            });
+        };
     for e in &report.entries {
         let rel = e.rel.as_path();
         let lk = e.left.map(|i| i.kind);
@@ -300,7 +319,7 @@ pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMo
             EntryState::Error(msg) => skipped.push(OpIssue::new(rel, msg.clone())),
             EntryState::LeftOnly => match lk {
                 Some(NodeKind::Dir) => mkdirs.push(SyncAction::CreateDir { rel: rel.into() }),
-                Some(NodeKind::File) => copy(rel, false, e.left.unwrap().size, &mut copies),
+                Some(NodeKind::File) => copy(e, false, e.left.unwrap().size, &mut copies),
                 _ => skipped.push(OpIssue::new(rel, "links are not synced")),
             },
             EntryState::RightOnly => {
@@ -331,7 +350,7 @@ pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMo
                     if lk == Some(NodeKind::Dir) {
                         mkdirs.push(SyncAction::CreateDir { rel: rel.into() });
                     } else {
-                        copy(rel, false, e.left.unwrap().size, &mut copies);
+                        copy(e, false, e.left.unwrap().size, &mut copies);
                     }
                 } else {
                     skipped.push(OpIssue::new(rel, "different item types on each side"));
@@ -349,7 +368,7 @@ pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMo
                     Duration::from_secs(2),
                 ) == std::cmp::Ordering::Greater;
                 if mirror || *reason == DiffReason::LeftNewer || left_newer {
-                    copy(rel, true, size, &mut copies);
+                    copy(e, true, size, &mut copies);
                 } else {
                     skipped.push(OpIssue::new(
                         rel,
@@ -369,12 +388,25 @@ pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMo
         actions,
         bytes_to_copy: bytes,
         skipped,
+        expected,
     }
 }
 
 /// Deleter used for Mirror deletions; `None` means permanent deletion. The app can pass a
 /// Recycle Bin implementation from `forge-win`.
 pub type Deleter<'a> = &'a mut dyn FnMut(&Path) -> std::result::Result<(), String>;
+
+fn matches_snapshot(path: &Path, expected: Option<SideInfo>) -> bool {
+    match (expected, fs::symlink_metadata(path)) {
+        (Some(expected), Ok(actual)) => {
+            crate::ops::node_kind(&actual) == expected.kind
+                && actual.len() == expected.size
+                && actual.modified().ok() == expected.modified
+        }
+        (None, Err(error)) => error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
 
 /// Execute a previewed sync plan.
 pub fn execute_sync(
@@ -431,6 +463,20 @@ pub fn execute_sync(
             } => {
                 let src = plan.left.join(rel);
                 let dest = plan.right.join(rel);
+                let expected = plan.expected.iter().find(|snapshot| snapshot.rel == *rel);
+                if expected.is_none_or(|snapshot| {
+                    !matches_snapshot(&src, Some(snapshot.left))
+                        || !matches_snapshot(&dest, snapshot.right)
+                }) {
+                    ctx.progress.add_bytes(*bytes);
+                    fail(
+                        &mut report,
+                        &dest,
+                        "source or destination changed since comparison; rerun compare".into(),
+                    );
+                    ctx.progress.add_items(1);
+                    continue;
+                }
                 ctx.progress.set_current(src.display().to_string());
                 let opts = CopyFileOptions {
                     overwrite: *overwrite,
@@ -543,6 +589,38 @@ mod tests {
     }
 
     #[test]
+    fn update_refuses_files_changed_after_the_preview() {
+        for change_source in [true, false] {
+            let (_d, l, r) = setup();
+            let cancel = CancelToken::new();
+            let progress = Progress::default();
+            let ctx = JobCtx::new(&cancel, &progress);
+            let report = compare_dirs(&l, &r, &CompareOptions::default(), &ctx).unwrap();
+            let plan = plan_sync(&report, &l, &r, SyncMode::Update);
+            let left = l.join("sub/newer.txt");
+            let right = r.join("sub/newer.txt");
+
+            if change_source {
+                fs::write(&left, b"changed after compare").unwrap();
+                set_mtime(&left, 1_700_000_000);
+            } else {
+                fs::write(&right, b"changed after compare").unwrap();
+                set_mtime(&right, 1_700_000_000);
+            }
+            let expected_right = fs::read(&right).unwrap();
+            let result = execute_sync(&plan, true, None, &ctx);
+
+            assert_eq!(fs::read(&right).unwrap(), expected_right);
+            assert!(
+                result.failed.iter().any(|issue| {
+                    issue.path == right && issue.reason.contains("changed since comparison")
+                }),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn mirror_makes_identical() {
         let (_d, l, r) = setup();
         let cancel = CancelToken::new();
@@ -589,6 +667,7 @@ mod tests {
             }],
             bytes_to_copy: 0,
             skipped: vec![],
+            expected: vec![],
         };
         let cancel = CancelToken::new();
         let progress = Progress::default();

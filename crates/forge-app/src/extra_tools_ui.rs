@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{ArchiveEntry, ExtractOptions};
 use forge_core::model::{EntryKind, MediaKind};
@@ -419,11 +419,20 @@ pub fn join_files(app: &mut ZxrawApp) {
         app.toast_err("Select a .b3split manifest or the first .001 part");
         return;
     };
-    let jobs = app.ops.jobs.clone();
-    let event_tx = app.ops.tx.clone();
-    let app_ctx = app.ops.ctx.clone();
+    let job = start_join(&app.ops.jobs, &app.ops.tx, &app.ops.ctx, input);
+    app.toast(format!("Started {}", job.title));
+}
+
+fn start_join(
+    jobs: &JobRegistry,
+    event_tx: &crossbeam_channel::Sender<Event>,
+    app_ctx: &egui::Context,
+    input: PathBuf,
+) -> JobHandle {
+    let event_tx = event_tx.clone();
+    let app_ctx = app_ctx.clone();
     let input_for_job = input.clone();
-    let job = jobs.spawn(
+    jobs.spawn(
         "file-join",
         format!("Joining {}", input.display()),
         move |job| {
@@ -449,8 +458,145 @@ pub fn join_files(app: &mut ZxrawApp) {
                 }
             }
         },
+    )
+}
+
+/// Automation: open the ZIP browser on `path`, as `browse_archive` does for a selection.
+pub(crate) fn automation_open_archive(app: &mut ZxrawApp, path: PathBuf) {
+    let jobs = app.ops.jobs.clone();
+    let app_ctx = app.ops.ctx.clone();
+    app.ops.extra_tools.archive = Some(open_archive_state(&jobs, &app_ctx, path));
+}
+
+/// `None` while the listing runs; then the number of entries, or the listing error.
+pub(crate) fn automation_archive_listing(app: &mut ZxrawApp) -> Option<Result<usize, String>> {
+    let state = app.ops.extra_tools.archive.as_mut()?;
+    if let Some(rx) = &state.list_result {
+        match rx.try_recv() {
+            Ok(Ok(entries)) => {
+                state.entries = entries;
+                state.list_result = None;
+            }
+            Ok(Err(error)) => {
+                state.list_result = None;
+                return Some(Err(error));
+            }
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                state.list_result = None;
+                return Some(Err("the archive listing ended without a result".into()));
+            }
+        }
+    }
+    match &state.notice {
+        Some(error) if state.entries.is_empty() => Some(Err(error.clone())),
+        _ => Some(Ok(state.entries.len())),
+    }
+}
+
+/// Names of the listed entries, for assertions.
+pub(crate) fn automation_archive_names(app: &ZxrawApp) -> Vec<String> {
+    app.ops
+        .extra_tools
+        .archive
+        .as_ref()
+        .map(|state| state.entries.iter().map(|e| e.name.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// Automation: extract the whole open archive into `destination`, as the "Extract all" button.
+pub(crate) fn automation_archive_extract(
+    app: &mut ZxrawApp,
+    destination: PathBuf,
+) -> Result<(), String> {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let state = app
+        .ops
+        .extra_tools
+        .archive
+        .as_mut()
+        .ok_or("the archive browser is not open")?;
+    if state
+        .extract_job
+        .as_ref()
+        .is_some_and(|job| !job.state().is_finished())
+    {
+        return Err("an extraction is already running".into());
+    }
+    let job = start_extract_archive(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        &state.path,
+        destination.clone(),
+        Vec::new(),
+        HashSet::new(),
     );
-    app.toast(format!("Started {}", job.title));
+    state.destination = destination;
+    state.extract_job = Some(job);
+    Ok(())
+}
+
+/// Automation: create a ZIP named `name` in `directory` from `sources`, as the create dialog.
+pub(crate) fn automation_create_archive(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    directory: PathBuf,
+    name: String,
+) -> Result<(), String> {
+    if sources.is_empty() {
+        return Err("choose at least one file or folder".into());
+    }
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let job = start_create_archive(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        sources.clone(),
+        directory.clone(),
+        name.clone(),
+    );
+    app.ops.extra_tools.create_archive = Some(CreateArchiveWindow {
+        sources,
+        directory,
+        name,
+        job: Some(job),
+        open: true,
+    });
+    Ok(())
+}
+
+/// Automation: split `source` into parts of `bytes`, as the split dialog's Start button.
+pub(crate) fn automation_split(
+    app: &mut ZxrawApp,
+    source: PathBuf,
+    bytes: u64,
+) -> Result<(), String> {
+    if !source.is_file() {
+        return Err(format!("{} is not a regular file", source.display()));
+    }
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let job = start_split(&jobs, &event_tx, &app_ctx, source.clone(), bytes);
+    app.ops.extra_tools.split = Some(SplitWindow {
+        source,
+        preset_mib: 700,
+        custom: false,
+        custom_mib: 1024,
+        job: Some(job),
+        open: true,
+    });
+    Ok(())
+}
+
+/// Automation: join the parts described by a `.b3split` manifest or its first part.
+pub(crate) fn automation_join(app: &mut ZxrawApp, input: PathBuf) {
+    let _ = start_join(&app.ops.jobs, &app.ops.tx, &app.ops.ctx, input);
 }
 
 fn pane_action_target(app: &ZxrawApp) -> Option<PathBuf> {

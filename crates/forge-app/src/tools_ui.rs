@@ -85,6 +85,7 @@ impl ToolsState {
                 filter: CompareFilter::All,
                 sync_mode: SyncMode::Update,
                 plan: None,
+                last_sync: None,
                 confirming_mirror: false,
             }),
         };
@@ -167,6 +168,7 @@ struct CompareState {
     filter: CompareFilter,
     sync_mode: SyncMode,
     plan: Option<SyncPlan>,
+    last_sync: Option<OpReport>,
     confirming_mirror: bool,
 }
 
@@ -193,7 +195,7 @@ enum ToolPayload {
     Saved(Result<PathBuf, String>),
     Compare(Result<CompareReport, String>),
     Recycled(Result<(), String>),
-    Synced(Result<OpReport, String>),
+    Synced(OpReport),
 }
 
 enum UiAction {
@@ -328,28 +330,25 @@ impl ToolWindow {
                     }
                     Err(error) => self.notice = Some(error),
                 },
-                ToolPayload::Synced(result) => match result {
-                    Ok(report) => {
-                        let text = if report.failed.is_empty() {
-                            format!(
-                                "Sync complete: {} item(s), {}",
-                                report.done.len(),
-                                format_size(report.bytes)
-                            )
-                        } else {
-                            format!("Sync finished with {} error(s)", report.failed.len())
-                        };
-                        self.notice = Some(text);
-                        if let ToolState::Compare(state) = &mut self.state {
-                            state.plan = None;
-                            state.report = None;
-                            state.confirming_mirror = false;
-                        }
-                        self.initial_pending =
-                            matches!(&self.state, ToolState::Compare(c) if c.right.is_some());
+                ToolPayload::Synced(report) => {
+                    self.notice = Some(if report.failed.is_empty() {
+                        format!(
+                            "Sync complete: {} item(s), {}",
+                            report.done.len(),
+                            format_size(report.bytes)
+                        )
+                    } else {
+                        format!("Sync finished with {} error(s)", report.failed.len())
+                    });
+                    if let ToolState::Compare(state) = &mut self.state {
+                        state.last_sync = Some(report);
+                        state.plan = None;
+                        state.report = None;
+                        state.confirming_mirror = false;
                     }
-                    Err(error) => self.notice = Some(error),
-                },
+                    self.initial_pending =
+                        matches!(&self.state, ToolState::Compare(c) if c.right.is_some());
+                }
             }
         }
     }
@@ -429,6 +428,290 @@ pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
             index += 1;
         }
     }
+}
+
+pub(crate) fn automation_open_duplicates(app: &mut ZxrawApp, folder: PathBuf) {
+    app.ops
+        .tools
+        .open(Tool::Duplicates, folder, Vec::new(), None);
+}
+
+pub(crate) fn automation_duplicate_groups(
+    app: &mut ZxrawApp,
+) -> Option<std::result::Result<Vec<Vec<PathBuf>>, String>> {
+    let window = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Duplicates(_)))?;
+    window.poll_messages();
+    let ToolState::Duplicates(state) = &window.state else {
+        unreachable!();
+    };
+    if let Some(report) = &state.report {
+        Some(Ok(report
+            .groups
+            .iter()
+            .map(|group| group.files.clone())
+            .collect()))
+    } else if window
+        .job
+        .as_ref()
+        .is_none_or(|job| job.state().is_finished())
+        && let Some(notice) = &window.notice
+    {
+        Some(Err(notice.clone()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn automation_duplicates_keep_first(app: &mut ZxrawApp) -> Result<usize, String> {
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Duplicates(_)))
+    else {
+        return Err("the duplicate finder is not open".into());
+    };
+    window.poll_messages();
+    let ToolState::Duplicates(state) = &mut window.state else {
+        unreachable!();
+    };
+    let report = state
+        .report
+        .as_ref()
+        .ok_or("duplicate scan has not completed")?;
+    state.selected.clear();
+    for (group_index, group) in report.groups.iter().enumerate() {
+        for file_index in 1..group.files.len() {
+            state.selected.insert((group_index, file_index));
+        }
+    }
+    if !selection_is_safe(&report.groups, &state.selected) {
+        return Err("the selected copies would remove every file in a group".into());
+    }
+    Ok(state.selected.len())
+}
+
+pub(crate) fn automation_duplicates_recycle(app: &mut ZxrawApp) -> Result<(), String> {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Duplicates(_)))
+    else {
+        return Err("the duplicate finder is not open".into());
+    };
+    window.poll_messages();
+    let ToolState::Duplicates(state) = &mut window.state else {
+        unreachable!();
+    };
+    let report = state
+        .report
+        .as_ref()
+        .ok_or("duplicate scan has not completed")?;
+    let (targets, bytes) = selected_duplicate_targets(&report.groups, &state.selected)
+        .ok_or("unsafe duplicate selection")?;
+    if targets.is_empty() {
+        return Err("no duplicate copies are selected".into());
+    }
+    let checks = recycle_checks(&report.groups, &state.selected);
+    launch_action(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        window,
+        DeferredAction::RecycleDuplicates {
+            targets,
+            bytes,
+            checks,
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn automation_open_compare(app: &mut ZxrawApp, left: PathBuf) {
+    app.ops
+        .tools
+        .open(Tool::CompareFolders, left, Vec::new(), None);
+}
+
+pub(crate) fn automation_compare_set_right(
+    app: &mut ZxrawApp,
+    right: PathBuf,
+) -> Result<(), String> {
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))
+    else {
+        return Err("folder compare is not open".into());
+    };
+    let ToolState::Compare(state) = &mut window.state else {
+        unreachable!();
+    };
+    state.right = Some(right);
+    state.report = None;
+    state.plan = None;
+    state.last_sync = None;
+    state.confirming_mirror = false;
+    Ok(())
+}
+
+pub(crate) fn automation_compare_start(app: &mut ZxrawApp) -> Result<(), String> {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))
+    else {
+        return Err("folder compare is not open".into());
+    };
+    let ToolState::Compare(state) = &mut window.state else {
+        unreachable!();
+    };
+    let right = state
+        .right
+        .clone()
+        .ok_or("choose the right folder before comparing")?;
+    let left = state.left.clone();
+    let use_hash = state.use_hash;
+    state.report = None;
+    state.plan = None;
+    state.last_sync = None;
+    launch_action(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        window,
+        DeferredAction::CompareScan {
+            left,
+            right,
+            use_hash,
+        },
+    );
+    Ok(())
+}
+
+pub(crate) fn automation_compare_report(
+    app: &mut ZxrawApp,
+) -> Option<std::result::Result<CompareReport, String>> {
+    let window = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))?;
+    window.poll_messages();
+    let ToolState::Compare(state) = &window.state else {
+        unreachable!();
+    };
+    if let Some(report) = &state.report {
+        Some(Ok(report.clone()))
+    } else if window
+        .job
+        .as_ref()
+        .is_none_or(|job| job.state().is_finished())
+        && let Some(notice) = &window.notice
+    {
+        Some(Err(notice.clone()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn automation_compare_build_update(app: &mut ZxrawApp) -> Result<SyncPlan, String> {
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))
+    else {
+        return Err("folder compare is not open".into());
+    };
+    let ToolState::Compare(state) = &mut window.state else {
+        unreachable!();
+    };
+    let right = state
+        .right
+        .as_ref()
+        .ok_or("choose the right folder before building a plan")?;
+    let report = state
+        .report
+        .as_ref()
+        .ok_or("comparison has not completed")?;
+    state.sync_mode = SyncMode::Update;
+    let plan = compare::plan_sync(report, &state.left, right, SyncMode::Update);
+    state.plan = Some(plan.clone());
+    Ok(plan)
+}
+
+pub(crate) fn automation_compare_execute_update(app: &mut ZxrawApp) -> Result<(), String> {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let Some(window) = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))
+    else {
+        return Err("folder compare is not open".into());
+    };
+    let ToolState::Compare(state) = &window.state else {
+        unreachable!();
+    };
+    if state.sync_mode != SyncMode::Update {
+        return Err("sync mode is not Update".into());
+    }
+    let plan = state.plan.clone().ok_or("build a sync preview first")?;
+    launch_action(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        window,
+        DeferredAction::ExecuteSync(plan),
+    );
+    Ok(())
+}
+
+pub(crate) fn automation_compare_sync_result(app: &mut ZxrawApp) -> Option<OpReport> {
+    let window = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Compare(_)))?;
+    window.poll_messages();
+    let ToolState::Compare(state) = &window.state else {
+        unreachable!();
+    };
+    state.last_sync.clone()
 }
 
 fn render_window(window: &mut ToolWindow, ctx: &egui::Context) -> Option<UiAction> {
@@ -819,22 +1102,12 @@ fn launch_action(
                         lines,
                     });
                 }
-                let result = if report.failed.is_empty() {
-                    Ok(report)
-                } else {
-                    Err(report)
-                };
-                if let Err(report) = &result {
-                    for _ in &report.failed {
-                        job.progress.add_error();
-                    }
+                for _ in &report.failed {
+                    job.progress.add_error();
                 }
-                let envelope_result = result
-                    .clone()
-                    .map_err(|r| format!("Sync completed with {} error(s)", r.failed.len()));
                 let _ = result_tx.send(ToolEnvelope {
                     generation,
-                    payload: ToolPayload::Synced(envelope_result),
+                    payload: ToolPayload::Synced(report),
                 });
                 ctx.request_repaint();
                 Ok(())
@@ -1425,7 +1698,7 @@ fn recycle_checks(
         .iter()
         .enumerate()
         .filter_map(|(gi, g)| {
-            let (remove, keep): (Vec<(usize, &PathBuf)>, Vec<(usize, &PathBuf)>) = g
+            let (remove, keep): (Vec<_>, Vec<_>) = g
                 .files
                 .iter()
                 .enumerate()
