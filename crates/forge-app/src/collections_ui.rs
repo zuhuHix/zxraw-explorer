@@ -1,5 +1,6 @@
 //! Collections, saved searches, portable backup, and relinking.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,8 +8,9 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::RichText;
 use forge_core::model::EntryKind;
 use forge_db::{
-    Collection, CollectionId, CollectionKind, Db, FileRecord, NewFile, RelinkReport, SavedSearch,
-    SearchOptions, SearchScope,
+    Collection, CollectionId, CollectionKind, Db, FileRecord, ImportReport, NewFile, RelinkReport,
+    SavedSearch, SearchOptions, SearchScope, SmartCollectionConflict,
+    SmartCollectionConflictChoice,
 };
 
 use crate::app::ZxrawApp;
@@ -42,6 +44,7 @@ pub struct CollectionsUi {
     relink_preview_running: bool,
     relink_preview_error: Option<String>,
     relink_confirm: bool,
+    import_prompt: Option<ImportPrompt>,
 }
 
 impl Default for CollectionsUi {
@@ -74,6 +77,7 @@ impl Default for CollectionsUi {
             relink_preview_running: false,
             relink_preview_error: None,
             relink_confirm: false,
+            import_prompt: None,
         }
     }
 }
@@ -130,6 +134,13 @@ enum UiMessage {
         new: PathBuf,
         result: Result<u64, String>,
     },
+    ImportPreview(Result<(String, ImportReport), String>),
+}
+
+struct ImportPrompt {
+    json: String,
+    conflicts: Vec<SmartCollectionConflict>,
+    choices: HashMap<String, SmartCollectionConflictChoice>,
 }
 
 #[derive(Clone)]
@@ -192,6 +203,11 @@ enum UiCommand {
         name: String,
     },
     ChooseImport,
+    ResolveImport {
+        json: String,
+        choices: HashMap<String, SmartCollectionConflictChoice>,
+    },
+    CancelImport,
     ChooseRelinkOld,
     ChooseRelinkNew,
     PreviewRelink {
@@ -299,6 +315,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     render_edit_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
     render_delete_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
     render_relink_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
+    render_import_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
 
     for command in commands {
         execute_command(app, ctx, command);
@@ -432,6 +449,28 @@ fn poll_messages(app: &mut ZxrawApp) {
                         }
                     }
                 }
+                UiMessage::ImportPreview(result) => {
+                    state.operation_pending = false;
+                    match result {
+                        Ok((json, report)) if !report.smart_conflicts.is_empty() => {
+                            state.import_prompt = Some(ImportPrompt {
+                                json,
+                                conflicts: report.smart_conflicts,
+                                choices: HashMap::new(),
+                            });
+                        }
+                        Ok((_json, report)) => {
+                            state.catalog_loaded = false;
+                            let text = import_summary(&report);
+                            state.feedback = Some((text.clone(), false));
+                            toasts.push((text, false));
+                        }
+                        Err(error) => {
+                            state.feedback = Some((error.clone(), true));
+                            toasts.push((error, true));
+                        }
+                    }
+                }
             }
         }
     }
@@ -546,6 +585,135 @@ fn start_operation(
             });
             ctx.request_repaint();
         });
+}
+
+fn start_import_preview(app: &mut ZxrawApp, ctx: &egui::Context, path: PathBuf) {
+    if app.ops.collections_ui.operation_pending {
+        return;
+    }
+    let Some(db) = app.ops.library.db.clone() else {
+        app.ops.collections_ui.feedback =
+            Some(("Library database is not available yet".into(), true));
+        return;
+    };
+    let state = &mut app.ops.collections_ui;
+    state.operation_pending = true;
+    let tx = state.tx.clone();
+    let ctx = ctx.clone();
+    let _ = std::thread::Builder::new()
+        .name("collections-import-preview".into())
+        .spawn(move || {
+            let result = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Could not read import file: {e}"))
+                .and_then(|json| {
+                    db.import_collections_json(&json)
+                        .map(|report| (json, report))
+                        .map_err(|e| e.to_string())
+                });
+            let _ = tx.send(UiMessage::ImportPreview(result));
+            ctx.request_repaint();
+        });
+}
+
+fn import_summary(report: &ImportReport) -> String {
+    format!(
+        "Imported {} collection(s); linked {}, offline placeholders {}, merged {}",
+        report.collections_created,
+        report.items_linked,
+        report.items_placeholder,
+        report.collections_merged
+    )
+}
+
+fn relink_summary(report: &RelinkReport) -> String {
+    let mut summary = format!(
+        "Relinked {} path(s), merged {} indexed row(s)",
+        report.moved, report.merged
+    );
+    if !report.offline_paths.is_empty() {
+        let paths = report
+            .offline_paths
+            .iter()
+            .take(3)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = report.offline_paths.len().saturating_sub(3);
+        summary.push_str(&format!(
+            "; {} destination path(s) remain offline: {paths}{}",
+            report.offline_paths.len(),
+            if extra > 0 {
+                format!(" and {extra} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    if !report.conflicts.is_empty() {
+        summary.push_str(&format!(
+            "; {} annotation conflict(s), source values kept",
+            report.conflicts.len()
+        ));
+        for conflict in report.conflicts.iter().take(3) {
+            summary.push_str(&format!(
+                "; {}: {} → {}",
+                conflict.field,
+                conflict.source.display(),
+                conflict.destination.display()
+            ));
+        }
+        let extra = report.conflicts.len().saturating_sub(3);
+        if extra > 0 {
+            summary.push_str(&format!("; and {extra} more conflict(s)"));
+        }
+    }
+    summary
+}
+
+fn atomic_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "export path has no file name",
+        )
+    })?;
+    let (temporary, mut file) = loop {
+        let sequence = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.zxraw-export-{}-{sequence}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn render_main(
@@ -791,8 +959,7 @@ fn render_detail(ui: &mut egui::Ui, state: &CollectionsUi, commands: &mut Vec<Ui
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         if row.present {
-                            let response =
-                                ui.selectable_label(false, RichText::new(&row.name));
+                            let response = ui.selectable_label(false, RichText::new(&row.name));
                             if response.clicked() {
                                 navigate = Some(row.path.clone());
                             }
@@ -1080,7 +1247,10 @@ fn render_relink_dialog(
                         "Rewrite {count} indexed path(s) from the old folder to the new one?"
                     ));
                     if ui
-                        .add_enabled(!state.operation_pending, egui::Button::new("Confirm relink"))
+                        .add_enabled(
+                            !state.operation_pending,
+                            egui::Button::new("Confirm relink"),
+                        )
                         .clicked()
                     {
                         if let (Some(old), Some(new)) =
@@ -1116,6 +1286,80 @@ fn render_relink_dialog(
         state.relink_confirm = false;
     }
     state.relink_open = open;
+}
+
+fn render_import_dialog(
+    ctx: &egui::Context,
+    state: &mut CollectionsUi,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(prompt) = state.import_prompt.as_mut() else {
+        return;
+    };
+    let mut open = true;
+    let mut apply = false;
+    let mut cancel = false;
+    egui::Window::new("Smart collection import conflicts")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(520.0)
+        .show(ctx, |ui| {
+            ui.label("These collections already exist with a different query. Choose how each one should be imported.");
+            ui.separator();
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for conflict in &prompt.conflicts {
+                    ui.group(|ui| {
+                        ui.label(RichText::new(&conflict.name).strong());
+                        ui.label(format!("Existing: {}", conflict.existing_query));
+                        ui.label(format!("Import: {}", conflict.imported_query));
+                        let key = conflict.name.to_lowercase();
+                        let mut selected = prompt.choices.get(&key).copied();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut selected,
+                                Some(SmartCollectionConflictChoice::Replace),
+                                "Replace",
+                            );
+                            ui.selectable_value(
+                                &mut selected,
+                                Some(SmartCollectionConflictChoice::KeepExisting),
+                                "Keep existing",
+                            );
+                            ui.selectable_value(
+                                &mut selected,
+                                Some(SmartCollectionConflictChoice::ImportAsCopy),
+                                format!("Import as copy (e.g. '{} (2)')", conflict.name),
+                            );
+                        });
+                        if let Some(choice) = selected {
+                            prompt.choices.insert(key, choice);
+                        } else {
+                            prompt.choices.remove(&key);
+                        }
+                    });
+                }
+            });
+            let all_chosen = prompt
+                .conflicts
+                .iter()
+                .all(|conflict| prompt.choices.contains_key(&conflict.name.to_lowercase()));
+            ui.separator();
+            ui.horizontal(|ui| {
+                apply = ui
+                    .add_enabled(all_chosen, egui::Button::new("Apply choices and import"))
+                    .clicked();
+                cancel = ui.button("Cancel import").clicked();
+            });
+        });
+    if apply {
+        commands.push(UiCommand::ResolveImport {
+            json: prompt.json.clone(),
+            choices: prompt.choices.clone(),
+        });
+    } else if cancel || !open {
+        commands.push(UiCommand::CancelImport);
+    }
 }
 
 fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) {
@@ -1168,7 +1412,7 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
                     let json = db
                         .export_collections_json(&[collection_id])
                         .map_err(|e| e.to_string())?;
-                    std::fs::write(&path, json)
+                    atomic_export(&path, json.as_bytes())
                         .map_err(|e| format!("Could not write export: {e}"))?;
                     Ok(format!("Exported collection to {}", path.display()))
                 });
@@ -1179,22 +1423,22 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
                 .add_filter("JSON", &["json"])
                 .pick_file()
             {
-                start_operation(app, ctx, OperationFlags::IMPORT, move |db| {
-                    let json = std::fs::read_to_string(&path)
-                        .map_err(|e| format!("Could not read import file: {e}"))?;
-                    let report = db
-                        .import_collections_json(&json)
-                        .map_err(|e| e.to_string())?;
-                    Ok(format!(
-                        "Imported {} collection(s); linked {}, offline placeholders {}, merged {}",
-                        report.collections_created,
-                        report.items_linked,
-                        report.items_placeholder,
-                        report.collections_merged
-                    ))
-                });
+                start_import_preview(app, ctx, path);
             }
         }
+        UiCommand::ResolveImport { json, choices } => {
+            app.ops.collections_ui.import_prompt = None;
+            start_operation(app, ctx, OperationFlags::IMPORT, move |db| {
+                let report = db
+                    .import_collections_json_with_choices(&json, &choices)
+                    .map_err(|e| e.to_string())?;
+                if !report.smart_conflicts.is_empty() {
+                    return Err("Some smart collection conflicts still need a choice".into());
+                }
+                Ok(import_summary(&report))
+            });
+        }
+        UiCommand::CancelImport => app.ops.collections_ui.import_prompt = None,
         UiCommand::ChooseRelinkOld => {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 let state = &mut app.ops.collections_ui;
@@ -1215,10 +1459,7 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             start_operation(app, ctx, OperationFlags::RELINK, move |db| {
                 let report: RelinkReport =
                     db.relink(&old, &new, None).map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "Relinked {} path(s), merged {} indexed row(s)",
-                    report.moved, report.merged
-                ))
+                Ok(relink_summary(&report))
             });
             app.ops.collections_ui.relink_open = false;
         }
@@ -1468,5 +1709,33 @@ mod tests {
         let filtered = filtered_collections(&collections, "WEDD");
         assert_eq!(filtered.iter().map(|c| c.id).collect::<Vec<_>>(), [1]);
         assert_eq!(filtered_collections(&collections, "").len(), 2);
+    }
+
+    #[test]
+    fn export_replaces_destination_only_after_complete_temp_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("collections.json");
+        std::fs::write(&destination, b"old data").unwrap();
+
+        atomic_export(&destination, b"complete json").unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete json");
+        assert_eq!(
+            std::fs::read_dir(temp.path()).unwrap().count(),
+            1,
+            "temporary sibling should be renamed away"
+        );
+    }
+
+    #[test]
+    fn failed_export_keeps_existing_destination_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&destination).unwrap();
+
+        assert!(atomic_export(&destination, b"data").is_err());
+
+        assert!(destination.is_dir());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 }

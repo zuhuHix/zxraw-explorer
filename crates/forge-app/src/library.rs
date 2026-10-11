@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use forge_core::query::{ColorLabel, PickState};
 use forge_db::{AnnotationChange, Db, FileRecord, SearchOptions};
 use forge_jobs::{JobHandle, JobRegistry};
@@ -35,6 +35,19 @@ struct AnnotationWrite {
     xmp_sync: bool,
 }
 
+enum LibraryWrite {
+    Annotation(AnnotationWrite),
+    RenameTag {
+        old: String,
+        new: String,
+        reply: Sender<Result<(), String>>,
+    },
+    DeleteTag {
+        name: String,
+        reply: Sender<Result<bool, String>>,
+    },
+}
+
 pub struct Library {
     pub db: Option<Arc<Db>>,
     pub open_error: Option<String>,
@@ -52,7 +65,7 @@ pub struct Library {
     /// Edits made before the database finished opening; flushed once it is ready.
     queued: Vec<AnnotationWrite>,
     /// Single writer thread so edits reach the database in the order they were made.
-    writer: Option<Sender<AnnotationWrite>>,
+    writer: Option<Sender<LibraryWrite>>,
     /// Mirror annotation changes into `.xmp` sidecars (set from the settings every frame).
     xmp_sync: bool,
     pub search: SearchState,
@@ -260,8 +273,49 @@ impl Library {
 
     fn persist(&self, write: AnnotationWrite) {
         if let Some(w) = &self.writer {
-            let _ = w.send(write);
+            let _ = w.send(LibraryWrite::Annotation(write));
         }
+    }
+
+    /// Rename a tag in the same ordered queue as annotation edits.
+    pub fn rename_tag(&self, old: String, new: String) -> Receiver<Result<(), String>> {
+        let (reply, result) = bounded(1);
+        let error = "Library database is not available; tag change was not saved".to_string();
+        let Some(writer) = &self.writer else {
+            let _ = reply.send(Err(error));
+            return result;
+        };
+        if writer
+            .send(LibraryWrite::RenameTag {
+                old,
+                new,
+                reply: reply.clone(),
+            })
+            .is_err()
+        {
+            let _ = reply.send(Err(error));
+        }
+        result
+    }
+
+    /// Delete a tag in the same ordered queue as annotation edits.
+    pub fn delete_tag(&self, name: String) -> Receiver<Result<bool, String>> {
+        let (reply, result) = bounded(1);
+        let error = "Library database is not available; tag change was not saved".to_string();
+        let Some(writer) = &self.writer else {
+            let _ = reply.send(Err(error));
+            return result;
+        };
+        if writer
+            .send(LibraryWrite::DeleteTag {
+                name,
+                reply: reply.clone(),
+            })
+            .is_err()
+        {
+            let _ = reply.send(Err(error));
+        }
+        result
     }
 
     pub fn run_search(&mut self) {
@@ -508,58 +562,151 @@ fn sync_sidecars(
     ))
 }
 
-fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
-    let (wtx, wrx) = unbounded::<AnnotationWrite>();
+fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<LibraryWrite> {
+    let (wtx, wrx) = unbounded::<LibraryWrite>();
     std::thread::Builder::new()
         .name("library-writer".into())
         .spawn(move || {
-            for AnnotationWrite {
-                paths,
-                change,
-                versions,
-                xmp_sync,
-            } in wrx
-            {
-                let r = (|| -> Result<(), String> {
-                    let entries: Vec<_> = paths
-                        .iter()
-                        .filter_map(|p| forge_core::listing::entry_for_path(p).ok())
-                        .collect();
-                    db.upsert_entries(&entries).map_err(|e| e.to_string())?;
-                    let ids: Vec<_> = db
-                        .file_ids(&paths)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(|(_, id)| id)
-                        .collect();
-                    db.annotate(&ids, &change)
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
-                })();
-                if let Err(e) = r {
-                    let _ = tx.send(LibMsg::Error(format!("Saving rating failed: {e}")));
-                    match authoritative_annotations(&db, &paths) {
-                        Ok(annotations) => {
-                            let _ = tx.send(LibMsg::AuthoritativeAnnotations {
-                                versions,
-                                annotations,
-                            });
-                        }
-                        Err(reload_error) => {
-                            let _ = tx.send(LibMsg::Error(format!(
-                                "Reloading saved ratings failed: {reload_error}"
-                            )));
-                        }
+            for write in wrx {
+                match write {
+                    LibraryWrite::Annotation(write) => {
+                        persist_annotation(&db, &tx, write);
                     }
-                } else if let Some(msg) =
-                    sync_sidecars(xmp_sync, &paths, &sidecar_update(&change), update_sidecar)
-                {
-                    let _ = tx.send(LibMsg::Error(msg));
+                    LibraryWrite::RenameTag { old, new, reply } => {
+                        let result = db.rename_tag(&old, &new).map_err(|e| e.to_string());
+                        let _ = reply.send(result);
+                    }
+                    LibraryWrite::DeleteTag { name, reply } => {
+                        let result = db.delete_tag(&name).map_err(|e| e.to_string());
+                        let _ = reply.send(result);
+                    }
                 }
             }
         })
         .expect("spawn library writer");
     wtx
+}
+
+fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
+    let AnnotationWrite {
+        paths,
+        change,
+        versions,
+        xmp_sync,
+    } = write;
+    if paths.is_empty() {
+        return;
+    }
+
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut failures = Vec::new();
+    for path in &paths {
+        match forge_core::listing::entry_for_path(path) {
+            Ok(entry) => entries.push((path.clone(), entry)),
+            Err(error) => failures.push((path.clone(), error.to_string())),
+        }
+    }
+
+    let mut saved_paths = Vec::new();
+    let mut db_failure = None;
+    if !entries.is_empty() {
+        let entry_rows: Vec<_> = entries.iter().map(|(_, entry)| entry.clone()).collect();
+        if let Err(error) = db.upsert_entries(&entry_rows) {
+            db_failure = Some(format!("could not index requested files: {error}"));
+        } else {
+            let index_paths: Vec<_> = entries.iter().map(|(path, _)| path.clone()).collect();
+            match db.file_ids(&index_paths) {
+                Err(error) => {
+                    db_failure = Some(format!("could not resolve indexed files: {error}"))
+                }
+                Ok(resolved) => {
+                    let id_by_path: HashMap<PathBuf, i64> = resolved.into_iter().collect();
+                    let ids: Vec<_> = entries
+                        .iter()
+                        .filter_map(|(path, _)| id_by_path.get(path).copied())
+                        .collect();
+                    for (path, _) in &entries {
+                        if !id_by_path.contains_key(path) {
+                            failures.push((
+                                path.clone(),
+                                "the indexed file row could not be resolved".into(),
+                            ));
+                        }
+                    }
+                    if ids.is_empty() {
+                        db_failure = Some(
+                            "no requested path resolved to a database id; no annotation was saved"
+                                .into(),
+                        );
+                    } else if let Err(error) = db.annotate(&ids, &change) {
+                        db_failure = Some(format!("database annotation write failed: {error}"));
+                    } else {
+                        saved_paths = entries
+                            .iter()
+                            .filter(|(path, entry)| {
+                                id_by_path.contains_key(path)
+                                    && entry.kind == forge_core::model::EntryKind::File
+                            })
+                            .map(|(path, _)| path.clone())
+                            .collect();
+                    }
+                }
+            }
+        }
+    } else {
+        db_failure =
+            Some("no requested path exists or can be indexed; no annotation was saved".into());
+    }
+
+    if db_failure.is_some() {
+        saved_paths.clear();
+    }
+
+    if !failures.is_empty() || db_failure.is_some() {
+        let mut failed_paths: Vec<_> = failures.iter().map(|(path, _)| path.clone()).collect();
+        if db_failure.is_some() {
+            failed_paths.extend(paths.iter().cloned());
+        }
+        failed_paths.sort();
+        failed_paths.dedup();
+        let failed_versions = versions
+            .into_iter()
+            .filter(|(path, _)| failed_paths.contains(path))
+            .collect();
+        let mut details = failures
+            .iter()
+            .map(|(path, error)| format!("{}: {error}", path.display()))
+            .collect::<Vec<_>>();
+        if let Some(error) = db_failure {
+            details.push(error);
+        }
+        let _ = tx.send(LibMsg::Error(format!(
+            "Some annotations were not saved: {}",
+            details.join("; ")
+        )));
+        match authoritative_annotations(db, &failed_paths) {
+            Ok(annotations) => {
+                let _ = tx.send(LibMsg::AuthoritativeAnnotations {
+                    versions: failed_versions,
+                    annotations,
+                });
+            }
+            Err(reload_error) => {
+                let _ = tx.send(LibMsg::Error(format!(
+                    "Reloading saved annotations failed: {reload_error}"
+                )));
+            }
+        }
+    }
+
+    if let Some(msg) = sync_sidecars(
+        xmp_sync,
+        &saved_paths,
+        &sidecar_update(&change),
+        update_sidecar,
+    ) {
+        let _ = tx.send(LibMsg::Error(msg));
+    }
 }
 
 #[cfg(test)]
@@ -571,6 +718,27 @@ mod tests {
         Annotation {
             rating,
             ..Default::default()
+        }
+    }
+
+    fn library_with_test_writer(db: Arc<Db>) -> Library {
+        let (tx, rx) = unbounded();
+        let writer = Some(spawn_writer(db.clone(), tx.clone()));
+        Library {
+            db: Some(db),
+            open_error: None,
+            tx,
+            rx,
+            ctx: egui::Context::default(),
+            annotations: HashMap::new(),
+            loaded_dirs: HashSet::new(),
+            locally_edited: HashSet::new(),
+            annotation_versions: HashMap::new(),
+            next_annotation_version: 0,
+            queued: Vec::new(),
+            writer,
+            xmp_sync: false,
+            search: SearchState::default(),
         }
     }
 
@@ -697,5 +865,84 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sidecar_update(&clear).label, Some(None));
+    }
+
+    #[test]
+    fn unresolved_annotation_path_reports_error_and_reverts_optimistic_cache() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut library = library_with_test_writer(db);
+        let path = std::env::temp_dir().join(format!(
+            "zxraw-does-not-exist-{}-{}.jpg",
+            std::process::id(),
+            forge_db::latest_version()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let sidecar = path.with_extension("xmp");
+        let _ = std::fs::remove_file(&sidecar);
+        library.xmp_sync = true;
+
+        library.annotate(
+            vec![path.clone()],
+            AnnotationChange {
+                rating: Some(5),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !library
+                .delete_tag("test-writer-barrier-tag".into())
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+        );
+        let notices = library.poll();
+
+        assert!(notices.iter().any(|notice| match notice {
+            Err(error) => error.contains(&path.display().to_string()),
+            Ok(_) => false,
+        }));
+        assert_eq!(library.annotations[&path].rating, 0);
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn tag_rename_then_annotation_add_share_writer_order() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let root = std::env::temp_dir().join(format!(
+            "zxraw-writer-order-{}-{}",
+            std::process::id(),
+            forge_db::latest_version()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("photo.jpg");
+        std::fs::write(&path, b"photo").unwrap();
+        let entry = forge_core::listing::entry_for_path(&path).unwrap();
+        let id = db.upsert_entries(&[entry]).unwrap()[0];
+        db.add_tags(&[id], &["old"]).unwrap();
+        let mut library = library_with_test_writer(db.clone());
+
+        let rename = library.rename_tag("old".into(), "renamed".into());
+        library.annotate(
+            vec![path.clone()],
+            AnnotationChange {
+                add_tags: vec!["old".into()],
+                ..Default::default()
+            },
+        );
+        let barrier = library.delete_tag("unused-writer-barrier-tag".into());
+
+        rename
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !barrier
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(db.annotation(id).unwrap().tags, ["old", "renamed"]);
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

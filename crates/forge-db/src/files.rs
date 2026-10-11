@@ -193,6 +193,17 @@ pub struct RelinkReport {
     /// Rows merged into an already-indexed row at the new path (annotations, tags and
     /// collection membership carried over; the old row removed).
     pub merged: u64,
+    /// Conflicting non-default annotation values. The source value was kept.
+    pub conflicts: Vec<RelinkConflict>,
+    /// Rewritten destination paths that were not found on disk and remain offline.
+    pub offline_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RelinkConflict {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub field: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -642,8 +653,8 @@ impl Db {
     /// Restrict to one volume with `volume`. Where a row already exists at the new path
     /// (because the new location was indexed meanwhile), the old row's annotations, tags
     /// and collection memberships are merged into it and the old row is removed.
-    /// `present` flags are not changed; run [`crate::Indexer::reconcile_dir`] or an index
-    /// pass to refresh them.
+    /// Rewritten rows are marked present only when their destination exists on disk. Missing
+    /// targets are listed in `offline_paths`.
     pub fn relink(&self, old: &Path, new: &Path, volume: Option<VolumeId>) -> Result<RelinkReport> {
         let old_s = normalize_dir(&path_str(old));
         let new_s = normalize_dir(&path_str(new));
@@ -692,10 +703,25 @@ impl Db {
                 let rest = &path[old_s.len()..];
                 let np = format!("{new_s}{rest}");
                 let pb = PathBuf::from(&np);
+                let present = std::fs::symlink_metadata(&pb).is_ok();
                 if let Some(target) = find.query_row([&np], |r| r.get::<_, i64>(0)).optional()?
                     && target != id
                 {
-                    merge_rows_tx(tx, id, target)?;
+                    merge_rows_tx(
+                        tx,
+                        id,
+                        target,
+                        Path::new(&path),
+                        &pb,
+                        &mut report.conflicts,
+                    )?;
+                    tx.execute(
+                        "UPDATE files SET present = ?2 WHERE id = ?1",
+                        params![target, present],
+                    )?;
+                    if !present {
+                        report.offline_paths.push(pb);
+                    }
                     report.merged += 1;
                     continue;
                 }
@@ -713,6 +739,13 @@ impl Db {
                     name.to_lowercase(),
                     new_volume.unwrap_or(vol)
                 ])?;
+                tx.execute(
+                    "UPDATE files SET present = ?2 WHERE id = ?1",
+                    params![id, present],
+                )?;
+                if !present {
+                    report.offline_paths.push(pb);
+                }
                 report.moved += 1;
             }
             Ok(report)
@@ -924,12 +957,77 @@ impl Db {
 }
 
 /// Move user data from row `from` to row `to`, then delete `from`.
-fn merge_rows_tx(tx: &Transaction<'_>, from: FileId, to: FileId) -> Result<()> {
-    tx.execute(
-        "INSERT OR IGNORE INTO annotations(file_id, rating, label, pick, notes, updated_at)
-         SELECT ?2, rating, label, pick, notes, updated_at FROM annotations WHERE file_id = ?1",
-        params![from, to],
-    )?;
+fn merge_rows_tx(
+    tx: &Transaction<'_>,
+    from: FileId,
+    to: FileId,
+    source_path: &Path,
+    destination_path: &Path,
+    conflicts: &mut Vec<RelinkConflict>,
+) -> Result<()> {
+    let source: Option<(i64, Option<String>, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT rating, label, pick, notes FROM annotations WHERE file_id = ?1",
+            [from],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    if let Some((source_rating, source_label, source_pick, source_notes)) = source {
+        let destination: (i64, Option<String>, i64, Option<String>) = tx
+            .query_row(
+                "SELECT rating, label, pick, notes FROM annotations WHERE file_id = ?1",
+                [to],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .unwrap_or((0, None, 0, None));
+
+        let (destination_rating, destination_label, destination_pick, destination_notes) =
+            destination;
+        let rating = if source_rating > 0 {
+            if destination_rating > 0 && source_rating != destination_rating {
+                conflicts.push(relink_conflict(source_path, destination_path, "rating"));
+            }
+            source_rating
+        } else {
+            destination_rating
+        };
+        let label = merge_annotation_field(
+            source_label,
+            destination_label,
+            "label",
+            source_path,
+            destination_path,
+            conflicts,
+        );
+        let pick = if source_pick != 0 {
+            if destination_pick != 0 && source_pick != destination_pick {
+                conflicts.push(relink_conflict(source_path, destination_path, "pick"));
+            }
+            source_pick
+        } else {
+            destination_pick
+        };
+        let notes = match (
+            nonempty_note(source_notes),
+            nonempty_note(destination_notes),
+        ) {
+            (Some(source), Some(destination)) if source != destination => {
+                conflicts.push(relink_conflict(source_path, destination_path, "notes"));
+                Some(format!("{source}\n\n--- merged note ---\n\n{destination}"))
+            }
+            (Some(source), _) => Some(source),
+            (_, Some(destination)) => Some(destination),
+            (None, None) => None,
+        };
+        tx.execute(
+            "INSERT INTO annotations(file_id, rating, label, pick, notes, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(file_id) DO UPDATE SET rating = excluded.rating, label = excluded.label,
+                 pick = excluded.pick, notes = excluded.notes, updated_at = excluded.updated_at",
+            params![to, rating, label, pick, notes, now_ms()],
+        )?;
+    }
     tx.execute(
         "INSERT OR IGNORE INTO file_tags(file_id, tag_id) SELECT ?2, tag_id FROM file_tags WHERE file_id = ?1",
         params![from, to],
@@ -940,6 +1038,37 @@ fn merge_rows_tx(tx: &Transaction<'_>, from: FileId, to: FileId) -> Result<()> {
     )?;
     tx.execute("DELETE FROM files WHERE id = ?1", [from])?;
     Ok(())
+}
+
+fn merge_annotation_field(
+    source: Option<String>,
+    destination: Option<String>,
+    field: &str,
+    source_path: &Path,
+    destination_path: &Path,
+    conflicts: &mut Vec<RelinkConflict>,
+) -> Option<String> {
+    match (source, destination) {
+        (Some(source), Some(destination)) if source != destination => {
+            conflicts.push(relink_conflict(source_path, destination_path, field));
+            Some(source)
+        }
+        (Some(source), _) => Some(source),
+        (_, Some(destination)) => Some(destination),
+        (None, None) => None,
+    }
+}
+
+fn nonempty_note(note: Option<String>) -> Option<String> {
+    note.filter(|text| !text.trim().is_empty())
+}
+
+fn relink_conflict(source: &Path, destination: &Path, field: &str) -> RelinkConflict {
+    RelinkConflict {
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        field: field.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1159,5 +1288,127 @@ mod tests {
         assert!(db.file(ids[0]).unwrap().is_some());
         assert_eq!(db.purge_offline(false).unwrap(), 1);
         assert!(db.file(ids[0]).unwrap().is_none());
+    }
+
+    #[test]
+    fn relink_collision_merges_annotations_tags_and_memberships() {
+        use crate::annotations::AnnotationChange;
+        use forge_core::query::{ColorLabel, PickState};
+
+        let db = Db::open_in_memory().unwrap();
+        let source_path = PathBuf::from(r"C:\old\photo.jpg");
+        let destination_path = PathBuf::from(r"D:\new\photo.jpg");
+        let ids = db
+            .upsert_files(&[
+                nf(source_path.to_str().unwrap(), 10, 1),
+                nf(destination_path.to_str().unwrap(), 20, 2),
+            ])
+            .unwrap();
+        db.annotate(
+            &[ids[0]],
+            &AnnotationChange {
+                rating: Some(5),
+                label: Some(Some(ColorLabel::Red)),
+                pick: Some(PickState::Pick),
+                notes: Some(Some("note from moved original".into())),
+                add_tags: vec!["source-tag".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.annotate(
+            &[ids[1]],
+            &AnnotationChange {
+                rating: Some(3),
+                label: Some(Some(ColorLabel::Blue)),
+                pick: Some(PickState::Reject),
+                add_tags: vec!["destination-tag".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let source_collection = db.create_manual_collection("Moved picks").unwrap();
+        let destination_collection = db.create_manual_collection("Existing picks").unwrap();
+        db.add_to_collection(source_collection, &[ids[0]]).unwrap();
+        db.add_to_collection(destination_collection, &[ids[1]])
+            .unwrap();
+
+        let report = db.relink(&source_path, &destination_path, None).unwrap();
+
+        let merged = db.annotation(ids[1]).unwrap();
+        assert_eq!(merged.notes.as_deref(), Some("note from moved original"));
+        assert_eq!(merged.rating, 5);
+        assert_eq!(merged.label, Some(ColorLabel::Red));
+        assert_eq!(merged.pick, PickState::Pick);
+        assert_eq!(merged.tags, ["destination-tag", "source-tag"]);
+        assert_eq!(report.merged, 1);
+        assert_eq!(report.conflicts.len(), 3);
+        assert_eq!(report.conflicts[0].field, "rating");
+        assert_eq!(report.conflicts[1].field, "label");
+        assert_eq!(report.conflicts[2].field, "pick");
+        assert_eq!(report.conflicts[0].source, source_path);
+        assert_eq!(report.conflicts[0].destination, destination_path);
+        assert_eq!(
+            db.collection(source_collection)
+                .unwrap()
+                .unwrap()
+                .item_count,
+            1
+        );
+        assert_eq!(
+            db.collection(destination_collection)
+                .unwrap()
+                .unwrap()
+                .item_count,
+            1
+        );
+    }
+
+    #[test]
+    fn relink_marks_existing_destination_present() {
+        let db = Db::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "zxraw-relink-present-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let destination = root.join("photo.jpg");
+        std::fs::write(&destination, b"photo").unwrap();
+        let source = root.join("offline.jpg");
+        let source_id = db
+            .upsert_files(&[NewFile {
+                path: source.clone(),
+                kind: EntryKind::File,
+                size: 5,
+                mtime: Some(1),
+                ctime: None,
+            }])
+            .unwrap()[0];
+        db.mark_missing(std::slice::from_ref(&source)).unwrap();
+
+        let report = db.relink(&source, &destination, None).unwrap();
+
+        let moved = db.file(source_id).unwrap().unwrap();
+        assert_eq!(moved.path, destination);
+        assert!(moved.present);
+        assert_eq!(report.moved, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn relink_reports_missing_destination_offline() {
+        let db = Db::open_in_memory().unwrap();
+        let source = PathBuf::from(r"C:\offline\photo.jpg");
+        let destination = PathBuf::from(r"D:\recovered\photo.jpg");
+        let id = db
+            .upsert_files(&[nf(source.to_str().unwrap(), 1, 1)])
+            .unwrap()[0];
+        db.mark_missing(std::slice::from_ref(&source)).unwrap();
+
+        let report = db.relink(&source, &destination, None).unwrap();
+
+        assert!(!db.file(id).unwrap().unwrap().present);
+        assert_eq!(report.offline_paths, [destination]);
     }
 }

@@ -1,6 +1,7 @@
 //! Manual collections (ordered file references), smart collections (stored query),
 //! saved searches, and portable JSON export/import (path based).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use forge_core::model::EntryKind;
@@ -86,14 +87,30 @@ pub struct CollectionExport {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ImportReport {
     pub collections_created: u64,
-    /// Existing collections with the same name that items were appended to (manual) or
-    /// whose query was replaced (smart).
+    /// Existing collections with the same name that were merged or resolved by an explicit choice.
     pub collections_merged: u64,
     /// Items whose path was already indexed.
     pub items_linked: u64,
     /// Items not in the index yet: recorded as offline placeholders that become live when
     /// the path is indexed.
     pub items_placeholder: u64,
+    /// Same-named smart collections with different queries. No import is applied until every
+    /// reported conflict has an explicit resolution.
+    pub smart_conflicts: Vec<SmartCollectionConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SmartCollectionConflict {
+    pub name: String,
+    pub existing_query: String,
+    pub imported_query: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartCollectionConflictChoice {
+    Replace,
+    KeepExisting,
+    ImportAsCopy,
 }
 
 const EXPORT_FORMAT: &str = "forge-collections";
@@ -440,8 +457,18 @@ impl Db {
         )?)
     }
 
-    /// Import in one transaction. Same-named collections are merged.
+    /// Import in one transaction. Same-named manual collections are merged. A smart collection
+    /// with a different query is reported and the whole import is left unapplied until resolved.
     pub fn import_collections(&self, data: &CollectionsExport) -> Result<ImportReport> {
+        self.import_collections_with_choices(data, &HashMap::new())
+    }
+
+    /// Import with explicit choices for conflicting smart collections, keyed by lower-cased name.
+    pub fn import_collections_with_choices(
+        &self,
+        data: &CollectionsExport,
+        choices: &HashMap<String, SmartCollectionConflictChoice>,
+    ) -> Result<ImportReport> {
         if data.format != EXPORT_FORMAT {
             return Err(DbError::Invalid(format!(
                 "not a ZXraw Explorer collections file (format '{}')",
@@ -461,28 +488,91 @@ impl Db {
             }
         }
         self.with_tx(|tx| {
+            let mut unresolved = ImportReport::default();
+            for c in &data.collections {
+                if c.kind != CollectionKind::Smart {
+                    continue;
+                }
+                let name = c.name.trim();
+                let existing: Option<(String, Option<String>)> = tx
+                    .query_row(
+                        "SELECT kind, query FROM collections WHERE name_lc = ?1",
+                        [name.to_lowercase()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((kind, existing_query)) = existing
+                    && kind == CollectionKind::Smart.as_str()
+                    && existing_query.as_deref() != c.query.as_deref()
+                    && !choices.contains_key(&name.to_lowercase())
+                {
+                    unresolved.smart_conflicts.push(SmartCollectionConflict {
+                        name: name.to_string(),
+                        existing_query: existing_query.unwrap_or_default(),
+                        imported_query: c.query.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            if !unresolved.smart_conflicts.is_empty() {
+                return Ok(unresolved);
+            }
+
             let mut report = ImportReport::default();
             let mut vols = VolumeCache::new();
             let mut find = tx.prepare_cached("SELECT id FROM files WHERE path = ?1")?;
             for c in &data.collections {
                 let name = c.name.trim();
-                let existing: Option<(i64, String)> = tx
+                let existing: Option<(i64, String, Option<String>)> = tx
                     .query_row(
-                        "SELECT id, kind FROM collections WHERE name_lc = ?1",
+                        "SELECT id, kind, query FROM collections WHERE name_lc = ?1",
                         [name.to_lowercase()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
                 let id = match existing {
-                    Some((id, kind)) if kind == c.kind.as_str() => {
+                    Some((id, kind, _))
+                        if kind == c.kind.as_str() && c.kind == CollectionKind::Manual =>
+                    {
                         report.collections_merged += 1;
-                        if c.kind == CollectionKind::Smart {
-                            tx.execute(
-                                "UPDATE collections SET query = ?2, updated_at = ?3 WHERE id = ?1",
-                                params![id, c.query, now_ms()],
-                            )?;
-                        }
                         id
+                    }
+                    Some((id, kind, existing_query))
+                        if kind == CollectionKind::Smart.as_str()
+                            && c.kind == CollectionKind::Smart
+                            && existing_query.as_deref() == c.query.as_deref() =>
+                    {
+                        report.collections_merged += 1;
+                        id
+                    }
+                    Some((id, kind, _))
+                        if kind == CollectionKind::Smart.as_str()
+                            && c.kind == CollectionKind::Smart =>
+                    {
+                        match choices.get(&name.to_lowercase()) {
+                            Some(SmartCollectionConflictChoice::Replace) => {
+                                tx.execute(
+                                    "UPDATE collections SET query = ?2, updated_at = ?3 WHERE id = ?1",
+                                    params![id, c.query, now_ms()],
+                                )?;
+                                report.collections_merged += 1;
+                                id
+                            }
+                            Some(SmartCollectionConflictChoice::KeepExisting) => {
+                                report.collections_merged += 1;
+                                id
+                            }
+                            Some(SmartCollectionConflictChoice::ImportAsCopy) => {
+                                let copy_name = copy_collection_name_tx(tx, name)?;
+                                report.collections_created += 1;
+                                insert_collection_tx(
+                                    tx,
+                                    &copy_name,
+                                    CollectionKind::Smart,
+                                    c.query.as_deref(),
+                                )?
+                            }
+                            None => unreachable!("unresolved conflicts returned before import"),
+                        }
                     }
                     Some(_) => {
                         return Err(DbError::Invalid(format!(
@@ -532,6 +622,32 @@ impl Db {
         let data: CollectionsExport = serde_json::from_str(json)?;
         self.import_collections(&data)
     }
+
+    pub fn import_collections_json_with_choices(
+        &self,
+        json: &str,
+        choices: &HashMap<String, SmartCollectionConflictChoice>,
+    ) -> Result<ImportReport> {
+        let data: CollectionsExport = serde_json::from_str(json)?;
+        self.import_collections_with_choices(&data, choices)
+    }
+}
+
+fn copy_collection_name_tx(tx: &Transaction<'_>, name: &str) -> Result<String> {
+    for copy_number in 2..=u64::MAX {
+        let candidate = format!("{name} ({copy_number})");
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM collections WHERE name_lc = ?1)",
+            [candidate.to_lowercase()],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+    Err(DbError::Invalid(
+        "could not find an available collection copy name".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -669,6 +785,93 @@ mod tests {
                 "{\"format\":\"x\",\"version\":1,\"exported_at\":0,\"collections\":[]}"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn import_reports_smart_collection_query_conflict_without_replacing() {
+        let db = Db::open_in_memory().unwrap();
+        db.create_smart_collection("Raws", "kind:raw").unwrap();
+        let incoming = CollectionsExport {
+            format: EXPORT_FORMAT.into(),
+            version: 1,
+            exported_at: 0,
+            collections: vec![CollectionExport {
+                name: "Raws".into(),
+                kind: CollectionKind::Smart,
+                query: Some("kind:image".into()),
+                items: Vec::new(),
+            }],
+        };
+
+        let report = db.import_collections(&incoming).unwrap();
+
+        assert_eq!(
+            db.collection_by_name("Raws")
+                .unwrap()
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("kind:raw")
+        );
+        assert_eq!(report.smart_conflicts.len(), 1);
+        assert_eq!(report.smart_conflicts[0].name, "Raws");
+        assert_eq!(report.smart_conflicts[0].existing_query, "kind:raw");
+        assert_eq!(report.smart_conflicts[0].imported_query, "kind:image");
+
+        let choice = HashMap::from([(
+            "raws".to_string(),
+            SmartCollectionConflictChoice::ImportAsCopy,
+        )]);
+        let resolved = db
+            .import_collections_with_choices(&incoming, &choice)
+            .unwrap();
+        assert_eq!(resolved.collections_created, 1);
+        assert_eq!(
+            db.collection_by_name("Raws")
+                .unwrap()
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("kind:raw")
+        );
+        assert_eq!(
+            db.collection_by_name("Raws (2)")
+                .unwrap()
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("kind:image")
+        );
+
+        let keep_choice = HashMap::from([(
+            "raws".to_string(),
+            SmartCollectionConflictChoice::KeepExisting,
+        )]);
+        let mut later_import = incoming.clone();
+        later_import.collections[0].query = Some("kind:video".into());
+        db.import_collections_with_choices(&later_import, &keep_choice)
+            .unwrap();
+        assert_eq!(
+            db.collection_by_name("Raws")
+                .unwrap()
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("kind:raw")
+        );
+
+        let replace_choice =
+            HashMap::from([("raws".to_string(), SmartCollectionConflictChoice::Replace)]);
+        db.import_collections_with_choices(&later_import, &replace_choice)
+            .unwrap();
+        assert_eq!(
+            db.collection_by_name("Raws")
+                .unwrap()
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("kind:video")
         );
     }
 }

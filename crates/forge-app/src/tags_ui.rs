@@ -1,7 +1,7 @@
 //! Tags/keywords and notes editor for the selection, shown in the preview panel (WP-T), and a
 //! "Manage tags" window for renaming, merging and deleting tags.
 //!
-//! Reads run on worker threads. Edits go through `Library::annotate` so they keep the library's
+//! Reads run on worker threads. Edits go through the library's single writer so they keep the
 //! write ordering and offline handling. The panel applies an edit to its cache straight away and
 //! re-reads a moment later, because the writer may not have finished when a read is issued.
 
@@ -449,28 +449,42 @@ impl TagsUi {
         Some(summarize_tags(&tags))
     }
 
-    fn run_manage(&mut self, db: Option<&Arc<Db>>, ctx: &egui::Context, op: ManageOp) {
-        let Some(db) = db.cloned() else {
-            self.manage.notice = Some(Err("Library database is not available".into()));
-            return;
-        };
+    fn run_manage(&mut self, library: &Library, ctx: &egui::Context, op: ManageOp) {
         self.manage.busy = true;
+        let wait_for_write: Box<dyn FnOnce() -> Result<String, String> + Send> = match op {
+            ManageOp::Rename { old, new } => {
+                let reply = library.rename_tag(old.clone(), new.clone());
+                Box::new(move || {
+                    reply
+                        .recv()
+                        .unwrap_or_else(|_| {
+                            Err("Library writer stopped before saving the tag".into())
+                        })
+                        .map(|()| format!("Renamed '{old}' to '{new}'"))
+                })
+            }
+            ManageOp::Delete { name } => {
+                let reply = library.delete_tag(name.clone());
+                Box::new(move || {
+                    reply
+                        .recv()
+                        .unwrap_or_else(|_| {
+                            Err("Library writer stopped before saving the tag".into())
+                        })
+                        .map(|deleted| {
+                            if deleted {
+                                format!("Deleted '{name}'")
+                            } else {
+                                format!("'{name}' was already gone")
+                            }
+                        })
+                })
+            }
+        };
         let tx = self.tx.clone();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let result = match op {
-                ManageOp::Rename { old, new } => db
-                    .rename_tag(&old, &new)
-                    .map(|()| format!("Renamed '{old}' to '{new}'")),
-                ManageOp::Delete { name } => db.delete_tag(&name).map(|deleted| {
-                    if deleted {
-                        format!("Deleted '{name}'")
-                    } else {
-                        format!("'{name}' was already gone")
-                    }
-                }),
-            }
-            .map_err(|e| e.to_string());
+            let result = wait_for_write();
             let _ = tx.send(Msg::Manage(result));
             repaint.request_repaint();
         });
@@ -690,7 +704,8 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
 /// "Manage tags" window: rename (a rename onto an existing tag merges them) and delete, with the
 /// number of files that will change. Opened from the panel; drawn each frame by the app shell.
 pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
-    let db = app.ops.library.db.clone();
+    let library = &app.ops.library;
+    let db = library.db.clone();
     let st = &mut app.ops.tags_ui;
     if !st.manage_open {
         return;
@@ -824,13 +839,13 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
         Some(ManageAction::CancelRename) => st.manage.renaming = None,
         Some(ManageAction::Rename { old, new }) => {
             st.manage.renaming = None;
-            st.run_manage(db.as_ref(), ctx, ManageOp::Rename { old, new });
+            st.run_manage(library, ctx, ManageOp::Rename { old, new });
         }
         Some(ManageAction::AskDelete(name)) => st.manage.confirm_delete = Some(name),
         Some(ManageAction::CancelDelete) => st.manage.confirm_delete = None,
         Some(ManageAction::Delete(name)) => {
             st.manage.confirm_delete = None;
-            st.run_manage(db.as_ref(), ctx, ManageOp::Delete { name });
+            st.run_manage(library, ctx, ManageOp::Delete { name });
         }
         None => {}
     }

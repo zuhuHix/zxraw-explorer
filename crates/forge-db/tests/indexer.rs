@@ -299,7 +299,10 @@ fn relink_simple_prefix_rewrite_then_present_again() {
     let rec = db.file(id).unwrap().unwrap();
     assert_eq!(rec.path, new.join("a").join("b").join("photo.jpg"));
     assert_eq!(rec.parent_path, new.join("a").join("b"));
-    assert!(!rec.present);
+    // The destination exists on disk after the rename, so relink marks the row present
+    // straight away; nothing is reported offline.
+    assert!(rec.present);
+    assert!(r.offline_paths.is_empty());
     let rid2 = db.add_index_root(&new).unwrap();
     Indexer::new(&db).index_root(rid2).unwrap();
     let rec = db.file(id).unwrap().unwrap();

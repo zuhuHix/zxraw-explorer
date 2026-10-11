@@ -31,12 +31,12 @@ use serde::Serialize;
 pub use annotations::{Annotation, AnnotationChange, TagCount};
 pub use collections::{
     Collection, CollectionExport, CollectionId, CollectionKind, CollectionsExport, ImportReport,
-    SavedSearch,
+    SavedSearch, SmartCollectionConflict, SmartCollectionConflictChoice,
 };
 pub use error::{DbError, Result};
 pub use files::{
-    FileId, FileRecord, ImageMeta, NewFile, RelinkReport, VideoMeta, Volume, VolumeId, VolumeInfo,
-    media_kind_from_str, media_kind_str, volume_root_of,
+    FileId, FileRecord, ImageMeta, NewFile, RelinkConflict, RelinkReport, VideoMeta, Volume,
+    VolumeId, VolumeInfo, media_kind_from_str, media_kind_str, volume_root_of,
 };
 pub use indexer::{IndexOutcome, IndexReport, Indexer, ReconcileReport, RootReport};
 pub use schema::latest_version;
