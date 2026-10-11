@@ -71,13 +71,15 @@ pub fn partial_hash(path: &Path) -> Result<u64> {
     let size = f.metadata().map_err(|e| CoreError::io(path, e))?.len();
     let mut h = Xxh3::new();
     h.update(&size.to_le_bytes());
-    let mut buf = vec![0u8; PARTIAL_BYTES as usize];
     let io = |e| CoreError::io(path, e);
     if size <= PARTIAL_BYTES * 2 {
         let mut all = Vec::with_capacity(size as usize);
         f.read_to_end(&mut all).map_err(io)?;
         h.update(&all);
     } else {
+        // Only large files need the 64 KiB window; small ones (the common case in bulk
+        // duplicate scans) skip allocating and zeroing it.
+        let mut buf = vec![0u8; PARTIAL_BYTES as usize];
         f.read_exact(&mut buf).map_err(io)?;
         h.update(&buf);
         f.seek(SeekFrom::End(-(PARTIAL_BYTES as i64))).map_err(io)?;

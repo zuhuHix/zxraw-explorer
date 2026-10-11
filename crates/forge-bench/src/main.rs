@@ -586,6 +586,11 @@ fn benchmark_duplicates(tree: &Path) -> anyhow::Result<()> {
         report.groups.len(),
         report.errors.len()
     );
+    let t = report.stage_times.map(|d| d.as_secs_f64());
+    println!(
+        "duplicate stage times: walk+size {:.3} s; partial hash {:.3} s; full hash {:.3} s; byte compare {:.3} s",
+        t[0], t[1], t[2], t[3]
+    );
     Ok(())
 }
 

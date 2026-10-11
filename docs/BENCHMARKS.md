@@ -181,3 +181,22 @@ regression guards, not performance claims.
 Two results are weak points for a future optimisation pass and should be reviewed before the
 targets are relied on: the duplicate scan's first-run time, and cold thumbnail throughput
 (about 3–4 images/s for 24 MP JPEGs on this loaded machine).
+
+## Duplicate scan — quiet-machine follow-up (2026-10-11)
+
+Re-measured with per-stage timing (`DupReport::stage_times`, printed by `zxraw-cli dupes`),
+release build, no cargo/rustc running, files warm in cache. Raw outputs: `%TEMP%\dup-measure`.
+
+| Dataset | Wall (median) | Walk + size | Partial hash | Full hash |
+|---|---|---|---|---|
+| 50k files | 1.2–1.4 s | 0.12 s | 1.0–1.2 s | 0.02 s |
+| 100k files | 3.0 s | 0.27 s | 2.7 s | 0.03 s |
+| 200k files | 6.0 s (first run after build: 16.8 s) | 0.5 s | 5.4 s | 0.02 s |
+
+Scaling is linear (~27 µs per file in the partial-hash stage at 8 threads; 12.8 s single-threaded).
+The partial-hash stage is bound by per-file open latency; 8 threads sit near the knee
+(16 threads: 4.6 s, 32: 4.9 s). Under heavy CPU load it rose 1.4–2.3×. The earlier
+23–1,662 s spread (taken during ~50 concurrent compiler processes right after generating the
+data) was **not** reproduced; it is attributed to load plus cold cache/write-back, unproven.
+A truly cold (standby-cache evicted) run needs admin rights and was not measured.
+Proposed target: 200k-file duplicate scan ≤ 15 s warm on this class of machine.

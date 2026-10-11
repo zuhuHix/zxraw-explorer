@@ -56,6 +56,11 @@ pub fn run(args: DupesArgs) -> Result<u8> {
             report.stage_candidates[1],
             report.stage_candidates[2]
         );
+        let t = report.stage_times.map(|d| d.as_secs_f64());
+        println!(
+            "stage times (s): walk+size {:.3} / partial hash {:.3} / full hash {:.3} / byte compare {:.3}",
+            t[0], t[1], t[2], t[3]
+        );
         println!(
             "{} duplicate group(s), {} reclaimable by keeping one copy each",
             report.groups.len(),

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,9 @@ pub struct DupReport {
     pub files_scanned: u64,
     /// Candidates remaining after each stage: [size, partial hash, full hash].
     pub stage_candidates: [u64; 3],
+    /// Wall-clock time per stage: [walk + size grouping, partial hash, full hash, byte
+    /// comparison]. The byte-comparison slot stays zero unless `byte_compare` is set.
+    pub stage_times: [Duration; 4],
     pub links_skipped: u64,
     pub errors: Vec<OpIssue>,
 }
@@ -131,6 +135,7 @@ pub fn find_duplicates(
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut errors = Vec::new();
     let mut links = 0;
+    let stage_start = Instant::now();
     ctx.progress.set_current("scanning");
     collect_files(roots, ctx, &mut errors, &mut links, |path, size| {
         report.files_scanned += 1;
@@ -146,6 +151,7 @@ pub fn find_duplicates(
     report.links_skipped = links;
     by_size.retain(|_, v| v.len() > 1);
     report.stage_candidates[0] = by_size.values().map(|v| v.len() as u64).sum();
+    report.stage_times[0] = stage_start.elapsed();
 
     let mut groups = Vec::new();
     if let Some(mut empty) = by_size.remove(&0) {
@@ -159,6 +165,7 @@ pub fn find_duplicates(
 
     // Stage 2: partial hash. Dominated by per-file open latency (antivirus scanning of
     // cold files can cost ~10 ms each), so files are opened on several threads at once.
+    let stage_start = Instant::now();
     ctx.progress.set_current("comparing file starts and ends");
     let mut by_partial: HashMap<(u64, u64), Vec<PathBuf>> = HashMap::new();
     let items: Vec<(u64, PathBuf)> = by_size
@@ -181,8 +188,10 @@ pub fn find_duplicates(
     }
     by_partial.retain(|_, v| v.len() > 1);
     report.stage_candidates[1] = by_partial.values().map(|v| v.len() as u64).sum();
+    report.stage_times[1] = stage_start.elapsed();
 
     // Stage 3: full BLAKE3.
+    let stage_start = Instant::now();
     ctx.progress.set_current("hashing candidates");
     let total: u64 = by_partial
         .iter()
@@ -207,8 +216,10 @@ pub fn find_duplicates(
     }
     by_full.retain(|_, v| v.len() > 1);
     report.stage_candidates[2] = by_full.values().map(|v| v.len() as u64).sum();
+    report.stage_times[2] = stage_start.elapsed();
 
     // Stage 4: optional byte comparison (splits groups on mismatch).
+    let stage_start = Instant::now();
     for ((size, hash), mut files) in by_full {
         files.sort();
         let parts = if opts.byte_compare {
@@ -230,6 +241,7 @@ pub fn find_duplicates(
             .cmp(&a.wasted_bytes())
             .then_with(|| a.files.cmp(&b.files))
     });
+    report.stage_times[3] = stage_start.elapsed();
     report.groups = groups;
     report.errors = errors;
     Ok(report)
