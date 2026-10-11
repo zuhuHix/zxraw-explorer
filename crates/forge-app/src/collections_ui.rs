@@ -759,7 +759,7 @@ fn atomic_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, path)
+        forge_core::paths::rename_no_replace(&temporary, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -1463,8 +1463,13 @@ pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: 
                     let json = db
                         .export_collections_json(&[collection_id])
                         .map_err(|e| e.to_string())?;
-                    atomic_export(&path, json.as_bytes())
-                        .map_err(|e| format!("Could not write export: {e}"))?;
+                    atomic_export(&path, json.as_bytes()).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!("{} already exists; export not saved", path.display())
+                        } else {
+                            format!("Could not write export: {error}")
+                        }
+                    })?;
                     Ok(format!("Exported collection to {}", path.display()))
                 });
             }
@@ -1771,18 +1776,19 @@ mod tests {
     }
 
     #[test]
-    fn export_replaces_destination_only_after_complete_temp_write() {
+    fn export_refuses_to_replace_existing_destination() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("collections.json");
         std::fs::write(&destination, b"old data").unwrap();
 
-        atomic_export(&destination, b"complete json").unwrap();
+        let error = atomic_export(&destination, b"complete json").unwrap_err();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"complete json");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old data");
         assert_eq!(
             std::fs::read_dir(temp.path()).unwrap().count(),
             1,
-            "temporary sibling should be renamed away"
+            "the temporary file should be removed after refusing replacement"
         );
     }
 

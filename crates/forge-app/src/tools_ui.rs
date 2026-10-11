@@ -194,6 +194,7 @@ enum ToolPayload {
     Verify(Result<VerifyReport, String>),
     Saved(Result<PathBuf, String>),
     Compare(Result<CompareReport, String>),
+    SyncPlan(Result<SyncPlan, String>),
     Recycled(Result<(), String>),
     Synced(OpReport),
 }
@@ -223,6 +224,12 @@ enum DeferredAction {
         left: PathBuf,
         right: PathBuf,
         use_hash: bool,
+    },
+    BuildSyncPlan {
+        report: CompareReport,
+        left: PathBuf,
+        right: PathBuf,
+        mode: SyncMode,
     },
     RecycleDuplicates {
         targets: Vec<PathBuf>,
@@ -312,6 +319,16 @@ impl ToolWindow {
                         if let ToolState::Compare(state) = &mut self.state {
                             state.report = Some(report);
                             state.plan = None;
+                            state.confirming_mirror = false;
+                        }
+                        self.notice = None;
+                    }
+                    Err(error) => self.notice = Some(error),
+                },
+                ToolPayload::SyncPlan(result) => match result {
+                    Ok(plan) => {
+                        if let ToolState::Compare(state) = &mut self.state {
+                            state.plan = Some(plan);
                             state.confirming_mirror = false;
                         }
                         self.notice = None;
@@ -983,6 +1000,36 @@ fn launch_action(
             });
             ("compare-folders", title, handle)
         }
+        DeferredAction::BuildSyncPlan {
+            report,
+            left,
+            right,
+            mode,
+        } => {
+            let title = format!("Building sync preview for {}", right.display());
+            let result_tx = result_tx.clone();
+            let ctx = ctx.clone();
+            let handle = jobs.spawn("sync-preview", title.clone(), move |job| {
+                job.progress.set_current("Fingerprinting preview paths");
+                job.progress.add_total_items(report.entries.len() as u64);
+                let job_ctx = JobCtx::from_job(job);
+                let plan = compare::plan_sync_with_ctx(&report, &left, &right, mode, &job_ctx);
+                job.progress.add_items(report.entries.len() as u64);
+                let result = if job.cancel.is_cancelled() {
+                    Err("sync preview cancelled".to_owned())
+                } else {
+                    Ok(plan)
+                };
+                let err = result.as_ref().err().cloned();
+                let _ = result_tx.send(ToolEnvelope {
+                    generation,
+                    payload: ToolPayload::SyncPlan(result),
+                });
+                ctx.request_repaint();
+                err.map_or(Ok(()), Err)
+            });
+            ("sync-preview", title, handle)
+        }
         DeferredAction::RecycleDuplicates {
             targets,
             bytes,
@@ -1588,6 +1635,17 @@ fn place_treemap_row(remaining: &mut Rect, row: &[(usize, f64)], output: &mut [R
 // Duplicates
 // -----------------------------------------------------------------------------
 
+/// Remember a button's egui id so the test hook can click it through real pointer input
+/// (`ui tools click-button <label>`). Only debug and automation builds keep the id.
+pub(crate) fn register_click_target(ctx: &egui::Context, label: &str, response: &egui::Response) {
+    #[cfg(any(debug_assertions, feature = "automation"))]
+    ctx.data_mut(|data| {
+        data.insert_temp(egui::Id::new(("testhook-tools-button", label)), response.id);
+    });
+    #[cfg(not(any(debug_assertions, feature = "automation")))]
+    let _ = (ctx, label, response);
+}
+
 #[derive(Clone, Copy)]
 enum KeepRule {
     Newest,
@@ -1793,14 +1851,14 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
             &mut state.byte_compare,
             "Confirm byte-for-byte after BLAKE3",
         );
-        if ui
-            .button(if state.report.is_some() {
-                "Scan again"
-            } else {
-                "Scan"
-            })
-            .clicked()
-        {
+        let scan_label = if state.report.is_some() {
+            "Scan again"
+        } else {
+            "Scan"
+        };
+        let scan = ui.button(scan_label);
+        register_click_target(ui.ctx(), "duplicates:Scan", &scan);
+        if scan.clicked() {
             state.report = None;
             state.selected.clear();
             state.confirming = false;
@@ -1859,13 +1917,23 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
                                 format_size(group.size),
                                 format_size(group.wasted_bytes())
                             ));
-                            if ui.small_button("Keep newest").clicked() {
+                            let newest = ui.small_button("Keep newest");
+                            register_click_target(ui.ctx(), "duplicates:Keep newest", &newest);
+                            if newest.clicked() {
                                 chosen_rule = Some((group_index, KeepRule::Newest));
                             }
-                            if ui.small_button("Keep oldest").clicked() {
+                            let oldest = ui.small_button("Keep oldest");
+                            register_click_target(ui.ctx(), "duplicates:Keep oldest", &oldest);
+                            if oldest.clicked() {
                                 chosen_rule = Some((group_index, KeepRule::Oldest));
                             }
-                            if ui.small_button("Keep shortest path").clicked() {
+                            let shortest = ui.small_button("Keep shortest path");
+                            register_click_target(
+                                ui.ctx(),
+                                "duplicates:Keep shortest path",
+                                &shortest,
+                            );
+                            if shortest.clicked() {
                                 chosen_rule = Some((group_index, KeepRule::ShortestPath));
                             }
                         });
@@ -1902,10 +1970,13 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
             format_size(target_bytes)
         ));
         let safe = targets.is_some() && target_count > 0;
-        if ui
-            .add_enabled(safe, egui::Button::new("Move ticked to Recycle Bin"))
-            .clicked()
-        {
+        let move_ticked = ui.add_enabled(safe, egui::Button::new("Move ticked to Recycle Bin"));
+        register_click_target(
+            ui.ctx(),
+            "duplicates:Move ticked to Recycle Bin",
+            &move_ticked,
+        );
+        if move_ticked.clicked() {
             state.confirming = true;
         }
         if state.confirming && ui.button("Cancel confirmation").clicked() {
@@ -1922,10 +1993,22 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
                     if paths.len() > 40 { ui.label(format!("… and {} more", paths.len() - 40)); }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button(RichText::new("Move to Recycle Bin").color(Color32::WHITE).strong()).clicked() {
+                    let move_confirm = ui.button(
+                        RichText::new("Move to Recycle Bin")
+                            .color(Color32::WHITE)
+                            .strong(),
+                    );
+                    register_click_target(
+                        ui.ctx(),
+                        "duplicates:Confirm Move to Recycle Bin",
+                        &move_confirm,
+                    );
+                    if move_confirm.clicked() {
                         ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("dup-confirm", id)), true));
                     }
-                    if ui.button("Keep copies").clicked() { state.confirming = false; }
+                    let keep_copies = ui.button("Keep copies");
+                    register_click_target(ui.ctx(), "duplicates:Keep copies", &keep_copies);
+                    if keep_copies.clicked() { state.confirming = false; }
                 });
             });
         } else {
@@ -2323,6 +2406,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
         });
 
     ui.separator();
+    let mut build_preview = false;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Sync preview").strong());
         let old_mode = state.sync_mode;
@@ -2340,18 +2424,17 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
             state.plan = None;
             state.confirming_mirror = false;
         }
-        if ui.button("Build preview").clicked()
-            && let Some(right) = &state.right
-        {
-            state.plan = Some(compare::plan_sync(
-                report,
-                &state.left,
-                right,
-                state.sync_mode,
-            ));
-            state.confirming_mirror = false;
-        }
+        build_preview = ui.button("Build preview").clicked();
     });
+    // The preview is fingerprinted off the UI thread; `ToolPayload::SyncPlan` stores it.
+    if build_preview && let Some(right) = &state.right {
+        return Some(UiAction::Start(DeferredAction::BuildSyncPlan {
+            report: report.clone(),
+            left: state.left.clone(),
+            right: right.clone(),
+            mode: state.sync_mode,
+        }));
+    }
     if let Some(plan) = &state.plan {
         let copies = plan
             .actions
@@ -2397,7 +2480,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
                             plan.right.join(rel).display(),
                             format_size(*bytes)
                         )),
-                        SyncAction::Delete { rel, is_dir } => ui.colored_label(
+                        SyncAction::Delete { rel, is_dir, .. } => ui.colored_label(
                             ui.visuals().error_fg_color,
                             format!(
                                 "RECYCLE {}  {}",
@@ -2425,7 +2508,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
                     ui.label(format!("{} destination item(s) will be moved to the Recycle Bin. Review the exact list below before continuing.", deletes));
                     egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
                         for action in &plan.actions {
-                            if let SyncAction::Delete { rel, is_dir } = action {
+                            if let SyncAction::Delete { rel, is_dir, .. } = action {
                                 ui.label(format!("{}  {}", if *is_dir { "FOLDER" } else { "FILE" }, plan.right.join(rel).display()));
                             }
                         }

@@ -1685,7 +1685,9 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
             ui.horizontal(|ui| {
                 ui.label("Extract to");
                 ui.text_edit_singleline(&mut state.destination_text);
-                if ui.button("Choose…").clicked()
+                let choose = ui.button("Choose…");
+                crate::tools_ui::register_click_target(ui.ctx(), "archive:Choose…", &choose);
+                if choose.clicked()
                     && let Some(path) = crate::dialogs::pick_folder(
                         rfd::FileDialog::new().set_directory(&state.destination),
                     )
@@ -1763,7 +1765,13 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
                     state.selected.len()
                 ));
                 ui.horizontal(|ui| {
-                    if ui.button("Extract all").clicked() {
+                    let extract_all = ui.button("Extract all");
+                    crate::tools_ui::register_click_target(
+                        ui.ctx(),
+                        "archive:Extract all",
+                        &extract_all,
+                    );
+                    if extract_all.clicked() {
                         state.destination = PathBuf::from(state.destination_text.trim());
                         actions.push(UiAction::ExtractArchive {
                             selected_only: false,

@@ -128,6 +128,94 @@ fn duplicate_changed_after_the_scan_is_not_recycled() {
     );
 }
 
+/// Two copies of one photo, the second one older, in folders `a` and `b`, plus an unrelated
+/// file. Returns the newer copy, the older copy and the shared bytes.
+fn newest_and_older_copies(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    let original = noise(32 * 1024, 31);
+    let newest = root.join("a").join("newest.bin");
+    let older = root.join("b").join("older.bin");
+    write_file(&newest, &original);
+    write_file(&older, &original);
+    set_modified(&older, SystemTime::now() - Duration::from_secs(86_400));
+    write_file(&root.join("unique.bin"), &noise(2048, 32));
+    (newest, older, original)
+}
+
+#[test]
+fn duplicates_scan_and_recycle_through_the_window_buttons() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("photos");
+    let profile = sandbox.path().join("profile");
+    let (newest, older, original) = newest_and_older_copies(&root);
+    let script = format!(
+        "navigate {root}\n\
+         cmd FindDuplicates\n\
+         ui tools click-button duplicates:Scan\n\
+         ui tools duplicates wait 30\n\
+         ui tools click-button duplicates:Keep newest\n\
+         ui tools click-button duplicates:Move ticked to Recycle Bin\n\
+         ui tools click-button duplicates:Confirm Move to Recycle Bin\n\
+         wait-jobs 20\n\
+         screenshot {shot}\n\
+         exit\n",
+        root = shown(&root),
+        shot = shown(&shot("duplicates-buttons-recycled.png")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(!older.exists(), "the older copy must be recycled");
+    assert_eq!(
+        fs::read(&newest).unwrap(),
+        original,
+        "the newest copy is kept"
+    );
+    assert!(
+        root.join("unique.bin").exists(),
+        "non-duplicates are never touched"
+    );
+    let removed = find_named(&recycle_sandbox(&profile), "older.bin")
+        .expect("the older copy must be in the recycle sandbox");
+    assert_eq!(fs::read(removed).unwrap(), original);
+}
+
+#[test]
+fn duplicates_keep_copies_button_recycles_nothing() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("photos");
+    let profile = sandbox.path().join("profile");
+    let (newest, older, original) = newest_and_older_copies(&root);
+    let script = format!(
+        "navigate {root}\n\
+         cmd FindDuplicates\n\
+         ui tools click-button duplicates:Scan\n\
+         ui tools duplicates wait 30\n\
+         ui tools click-button duplicates:Keep newest\n\
+         ui tools click-button duplicates:Move ticked to Recycle Bin\n\
+         ui tools click-button duplicates:Keep copies\n\
+         wait-frames 10\n\
+         exit\n",
+        root = shown(&root),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        fs::read(&older).unwrap(),
+        original,
+        "cancelled: the copy stays"
+    );
+    assert_eq!(fs::read(&newest).unwrap(), original);
+    assert!(
+        find_named(&recycle_sandbox(&profile), "older.bin").is_none(),
+        "nothing may reach the recycle sandbox after Keep copies"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Folder compare and Update sync
 // ---------------------------------------------------------------------------
@@ -592,6 +680,48 @@ fn extracting_over_an_existing_file_never_replaces_it() {
 }
 
 #[test]
+fn archive_extract_through_the_window_buttons_keeps_existing_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let folder = sandbox.path().join("zips");
+    let zip = folder.join("shared.zip");
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&folder).unwrap();
+    fs::write(
+        &zip,
+        raw_zip(&[("keep.txt", b"from the archive"), ("new.txt", b"new")]),
+    )
+    .unwrap();
+    write_file(&dest.join("keep.txt"), b"my own version");
+    let script = format!(
+        "navigate {folder}\n\
+         select shared.zip\n\
+         cmd BrowseArchive\n\
+         ui tools archive wait 30\n\
+         dialog {dest}\n\
+         ui tools click-button archive:Choose…\n\
+         ui tools click-button archive:Extract all\n\
+         wait-jobs 30\n\
+         screenshot {shot}\n\
+         exit\n",
+        folder = shown(&folder),
+        dest = shown(&dest),
+        shot = shown(&shot("archive-buttons-extracted.png")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(fs::read(dest.join("new.txt")).unwrap(), b"new");
+    assert_eq!(
+        fs::read(dest.join("keep.txt")).unwrap(),
+        b"my own version",
+        "an existing file is never replaced by the window's Extract all"
+    );
+}
+
+#[test]
 fn zipping_a_folder_with_a_junction_does_not_follow_it() {
     let sandbox = tempfile::tempdir().unwrap();
     let profile = sandbox.path().join("profile");
@@ -710,8 +840,9 @@ fn join_reports_a_missing_part_and_publishes_nothing() {
     fs::remove_file(dir.join(&parsed.parts[1].name)).unwrap();
 
     let script = format!(
-        "ui tools join {manifest}\nwait-jobs 60\nassert-missing {file}\nexit\n",
+        "ui tools join {manifest}\nwait-jobs 60\nassert-toast missing part {part}\nassert-missing {file}\nexit\n",
         manifest = shown(&manifest),
+        part = parsed.parts[1].name,
         file = shown(&file),
     );
     let outcome = run_app(sandbox.path(), &profile, &script);
@@ -740,8 +871,9 @@ fn join_detects_a_corrupted_part_and_publishes_nothing() {
     fs::write(&part, bytes).unwrap();
 
     let script = format!(
-        "ui tools join {manifest}\nwait-jobs 60\nassert-missing {file}\nexit\n",
+        "ui tools join {manifest}\nwait-jobs 60\nassert-toast corrupt part {part}: BLAKE3 mismatch\nassert-missing {file}\nexit\n",
         manifest = shown(&manifest),
+        part = parsed.parts[2].name,
         file = shown(&file),
     );
     let outcome = run_app(sandbox.path(), &profile, &script);

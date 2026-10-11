@@ -39,6 +39,11 @@
 //! - `split <file> <bytes>`: split into parts of that size; follow with `wait-jobs`.
 //! - `join <manifest or first .001 part>`: join the parts; follow with `wait-jobs`.
 //!
+//! Buttons, through real pointer input (the handler is never called directly):
+//! - `click-button <label>`: press and release on a button the UI registered under `label`,
+//!   such as `duplicates:Scan` or `archive:Extract all`. Waits up to 10 s for the button to
+//!   be visible and enabled. Answer any native dialog with `dialog <path>` before the click.
+//!
 //! External changes, made with `std::fs` from the hook so the pane must notice them through
 //! the OS watcher alone (paths are absolute; `|` separates two paths):
 //! - `external create <path>`: create a 4 KiB file (`create_new`, never replaces).
@@ -62,10 +67,12 @@ use forge_core::compare::{EntryState, SyncAction};
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 const WAIT_MAX: u64 = 300;
 const BURST_LIMIT: usize = 5000;
+/// How long `click-button` waits for its widget to be visible and enabled.
+const BUTTON_WAIT: Duration = Duration::from_secs(10);
 
 pub(super) fn step(
     app: &mut ZxrawApp,
-    _ctx: &egui::Context,
+    ctx: &egui::Context,
     verb: &str,
     args: &str,
     st: &mut StepState,
@@ -77,6 +84,7 @@ pub(super) fn step(
         "wait-listing" => wait_listing(app, args, st),
         "wait-entry-size" => wait_entry_size(app, args, st),
         "archive" => archive_step(app, args, st),
+        "click-button" => click_button(app, ctx, args.trim(), st),
         "split" => {
             let (file, bytes) = args
                 .rsplit_once(char::is_whitespace)
@@ -93,6 +101,73 @@ pub(super) fn step(
             Ok(Flow::Done)
         }
         _ => Err(format!("unknown `ui tools` verb `{verb}`")),
+    }
+}
+
+/// Click a visible tool button by its registered egui widget id. This still goes through
+/// egui's pointer input path; the handler is never called directly by the test hook.
+fn click_button(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    label: &str,
+    st: &mut StepState,
+) -> Result<Flow, String> {
+    if label.is_empty() {
+        return Err("expected a registered tool button label".into());
+    }
+    if st.data.is_none() {
+        // The button may appear a frame or two after the step that opens its window, so
+        // wait for it, but only up to BUTTON_WAIT.
+        let id = ctx.data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::new(("testhook-tools-button", label)))
+        });
+        let reason = match id.and_then(|id| ctx.read_response(id)) {
+            Some(response) if response.enabled() && response.interact_rect.is_positive() => {
+                st.data = Some(Box::new(response.interact_rect.center()));
+                String::new()
+            }
+            Some(_) => format!("tool button {label:?} is disabled"),
+            None => format!("tool button {label:?} is not visible"),
+        };
+        if st.data.is_none() {
+            if st.started.is_some_and(|started| started.elapsed() > BUTTON_WAIT) {
+                return Err(format!("{reason} after {} s", BUTTON_WAIT.as_secs()));
+            }
+            return Ok(Flow::Wait(reason));
+        }
+    }
+    let pos = *st
+        .data
+        .as_ref()
+        .and_then(|data| data.downcast_ref::<egui::Pos2>())
+        .ok_or("invalid click-button state")?;
+    app.testhook.input.pointer = Some(pos);
+    let pressed = st.frames == 0;
+    let events = if pressed {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    } else {
+        vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    };
+    match super::inject(app, st, &events) {
+        Flow::Done if pressed => {
+            st.frames = 1;
+            st.phase = 0;
+            Ok(Flow::Wait("button pressed".into()))
+        }
+        other => Ok(other),
     }
 }
 
