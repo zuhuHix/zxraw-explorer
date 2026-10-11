@@ -9,6 +9,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use forge_core::query::{ColorLabel, PickState};
 use forge_db::{AnnotationChange, Db, FileRecord, SearchOptions};
 use forge_jobs::{JobHandle, JobRegistry};
+use forge_media::{SidecarOutcome, SidecarUpdate, update_sidecar};
 
 use crate::views::Annotation;
 
@@ -30,6 +31,8 @@ struct AnnotationWrite {
     paths: Vec<PathBuf>,
     change: AnnotationChange,
     versions: HashMap<PathBuf, u64>,
+    /// Whether to mirror the change into XMP sidecars once the database write succeeds.
+    xmp_sync: bool,
 }
 
 pub struct Library {
@@ -50,6 +53,8 @@ pub struct Library {
     queued: Vec<AnnotationWrite>,
     /// Single writer thread so edits reach the database in the order they were made.
     writer: Option<Sender<AnnotationWrite>>,
+    /// Mirror annotation changes into `.xmp` sidecars (set from the settings every frame).
+    xmp_sync: bool,
     pub search: SearchState,
 }
 
@@ -110,6 +115,7 @@ impl Library {
             next_annotation_version: 0,
             queued: Vec::new(),
             writer: None,
+            xmp_sync: false,
             search: SearchState::default(),
         }
     }
@@ -180,6 +186,11 @@ impl Library {
         notices
     }
 
+    /// Enables or disables XMP sidecar sync for annotation changes made from now on.
+    pub fn set_xmp_sync(&mut self, enabled: bool) {
+        self.xmp_sync = enabled;
+    }
+
     /// Load annotations for `dir` once (async).
     pub fn ensure_dir(&mut self, dir: &Path) {
         if !self.loaded_dirs.insert(dir.to_path_buf()) {
@@ -232,6 +243,7 @@ impl Library {
             paths,
             change,
             versions,
+            xmp_sync: self.xmp_sync,
         };
         if self.db.is_none() {
             if self.open_error.is_some() {
@@ -452,6 +464,50 @@ fn authoritative_annotations(
         .collect()
 }
 
+/// The XMP-visible part of an annotation change. Picks and notes stay in the app library.
+fn sidecar_update(change: &AnnotationChange) -> SidecarUpdate {
+    SidecarUpdate {
+        rating: change.rating.map(i32::from),
+        label: change.label.map(|l| l.map(|c| xmp_label(c).to_string())),
+        add_keywords: change.add_tags.clone(),
+        remove_keywords: change.remove_tags.clone(),
+    }
+}
+
+/// Label names as Lightroom, Bridge and Capture One write them in `xmp:Label`.
+fn xmp_label(label: ColorLabel) -> &'static str {
+    match label {
+        ColorLabel::Red => "Red",
+        ColorLabel::Yellow => "Yellow",
+        ColorLabel::Green => "Green",
+        ColorLabel::Blue => "Blue",
+        ColorLabel::Purple => "Purple",
+    }
+}
+
+/// Writes `update` to the sidecar of every path when enabled. Returns one summary message
+/// if any file failed; the originals are never modified, so only sidecars are at risk.
+fn sync_sidecars(
+    enabled: bool,
+    paths: &[PathBuf],
+    update: &SidecarUpdate,
+    mut write: impl FnMut(&Path, &SidecarUpdate) -> forge_media::Result<SidecarOutcome>,
+) -> Option<String> {
+    if !enabled || update.is_empty() {
+        return None;
+    }
+    let failures: Vec<String> = paths
+        .iter()
+        .filter_map(|p| write(p.as_path(), update).err().map(|e| e.to_string()))
+        .collect();
+    let first = failures.first()?;
+    Some(format!(
+        "XMP sidecar sync failed for {} of {} file(s); the photos were not modified. First error: {first}",
+        failures.len(),
+        paths.len()
+    ))
+}
+
 fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
     let (wtx, wrx) = unbounded::<AnnotationWrite>();
     std::thread::Builder::new()
@@ -461,6 +517,7 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
                 paths,
                 change,
                 versions,
+                xmp_sync,
             } in wrx
             {
                 let r = (|| -> Result<(), String> {
@@ -494,6 +551,10 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
                             )));
                         }
                     }
+                } else if let Some(msg) =
+                    sync_sidecars(xmp_sync, &paths, &sidecar_update(&change), update_sidecar)
+                {
+                    let _ = tx.send(LibMsg::Error(msg));
                 }
             }
         })
@@ -504,6 +565,7 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<AnnotationWrite> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_media::MediaError;
 
     fn annotation(rating: u8) -> Annotation {
         Annotation {
@@ -563,5 +625,77 @@ mod tests {
         );
 
         assert_eq!(cache.get(&edited).unwrap().rating, 3);
+    }
+
+    #[test]
+    fn sidecars_are_written_only_when_sync_is_enabled() {
+        let paths = vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")];
+        let update = SidecarUpdate {
+            rating: Some(3),
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let off = sync_sidecars(false, &paths, &update, |p, _| {
+            calls += 1;
+            Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
+        });
+        assert_eq!(calls, 0);
+        assert!(off.is_none());
+
+        let on = sync_sidecars(true, &paths, &update, |p, _| {
+            calls += 1;
+            Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
+        });
+        assert_eq!(calls, 2);
+        assert!(on.is_none());
+    }
+
+    #[test]
+    fn sidecar_failures_are_reported_as_one_summary() {
+        let paths = vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")];
+        let update = SidecarUpdate {
+            add_keywords: vec!["k".into()],
+            ..Default::default()
+        };
+        let msg = sync_sidecars(true, &paths, &update, |p, _| {
+            if p.ends_with("b.jpg") {
+                Err(MediaError::Unsupported("read-only".into()))
+            } else {
+                Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
+            }
+        })
+        .expect("one failure");
+        assert!(msg.contains("1 of 2"), "{msg}");
+        assert!(msg.contains("read-only"), "{msg}");
+    }
+
+    #[test]
+    fn pick_only_change_never_touches_sidecars() {
+        let change = AnnotationChange {
+            pick: Some(PickState::Pick),
+            ..Default::default()
+        };
+        assert!(sidecar_update(&change).is_empty());
+    }
+
+    #[test]
+    fn annotation_change_maps_to_sidecar_fields() {
+        let change = AnnotationChange {
+            rating: Some(4),
+            label: Some(Some(ColorLabel::Purple)),
+            add_tags: vec!["travel".into()],
+            remove_tags: vec!["old".into()],
+            ..Default::default()
+        };
+        let u = sidecar_update(&change);
+        assert_eq!(u.rating, Some(4));
+        assert_eq!(u.label, Some(Some("Purple".to_string())));
+        assert_eq!(u.add_keywords, vec!["travel".to_string()]);
+        assert_eq!(u.remove_keywords, vec!["old".to_string()]);
+        let clear = AnnotationChange {
+            label: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(sidecar_update(&clear).label, Some(None));
     }
 }

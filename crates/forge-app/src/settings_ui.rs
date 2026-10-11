@@ -206,6 +206,8 @@ impl Default for SettingsUi {
 /// Drawn every frame by the main app. Background work reports through the local channel;
 /// user-visible failures are also forwarded into the app's normal event/toast queue.
 pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
+    // The library writer thread reads this flag when annotations change; keep it current.
+    app.ops.library.set_xmp_sync(app.settings.xmp_sidecar_sync);
     drain_messages(app, ctx);
     start_open_tasks(app, ctx);
 
@@ -466,6 +468,17 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(
         &mut settings.confirm_recycle,
         "Confirm before moving items to the Recycle Bin",
+    );
+    ui.checkbox(
+        &mut settings.xmp_sidecar_sync,
+        "Write ratings, labels and keywords to XMP sidecar files",
+    );
+    ui.label(
+        RichText::new(
+            "Write ratings, labels and keywords to .xmp sidecar files next to your photos so \
+             Lightroom, Capture One and darktable can read them. Originals are never modified.",
+        )
+        .weak(),
     );
     ui.add_space(12.0);
     ui.horizontal(|ui| {

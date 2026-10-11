@@ -3,6 +3,7 @@
 //!
 //! * [`image_meta`] — EXIF (kamadak-exif + own CR3/RAF/ORF/RW2 container handling) and XMP.
 //! * [`raw_preview`] — largest/suitable embedded JPEG preview from RAW containers.
+//! * [`xmp_write`] — merge ratings/labels/keywords into `.xmp` sidecars without touching other data.
 //! * [`video`] — `ffprobe`/`ffmpeg` as external processes (timeouts, caps, no console).
 //! * [`thumbs`] — [`ThumbnailService`] with bounded pools, generations and caches.
 //! * [`analysis`] — sharpness, dHash/aHash, burst grouping.
@@ -17,6 +18,7 @@ pub mod image_meta;
 pub mod raw_preview;
 pub mod thumbs;
 pub mod video;
+pub mod xmp_write;
 
 pub use analysis::{
     BurstItem, Sharpness, ahash, dhash, group_bursts, hamming, hash_similarity, sharpness,
@@ -32,3 +34,4 @@ pub use thumbs::{
     ThumbnailService, cache_key, generate_thumbnail,
 };
 pub use video::{AudioStream, FfTools, FilmstripFrame, HdrKind, VideoMetadata, parse_ffprobe_json};
+pub use xmp_write::{SidecarOutcome, SidecarUpdate, update_sidecar};

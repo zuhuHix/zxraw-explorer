@@ -929,11 +929,11 @@ fn find_bytes(h: &[u8], n: &[u8]) -> Option<usize> {
 
 /// Candidate sidecar paths: `name.xmp` (Lightroom/C1) and `name.ext.xmp` (darktable).
 pub fn sidecar_paths(path: &Path) -> Vec<PathBuf> {
-    let mut v = vec![path.with_extension("xmp")];
+    // Same preference order as `xmp_write`: a full-name `IMG.CR3.xmp` (darktable) wins over
+    // `IMG.xmp`, so the app always displays the sidecar it writes to.
     let mut s = path.as_os_str().to_owned();
     s.push(".xmp");
-    v.push(PathBuf::from(s));
-    v
+    vec![PathBuf::from(s), path.with_extension("xmp")]
 }
 
 /// Reads and parses an XMP sidecar next to `path`, if one exists.

@@ -52,6 +52,8 @@ pub struct Settings {
     pub external_tools: Vec<ExternalTool>,
     pub index_roots: Vec<PathBuf>,
     pub index_exclusions: Vec<String>,
+    /// Mirror ratings, labels and keywords into `.xmp` sidecars next to the photos.
+    pub xmp_sidecar_sync: bool,
 }
 
 impl Default for Settings {
@@ -73,6 +75,7 @@ impl Default for Settings {
             external_tools: Vec::new(),
             index_roots: Vec::new(),
             index_exclusions: vec!["$RECYCLE.BIN".into(), "System Volume Information".into()],
+            xmp_sidecar_sync: false,
         }
     }
 }

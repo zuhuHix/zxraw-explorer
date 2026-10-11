@@ -1471,6 +1471,7 @@ dependencies = [
  "kamadak-exif",
  "lru",
  "parking_lot",
+ "quick-xml",
  "serde",
  "serde_json",
  "tempfile",

@@ -16,6 +16,7 @@ lru.workspace = true
 blake3.workspace = true
 image.workspace = true
 kamadak-exif.workspace = true
+quick-xml = "0.41"
 forge-core.workspace = true
 forge-jobs.workspace = true
 
