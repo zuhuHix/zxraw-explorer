@@ -1015,10 +1015,9 @@ fn launch_action(
                 let job_ctx = JobCtx::from_job(job);
                 let plan = compare::plan_sync_with_ctx(&report, &left, &right, mode, &job_ctx);
                 job.progress.add_items(report.entries.len() as u64);
-                let result = if job.cancel.is_cancelled() {
-                    Err("sync preview cancelled".to_owned())
-                } else {
-                    Ok(plan)
+                let result = match plan {
+                    Ok(plan) if !job.cancel.is_cancelled() => Ok(plan),
+                    _ => Err("sync preview cancelled".to_owned()),
                 };
                 let err = result.as_ref().err().cloned();
                 let _ = result_tx.send(ToolEnvelope {

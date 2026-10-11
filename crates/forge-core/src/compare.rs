@@ -5,7 +5,7 @@
 //! using the atomic copy from [`crate::ops`]. Deletions only ever appear in
 //! [`SyncMode::Mirror`] plans.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -304,17 +304,20 @@ impl SyncPlan {
 
 /// Build a sync plan (left → right) from a comparison.
 pub fn plan_sync(report: &CompareReport, left: &Path, right: &Path, mode: SyncMode) -> SyncPlan {
+    // Without a job context nothing can cancel planning.
     plan_sync_inner(report, left, right, mode, None)
+        .expect("planning without a job context cannot be cancelled")
 }
 
 /// Build a sync plan while updating a cancellable job's progress on large snapshots.
+/// Returns [`CoreError::Cancelled`] as soon as the job is cancelled; no partial plan escapes.
 pub fn plan_sync_with_ctx(
     report: &CompareReport,
     left: &Path,
     right: &Path,
     mode: SyncMode,
     ctx: &JobCtx<'_>,
-) -> SyncPlan {
+) -> Result<SyncPlan> {
     plan_sync_inner(report, left, right, mode, Some(ctx))
 }
 
@@ -324,24 +327,35 @@ fn plan_sync_inner(
     right: &Path,
     mode: SyncMode,
     ctx: Option<&JobCtx<'_>>,
-) -> SyncPlan {
+) -> Result<SyncPlan> {
     let mirror = mode == SyncMode::Mirror;
     let mut deletes: Vec<SyncAction> = Vec::new();
     let mut mkdirs = Vec::new();
     let mut copies = Vec::new();
     let mut skipped = Vec::new();
     let mut expected = Vec::new();
-    let mut deleted_dirs: Vec<&Path> = Vec::new();
+    let mut deleted_dirs: HashSet<&Path> = HashSet::new();
+    // Right-side entries sorted by path. A folder's subtree is then one contiguous run, which
+    // each delete finds by binary search instead of rescanning the whole report.
+    let mut right_sides: Vec<(&Path, SideInfo)> = report
+        .entries
+        .iter()
+        .filter_map(|entry| entry.right.map(|side| (entry.rel.as_path(), side)))
+        .collect();
+    right_sides.sort_by(|a, b| a.0.cmp(b.0));
     let mut bytes = 0;
     let mut copy =
         |entry: &CompareEntry, overwrite: bool, size: u64, copies: &mut Vec<SyncAction>| {
             if let Some(left_side) = entry.left {
-                let left_fingerprint = fingerprint_for_side(&left.join(&entry.rel), left_side, ctx);
+                let left_fingerprint =
+                    fingerprint_for_side(&left.join(&entry.rel), left_side, Coverage::Sampled, ctx);
                 let right_side = entry
                     .right
                     .filter(|side| overwrite && side.kind == NodeKind::File);
-                let right_fingerprint = right_side
-                    .and_then(|side| fingerprint_for_side(&right.join(&entry.rel), side, ctx));
+                // An overwritten destination is hashed in full: a sample could miss an edit.
+                let right_fingerprint = right_side.and_then(|side| {
+                    fingerprint_for_side(&right.join(&entry.rel), side, Coverage::Full, ctx)
+                });
                 expected.push(SyncExpectation {
                     rel: entry.rel.clone(),
                     left: left_side,
@@ -358,6 +372,7 @@ fn plan_sync_inner(
             });
         };
     for e in &report.entries {
+        check_cancel(ctx)?;
         let rel = e.rel.as_path();
         let lk = e.left.map(|i| i.kind);
         match &e.state {
@@ -370,17 +385,22 @@ fn plan_sync_inner(
             },
             EntryState::RightOnly => {
                 if mirror {
-                    if deleted_dirs.iter().any(|d| rel.starts_with(d)) {
+                    // Ancestors come first in the report, so a deleted folder covers its contents.
+                    if rel
+                        .ancestors()
+                        .skip(1)
+                        .any(|dir| deleted_dirs.contains(dir))
+                    {
                         continue; // removed with its parent
                     }
                     let is_dir = e.right.is_some_and(|i| i.kind == NodeKind::Dir);
                     if is_dir {
-                        deleted_dirs.push(rel);
+                        deleted_dirs.insert(rel);
                     }
                     deletes.push(SyncAction::Delete {
                         rel: rel.into(),
                         is_dir,
-                        expected: deletion_snapshot(report, right, rel, is_dir, ctx),
+                        expected: deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?,
                     });
                 }
             }
@@ -388,12 +408,12 @@ fn plan_sync_inner(
                 if mirror && matches!(lk, Some(NodeKind::Dir | NodeKind::File)) {
                     let is_dir = e.right.is_some_and(|i| i.kind == NodeKind::Dir);
                     if is_dir {
-                        deleted_dirs.push(rel);
+                        deleted_dirs.insert(rel);
                     }
                     deletes.push(SyncAction::Delete {
                         rel: rel.into(),
                         is_dir,
-                        expected: deletion_snapshot(report, right, rel, is_dir, ctx),
+                        expected: deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?,
                     });
                     if lk == Some(NodeKind::Dir) {
                         mkdirs.push(SyncAction::CreateDir { rel: rel.into() });
@@ -429,7 +449,7 @@ fn plan_sync_inner(
     let mut actions = deletes;
     actions.extend(mkdirs);
     actions.extend(copies);
-    SyncPlan {
+    Ok(SyncPlan {
         left: left.to_path_buf(),
         right: right.to_path_buf(),
         mode,
@@ -437,58 +457,89 @@ fn plan_sync_inner(
         bytes_to_copy: bytes,
         skipped,
         expected,
+    })
+}
+
+/// Fails once a cancellable job is cancelled, so planning stops between entries.
+fn check_cancel(ctx: Option<&JobCtx<'_>>) -> Result<()> {
+    match ctx {
+        Some(ctx) => Ok(ctx.cancel.check()?),
+        None => Ok(()),
     }
 }
 
 fn fingerprint_for_side(
     path: &Path,
     side: SideInfo,
+    coverage: Coverage,
     ctx: Option<&JobCtx<'_>>,
 ) -> Option<ContentFingerprint> {
     (side.kind == NodeKind::File)
-        .then(|| content_fingerprint(path, side, ctx))
+        .then(|| content_fingerprint(path, side, coverage, ctx))
         .flatten()
 }
 
+/// Snapshot of `rel` and, for a folder, of every right-side descendant. `right_sides` must be
+/// sorted by path (see [`plan_sync_inner`]).
 fn deletion_snapshot(
-    report: &CompareReport,
+    right_sides: &[(&Path, SideInfo)],
     right: &Path,
     rel: &Path,
     is_dir: bool,
     ctx: Option<&JobCtx<'_>>,
-) -> Vec<SyncSnapshot> {
-    let mut snapshots = report
-        .entries
+) -> Result<Vec<SyncSnapshot>> {
+    let belongs = |path: &Path| {
+        if is_dir {
+            path.starts_with(rel)
+        } else {
+            path == rel
+        }
+    };
+    let start = right_sides.partition_point(|entry| entry.0 < rel);
+    let mut snapshots = Vec::new();
+    for &(path, side) in right_sides[start..]
         .iter()
-        .filter_map(|entry| {
-            let side = entry.right?;
-            let belongs = entry.rel == rel || (is_dir && entry.rel.starts_with(rel));
-            belongs.then(|| SyncSnapshot {
-                rel: entry.rel.clone(),
-                side: SideInfo {
-                    modified: snapshot_modified(side.kind, side.modified),
-                    ..side
-                },
-                fingerprint: fingerprint_for_side(&right.join(&entry.rel), side, ctx),
-            })
-        })
-        .collect::<Vec<_>>();
-    snapshots.sort_by(|a, b| a.rel.cmp(&b.rel));
-    snapshots
+        .take_while(|&&(path, _)| belongs(path))
+    {
+        check_cancel(ctx)?;
+        snapshots.push(SyncSnapshot {
+            rel: path.to_path_buf(),
+            side: SideInfo {
+                modified: snapshot_modified(side.kind, side.modified),
+                ..side
+            },
+            // Sampled is enough here: Mirror deletes go to the Recycle Bin, so a stale
+            // delete is recoverable.
+            fingerprint: fingerprint_for_side(&right.join(path), side, Coverage::Sampled, ctx),
+        });
+    }
+    Ok(snapshots)
 }
 
-/// Deleter used for Mirror deletions; `None` means permanent deletion. The app can pass a
-/// Recycle Bin implementation from `forge-win`.
+/// Deleter used for Mirror deletions. The app passes a Recycle Bin implementation from
+/// `forge-win`. A plan with deletes is refused without one: there is no permanent delete.
 pub type Deleter<'a> = &'a mut dyn FnMut(&Path) -> std::result::Result<(), String>;
 
 const FULL_FINGERPRINT_LIMIT: u64 = 1024 * 1024;
 const FINGERPRINT_BLOCK: usize = 64 * 1024;
+
+/// How much of a file a fingerprint covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Coverage {
+    /// Whole file up to [`FULL_FINGERPRINT_LIMIT`], then a bounded sample. Only for checks
+    /// where a missed edit is recoverable: source-side staleness, and Mirror deletes (which
+    /// go to the Recycle Bin).
+    Sampled,
+    /// Every byte, whatever the size. Required for any destination an action overwrites.
+    Full,
+}
 
 /// Snapshot content without following a symlink or junction. Small files get a full hash;
 /// larger files use a bounded sample so preview and revalidation cost stays predictable.
 fn content_fingerprint(
     path: &Path,
     expected: SideInfo,
+    coverage: Coverage,
     ctx: Option<&JobCtx<'_>>,
 ) -> Option<ContentFingerprint> {
     if expected.kind != NodeKind::File || ctx.is_some_and(|ctx| ctx.cancel.check().is_err()) {
@@ -504,6 +555,7 @@ fn content_fingerprint(
     let mut file = File::open(path).ok()?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ZXraw sync snapshot v1\0");
+    hasher.update(&[coverage as u8]);
     hasher.update(&expected.size.to_le_bytes());
     match expected.modified {
         Some(modified) => match modified.duration_since(std::time::UNIX_EPOCH) {
@@ -523,7 +575,7 @@ fn content_fingerprint(
         }
     }
 
-    if expected.size <= FULL_FINGERPRINT_LIMIT {
+    if coverage == Coverage::Full || expected.size <= FULL_FINGERPRINT_LIMIT {
         let mut remaining = expected.size;
         let mut buffer = [0u8; FINGERPRINT_BLOCK];
         while remaining > 0 {
@@ -545,7 +597,9 @@ fn content_fingerprint(
     } else {
         // Unsampled middle bytes can change while size and mtime are preserved. The fixed
         // head, tail, and interior samples keep this guard bounded, but are not a full-file
-        // proof for large files.
+        // proof for large files. That is why a destination an action overwrites is hashed in
+        // full (`Coverage::Full`); sampling is only acceptable where a stale answer is
+        // recoverable.
         let last = expected.size - FINGERPRINT_BLOCK as u64;
         let mut offsets = vec![
             0,
@@ -614,13 +668,14 @@ fn matches_snapshot(
     path: &Path,
     expected: Option<SideInfo>,
     fingerprint: Option<ContentFingerprint>,
+    coverage: Coverage,
     ctx: &JobCtx<'_>,
 ) -> bool {
     match (expected, fs::symlink_metadata(path)) {
         (Some(expected), Ok(actual)) if metadata_matches(&actual, expected) => {
             if expected.kind == NodeKind::File {
                 fingerprint.is_some_and(|fingerprint| {
-                    content_fingerprint(path, expected, Some(ctx)) == Some(fingerprint)
+                    content_fingerprint(path, expected, coverage, Some(ctx)) == Some(fingerprint)
                 })
             } else {
                 fingerprint.is_none()
@@ -666,8 +721,12 @@ fn matches_delete_snapshot(
             let Some(expected_fingerprint) = snapshot.fingerprint else {
                 return false;
             };
-            if content_fingerprint(&right.join(&path), actual_side, Some(ctx))
-                != Some(expected_fingerprint)
+            if content_fingerprint(
+                &right.join(&path),
+                actual_side,
+                Coverage::Sampled,
+                Some(ctx),
+            ) != Some(expected_fingerprint)
             {
                 return false;
             }
@@ -749,6 +808,15 @@ pub fn execute_sync(
         ));
         return report;
     }
+    // There is no permanent-delete path: a plan with deletes needs a deleter (the Recycle Bin).
+    // Refuse before any action runs, so nothing is copied or deleted.
+    if deleter.is_none() && plan.deletes() > 0 {
+        report.failed.push(OpIssue::new(
+            &plan.right,
+            "refusing to delete: no Recycle Bin deleter was given; nothing was changed",
+        ));
+        return report;
+    }
     let fail = |report: &mut OpReport, p: &Path, why: String| {
         ctx.log(format!("failed: {}: {why}", p.display()));
         ctx.progress.add_error();
@@ -777,16 +845,20 @@ pub fn execute_sync(
                     ctx.progress.add_items(1);
                     continue;
                 }
-                match deleter.as_mut() {
-                    Some(d) => match d(&p) {
-                        Ok(()) => report.done.push(p),
-                        Err(e) => fail(&mut report, &p, e),
-                    },
-                    None => {
-                        let r = ops::delete_permanently(std::slice::from_ref(&p), ctx);
-                        report.failed.extend(r.failed);
-                        report.done.extend(r.done);
-                    }
+                let Some(delete) = deleter.as_mut() else {
+                    // Unreachable after the refusal above; still never fall back to a
+                    // permanent delete.
+                    fail(
+                        &mut report,
+                        &p,
+                        "no Recycle Bin deleter; item was not deleted".into(),
+                    );
+                    ctx.progress.add_items(1);
+                    continue;
+                };
+                match delete(&p) {
+                    Ok(()) => report.done.push(p),
+                    Err(e) => fail(&mut report, &p, e),
                 }
             }
             SyncAction::CreateDir { rel } => {
@@ -803,20 +875,37 @@ pub fn execute_sync(
                 let src = plan.left.join(rel);
                 let dest = plan.right.join(rel);
                 let expected = expected_by_rel.get(rel.as_path());
-                if expected.is_none_or(|snapshot| {
-                    !matches_snapshot(&src, Some(snapshot.left), snapshot.left_fingerprint, ctx)
-                        || !matches_snapshot(&dest, snapshot.right, snapshot.right_fingerprint, ctx)
-                }) {
+                // The destination is always checked in full: it is what a copy may overwrite.
+                let source_unchanged = expected.is_some_and(|snapshot| {
+                    matches_snapshot(
+                        &src,
+                        Some(snapshot.left),
+                        snapshot.left_fingerprint,
+                        Coverage::Sampled,
+                        ctx,
+                    )
+                });
+                let destination_unchanged = expected.is_some_and(|snapshot| {
+                    matches_snapshot(
+                        &dest,
+                        snapshot.right,
+                        snapshot.right_fingerprint,
+                        Coverage::Full,
+                        ctx,
+                    )
+                });
+                if !source_unchanged || !destination_unchanged {
                     if ctx.cancel.check().is_err() {
                         report.cancelled = true;
                         break;
                     }
                     ctx.progress.add_bytes(*bytes);
-                    fail(
-                        &mut report,
-                        &dest,
-                        "source or destination changed since comparison; rerun compare".into(),
-                    );
+                    let reason = if !source_unchanged {
+                        "source changed since preview; nothing was copied; rerun compare"
+                    } else {
+                        "destination changed since preview; it was not overwritten; rerun compare"
+                    };
+                    fail(&mut report, &dest, reason.into());
                     ctx.progress.add_items(1);
                     continue;
                 }
@@ -826,7 +915,20 @@ pub fn execute_sync(
                     verify,
                     want_hash: false,
                 };
-                match ops::copy_file_atomic(&src, &dest, opts, ctx) {
+                // Checked again once the copy is written and verified, right before it is
+                // published: a long copy leaves time for someone to edit the destination.
+                let destination_still_unchanged = || {
+                    expected.is_some_and(|snapshot| {
+                        matches_snapshot(
+                            &dest,
+                            snapshot.right,
+                            snapshot.right_fingerprint,
+                            Coverage::Full,
+                            ctx,
+                        )
+                    })
+                };
+                match ops::copy_file_atomic_guarded(&src, &dest, opts, ctx, &destination_still_unchanged) {
                     Ok(out) => {
                         report.bytes += out.bytes;
                         report.done.push(dest);
@@ -959,7 +1061,7 @@ mod tests {
             assert_eq!(fs::read(&right).unwrap(), expected_right);
             assert!(
                 result.failed.iter().any(|issue| {
-                    issue.path == right && issue.reason.contains("changed since comparison")
+                    issue.path == right && issue.reason.contains("changed since preview")
                 }),
                 "{result:?}"
             );
@@ -1060,9 +1162,154 @@ mod tests {
         assert_eq!(res.failed.len(), 1);
         assert!(r.join("right.txt").exists());
         plan.mode = SyncMode::Mirror;
-        let res = execute_sync(&plan, false, None, &ctx);
-        assert!(res.failed.is_empty());
+        let mut deleter = |p: &Path| {
+            let removed = if p.is_dir() {
+                fs::remove_dir_all(p)
+            } else {
+                fs::remove_file(p)
+            };
+            removed.map_err(|e| e.to_string())
+        };
+        let res = execute_sync(&plan, false, Some(&mut deleter), &ctx);
+        assert!(res.failed.is_empty(), "{res:?}");
         assert!(!r.join("right.txt").exists());
+    }
+
+    #[test]
+    fn update_does_not_overwrite_a_large_destination_edited_after_the_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        // Larger than the sampled-fingerprint limit, so only a full hash sees byte 300 KiB.
+        const SIZE: usize = 2 * 1024 * 1024;
+        let source = vec![b'b'; SIZE];
+        let original = vec![b'a'; SIZE];
+        let mut edited = original.clone();
+        edited[300 * 1024] = b'X';
+        fs::write(left.join("big.bin"), &source).unwrap();
+        let dest = right.join("big.bin");
+        fs::write(&dest, &original).unwrap();
+        set_mtime(&left.join("big.bin"), 1_600_000_000);
+        set_mtime(&dest, 1_500_000_000);
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(&left, &right, &CompareOptions::default(), &ctx).unwrap();
+        let plan = plan_sync(&report, &left, &right, SyncMode::Update);
+        assert_eq!(plan.deletes(), 0);
+        let original_mtime = fs::metadata(&dest).unwrap().modified().unwrap();
+
+        // Same size and timestamp, different bytes in an unsampled region.
+        fs::write(&dest, &edited).unwrap();
+        File::options()
+            .write(true)
+            .open(&dest)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+        let result = execute_sync(&plan, true, None, &ctx);
+
+        assert_eq!(fs::read(&dest).unwrap(), edited, "user edit must survive");
+        assert!(result.done.is_empty(), "{result:?}");
+        assert!(
+            result.failed.iter().any(|issue| {
+                issue.path == dest && issue.reason.contains("changed since preview")
+            }),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn update_overwrites_an_unchanged_large_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        const SIZE: usize = 2 * 1024 * 1024;
+        let source = vec![b'b'; SIZE];
+        fs::write(left.join("big.bin"), &source).unwrap();
+        let dest = right.join("big.bin");
+        fs::write(&dest, vec![b'a'; SIZE]).unwrap();
+        set_mtime(&left.join("big.bin"), 1_600_000_000);
+        set_mtime(&dest, 1_500_000_000);
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(&left, &right, &CompareOptions::default(), &ctx).unwrap();
+        let plan = plan_sync(&report, &left, &right, SyncMode::Update);
+
+        let result = execute_sync(&plan, true, None, &ctx);
+
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(fs::read(&dest).unwrap(), source);
+    }
+
+    #[test]
+    fn mirror_with_deletes_and_no_deleter_deletes_nothing() {
+        let (_d, l, r) = setup();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(&l, &r, &CompareOptions::default(), &ctx).unwrap();
+        let plan = plan_sync(&report, &l, &r, SyncMode::Mirror);
+        assert!(plan.deletes() > 0);
+
+        let res = execute_sync(&plan, false, None, &ctx);
+
+        assert_eq!(res.failed.len(), 1, "{res:?}");
+        assert!(res.done.is_empty(), "{res:?}");
+        assert!(r.join("right.txt").exists(), "no permanent delete");
+        assert!(r.join("extra/inner/only-right.txt").exists());
+        assert_eq!(fs::read(r.join("sub/newer.txt")).unwrap(), b"rght");
+    }
+
+    #[test]
+    fn cancelled_planning_returns_an_error_and_no_plan() {
+        let (_d, l, r) = setup();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(&l, &r, &CompareOptions::default(), &ctx).unwrap();
+        cancel.cancel();
+
+        let result = plan_sync_with_ctx(&report, &l, &r, SyncMode::Mirror, &ctx);
+
+        assert!(matches!(result, Err(CoreError::Cancelled)), "{result:?}");
+    }
+
+    #[test]
+    fn mirror_planning_scales_to_twenty_thousand_deletes() {
+        const COUNT: usize = 20_000;
+        let side = SideInfo {
+            kind: NodeKind::File,
+            size: 1,
+            modified: None,
+        };
+        let report = CompareReport {
+            entries: (0..COUNT)
+                .map(|index| CompareEntry {
+                    rel: PathBuf::from(format!("old-{index:05}.bin")),
+                    left: None,
+                    right: Some(side),
+                    state: EntryState::RightOnly,
+                })
+                .collect(),
+            errors: Vec::new(),
+        };
+        let root = Path::new("does-not-exist");
+
+        let started = std::time::Instant::now();
+        let plan = plan_sync(&report, root, root, SyncMode::Mirror);
+        let elapsed = started.elapsed();
+
+        assert_eq!(plan.deletes(), COUNT);
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "{COUNT} delete snapshots took {elapsed:?}"
+        );
     }
 
     #[test]

@@ -417,7 +417,23 @@ pub fn copy_file_atomic(
 ) -> Result<CopyOutcome> {
     let mut counted = 0;
     let mut dest = dest.to_path_buf();
-    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false)
+    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false, None)
+}
+
+/// [`copy_file_atomic`] that asks `still_ok` right before the finished, verified copy is
+/// published, and abandons the copy (removing its temp file) if it returns false. Sync
+/// uses it so a destination edited while a long copy runs is not overwritten; only the
+/// instant between this check and the rename remains.
+pub fn copy_file_atomic_guarded(
+    src: &Path,
+    dest: &Path,
+    opts: CopyFileOptions,
+    ctx: &JobCtx<'_>,
+    still_ok: &dyn Fn() -> bool,
+) -> Result<CopyOutcome> {
+    let mut counted = 0;
+    let mut dest = dest.to_path_buf();
+    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false, Some(still_ok))
 }
 
 fn copy_file_counted(
@@ -427,6 +443,7 @@ fn copy_file_counted(
     ctx: &JobCtx<'_>,
     counted: &mut u64,
     keep_both: bool,
+    still_ok: Option<&dyn Fn() -> bool>,
 ) -> Result<CopyOutcome> {
     let f = File::open(src).map_err(|e| CoreError::io(src, e))?;
     let md = f.metadata().map_err(|e| CoreError::io(src, e))?;
@@ -446,7 +463,8 @@ fn copy_file_counted(
         limit: None,
         attributes,
     };
-    stream_into_place(fault::reader(f, src), src, dest, sopts, ctx, counted, keep_both)
+    let publish = Publish { keep_both, still_ok };
+    stream_into_place(fault::reader(f, src), src, dest, sopts, ctx, counted, publish)
 }
 
 /// Write an arbitrary stream (e.g. an archive entry) to `dest` with the same temp-file +
@@ -473,8 +491,19 @@ pub(crate) fn write_stream_placed<R: Read>(
 ) -> Result<(CopyOutcome, PathBuf)> {
     let mut counted = 0;
     let mut placed = dest.to_path_buf();
-    let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, keep_both)?;
+    let publish = Publish {
+        keep_both,
+        still_ok: None,
+    };
+    let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
     Ok((out, placed))
+}
+
+/// How a finished temp file is published: under the next free name when the destination
+/// is taken (`keep_both`), and only if `still_ok` (when given) agrees at that moment.
+struct Publish<'a> {
+    keep_both: bool,
+    still_ok: Option<&'a dyn Fn() -> bool>,
 }
 
 fn stream_into_place<R: Read>(
@@ -484,8 +513,12 @@ fn stream_into_place<R: Read>(
     opts: StreamOptions,
     ctx: &JobCtx<'_>,
     counted: &mut u64,
-    keep_both: bool,
+    publish: Publish<'_>,
 ) -> Result<CopyOutcome> {
+    let Publish {
+        keep_both,
+        still_ok,
+    } = publish;
     let dir = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -564,6 +597,14 @@ fn stream_into_place<R: Read>(
         }
     }
     ctx.cancel.check()?;
+    if let Some(still_ok) = still_ok
+        && !still_ok()
+    {
+        return Err(CoreError::Invalid(format!(
+            "{} changed while it was being copied; it was not overwritten",
+            dest.display()
+        )));
+    }
     let mut placed = false;
     for _ in 0..1024 {
         match place(&tmp, dest, opts.overwrite) {
@@ -1585,7 +1626,7 @@ impl Executor<'_, '_, '_> {
             want_hash: false,
         };
         let mut counted = 0;
-        let res = copy_file_counted(src, &mut dest, opts, self.ctx, &mut counted, keep_both);
+        let res = copy_file_counted(src, &mut dest, opts, self.ctx, &mut counted, keep_both, None);
         self.ctx.progress.add_items(1);
         match res {
             Ok(out) => {
@@ -2590,5 +2631,28 @@ mod tests {
             &ctx,
         );
         assert!(matches!(r, Err(CoreError::NotFound(_))));
+    }
+
+    #[test]
+    fn guarded_copy_publishes_nothing_when_the_destination_changed_meanwhile() {
+        let f = fx();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let src = f.src.join("new.bin");
+        let dest = f.dst.join("edited.bin");
+        fs::write(&src, b"source bytes").unwrap();
+        fs::write(&dest, b"the user's edit").unwrap();
+        let opts = CopyFileOptions {
+            overwrite: true,
+            ..Default::default()
+        };
+        let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| false);
+        assert!(r.is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"the user's edit");
+        assert_eq!(fs::read_dir(&f.dst).unwrap().count(), 1, "the temp file is removed");
+        let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| true);
+        assert!(r.is_ok());
+        assert_eq!(fs::read(&dest).unwrap(), b"source bytes");
     }
 }
