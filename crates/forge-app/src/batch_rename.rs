@@ -29,6 +29,8 @@ pub struct BatchRename {
     previews: Vec<RenamePreview>,
     dirty: bool,
     running: Option<Arc<Mutex<Option<RenameReport>>>>,
+    /// Test hook (`ZXRAW_SCRIPT` `accept`): press the Rename button on the next frame.
+    pub(crate) auto_apply: bool,
 }
 
 fn rule_label(r: &RenameRule) -> &'static str {
@@ -99,6 +101,7 @@ impl BatchRename {
             previews: Vec::new(),
             dirty: true,
             running: None,
+            auto_apply: false,
         }
     }
 
@@ -321,10 +324,10 @@ impl BatchRename {
             ui.separator();
             ui.horizontal(|ui| {
                 let can = problems == 0 && changes > 0 && self.running.is_none();
-                if ui
+                let pressed = ui
                     .add_enabled(can, egui::Button::new(format!("Rename {changes} item(s)")))
-                    .clicked()
-                {
+                    .clicked();
+                if can && (pressed || std::mem::take(&mut self.auto_apply)) {
                     let slot = Arc::new(Mutex::new(None));
                     let previews = self.previews.clone();
                     let s2 = slot.clone();

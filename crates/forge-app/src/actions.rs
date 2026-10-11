@@ -804,7 +804,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
 }
 
 /// Apply an accepted dialog. Returns the dialog again (with an error) if it must stay open.
-fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
+pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
     match m {
         Modal::Prompt(mut p) => {
             let name = p.text.trim().to_string();

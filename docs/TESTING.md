@@ -176,3 +176,44 @@ Any run with `ZXRAW_SCREENSHOT`, `ZXRAW_CMDS` or `ZXRAW_SELECT` set uses a throw
 never modify the user's real data. Set `ZXRAW_PROFILE_DIR` to choose the profile explicitly.
 Commands run once the first listing finishes (or after 30 s), the capture happens ~90 frames
 after the commands, and a run closes itself after 120 s at most.
+
+## End-to-end tests
+
+`crates/forge-app/tests/e2e.rs` drives the real `zxraw` window through `ZXRAW_SCRIPT` and asserts
+on the filesystem afterwards. Each test builds its own fixtures in a temp directory and uses a
+fresh profile (`ZXRAW_PROFILE_DIR`), so no user settings, session or library data is touched.
+The Recycle Bin is deliberately not exercised.
+
+```powershell
+$env:CARGO_TARGET_DIR = 'target/e2e'
+cargo test -p forge-app --test e2e -- --test-threads=1
+cargo test -p forge-app --bin zxraw
+```
+
+Each run opens a real window, so run the tests one at a time (a static lock enforces this too).
+Every run must finish within 75 s; the script itself has a 60 s limit.
+
+A script is one step per line; `#` starts a comment. Steps run one per frame after all panes have
+loaded. Waiting steps give up after 30 s (`wait-jobs` takes its own limit).
+
+| Step | Meaning |
+|---|---|
+| `navigate <path>` | Open the path in the focused pane |
+| `select <a>, <b>` / `select-all` | Select entries by name (comma-separated) or everything |
+| `focus left\|right` | Move focus to a pane of the active tab |
+| `cmd <CmdVariant>` | Run a `Cmd` by its debug name, e.g. `NewFolder` |
+| `type <text>` | Replace the text of the active Prompt dialog |
+| `accept` / `cancel` | Accept or dismiss the active dialog (batch rename included) |
+| `conflict keep-both\|skip\|replace\|replace-if-newer\|cancel [all]` | Answer the oldest file conflict |
+| `wait-jobs [seconds]` / `wait-frames <n>` | Wait for operations to finish, or for frames to pass |
+| `screenshot <png>` | Save the rendered frame |
+| `assert-tabs <n>` / `assert-path <path>` | Check the tab count or the focused pane's folder |
+| `assert-exists <path>` / `assert-missing <path>` | Check the filesystem |
+| `exit` | Stop early (optional) |
+
+The outcome goes to `ZXRAW_SCRIPT_RESULT` (default `<script>.result`): `OK`, or `SCRIPT ERROR: …` with
+exit code 2. Release builds use the Windows subsystem and have no console, so read the result file
+rather than stderr when running a release binary.
+
+A failing scenario that exposes a real application bug stays in the suite and is marked
+`#[ignore = "bug: …"]` until the bug is fixed.
