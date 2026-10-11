@@ -22,6 +22,7 @@ enum SettingsPage {
     Performance,
     FileOperations,
     Video,
+    MediaLinks,
     Library,
     ExternalTools,
     Privacy,
@@ -29,12 +30,13 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    const ALL: [(Self, &'static str); 9] = [
+    const ALL: [(Self, &'static str); 10] = [
         (Self::Appearance, "Appearance"),
         (Self::Browsing, "Browsing"),
         (Self::Performance, "Performance"),
         (Self::FileOperations, "File operations"),
         (Self::Video, "Video"),
+        (Self::MediaLinks, "Media links"),
         (Self::Library, "Library"),
         (Self::ExternalTools, "External tools"),
         (Self::Privacy, "Privacy"),
@@ -389,6 +391,7 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                     SettingsPage::Video => {
                                         video_page(ui, settings, state, &mut intents)
                                     }
+                                    SettingsPage::MediaLinks => media_links_page(ui, settings),
                                     SettingsPage::Library => library_page(
                                         ui,
                                         state,
@@ -595,6 +598,109 @@ fn video_page(
             ProbeStatus::Missing => {
                 ui.colored_label(ui.visuals().error_fg_color, "ffprobe not found");
             }
+        }
+    });
+}
+
+pub fn apply_export_rule(
+    settings: &mut Settings,
+    index: usize,
+    rule: String,
+) -> Result<(), String> {
+    crate::export_assoc::validate_rule(&rule)?;
+    let Some(existing) = settings.export_rules.get_mut(index) else {
+        return Err("Rule row no longer exists".into());
+    };
+    *existing = rule;
+    Ok(())
+}
+
+pub fn open_media_links(app: &mut ZxrawApp) {
+    app.ops.settings_ui.open = true;
+    app.ops.settings_ui.page = SettingsPage::MediaLinks;
+}
+
+fn media_links_page(ui: &mut egui::Ui, settings: &mut Settings) {
+    page_heading(
+        ui,
+        "Media links",
+        "Set the map link template and filename rules for related exports.",
+    );
+    ui.add_space(10.0);
+    ui.label(RichText::new("Map URL template").strong());
+    ui.add(
+        egui::TextEdit::singleline(&mut settings.map_url_template)
+            .desired_width(ui.available_width()),
+    );
+    ui.label(
+        RichText::new("Use {lat} and {lon}; the URL opens only when you choose Open in maps.")
+            .small()
+            .weak(),
+    );
+    if !settings.map_url_template.contains("{lat}") || !settings.map_url_template.contains("{lon}")
+    {
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            "The map URL should contain both {lat} and {lon}.",
+        );
+    }
+
+    ui.add_space(16.0);
+    ui.label(RichText::new("Export filename rules").strong());
+    ui.label(
+        RichText::new("{base} is the original name without its extension. {n} matches digits.")
+            .small()
+            .weak(),
+    );
+    let mut remove = None;
+    for index in 0..settings
+        .export_rules
+        .len()
+        .min(crate::export_assoc::MAX_EXPORT_RULES)
+    {
+        ui.push_id(("export-rule", index), |ui| {
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut settings.export_rules[index])
+                        .desired_width((ui.available_width() - 80.0).max(180.0)),
+                );
+                if response.changed() {
+                    let edited = settings.export_rules[index].clone();
+                    let _ = apply_export_rule(settings, index, edited);
+                }
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(index);
+                }
+            });
+            if let Err(error) = crate::export_assoc::validate_rule(&settings.export_rules[index]) {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        settings.export_rules.remove(index);
+    }
+    if settings.export_rules.len() > crate::export_assoc::MAX_EXPORT_RULES {
+        ui.label(
+            RichText::new(format!(
+                "Only the first {} rules are used.",
+                crate::export_assoc::MAX_EXPORT_RULES
+            ))
+            .weak(),
+        );
+    }
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                settings.export_rules.len() < crate::export_assoc::MAX_EXPORT_RULES,
+                egui::Button::new("Add rule"),
+            )
+            .clicked()
+        {
+            settings.export_rules.push("{base}-Edit".into());
+        }
+        if ui.button("Reset to defaults").clicked() {
+            settings.export_rules = crate::export_assoc::default_rules();
         }
     });
 }

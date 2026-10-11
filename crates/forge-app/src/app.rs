@@ -323,6 +323,8 @@ impl ZxrawApp {
     }
 
     pub fn refresh_all_showing(&mut self, dir: &Path) {
+        // Exports may have appeared or gone; their associations are re-scanned on demand.
+        crate::export_assoc::invalidate_cache();
         for t in &mut self.tabs {
             if t.left.path == dir {
                 t.left.refresh();

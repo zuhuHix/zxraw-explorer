@@ -82,7 +82,7 @@ impl Default for Settings {
             index_exclusions: vec!["$RECYCLE.BIN".into(), "System Volume Information".into()],
             xmp_sidecar_sync: false,
             map_url_template: "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}".into(),
-            export_rules: Vec::new(),
+            export_rules: crate::export_assoc::default_rules(),
         }
     }
 }
