@@ -244,6 +244,9 @@ loaded. Waiting steps give up after 30 s unless given their own limit.
 | `key [ctrl+][shift+][alt+]<Key>` | Send a real key press and release through egui input (`key 3`, `key ctrl+A`, `key ArrowRight`) |
 | `text <text>` | Send text input to the focused widget |
 | `pointer <x> <y>` / `click <x> <y>` / `scroll <dy>` | Move, click or scroll the real pointer |
+| `click-entry <name>` / `double-click-entry <name>` | Real pointer click(s) where the view drew that row or tile (points, so any display scale) |
+| `click-empty` | Real click on the file list below its last row or tile |
+| `assert-selected <n>` | Number of selected entries the focused pane lists |
 | `dialog <path>\|cancel` | Answer the next native file dialog |
 | `wait-jobs [seconds]` / `wait-frames <n>` / `sleep <ms>` | Wait for operations, frames or time |
 | `wait-exists\|wait-missing <path> [\| <seconds>]` | Wait for the filesystem |
@@ -267,6 +270,14 @@ split/join, duplicates, compare/sync, external filesystem changes), `perf` (fram
 
 `ui perf begin` starts recording per-frame work time (from the raw-input hook to the end of the
 frame) and frame interval; `ui perf end <json>` writes count, mean, p50, p95, p99 and max for both.
+The report goes inside the sandbox or under `ZXRAW_SCREENSHOT_DIR`. The `perf::` e2e scenarios
+record a 50,000-file folder (details and grid scrolling, keyboard paging) and 5,000 burst photos
+(grouping analysis, grouped scrolling, a 1,000-file selection), and fail when p95 frame work
+exceeds 100 ms in a debug build. Release-build numbers are in [BENCHMARKS.md](BENCHMARKS.md).
+
+Prefer `click-entry` over `select` when a scenario is about what the user does: `select` sets the
+selection directly and would not have caught a widget layered over the rows (a double-click
+regression at 125 % display scaling was found by a user, not by the suite).
 
 The outcome goes to `ZXRAW_SCRIPT_RESULT` (default `<script>.result`): `OK`, or `SCRIPT ERROR: …` with
 exit code 2. Release builds use the Windows subsystem and have no console, so read the result file

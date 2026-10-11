@@ -70,11 +70,27 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Burst and similar-photo grouping works in the grid view only (not details). It uses
   capture time (EXIF, else modification time) and a 64-bit difference hash (dHash) of the thumbnail, so heavily
   edited versions or crops of the same shot are not grouped, and unrelated photos with very
-  similar composition can be. Groups are recomputed when the folder is reloaded.
+  similar composition can be. Hidden files take part in the analysis (so a filter change needs no
+  re-run), so a hidden shot can link two visible ones into one stack; stacks only ever select,
+  drag or tag the files the listing shows.
 * The GPS panel is offline; "Open in maps" opens the configured http/https URL in the
   default browser only when clicked. There is no embedded map and no reverse geocoding.
 * Metadata export needs the library database to be open (it is opened at startup), and
   video fields stay empty without `ffprobe`.
+
+## Folder compare and sync
+
+* Sync re-checks every planned action against the preview before acting. A destination it would
+  overwrite is guarded by a full BLAKE3 hash, checked again right before the finished copy is
+  published; only the instant between that check and the rename is unguarded. Sources and
+  right-only files that Mirror recycles are guarded by size, modification time, and a sampled
+  hash above 1 MiB (five 64 KiB blocks), so an edit between the samples with the timestamp put
+  back is not noticed: the newer source bytes are copied, or the edited file is recycled
+  (recoverable from the Recycle Bin).
+* Copies and deletes check the last path component for links and junctions. A junction swapped
+  into the middle of a path while a sync runs is followed.
+* When Windows cannot recycle an item (for example on some network drives), the shell asks
+  whether to delete it permanently. Answering yes deletes it outside the preview.
 
 ## Scale and background work
 
@@ -130,8 +146,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   changes, or real removable media: a "card" is a temp folder, and a pulled card is simulated by
   fault injection in the copy reader. Screenshots are inspected by a person, not compared pixel by
   pixel. See [TESTING.md](TESTING.md).
-* The 50,000-folder screenshot in [BENCHMARKS.md](BENCHMARKS.md) shows that the list renders; it does
-  not establish frame pacing or interactive responsiveness. That run predates `dfd43d9`.
+* Frame times for a 50,000-file folder (scrolling details and grid, keyboard paging) were measured
+  in a release build on one machine; see [BENCHMARKS.md](BENCHMARKS.md). Listing, thumbnail decoding,
+  grouping analysis on large real photo sets, and network folders were not part of that measurement.
 
 ## Fixed since commit 476021b
 

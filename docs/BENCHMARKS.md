@@ -200,3 +200,40 @@ The partial-hash stage is bound by per-file open latency; 8 threads sit near the
 data) was **not** reproduced; it is attributed to load plus cold cache/write-back, unproven.
 A truly cold (standby-cache evicted) run needs admin rights and was not measured.
 Proposed target: 200k-file duplicate scan ≤ 15 s warm on this class of machine.
+
+## 50,000-file folder: frame times while scrolling and paging (2026-10-11)
+
+Measured with the app's own frame clock (`ui perf begin` / `ui perf end`, see
+[TESTING.md](TESTING.md)) in a release build of `297c61e` with the `automation` feature
+(`cargo build -p forge-app --release --no-default-features --features automation`), driven by
+`crates/forge-bench/scripts/bench50k_frames.py`, which runs the same script as the
+`perf::fifty_thousand_files_scroll_without_long_frames` e2e scenario. Five runs, each with a
+fresh profile, on the test machine above. No `rustc`/`cargo` process was running and CPU load
+was about 20 % when the runs started; other desktop sessions were open. Display: 1536 × 960
+logical at 125 % scaling, 60 Hz.
+
+Folder: 50,000 empty files (`IMG_00000.JPG` …, five extensions in turn), so thumbnail decoding
+does not enter the numbers. Each series records every frame of: 150 wheel steps down and 150 up
+in the details view; the same in the grid view; 60 PageDown presses plus End and Home in the
+details view with one file selected.
+
+`work` is the app's time per frame from the start of input handling to the end of its UI code
+(it excludes tessellation and GPU presentation). `interval` is the time between frame starts
+(vsync-paced). Values are the median across the five runs, with the range across runs.
+
+| Series | work p50 | work p95 | work p99 | work max | interval p50 | interval p95 | interval max |
+|---|---|---|---|---|---|---|---|
+| Details, wheel scroll | 1.73 ms (1.73–2.33) | 2.62 ms (2.51–3.55) | 3.03 ms (2.75–5.07) | 3.49 ms (3.38–14.84) | 16.72 ms | 19.51 ms (18.99–24.33) | 29.2 ms (23.4–39.4) |
+| Grid, wheel scroll | 1.80 ms (1.52–2.19) | 2.65 ms (2.40–3.76) | 3.01 ms (2.75–5.96) | 9.46 ms (3.13–18.32) | 16.65 ms | 19.26 ms (18.77–23.74) | 23.1 ms (21.3–71.1) |
+| Details, keyboard paging | 1.89 ms (1.87–2.54) | 2.81 ms (2.55–5.32) | 6.20 ms (2.82–25.53) | 6.53 ms (3.24–34.21) | 16.63 ms | 19.21 ms (18.51–47.13) | 22.2 ms (19.0–129.6) |
+
+Frame counts per run: about 600 for each scroll series and 137 for paging. One of the five
+runs had the slow outliers in the paging series (p99 interval 129 ms, work max 34 ms); the
+cause was not isolated (it could be a background process; it did not recur in the other four).
+
+What this supports: browsing, scrolling and paging a 50,000-entry folder keeps the app's own
+per-frame work around 2–3 ms at p95, far inside a 16.7 ms frame. It does not cover listing
+time (see the scenario above), thumbnail decoding, grouping analysis, or folders on network
+drives. Before `f5708aa`, the status bar walked every entry each frame while anything was
+selected: in a debug build, paging this folder cost about 206 ms of work per frame (p50); the
+same debug scenario now measures about 3 ms. The debug e2e scenario fails above a 100 ms p95.

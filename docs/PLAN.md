@@ -39,33 +39,38 @@ the screenshots.
 
 ### Wave 0 — test infrastructure
 * ✅ Script verbs per area (`ui <area> …`), real key/mouse injection, dialog seam, Recycle Bin
-  sandbox seam, frame-time recorder, e2e suite split per area (`1d6c76d`).
+  sandbox seam, frame-time recorder, e2e suite split per area (`2fe19c2`).
 
 ### Wave 1 — prove the 🟡 workflows (GPT-6-Luna max, one agent per area)
 * ✅ Viewer: culling keys persist ratings across restart; corrupt media in viewer/video
-  paths; cancelling thumbnail generation (`2a98d43`).
+  paths; cancelling thumbnail generation (`1454c2d`).
 * ✅ Ingest: fake card through the UI with verified copies and safe-to-format; source
-  vanishing mid-copy (fault injection) for copy, move and ingest (`5bc4198`).
+  vanishing mid-copy (fault injection) for copy, move and ingest (`cc877d5`).
 * ✅ Library: collections create/add/relink; search after indexing; tags; restart restores
-  settings and resumes an interrupted index (`7cecc07`).
+  settings and resumes an interrupted index (`36a1ea4`).
 * ✅ Tools: zip create/extract (hostile zips), split/join, duplicates → recycle (sandbox),
-  compare/sync Update mode, auto-refresh after external changes (`280b3ac`).
-* ⬜ 50k-folder responsiveness: frame-time numbers recorded in BENCHMARKS.md (lead).
-* 🟡 Adversarial review of wave 1 and fixes.
+  compare/sync Update mode, auto-refresh after external changes (`2aada08`).
+* ✅ 50k-folder responsiveness: release frame times in BENCHMARKS.md; e2e perf scenarios guard
+  against per-frame O(n) work.
+* ✅ Adversarial review of wave 1 (13 findings) and fixes (`f5708aa`, `fb12b68`, `dc0b452`,
+  `b5ccc13`).
 
 ### Wave 2 — missing features
-* ✅ Near-duplicate / burst grouping in the browser (`feca463`).
-* ✅ GPS panel (offline) + "open in maps" link-out (`ac833bb`).
-* ✅ Metadata report export (CSV/JSON) (`ac833bb`).
-* ⬜ Locate proxies for videos.
-* ⬜ Associate exports with originals (configurable filename rules).
-* 🟡 OLE drag-out to other apps (`2e8d8de`): implemented and unit tested; the drop into a
+* ✅ Near-duplicate / burst grouping in the browser (`35c832b`).
+* ✅ GPS panel (offline) + "open in maps" link-out (`87f8cc1`).
+* ✅ Metadata report export (CSV/JSON) (`87f8cc1`).
+* ✅ Locate proxies for videos (`a9850df`).
+* ✅ Associate exports with originals, configurable filename rules (`a9850df`).
+* 🟡 OLE drag-out to other apps (`75f79b1`): implemented and unit tested; the drop into a
   real external app is manually unverified.
-* ✅ HEIC/AVIF thumbnails and viewer via WIC (`2e8d8de`).
-* ⬜ Adversarial review of wave 2 and fixes.
+* ✅ HEIC/AVIF thumbnails and viewer via WIC (`75f79b1`).
+* ✅ Adversarial review of wave 2 in three slices (Haiku 5.5 high; 29 findings) and fixes
+  (`dbf3bc8`, `5e2ca91`, `f78ca01`, `45fa89c`, `06f7efa`, `297c61e`).
+* ✅ User-reported: double-click/Enter on folders failed at fractional display scaling;
+  fixed with real-pointer e2e regressions (`05c17e4`).
 
 ### Wave 3 — packaging polish
 * 🟡 Inno Setup installer: `packaging/zxraw.iss` exists, but ISCC is not installed on the build
   machine, so the installer was not compiled on this branch (see LIMITATIONS.md).
-* ✅ First-run experience (`4bf32a0`).
-* ✅ In-app crash-report notice (`4bf32a0`).
+* ✅ First-run experience (`67a5147`).
+* ✅ In-app crash-report notice (`67a5147`).
