@@ -90,6 +90,10 @@ fn assert_proxies(
     present: bool,
 ) -> Result<Flow, String> {
     let expected = names(args)?;
+    if app.pane().is_loading() {
+        wait_timed_out(st, "the pane listing before checking proxies")?;
+        return Ok(Flow::Wait("the pane listing is still loading".into()));
+    }
     let Some(entry) = app.pane().cursor_entry().cloned() else {
         return Err("select a video clip before asserting proxies".into());
     };
@@ -108,11 +112,27 @@ fn assert_proxies(
             .chain(ui.located_proxy_results())
             .map(|related| related.path.clone()),
     );
-    if present && !expected.is_subset(&actual) {
-        return Err(format!(
-            "expected proxies {expected:?}; found {actual:?}; scan error: {}",
-            ui.proxy_scan_error().unwrap_or("none")
-        ));
+    if present {
+        if !expected.is_subset(&actual) {
+            return Err(format!(
+                "expected proxies {expected:?}; found {actual:?}; scan error: {}",
+                ui.proxy_scan_error().unwrap_or("none")
+            ));
+        }
+        let drawn = ui
+            .related_results()
+            .iter()
+            .chain(ui.located_proxy_results())
+            .filter(|related| expected.contains(&path_name(&related.path)))
+            .filter(|related| related_row_was_drawn(ctx, &related.path))
+            .map(|related| path_name(&related.path))
+            .collect::<HashSet<_>>();
+        if !expected.is_subset(&drawn) {
+            wait_timed_out(st, "expected proxy rows to be drawn in the preview")?;
+            return Ok(Flow::Wait(
+                "expected proxy rows are not visible in the preview yet".into(),
+            ));
+        }
     }
     if !present && !expected.is_disjoint(&actual) {
         return Err(format!(
@@ -120,6 +140,26 @@ fn assert_proxies(
         ));
     }
     Ok(Flow::Done)
+}
+
+fn path_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+fn related_row_was_drawn(ctx: &egui::Context, path: &std::path::Path) -> bool {
+    let id = egui::Id::new(("testhook-entry-rect", related_row_test_key(path)));
+    ctx.data(|data| data.get_temp::<(u64, egui::Rect)>(id))
+        .is_some_and(|(frame, rect)| {
+            rect.is_positive() && ctx.cumulative_frame_nr().saturating_sub(frame) <= 2
+        })
+}
+
+fn related_row_test_key(path: &std::path::Path) -> std::path::PathBuf {
+    let mut key = path.as_os_str().to_os_string();
+    key.push("::related-row");
+    std::path::PathBuf::from(key)
 }
 
 fn assert_associations(

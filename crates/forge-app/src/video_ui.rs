@@ -6,9 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -36,6 +37,7 @@ const RELATED_FOLDER_CACHE_CAPACITY: usize = 16;
 const RELATED_PATHS_PER_FOLDER: usize = 64;
 const MAX_LOCAL_RELATED_ENTRIES: usize = 10_000;
 const MAX_LOCAL_RELATED_DEPTH: usize = 8;
+const MAX_DRAWN_RELATED_ROWS: usize = 50;
 const MAX_PROXY_SCAN_ENTRIES: usize = 40_000;
 const MAX_PROXY_SCAN_DIRECTORIES: usize = 4_096;
 const MAX_PROXY_SCAN_DEPTH: usize = 32;
@@ -158,6 +160,139 @@ struct RelatedScan {
     related: Vec<Related>,
 }
 
+struct RelationScanRequest {
+    id: u64,
+    path: PathBuf,
+    media: MediaKey,
+    generation: u64,
+    cancel: CancelToken,
+    cache: Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
+    tx: Sender<VideoMessage>,
+    repaint: egui::Context,
+}
+
+#[derive(Default)]
+struct RelatedScanState {
+    pending: Option<RelationScanRequest>,
+    running: Option<(u64, CancelToken)>,
+    shutdown: bool,
+}
+
+struct RelatedScanWorker {
+    state: Mutex<RelatedScanState>,
+    ready: Condvar,
+}
+
+static RELATED_SCAN_WORKER: OnceLock<Option<Arc<RelatedScanWorker>>> = OnceLock::new();
+static NEXT_RELATED_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+
+impl RelatedScanWorker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RelatedScanState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, request: RelationScanRequest) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, cancel)) = &state.running {
+            cancel.cancel();
+        }
+        if let Some(pending) = state.pending.replace(request) {
+            pending.cancel.cancel();
+        }
+        self.ready.notify_one();
+    }
+
+    #[cfg(test)]
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.shutdown = true;
+        if let Some((_, cancel)) = &state.running {
+            cancel.cancel();
+        }
+        if let Some(pending) = state.pending.take() {
+            pending.cancel.cancel();
+        }
+        self.ready.notify_one();
+    }
+}
+
+fn related_scan_worker() -> Option<Arc<RelatedScanWorker>> {
+    RELATED_SCAN_WORKER
+        .get_or_init(|| {
+            let worker = Arc::new(RelatedScanWorker::new());
+            let thread_worker = worker.clone();
+            std::thread::Builder::new()
+                .name("video-related-scan".into())
+                .spawn(move || {
+                    run_related_scan_worker(thread_worker, |request| {
+                        related_scan_cached(&request.path, &request.cache, &request.cancel)
+                    });
+                })
+                .ok()?;
+            Some(worker)
+        })
+        .clone()
+}
+
+fn run_related_scan_worker<F>(worker: Arc<RelatedScanWorker>, scan: F)
+where
+    F: Fn(&RelationScanRequest) -> Option<RelatedScan> + Send + 'static,
+{
+    loop {
+        let request = {
+            let mut state = worker
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(request) = state.pending.take() {
+                    state.running = Some((request.id, request.cancel.clone()));
+                    break request;
+                }
+                state = worker
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        };
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| scan(&request)))
+            .unwrap_or_else(|_| Some(RelatedScan {
+                take_label: None,
+                related: Vec::new(),
+            }));
+        if !request.cancel.is_cancelled()
+            && let Some(result) = result
+        {
+            let _ = request.tx.send(VideoMessage::Relations {
+                media: request.media,
+                generation: request.generation,
+                take_label: result.take_label,
+                related: result.related,
+            });
+            request.repaint.request_repaint();
+        }
+
+        let mut state = worker
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .running
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request.id)
+        {
+            state.running = None;
+        }
+    }
+}
+
 /// State for preview extraction. GPU textures and frame data are cached by file path,
 /// modification time, and requested time; only the selected file's work is allowed to run.
 pub struct VideoUi {
@@ -185,6 +320,7 @@ pub struct VideoUi {
     exact_scrub_time: bool,
     relation_key: Option<MediaKey>,
     relation_pending: bool,
+    relation_scan_cancel: Option<CancelToken>,
     relation_cache: Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
     take_label: Option<String>,
     related: Vec<Related>,
@@ -226,6 +362,7 @@ impl Default for VideoUi {
             exact_scrub_time: false,
             relation_key: None,
             relation_pending: false,
+            relation_scan_cancel: None,
             relation_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(RELATED_FOLDER_CACHE_CAPACITY).expect("non-zero"),
             ))),
@@ -264,6 +401,9 @@ impl VideoUi {
         }
 
         self.generation_cancel.cancel();
+        if let Some(cancel) = self.relation_scan_cancel.take() {
+            cancel.cancel();
+        }
         if let Some(cancel) = &self.hover_cancel {
             cancel.cancel();
         }
@@ -460,6 +600,7 @@ impl VideoUi {
                         && self.relation_key.as_ref() == Some(&media)
                     {
                         self.relation_pending = false;
+                        self.relation_scan_cancel = None;
                         self.take_label = take_label;
                         self.related = related;
                     }
@@ -568,29 +709,30 @@ impl VideoUi {
         let Some(media) = self.selection.clone() else {
             return;
         };
+        if let Some(cancel) = self.relation_scan_cancel.take() {
+            cancel.cancel();
+        }
         let generation = self.generation;
         let path = entry.path.clone();
         let cache = self.relation_cache.clone();
-        let tx = self.tx.clone();
-        let repaint = ctx.clone();
         self.relation_key = Some(media.clone());
         self.relation_pending = true;
-
-        let spawn = std::thread::Builder::new()
-            .name("video-related-scan".into())
-            .spawn(move || {
-                let result = related_scan_cached(&path, &cache);
-                let _ = tx.send(VideoMessage::Relations {
-                    media,
-                    generation,
-                    take_label: result.take_label,
-                    related: result.related,
-                });
-                repaint.request_repaint();
-            });
-        if spawn.is_err() {
+        let Some(worker) = related_scan_worker() else {
             self.relation_pending = false;
-        }
+            return;
+        };
+        let cancel = CancelToken::new();
+        self.relation_scan_cancel = Some(cancel.clone());
+        worker.enqueue(RelationScanRequest {
+            id: NEXT_RELATED_SCAN_ID.fetch_add(1, Ordering::Relaxed),
+            path,
+            media,
+            generation,
+            cancel,
+            cache,
+            tx: self.tx.clone(),
+            repaint: ctx.clone(),
+        });
     }
 
     fn insert_texture(&mut self, ctx: &egui::Context, key: FrameKey, image: &RgbaImage) {
@@ -907,11 +1049,8 @@ fn draw_related_section(ui: &mut Ui, video: &VideoUi, actions: &mut Vec<VideoAct
     if let Some(error) = &video.proxy_scan_error {
         ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
     }
-    let mut displayed = HashSet::new();
-    for related in video.related.iter().chain(&video.located_proxies) {
-        if !displayed.insert(normalized_path(&related.path)) {
-            continue;
-        }
+    let (rows, hidden_count) = visible_related_rows(&video.related, &video.located_proxies);
+    for related in rows {
         let name = related
             .path
             .file_name()
@@ -921,7 +1060,7 @@ fn draw_related_section(ui: &mut Ui, video: &VideoUi, actions: &mut Vec<VideoAct
         // and truncates; a fixed reservation overflowed and pushed the whole panel left.
         let row = egui::Layout::right_to_left(egui::Align::Center);
         let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-        ui.allocate_ui_with_layout(size, row, |ui| {
+        let row = ui.allocate_ui_with_layout(size, row, |ui| {
             if ui.small_button("Select in pane").clicked() {
                 actions.push(VideoAction::SelectRelated(related.path.clone()));
             }
@@ -937,6 +1076,18 @@ fn draw_related_section(ui: &mut Ui, video: &VideoUi, actions: &mut Vec<VideoAct
                     .on_hover_text(&related.label);
             });
         });
+        crate::testhook::note_entry_rect(
+            ui,
+            &related_row_test_key(&related.path),
+            row.response.rect,
+        );
+    }
+    if hidden_count > 0 {
+        ui.label(
+            RichText::new(format!("{hidden_count} more related files not shown"))
+                .small()
+                .weak(),
+        );
     }
     if video.proxy_scan_truncated {
         ui.label(
@@ -945,6 +1096,32 @@ fn draw_related_section(ui: &mut Ui, video: &VideoUi, actions: &mut Vec<VideoAct
                 .weak(),
         );
     }
+}
+
+fn visible_related_rows<'a>(
+    related: &'a [Related],
+    located: &'a [Related],
+) -> (Vec<&'a Related>, usize) {
+    let mut seen = HashSet::new();
+    let mut rows = Vec::with_capacity(MAX_DRAWN_RELATED_ROWS);
+    let mut hidden = 0;
+    for item in related.iter().chain(located) {
+        if !seen.insert(normalized_path(&item.path)) {
+            continue;
+        }
+        if rows.len() < MAX_DRAWN_RELATED_ROWS {
+            rows.push(item);
+        } else {
+            hidden += 1;
+        }
+    }
+    (rows, hidden)
+}
+
+fn related_row_test_key(path: &Path) -> PathBuf {
+    let mut key = path.as_os_str().to_os_string();
+    key.push("::related-row");
+    PathBuf::from(key)
 }
 
 fn related_display_label(label: &str) -> String {
@@ -2266,7 +2443,11 @@ fn clip_label(entries: &[FileEntry], path: &Path) -> Option<String> {
 fn related_scan_cached(
     path: &Path,
     cache: &Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
-) -> RelatedScan {
+    cancel: &CancelToken,
+) -> Option<RelatedScan> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let directory = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -2294,15 +2475,23 @@ fn related_scan_cached(
             .and_then(|scans| scans.get(path))
             .cloned()
         {
-            return scan;
+            return (!cancel.is_cancelled()).then_some(scan);
         }
     }
 
+    let take_label = scan_clip_label(path, cancel);
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let related = related_media_cancellable(path, cancel)?;
     let scan = RelatedScan {
-        take_label: scan_clip_label(path),
-        related: related_media(path),
+        take_label,
+        related,
     };
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cancel.is_cancelled() {
+        return None;
+    }
     let mut scans = cache.pop(&folder_key).unwrap_or_default();
     if scans.len() >= RELATED_PATHS_PER_FOLDER
         && !scans.contains_key(path)
@@ -2312,39 +2501,46 @@ fn related_scan_cached(
     }
     scans.insert(path.to_path_buf(), scan.clone());
     cache.put(folder_key, scans);
-    scan
+    Some(scan)
 }
 
-fn scan_clip_label(path: &Path) -> Option<String> {
+fn scan_clip_label(path: &Path, cancel: &CancelToken) -> Option<String> {
     let directory = path.parent()?;
-    let entries = fs::read_dir(directory)
-        .ok()?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_file() {
-                return None;
-            }
-            let path = entry.path();
-            let ext = ext_of(&path);
-            if forge_core::model::media_kind_for_ext(&ext) != MediaKind::Video {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            Some(FileEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                path,
-                kind: EntryKind::File,
-                size: metadata.len(),
-                modified: metadata.modified().ok(),
-                created: metadata.created().ok(),
-                hidden: false,
-                readonly: metadata.permissions().readonly(),
-                system: false,
-                ext,
-            })
-        })
-        .collect::<Vec<_>>();
-    clip_label(&entries, path)
+    let entries = fs::read_dir(directory).ok()?;
+    let mut files = Vec::new();
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let ext = ext_of(&candidate);
+        if forge_core::model::media_kind_for_ext(&ext) != MediaKind::Video {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        files.push(FileEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: candidate,
+            kind: EntryKind::File,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            hidden: false,
+            readonly: metadata.permissions().readonly(),
+            system: false,
+            ext,
+        });
+    }
+    clip_label(&files, path)
 }
 
 fn sequence_name(path: &Path) -> Option<SequenceName> {
@@ -2443,27 +2639,42 @@ fn capture_gap_exceeded(a: &FileEntry, b: &FileEntry, max_gap: Duration) -> bool
 }
 
 /// Finds likely proxy/derivative files, GoPro companions, and same-basename variants.
+#[cfg(test)]
 pub fn related_media(path: &Path) -> Vec<Related> {
+    related_media_cancellable(path, &CancelToken::new()).unwrap_or_default()
+}
+
+fn related_media_cancellable(path: &Path, cancel: &CancelToken) -> Option<Vec<Related>> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let Some(parent) = path.parent() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     if path.file_stem().is_none() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut found = HashMap::<String, Related>::new();
     let mut scanned_entries = 0;
-    scan_related_directory(path, parent, &mut found, 0, &mut scanned_entries);
+    scan_related_directory(path, parent, &mut found, 0, &mut scanned_entries, cancel).ok()?;
     if parent
         .file_name()
         .is_some_and(|name| is_proxy_folder(&name.to_string_lossy()))
         && let Some(source_dir) = parent.parent()
     {
-        scan_related_directory(path, source_dir, &mut found, 0, &mut scanned_entries);
+        scan_related_directory(path, source_dir, &mut found, 0, &mut scanned_entries, cancel)
+            .ok()?;
+    }
+    if cancel.is_cancelled() {
+        return None;
     }
     if let Some(grandparent) = parent.parent()
         && let Ok(entries) = fs::read_dir(grandparent)
     {
         for entry in entries.take(MAX_LOCAL_RELATED_ENTRIES).flatten() {
+            if cancel.is_cancelled() {
+                return None;
+            }
             if entry.path() == parent || scanned_entries >= MAX_LOCAL_RELATED_ENTRIES {
                 continue;
             }
@@ -2474,9 +2685,20 @@ pub fn related_media(path: &Path) -> Vec<Related> {
                 && !file_type.is_symlink()
                 && is_proxy_folder(&entry.file_name().to_string_lossy())
             {
-                scan_related_directory(path, &entry.path(), &mut found, 0, &mut scanned_entries);
+                scan_related_directory(
+                    path,
+                    &entry.path(),
+                    &mut found,
+                    0,
+                    &mut scanned_entries,
+                    cancel,
+                )
+                .ok()?;
             }
         }
+    }
+    if cancel.is_cancelled() {
+        return None;
     }
     let mut values: Vec<_> = found.into_values().collect();
     values.sort_by(|a, b| {
@@ -2487,7 +2709,7 @@ pub fn related_media(path: &Path) -> Vec<Related> {
                 .cmp(&b.path.to_string_lossy().to_lowercase())
         })
     });
-    values
+    Some(values)
 }
 
 fn scan_related_directory(
@@ -2496,14 +2718,21 @@ fn scan_related_directory(
     found: &mut HashMap<String, Related>,
     depth: usize,
     scanned_entries: &mut usize,
-) {
+    cancel: &CancelToken,
+) -> Result<(), ()> {
+    if cancel.is_cancelled() {
+        return Err(());
+    }
     if *scanned_entries >= MAX_LOCAL_RELATED_ENTRIES || depth > MAX_LOCAL_RELATED_DEPTH {
-        return;
+        return Ok(());
     }
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return Ok(());
     };
     for entry in entries.flatten() {
+        if cancel.is_cancelled() {
+            return Err(());
+        }
         if *scanned_entries >= MAX_LOCAL_RELATED_ENTRIES {
             break;
         }
@@ -2517,7 +2746,14 @@ fn scan_related_directory(
         }
         if file_type.is_dir() {
             if is_proxy_folder(&entry.file_name().to_string_lossy()) {
-                scan_related_directory(path, &candidate, found, depth + 1, scanned_entries);
+                scan_related_directory(
+                    path,
+                    &candidate,
+                    found,
+                    depth + 1,
+                    scanned_entries,
+                    cancel,
+                )?;
             }
             continue;
         }
@@ -2538,6 +2774,7 @@ fn scan_related_directory(
             },
         );
     }
+    Ok(())
 }
 
 fn is_media_derivative(path: &Path) -> bool {
@@ -2868,6 +3105,100 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn related_rows_are_bounded_and_report_hidden_matches() {
+        let related = (0..320)
+            .map(|index| Related {
+                path: PathBuf::from(format!(r"C:\Media\clip-{index:03}_proxy.mp4")),
+                label: "Proxy".into(),
+            })
+            .collect::<Vec<_>>();
+        let located = related[..12].to_vec();
+
+        let (rows, hidden) = visible_related_rows(&related, &located);
+
+        assert_eq!(rows.len(), MAX_DRAWN_RELATED_ROWS);
+        assert_eq!(hidden, related.len() - MAX_DRAWN_RELATED_ROWS);
+    }
+
+    #[test]
+    fn related_scan_worker_cancels_and_coalesces_rapid_requests() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let worker = Arc::new(RelatedScanWorker::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = unbounded();
+        let (messages_tx, messages_rx) = unbounded();
+        let scan_active = active.clone();
+        let scan_max_active = max_active.clone();
+        let scan_first_started = first_started.clone();
+        let scan = move |request: &RelationScanRequest| {
+            let count = scan_active.fetch_add(1, Ordering::SeqCst) + 1;
+            scan_max_active.fetch_max(count, Ordering::SeqCst);
+            if !scan_first_started.swap(true, Ordering::SeqCst) {
+                started_tx.send(()).unwrap();
+            }
+            for _ in 0..200 {
+                if request.cancel.is_cancelled() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            scan_active.fetch_sub(1, Ordering::SeqCst);
+            (!request.cancel.is_cancelled()).then_some(RelatedScan {
+                take_label: None,
+                related: Vec::new(),
+            })
+        };
+        let thread_worker = worker.clone();
+        let handle = std::thread::spawn(move || run_related_scan_worker(thread_worker, scan));
+        let cache = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(RELATED_FOLDER_CACHE_CAPACITY).unwrap(),
+        )));
+        let context = egui::Context::default();
+        let make_request = |number: u64| RelationScanRequest {
+            id: number,
+            path: PathBuf::from(format!(r"C:\Media\clip-{number}.mp4")),
+            media: MediaKey {
+                path: PathBuf::from(format!(r"C:\Media\clip-{number}.mp4")),
+                modified: None,
+            },
+            generation: number,
+            cancel: CancelToken::new(),
+            cache: cache.clone(),
+            tx: messages_tx.clone(),
+            repaint: context.clone(),
+        };
+
+        worker.enqueue(make_request(1));
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first request starts");
+        for number in 2..=80 {
+            worker.enqueue(make_request(number));
+        }
+
+        match messages_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the latest request completes")
+        {
+            VideoMessage::Relations {
+                media, generation, ..
+            } => {
+                assert_eq!(generation, 80);
+                assert_eq!(media.path, PathBuf::from(r"C:\Media\clip-80.mp4"));
+            }
+            _ => panic!("expected the latest related-scan result"),
+        }
+        assert!(messages_rx.try_recv().is_err());
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+        worker.shutdown();
+        handle.join().unwrap();
+    }
 
     fn entry(name: &str, at: Option<SystemTime>) -> FileEntry {
         let path = PathBuf::from(r"C:\Media").join(name);

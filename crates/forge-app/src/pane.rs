@@ -166,7 +166,10 @@ impl Pane {
     /// Re-list the folder, keeping the selection and the cursor item (if it still exists).
     pub fn refresh(&mut self) {
         let keep: Vec<PathBuf> = self.selected.iter().cloned().collect();
-        let cursor = self.cursor_entry().map(|e| e.name.clone());
+        let cursor = self
+            .cursor_entry()
+            .map(|e| e.name.clone())
+            .or_else(|| self.pending_select_keep.clone());
         let p = self.path.clone();
         self.load_path(p);
         self.selected.extend(keep);
@@ -553,6 +556,46 @@ mod tests {
 
         pane.navigate(other.path().to_path_buf());
         assert!(pane.similar.groups().is_empty());
+    }
+
+    #[test]
+    fn repeated_refresh_keeps_the_pending_cursor_and_selection() {
+        let folder = tempfile::tempdir().unwrap();
+        let selected = folder.path().join("selected.jpg");
+        std::fs::write(&selected, b"image").unwrap();
+        let mut pane = Pane::new(
+            folder.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Details,
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while pane.is_loading() {
+            pane.poll();
+            assert!(Instant::now() < deadline, "initial listing timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pane.poll();
+        pane.select_name("selected.jpg");
+        assert_eq!(
+            pane.cursor_entry().map(|entry| entry.name.as_str()),
+            Some("selected.jpg")
+        );
+
+        pane.refresh();
+        pane.refresh();
+        while pane.is_loading() {
+            pane.poll();
+            assert!(Instant::now() < deadline, "refreshed listing timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pane.poll();
+
+        assert_eq!(
+            pane.cursor_entry().map(|entry| entry.name.as_str()),
+            Some("selected.jpg")
+        );
+        assert!(pane.selected.contains(&selected));
     }
 
     #[test]

@@ -1559,6 +1559,18 @@ pub fn grid(
                             id.with(("similar-stack-badge", &badge.key)),
                             Sense::click(),
                         );
+                        let accessible_label = if item.members.is_some() {
+                            format!("Expand group of {} photos", badge.count)
+                        } else {
+                            "Collapse group".to_string()
+                        };
+                        register_accessible_node(
+                            &badge_response,
+                            egui::accesskit::Role::Button,
+                            &accessible_label,
+                            None,
+                            None,
+                        );
                         if badge_response.hovered() {
                             badge_response
                                 .clone()
@@ -1726,7 +1738,7 @@ mod accessibility_tests {
     use forge_core::listing::SortSpec;
     use forge_core::{FileEntry, model::EntryKind};
 
-    use super::{DetailsColumn, LoadState, ThumbProvider, details, splitter_width_range};
+    use super::{DetailsColumn, LoadState, ThumbProvider, details, grid, splitter_width_range};
     use crate::{pane::Pane, settings::ViewMode};
 
     struct NoThumbs;
@@ -1866,6 +1878,111 @@ mod accessibility_tests {
         assert_eq!(unselected_node.1.is_selected(), Some(false));
 
         output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn similar_stack_badge_is_a_named_accesskit_button() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let first = FileEntry {
+            path: directory.path().join("burst-1.jpg"),
+            name: "burst-1.jpg".into(),
+            kind: EntryKind::File,
+            size: 1,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            ext: "jpg".into(),
+        };
+        let second = FileEntry {
+            path: directory.path().join("burst-2.jpg"),
+            name: "burst-2.jpg".into(),
+            ..first.clone()
+        };
+        let mut pane = Pane::new(
+            directory.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Grid,
+        );
+        pane.entries = vec![first.clone(), second.clone()];
+        pane.visible = vec![0, 1];
+        pane.load = LoadState::Loading {
+            since: std::time::Instant::now(),
+        };
+        pane.similar.toggle();
+        pane.similar.insert_group_for_test(
+            first.path.clone(),
+            vec![first.path.clone(), second.path.clone()],
+        );
+
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut thumbs = NoThumbs;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+            ..Default::default()
+        };
+        let mut output = context.run_ui(input, |ui| {
+            grid(
+                ui,
+                &mut pane,
+                true,
+                egui::Id::new("similar-stack-a11y-test"),
+                80.0,
+                &mut thumbs,
+            );
+        });
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("AccessKit tree update from enabled context");
+        let badge = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Expand group of 2 photos"))
+            .map(|(_, node)| node.role());
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            badge,
+            Some(egui::accesskit::Role::Button),
+            "named stack expansion button"
+        );
+
+        pane.similar.set_expanded(first.path, true);
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+                ..Default::default()
+            },
+            |ui| {
+                grid(
+                    ui,
+                    &mut pane,
+                    true,
+                    egui::Id::new("similar-stack-a11y-test"),
+                    80.0,
+                    &mut thumbs,
+                );
+            },
+        );
+        let update = output
+            .platform_output
+            .accesskit_update
+            .take()
+            .expect("updated AccessKit tree");
+        let badge = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.label() == Some("Collapse group"))
+            .map(|(_, node)| node.role());
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            badge,
+            Some(egui::accesskit::Role::Button),
+            "named stack collapse button"
+        );
     }
 }
 

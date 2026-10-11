@@ -10,7 +10,8 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use egui::{RichText, Ui};
 use forge_core::model::{EntryKind, FileEntry, MediaKind, ext_of, media_kind_for_ext};
 
-use crate::app::ZxrawApp;
+use crate::app::{Side, Tab, ZxrawApp};
+use crate::pane::Pane;
 
 const MAX_QUERY_CACHE: usize = 96;
 /// Folder scans waiting for the worker. The newest requests run first, and the oldest are dropped.
@@ -49,10 +50,31 @@ struct QueryKey {
     rules: Vec<String>,
 }
 
-static QUERY_CACHE: OnceLock<Mutex<HashMap<QueryKey, QueryState>>> = OnceLock::new();
+#[derive(Default)]
+struct QueryCache {
+    generation: u64,
+    entries: HashMap<QueryKey, QueryState>,
+}
 
-fn query_cache() -> &'static Mutex<HashMap<QueryKey, QueryState>> {
-    QUERY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+impl QueryCache {
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+    }
+
+    fn publish_if_current(&mut self, generation: u64, key: QueryKey, state: QueryState) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.entries.insert(key, state);
+        true
+    }
+}
+
+static QUERY_CACHE: OnceLock<Mutex<QueryCache>> = OnceLock::new();
+
+fn query_cache() -> &'static Mutex<QueryCache> {
+    QUERY_CACHE.get_or_init(|| Mutex::new(QueryCache::default()))
 }
 
 pub fn default_rules() -> Vec<String> {
@@ -393,17 +415,18 @@ fn scan_for(path: &Path, rules: &[String]) -> Associations {
     associations
 }
 
-/// Forgets finished association scans (a folder changed, so exports may have appeared or
-/// disappeared). Scans still running keep their slot and publish when they finish.
+/// Forgets association scans (a folder changed, so exports may have appeared or disappeared).
+/// Results from scans already in flight are discarded by their cache generation.
 pub fn invalidate_cache() {
     query_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .retain(|_, state| *state == QueryState::Pending);
+        .invalidate();
 }
 
 struct ScanJob {
     key: QueryKey,
+    generation: u64,
     repaint: egui::Context,
 }
 
@@ -445,7 +468,9 @@ fn enqueue_scan(job: ScanJob) -> Result<(), String> {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for job in dropped {
-            cache.remove(&job.key);
+            if cache.generation == job.generation {
+                cache.entries.remove(&job.key);
+            }
         }
     }
     Ok(())
@@ -470,10 +495,10 @@ fn scan_worker() {
                 Ok(associations) => QueryState::Complete(associations),
                 Err(_) => QueryState::Failed("the scan stopped unexpectedly".into()),
             };
-        query_cache()
+        let mut cache = query_cache()
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(job.key, state);
+            .unwrap_or_else(|error| error.into_inner());
+        cache.publish_if_current(job.generation, job.key, state);
         job.repaint.request_repaint();
     }
 }
@@ -483,32 +508,36 @@ pub fn request_for(path: &Path, rules: &[String], ctx: &egui::Context) {
         path: path.to_path_buf(),
         rules: active_rules(rules),
     };
-    {
+    let generation = {
         let mut cache = query_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if cache.contains_key(&key) {
+        if cache.entries.contains_key(&key) {
             return;
         }
-        if cache.len() >= MAX_QUERY_CACHE
+        if cache.entries.len() >= MAX_QUERY_CACHE
             && let Some(oldest) = cache
+                .entries
                 .iter()
                 .find_map(|(key, state)| (*state != QueryState::Pending).then_some(key.clone()))
         {
-            cache.remove(&oldest);
+            cache.entries.remove(&oldest);
         }
-        cache.insert(key.clone(), QueryState::Pending);
-    }
+        let generation = cache.generation;
+        cache.entries.insert(key.clone(), QueryState::Pending);
+        generation
+    };
 
     let job = ScanJob {
         key: key.clone(),
+        generation,
         repaint: ctx.clone(),
     };
     if let Err(error) = enqueue_scan(job) {
-        query_cache()
+        let mut cache = query_cache()
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(key, QueryState::Failed(error));
+            .unwrap_or_else(|error| error.into_inner());
+        cache.publish_if_current(generation, key, QueryState::Failed(error));
     }
 }
 
@@ -516,6 +545,7 @@ pub fn cached_for(path: &Path, rules: &[String]) -> Option<QueryState> {
     query_cache()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
+        .entries
         .get(&QueryKey {
             path: path.to_path_buf(),
             rules: active_rules(rules),
@@ -630,10 +660,18 @@ pub fn select_exports(app: &mut ZxrawApp) {
 /// The latest select command. Matching runs on its own thread, and `poll` applies the result.
 struct PendingSelection {
     id: u64,
-    folder: PathBuf,
+    origin: SelectionOrigin,
     want_exports: bool,
     /// `None` while matching runs.
     matches: Option<Vec<PathBuf>>,
+}
+
+#[derive(Clone)]
+struct SelectionOrigin {
+    tab_index: usize,
+    side: Side,
+    folder: PathBuf,
+    listing_rev: u64,
 }
 
 static PENDING_SELECTION: Mutex<Option<PendingSelection>> = Mutex::new(None);
@@ -652,8 +690,20 @@ pub fn selection_pending() -> bool {
 
 fn select_counterparts(app: &mut ZxrawApp, want_exports: bool) {
     let rules = active_rules(&app.settings.export_rules);
-    let pane = app.pane();
-    let folder = pane.path.clone();
+    let tab_index = app.active;
+    let tab = app.tab();
+    let side = if tab.right.is_some() {
+        tab.focus
+    } else {
+        Side::Left
+    };
+    let pane = pane_on_side(tab, side).expect("the focused pane exists");
+    let origin = SelectionOrigin {
+        tab_index,
+        side,
+        folder: pane.path.clone(),
+        listing_rev: pane.listing_rev(),
+    };
     let targets = pane
         .action_targets()
         .into_iter()
@@ -670,7 +720,7 @@ fn select_counterparts(app: &mut ZxrawApp, want_exports: bool) {
     let id = NEXT_SELECTION_ID.fetch_add(1, Ordering::Relaxed);
     *pending_selection() = Some(PendingSelection {
         id,
-        folder,
+        origin,
         want_exports,
         matches: None,
     });
@@ -718,7 +768,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         }
     };
     let Some(PendingSelection {
-        folder,
+        origin,
         want_exports,
         matches: Some(matches),
         ..
@@ -726,17 +776,67 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     else {
         return false;
     };
-    if app.pane().path != folder {
-        app.toast("Selection cancelled: the folder changed while it was being matched");
+    let count = match apply_selection_to_origin(&mut app.tabs, &origin, &matches) {
+        Ok(count) => count,
+        Err(SelectionApplyError::PaneGone) => {
+            app.toast("Selection cancelled: its originating tab or pane is no longer available");
+            return true;
+        }
+        Err(SelectionApplyError::PaneChanged) => {
+            app.toast("Selection cancelled: its originating pane changed while matching");
+            return true;
+        }
+    };
+    if count == 0 {
+        let what = if want_exports { "exports" } else { "originals" };
+        app.show_preview = true;
+        app.toast(format!(
+            "No matching {what} are in this folder. Nearby matches appear in the preview with Show in folder."
+        ));
         return true;
     }
+    app.toast(format!("Selected {count} counterpart(s)"));
+    true
+}
 
-    // Only entries still listed are selected, in case the folder refreshed while matching ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectionApplyError {
+    PaneGone,
+    PaneChanged,
+}
+
+fn pane_on_side(tab: &Tab, side: Side) -> Option<&Pane> {
+    match side {
+        Side::Left => Some(&tab.left),
+        Side::Right => tab.right.as_ref(),
+    }
+}
+
+fn pane_on_side_mut(tab: &mut Tab, side: Side) -> Option<&mut Pane> {
+    match side {
+        Side::Left => Some(&mut tab.left),
+        Side::Right => tab.right.as_mut(),
+    }
+}
+
+fn apply_selection_to_origin(
+    tabs: &mut [Tab],
+    origin: &SelectionOrigin,
+    matches: &[PathBuf],
+) -> Result<usize, SelectionApplyError> {
+    let pane = tabs
+        .get(origin.tab_index)
+        .and_then(|tab| pane_on_side(tab, origin.side))
+        .ok_or(SelectionApplyError::PaneGone)?;
+    if pane.path != origin.folder || pane.listing_rev() != origin.listing_rev {
+        return Err(SelectionApplyError::PaneChanged);
+    }
+
+    // Only entries still listed are selected, in case the folder changed while matching ran.
     let matched = matches
         .iter()
         .map(|path| normalized_path(path))
         .collect::<HashSet<_>>();
-    let pane = app.pane();
     let mut found = Vec::new();
     let mut cursor = None;
     for (position, &index) in pane.visible.iter().enumerate() {
@@ -749,21 +849,18 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         }
     }
     if found.is_empty() {
-        let what = if want_exports { "exports" } else { "originals" };
-        app.show_preview = true;
-        app.toast(format!(
-            "No matching {what} are in this folder. Nearby matches appear in the preview with Show in folder."
-        ));
-        return true;
+        return Ok(0);
     }
     let count = found.len();
-    let pane = app.pane_mut();
+    let pane = tabs
+        .get_mut(origin.tab_index)
+        .and_then(|tab| pane_on_side_mut(tab, origin.side))
+        .ok_or(SelectionApplyError::PaneGone)?;
     pane.selected.clear();
     pane.selected.extend(found);
     pane.cursor = cursor;
     pane.scroll_to_cursor = true;
-    app.toast(format!("Selected {count} counterpart(s)"));
-    true
+    Ok(count)
 }
 
 /// Pairs `targets` with `candidates` through an index of original stems. Each export-side file
@@ -1062,6 +1159,104 @@ mod tests {
         assert_eq!(queue.len(), MAX_QUEUED_SCANS);
         // The worker takes from the back, so the newest request runs first.
         assert_eq!(queue.pop_back(), Some(19));
+    }
+
+    #[test]
+    fn invalidated_pending_scan_cannot_publish_and_a_new_generation_can() {
+        let mut cache = QueryCache::default();
+        let key = QueryKey {
+            path: PathBuf::from(r"C:\shoot\IMG_1234.jpg"),
+            rules: default_rules(),
+        };
+        let started_generation = cache.generation;
+        cache.entries.insert(key.clone(), QueryState::Pending);
+
+        cache.invalidate();
+
+        assert!(cache.entries.is_empty());
+        assert!(!cache.publish_if_current(
+            started_generation,
+            key.clone(),
+            QueryState::Complete(Associations::default())
+        ));
+        assert!(!cache.entries.contains_key(&key));
+
+        let next_generation = cache.generation;
+        cache.entries.insert(key.clone(), QueryState::Pending);
+        assert!(cache.publish_if_current(
+            next_generation,
+            key.clone(),
+            QueryState::Complete(Associations::default())
+        ));
+        assert_eq!(
+            cache.entries.get(&key),
+            Some(&QueryState::Complete(Associations::default()))
+        );
+    }
+
+    #[test]
+    fn selection_result_updates_its_originating_pane_only() {
+        fn file(path: PathBuf) -> FileEntry {
+            FileEntry {
+                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                ext: ext_of(&path),
+                path,
+                kind: EntryKind::File,
+                size: 1,
+                modified: None,
+                created: None,
+                hidden: false,
+                readonly: false,
+                system: false,
+            }
+        }
+
+        fn pane(folder: &Path, entries: &[FileEntry]) -> Pane {
+            let mut pane = Pane::new(
+                folder.to_path_buf(),
+                forge_core::listing::SortSpec::default(),
+                crate::settings::ViewMode::Details,
+            );
+            pane.entries = entries.to_vec();
+            pane.rebuild_visible();
+            pane
+        }
+
+        let temp = TempDir::new().unwrap();
+        let original = temp.path().join("IMG_1234.jpg");
+        let export = temp.path().join("IMG_1234-Edit.jpg");
+        let existing_right_selection = temp.path().join("IMG_9999.jpg");
+        let entries = vec![
+            file(original.clone()),
+            file(export.clone()),
+            file(existing_right_selection.clone()),
+        ];
+        let mut left = pane(temp.path(), &entries);
+        left.selected.insert(original);
+        let mut right = pane(temp.path(), &entries);
+        right.selected.insert(existing_right_selection.clone());
+        let listing_rev = left.listing_rev();
+        let mut tabs = vec![Tab {
+            left,
+            right: Some(right),
+            focus: Side::Right,
+        }];
+        let origin = SelectionOrigin {
+            tab_index: 0,
+            side: Side::Left,
+            folder: temp.path().to_path_buf(),
+            listing_rev,
+        };
+
+        let count = apply_selection_to_origin(&mut tabs, &origin, std::slice::from_ref(&export))
+            .expect("the originating pane still matches");
+
+        assert_eq!(count, 1);
+        assert_eq!(tabs[0].left.selected, HashSet::from([export]));
+        assert_eq!(
+            tabs[0].right.as_ref().unwrap().selected,
+            HashSet::from([existing_right_selection])
+        );
     }
 
     #[test]

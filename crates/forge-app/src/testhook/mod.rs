@@ -1160,10 +1160,27 @@ fn exec(
                 save_png(&img, path)?;
                 Ok(Flow::Done)
             }
-            _ if st.shot_requested => Ok(Flow::Wait("waiting for the frame capture".into())),
+            _ if st.shot_requested => {
+                // A capture request can be lost (e.g. a frame that was never presented while
+                // the window was busy or covered): ask again every two seconds rather than
+                // waiting out the whole step limit for one request.
+                let resend = st
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.downcast_ref::<Instant>())
+                    .is_none_or(|at| at.elapsed() > Duration::from_secs(2));
+                if resend {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+                    st.data = Some(Box::new(Instant::now()));
+                }
+                ctx.request_repaint();
+                Ok(Flow::Wait("waiting for the frame capture".into()))
+            }
             _ => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
                 st.shot_requested = true;
+                st.data = Some(Box::new(Instant::now()));
+                ctx.request_repaint();
                 Ok(Flow::Wait("capture requested".into()))
             }
         },
