@@ -19,6 +19,7 @@ mod palette;
 mod platform;
 mod preview;
 mod search_ui;
+mod tags_ui;
 mod settings;
 mod settings_ui;
 mod sidebar;

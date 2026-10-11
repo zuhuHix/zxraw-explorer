@@ -126,6 +126,7 @@ pub struct Actions {
     pub collections_ui: crate::collections_ui::CollectionsUi,
     pub video_ui: crate::video_ui::VideoUi,
     pub extra_tools: crate::extra_tools_ui::ExtraToolsUi,
+    pub tags_ui: crate::tags_ui::TagsUi,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -174,6 +175,7 @@ impl Actions {
             collections_ui: Default::default(),
             video_ui: Default::default(),
             extra_tools: Default::default(),
+            tags_ui: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -906,6 +908,8 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
                 if e.media_kind() == forge_core::MediaKind::Video {
                     crate::video_ui::preview(app, ui, &e);
                 }
+                ui.separator();
+                crate::tags_ui::panel(app, ui, &e);
             });
         return;
     }
