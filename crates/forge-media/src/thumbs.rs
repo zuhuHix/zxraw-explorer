@@ -600,15 +600,14 @@ fn store_cached(dir: &Path, k: &CacheKey, img: &ThumbImage, quality: u8) -> Resu
     publish_new(&tmp, &target)
 }
 
-/// Moves a finished temp file to `target` without replacing an existing entry. A hard link
-/// fails atomically when `target` exists; volumes without hard links fall back to a
-/// check-then-rename. An existing entry is already a complete thumbnail, so it is kept.
+/// Moves a finished temp file to `target` without replacing an existing entry
+/// (`rename_no_replace` is atomic on the same volume). An existing entry is already a
+/// complete thumbnail, so it is kept and the temp file is discarded.
 fn publish_new(tmp: &Path, target: &Path) -> Result<()> {
-    let placed = match std::fs::hard_link(tmp, target) {
-        Ok(()) => Ok(()),
+    let placed = match forge_core::paths::rename_no_replace(tmp, target) {
+        Ok(()) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(_) if target.symlink_metadata().is_ok() => Ok(()),
-        Err(_) => std::fs::rename(tmp, target).map_err(|e| MediaError::io(target, e)),
+        Err(e) => Err(MediaError::io(target, e)),
     };
     let _ = std::fs::remove_file(tmp);
     placed
