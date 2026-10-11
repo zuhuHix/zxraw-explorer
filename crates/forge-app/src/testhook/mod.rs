@@ -1005,7 +1005,7 @@ fn drawn_rect(ctx: &egui::Context, id: egui::Id) -> Option<egui::Rect> {
 /// back to back so two clicks register as a double-click.
 fn pointer_clicks(app: &mut ZxrawApp, st: &mut StepState, pos: egui::Pos2, clicks: u32) -> Result<Flow, String> {
     app.testhook.input.pointer = Some(pos);
-    let pressed = st.frames % 2 == 0;
+    let pressed = st.frames.is_multiple_of(2);
     let mut events = Vec::new();
     if st.frames == 0 {
         events.push(egui::Event::PointerMoved(pos));
