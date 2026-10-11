@@ -101,6 +101,32 @@ struct ImportCompletion {
 
 type ImportMessage = Result<ImportCompletion, String>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutomationSafety {
+    Safe,
+    NotSafe,
+    Incomplete,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AutomationSummary {
+    pub preview_ready: bool,
+    pub preview_error: Option<String>,
+    pub plan_items: usize,
+    pub plan_errors: usize,
+    pub can_start: bool,
+    pub running: bool,
+    pub result_ready: bool,
+    pub result_error: Option<String>,
+    pub copied: usize,
+    pub verified: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub missing: usize,
+    pub safety: AutomationSafety,
+    pub issue_paths: Vec<PathBuf>,
+}
+
 /// State is owned by `Actions`; public shape is intentionally small for command wiring.
 pub struct IngestState {
     pub open: bool,
@@ -135,6 +161,7 @@ pub struct IngestState {
     import_rx: Receiver<ImportMessage>,
     report: Option<ImportCompletion>,
     import_error: Option<String>,
+    automation_start_requested: bool,
 }
 
 impl Default for IngestState {
@@ -176,6 +203,7 @@ impl Default for IngestState {
             import_rx,
             report: None,
             import_error: None,
+            automation_start_requested: false,
         }
     }
 }
@@ -248,6 +276,149 @@ impl IngestState {
             shoot: self.shoot.clone(),
             filter: self.filter,
         }
+    }
+
+    pub(crate) fn automation_open(&mut self) {
+        self.open = true;
+    }
+
+    pub(crate) fn automation_open_with(
+        &mut self,
+        source: &Path,
+        destination: &Path,
+        ctx: &egui::Context,
+    ) {
+        self.open = true;
+        self.destination = destination.to_string_lossy().into_owned();
+        self.invalidate_preview();
+        self.start_card_detection(source, ctx);
+    }
+
+    pub(crate) fn automation_pick_source(&mut self, ctx: &egui::Context) -> bool {
+        let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) else {
+            return false;
+        };
+        self.start_card_detection(&path, ctx);
+        true
+    }
+
+    pub(crate) fn automation_pick_destination(&mut self) -> bool {
+        let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) else {
+            return false;
+        };
+        self.destination = path.to_string_lossy().into_owned();
+        self.invalidate_preview();
+        true
+    }
+
+    pub(crate) fn automation_set_template(&mut self, folder: &str, file: &str) {
+        self.folder_template = folder.to_string();
+        self.file_template = file.to_string();
+        self.invalidate_preview();
+    }
+
+    pub(crate) fn automation_set_option(&mut self, name: &str, value: &str) -> Result<(), String> {
+        match (name, value) {
+            ("filter", "all") => self.filter = MediaFilter::All,
+            ("filter", "photos") => self.filter = MediaFilter::Photos,
+            ("filter", "videos") => self.filter = MediaFilter::Videos,
+            ("verify", "on") => return Ok(()),
+            ("verify", "off") => {
+                return Err("ingest verification is mandatory and always on".into());
+            }
+            ("project", value) => self.project = value.to_string(),
+            ("client", value) => self.client = value.to_string(),
+            ("shoot", value) => self.shoot = value.to_string(),
+            ("filter", _) => return Err("filter must be all, photos, or videos".into()),
+            ("verify", _) => return Err("verify must be on; ingest always verifies copies".into()),
+            _ => return Err(format!("unknown ingest option `{name}`")),
+        }
+        self.invalidate_preview();
+        Ok(())
+    }
+
+    pub(crate) fn automation_preview(&mut self) {
+        if !self.sources.is_empty() && !self.destination.trim().is_empty() {
+            self.invalidate_preview();
+        }
+    }
+
+    pub(crate) fn automation_start(&mut self) {
+        self.automation_start_requested = true;
+    }
+
+    pub(crate) fn automation_cancel(&mut self) {
+        if let Some(job) = &self.import_job {
+            job.cancel.cancel();
+        } else if let Some(cancel) = &self.preview_cancel {
+            cancel.cancel();
+        }
+    }
+
+    pub(crate) fn automation_retry(&mut self) -> Result<(), String> {
+        if self.import_running {
+            return Err("cannot retry while an ingest is running".into());
+        }
+        self.report = None;
+        self.import_error = None;
+        self.automation_preview();
+        Ok(())
+    }
+
+    pub(crate) fn automation_summary(&self) -> AutomationSummary {
+        let plan_items = self.plan.as_ref().map_or(0, |plan| plan.items.len());
+        let plan_errors = self.plan.as_ref().map_or(0, |plan| plan.errors.len());
+        let enough_space = self
+            .plan
+            .as_ref()
+            .is_none_or(|plan| !space_is_insufficient(plan.bytes_to_copy, self.free_space));
+        let mut summary = AutomationSummary {
+            preview_ready: self.planned_revision == Some(self.revision) && !self.preview_busy,
+            preview_error: self.plan_error.clone(),
+            plan_items,
+            plan_errors,
+            can_start: self.planned_revision == Some(self.revision)
+                && self
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.items.is_empty() && plan.errors.is_empty())
+                && enough_space
+                && !self.card_scan_busy
+                && !self.import_running,
+            running: self.import_running,
+            result_ready: self.report.is_some() || self.import_error.is_some(),
+            result_error: self.import_error.clone(),
+            copied: 0,
+            verified: 0,
+            skipped: 0,
+            failed: 0,
+            missing: 0,
+            safety: AutomationSafety::Incomplete,
+            issue_paths: Vec::new(),
+        };
+        if let Some(completion) = &self.report {
+            let report = &completion.report;
+            summary.copied = report.verified.len();
+            summary.verified = report.verified.len() + report.already_present.len();
+            summary.skipped = report.already_present.len();
+            summary.failed = report.failed.len();
+            summary.missing = report.missing.len();
+            summary
+                .issue_paths
+                .extend(report.failed.iter().map(|issue| issue.path.clone()));
+            summary.issue_paths.extend(report.missing.iter().cloned());
+            match (&completion.format_check, &completion.format_error) {
+                (Some(check), _) if check.safe => summary.safety = AutomationSafety::Safe,
+                (Some(_), _) => summary.safety = AutomationSafety::NotSafe,
+                _ => summary.safety = AutomationSafety::Incomplete,
+            }
+            if let Some(check) = &completion.format_check {
+                summary
+                    .issue_paths
+                    .extend(check.unverified.iter().map(|issue| issue.path.clone()));
+            }
+        }
+        summary
     }
 
     fn accept_plan_message(&mut self, message: PlanMessage) {
@@ -488,14 +659,14 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 
     let mut open = state.open;
-    let mut start_import = false;
+    let mut start_import = std::mem::take(&mut state.automation_start_requested);
     egui::Window::new("Media ingest")
         .open(&mut open)
         .default_size([1020.0, 780.0])
         .min_width(760.0)
         .resizable(true)
         .show(ctx, |ui| {
-            start_import = show_contents(ui, state, &removable_drives, &focused_folder);
+            start_import |= show_contents(ui, state, &removable_drives, &focused_folder);
         });
     state.open = open;
 
@@ -523,6 +694,7 @@ fn show_contents(
     let mut changed = false;
     let mut start_import = false;
     egui::ScrollArea::vertical()
+        .id_salt("ingest-window-body")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -715,6 +887,9 @@ fn show_contents(
                     } else {
                         "Start verified import"
                     };
+                    if state.import_running && ui.button("Cancel import").clicked() {
+                        state.automation_cancel();
+                    }
                     start_import = ui.add_enabled(can_start, egui::Button::new(RichText::new(label).strong())).clicked();
                 });
             });
@@ -835,6 +1010,7 @@ fn show_preview(ui: &mut Ui, state: &IngestState) {
         );
     });
     egui::ScrollArea::vertical()
+        .id_salt("ingest-preview-rows")
         .max_height(245.0)
         .auto_shrink([false, false])
         .show_rows(ui, 24.0, plan.items.len(), |ui, rows| {
@@ -928,6 +1104,7 @@ fn show_report(ui: &mut Ui, completion: &ImportCompletion) {
                 .color(ui.visuals().error_fg_color),
             );
             egui::ScrollArea::vertical()
+                .id_salt("ingest-unverified-list")
                 .max_height(110.0)
                 .show(ui, |ui| {
                     for issue in &check.unverified {

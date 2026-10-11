@@ -26,6 +26,7 @@ use forge_jobs::{CancelToken, JobHandle, Progress};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::fault;
 use crate::hashing::{self, Digest};
 use crate::paths;
 
@@ -445,7 +446,7 @@ fn copy_file_counted(
         limit: None,
         attributes,
     };
-    stream_into_place(f, src, dest, sopts, ctx, counted, keep_both)
+    stream_into_place(fault::reader(f, src), src, dest, sopts, ctx, counted, keep_both)
 }
 
 /// Write an arbitrary stream (e.g. an archive entry) to `dest` with the same temp-file +
@@ -553,6 +554,7 @@ fn stream_into_place<R: Read>(
     let source_hash = hasher.map(|h| *h.finalize().as_bytes());
     if opts.verify {
         let expected = source_hash.expect("hasher present when verifying");
+        fault::corrupt_before_verify(label, &tmp).map_err(|e| CoreError::io(dest.as_path(), e))?;
         let actual = hashing::hash_file(&tmp, ctx.cancel, None)?;
         if actual != expected {
             return Err(CoreError::VerifyFailed {
@@ -1469,7 +1471,7 @@ impl Executor<'_, '_, '_> {
                 NodeKind::File => self.transfer_file(&src, item, dest, false)?,
                 NodeKind::Link => self.transfer_link(&src, item, dest, false)?,
             };
-            if vanished && !paths::exists_no_follow(src_root) {
+            if (vanished && !paths::exists_no_follow(src_root)) || fault::source_is_gone(src_root) {
                 // The whole source is gone (e.g. card pulled): don't grind through
                 // thousands of doomed items.
                 let rest = &items[idx..];
@@ -2263,6 +2265,55 @@ mod tests {
             "no partial or final file"
         );
         assert!(s.exists());
+    }
+
+    #[test]
+    fn disconnect_mid_copy_cleans_partial_and_move_keeps_failed_source() {
+        for kind in [OpKind::Copy, OpKind::Move] {
+            let f = fx();
+            let card = f.src.join("card");
+            fs::create_dir_all(&card).unwrap();
+            fs::write(card.join("a-first.bin"), b"done").unwrap();
+            let large = vec![0x5a; COPY_CHUNK * 2];
+            fs::write(card.join("b-large.bin"), &large).unwrap();
+            fs::write(card.join("c-last.bin"), b"not reached").unwrap();
+
+            let options = OpOptions {
+                force_copy_for_move: kind == OpKind::Move,
+                verify: true,
+                ..Default::default()
+            };
+            let cancel = CancelToken::new();
+            let progress = Progress::default();
+            let plan = plan(kind, std::slice::from_ref(&card), &f.dst, options, &cancel).unwrap();
+            crate::fault::arm_source_gone_after(&card, 8).unwrap();
+            let report = execute_with(&plan, &JobCtx::new(&cancel, &progress), &mut SkipConflicts);
+            crate::fault::disarm();
+
+            let copied = f.dst.join("card");
+            assert!(
+                !report.cancelled,
+                "disconnect is a reported I/O failure: {report:?}"
+            );
+            assert!(
+                report
+                    .failed
+                    .iter()
+                    .any(|issue| issue.path.ends_with("b-large.bin"))
+            );
+            assert_eq!(fs::read(copied.join("a-first.bin")).unwrap(), b"done");
+            assert!(!copied.join("b-large.bin").exists());
+            assert!(!copied.join("c-last.bin").exists());
+            assert!(no_partials(&f.dst));
+            assert_eq!(fs::read(card.join("b-large.bin")).unwrap(), large);
+            assert_eq!(fs::read(card.join("c-last.bin")).unwrap(), b"not reached");
+            if kind == OpKind::Move {
+                assert!(!card.join("a-first.bin").exists());
+                assert!(card.join("b-large.bin").exists());
+            } else {
+                assert_eq!(fs::read(card.join("a-first.bin")).unwrap(), b"done");
+            }
+        }
     }
 
     #[test]

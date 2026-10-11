@@ -116,11 +116,15 @@ fn start_transfer_with(
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
     let title2 = title.clone();
+    // Automation can explicitly arm a read fault (only script steps arm it). Force the
+    // move-copy path in that case so tests exercise the same verified fallback used for
+    // cross-volume moves. Not `testhook.active()`: it is false while a script step runs.
+    let force_copy_for_move = kind == OpKind::Move && forge_core::fault::is_armed();
     app.ops.jobs.spawn("transfer", title, move |job| {
         let opts = OpOptions {
             policy,
             verify,
-            force_copy_for_move: false,
+            force_copy_for_move,
         };
         let plan = match ops::plan(kind, &sources, &dest, opts, &job.cancel) {
             Ok(plan) => plan,

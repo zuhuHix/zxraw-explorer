@@ -70,6 +70,9 @@ pub struct TestHook {
     script: Option<Script>,
     /// Every toast shown during the run (`(text, is_error)`), for `assert-toast`.
     toast_log: Vec<(String, bool)>,
+    /// Fixed at startup: the script is taken out of `self` while a step runs, so
+    /// "is a script present" cannot answer "is this an automated run".
+    automated: bool,
     pub(crate) input: InputQueue,
     pub(crate) perf: perf::FrameClock,
 }
@@ -94,13 +97,18 @@ impl TestHook {
                     .copied()
             })
             .collect();
-        Self {
+        let mut hook = Self {
             screenshot: std::env::var_os("ZXRAW_SCREENSHOT").map(PathBuf::from),
             cmds,
             select: std::env::var("ZXRAW_SELECT").ok(),
             script: std::env::var_os("ZXRAW_SCRIPT").map(|path| Script::load(PathBuf::from(path))),
             ..Default::default()
-        }
+        };
+        hook.automated = hook.script.is_some()
+            || hook.screenshot.is_some()
+            || !hook.cmds.is_empty()
+            || hook.select.is_some();
+        hook
     }
 
     pub fn record_toast(&mut self, text: &str, error: bool) {
@@ -110,10 +118,7 @@ impl TestHook {
     }
 
     pub fn active(&self) -> bool {
-        self.script.is_some()
-            || self.screenshot.is_some()
-            || !self.cmds.is_empty()
-            || self.select.is_some()
+        self.automated
     }
 }
 
