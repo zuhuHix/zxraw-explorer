@@ -34,8 +34,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
   of other applications, has not been checked.
 * Shell operations are Windows-only. Their non-Windows implementations return unsupported results
-  or empty data. Recycle Bin removal is tested; Open With, Properties, and Explorer reveal are not
-  tested by any automated test.
+  or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
+* Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox
+  folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
+  (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
 
 ## Installer, packaging, and licences
 
@@ -106,13 +108,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * The unit and integration suites verify the tested engine paths and UI logic. They do not verify
   every Windows shell call, screen-reader workflow, GPU rendering path, or behaviour on a real
   photo or video library.
-* The e2e suite (`crates/forge-app/tests/e2e.rs`, 10 scenarios) drives commands and dialogs through
-  the app's command layer and asserts on files. It does not assert pixels and does not simulate
-  pointer or keyboard input.
+* The e2e suite (`crates/forge-app/tests/e2e/`) drives the real window with injected egui key and
+  pointer events and scripted file-dialog answers, and asserts on files and app state. It does not
+  exercise the native dialogs themselves, OS-level input (IME, touch, pen), multi-monitor DPI
+  changes, or real removable media: a "card" is a temp folder, and a pulled card is simulated by
+  fault injection in the copy reader. Screenshots are inspected by a person, not compared pixel by
+  pixel. See [TESTING.md](TESTING.md).
 * The 50,000-folder screenshot in [BENCHMARKS.md](BENCHMARKS.md) shows that the list renders; it does
   not establish frame pacing or interactive responsiveness. That run predates `dfd43d9`.
-* `forge-win`'s `recycle_removes_file_from_disk` test sends a temporary file to the real Recycle Bin on
-  every run. The e2e suite avoids the Recycle Bin on purpose, but the unit test does not.
 
 ## Fixed since commit 476021b
 
