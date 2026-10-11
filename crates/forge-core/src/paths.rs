@@ -709,3 +709,74 @@ mod tests {
         }
     }
 }
+
+/// Move `from` to `to` atomically, failing with `ErrorKind::AlreadyExists` if `to` exists.
+///
+/// `std::fs::rename` *replaces* an existing destination on Windows, so every "publish a
+/// finished temp file under its final name" step must use this instead. On Windows this is
+/// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (atomic on the same volume; no check-
+/// then-rename window). Elsewhere it uses `link` + `unlink`, which also fails if `to` exists.
+pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
+        use windows::core::PCWSTR;
+        let wide = |p: &Path| -> Vec<u16> {
+            long_path_if_needed(p)
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let (f, t) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call.
+        unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }
+            .map_err(|e| {
+                // ERROR_ALREADY_EXISTS (183) / ERROR_FILE_EXISTS (80) -> AlreadyExists.
+                let code = (e.code().0 as u32) & 0xFFFF;
+                if code == 183 || code == 80 {
+                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination already exists")
+                } else {
+                    std::io::Error::from_raw_os_error(code as i32)
+                }
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(from, to)?;
+        std::fs::remove_file(from)
+    }
+}
+
+#[cfg(test)]
+mod no_replace_tests {
+    use super::rename_no_replace;
+
+    #[test]
+    fn never_replaces_and_moves_when_free() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.partial");
+        let b = d.path().join("b.jpg");
+        std::fs::write(&a, b"new").unwrap();
+        std::fs::write(&b, b"existing").unwrap();
+        let e = rename_no_replace(&a, &b).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).unwrap(), b"existing");
+        assert!(a.exists());
+        std::fs::remove_file(&b).unwrap();
+        rename_no_replace(&a, &b).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"new");
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn works_for_directories_and_unicode() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("тмп_日本");
+        std::fs::create_dir(&a).unwrap();
+        let b = d.path().join("final_ünï");
+        rename_no_replace(&a, &b).unwrap();
+        assert!(b.is_dir());
+    }
+}
