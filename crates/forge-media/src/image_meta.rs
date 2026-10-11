@@ -944,11 +944,49 @@ pub fn read_xmp_sidecar(path: &Path) -> Result<Option<XmpData>> {
     for p in sidecar_paths(path) {
         if p.is_file() {
             let b = bin_util::read_prefix(&p, XMP_MAX_LEN as u64)?;
-            let s = String::from_utf8_lossy(&b);
-            return Ok(Some(parse_xmp(&s, XmpSource::Sidecar)));
+            let s = decode_sidecar_xmp(&b, &p)?;
+            return Ok(Some(crate::xmp_write::parse_sidecar_xmp(&s, path)));
         }
     }
     Ok(None)
+}
+
+fn decode_sidecar_xmp(bytes: &[u8], path: &Path) -> Result<String> {
+    if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00])
+    {
+        return Err(MediaError::Unsupported(format!(
+            "unsupported encoding: UTF-32 XMP sidecar {}",
+            path.display()
+        )));
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let little_endian = bytes.starts_with(&[0xFF, 0xFE]);
+        let body = &bytes[2..];
+        let (pairs, trailing) = body.as_chunks::<2>();
+        if !trailing.is_empty() {
+            return Err(MediaError::Corrupt(format!(
+                "{}: truncated UTF-16 XMP sidecar",
+                path.display()
+            )));
+        }
+        let words: Vec<u16> = pairs
+            .iter()
+            .map(|pair| {
+                if little_endian {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect();
+        return String::from_utf16(&words).map_err(|e| {
+            MediaError::Corrupt(format!(
+                "{}: invalid UTF-16 XMP sidecar: {e}",
+                path.display()
+            ))
+        });
+    }
+    Ok(String::from_utf8_lossy(bytes).into_owned())
 }
 
 fn merge_xmp(primary: Option<XmpData>, secondary: Option<XmpData>) -> Option<XmpData> {
