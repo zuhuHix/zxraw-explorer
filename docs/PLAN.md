@@ -66,6 +66,8 @@ the screenshots.
 * ✅ HEIC/AVIF thumbnails and viewer via WIC (`75f79b1`).
 * ✅ Adversarial review of wave 2 in three slices (Haiku 5.5 high; 29 findings) and fixes
   (`dbf3bc8`, `5e2ca91`, `f78ca01`, `45fa89c`, `06f7efa`, `297c61e`).
+* ✅ Final whole-branch review (GPT-6-Luna, two reviewers; 14 findings) and fixes (`470bb60`,
+  `cc799ef`); full suite green at `cc799ef`.
 * ✅ User-reported: double-click/Enter on folders failed at fractional display scaling;
   fixed with real-pointer e2e regressions (`05c17e4`).
 
