@@ -287,6 +287,19 @@ impl ZxrawApp {
         self.tab_mut().focused_mut()
     }
 
+    /// Number of selected entries the focused pane still lists, from the same cache as the
+    /// status bar: cheap enough to call every frame, even in a 50,000-entry folder.
+    pub(crate) fn selected_listed_count(&mut self) -> usize {
+        let mut summary = std::mem::take(&mut self.selection_summary);
+        let count = if self.pane().selected.is_empty() {
+            0
+        } else {
+            summary.get(self.pane()).0
+        };
+        self.selection_summary = summary;
+        count
+    }
+
     pub fn toast(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.testhook.record_toast(&text, false);

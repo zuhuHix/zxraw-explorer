@@ -131,9 +131,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     if !is_open && active.is_none() {
         return;
     }
-    // Only while the window shows: this walks the whole listing (50k entries in a big
-    // folder), and `window` runs every frame.
-    let selected_count = app.pane().selected_entries().len();
+    let selected_count = app.selected_listed_count();
 
     let mut start = false;
     let mut close_after = false;
@@ -836,6 +834,19 @@ fn write_json(
         .map_err(|error| format!("cannot finish JSON report: {error}"))
 }
 
+/// Whether a spreadsheet could read the cell as a formula. Plain numbers (a western
+/// longitude, a negative altitude) stay numbers; any other text whose first non-blank
+/// character starts a formula, or that starts with a tab or carriage return, gets a `'`.
+fn needs_formula_guard(value: &str) -> bool {
+    if value.trim().parse::<f64>().is_ok_and(f64::is_finite) {
+        return false;
+    }
+    value.starts_with(['\t', '\r'])
+        || value
+            .trim_start()
+            .starts_with(['=', '+', '-', '@', '\t', '\r'])
+}
+
 fn write_csv_row(
     writer: &mut impl Write,
     values: impl IntoIterator<Item = String>,
@@ -846,11 +857,7 @@ fn write_csv_row(
             writer.write_all(b",")?;
         }
         first = false;
-        let escaped = if value
-            .chars()
-            .next()
-            .is_some_and(|character| matches!(character, '=' | '+' | '-' | '@' | '\t' | '\r'))
-        {
+        let escaped = if needs_formula_guard(&value) {
             format!("'{value}")
         } else {
             value
@@ -883,6 +890,26 @@ mod tests {
         assert_eq!(
             String::from_utf8(csv).unwrap(),
             "\"comma,here\",\"a\"\"b\",\"one\r\ntwo\"\r\n"
+        );
+    }
+
+    #[test]
+    fn csv_keeps_numbers_and_guards_formulas_behind_leading_blanks() {
+        let mut csv = Vec::new();
+        write_csv_row(
+            &mut csv,
+            [
+                "-74.006".into(),
+                "-12.5".into(),
+                " =HYPERLINK(\"http://x\")".into(),
+                "  -1+cmd".into(),
+                "plain".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(csv).unwrap(),
+            "\"-74.006\",\"-12.5\",\"' =HYPERLINK(\"\"http://x\"\")\",\"'  -1+cmd\",\"plain\"\r\n"
         );
     }
 

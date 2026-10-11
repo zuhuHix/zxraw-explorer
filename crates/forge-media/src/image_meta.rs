@@ -492,11 +492,15 @@ fn find(exifs: &[Exif], t: Tag) -> Option<&Field> {
     exifs.iter().find_map(|e| e.get_field(t, In::PRIMARY))
 }
 
+/// Longest EXIF text kept (make, model, lens, …). Real values are short; a crafted file can
+/// carry megabytes, which would otherwise be copied into every report and cache entry.
+const MAX_EXIF_TEXT_BYTES: usize = 1024;
+
 fn ascii(f: &Field) -> Option<String> {
     match &f.value {
         Value::Ascii(v) => {
             let s = v.first()?;
-            let s = String::from_utf8_lossy(s);
+            let s = String::from_utf8_lossy(&s[..s.len().min(MAX_EXIF_TEXT_BYTES)]);
             let s = s.trim_matches(|c: char| c == '\0' || c.is_whitespace());
             (!s.is_empty()).then(|| s.to_string())
         }
@@ -1305,6 +1309,16 @@ fn decode_entities(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exif_text_is_capped() {
+        let field = Field {
+            tag: Tag::Make,
+            ifd_num: In::PRIMARY,
+            value: Value::Ascii(vec![vec![b'a'; 4 * 1024 * 1024]]),
+        };
+        assert_eq!(ascii(&field).unwrap().len(), MAX_EXIF_TEXT_BYTES);
+    }
 
     #[test]
     fn shutter_formatting() {

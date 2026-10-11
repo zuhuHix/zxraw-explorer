@@ -242,7 +242,8 @@ fn exports_csv_and_json_and_never_replaces_an_existing_output() {
     assert_eq!(cell("camera_model"), "Camera X");
     assert_eq!(cell("iso"), "200");
     assert_eq!(cell("gps_lat"), "37.25");
-    assert_eq!(cell("gps_lon"), "'-122.5");
+    // Numbers stay numbers: only text that could start a formula gets a leading '.
+    assert_eq!(cell("gps_lon"), "-122.5");
     assert_eq!(cell("gps_alt_m"), "123.5");
     assert_eq!(cell("rating"), "4");
     assert_eq!(cell("label"), "green");
