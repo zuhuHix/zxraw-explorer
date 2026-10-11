@@ -188,7 +188,11 @@ impl Pane {
         self.listing_changed();
         self.cancel.cancel();
         self.cancel = CancelToken::new();
-        self.similar.on_navigation();
+        if path == self.path {
+            self.similar.on_refresh();
+        } else {
+            self.similar.on_navigation();
+        }
         self.path = path.clone();
         self.entries.clear();
         self.visible.clear();
@@ -443,6 +447,21 @@ impl Pane {
         self.cursor = Some(vis);
     }
 
+    /// The members of a stack that the listing shows, in listing order. Hidden and filtered
+    /// files are left out, so a stack never selects, drags or counts a file the user cannot see.
+    pub fn visible_group_paths(&self, members: &[PathBuf]) -> Vec<PathBuf> {
+        let listed: HashSet<&Path> = self
+            .visible
+            .iter()
+            .map(|&i| self.entries[i].path.as_path())
+            .collect();
+        members
+            .iter()
+            .filter(|path| listed.contains(path.as_path()))
+            .cloned()
+            .collect()
+    }
+
     /// Select every member represented by a collapsed stack while preserving Explorer's
     /// Ctrl and Shift selection behavior around the stack's first visible position.
     pub fn click_group(&mut self, vis: usize, members: &[PathBuf], ctrl: bool, shift: bool) {
@@ -506,5 +525,75 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_core::model::EntryKind;
+
+    #[test]
+    fn refresh_of_the_same_folder_keeps_groups_and_navigation_drops_them() {
+        let folder = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut pane = Pane::new(
+            folder.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Grid,
+        );
+        pane.similar.toggle();
+        let key = folder.path().join("burst-1.jpg");
+        let second = folder.path().join("burst-2.jpg");
+        pane.similar
+            .insert_group_for_test(key.clone(), vec![key, second]);
+
+        pane.refresh();
+        assert_eq!(pane.similar.groups().len(), 1);
+
+        pane.navigate(other.path().to_path_buf());
+        assert!(pane.similar.groups().is_empty());
+    }
+
+    #[test]
+    fn visible_group_paths_leave_out_entries_the_listing_hides() {
+        let folder = tempfile::tempdir().unwrap();
+        let mut pane = Pane::new(
+            folder.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Grid,
+        );
+        let shown = folder.path().join("shown.jpg");
+        let hidden = folder.path().join("hidden.jpg");
+        pane.entries = vec![
+            FileEntry {
+                path: shown.clone(),
+                name: "shown.jpg".into(),
+                kind: EntryKind::File,
+                size: 1,
+                modified: None,
+                created: None,
+                hidden: false,
+                readonly: false,
+                system: false,
+                ext: "jpg".into(),
+            },
+            FileEntry {
+                path: hidden.clone(),
+                name: "hidden.jpg".into(),
+                kind: EntryKind::File,
+                size: 1,
+                modified: None,
+                created: None,
+                hidden: true,
+                readonly: false,
+                system: false,
+                ext: "jpg".into(),
+            },
+        ];
+        pane.rebuild_visible();
+
+        let members = vec![hidden.clone(), shown.clone()];
+        assert_eq!(pane.visible_group_paths(&members), vec![shown]);
     }
 }

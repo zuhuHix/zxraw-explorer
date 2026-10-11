@@ -13,9 +13,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use forge_core::{
     FileEntry,
     model::{EntryKind, MediaKind},
@@ -34,6 +34,8 @@ const THUMB_EDGE: u32 = 96;
 const CACHE_LIMIT: usize = 100_000;
 const MESSAGE_CAPACITY: usize = 128;
 const RESULTS_PER_BATCH: usize = 32;
+/// While analysis runs, group changes reach the grid layout at most this often.
+const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// `Cmd::GroupSimilar`: toggles grouping for the focused pane.
 pub fn toggle(app: &mut ZxrawApp) {
@@ -81,6 +83,8 @@ pub(crate) struct Grouping {
     needs_run: bool,
     running: bool,
     complete: bool,
+    /// Set by [`Grouping::on_refresh`]: the next run keeps the current groups on screen.
+    refreshing: bool,
     phase: Phase,
     done: usize,
     total: usize,
@@ -88,9 +92,15 @@ pub(crate) struct Grouping {
     cancel: CancelToken,
     rx: Option<Receiver<WorkerMessage>>,
     groups: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Groups rebuilt by a refresh rerun; they replace `groups` when the rerun finishes.
+    pending: Option<HashMap<PathBuf, Vec<PathBuf>>>,
     expanded: HashSet<PathBuf>,
+    /// `groups` changed since the last layout revision.
+    groups_dirty: bool,
+    last_layout: Option<Instant>,
     /// Bumped whenever `enabled`, `groups` or `expanded` change, so the grid can cache its
-    /// layout instead of rebuilding it every frame.
+    /// layout instead of rebuilding it every frame. Group deltas from a running analysis
+    /// bump it at most once per [`LAYOUT_INTERVAL`].
     revision: u64,
 }
 
@@ -101,6 +111,7 @@ impl Default for Grouping {
             needs_run: false,
             running: false,
             complete: false,
+            refreshing: false,
             phase: Phase::CaptureTimes,
             done: 0,
             total: 0,
@@ -108,7 +119,10 @@ impl Default for Grouping {
             cancel: CancelToken::new(),
             rx: None,
             groups: HashMap::new(),
+            pending: None,
             expanded: HashSet::new(),
+            groups_dirty: false,
+            last_layout: None,
             revision: 0,
         }
     }
@@ -169,29 +183,47 @@ impl Grouping {
 
     pub(crate) fn toggle(&mut self) -> bool {
         self.enabled = !self.enabled;
-        self.cancel.cancel();
-        self.rx = None;
-        self.running = false;
-        self.complete = false;
-        self.done = 0;
-        self.total = 0;
-        self.groups.clear();
-        self.expanded.clear();
-        self.generation = self.generation.wrapping_add(1);
-        self.revision += 1;
-        self.needs_run = self.enabled;
+        self.clear();
         self.enabled
     }
 
+    /// Navigation to another folder: forget the old folder's groups and expansion.
     pub(crate) fn on_navigation(&mut self) {
+        self.clear();
+    }
+
+    /// The same folder was listed again (a watcher refresh). The analysis runs again, but
+    /// the groups and expansion stay on screen until it finishes; the cache keeps it cheap.
+    pub(crate) fn on_refresh(&mut self) {
+        if !self.enabled {
+            self.clear();
+            return;
+        }
         self.cancel.cancel();
         self.rx = None;
         self.running = false;
         self.complete = false;
         self.done = 0;
         self.total = 0;
+        self.refreshing = true;
+        self.pending = None;
+        self.generation = self.generation.wrapping_add(1);
+        self.needs_run = true;
+    }
+
+    /// Cancels any analysis and forgets its results. Keeps the toggle.
+    fn clear(&mut self) {
+        self.cancel.cancel();
+        self.rx = None;
+        self.running = false;
+        self.complete = false;
+        self.refreshing = false;
+        self.done = 0;
+        self.total = 0;
         self.groups.clear();
+        self.pending = None;
         self.expanded.clear();
+        self.groups_dirty = false;
         self.generation = self.generation.wrapping_add(1);
         self.revision += 1;
         self.needs_run = self.enabled;
@@ -205,7 +237,18 @@ impl Grouping {
         listing_finished: bool,
         ctx: &egui::Context,
     ) {
+        self.tick_at(entries, listing_finished, ctx, Instant::now());
+    }
+
+    fn tick_at(
+        &mut self,
+        entries: &[FileEntry],
+        listing_finished: bool,
+        ctx: &egui::Context,
+        now: Instant,
+    ) {
         self.poll(ctx);
+        self.publish_groups(now, ctx);
         if self.enabled && self.needs_run && listing_finished {
             self.start(entries, ctx);
         }
@@ -214,6 +257,25 @@ impl Grouping {
         } else if self.running || self.needs_run {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+    }
+
+    /// Makes group changes visible to the grid layout. Changes arriving while analysis runs
+    /// are published at most once per [`LAYOUT_INTERVAL`], so a 50,000-entry layout is not
+    /// rebuilt for every worker batch.
+    fn publish_groups(&mut self, now: Instant, ctx: &egui::Context) {
+        if !self.groups_dirty {
+            return;
+        }
+        if let Some(last) = self.last_layout {
+            let since = now.saturating_duration_since(last);
+            if since < LAYOUT_INTERVAL {
+                ctx.request_repaint_after(LAYOUT_INTERVAL - since);
+                return;
+            }
+        }
+        self.groups_dirty = false;
+        self.last_layout = Some(now);
+        self.revision += 1;
     }
 
     fn start(&mut self, entries: &[FileEntry], ctx: &egui::Context) {
@@ -232,15 +294,18 @@ impl Grouping {
             })
             .collect();
         self.needs_run = false;
-        self.groups.clear();
-        self.expanded.clear();
-        self.revision += 1;
+        if self.refreshing {
+            self.pending = Some(HashMap::new());
+        } else {
+            self.groups.clear();
+            self.expanded.clear();
+            self.revision += 1;
+        }
         self.done = 0;
         self.total = sources.len();
         self.phase = Phase::CaptureTimes;
         if sources.is_empty() {
-            self.running = false;
-            self.complete = true;
+            self.finish();
             return;
         }
 
@@ -264,6 +329,7 @@ impl Grouping {
         if submitted.is_err() {
             self.rx = None;
             self.running = false;
+            self.pending = None;
             self.needs_run = true;
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -272,8 +338,17 @@ impl Grouping {
     fn poll(&mut self, ctx: &egui::Context) {
         let Some(rx) = &self.rx else { return };
         let mut finished = false;
+        let mut disconnected = false;
         for _ in 0..16 {
-            let Ok(message) = rx.try_recv() else { break };
+            let message = match rx.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => break,
+                // The pool dropped the job before it ran or finished (evicted from its queue).
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            };
             match message {
                 WorkerMessage::Progress { phase, done, total } => {
                     self.phase = phase;
@@ -281,17 +356,20 @@ impl Grouping {
                     self.total = total;
                 }
                 WorkerMessage::Groups(deltas) => {
-                    self.revision += 1;
+                    // A refresh rerun builds its groups off screen; see `finish`.
+                    let staged = self.pending.is_some();
+                    let target = self.pending.as_mut().unwrap_or(&mut self.groups);
                     for delta in deltas {
                         match delta {
                             GroupDelta::Started { key, first, second } => {
-                                self.groups.insert(key, vec![first, second]);
+                                target.insert(key, vec![first, second]);
                             }
                             GroupDelta::Added { key, member } => {
-                                self.groups.entry(key).or_default().push(member);
+                                target.entry(key).or_default().push(member);
                             }
                         }
                     }
+                    self.groups_dirty |= !staged;
                 }
                 WorkerMessage::Finished => {
                     finished = true;
@@ -300,12 +378,36 @@ impl Grouping {
             }
         }
         if finished {
-            self.running = false;
-            self.complete = true;
+            self.finish();
+        } else if disconnected {
+            // Treat as finished, but incomplete: drop a partial rerun and start again once the
+            // listing is ready.
             self.rx = None;
+            self.running = false;
+            self.pending = None;
+            self.needs_run = self.enabled;
         } else if self.running {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+    }
+
+    fn finish(&mut self) {
+        if let Some(groups) = self.pending.take() {
+            self.groups = groups;
+            self.expanded.retain(|key| self.groups.contains_key(key));
+        }
+        self.refreshing = false;
+        self.groups_dirty = false;
+        self.running = false;
+        self.complete = true;
+        self.rx = None;
+        self.revision += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_group_for_test(&mut self, key: PathBuf, members: Vec<PathBuf>) {
+        self.groups.insert(key, members);
+        self.revision += 1;
     }
 }
 
@@ -735,5 +837,136 @@ mod tests {
         let missing =
             group_analyzed(&[item(0, Some(1.0), 0), item(1, None, 0xaaaa_aaaa_aaaa_aaaa)]);
         assert!(missing.is_empty());
+    }
+
+    fn running_grouping() -> (Grouping, Sender<WorkerMessage>) {
+        let (tx, rx) = bounded(256);
+        let grouping = Grouping {
+            enabled: true,
+            running: true,
+            rx: Some(rx),
+            ..Default::default()
+        };
+        (grouping, tx)
+    }
+
+    #[test]
+    fn many_group_deltas_publish_one_layout_per_interval() {
+        let ctx = egui::Context::default();
+        let (mut grouping, tx) = running_grouping();
+        let key = PathBuf::from("0.jpg");
+        tx.send(WorkerMessage::Groups(vec![GroupDelta::Started {
+            key: key.clone(),
+            first: key.clone(),
+            second: PathBuf::from("1.jpg"),
+        }]))
+        .unwrap();
+        for index in 2..200 {
+            tx.send(WorkerMessage::Groups(vec![GroupDelta::Added {
+                key: key.clone(),
+                member: PathBuf::from(format!("{index}.jpg")),
+            }]))
+            .unwrap();
+        }
+
+        let start = Instant::now();
+        let before = grouping.revision();
+        // 16 messages are applied per tick, so 200 batches take 13 ticks in one instant.
+        for _ in 0..13 {
+            grouping.tick_at(&[], false, &ctx, start);
+        }
+        assert_eq!(grouping.groups()[&key].len(), 200);
+        assert_eq!(
+            grouping.revision(),
+            before + 1,
+            "one layout for the whole burst"
+        );
+
+        tx.send(WorkerMessage::Groups(vec![GroupDelta::Added {
+            key: key.clone(),
+            member: PathBuf::from("late.jpg"),
+        }]))
+        .unwrap();
+        grouping.tick_at(&[], false, &ctx, start + Duration::from_millis(100));
+        assert_eq!(
+            grouping.revision(),
+            before + 1,
+            "throttled inside the interval"
+        );
+        grouping.tick_at(&[], false, &ctx, start + LAYOUT_INTERVAL);
+        assert_eq!(grouping.revision(), before + 2);
+    }
+
+    #[test]
+    fn disconnected_worker_is_treated_as_finished_and_retried() {
+        let ctx = egui::Context::default();
+        let (mut grouping, tx) = running_grouping();
+        drop(tx);
+
+        grouping.poll(&ctx);
+
+        assert!(!grouping.running());
+        assert!(!grouping.complete());
+        assert!(grouping.needs_run);
+        assert!(grouping.rx.is_none());
+    }
+
+    #[test]
+    fn refresh_keeps_groups_and_expansion_until_the_rerun_finishes() {
+        let ctx = egui::Context::default();
+        let mut grouping = Grouping {
+            enabled: true,
+            ..Default::default()
+        };
+        let key = PathBuf::from("a.jpg");
+        grouping.insert_group_for_test(key.clone(), vec![key.clone(), PathBuf::from("b.jpg")]);
+        assert!(grouping.set_expanded(key.clone(), true));
+
+        grouping.on_refresh();
+        assert_eq!(
+            grouping.groups().len(),
+            1,
+            "groups stay while the rerun runs"
+        );
+        assert!(grouping.is_expanded(&key));
+        assert!(grouping.needs_run);
+        assert!(!grouping.complete());
+
+        // A rerun that finds nothing replaces the old groups and drops their expansion.
+        grouping.start(&[], &ctx);
+        assert!(grouping.groups().is_empty());
+        assert!(!grouping.is_expanded(&key));
+        assert!(grouping.complete());
+    }
+
+    #[test]
+    fn rerun_groups_are_staged_until_the_worker_finishes() {
+        let ctx = egui::Context::default();
+        let (mut grouping, tx) = running_grouping();
+        let old = PathBuf::from("old.jpg");
+        grouping.insert_group_for_test(old.clone(), vec![old.clone(), PathBuf::from("o2.jpg")]);
+        grouping.refreshing = true;
+        grouping.pending = Some(HashMap::new());
+        let new = PathBuf::from("new.jpg");
+        tx.send(WorkerMessage::Groups(vec![GroupDelta::Started {
+            key: new.clone(),
+            first: new.clone(),
+            second: PathBuf::from("n2.jpg"),
+        }]))
+        .unwrap();
+
+        grouping.poll(&ctx);
+        assert!(
+            grouping.groups().contains_key(&old),
+            "old groups stay on screen"
+        );
+        assert!(!grouping.groups().contains_key(&new));
+
+        tx.send(WorkerMessage::Finished).unwrap();
+        grouping.poll(&ctx);
+        assert!(grouping.groups().contains_key(&new));
+        assert!(!grouping.groups().contains_key(&old));
+        assert!(grouping.complete());
+        assert!(!grouping.refreshing);
     }
 }

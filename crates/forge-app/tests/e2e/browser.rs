@@ -237,3 +237,72 @@ fn two_thousand_small_images_record_grouping_frame_times() {
     let perf = fs::read_to_string(&report).unwrap();
     println!("2,000-image grouping frame performance:\n{perf}");
 }
+
+/// Marks a file hidden the way Explorer does (`attrib +h`), so the listing leaves it out.
+fn hide(path: &Path) {
+    let status = std::process::Command::new("attrib")
+        .arg("+h")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "attrib +h failed for {}", path.display());
+}
+
+#[test]
+fn hidden_burst_member_is_not_selected_or_copied_with_its_stack() {
+    let (_temp, work, profile, root) = fixture();
+    let source = root.join("hidden-source");
+    let destination = root.join("hidden-destination");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&destination).unwrap();
+    let base = 1_702_000_000;
+    for shot in 0..3u32 {
+        write_jpeg(
+            &source,
+            &format!("shot-{}.jpg", shot + 1),
+            BURST_HASH,
+            shot + 1,
+            base + shot as u64,
+        );
+    }
+    hide(&source.join("shot-2.jpg"));
+
+    let screenshot_dir = shots_dir().join("browser");
+    fs::create_dir_all(&screenshot_dir).unwrap();
+    let stack_shot = screenshot_dir.join("similar-hidden-stack.png");
+    let copied = destination.join("shot-1.jpg");
+    let copied_last = destination.join("shot-3.jpg");
+    let hidden_copy = destination.join("shot-2.jpg");
+    let script = format!(
+        "limit 120\nnavigate {}\ncmd ViewGrid\nui browser toggle\nui browser wait 60\n\
+         ui browser assert-groups 1\n\
+         ui browser assert-members shot-1.jpg | shot-1.jpg, shot-3.jpg\n\
+         wait-frames 3\nscreenshot {}\n\
+         ui browser select-group shot-1.jpg\n\
+         cmd ToggleDualPane\nfocus right\nnavigate {}\nfocus left\ncmd CopyToOtherPane\n\
+         wait-exists {} | 60\nwait-exists {} | 60\nwait-jobs\n\
+         assert-missing {}\n\
+         assert-same {} | {}\n\
+         assert-same {} | {}\n\
+         assert-no-error-toast\nexit\n",
+        shown(&source),
+        shown(&stack_shot),
+        shown(&destination),
+        shown(&copied),
+        shown(&copied_last),
+        shown(&hidden_copy),
+        shown(&source.join("shot-1.jpg")),
+        shown(&copied),
+        shown(&source.join("shot-3.jpg")),
+        shown(&copied_last),
+    );
+    let outcome = run_app_with(&work, &profile, &script, &RunOpts::default());
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(
+        stack_shot.is_file(),
+        "missing stack screenshot: {}",
+        stack_shot.display()
+    );
+    println!("hidden-member stack screenshot: {}", stack_shot.display());
+}

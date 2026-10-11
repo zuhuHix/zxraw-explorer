@@ -1,7 +1,8 @@
 //! File list renderers. Both views are virtualized: only on-screen rows/tiles are laid out,
 //! so a folder with 100k entries costs the same per frame as one with 100.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -1144,30 +1145,64 @@ impl GridItem {
 
 struct GroupPlan {
     key: PathBuf,
+    /// Listed members only, in listing order.
     paths: Vec<PathBuf>,
+    /// Listing positions of `paths`.
     visible_members: Vec<usize>,
-    representative: usize,
+}
+
+/// The grouped grid: one cell per drawn stack or plain entry.
+struct GroupLayout {
+    items: Vec<GridItem>,
+    /// Index into `items` of the cell that shows each listing position. A stack shows all of
+    /// its members, so its members map to the stack's cell.
+    item_of_vis: Vec<usize>,
+}
+
+/// Visible path → listing position. It depends only on the listing, so it is cached per
+/// listing revision and reused while only the grouping changes. Keys are `OsStr` strings,
+/// which hash far faster than `Path` components in debug builds.
+fn cached_visible_positions(ui: &Ui, id: egui::Id, pane: &Pane) -> Arc<HashMap<OsString, usize>> {
+    type Cached = (u64, Arc<HashMap<OsString, usize>>);
+    let cache_id = id.with("similar-positions");
+    if let Some((rev, positions)) = ui.ctx().data(|d| d.get_temp::<Cached>(cache_id))
+        && rev == pane.listing_rev()
+    {
+        return positions;
+    }
+    let positions: Arc<HashMap<OsString, usize>> = Arc::new(
+        pane.visible
+            .iter()
+            .enumerate()
+            .map(|(vis, &entry_index)| (pane.entries[entry_index].path.as_os_str().to_owned(), vis))
+            .collect(),
+    );
+    ui.ctx().data_mut(|d| {
+        d.insert_temp::<Cached>(cache_id, (pane.listing_rev(), positions.clone()));
+    });
+    positions
 }
 
 /// The grouped layout walks the whole listing, so it is cached per listing and grouping
 /// revision; a 50,000-photo folder would otherwise rebuild it every frame. Stack covers
 /// (highest rating) are chosen per drawn cell by [`stack_cover`].
-fn cached_grid_items(ui: &Ui, id: egui::Id, pane: &Pane) -> Option<Arc<Vec<GridItem>>> {
+fn cached_grid_items(ui: &Ui, id: egui::Id, pane: &Pane) -> Option<Arc<GroupLayout>> {
     if !pane.similar.enabled() || pane.similar.groups().is_empty() {
         return None;
     }
-    type Cached = ((u64, u64), Option<Arc<Vec<GridItem>>>);
+    type Cached = ((u64, u64), Option<Arc<GroupLayout>>);
     let key = (pane.listing_rev(), pane.similar.revision());
     let cache_id = id.with("similar-layout");
-    if let Some((cached, items)) = ui.ctx().data(|d| d.get_temp::<Cached>(cache_id))
+    if let Some((cached, layout)) = ui.ctx().data(|d| d.get_temp::<Cached>(cache_id))
         && cached == key
     {
-        return items;
+        return layout;
     }
-    let items = grouped_grid_items(pane).map(Arc::new);
+    let positions = cached_visible_positions(ui, id, pane);
+    let layout = grouped_grid_items(pane, &positions).map(Arc::new);
     ui.ctx()
-        .data_mut(|d| d.insert_temp::<Cached>(cache_id, (key, items.clone())));
-    items
+        .data_mut(|d| d.insert_temp::<Cached>(cache_id, (key, layout.clone())));
+    layout
 }
 
 /// The highest-rated member of a collapsed stack; the first in listing order on ties.
@@ -1185,79 +1220,89 @@ fn stack_cover(pane: &Pane, thumbs: &dyn ThumbProvider, members: &[usize], first
     best.map_or(first, |(_, vis)| vis)
 }
 
-fn grouped_grid_items(pane: &Pane) -> Option<Vec<GridItem>> {
+fn grouped_grid_items(pane: &Pane, positions: &HashMap<OsString, usize>) -> Option<GroupLayout> {
     if !pane.similar.enabled() || pane.similar.groups().is_empty() {
         return None;
     }
 
-    let visible_position: HashMap<&Path, usize> = pane
-        .visible
-        .iter()
-        .enumerate()
-        .map(|(vis, &entry_index)| (pane.entries[entry_index].path.as_path(), vis))
-        .collect();
-    let mut plans = HashMap::<usize, GroupPlan>::new();
-    let mut grouped_positions = HashSet::new();
+    // Plans and flags are indexed by listing position, so the walk below is array access
+    // rather than hashing. This rebuild runs several times a second while analysis runs.
+    let count = pane.visible.len();
+    let mut plans: Vec<GroupPlan> = Vec::new();
+    let mut plan_at = vec![None::<usize>; count];
+    let mut grouped = vec![false; count];
     for (key, members) in pane.similar.groups() {
-        let visible_members: Vec<usize> = members
+        // Only listed members take part. A hidden or filtered file must not be selected,
+        // dragged or counted with its stack.
+        let mut listed: Vec<(usize, PathBuf)> = members
             .iter()
-            .filter_map(|path| visible_position.get(path.as_path()).copied())
+            .filter_map(|path| {
+                positions
+                    .get(path.as_os_str())
+                    .map(|&vis| (vis, path.clone()))
+            })
             .collect();
-        if visible_members.len() < 2 {
+        if listed.len() < 2 {
             continue;
         }
-        let first = *visible_members.iter().min().expect("two visible members");
-        let representative = first;
-        let mut ordered_visible = visible_members;
-        ordered_visible.sort_unstable();
-        grouped_positions.extend(ordered_visible.iter().copied());
-        plans.insert(
-            first,
-            GroupPlan {
-                key: key.clone(),
-                paths: members.clone(),
-                visible_members: ordered_visible,
-                representative,
-            },
-        );
+        listed.sort_unstable_by_key(|(vis, _)| *vis);
+        let first = listed[0].0;
+        for (vis, _) in &listed {
+            grouped[*vis] = true;
+        }
+        let (visible_members, paths): (Vec<usize>, Vec<PathBuf>) = listed.into_iter().unzip();
+        plan_at[first] = Some(plans.len());
+        plans.push(GroupPlan {
+            key: key.clone(),
+            paths,
+            visible_members,
+        });
     }
     if plans.is_empty() {
         return None;
     }
 
-    let mut items = Vec::with_capacity(pane.visible.len());
-    for vis in 0..pane.visible.len() {
-        if let Some(plan) = plans.remove(&vis) {
+    let mut items = Vec::with_capacity(count);
+    let mut item_of_vis = vec![0; count];
+    for vis in 0..count {
+        if let Some(index) = plan_at[vis] {
+            let plan = &mut plans[index];
             let badge = GroupBadge {
                 key: plan.key.clone(),
                 count: plan.paths.len(),
             };
+            let visible_members = std::mem::take(&mut plan.visible_members);
             if pane.similar.is_expanded(&plan.key) {
-                for (index, member_vis) in plan.visible_members.iter().copied().enumerate() {
+                for (member, member_vis) in visible_members.iter().copied().enumerate() {
+                    item_of_vis[member_vis] = items.len();
                     items.push(GridItem {
                         vis: member_vis,
                         focus_vis: member_vis,
                         activate_vis: member_vis,
                         members: None,
                         visible_members: None,
-                        badge: (index == 0).then(|| badge.clone()),
+                        badge: (member == 0).then(|| badge.clone()),
                     });
                 }
             } else {
+                for &member_vis in &visible_members {
+                    item_of_vis[member_vis] = items.len();
+                }
                 items.push(GridItem {
-                    vis: plan.representative,
+                    vis,
                     focus_vis: vis,
-                    activate_vis: plan.representative,
-                    members: Some(plan.paths),
-                    visible_members: Some(plan.visible_members),
+                    activate_vis: vis,
+                    members: Some(std::mem::take(&mut plan.paths)),
+                    visible_members: Some(visible_members),
                     badge: Some(badge),
                 });
             }
-        } else if !grouped_positions.contains(&vis) {
+        } else if !grouped[vis] {
+            item_of_vis[vis] = items.len();
             items.push(GridItem::plain(vis));
         }
     }
-    Some(items)
+    Some(GroupLayout { items, item_of_vis })
 }
 
 fn group_row_click(
@@ -1324,7 +1369,9 @@ pub fn grid(
     }
     // Stretch cells to fill the row exactly.
     let cell_w = width / per_row as f32;
-    let n = grid_items.as_ref().map_or(pane.visible.len(), |items| items.len());
+    let n = grid_items
+        .as_ref()
+        .map_or(pane.visible.len(), |layout| layout.items.len());
     let rows = n.div_ceil(per_row);
     pane_grid_columns_store(ui, id, per_row);
 
@@ -1347,19 +1394,12 @@ pub fn grid(
         .auto_shrink([false, false]);
     if pane.scroll_to_cursor {
         if let Some(c) = pane.cursor {
-            let row = grid_items
+            // The cell that shows the cursor's entry, looked up in the cached layout.
+            let cell_index = grid_items
                 .as_ref()
-                .and_then(|items| {
-                    items.iter().position(|item| {
-                        item.vis == c
-                            || item
-                                .visible_members
-                                .as_ref()
-                                .is_some_and(|members| members.contains(&c))
-                    })
-                })
-                .unwrap_or(c)
-                / per_row;
+                .and_then(|layout| layout.item_of_vis.get(c).copied())
+                .unwrap_or(c);
+            let row = cell_index / per_row;
             let off = ui
                 .ctx()
                 .data(|d| d.get_temp::<f32>(id.with("goff")))
@@ -1388,8 +1428,8 @@ pub fn grid(
                 for col in 0..per_row {
                     let display_index = row * per_row + col;
                     let plain_item;
-                    let item = if let Some(items) = &grid_items {
-                        let Some(item) = items.get(display_index) else {
+                    let item = if let Some(layout) = &grid_items {
+                        let Some(item) = layout.items.get(display_index) else {
                             break;
                         };
                         item
@@ -1826,5 +1866,123 @@ mod accessibility_tests {
         assert_eq!(unselected_node.1.is_selected(), Some(false));
 
         output.drop_without_applying_deltas();
+    }
+}
+
+#[cfg(test)]
+mod grouped_grid_tests {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use forge_core::listing::SortSpec;
+    use forge_core::{FileEntry, model::EntryKind};
+
+    use super::{GroupLayout, grouped_grid_items};
+    use crate::{pane::Pane, settings::ViewMode};
+
+    fn photo(dir: &Path, name: &str, hidden: bool) -> FileEntry {
+        FileEntry {
+            path: dir.join(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            created: None,
+            hidden,
+            readonly: false,
+            system: false,
+            ext: "jpg".into(),
+        }
+    }
+
+    /// A grouping pane whose listing is `entries`, with one group anchored by `members[0]`.
+    fn grouped(dir: &tempfile::TempDir, entries: Vec<FileEntry>, members: &[PathBuf]) -> Pane {
+        let mut pane = Pane::new(
+            dir.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Grid,
+        );
+        pane.entries = entries;
+        pane.rebuild_visible();
+        pane.similar.toggle();
+        pane.similar
+            .insert_group_for_test(members[0].clone(), members.to_vec());
+        pane
+    }
+
+    fn grid_layout(pane: &Pane) -> Option<GroupLayout> {
+        let positions: HashMap<OsString, usize> = pane
+            .visible
+            .iter()
+            .enumerate()
+            .map(|(vis, &i)| (pane.entries[i].path.as_os_str().to_owned(), vis))
+            .collect();
+        grouped_grid_items(pane, &positions)
+    }
+
+    #[test]
+    fn stack_counts_and_selects_only_the_members_the_listing_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = photo(dir.path(), "burst-1.jpg", false);
+        let hidden = photo(dir.path(), "burst-2.jpg", true);
+        let third = photo(dir.path(), "burst-3.jpg", false);
+        let members = [first.path.clone(), hidden.path.clone(), third.path.clone()];
+        let pane = grouped(&dir, vec![first.clone(), hidden, third.clone()], &members);
+
+        let layout = grid_layout(&pane).expect("two listed members form a stack");
+        assert_eq!(layout.items.len(), 1);
+        let stack = &layout.items[0];
+        assert_eq!(stack.members, Some(vec![first.path, third.path]));
+        assert_eq!(stack.visible_members, Some(vec![0, 1]));
+        assert_eq!(stack.badge.as_ref().map(|badge| badge.count), Some(2));
+    }
+
+    #[test]
+    fn expanded_stack_shows_only_listed_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = photo(dir.path(), "burst-1.jpg", false);
+        let hidden = photo(dir.path(), "burst-2.jpg", true);
+        let third = photo(dir.path(), "burst-3.jpg", false);
+        let members = [first.path.clone(), hidden.path.clone(), third.path.clone()];
+        let mut pane = grouped(&dir, vec![first, hidden, third], &members);
+        assert!(pane.similar.set_expanded(members[0].clone(), true));
+
+        let layout = grid_layout(&pane).expect("expanded stack");
+        let shown: Vec<usize> = layout.items.iter().map(|item| item.vis).collect();
+        assert_eq!(shown, vec![0, 1]);
+        assert!(layout.items.iter().all(|item| item.members.is_none()));
+    }
+
+    #[test]
+    fn group_with_one_listed_member_is_not_a_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = photo(dir.path(), "burst-1.jpg", false);
+        let hidden = photo(dir.path(), "burst-2.jpg", true);
+        let members = [first.path.clone(), hidden.path.clone()];
+        let pane = grouped(&dir, vec![first, hidden], &members);
+
+        assert!(grid_layout(&pane).is_none());
+    }
+
+    #[test]
+    fn every_listing_position_maps_to_the_cell_that_shows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = photo(dir.path(), "a-before.jpg", false);
+        let first = photo(dir.path(), "b-1.jpg", false);
+        let second = photo(dir.path(), "b-2.jpg", false);
+        let after = photo(dir.path(), "c-after.jpg", false);
+        let members = [first.path.clone(), second.path.clone()];
+        let mut pane = grouped(&dir, vec![before, first, second, after], &members);
+
+        let collapsed = grid_layout(&pane).expect("stack");
+        assert_eq!(collapsed.items.len(), 3);
+        assert_eq!(collapsed.item_of_vis, vec![0, 1, 1, 2]);
+
+        assert!(pane.similar.set_expanded(members[0].clone(), true));
+        let expanded = grid_layout(&pane).expect("expanded stack");
+        assert_eq!(expanded.items.len(), 4);
+        assert_eq!(expanded.item_of_vis, vec![0, 1, 2, 3]);
     }
 }

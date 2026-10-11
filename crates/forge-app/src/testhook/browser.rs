@@ -7,10 +7,11 @@
 //! - `wait [seconds]`: wait for capture-time and thumbnail analysis to finish (30 s default,
 //!   300 s maximum).
 //! - `assert-groups <count>`: assert the number of multi-image groups.
-//! - `assert-members <anchor> | <name1>, <name2>`: assert a group's exact member names.
+//! - `assert-members <anchor> | <name1>, <name2>`: assert a group's exact member names. Only
+//!   files the listing shows count: hidden and filtered members are not part of a stack.
 //! - `expand <anchor>` / `collapse <anchor>`: change a stack's display state.
 //! - `assert-expanded <anchor>` / `assert-collapsed <anchor>`: verify that display state.
-//! - `select-group <anchor>`: select every file represented by the group.
+//! - `select-group <anchor>`: select every listed file represented by the group.
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
@@ -167,19 +168,21 @@ fn timeout(args: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// The group anchored by, or containing, `name`, with its listed members.
 fn group_named(app: &ZxrawApp, name: &str) -> Result<(PathBuf, Vec<PathBuf>), String> {
-    let grouping = &app.pane().similar;
-    if !grouping.complete() && grouping.groups().is_empty() {
+    let pane = app.pane();
+    if !pane.similar.complete() && pane.similar.groups().is_empty() {
         return Err("grouping has not produced any groups yet".into());
     }
-    grouping
+    pane.similar
         .groups()
         .iter()
+        .map(|(key, members)| (key, pane.visible_group_paths(members)))
         .find(|(key, members)| {
             filename_matches(key, name)
                 || members.iter().any(|member| filename_matches(member, name))
         })
-        .map(|(key, members)| (key.clone(), members.clone()))
+        .map(|(key, members)| (key.clone(), members))
         .ok_or_else(|| format!("no group contains or is anchored by `{name}`"))
 }
 
