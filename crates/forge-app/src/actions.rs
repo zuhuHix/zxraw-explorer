@@ -763,6 +763,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::ops_ui::jobs_window(app, ui.ctx());
     crate::search_ui::window(app, ui.ctx());
     crate::ingest_ui::window(app, ui.ctx());
+    crate::tags_ui::window(app, ui.ctx());
     crate::tools_ui::windows(app, ui.ctx());
     crate::settings_ui::window(app, ui.ctx());
     crate::collections_ui::window(app, ui.ctx());

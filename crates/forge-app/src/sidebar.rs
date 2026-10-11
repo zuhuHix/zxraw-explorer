@@ -1,6 +1,8 @@
 //! Navigation sidebar: quick access, bookmarks, drives.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +26,111 @@ pub struct Drive {
 pub struct SidebarState {
     pub drives: Arc<Mutex<Vec<Drive>>>,
     pub known: Vec<(String, PathBuf)>,
+    pub cards: CardWatch,
+}
+
+/// Watches removable drives for inserted cards and decides which ones get an import prompt.
+/// The suppression rules live here as plain bookkeeping so they can be tested without the OS;
+/// the DCIM/PRIVATE check itself runs on a worker thread (see [`CardWatch::tick`]).
+pub struct CardWatch {
+    /// Removable roots seen on the previous observation.
+    present: HashSet<PathBuf>,
+    /// Roots the user dismissed ("Not now" or imported). Cleared when the card is removed.
+    dismissed: HashSet<PathBuf>,
+    /// Cards whose camera-folder check is running.
+    pending: HashMap<PathBuf, Drive>,
+    results_tx: Sender<(PathBuf, bool)>,
+    results_rx: Receiver<(PathBuf, bool)>,
+    /// Cards that have a camera folder and are waiting for an answer.
+    pub prompts: Vec<Drive>,
+}
+
+impl Default for CardWatch {
+    fn default() -> Self {
+        let (results_tx, results_rx) = mpsc::channel();
+        Self {
+            present: HashSet::new(),
+            dismissed: HashSet::new(),
+            pending: HashMap::new(),
+            results_tx,
+            results_rx,
+            prompts: Vec::new(),
+        }
+    }
+}
+
+impl CardWatch {
+    /// Feed the current removable, available drives. Returns the cards that just arrived and
+    /// need a camera-folder check. Removal forgets the card, so re-inserting it prompts again.
+    fn observe(&mut self, cards: &[Drive]) -> Vec<Drive> {
+        let current: HashSet<PathBuf> = cards.iter().map(|d| d.root.clone()).collect();
+        for gone in self.present.difference(&current) {
+            self.dismissed.remove(gone);
+            self.pending.remove(gone);
+            self.prompts.retain(|p| &p.root != gone);
+        }
+        let arrived = cards
+            .iter()
+            .filter(|d| !self.present.contains(&d.root))
+            .cloned()
+            .collect::<Vec<_>>();
+        for card in &arrived {
+            self.pending.insert(card.root.clone(), card.clone());
+        }
+        self.present = current;
+        arrived
+    }
+
+    /// Record a finished check. Only a card that is still present, has a camera folder and was
+    /// not dismissed gets a prompt; results for removed cards are dropped.
+    fn finish(&mut self, root: &Path, has_camera_folder: bool) {
+        let Some(card) = self.pending.remove(root) else {
+            return;
+        };
+        if has_camera_folder && self.present.contains(root) && !self.dismissed.contains(root) {
+            self.prompts.push(card);
+        }
+    }
+
+    /// Hide the prompt for `root` and stay quiet about it until the card is removed.
+    pub fn dismiss(&mut self, root: &Path) {
+        self.prompts.retain(|p| p.root != root);
+        self.dismissed.insert(root.to_path_buf());
+    }
+
+    /// Start checks for newly arrived cards and apply finished ones. Never blocks: the
+    /// directory reads happen on short-lived worker threads.
+    pub fn tick(&mut self, drives: &[Drive], ctx: &egui::Context) {
+        let cards: Vec<Drive> = drives
+            .iter()
+            .filter(|d| d.kind == "Removable" && d.available)
+            .cloned()
+            .collect();
+        for card in self.observe(&cards) {
+            let tx = self.results_tx.clone();
+            let repaint = ctx.clone();
+            let root = card.root.clone();
+            let spawned = std::thread::Builder::new()
+                .name("card-check".into())
+                .spawn(move || {
+                    let _ = tx.send((root.clone(), has_camera_folder(&root)));
+                    repaint.request_repaint();
+                });
+            if spawned.is_err() {
+                self.pending.remove(&card.root);
+            }
+        }
+        while let Ok((root, has_camera_folder)) = self.results_rx.try_recv() {
+            self.finish(&root, has_camera_folder);
+        }
+    }
+}
+
+/// True when the card root holds a DCIM or PRIVATE folder (the usual camera layout).
+pub fn has_camera_folder(root: &Path) -> bool {
+    ["DCIM", "PRIVATE"]
+        .iter()
+        .any(|name| crate::ingest_ui::find_child_directory(root, name).is_some())
 }
 
 impl SidebarState {
@@ -58,6 +165,7 @@ impl SidebarState {
         Self {
             drives,
             known: crate::platform::known_folders(),
+            cards: CardWatch::default(),
         }
     }
 }
@@ -216,4 +324,95 @@ fn section(ui: &mut Ui, title: &str) {
             .strong()
             .color(theme::muted(ui)),
     );
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+
+    fn card(root: &str) -> Drive {
+        Drive {
+            root: PathBuf::from(root),
+            label: "CARD".into(),
+            kind: "Removable",
+            total: 0,
+            free: 0,
+            available: true,
+        }
+    }
+
+    fn roots(cards: &[Drive]) -> Vec<PathBuf> {
+        cards.iter().map(|c| c.root.clone()).collect()
+    }
+
+    #[test]
+    fn arrival_requests_one_check() {
+        let mut watch = CardWatch::default();
+        let e = card(r"E:\");
+        assert_eq!(roots(&watch.observe(std::slice::from_ref(&e))), vec![e.root.clone()]);
+        assert!(watch.observe(std::slice::from_ref(&e)).is_empty());
+    }
+
+    #[test]
+    fn camera_folder_prompts_and_plain_card_does_not() {
+        let mut watch = CardWatch::default();
+        let (e, f) = (card(r"E:\"), card(r"F:\"));
+        watch.observe(&[e.clone(), f.clone()]);
+        watch.finish(&e.root, true);
+        watch.finish(&f.root, false);
+        assert_eq!(roots(&watch.prompts), vec![e.root]);
+    }
+
+    #[test]
+    fn dismissed_card_stays_quiet_until_removed() {
+        let mut watch = CardWatch::default();
+        let e = card(r"E:\");
+        watch.observe(std::slice::from_ref(&e));
+        watch.finish(&e.root, true);
+        watch.dismiss(&e.root);
+        assert!(watch.prompts.is_empty());
+
+        // Still inserted: no new check, so no prompt even if a late result arrives.
+        assert!(watch.observe(std::slice::from_ref(&e)).is_empty());
+        watch.finish(&e.root, true);
+        assert!(watch.prompts.is_empty());
+
+        // Removed, then inserted again: it is a new card and prompts again.
+        assert!(watch.observe(&[]).is_empty());
+        assert_eq!(roots(&watch.observe(std::slice::from_ref(&e))), vec![e.root.clone()]);
+        watch.finish(&e.root, true);
+        assert_eq!(roots(&watch.prompts), vec![e.root]);
+    }
+
+    #[test]
+    fn removal_before_check_finishes_drops_the_prompt() {
+        let mut watch = CardWatch::default();
+        let e = card(r"E:\");
+        watch.observe(std::slice::from_ref(&e));
+        assert!(watch.observe(&[]).is_empty());
+        watch.finish(&e.root, true);
+        assert!(watch.prompts.is_empty());
+    }
+
+    #[test]
+    fn removal_clears_an_open_prompt() {
+        let mut watch = CardWatch::default();
+        let e = card(r"E:\");
+        watch.observe(std::slice::from_ref(&e));
+        watch.finish(&e.root, true);
+        assert_eq!(watch.prompts.len(), 1);
+        watch.observe(&[]);
+        assert!(watch.prompts.is_empty());
+    }
+
+    #[test]
+    fn dismissing_one_card_leaves_others_prompting() {
+        let mut watch = CardWatch::default();
+        let (e, f) = (card(r"E:\"), card(r"F:\"));
+        watch.observe(&[e.clone(), f.clone()]);
+        watch.finish(&e.root, true);
+        watch.finish(&f.root, true);
+        watch.dismiss(&e.root);
+        assert_eq!(roots(&watch.prompts), vec![f.root]);
+    }
 }

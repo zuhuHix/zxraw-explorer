@@ -360,9 +360,59 @@ impl IngestState {
     }
 }
 
+/// Open the ingest window with `path` (a card root) as its source. Camera folders are picked the
+/// same way as "Use this card": DCIM/PRIVATE if present, otherwise the root itself.
+pub fn open_with_source(app: &mut ZxrawApp, path: &Path) {
+    let ctx = app.ops.ctx.clone();
+    let state = &mut app.ops.ingest;
+    state.open = true;
+    state.start_card_detection(path, &ctx);
+}
+
+/// Non-modal "card detected" prompts, one per card that has a DCIM/PRIVATE folder. Drive
+/// detection and the camera-folder check run off the UI thread; see `sidebar::CardWatch`.
+fn card_prompts(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let drives = app.sidebar.drives.lock().clone();
+    app.sidebar.cards.tick(&drives, ctx);
+    let prompts = app.sidebar.cards.prompts.clone();
+    for (index, card) in prompts.iter().enumerate() {
+        let drive = card.root.display().to_string();
+        let drive = drive.trim_end_matches('\\');
+        let heading = if card.label.is_empty() {
+            format!("Card detected: {drive}")
+        } else {
+            format!("Card detected: {} ({drive})", card.label)
+        };
+        let mut import = false;
+        let mut not_now = false;
+        egui::Window::new(format!("card-prompt-{}", card.root.display()))
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                [-14.0, -44.0 - index as f32 * 88.0],
+            )
+            .show(ctx, |ui| {
+                ui.label(RichText::new(heading).strong());
+                ui.horizontal(|ui| {
+                    import = ui.button("Import media…").clicked();
+                    not_now = ui.button("Not now").clicked();
+                });
+            });
+        if import {
+            app.sidebar.cards.dismiss(&card.root);
+            open_with_source(app, &card.root);
+        } else if not_now {
+            app.sidebar.cards.dismiss(&card.root);
+        }
+    }
+}
+
 /// Called each frame by the app shell. Planning, metadata reads, copying, verification and
 /// deep format-safety checking all happen on worker threads.
 pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
+    card_prompts(app, ctx);
     let config_file = app.paths.config.join("ingest.json");
     let cached_drives = app
         .sidebar
@@ -993,7 +1043,7 @@ fn detect_card_sources(root: &Path) -> Vec<PathBuf> {
     detected
 }
 
-fn find_child_directory(root: &Path, expected: &str) -> Option<PathBuf> {
+pub(crate) fn find_child_directory(root: &Path, expected: &str) -> Option<PathBuf> {
     std::fs::read_dir(root)
         .ok()?
         .filter_map(Result::ok)
@@ -1241,6 +1291,11 @@ mod tests {
         );
         let copied = &completion.report.verified[0].dest;
         assert_eq!(fs::read(copied).unwrap(), b"verified media");
+        // The job thread sets its final state just after sending the report; wait briefly.
+        let t0 = std::time::Instant::now();
+        while !job.state().is_finished() && t0.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(job.state().is_finished());
         fs::remove_dir_all(root).unwrap();
     }
