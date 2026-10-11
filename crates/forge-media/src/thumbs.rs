@@ -587,17 +587,50 @@ fn store_cached(dir: &Path, k: &CacheKey, img: &ThumbImage, quality: u8) -> Resu
     };
     // Write a private temp file, then publish it. Readers only look at `.jpg`/`.png` names,
     // so a temp file left by a crash is never read as a thumbnail.
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp = target.with_extension(format!(
-        "tmp{}-{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    if let Err(e) = std::fs::write(&tmp, &buf) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(MediaError::io(&tmp, e));
-    }
+    let tmp = write_new_temp(&target, &buf)?;
     publish_new(&tmp, &target)
+}
+
+/// Writes `bytes` to a fresh temp file beside `target`. The file is created with
+/// `create_new`: temp names repeat across runs (pid and sequence), and writing through an
+/// existing file or hard link at that name would modify whatever it points to. A taken
+/// name is skipped, and only a file this call created is ever removed.
+fn write_new_temp(target: &Path, bytes: &[u8]) -> Result<PathBuf> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    write_new_temp_with(target, bytes, || TMP_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+fn write_new_temp_with(
+    target: &Path,
+    bytes: &[u8],
+    mut next_seq: impl FnMut() -> u64,
+) -> Result<PathBuf> {
+    use std::io::Write;
+    for _ in 0..64 {
+        let tmp = target.with_extension(format!("tmp{}-{}", std::process::id(), next_seq()));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(MediaError::io(&tmp, e)),
+        };
+        if let Err(e) = file.write_all(bytes) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(MediaError::io(&tmp, e));
+        }
+        return Ok(tmp);
+    }
+    Err(MediaError::io(
+        target,
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "no free temp name beside the cache entry",
+        ),
+    ))
 }
 
 /// Moves a finished temp file to `target` without replacing an existing entry
@@ -941,6 +974,29 @@ mod tests {
         assert!(c.bytes <= c.budget);
         assert!(c.get(&[9; 32]).is_some());
         assert!(c.get(&[0; 32]).is_none());
+    }
+
+    #[test]
+    fn temp_write_never_writes_through_an_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        std::fs::write(&source, b"original photo").unwrap();
+        let target = dir.path().join("entry.jpg");
+        // Occupy the first temp names with hard links to the photo, as a stale run with
+        // the same pid or a hostile cache folder could.
+        for seq in 0..8 {
+            let name = target.with_extension(format!("tmp{}-{seq}", std::process::id()));
+            std::fs::hard_link(&source, &name).unwrap();
+        }
+        let mut seq = 0;
+        let tmp = write_new_temp_with(&target, b"thumbnail bytes", || {
+            seq += 1;
+            seq - 1
+        })
+        .unwrap();
+        assert!(tmp.to_string_lossy().ends_with("-8"), "{}", tmp.display());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"thumbnail bytes");
+        assert_eq!(std::fs::read(&source).unwrap(), b"original photo");
     }
 
     #[test]
