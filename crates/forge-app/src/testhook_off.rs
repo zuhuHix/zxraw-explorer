@@ -23,3 +23,9 @@ pub fn env_requests_automation() -> bool {
 pub fn raw_input(_app: &mut crate::app::ZxrawApp, _raw: &mut egui::RawInput) {}
 
 pub fn tick(_app: &mut crate::app::ZxrawApp, _ctx: &egui::Context) {}
+
+#[inline(always)]
+pub(crate) fn note_entry_rect(_ui: &egui::Ui, _path: &std::path::Path, _rect: egui::Rect) {}
+
+#[inline(always)]
+pub(crate) fn note_view_rect(_ui: &egui::Ui, _rect: egui::Rect) {}

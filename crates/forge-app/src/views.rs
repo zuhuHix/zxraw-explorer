@@ -877,6 +877,11 @@ pub fn details(
 
     let previous_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing.y = 0.0;
+    // Register the background before the rows so every row sits above it. Registered after,
+    // egui only lets a row win when the background fully contains it, which fractional
+    // display scaling breaks by a fraction of a pixel: every click then hit the background.
+    let background = ui.interact(ui.available_rect_before_wrap(), id.with("bg"), Sense::click());
+    crate::testhook::note_view_rect(ui, background.rect);
     let sa = scroll.show_rows(ui, row_h, n, |ui, range| {
         for vis in range {
             let Some(&entry_index) = pane.visible.get(vis) else {
@@ -887,6 +892,7 @@ pub fn details(
             let selected = pane.is_selected(entry);
             let (rect, response) =
                 ui.allocate_exact_size(vec2(table_width, row_h), Sense::click_and_drag());
+            crate::testhook::note_entry_rect(ui, &entry.path, rect);
             let response = response.on_hover_cursor(egui::CursorIcon::Default);
             let painter = ui.painter_at(rect);
             let drop_hover = if entry.kind != EntryKind::File {
@@ -1069,7 +1075,6 @@ pub fn details(
     ui.ctx()
         .accesskit_node_builder(sa.id, |node| node.set_role(egui::accesskit::Role::List));
 
-    let background = ui.interact(sa.inner_rect, id.with("bg"), Sense::click());
     background_interactions(ui, &background, pane, &mut out);
     out
 }
@@ -1374,6 +1379,9 @@ pub fn grid(
     }
     let prev_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing = Vec2::ZERO;
+    // See `details`: the background must be registered before the tiles.
+    let bg = ui.interact(ui.available_rect_before_wrap(), id.with("bg"), Sense::click());
+    crate::testhook::note_view_rect(ui, bg.rect);
     let sa = scroll.show_rows(ui, cell.y, rows, |ui, range| {
         for row in range {
             ui.horizontal(|ui| {
@@ -1403,6 +1411,7 @@ pub fn grid(
                     };
                     let (rect, resp) =
                         ui.allocate_exact_size(vec2(cell_w, cell.y), Sense::click_and_drag());
+                    crate::testhook::note_entry_rect(ui, &pane.entries[ei].path, rect);
                     if !ui.is_rect_visible(rect) {
                         continue;
                     }
@@ -1614,7 +1623,6 @@ pub fn grid(
         .data_mut(|d| d.insert_temp(id.with("goff"), sa.state.offset.y));
     ui.ctx()
         .accesskit_node_builder(sa.id, |node| node.set_role(egui::accesskit::Role::Grid));
-    let bg = ui.interact(sa.inner_rect, id.with("bg"), Sense::click());
     background_interactions(ui, &bg, pane, &mut out);
     out
 }

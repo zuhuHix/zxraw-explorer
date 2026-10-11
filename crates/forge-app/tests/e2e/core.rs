@@ -2,7 +2,7 @@
 //! session restore, and the script hook's own generic verbs.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::*;
 
@@ -402,4 +402,62 @@ fn crash_report_from_the_last_session_is_announced_once() {
     if let Ok(keep) = std::env::var("ZXFR_SHOTS") {
         let _ = fs::copy(&shot, PathBuf::from(keep).join("crash-notice.png"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Real pointer clicks on rows and tiles. Positions come from where the view drew each
+// entry (in points), so these hold at fractional display scaling: at 1.2 the view's
+// background widget used to sit above the rows and swallow every click.
+// ---------------------------------------------------------------------------
+
+fn folder_with_subfolder(sandbox: &Path) -> (PathBuf, PathBuf) {
+    let dir = sandbox.join("work");
+    let sub = dir.join("Shoot 2024");
+    fs::create_dir_all(&sub).unwrap();
+    write_file(&sub.join("inside.txt"), b"x");
+    write_file(&dir.join("notes.txt"), b"y");
+    (dir, sub)
+}
+
+fn click_scenario(view: &str, steps: &str) {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (dir, sub) = folder_with_subfolder(sandbox.path());
+    let script = format!(
+        "navigate {dir}\ncmd {view}\nwait-frames 5\n{steps}\nwait-entry inside.txt\nassert-path {sub}\nexit\n",
+        dir = shown(&dir),
+        sub = shown(&sub),
+    );
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn double_clicking_a_folder_row_opens_it() {
+    click_scenario("ViewDetails", "double-click-entry Shoot 2024");
+}
+
+#[test]
+fn double_clicking_a_folder_tile_opens_it() {
+    click_scenario("ViewGrid", "double-click-entry Shoot 2024");
+}
+
+#[test]
+fn clicking_a_folder_row_then_enter_opens_it() {
+    click_scenario(
+        "ViewDetails",
+        "click-entry Shoot 2024\nassert-selected 1\nkey Enter",
+    );
+}
+
+#[test]
+fn clicking_empty_space_below_the_rows_clears_the_selection() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (dir, _) = folder_with_subfolder(sandbox.path());
+    let script = format!(
+        "navigate {dir}\ncmd ViewDetails\nwait-frames 5\nclick-entry notes.txt\nassert-selected 1\n\
+         click-empty\nassert-selected 0\nassert-path {dir}\nexit\n",
+        dir = shown(&dir),
+    );
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+    expect_ok(&outcome);
 }
