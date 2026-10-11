@@ -373,6 +373,15 @@ thread_local! {
         RefCell::new(None);
 }
 
+#[cfg(test)]
+type BeforeMoveRenameHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook after a Replace choice but before the same-volume move rename.
+    static BEFORE_MOVE_RENAME: RefCell<Option<BeforeMoveRenameHook>> = RefCell::new(None);
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CopyFileOptions {
     /// Replace an existing destination file. Without this the copy fails with
@@ -417,7 +426,18 @@ pub fn copy_file_atomic(
 ) -> Result<CopyOutcome> {
     let mut counted = 0;
     let mut dest = dest.to_path_buf();
-    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false, None)
+    copy_file_counted(
+        src,
+        &mut dest,
+        opts,
+        ctx,
+        &mut counted,
+        Publish {
+            keep_both: false,
+            still_ok: None,
+            still_ok_message: None,
+        },
+    )
 }
 
 /// [`copy_file_atomic`] that asks `still_ok` right before the finished, verified copy is
@@ -433,7 +453,18 @@ pub fn copy_file_atomic_guarded(
 ) -> Result<CopyOutcome> {
     let mut counted = 0;
     let mut dest = dest.to_path_buf();
-    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false, Some(still_ok))
+    copy_file_counted(
+        src,
+        &mut dest,
+        opts,
+        ctx,
+        &mut counted,
+        Publish {
+            keep_both: false,
+            still_ok: Some(still_ok),
+            still_ok_message: Some("destination changed since preview; it was not overwritten"),
+        },
+    )
 }
 
 fn copy_file_counted(
@@ -442,8 +473,7 @@ fn copy_file_counted(
     opts: CopyFileOptions,
     ctx: &JobCtx<'_>,
     counted: &mut u64,
-    keep_both: bool,
-    still_ok: Option<&dyn Fn() -> bool>,
+    publish: Publish<'_>,
 ) -> Result<CopyOutcome> {
     let f = File::open(src).map_err(|e| CoreError::io(src, e))?;
     let md = f.metadata().map_err(|e| CoreError::io(src, e))?;
@@ -463,8 +493,15 @@ fn copy_file_counted(
         limit: None,
         attributes,
     };
-    let publish = Publish { keep_both, still_ok };
-    stream_into_place(fault::reader(f, src), src, dest, sopts, ctx, counted, publish)
+    stream_into_place(
+        fault::reader(f, src),
+        src,
+        dest,
+        sopts,
+        ctx,
+        counted,
+        publish,
+    )
 }
 
 /// Write an arbitrary stream (e.g. an archive entry) to `dest` with the same temp-file +
@@ -494,6 +531,7 @@ pub(crate) fn write_stream_placed<R: Read>(
     let publish = Publish {
         keep_both,
         still_ok: None,
+        still_ok_message: None,
     };
     let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
     Ok((out, placed))
@@ -504,6 +542,7 @@ pub(crate) fn write_stream_placed<R: Read>(
 struct Publish<'a> {
     keep_both: bool,
     still_ok: Option<&'a dyn Fn() -> bool>,
+    still_ok_message: Option<&'a str>,
 }
 
 fn stream_into_place<R: Read>(
@@ -518,6 +557,7 @@ fn stream_into_place<R: Read>(
     let Publish {
         keep_both,
         still_ok,
+        still_ok_message,
     } = publish;
     let dir = dest
         .parent()
@@ -600,10 +640,9 @@ fn stream_into_place<R: Read>(
     if let Some(still_ok) = still_ok
         && !still_ok()
     {
-        return Err(CoreError::Invalid(format!(
-            "{} changed while it was being copied; it was not overwritten",
-            dest.display()
-        )));
+        let message = still_ok_message
+            .unwrap_or("destination changed while it was being copied; it was not overwritten");
+        return Err(CoreError::Invalid(format!("{}: {message}", dest.display())));
     }
     let mut placed = false;
     for _ in 0..1024 {
@@ -1135,9 +1174,36 @@ enum Placement {
     New(PathBuf),
     KeepBoth(PathBuf),
     Merge(PathBuf),
-    Overwrite(PathBuf),
+    Overwrite(PathBuf, ReplaceState),
     Skip(String),
     Fail(String),
+}
+
+/// Metadata observed when a Replace decision is presented. It is checked again immediately
+/// before an overwrite is published so a later save at the destination is preserved.
+#[derive(Debug, Clone, Copy)]
+struct ReplaceState {
+    kind: NodeKind,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+impl ReplaceState {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            kind: node_kind(metadata),
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        }
+    }
+
+    fn still_matches(self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            node_kind(&metadata) == self.kind
+                && metadata.len() == self.size
+                && metadata.modified().ok() == self.modified
+        })
+    }
 }
 
 struct Executor<'p, 'c, 'r> {
@@ -1269,6 +1335,9 @@ impl Executor<'_, '_, '_> {
             return Ok(Placement::New(dest));
         };
         let dkind = node_kind(&dmd);
+        // Capture before asking the resolver: it may wait while another app saves a new
+        // version, and Replace must apply only to the item described in this prompt.
+        let replace_state = ReplaceState::from_metadata(&dmd);
         if item.kind == NodeKind::Dir && dkind == NodeKind::Dir {
             if is_root && self.policy == ConflictPolicy::KeepBoth {
                 return Ok(Placement::KeepBoth(Self::unique(&dest, item.kind)));
@@ -1312,7 +1381,7 @@ impl Executor<'_, '_, '_> {
                         kind_word(item.kind)
                     ))
                 } else {
-                    Placement::Overwrite(dest)
+                    Placement::Overwrite(dest, replace_state)
                 }
             }
             ConflictDecision::Cancel => unreachable!("handled in decide"),
@@ -1458,7 +1527,7 @@ impl Executor<'_, '_, '_> {
                     self.consume(items);
                     return Ok(());
                 }
-                Placement::Overwrite(_) => unreachable!("folders are never overwritten"),
+                Placement::Overwrite(_, _) => unreachable!("folders are never overwritten"),
             };
         self.ctx.progress.add_items(1);
 
@@ -1501,7 +1570,7 @@ impl Executor<'_, '_, '_> {
                                 self.fail(&src, r);
                                 blocked.push(&item.rel);
                             }
-                            Placement::Overwrite(_) => {
+                            Placement::Overwrite(_, _) => {
                                 unreachable!("folders are never overwritten")
                             }
                         }
@@ -1558,26 +1627,43 @@ impl Executor<'_, '_, '_> {
             self.consume(std::slice::from_ref(item));
             return Ok(true);
         }
-        let (mut dest, overwrite, keep_both) = match self.placement(src, item, dest, is_root)? {
-            Placement::New(p) => (p, false, self.policy == ConflictPolicy::KeepBoth),
-            Placement::KeepBoth(p) => (p, false, true),
-            Placement::Overwrite(p) => (p, true, false),
-            Placement::Skip(r) => {
-                self.skip(src, r);
-                self.consume(std::slice::from_ref(item));
-                return Ok(false);
-            }
-            Placement::Fail(r) => {
-                self.fail(src, r);
-                self.consume(std::slice::from_ref(item));
-                return Ok(false);
-            }
-            Placement::Merge(_) => unreachable!("files never merge"),
-        };
+        let (mut dest, overwrite, keep_both, replace_state) =
+            match self.placement(src, item, dest, is_root)? {
+                Placement::New(p) => (p, false, self.policy == ConflictPolicy::KeepBoth, None),
+                Placement::KeepBoth(p) => (p, false, true, None),
+                Placement::Overwrite(p, state) => (p, true, false, Some(state)),
+                Placement::Skip(r) => {
+                    self.skip(src, r);
+                    self.consume(std::slice::from_ref(item));
+                    return Ok(false);
+                }
+                Placement::Fail(r) => {
+                    self.fail(src, r);
+                    self.consume(std::slice::from_ref(item));
+                    return Ok(false);
+                }
+                Placement::Merge(_) => unreachable!("files never merge"),
+            };
         self.ctx.progress.set_current(src.display().to_string());
         let mv = self.is_move();
         if self.try_rename {
             loop {
+                if overwrite {
+                    #[cfg(test)]
+                    BEFORE_MOVE_RENAME.with(|hook| {
+                        if let Some(f) = &*hook.borrow() {
+                            f(&dest);
+                        }
+                    });
+                    if !replace_state.is_some_and(|state| state.still_matches(&dest)) {
+                        self.fail(
+                            src,
+                            "destination changed after you chose Replace; not overwritten",
+                        );
+                        self.consume(std::slice::from_ref(item));
+                        return Ok(false);
+                    }
+                }
                 if overwrite {
                     let _ = clear_readonly(&dest);
                 }
@@ -1626,7 +1712,22 @@ impl Executor<'_, '_, '_> {
             want_hash: false,
         };
         let mut counted = 0;
-        let res = copy_file_counted(src, &mut dest, opts, self.ctx, &mut counted, keep_both, None);
+        let replace_guard_path = dest.clone();
+        let replace_still_ok =
+            move || replace_state.is_some_and(|state| state.still_matches(&replace_guard_path));
+        let res = copy_file_counted(
+            src,
+            &mut dest,
+            opts,
+            self.ctx,
+            &mut counted,
+            Publish {
+                keep_both,
+                still_ok: overwrite.then_some(&replace_still_ok as &dyn Fn() -> bool),
+                still_ok_message: overwrite
+                    .then_some("destination changed after you chose Replace; not overwritten"),
+            },
+        );
         self.ctx.progress.add_items(1);
         match res {
             Ok(out) => {
@@ -1695,7 +1796,7 @@ impl Executor<'_, '_, '_> {
                 self.fail(src, r);
                 return Ok(false);
             }
-            Placement::Overwrite(_) => {
+            Placement::Overwrite(_, _) => {
                 self.skip(src, "replacing existing items with a link is not supported");
                 return Ok(false);
             }
@@ -2131,6 +2232,98 @@ mod tests {
         let (f, _) = conflict_fx(ConflictPolicy::Ask, true);
         assert_eq!(fs::read(f.dst.join("x.txt")).unwrap(), b"old");
         assert!(no_partials(&f.dst));
+    }
+
+    #[test]
+    fn replace_preserves_a_destination_changed_during_copy() {
+        let f = fx();
+        let source = f.src.join("replace.bin");
+        let dest = f.dst.join("replace.bin");
+        fs::write(&source, vec![b's'; COPY_CHUNK * 2]).unwrap();
+        fs::write(&dest, b"version shown in Replace prompt").unwrap();
+        let hook_dest = dest.clone();
+        AFTER_CHUNK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, bytes| {
+                if bytes == COPY_CHUNK as u64 {
+                    fs::write(&hook_dest, b"newer version saved during copy").unwrap();
+                }
+            }))
+        });
+
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        AFTER_CHUNK.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"newer version saved during copy",
+            "the destination changed after the Replace decision must survive"
+        );
+        assert!(
+            report.failed.iter().any(|issue| {
+                issue.path == source
+                    && issue
+                        .reason
+                        .contains("changed after you chose Replace; not overwritten")
+            }),
+            "{report:?}"
+        );
+        assert!(no_partials(&f.dst));
+
+        let unchanged = fx();
+        let source = unchanged.src.join("replace.bin");
+        let dest = unchanged.dst.join("replace.bin");
+        fs::write(&source, b"replacement bytes").unwrap();
+        fs::write(&dest, b"old bytes").unwrap();
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &unchanged.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(fs::read(dest).unwrap(), b"replacement bytes");
+    }
+
+    #[test]
+    fn same_volume_move_preserves_a_destination_changed_after_replace() {
+        let f = fx();
+        let source = f.src.join("move.bin");
+        let dest = f.dst.join("move.bin");
+        fs::write(&source, b"move source").unwrap();
+        fs::write(&dest, b"version shown in Replace prompt").unwrap();
+        let hook_dest = dest.clone();
+        BEFORE_MOVE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                fs::write(&hook_dest, b"newer version saved before rename").unwrap();
+            }))
+        });
+
+        let report = run(
+            OpKind::Move,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        BEFORE_MOVE_RENAME.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(
+            fs::read(dest).unwrap(),
+            b"newer version saved before rename"
+        );
+        assert!(source.exists(), "a refused move must keep its source");
+        assert!(
+            report.failed.iter().any(|issue| {
+                issue
+                    .reason
+                    .contains("changed after you chose Replace; not overwritten")
+            }),
+            "{report:?}"
+        );
     }
 
     #[test]

@@ -87,6 +87,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   hash above 1 MiB (five 64 KiB blocks), so an edit between the samples with the timestamp put
   back is not noticed: the newer source bytes are copied, or the edited file is recycled
   (recoverable from the Recycle Bin).
+* A Replace chosen in a copy or move conflict, and split/join rollback, check the destination's
+  kind, size and modification time right before acting, not its content or Windows file ID: a
+  same-size replacement that keeps the exact timestamp would not be noticed.
+* Mirror recycles a deleted folder's previewed files one by one and then removes the folders
+  only if they are empty, so a file created inside during the sync keeps its folder (reported
+  as skipped). The Recycle Bin then holds the files individually rather than the folder.
 * Copies and deletes check the last path component for links and junctions. A junction swapped
   into the middle of a path while a sync runs is followed.
 * When Windows cannot recycle an item (for example on some network drives), the shell asks
@@ -116,6 +122,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   application pass over data or a missing ZXraw disk-cache entry.
 * Indexing and thumbnail jobs are local. There is no cloud catalog, remote database, or
   multi-machine synchronisation.
+* A WIC decode (HEIC/AVIF) runs inside the Windows codec and cannot be interrupted. If a codec
+  or a network-backed file stalls, the thumbnail worker waits, and closing the app waits for it.
+* Export-association previews are scanned by a single worker; a scan stuck on an unreachable
+  network folder delays the previews queued behind it.
+* The copy path keeps the fault-injection reader used by the e2e "card pulled" tests in release
+  builds. When not armed it costs one relaxed atomic load per read chunk.
 
 ## Metadata and XMP sync
 

@@ -248,7 +248,7 @@ pub enum SyncAction {
         overwrite: bool,
         bytes: u64,
     },
-    /// Only produced in Mirror mode. Removes `right/rel` (recursively for folders).
+    /// Only produced in Mirror mode. Folders are removed from their snapshot-listed entries.
     Delete {
         rel: PathBuf,
         is_dir: bool,
@@ -735,6 +735,65 @@ fn matches_delete_snapshot(
     true
 }
 
+fn path_is_within_real_directories(root: &Path, parent_rel: &Path) -> bool {
+    let mut path = root.to_path_buf();
+    let Ok(root_metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if sync_node_kind(&root_metadata) != NodeKind::Dir {
+        return false;
+    }
+    for component in parent_rel.components() {
+        path.push(component);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if sync_node_kind(&metadata) != NodeKind::Dir {
+            return false;
+        }
+    }
+    true
+}
+
+fn has_unlisted_items(
+    right: &Path,
+    rel: &Path,
+    expected: &[SyncSnapshot],
+    ctx: &JobCtx<'_>,
+) -> bool {
+    let expected_paths: HashSet<String> =
+        expected.iter().map(|snapshot| key(&snapshot.rel)).collect();
+    current_tree_snapshot(&right.join(rel), right, ctx).is_some_and(|actual| {
+        actual
+            .iter()
+            .any(|(path, _)| !expected_paths.contains(&key(path)))
+    })
+}
+
+fn delete_snapshot_item(
+    right: &Path,
+    snapshot: &SyncSnapshot,
+    delete: &mut dyn FnMut(&Path) -> std::result::Result<(), String>,
+    ctx: &JobCtx<'_>,
+) -> std::result::Result<(), String> {
+    let path = right.join(&snapshot.rel);
+    let parent = snapshot.rel.parent().unwrap_or(Path::new(""));
+    if !path_is_within_real_directories(right, parent)
+        || !matches_snapshot(
+            &path,
+            Some(snapshot.side),
+            snapshot.fingerprint,
+            Coverage::Sampled,
+            ctx,
+        )
+    {
+        return Err(
+            "destination changed since preview; item was not deleted; rerun compare".into(),
+        );
+    }
+    delete(&path)
+}
+
 fn current_tree_snapshot(
     root: &Path,
     relative_to: &Path,
@@ -823,18 +882,25 @@ pub fn execute_sync(
         report.failed.push(OpIssue::new(p, why));
     };
     let expected_by_rel = indexed_expectations(&plan.expected);
-    for action in &plan.actions {
+    'actions: for action in &plan.actions {
         if ctx.cancel.check().is_err() {
             report.cancelled = true;
             break;
         }
         match action {
-            SyncAction::Delete { rel, expected, .. } => {
+            SyncAction::Delete {
+                rel,
+                is_dir,
+                expected,
+            } => {
                 let p = plan.right.join(rel);
-                if !matches_delete_snapshot(&plan.right, rel, expected, ctx) {
+                let parent = rel.parent().unwrap_or(Path::new(""));
+                let snapshot_matches = path_is_within_real_directories(&plan.right, parent)
+                    && matches_delete_snapshot(&plan.right, rel, expected, ctx);
+                if !snapshot_matches {
                     if ctx.cancel.check().is_err() {
                         report.cancelled = true;
-                        break;
+                        break 'actions;
                     }
                     fail(
                         &mut report,
@@ -842,10 +908,133 @@ pub fn execute_sync(
                         "destination changed since preview; item was not deleted; rerun compare"
                             .into(),
                     );
-                    ctx.progress.add_items(1);
-                    continue;
-                }
-                let Some(delete) = deleter.as_mut() else {
+                } else if let Some(delete) = deleter.as_mut() {
+                    if !is_dir {
+                        if let Some(snapshot) = expected
+                            .iter()
+                            .find(|snapshot| snapshot.rel.as_path() == rel.as_path())
+                        {
+                            match delete_snapshot_item(&plan.right, snapshot, delete, ctx) {
+                                Ok(()) => report.done.push(p),
+                                Err(error) => fail(&mut report, &p, error),
+                            }
+                        } else {
+                            fail(
+                                &mut report,
+                                &p,
+                                "delete snapshot is missing the item".into(),
+                            );
+                        }
+                    } else {
+                        let mut files: Vec<&SyncSnapshot> = expected
+                            .iter()
+                            .filter(|snapshot| snapshot.side.kind != NodeKind::Dir)
+                            .collect();
+                        files.sort_by_key(|snapshot| {
+                            std::cmp::Reverse(snapshot.rel.components().count())
+                        });
+                        let mut action_failed = false;
+                        for snapshot in files {
+                            if ctx.cancel.check().is_err() {
+                                report.cancelled = true;
+                                break 'actions;
+                            }
+                            match delete_snapshot_item(&plan.right, snapshot, delete, ctx) {
+                                Ok(()) => {}
+                                Err(error) => {
+                                    let path = plan.right.join(&snapshot.rel);
+                                    fail(&mut report, &path, error);
+                                    action_failed = true;
+                                }
+                            }
+                        }
+
+                        let mut directories: Vec<&SyncSnapshot> = expected
+                            .iter()
+                            .filter(|snapshot| snapshot.side.kind == NodeKind::Dir)
+                            .collect();
+                        directories.sort_by_key(|snapshot| {
+                            std::cmp::Reverse(snapshot.rel.components().count())
+                        });
+                        let mut folder_kept = false;
+                        for snapshot in directories {
+                            if ctx.cancel.check().is_err() {
+                                report.cancelled = true;
+                                break 'actions;
+                            }
+                            let path = plan.right.join(&snapshot.rel);
+                            let parent = snapshot.rel.parent().unwrap_or(Path::new(""));
+                            if !path_is_within_real_directories(&plan.right, parent) {
+                                fail(
+                                    &mut report,
+                                    &p,
+                                    "folder path changed since preview; folder kept".into(),
+                                );
+                                action_failed = true;
+                                folder_kept = true;
+                                break;
+                            }
+                            match fs::symlink_metadata(&path) {
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                    continue;
+                                }
+                                Err(error) => {
+                                    fail(&mut report, &path, error.to_string());
+                                    action_failed = true;
+                                    folder_kept = true;
+                                    break;
+                                }
+                                Ok(metadata) if sync_node_kind(&metadata) != NodeKind::Dir => {
+                                    fail(
+                                        &mut report,
+                                        &p,
+                                        "folder changed to a link or non-folder; folder kept"
+                                            .into(),
+                                    );
+                                    action_failed = true;
+                                    folder_kept = true;
+                                    break;
+                                }
+                                Ok(_) => {}
+                            }
+                            match fs::remove_dir(&path) {
+                                Ok(()) => {}
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::DirectoryNotEmpty =>
+                                {
+                                    if has_unlisted_items(&plan.right, rel, expected, ctx) {
+                                        report.skipped.push(OpIssue::new(
+                                            &p,
+                                            "new items appeared; folder kept",
+                                        ));
+                                    } else {
+                                        fail(
+                                            &mut report,
+                                            &p,
+                                            "folder contents remain; folder kept".into(),
+                                        );
+                                    }
+                                    folder_kept = true;
+                                    break;
+                                }
+                                Err(error) => {
+                                    fail(&mut report, &path, error.to_string());
+                                    action_failed = true;
+                                    folder_kept = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !folder_kept
+                            && !action_failed
+                            && fs::symlink_metadata(&p)
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            report.done.push(p);
+                        }
+                    }
+                } else {
                     // Unreachable after the refusal above; still never fall back to a
                     // permanent delete.
                     fail(
@@ -853,12 +1042,6 @@ pub fn execute_sync(
                         &p,
                         "no Recycle Bin deleter; item was not deleted".into(),
                     );
-                    ctx.progress.add_items(1);
-                    continue;
-                };
-                match delete(&p) {
-                    Ok(()) => report.done.push(p),
-                    Err(e) => fail(&mut report, &p, e),
                 }
             }
             SyncAction::CreateDir { rel } => {
@@ -1146,6 +1329,56 @@ mod tests {
             after.entries.iter().all(|e| e.state == EntryState::Same),
             "{:?}",
             after.entries
+        );
+    }
+
+    #[test]
+    fn mirror_keeps_a_new_child_created_while_recycling_a_folder_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = temp.path().join("left");
+        let right = temp.path().join("right");
+        let folder = right.join("extra");
+        let previewed = folder.join("inner/previewed.txt");
+        let new_child = folder.join("new-after-preview.txt");
+        fs::create_dir(&left).unwrap();
+        fs::create_dir(&right).unwrap();
+        fs::create_dir_all(previewed.parent().unwrap()).unwrap();
+        fs::write(&previewed, b"shown in the compare snapshot").unwrap();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let comparison = compare_dirs(&left, &right, &CompareOptions::default(), &ctx).unwrap();
+        let plan = plan_sync(&comparison, &left, &right, SyncMode::Mirror);
+        assert_eq!(plan.deletes(), 1);
+
+        let mut created_new_child = false;
+        let mut deleted = Vec::new();
+        let mut deleter = |path: &Path| {
+            if !created_new_child {
+                fs::write(&new_child, b"not shown in the preview").unwrap();
+                created_new_child = true;
+            }
+            deleted.push(path.to_path_buf());
+            let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            let result = if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_file(path)
+            };
+            result.map_err(|error| error.to_string())
+        };
+        let result = execute_sync(&plan, false, Some(&mut deleter), &ctx);
+
+        assert_eq!(fs::read(&new_child).unwrap(), b"not shown in the preview");
+        assert_eq!(deleted, vec![previewed.clone()]);
+        assert!(!previewed.exists());
+        assert!(folder.exists(), "the folder with the new item must stay");
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert!(
+            result.skipped.iter().any(|issue| {
+                issue.path == folder && issue.reason == "new items appeared; folder kept"
+            }),
+            "{result:?}"
         );
     }
 
