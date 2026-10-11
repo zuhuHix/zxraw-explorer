@@ -36,14 +36,30 @@ pub fn unregister_context_menu() -> Result<()> {
     }
 }
 
-/// Return whether all three current-user context menu entries are installed.
-pub fn is_registered() -> Result<bool> {
+/// Return whether all three current-user context menu entries point at the executable.
+pub fn is_registered(exe: impl AsRef<Path>) -> Result<bool> {
     #[cfg(windows)]
     {
-        is_registered_at(ROOT)
+        is_registered_at(ROOT, exe.as_ref())
     }
     #[cfg(not(windows))]
     {
+        let _ = exe;
+        Err(WinError::Unsupported)
+    }
+}
+
+/// Refreshes the registered command if the user opted in and this executable moved.
+///
+/// Returns true only when a stale command was rewritten.
+pub fn refresh_if_registered(current_exe: impl AsRef<Path>) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        refresh_if_registered_at(ROOT, current_exe.as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = current_exe;
         Err(WinError::Unsupported)
     }
 }
@@ -106,12 +122,30 @@ fn unregister_context_menu_at(root: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn is_registered_at(root: &str) -> Result<bool> {
+fn is_registered_at(root: &str, exe: &Path) -> Result<bool> {
+    let expected = command_line(exe)?;
     for location in LOCATIONS {
-        if !registry::key_exists(&command_key(root, location))? {
+        let Some(actual) = registry::default_wide(&command_key(root, location))? else {
+            return Ok(false);
+        };
+        if actual != expected[..expected.len().saturating_sub(1)] {
             return Ok(false);
         }
     }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn refresh_if_registered_at(root: &str, current_exe: &Path) -> Result<bool> {
+    if !LOCATIONS.iter().try_fold(true, |all, location| {
+        registry::key_exists(&command_key(root, location)).map(|exists| all && exists)
+    })? {
+        return Ok(false);
+    }
+    if is_registered_at(root, current_exe)? {
+        return Ok(false);
+    }
+    register_context_menu_at(root, current_exe)?;
     Ok(true)
 }
 
@@ -130,6 +164,7 @@ mod registry {
     const REG_SZ: u32 = 1;
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_PATH_NOT_FOUND: i32 = 3;
+    const ERROR_MORE_DATA: i32 = 234;
 
     #[link(name = "Advapi32")]
     unsafe extern "system" {
@@ -158,6 +193,14 @@ mod registry {
             options: u32,
             desired: u32,
             result: *mut HKey,
+        ) -> i32;
+        fn RegQueryValueExW(
+            hkey: HKey,
+            value_name: *const u16,
+            reserved: *mut u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            data_size: *mut u32,
         ) -> i32;
         fn RegCloseKey(hkey: HKey) -> i32;
         fn RegDeleteTreeW(hkey: HKey, sub_key: *const u16) -> i32;
@@ -254,6 +297,77 @@ mod registry {
         }
     }
 
+    pub(super) fn default_wide(path: &str) -> Result<Option<Vec<u16>>> {
+        let path_wide = wide(path);
+        let mut key = std::ptr::null_mut();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path_wide.as_ptr(),
+                0,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(api_error("RegOpenKeyExW", status));
+        }
+
+        let result = (|| {
+            let mut value_type = 0;
+            let mut byte_count = 0;
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &mut value_type,
+                    std::ptr::null_mut(),
+                    &mut byte_count,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status != 0 {
+                return Err(api_error("RegQueryValueExW", status));
+            }
+            if value_type != REG_SZ || byte_count % 2 != 0 {
+                return Ok(Some(Vec::new()));
+            }
+            let mut value = vec![0_u16; byte_count as usize / 2];
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    &mut value_type,
+                    value.as_mut_ptr().cast(),
+                    &mut byte_count,
+                )
+            };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            if status == ERROR_MORE_DATA {
+                return Err(api_error("RegQueryValueExW", status));
+            }
+            if status != 0 {
+                return Err(api_error("RegQueryValueExW", status));
+            }
+            value.truncate(byte_count as usize / 2);
+            while value.last() == Some(&0) {
+                value.pop();
+            }
+            Ok(Some(value))
+        })();
+        unsafe { RegCloseKey(key) };
+        result
+    }
+
     pub(super) fn delete_tree(path: &str) -> Result<()> {
         let path_wide = wide(path);
         let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path_wide.as_ptr()) };
@@ -298,10 +412,16 @@ mod tests {
         }
         let _cleanup = Cleanup(root.clone());
 
-        super::register_context_menu_at(&root, Path::new(r"C:\Test Folder\zxraw.exe")).unwrap();
-        assert!(super::is_registered_at(&root).unwrap());
+        let original = Path::new(r"C:\Test Folder\zxraw.exe");
+        let moved = Path::new(r"D:\Moved Folder\zxraw.exe");
+        super::register_context_menu_at(&root, original).unwrap();
+        assert!(super::is_registered_at(&root, original).unwrap());
+        assert!(!super::is_registered_at(&root, moved).unwrap());
+        assert!(super::refresh_if_registered_at(&root, moved).unwrap());
+        assert!(super::is_registered_at(&root, moved).unwrap());
+        assert!(!super::refresh_if_registered_at(&root, moved).unwrap());
         super::unregister_context_menu_at(&root).unwrap();
-        assert!(!super::is_registered_at(&root).unwrap());
+        assert!(!super::is_registered_at(&root, moved).unwrap());
     }
 
     #[cfg(not(windows))]

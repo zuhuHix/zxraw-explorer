@@ -23,7 +23,7 @@ try {
     $env:CARGO_TARGET_DIR = $resolvedTargetDir
 
     Write-Host "Building ZXraw Explorer (release)..."
-    & cargo build --release
+    & cargo build --release --no-default-features
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed with exit code $LASTEXITCODE" }
 
     if ($SkipTests) {
@@ -33,6 +33,9 @@ try {
         & cargo test --workspace
         if ($LASTEXITCODE -ne 0) { throw "cargo test --workspace failed with exit code $LASTEXITCODE" }
     }
+
+    Write-Host "Generating Windows-target third-party inventory..."
+    & (Join-Path $PSScriptRoot "generate-third-party.ps1")
 
     $manifest = Get-Content -Raw (Join-Path $repoRoot "Cargo.toml")
     $versionMatch = [regex]::Match($manifest, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
@@ -60,7 +63,13 @@ try {
         if (-not (Test-Path -LiteralPath $source)) { throw "Required release binary missing: $source" }
         Copy-Item -LiteralPath $source -Destination $stagePath
     }
-    foreach ($file in @("README.md", "LICENSE-MIT", "LICENSE-APACHE")) {
+    foreach ($file in @(
+        "README.md",
+        "LICENSE-MIT",
+        "LICENSE-APACHE",
+        "packaging/THIRD_PARTY.md",
+        "packaging/LICENSES-NOTE.md"
+    )) {
         $source = Join-Path $repoRoot $file
         if (-not (Test-Path -LiteralPath $source)) { throw "Required release file missing: $source" }
         Copy-Item -LiteralPath $source -Destination $stagePath

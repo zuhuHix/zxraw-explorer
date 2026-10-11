@@ -109,22 +109,33 @@ impl Paths {
         let pd = directories::ProjectDirs::from("", "", "ZXraw Explorer");
         // Automated UI runs (screenshot hook) must never touch the user's real settings,
         // session or library: they get a throwaway profile unless one is given explicitly.
-        let profile = std::env::var_os("ZXRAW_PROFILE_DIR").map(PathBuf::from).or_else(|| {
-            crate::testhook::env_requests_automation()
-                .then(|| std::env::temp_dir().join("zxraw-test-profile"))
-        });
+        #[cfg(any(debug_assertions, feature = "automation"))]
+        let profile = std::env::var_os("ZXRAW_PROFILE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                crate::testhook::env_requests_automation().then(|| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos();
+                    std::env::temp_dir()
+                        .join(format!("zxraw-test-profile-{}-{now}", std::process::id()))
+                })
+            });
+        #[cfg(not(any(debug_assertions, feature = "automation")))]
+        let profile: Option<PathBuf> = None;
         let (config, data, cache) = match (&profile, &pd) {
             (Some(root), _) => (root.join("config"), root.join("data"), root.join("cache")),
             (None, pd) => match pd {
-            Some(p) => (
-                p.config_dir().to_path_buf(),
-                p.data_local_dir().to_path_buf(),
-                p.cache_dir().to_path_buf(),
-            ),
-            None => {
-                let t = std::env::temp_dir().join("ZXraw Explorer");
-                (t.join("config"), t.join("data"), t.join("cache"))
-            }
+                Some(p) => (
+                    p.config_dir().to_path_buf(),
+                    p.data_local_dir().to_path_buf(),
+                    p.cache_dir().to_path_buf(),
+                ),
+                None => {
+                    let t = std::env::temp_dir().join("ZXraw Explorer");
+                    (t.join("config"), t.join("data"), t.join("cache"))
+                }
             },
         };
         let logs = data.join("logs");

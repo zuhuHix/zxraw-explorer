@@ -76,6 +76,24 @@ fn main() -> eframe::Result {
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
 
+    #[cfg(windows)]
+    if !testhook::env_requests_automation() {
+        match std::env::current_exe() {
+            Ok(current_exe) => match forge_win::refresh_if_registered(&current_exe) {
+                Ok(true) => tracing::info!("refreshed the Explorer context-menu command path"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!("could not refresh the Explorer context-menu command: {error}")
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    "could not determine the executable path for context-menu refresh: {error}"
+                )
+            }
+        }
+    }
+
     let default_hook = std::panic::take_hook();
     let crash_dir = paths.data.join("crashes");
     std::panic::set_hook(Box::new(move |info| {

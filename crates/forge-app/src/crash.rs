@@ -53,7 +53,13 @@ fn pending_crash_report_in(data_dir: &Path) -> Option<PathBuf> {
     let now = system_time_nanos(SystemTime::now());
     // This marker contains only one integer, so replacing it in place is sufficient and
     // works on Windows where rename does not replace an existing destination.
-    let _ = fs::write(marker, now.to_string());
+    if let Err(error) = fs::write(&marker, now.to_string()) {
+        tracing::warn!(
+            "cannot write startup marker {}: {error}; suppressing the pending crash report to avoid showing it repeatedly",
+            marker.display()
+        );
+        return None;
+    }
     pending
 }
 
@@ -237,6 +243,23 @@ mod tests {
         fs::write(&report, "test report").unwrap();
 
         assert_eq!(pending_crash_report_in(dir.path()), Some(report.clone()));
+        assert_eq!(pending_crash_report_in(dir.path()), None);
+    }
+
+    #[test]
+    fn pending_report_is_suppressed_when_startup_marker_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let crash_dir = dir.path().join("crashes");
+        fs::create_dir_all(&crash_dir).unwrap();
+        fs::write(
+            crash_dir.join("crash-20260101T000000000000000Z.txt"),
+            "test report",
+        )
+        .unwrap();
+        // A directory at the marker path reliably makes fs::write fail on Windows and Unix.
+        fs::create_dir(crash_dir.join(STARTUP_MARKER)).unwrap();
+
+        assert_eq!(pending_crash_report_in(dir.path()), None);
         assert_eq!(pending_crash_report_in(dir.path()), None);
     }
 }

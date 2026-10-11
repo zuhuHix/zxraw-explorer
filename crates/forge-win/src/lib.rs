@@ -29,7 +29,9 @@ pub use clipboard::{
 };
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use files::{hard_link_count, is_removable, set_attributes, volume_serial};
-pub use integration::{is_registered, register_context_menu, unregister_context_menu};
+pub use integration::{
+    is_registered, refresh_if_registered, register_context_menu, unregister_context_menu,
+};
 pub use process::launch;
 pub use restart::file_locking_processes;
 pub use shell::{

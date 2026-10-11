@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+automation = []
+
 [[bin]]
 name = "zxraw"
 path = "src/main.rs"

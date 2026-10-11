@@ -565,6 +565,30 @@ fn resize_column_pair(
     }
 }
 
+fn splitter_width_range(
+    columns: &[DetailsColumn],
+    boundary: usize,
+    widths: &[f32; 5],
+) -> (f32, f32, f32) {
+    let left = columns[boundary].width_index;
+    let right = columns[boundary + 1].width_index;
+    match (left, right) {
+        (None, Some(right)) => {
+            let value = columns[0].width;
+            let minimum = 140.0;
+            let maximum = (value + widths[right] - 68.0).max(minimum);
+            (value, minimum, maximum)
+        }
+        (Some(left), Some(right)) => {
+            let value = widths[left];
+            let minimum = 68.0;
+            let maximum = (widths[left] + widths[right] - 68.0).max(minimum);
+            (value, minimum, maximum)
+        }
+        _ => (0.0, 0.0, 0.0),
+    }
+}
+
 fn truncated_name_galley(
     painter: &egui::Painter,
     name: &str,
@@ -727,7 +751,11 @@ pub fn details(
         if index + 1 < columns.len() {
             let separator_rect = Rect::from_center_size(pos2(x, rect.center().y), vec2(8.0, row_h));
             let separator = ui
-                .interact(separator_rect, id.with(("resize", index)), Sense::drag())
+                .interact(
+                    separator_rect,
+                    id.with(("resize", index)),
+                    Sense::drag().union(Sense::focusable_noninteractive()),
+                )
                 .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
             remember_accessible_focus(ui, id, &separator);
             let label = format!(
@@ -741,9 +769,15 @@ pub fn details(
             separator.ctx.accesskit_node_builder(separator.id, |node| {
                 node.set_role(egui::accesskit::Role::Splitter);
                 node.set_label(label);
-                node.set_orientation(egui::accesskit::Orientation::Horizontal);
+                node.set_orientation(egui::accesskit::Orientation::Vertical);
+                let (value, minimum, maximum) = splitter_width_range(&columns, index, &widths);
+                node.set_numeric_value(value as f64);
+                node.set_min_numeric_value(minimum as f64);
+                node.set_max_numeric_value(maximum as f64);
+                node.set_numeric_value_step(10.0);
             });
             if separator.drag_started() {
+                separator.request_focus();
                 separator
                     .ctx
                     .data_mut(|data| data.insert_temp(id.with(("resize-delta", index)), 0.0_f32));
@@ -771,6 +805,29 @@ pub fn details(
                 separator
                     .ctx
                     .data_mut(|data| data.remove_temp::<f32>(id.with(("resize-delta", index))));
+            }
+            if separator.has_focus() {
+                let key_delta = ui.input_mut(|input| {
+                    if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                        Some(-10.0)
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                        Some(10.0)
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
+                        let (value, minimum, _) = splitter_width_range(&columns, index, &widths);
+                        Some(minimum - value)
+                    } else if input.consume_key(egui::Modifiers::NONE, egui::Key::End) {
+                        let (value, _, maximum) = splitter_width_range(&columns, index, &widths);
+                        Some(maximum - value)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(delta) = key_delta {
+                    resize_column_pair(&columns, index, &mut widths, columns[0].width, delta);
+                    separator
+                        .ctx
+                        .data_mut(|data| data.insert_persisted(widths_key, widths));
+                }
             }
             header_painter.line_segment(
                 [pos2(x, rect.top() + 4.0), pos2(x, rect.bottom() - 4.0)],
@@ -1325,7 +1382,7 @@ mod accessibility_tests {
     use forge_core::listing::SortSpec;
     use forge_core::{FileEntry, model::EntryKind};
 
-    use super::{LoadState, ThumbProvider, details};
+    use super::{DetailsColumn, LoadState, ThumbProvider, details, splitter_width_range};
     use crate::{pane::Pane, settings::ViewMode};
 
     struct NoThumbs;
@@ -1339,6 +1396,39 @@ mod accessibility_tests {
         ) -> Option<egui::TextureHandle> {
             None
         }
+    }
+
+    #[test]
+    fn column_splitter_exposes_current_value_and_allowed_range() {
+        let columns = vec![
+            DetailsColumn {
+                label: "Name",
+                sort: None,
+                width_index: None,
+                width: 300.0,
+            },
+            DetailsColumn {
+                label: "Date modified",
+                sort: None,
+                width_index: Some(0),
+                width: 120.0,
+            },
+            DetailsColumn {
+                label: "Type",
+                sort: None,
+                width_index: Some(1),
+                width: 80.0,
+            },
+        ];
+        let widths = [120.0, 80.0, 96.0, 120.0, 72.0];
+        assert_eq!(
+            splitter_width_range(&columns, 0, &widths),
+            (300.0, 140.0, 352.0)
+        );
+        assert_eq!(
+            splitter_width_range(&columns, 1, &widths),
+            (120.0, 68.0, 132.0)
+        );
     }
 
     #[test]

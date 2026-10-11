@@ -3,6 +3,7 @@
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Visuals};
 
 pub const ACCENT: Color32 = Color32::from_rgb(77, 144, 254);
+const LIGHT_LINK: Color32 = Color32::from_rgb(0, 85, 160);
 
 /// Color-label swatches (Red, Yellow, Green, Blue, Purple) — used for culling labels.
 pub const LABEL_COLORS: [Color32; 5] = [
@@ -14,7 +15,11 @@ pub const LABEL_COLORS: [Color32; 5] = [
 ];
 
 pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
-    let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+    let mut v = if dark {
+        Visuals::dark()
+    } else {
+        Visuals::light()
+    };
     let (bg, panel, faint, border) = if dark {
         (
             Color32::from_rgb(24, 25, 28),
@@ -39,7 +44,7 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
     // Keep selected list rows opaque, with text colors that retain WCAG AA contrast.
     v.selection.bg_fill = selection_fill(dark);
     v.selection.stroke = Stroke::new(1.0, selection_text(dark));
-    v.hyperlink_color = ACCENT;
+    v.hyperlink_color = link_color(dark);
     let r = CornerRadius::same(4);
     v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.corner_radius = r;
@@ -55,11 +60,23 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
         s.spacing.button_padding = egui::vec2(8.0, 3.0);
         s.spacing.interact_size.y = 22.0;
         s.text_styles = [
-            (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+            (
+                TextStyle::Small,
+                FontId::new(11.0, FontFamily::Proportional),
+            ),
             (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
-            (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
-            (TextStyle::Heading, FontId::new(17.0, FontFamily::Proportional)),
-            (TextStyle::Monospace, FontId::new(12.5, FontFamily::Monospace)),
+            (
+                TextStyle::Button,
+                FontId::new(13.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Heading,
+                FontId::new(17.0, FontFamily::Proportional),
+            ),
+            (
+                TextStyle::Monospace,
+                FontId::new(12.5, FontFamily::Monospace),
+            ),
         ]
         .into();
     });
@@ -68,6 +85,10 @@ pub fn apply(ctx: &egui::Context, dark: bool, scale: f32) {
 
 pub fn muted(ui: &egui::Ui) -> Color32 {
     ui.visuals().weak_text_color()
+}
+
+fn link_color(dark: bool) -> Color32 {
+    if dark { ACCENT } else { LIGHT_LINK }
 }
 
 /// Fill behind selected rows and tiles.
@@ -126,7 +147,21 @@ mod tests {
     fn selected_row_text_meets_wcag_aa() {
         for dark in [true, false] {
             let ratio = contrast_ratio(selection_text(dark), selection_fill(dark));
-            assert!(ratio >= 4.5, "selection text ratio {ratio:.2} (dark={dark})");
+            assert!(
+                ratio >= 4.5,
+                "selection text ratio {ratio:.2} (dark={dark})"
+            );
+        }
+    }
+
+    #[test]
+    fn hyperlink_color_meets_wcag_aa_on_its_theme_panel() {
+        for (dark, panel) in [(true, PANEL_DARK), (false, PANEL_LIGHT)] {
+            let ratio = contrast_ratio(link_color(dark), panel);
+            assert!(
+                ratio >= 4.5,
+                "hyperlink ratio {ratio:.2} on {panel:?} (dark={dark})"
+            );
         }
     }
 

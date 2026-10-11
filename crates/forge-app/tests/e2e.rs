@@ -43,6 +43,10 @@ fn run_app(work: &Path, profile: &Path, script: &str) -> Outcome {
     let mut child = Command::new(env!("CARGO_BIN_EXE_zxraw"))
         .env("ZXRAW_SCRIPT", &script_path)
         .env("ZXRAW_SCRIPT_RESULT", &result_path)
+        .env(
+            "ZXRAW_SCRIPT_SANDBOX",
+            profile.parent().expect("profile sandbox"),
+        )
         .env("ZXRAW_PROFILE_DIR", profile)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

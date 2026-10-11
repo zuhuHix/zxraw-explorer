@@ -55,11 +55,16 @@ is based on those suites.
 The hook has **no timeout**: if a listing never finishes, the app waits indefinitely. Wrap
 runs in a watchdog (as in the example below).
 
+The automation hook and profile override are compiled into debug builds. Release builds
+include them only when the non-default `automation` feature is explicitly enabled. The
+release packaging script uses `--no-default-features` and does not enable this feature.
+The end-to-end suite runs the debug `zxraw` binary, so it does not need the feature.
+
 Example PowerShell session (the 50,000-file scenario used for [BENCHMARKS.md](BENCHMARKS.md)):
 
 ```powershell
 $env:CARGO_TARGET_DIR = 'target/l5'
-cargo build -p forge-app --release
+cargo build -p forge-app --release --no-default-features --features automation
 $png = "$env:TEMP\zxraw-bench\scenario-flat50k-details.png"
 $env:ZXRAW_SCREENSHOT = $png
 $env:ZXRAW_CMDS = 'ViewDetails'
@@ -70,9 +75,9 @@ Remove-Item Env:ZXRAW_SCREENSHOT, Env:ZXRAW_CMDS -ErrorAction Ignore
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 ```
 
-This launches the user's normal profile, so session-restore tabs from that profile also
-appear in the screenshot. The screenshot hook is a smoke-test aid. It does not assert
-visual correctness or simulate mouse or keyboard input.
+Without `ZXRAW_PROFILE_DIR`, automation uses a unique throwaway profile for this process,
+so the screenshot does not include the user's session-restore tabs. The screenshot hook is
+a smoke-test aid. It does not assert visual correctness or simulate mouse or keyboard input.
 
 ## Reproducible benchmark data and harness
 
@@ -171,9 +176,11 @@ published results must record any non-default values.
 
 ### UI test hook isolation
 
-Any run with `ZXRAW_SCREENSHOT`, `ZXRAW_CMDS` or `ZXRAW_SELECT` set uses a throwaway profile
-(`%TEMP%\zxraw-test-profile`: settings, session, library database, caches) so automated runs
-never modify the user's real data. Set `ZXRAW_PROFILE_DIR` to choose the profile explicitly.
+In debug builds or builds with the `automation` feature, any run with `ZXRAW_SCREENSHOT`,
+`ZXRAW_CMDS`, `ZXRAW_SELECT` or `ZXRAW_SCRIPT` set uses a unique throwaway profile (settings,
+session, library database, caches) so concurrent automated runs do not share data. Set
+`ZXRAW_PROFILE_DIR` to choose the profile explicitly. Shipped release builds ignore all
+these automation variables and the profile override.
 Commands run once the first listing finishes (or after 30 s), the capture happens ~90 frames
 after the commands, and a run closes itself after 120 s at most.
 
@@ -182,10 +189,15 @@ after the commands, and a run closes itself after 120 s at most.
 `crates/forge-app/tests/e2e.rs` drives the real `zxraw` window through `ZXRAW_SCRIPT` and asserts
 on the filesystem afterwards. Each test builds its own fixtures in a temp directory and uses a
 fresh profile (`ZXRAW_PROFILE_DIR`), so no user settings, session or library data is touched.
-The Recycle Bin is deliberately not exercised.
+The runner sets `ZXRAW_SCRIPT_SANDBOX` to that fixture root. If omitted, the script file's
+directory is the sandbox. Relative sandbox roots are resolved against the script directory.
+Every `navigate`, `assert-path`, `assert-exists`, `assert-missing`, and `screenshot` path
+must resolve inside the sandbox; paths through symlinks or junctions are checked against their
+canonical target. Script mode rejects Recycle Bin commands before dispatch because no test-only
+Recycle Bin backend is injected.
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'target/e2e'
+$env:CARGO_TARGET_DIR = 'target/fixg'
 cargo test -p forge-app --test e2e -- --test-threads=1
 cargo test -p forge-app --bin zxraw
 ```
