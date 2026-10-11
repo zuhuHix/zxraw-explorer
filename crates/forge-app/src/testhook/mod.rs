@@ -73,6 +73,7 @@ pub struct TestHook {
     /// Fixed at startup: the script is taken out of `self` while a step runs, so
     /// "is a script present" cannot answer "is this an automated run".
     automated: bool,
+    animations_off: bool,
     pub(crate) input: InputQueue,
     pub(crate) perf: perf::FrameClock,
 }
@@ -139,6 +140,11 @@ pub fn raw_input(app: &mut ZxrawApp, raw: &mut egui::RawInput) {
 pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     if !app.testhook.active() {
         return;
+    }
+    if !app.testhook.animations_off {
+        // Screenshots must show settled UI, not windows halfway through a fade-in.
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        app.testhook.animations_off = true;
     }
     app.testhook.perf.frame_finished();
     if app.testhook.script.is_some() {

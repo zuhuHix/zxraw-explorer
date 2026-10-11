@@ -146,6 +146,18 @@ impl ZxrawApp {
             .unwrap_or_else(|| PathBuf::from(r"C:\"))
     }
 
+    /// Folder for a new window without a restored session. Automated runs start in an
+    /// empty folder inside their profile so they never list the user's real home folder.
+    fn start_folder(&self) -> PathBuf {
+        if self.testhook.active() {
+            let dir = self.paths.data.join("start");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                return dir;
+            }
+        }
+        Self::home()
+    }
+
     fn new_pane(&self, path: PathBuf, view: ViewMode) -> Pane {
         let mut p = Pane::new(path, self.settings.default_sort, view);
         p.show_hidden = self.settings.show_hidden;
@@ -156,7 +168,8 @@ impl ZxrawApp {
     fn restore_session(&mut self, s: Session) {
         for t in &s.tabs {
             // Restore folders that still exist; fall back to home for vanished/offline ones.
-            let pick = |p: &PathBuf| if p.is_dir() { p.clone() } else { Self::home() };
+            let home = self.start_folder();
+            let pick = |p: &PathBuf| if p.is_dir() { p.clone() } else { home.clone() };
             let left = self.new_pane(pick(&t.left), t.view);
             let right = t.right.as_ref().map(|r| self.new_pane(pick(r), t.view));
             self.tabs.push(Tab {
@@ -166,7 +179,7 @@ impl ZxrawApp {
             });
         }
         if self.tabs.is_empty() {
-            let left = self.new_pane(Self::home(), self.settings.default_view);
+            let left = self.new_pane(self.start_folder(), self.settings.default_view);
             self.tabs.push(Tab {
                 left,
                 right: None,
