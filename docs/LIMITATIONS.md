@@ -12,8 +12,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF
   and AVIF go through Windows Imaging Component (`forge-media/src/wic.rs`), so they need the
-  Microsoft HEIF/HEVC (and AV1) extensions; without them the thumbnail and viewer show a
-  "codec not installed" error. WIC decoding was tested with fixtures encoded on this machine,
+  Microsoft HEIF/HEVC (and AV1) extensions; when no installed decoder accepts a file, the
+  thumbnail and viewer show an error naming the extension that may be missing. WIC decoding was tested with fixtures encoded on this machine,
   not with camera or phone files.
 * Thumbnail throughput is limited. On this machine, under concurrent build load, 256 px
   thumbnails from 24 MP JPEGs were generated at a median of 3.7 images/s with an empty disk
@@ -32,7 +32,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another
   application has not been verified: it is modal and cannot be automated here. The drag starts
-  only at the window edge, so the drop target must be outside ZXraw.
+  only at the window edge, so the drop target must be outside ZXraw. At most 500 items can be
+  dragged out at once (each costs a shell parse on the UI thread); larger selections are
+  refused with a message pointing to copy and paste.
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
   of other applications, has not been checked.

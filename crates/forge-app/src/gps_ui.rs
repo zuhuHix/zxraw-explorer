@@ -44,6 +44,8 @@ fn valid_coordinates(latitude: f64, longitude: f64) -> bool {
         && (-180.0..=180.0).contains(&longitude)
 }
 
+const MAX_TEMPLATE_LEN: usize = 2048;
+
 fn validate_template(template: &str) -> Result<(), &'static str> {
     let template = template.trim();
     let Some((scheme, rest)) = template.split_once("://") else {
@@ -52,9 +54,14 @@ fn validate_template(template: &str) -> Result<(), &'static str> {
     if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return Err("Map URL must use http or https.");
     }
+    if template.len() > MAX_TEMPLATE_LEN {
+        return Err("Map URL is too long.");
+    }
+    // ASCII only: rules out invisible and bidirectional-override characters that could
+    // make the field show a different host from the one that opens.
     if template
         .chars()
-        .any(|c| c.is_control() || c.is_whitespace())
+        .any(|c| !c.is_ascii() || c.is_ascii_control() || c.is_ascii_whitespace())
         || template.contains('\\')
     {
         return Err("Map URL contains invalid characters.");
@@ -63,7 +70,9 @@ fn validate_template(template: &str) -> Result<(), &'static str> {
         return Err("Map URL must include {lat} and {lon}.");
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // No `user@host`: `https://maps.example@other.example/` opens other.example.
     if authority.is_empty()
+        || authority.contains('@')
         || authority.contains('{')
         || authority.contains('}')
         || template
@@ -240,5 +249,10 @@ mod tests {
         assert!(map_url("file:///map/{lat}/{lon}", 1.0, 2.0).is_err());
         assert!(map_url("https://maps.example/?q={lat}", 1.0, 2.0).is_err());
         assert!(map_url("https:///map/{lat}/{lon}", 1.0, 2.0).is_err());
+        // Userinfo, invisible/bidi characters and oversized templates are rejected.
+        assert!(map_url("https://maps.example@evil.example/{lat}/{lon}", 1.0, 2.0).is_err());
+        assert!(map_url("https://maps.example/\u{202E}{lat}/{lon}", 1.0, 2.0).is_err());
+        let long = format!("https://maps.example/{}?q={{lat}},{{lon}}", "a".repeat(4096));
+        assert!(map_url(&long, 1.0, 2.0).is_err());
     }
 }

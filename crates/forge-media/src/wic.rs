@@ -194,10 +194,22 @@ mod windows_impl {
     }
 
     fn decoder_error(path: &Path, op: &str, error: windows::core::Error) -> MediaError {
+        // WIC reports "component not found" both when no decoder is installed and when the
+        // installed one doesn't recognise this file (an unusual brand, a damaged header), so
+        // name both causes rather than telling users to install a codec they may have.
         if error.code().0 == WINCODEC_ERR_COMPONENTNOTFOUND && is_heif_path(path) {
-            return MediaError::Unsupported(
-                "HEIC codec not installed (Microsoft HEIF Image Extensions)".into(),
-            );
+            let extension = if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("avif"))
+            {
+                "AV1 Video Extension"
+            } else {
+                "HEIF Image Extensions"
+            };
+            return MediaError::Unsupported(format!(
+                "no Windows decoder accepted this file: the Microsoft {extension} may be \
+                 missing, or the file is an unsupported variant or damaged"
+            ));
         }
         MediaError::Decode(format!("WIC {op} failed for {}: {error}", path.display()))
     }
