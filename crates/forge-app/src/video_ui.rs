@@ -819,6 +819,11 @@ fn place_no_replace(temp: &Path, output: &Path) -> std::io::Result<()> {
     rename_no_replace(temp, output)
 }
 
+/// `Cmd::LocateProxies` (wave-2 stub, owned by the related-files agent).
+pub fn locate_proxies(app: &mut ZxrawApp) {
+    app.toast("Locating proxies is not available yet");
+}
+
 pub fn generate_proxies(app: &mut ZxrawApp) {
     let targets = app.pane().action_targets();
     let entries = &app.pane().entries;
@@ -2405,7 +2410,7 @@ mod tests {
         assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign output");
         assert!(private_dir.exists());
 
-        let mut owned = ProxyTemp::create(destination.path(), &output, 45, 1).unwrap();
+        let owned = ProxyTemp::create(destination.path(), &output, 45, 1).unwrap();
         std::fs::write(owned.path(), b"job output").unwrap();
         let foreign_sibling = owned.directory.join("foreign.txt");
         std::fs::write(&foreign_sibling, b"keep this").unwrap();

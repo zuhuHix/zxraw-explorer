@@ -453,6 +453,11 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::CreateArchive => crate::extra_tools_ui::create_archive(app),
         Cmd::SplitFile => crate::extra_tools_ui::split_file(app),
         Cmd::JoinFiles => crate::extra_tools_ui::join_files(app),
+        Cmd::GroupSimilar => crate::similar::toggle(app),
+        Cmd::ExportMetadata => crate::meta_export::open(app),
+        Cmd::LocateProxies => crate::video_ui::locate_proxies(app),
+        Cmd::SelectOriginals => crate::export_assoc::select_originals(app),
+        Cmd::SelectExports => crate::export_assoc::select_exports(app),
         Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {
             use crate::tools_ui::Tool;
             let tool = match cmd {
@@ -769,6 +774,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::collections_ui::window(app, ui.ctx());
     crate::video_ui::window(app, ui.ctx());
     crate::extra_tools_ui::window(app, ui.ctx());
+    crate::meta_export::window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }
@@ -909,6 +915,8 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
                 if e.media_kind() == forge_core::MediaKind::Video {
                     crate::video_ui::preview(app, ui, &e);
                 }
+                crate::gps_ui::panel(app, ui, &e);
+                crate::export_assoc::panel(app, ui, &e);
                 ui.separator();
                 crate::tags_ui::panel(app, ui, &e);
             });

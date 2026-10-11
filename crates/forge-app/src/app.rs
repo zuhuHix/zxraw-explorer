@@ -817,6 +817,7 @@ impl eframe::App for ZxrawApp {
         }
 
         self.handle_keys(&ctx);
+        crate::dragout::tick(self, &ctx);
 
         if crate::viewer_host::show(self, ui) {
             crate::actions::modals(self, ui);

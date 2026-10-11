@@ -14,6 +14,7 @@
 //!   automated run without it gets a unique throwaway profile, never the user's profile.
 //! * `ZXRAW_SCRIPT_SANDBOX=dir` — allowed root for navigation and asserted paths; defaults
 //!   to the script file's directory.
+//! * `ZXRAW_SCREENSHOT_DIR=dir` — a second allowed root, for `screenshot` PNGs only.
 //!
 //! Timing: commands run once the first listing finishes (or after 30 s regardless); the
 //! capture happens ~90 frames *after* the commands; a run is closed after 120 s at most.
@@ -35,9 +36,13 @@ use crate::modal::Modal;
 use crate::pane::Pane;
 
 // Area-specific script verbs (`ui <area> <verb> <args>`). Each area module owns its verbs.
+mod browser;
 mod ingest;
 mod library;
+mod media;
 mod perf;
+mod related;
+mod system;
 mod tools;
 mod viewer;
 
@@ -240,7 +245,8 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// assert-no-error-toast      fail if any error toast was shown so far
 /// assert-notice <kind>       crash | welcome | none: which startup notices are open
 /// dismiss-notices            close the startup notices as the user would
-/// ui <area> <verb> [args]    area-specific verbs: viewer, ingest, library, tools, perf
+/// ui <area> <verb> [args]    area-specific verbs: viewer, ingest, library, tools, perf,
+///                            browser, media, related, system
 ///                            (documented in the area modules under `testhook/`)
 /// ```
 #[derive(Debug, Clone)]
@@ -300,6 +306,10 @@ enum Area {
     Library,
     Tools,
     Perf,
+    Browser,
+    Media,
+    Related,
+    System,
 }
 
 pub struct Script {
@@ -351,6 +361,7 @@ impl Script {
             Ok(root) => root,
             Err(error) => fail(&result, error),
         };
+        let _ = SANDBOX_ROOT.set(sandbox_root.clone());
         match parse_script(&text, &sandbox_root) {
             Ok(steps) => Self {
                 steps,
@@ -430,7 +441,9 @@ fn sandbox_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
                     resolved.push(component);
                 }
                 if resolved.starts_with(root) {
-                    return Ok(resolved);
+                    // Contained: hand the app the ordinary form. `canonicalize` yields
+                    // verbatim `\\?\` paths, which the app would otherwise store and show.
+                    return Ok(without_verbatim_prefix(resolved));
                 }
                 return Err(format!(
                     "path {} is outside script sandbox {}",
@@ -472,6 +485,49 @@ fn sandbox_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
             }
         }
     }
+}
+
+/// Screenshots go inside the script sandbox, or into `ZXRAW_SCREENSHOT_DIR` when it is set
+/// (PNG files only), so test runs can collect their captures in one place.
+fn screenshot_path(sandbox_root: &Path, rest: &str) -> Result<PathBuf, String> {
+    if rest.is_empty() {
+        return Err("expected a path".into());
+    }
+    let requested = Path::new(rest);
+    let is_png = requested
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"));
+    if is_png
+        && let Some(dir) = std::env::var_os("ZXRAW_SCREENSHOT_DIR")
+        && let Ok(path) = sandbox_path(Path::new(&dir), requested)
+    {
+        return Ok(path);
+    }
+    sandbox_path(sandbox_root, requested)
+}
+
+/// `\\?\C:\x` → `C:\x` and `\\?\UNC\server\share` → `\\server\share`; other paths unchanged.
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+static SANDBOX_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Resolves a path argument of an area verb inside the script sandbox. Every verb that
+/// writes, renames or deletes files must use this (or only touch the profile/app state).
+#[allow(dead_code)] // used by area verbs that touch paths
+pub(crate) fn sandboxed(requested: &Path) -> Result<PathBuf, String> {
+    let root = SANDBOX_ROOT.get().ok_or("no script sandbox is active")?;
+    sandbox_path(root, requested)
 }
 
 /// Recycle Bin commands only run while the automated recycle sandbox is active, so a
@@ -580,7 +636,7 @@ fn parse_step(
             Step::WaitJobs(Duration::from_secs(secs))
         }
         "wait-frames" => Step::WaitFrames(number("a frame count")? as u32),
-        "screenshot" => Step::Screenshot(path()?),
+        "screenshot" => Step::Screenshot(screenshot_path(sandbox_root, rest)?),
         "assert-tabs" => Step::AssertTabs(number("a tab count")? as usize),
         "assert-path" => Step::AssertPath(path()?),
         "assert-exists" => Step::AssertExists(path()?),
@@ -647,6 +703,10 @@ fn parse_step(
                 "library" => Area::Library,
                 "tools" => Area::Tools,
                 "perf" => Area::Perf,
+                "browser" => Area::Browser,
+                "media" => Area::Media,
+                "related" => Area::Related,
+                "system" => Area::System,
                 other => return Err(format!("unknown area `{other}`")),
             };
             let rest = rest.trim();
@@ -1186,6 +1246,10 @@ fn exec(
             Area::Library => library::step(app, ctx, verb, args, st),
             Area::Tools => tools::step(app, ctx, verb, args, st),
             Area::Perf => perf::step(app, ctx, verb, args, st),
+            Area::Browser => browser::step(app, ctx, verb, args, st),
+            Area::Media => media::step(app, ctx, verb, args, st),
+            Area::Related => related::step(app, ctx, verb, args, st),
+            Area::System => system::step(app, ctx, verb, args, st),
         },
     }
 }
@@ -1247,7 +1311,7 @@ mod tests {
     }
 
     fn in_temp(rel: &str) -> PathBuf {
-        std::fs::canonicalize(std::env::temp_dir()).unwrap().join(rel)
+        without_verbatim_prefix(std::fs::canonicalize(std::env::temp_dir()).unwrap()).join(rel)
     }
 
     #[test]
@@ -1295,7 +1359,8 @@ mod tests {
     #[test]
     fn relative_and_missing_paths_are_resolved_inside_the_sandbox() {
         let sandbox = tempfile::tempdir().unwrap();
-        let canonical_root = std::fs::canonicalize(sandbox.path()).unwrap();
+        let canonical_root =
+            without_verbatim_prefix(std::fs::canonicalize(sandbox.path()).unwrap());
         let path = sandbox_path(sandbox.path(), Path::new("new/subfolder")).unwrap();
         assert_eq!(path, canonical_root.join("new/subfolder"));
 
@@ -1328,6 +1393,18 @@ mod tests {
                 "unexpected error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_removed_from_resolved_paths() {
+        let p = |s: &str| without_verbatim_prefix(PathBuf::from(s));
+        assert_eq!(p(r"\\?\C:\Temp\a b"), PathBuf::from(r"C:\Temp\a b"));
+        assert_eq!(p(r"\\?\UNC\srv\share\x"), PathBuf::from(r"\\srv\share\x"));
+        assert_eq!(p(r"C:\plain"), PathBuf::from(r"C:\plain"));
+        assert_eq!(p(r"\\?\Volume{abc}\x"), PathBuf::from(r"\\?\Volume{abc}\x"));
+        let sandbox = tempfile::tempdir().unwrap();
+        let resolved = sandbox_path(sandbox.path(), Path::new("sub")).unwrap();
+        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"), "{}", resolved.display());
     }
 
     #[test]

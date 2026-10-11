@@ -8,11 +8,15 @@ mod collections_ui;
 mod commands;
 mod crash;
 mod dialogs;
+mod dragout;
+mod export_assoc;
 mod extra_tools_ui;
 mod fonts;
+mod gps_ui;
 mod ingest_ui;
 mod library;
 mod media_meta;
+mod meta_export;
 mod modal;
 mod notices;
 mod ops_ui;
@@ -25,6 +29,7 @@ mod tags_ui;
 mod settings;
 mod settings_ui;
 mod sidebar;
+mod similar;
 // The automation hook exists only in debug builds or with the `automation` feature;
 // release builds get an inert stub with the same surface.
 #[cfg(any(debug_assertions, feature = "automation"))]

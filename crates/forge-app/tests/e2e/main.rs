@@ -14,10 +14,14 @@
 
 #![allow(dead_code)]
 
+mod browser;
 mod core;
 mod ingest;
 mod library;
+mod media;
 mod perf;
+mod related;
+mod system;
 mod tools;
 mod viewer;
 
@@ -53,6 +57,13 @@ pub struct RunOpts {
     pub args: Vec<OsString>,
 }
 
+/// Folder scenarios save screenshots into (`%TEMP%\zxfr-shots`), created on demand.
+pub fn shots_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("zxfr-shots");
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 /// Runs `script` in a fresh window with the given profile and waits for it to finish.
 /// Panics with a clear message when the window never ran the script.
 pub fn run_app(work: &Path, profile: &Path, script: &str) -> Outcome {
@@ -81,6 +92,8 @@ pub fn run_app_with(work: &Path, profile: &Path, script: &str, opts: &RunOpts) -
             profile.parent().expect("profile sandbox"),
         )
         .env("ZXRAW_PROFILE_DIR", profile)
+        // Scenarios collect their screenshots here for review (PNG files only).
+        .env("ZXRAW_SCREENSHOT_DIR", shots_dir())
         .args(&opts.args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

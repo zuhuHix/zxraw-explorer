@@ -866,6 +866,7 @@ mod tests {
             writer,
             xmp_sync: false,
             search: SearchState::default(),
+            resume_checked: false,
         }
     }
 

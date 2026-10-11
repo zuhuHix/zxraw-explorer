@@ -17,6 +17,7 @@ use thiserror::Error;
 
 mod clipboard;
 mod integration;
+pub mod dragout;
 pub mod drives;
 pub mod files;
 pub mod process;
