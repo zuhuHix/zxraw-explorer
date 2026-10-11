@@ -379,11 +379,39 @@ fn other_formats_thumbnail() {
         let t = generate_thumbnail(&p, 100, &limits, None, 1, None).unwrap();
         assert_eq!((t.width, t.height), (100, 50), "{ext}");
     }
+    // A bare HEIF header with no image data: an error (codec missing or corrupt input),
+    // never a panic or a bogus thumbnail.
     let p = write(dir.path(), "x.heic", b"\0\0\0\x18ftypheic\0\0\0\0mif1heic");
-    assert!(matches!(
-        generate_thumbnail(&p, 100, &limits, None, 1, None),
-        Err(MediaError::Unsupported(_))
-    ));
+    assert!(generate_thumbnail(&p, 100, &limits, None, 1, None).is_err());
+}
+
+/// HEIC goes through WIC with the caller's decode limits. Skips when this machine has no
+/// HEIF encoder (Microsoft HEIF/HEVC extensions), since the fixture is generated through it.
+#[test]
+fn heic_thumbnail_uses_wic_within_the_decode_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("generated.heic");
+    if let Err(e) = forge_media::wic::encode_test_fixture(&p, forge_media::wic::TestContainer::Heif)
+    {
+        eprintln!("skipping: no HEIF encoder available ({e})");
+        return;
+    }
+    let (w, h) = forge_media::wic::source_dimensions(&p).unwrap();
+    let t = generate_thumbnail(&p, 32, &DecodeLimits::default(), None, 1, None).unwrap();
+    assert!(
+        t.width.max(t.height) <= 32 && t.width > 0 && t.height > 0,
+        "{}x{}",
+        t.width,
+        t.height
+    );
+    let tight = DecodeLimits {
+        max_input_pixels: u64::from(w) * u64::from(h) - 1,
+        ..DecodeLimits::default()
+    };
+    assert!(
+        generate_thumbnail(&p, 32, &tight, None, 1, None).is_err(),
+        "a source over the pixel limit must be rejected"
+    );
 }
 
 fn service(cache: Option<&Path>, threads: usize) -> ThumbnailService {

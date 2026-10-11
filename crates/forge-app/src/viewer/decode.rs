@@ -253,9 +253,18 @@ pub fn decode(
             (img, p.orientation.clamp(1, 8) as u8)
         }
         ImageFormat::Heif => {
-            return Err(DecodeError::Unsupported(
-                "HEIC/HEIF/AVIF preview is not available yet".into(),
-            ));
+            let (width, height) = forge_media::wic::source_dimensions(path)?;
+            check_pixels(width, height, limits)?;
+            let rgba = match max_edge {
+                Some(edge) => forge_media::wic::decode_thumbnail(path, edge)?,
+                None => forge_media::wic::decode_full(path, limits.max_input_pixels)?,
+            };
+            check(cancel)?;
+            return Ok(Decoded {
+                rgba,
+                natural: [width, height],
+                video: false,
+            });
         }
         _ => {
             let r = ImageReader::open(path)

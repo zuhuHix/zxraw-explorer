@@ -716,7 +716,7 @@ fn decode_jpeg_bytes(b: &[u8], l: &DecodeLimits) -> Result<(DynamicImage, u8)> {
 /// * RAW: smallest embedded preview ≥ `size` (largest otherwise).
 /// * PNG/TIFF/WebP/GIF/BMP: `image` crate decode with pixel/alloc limits.
 /// * Video: representative frame via ffmpeg (requires `ff`).
-/// * HEIC/AVIF/PSD etc.: `Unsupported` (WIC fallback is a later phase).
+/// * HEIC/AVIF: WIC thumbnail decode when the Windows codec is installed.
 pub fn generate_thumbnail(
     path: &Path,
     size: u32,
@@ -785,11 +785,14 @@ pub fn generate_thumbnail(
             let (img, _) = decode_jpeg_bytes(&p.jpeg, limits)?;
             (img, p.orientation as u8)
         }
-        ImageFormat::Heif => {
-            return Err(MediaError::Unsupported(
-                "HEIC/HEIF/AVIF decoding is not available yet".into(),
-            ));
-        }
+        ImageFormat::Heif => (
+            DynamicImage::ImageRgba8(crate::wic::decode_thumbnail_within(
+                path,
+                size,
+                limits.max_input_pixels,
+            )?),
+            1,
+        ),
         _ => decode_file(path, limits)?,
     };
     check()?;
