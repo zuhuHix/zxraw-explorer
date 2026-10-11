@@ -14,6 +14,7 @@ mod ingest_ui;
 mod library;
 mod media_meta;
 mod modal;
+mod notices;
 mod ops_ui;
 mod pane;
 mod palette;
@@ -123,7 +124,8 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     tracing::info!("ZXraw Explorer {} starting", env!("CARGO_PKG_VERSION"));
-    if let Some(report) = crash::pending_crash_report(&paths) {
+    let pending_crash = crash::pending_crash_report(&paths);
+    if let Some(report) = &pending_crash {
         tracing::warn!(
             "the previous session ended with a crash; report saved at {}",
             report.display()
@@ -150,6 +152,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ZXraw Explorer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths)))),
+        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))),
     )
 }

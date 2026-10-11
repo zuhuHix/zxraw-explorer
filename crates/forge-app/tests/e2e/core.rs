@@ -332,3 +332,74 @@ fn a_failing_step_is_reported_with_its_line() {
 
     expect_script_error(&outcome, "line 2");
 }
+
+#[test]
+fn first_run_welcome_shows_once_per_profile() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let profile = sandbox.path().join("profile");
+    let shot = sandbox.path().join("welcome.png");
+    let opts = RunOpts {
+        env: vec![("ZXRAW_FIRST_RUN".into(), "1".into())],
+        ..Default::default()
+    };
+
+    let first = run_app_with(
+        &sandbox.path().join("run1"),
+        &profile,
+        &format!(
+            "navigate {}\nassert-notice welcome\nwait-frames 10\nscreenshot {}\ndismiss-notices\nassert-notice none\nexit\n",
+            shown(&dir),
+            shown(&shot)
+        ),
+        &opts,
+    );
+    expect_ok(&first);
+    assert!(profile.join("config").join("first-run.done").is_file());
+
+    let second = run_app_with(
+        &sandbox.path().join("run2"),
+        &profile,
+        &format!("navigate {}\nassert-notice none\nexit\n", shown(&dir)),
+        &opts,
+    );
+    expect_ok(&second);
+    if let Ok(keep) = std::env::var("ZXFR_SHOTS") {
+        let _ = fs::copy(&shot, PathBuf::from(keep).join("welcome.png"));
+    }
+}
+
+#[test]
+fn crash_report_from_the_last_session_is_announced_once() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let profile = sandbox.path().join("profile");
+    write_file(
+        &profile.join("data").join("crashes").join("crash-20261011-000000.txt"),
+        b"ZXraw Explorer crash report\npanic: synthetic test report\n",
+    );
+    let shot = sandbox.path().join("crash-notice.png");
+
+    let first = run_app(
+        &sandbox.path().join("run1"),
+        &profile,
+        &format!(
+            "navigate {}\nassert-notice crash\nwait-frames 10\nscreenshot {}\nexit\n",
+            shown(&dir),
+            shown(&shot)
+        ),
+    );
+    expect_ok(&first);
+
+    let second = run_app(
+        &sandbox.path().join("run2"),
+        &profile,
+        &format!("navigate {}\nassert-notice none\nexit\n", shown(&dir)),
+    );
+    expect_ok(&second);
+    if let Ok(keep) = std::env::var("ZXFR_SHOTS") {
+        let _ = fs::copy(&shot, PathBuf::from(keep).join("crash-notice.png"));
+    }
+}

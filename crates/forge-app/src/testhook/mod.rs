@@ -227,6 +227,8 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// wait-no-entry <name> [| s] wait until the focused pane no longer lists the entry
 /// assert-toast <text>        fail unless some toast so far contained the text
 /// assert-no-error-toast      fail if any error toast was shown so far
+/// assert-notice <kind>       crash | welcome | none: which startup notices are open
+/// dismiss-notices            close the startup notices as the user would
 /// ui <area> <verb> [args]    area-specific verbs: viewer, ingest, library, tools, perf
 ///                            (documented in the area modules under `testhook/`)
 /// ```
@@ -271,6 +273,8 @@ enum Step {
     WaitNoEntry(String, Duration),
     AssertToast(String),
     AssertNoErrorToast,
+    AssertNotice(String),
+    DismissNotices,
     Ui {
         area: Area,
         verb: String,
@@ -619,6 +623,11 @@ fn parse_step(
         }
         "assert-toast" => Step::AssertToast(non_empty(rest)?),
         "assert-no-error-toast" => Step::AssertNoErrorToast,
+        "assert-notice" => match rest {
+            "crash" | "welcome" | "none" => Step::AssertNotice(rest.to_string()),
+            _ => return Err("expected `crash`, `welcome` or `none`".into()),
+        },
+        "dismiss-notices" => Step::DismissNotices,
         "ui" => {
             let (area, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
             let area = match area {
@@ -819,6 +828,8 @@ fn needs_listing(step: &Step) -> bool {
             | Step::WaitNoEntry(..)
             | Step::AssertToast(_)
             | Step::AssertNoErrorToast
+            | Step::AssertNotice(_)
+            | Step::DismissNotices
             | Step::Ui { .. }
     )
 }
@@ -1133,6 +1144,30 @@ fn exec(
             } else {
                 Err(format!("error toast(s) were shown: {errors:?}"))
             }
+        }
+        Step::AssertNotice(kind) => {
+            let n = &app.notices;
+            let ok = match kind.as_str() {
+                "crash" => n.crash.is_some(),
+                "welcome" => n.welcome.is_some(),
+                _ => n.crash.is_none() && n.welcome.is_none(),
+            };
+            if ok {
+                Ok(Flow::Done)
+            } else {
+                Err(format!(
+                    "expected notice `{kind}`; crash open: {}, welcome open: {}",
+                    n.crash.is_some(),
+                    n.welcome.is_some()
+                ))
+            }
+        }
+        Step::DismissNotices => {
+            app.notices.crash = None;
+            if app.notices.welcome.is_some() {
+                app.notices.mark_welcome_done();
+            }
+            Ok(Flow::Done)
         }
         Step::Ui { area, verb, args } => match area {
             Area::Viewer => viewer::step(app, ctx, verb, args, st),

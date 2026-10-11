@@ -73,13 +73,18 @@ pub struct ZxrawApp {
     pub ops: crate::actions::Actions,
     pub testhook: crate::testhook::TestHook,
     pub viewer: Option<crate::viewer::Viewer>,
+    pub notices: crate::notices::Notices,
     applied_theme: Option<(bool, f32)>,
     type_ahead: (String, Instant),
     last_session_save: Instant,
 }
 
 impl ZxrawApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        paths: Paths,
+        pending_crash: Option<PathBuf>,
+    ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
         let settings: Settings = settings::load_json(&paths.config.join("settings.json"));
         let session: Session = settings::load_json(&paths.config.join("session.json"));
@@ -100,8 +105,14 @@ impl ZxrawApp {
             last_session_save: Instant::now(),
             testhook: crate::testhook::TestHook::from_env(),
             viewer: None,
+            notices: Default::default(),
             settings,
         };
+        app.notices = crate::notices::Notices::new(
+            &app.paths.config,
+            pending_crash,
+            app.testhook.active(),
+        );
         if app.testhook.active() {
             // Automated runs never show native dialogs or touch the real Recycle Bin.
             crate::dialogs::set_automated();
@@ -847,6 +858,7 @@ impl eframe::App for ZxrawApp {
         });
 
         crate::actions::modals(self, ui);
+        crate::notices::show(self, &ctx);
         if let Some(mut pal) = self.palette.take() {
             if let Some(cmd) = pal.show(&ctx) {
                 self.run(cmd, &ctx);
