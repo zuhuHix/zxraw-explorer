@@ -585,23 +585,33 @@ fn store_cached(dir: &Path, k: &CacheKey, img: &ThumbImage, quality: u8) -> Resu
         )?;
         png
     };
-    // Write-then-rename so readers never see a partial file.
+    // Write a private temp file, then publish it. Readers only look at `.jpg`/`.png` names,
+    // so a temp file left by a crash is never read as a thumbnail.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = target.with_extension(format!(
-        "tmp{}",
-        std::process::id() as u64 * 1_000_003 + thread_tag()
+        "tmp{}-{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&tmp, &buf).map_err(|e| MediaError::io(&tmp, e))?;
-    std::fs::rename(&tmp, &target).map_err(|e| {
+    if let Err(e) = std::fs::write(&tmp, &buf) {
         let _ = std::fs::remove_file(&tmp);
-        MediaError::io(&target, e)
-    })
+        return Err(MediaError::io(&tmp, e));
+    }
+    publish_new(&tmp, &target)
 }
 
-fn thread_tag() -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::thread::current().id().hash(&mut h);
-    h.finish() % 1_000_000
+/// Moves a finished temp file to `target` without replacing an existing entry. A hard link
+/// fails atomically when `target` exists; volumes without hard links fall back to a
+/// check-then-rename. An existing entry is already a complete thumbnail, so it is kept.
+fn publish_new(tmp: &Path, target: &Path) -> Result<()> {
+    let placed = match std::fs::hard_link(tmp, target) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) if target.symlink_metadata().is_ok() => Ok(()),
+        Err(_) => std::fs::rename(tmp, target).map_err(|e| MediaError::io(target, e)),
+    };
+    let _ = std::fs::remove_file(tmp);
+    placed
 }
 
 /// Deletes the least-recently-modified cache files until the directory is ≤ `max_bytes`.
@@ -929,5 +939,113 @@ mod tests {
         assert!(c.bytes <= c.budget);
         assert!(c.get(&[9; 32]).is_some());
         assert!(c.get(&[0; 32]).is_none());
+    }
+
+    #[test]
+    fn publish_never_replaces_an_existing_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("entry.jpg");
+        let tmp = dir.path().join("entry.tmp1");
+        std::fs::write(&target, b"first").unwrap();
+        std::fs::write(&tmp, b"second").unwrap();
+        publish_new(&tmp, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"first");
+        assert!(!tmp.exists());
+
+        let fresh = dir.path().join("fresh.jpg");
+        std::fs::write(&tmp, b"second").unwrap();
+        publish_new(&tmp, &fresh).unwrap();
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"second");
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn disk_cache_round_trips_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let img =
+            ThumbImage::from_rgba(RgbaImage::from_pixel(8, 8, image::Rgba([10, 20, 30, 255])));
+        let key = [7u8; 32];
+        store_cached(dir.path(), &key, &img, 85).unwrap();
+        store_cached(dir.path(), &key, &img, 85).unwrap();
+        let back = load_cached(dir.path(), &key).unwrap();
+        assert_eq!((back.width, back.height), (8, 8));
+        let (jpg, _) = cache_paths(dir.path(), &key);
+        let names: Vec<_> = std::fs::read_dir(jpg.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names.len(),
+            1,
+            "only the published entry remains: {names:?}"
+        );
+    }
+
+    /// A PNG whose IHDR claims `w`×`h`: enough to exercise the declared-size limit.
+    fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend((data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend(kind);
+            out.extend(data);
+            let mut crc = 0xFFFF_FFFFu32;
+            for b in &out[start..] {
+                crc ^= *b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        0xEDB8_8320 ^ (crc >> 1)
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            out.extend((!crc).to_be_bytes());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]); // 8-bit RGB, deflate, no filter, no interlace
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(
+            &mut png,
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        );
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn enormous_declared_png_is_rejected_before_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.png");
+        std::fs::write(&path, png_claiming(60_000, 60_000)).unwrap();
+        let err =
+            generate_thumbnail(&path, 256, &DecodeLimits::default(), None, 0, None).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                MediaError::TooLarge {
+                    width: 60_000,
+                    height: 60_000,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn requests_from_an_older_generation_are_refused() {
+        let svc = ThumbnailService::new(ThumbConfig {
+            cache_dir: None,
+            ff_tools: None,
+            ..Default::default()
+        });
+        svc.cancel_stale(2);
+        let status = svc.request(ThumbRequest::new("missing.jpg", 128).generation(1));
+        assert_eq!(status, RequestStatus::Stale);
+        assert_eq!(svc.current_generation(), 2);
     }
 }

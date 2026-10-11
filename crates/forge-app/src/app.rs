@@ -807,6 +807,9 @@ impl eframe::App for ZxrawApp {
 
         if crate::viewer_host::show(self, ui) {
             crate::actions::modals(self, ui);
+            // The palette must be drawn here too: an open palette blocks the viewer's keys,
+            // so if it were not shown it could never be closed.
+            self.palette_ui(&ctx);
             self.toasts_ui(&ctx);
             crate::testhook::tick(self, &ctx);
             return;
@@ -859,13 +862,7 @@ impl eframe::App for ZxrawApp {
 
         crate::actions::modals(self, ui);
         crate::notices::show(self, &ctx);
-        if let Some(mut pal) = self.palette.take() {
-            if let Some(cmd) = pal.show(&ctx) {
-                self.run(cmd, &ctx);
-            } else if pal.open {
-                self.palette = Some(pal);
-            }
-        }
+        self.palette_ui(&ctx);
         self.toasts_ui(&ctx);
         crate::testhook::tick(self, &ctx);
     }
@@ -881,6 +878,16 @@ impl eframe::App for ZxrawApp {
 }
 
 impl ZxrawApp {
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        if let Some(mut pal) = self.palette.take() {
+            if let Some(cmd) = pal.show(ctx) {
+                self.run(cmd, ctx);
+            } else if pal.open {
+                self.palette = Some(pal);
+            }
+        }
+    }
+
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         self.toasts.retain(|t| t.until > Instant::now());
         if self.toasts.is_empty() {

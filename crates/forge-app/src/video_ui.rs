@@ -206,6 +206,11 @@ impl Default for VideoUi {
 }
 
 impl VideoUi {
+    /// Whether the selected clip cannot be previewed because FFmpeg tools are unavailable.
+    pub fn tools_unavailable(&self) -> bool {
+        self.missing_tools.is_some()
+    }
+
     fn sync_selection(
         &mut self,
         entry: Option<&FileEntry>,

@@ -34,6 +34,17 @@ pub enum DecodeError {
     Cancelled,
 }
 
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::NoFfmpeg => write!(f, "Video preview needs FFmpeg"),
+            DecodeError::Unsupported(m) => write!(f, "Preview not available for this format: {m}"),
+            DecodeError::Failed(m) => write!(f, "This file couldn't be displayed: {m}"),
+            DecodeError::Cancelled => write!(f, "Preview cancelled"),
+        }
+    }
+}
+
 impl From<MediaError> for DecodeError {
     fn from(e: MediaError) -> Self {
         match e {
@@ -364,6 +375,59 @@ mod tests {
         );
         assert!(big.rgba.width() as u64 * big.rgba.height() as u64 <= 20_000);
         assert_eq!(big.natural, [400, 200]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PNG whose IHDR claims `w`×`h` with a stub pixel stream: only the declared size is read.
+    fn png_claiming(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            out.extend((data.len() as u32).to_be_bytes());
+            let start = out.len();
+            out.extend(kind);
+            out.extend(data);
+            let mut crc = 0xFFFF_FFFFu32;
+            for b in &out[start..] {
+                crc ^= *b as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        0xEDB8_8320 ^ (crc >> 1)
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            out.extend((!crc).to_be_bytes());
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 2, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(
+            &mut png,
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        );
+        chunk(&mut png, b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn enormous_declared_size_is_refused_before_allocation() {
+        let dir = std::env::temp_dir().join(format!("zx_viewer_huge_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("huge.png");
+        std::fs::write(&p, png_claiming(60_000, 60_000)).unwrap();
+        let ff = FfTools::default();
+        let c = CancelToken::new();
+        let err = decode(&p, Some(256), &DecodeLimits::default(), &ff, &c)
+            .err()
+            .unwrap();
+        match err {
+            DecodeError::Failed(msg) => assert!(msg.contains("decode limit"), "{msg}"),
+            other => panic!("expected a decode-limit failure, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
