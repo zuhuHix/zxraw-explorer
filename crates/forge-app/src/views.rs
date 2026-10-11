@@ -1,7 +1,9 @@
 //! File list renderers. Both views are virtualized: only on-screen rows/tiles are laid out,
 //! so a folder with 100k entries costs the same per frame as one with 100.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
@@ -1101,6 +1103,184 @@ fn background_interactions(
 // Grid (thumbnail) view
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct GroupBadge {
+    key: PathBuf,
+    count: usize,
+}
+
+struct GridItem {
+    /// Entry rendered in this cell (a group's preferred representative when collapsed).
+    vis: usize,
+    /// Cursor anchor for a collapsed group.
+    focus_vis: usize,
+    /// Entry opened by double-click. For a stack this is its representative.
+    activate_vis: usize,
+    /// All group paths when this cell is a collapsed stack.
+    members: Option<Vec<PathBuf>>,
+    /// Visible listing positions represented by a collapsed stack.
+    visible_members: Option<Vec<usize>>,
+    /// Badge on a collapsed stack or the first item of an expanded group.
+    badge: Option<GroupBadge>,
+}
+
+impl GridItem {
+    fn plain(vis: usize) -> Self {
+        Self {
+            vis,
+            focus_vis: vis,
+            activate_vis: vis,
+            members: None,
+            visible_members: None,
+            badge: None,
+        }
+    }
+}
+
+struct GroupPlan {
+    key: PathBuf,
+    paths: Vec<PathBuf>,
+    visible_members: Vec<usize>,
+    representative: usize,
+}
+
+/// The grouped layout walks the whole listing, so it is cached per listing and grouping
+/// revision; a 50,000-photo folder would otherwise rebuild it every frame. Stack covers
+/// (highest rating) are chosen per drawn cell by [`stack_cover`].
+fn cached_grid_items(ui: &Ui, id: egui::Id, pane: &Pane) -> Option<Arc<Vec<GridItem>>> {
+    if !pane.similar.enabled() || pane.similar.groups().is_empty() {
+        return None;
+    }
+    type Cached = ((u64, u64), Option<Arc<Vec<GridItem>>>);
+    let key = (pane.listing_rev(), pane.similar.revision());
+    let cache_id = id.with("similar-layout");
+    if let Some((cached, items)) = ui.ctx().data(|d| d.get_temp::<Cached>(cache_id))
+        && cached == key
+    {
+        return items;
+    }
+    let items = grouped_grid_items(pane).map(Arc::new);
+    ui.ctx()
+        .data_mut(|d| d.insert_temp::<Cached>(cache_id, (key, items.clone())));
+    items
+}
+
+/// The highest-rated member of a collapsed stack; the first in listing order on ties.
+fn stack_cover(pane: &Pane, thumbs: &dyn ThumbProvider, members: &[usize], first: usize) -> usize {
+    let mut best = None::<(u8, usize)>;
+    for &vis in members {
+        let Some(entry) = pane.entry_at(vis) else {
+            continue;
+        };
+        let rating = thumbs.annotation(&entry.path).map_or(0, |a| a.rating);
+        if best.is_none_or(|(top, _)| rating > top) {
+            best = Some((rating, vis));
+        }
+    }
+    best.map_or(first, |(_, vis)| vis)
+}
+
+fn grouped_grid_items(pane: &Pane) -> Option<Vec<GridItem>> {
+    if !pane.similar.enabled() || pane.similar.groups().is_empty() {
+        return None;
+    }
+
+    let visible_position: HashMap<&Path, usize> = pane
+        .visible
+        .iter()
+        .enumerate()
+        .map(|(vis, &entry_index)| (pane.entries[entry_index].path.as_path(), vis))
+        .collect();
+    let mut plans = HashMap::<usize, GroupPlan>::new();
+    let mut grouped_positions = HashSet::new();
+    for (key, members) in pane.similar.groups() {
+        let visible_members: Vec<usize> = members
+            .iter()
+            .filter_map(|path| visible_position.get(path.as_path()).copied())
+            .collect();
+        if visible_members.len() < 2 {
+            continue;
+        }
+        let first = *visible_members.iter().min().expect("two visible members");
+        let representative = first;
+        let mut ordered_visible = visible_members;
+        ordered_visible.sort_unstable();
+        grouped_positions.extend(ordered_visible.iter().copied());
+        plans.insert(
+            first,
+            GroupPlan {
+                key: key.clone(),
+                paths: members.clone(),
+                visible_members: ordered_visible,
+                representative,
+            },
+        );
+    }
+    if plans.is_empty() {
+        return None;
+    }
+
+    let mut items = Vec::with_capacity(pane.visible.len());
+    for vis in 0..pane.visible.len() {
+        if let Some(plan) = plans.remove(&vis) {
+            let badge = GroupBadge {
+                key: plan.key.clone(),
+                count: plan.paths.len(),
+            };
+            if pane.similar.is_expanded(&plan.key) {
+                for (index, member_vis) in plan.visible_members.iter().copied().enumerate() {
+                    items.push(GridItem {
+                        vis: member_vis,
+                        focus_vis: member_vis,
+                        activate_vis: member_vis,
+                        members: None,
+                        visible_members: None,
+                        badge: (index == 0).then(|| badge.clone()),
+                    });
+                }
+            } else {
+                items.push(GridItem {
+                    vis: plan.representative,
+                    focus_vis: vis,
+                    activate_vis: plan.representative,
+                    members: Some(plan.paths),
+                    visible_members: Some(plan.visible_members),
+                    badge: Some(badge),
+                });
+            }
+        } else if !grouped_positions.contains(&vis) {
+            items.push(GridItem::plain(vis));
+        }
+    }
+    Some(items)
+}
+
+fn group_row_click(
+    resp: &egui::Response,
+    pane: &mut Pane,
+    cursor_vis: usize,
+    activate_vis: usize,
+    members: &[PathBuf],
+    out: &mut Vec<ViewEvent>,
+) {
+    let modifiers = resp.ctx.input(|input| input.modifiers);
+    if resp.clicked() {
+        resp.request_focus();
+        pane.click_group(cursor_vis, members, modifiers.command, modifiers.shift);
+        out.push(ViewEvent::Focus);
+    }
+    if resp.secondary_clicked() {
+        resp.request_focus();
+        if !members.iter().all(|path| pane.selected.contains(path)) {
+            pane.click_group(cursor_vis, members, false, false);
+        }
+        out.push(ViewEvent::Focus);
+    }
+    if resp.double_clicked() {
+        out.push(ViewEvent::Activate(activate_vis));
+    }
+}
+
 pub fn grid(
     ui: &mut Ui,
     pane: &mut Pane,
@@ -1110,6 +1290,25 @@ pub fn grid(
     thumbs: &mut dyn ThumbProvider,
 ) -> Vec<ViewEvent> {
     let mut out = Vec::new();
+    pane.similar
+        .tick(&pane.entries, !pane.is_loading(), ui.ctx());
+    ui.horizontal(|ui| {
+        let response = ui
+            .selectable_label(pane.similar.enabled(), "Group bursts & similar")
+            .on_hover_text("Group images within 2 seconds or with a dHash distance of 6 or less.");
+        if response.clicked() {
+            pane.similar.toggle();
+        }
+        if pane.similar.running() {
+            let (phase, done, total) = pane.similar.progress();
+            let phase = match phase {
+                crate::similar::Phase::CaptureTimes => "Reading capture times",
+                crate::similar::Phase::Hashes => "Comparing thumbnails",
+            };
+            ui.label(format!("{phase} {done}/{total}"));
+        }
+    });
+    let grid_items = cached_grid_items(ui, id, pane);
     let pad = 8.0;
     let label_h = 34.0;
     let cell = vec2(thumb_size + pad * 2.0, thumb_size + label_h + pad);
@@ -1120,7 +1319,7 @@ pub fn grid(
     }
     // Stretch cells to fill the row exactly.
     let cell_w = width / per_row as f32;
-    let n = pane.visible.len();
+    let n = grid_items.as_ref().map_or(pane.visible.len(), |items| items.len());
     let rows = n.div_ceil(per_row);
     pane_grid_columns_store(ui, id, per_row);
 
@@ -1143,7 +1342,19 @@ pub fn grid(
         .auto_shrink([false, false]);
     if pane.scroll_to_cursor {
         if let Some(c) = pane.cursor {
-            let row = c / per_row;
+            let row = grid_items
+                .as_ref()
+                .and_then(|items| {
+                    items.iter().position(|item| {
+                        item.vis == c
+                            || item
+                                .visible_members
+                                .as_ref()
+                                .is_some_and(|members| members.contains(&c))
+                    })
+                })
+                .unwrap_or(c)
+                / per_row;
             let off = ui
                 .ctx()
                 .data(|d| d.get_temp::<f32>(id.with("goff")))
@@ -1167,9 +1378,28 @@ pub fn grid(
         for row in range {
             ui.horizontal(|ui| {
                 for col in 0..per_row {
-                    let vis = row * per_row + col;
-                    let Some(&ei) = pane.visible.get(vis) else {
+                    let display_index = row * per_row + col;
+                    let plain_item;
+                    let item = if let Some(items) = &grid_items {
+                        let Some(item) = items.get(display_index) else {
+                            break;
+                        };
+                        item
+                    } else if display_index < pane.visible.len() {
+                        plain_item = GridItem::plain(display_index);
+                        &plain_item
+                    } else {
                         break;
+                    };
+                    let cover = match (&item.members, &item.visible_members) {
+                        (Some(_), Some(members)) => {
+                            Some(stack_cover(pane, &*thumbs, members, item.vis))
+                        }
+                        _ => None,
+                    };
+                    let vis = cover.unwrap_or(item.vis);
+                    let Some(&ei) = pane.visible.get(vis) else {
+                        continue;
                     };
                     let (rect, resp) =
                         ui.allocate_exact_size(vec2(cell_w, cell.y), Sense::click_and_drag());
@@ -1181,7 +1411,11 @@ pub fn grid(
                     if entry.kind != EntryKind::File {
                         drop_hover = handle_drop(&resp, &entry.path, &mut out);
                     }
-                    let selected = pane.is_selected(&entry);
+                    let selected = item
+                        .members
+                        .as_ref()
+                        .map(|members| members.iter().all(|path| pane.selected.contains(path)))
+                        .unwrap_or_else(|| pane.is_selected(&entry));
                     let p = ui.painter_at(rect);
                     let inner = rect.shrink(3.0);
                     if selected {
@@ -1189,7 +1423,11 @@ pub fn grid(
                     } else if resp.hovered() || drop_hover {
                         p.rect_filled(inner, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
                     }
-                    if focused && pane.cursor == Some(vis) {
+                    let cursor_here = pane.cursor == Some(vis)
+                        || item.visible_members.as_ref().is_some_and(|members| {
+                            pane.cursor.is_some_and(|cursor| members.contains(&cursor))
+                        });
+                    if focused && cursor_here {
                         p.rect_stroke(
                             inner,
                             6.0,
@@ -1251,6 +1489,46 @@ pub fn grid(
                     if let Some(a) = annotation {
                         draw_annotation(&p, badge_rect, a);
                     }
+                    let badge_clicked = if let Some(badge) = &item.badge {
+                        let label = badge.count.to_string();
+                        let badge_size =
+                            vec2((label.chars().count() as f32 * 8.0 + 14.0).max(28.0), 22.0);
+                        let badge_rect = Rect::from_min_size(
+                            pos2(img_rect.right() - badge_size.x - 3.0, img_rect.top() + 3.0),
+                            badge_size,
+                        );
+                        p.rect_filled(badge_rect, 6.0, Color32::from_black_alpha(205));
+                        p.text(
+                            badge_rect.center(),
+                            Align2::CENTER_CENTER,
+                            label,
+                            FontId::proportional(12.0),
+                            Color32::WHITE,
+                        );
+                        let badge_response = ui.interact(
+                            badge_rect,
+                            id.with(("similar-stack-badge", &badge.key)),
+                            Sense::click(),
+                        );
+                        if badge_response.hovered() {
+                            badge_response
+                                .clone()
+                                .on_hover_text(if item.members.is_some() {
+                                    "Click to expand this group"
+                                } else {
+                                    "Click to collapse this group"
+                                });
+                        }
+                        if badge_response.clicked() {
+                            pane.similar.toggle_expanded(&badge.key);
+                            out.push(ViewEvent::Focus);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     let text_rect = Rect::from_min_max(
                         pos2(rect.left() + 4.0, img_rect.bottom() + 4.0),
                         pos2(rect.right() - 4.0, rect.bottom() - 2.0),
@@ -1298,8 +1576,26 @@ pub fn grid(
                     remember_accessible_focus(ui, id, &resp);
                     remember_cursor_accessible_focus(ui, id, &resp);
                     let resp = resp.on_hover_text_at_pointer(entry.name.clone());
-                    begin_drag(&resp, pane, &entry);
-                    row_click(&resp, pane, vis, &mut out);
+                    if let Some(members) = &item.members {
+                        if resp.drag_started() {
+                            resp.dnd_set_drag_payload(DragPaths(members.clone()));
+                        }
+                        if !badge_clicked {
+                            group_row_click(
+                                &resp,
+                                pane,
+                                item.focus_vis,
+                                cover.unwrap_or(item.activate_vis),
+                                members,
+                                &mut out,
+                            );
+                        }
+                    } else {
+                        begin_drag(&resp, pane, &entry);
+                        if !badge_clicked {
+                            row_click(&resp, pane, vis, &mut out);
+                        }
+                    }
                     if resp.clicked() || resp.secondary_clicked() {
                         ui.ctx().data_mut(|data| {
                             data.insert_temp(id.with("accessible-focus"), resp.id);

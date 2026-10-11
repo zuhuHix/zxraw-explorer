@@ -82,11 +82,11 @@ pub struct ZxrawApp {
 
 /// The status bar's "N selected (size)". Walking every listed entry each frame cost
 /// ~200 ms per frame in a 50,000-entry folder (debug build) while anything was selected,
-/// so the visible entries are indexed once per listing and a selection change costs time
-/// proportional to the selection, not the folder.
+/// so the visible entries are indexed once per listing revision and a selection change
+/// costs time proportional to the selection, not the folder.
 #[derive(Default)]
 struct SelectionSummary {
-    listing: Option<(PathBuf, usize, usize, usize, bool)>,
+    listing: Option<u64>,
     /// Visible entry path → size.
     index: std::collections::HashMap<PathBuf, u64>,
     selection: Option<(usize, u64)>,
@@ -96,16 +96,8 @@ struct SelectionSummary {
 
 impl SelectionSummary {
     fn get(&mut self, p: &crate::pane::Pane) -> (usize, u64) {
-        // Sorting reorders entries in place, which a path → size index doesn't mind. A
-        // reload passes through the loading state, which is part of the key.
-        let listing = (
-            p.path.clone(),
-            p.entries.as_ptr() as usize,
-            p.entries.len(),
-            p.visible.len(),
-            matches!(p.load, LoadState::Loading { .. }),
-        );
-        if self.listing.as_ref() != Some(&listing) {
+        let listing = p.listing_rev();
+        if self.listing != Some(listing) {
             self.index = p
                 .visible
                 .iter()

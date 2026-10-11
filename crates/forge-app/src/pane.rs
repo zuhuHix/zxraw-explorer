@@ -56,6 +56,17 @@ pub struct Pane {
     pub editing_path: Option<String>,
     pub show_hidden: bool,
     pub show_system: bool,
+    /// Optional burst / visual near-duplicate grouping for this folder.
+    pub similar: crate::similar::Grouping,
+    /// Changes whenever `entries` or `visible` change (see [`Pane::listing_rev`]).
+    listing_rev: u64,
+}
+
+/// Source of listing revisions, shared by all panes so two panes never report the same one.
+static LISTING_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_listing_rev() -> u64 {
+    LISTING_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Pane {
@@ -85,6 +96,8 @@ impl Pane {
             editing_path: None,
             show_hidden: false,
             show_system: false,
+            similar: crate::similar::Grouping::default(),
+            listing_rev: 0,
         };
         p.load_path(path);
         p
@@ -160,9 +173,22 @@ impl Pane {
         self.pending_select_keep = cursor;
     }
 
+    /// Identifies the current listing: it changes whenever entries are added, removed or
+    /// reordered, or the visible subset changes. Per-frame code caches derived data (for
+    /// example over 50,000 entries) against it instead of walking the listing every frame.
+    pub fn listing_rev(&self) -> u64 {
+        self.listing_rev
+    }
+
+    fn listing_changed(&mut self) {
+        self.listing_rev = next_listing_rev();
+    }
+
     fn load_path(&mut self, path: PathBuf) {
+        self.listing_changed();
         self.cancel.cancel();
         self.cancel = CancelToken::new();
+        self.similar.on_navigation();
         self.path = path.clone();
         self.entries.clear();
         self.visible.clear();
@@ -203,6 +229,8 @@ impl Pane {
             match rx.try_recv() {
                 Ok(ListMsg::Batch(b)) => {
                     self.entries.extend(b);
+                    // Field-level update: `rx` is still borrowed from `self`.
+                    self.listing_rev = next_listing_rev();
                     self.dirty_sort = true;
                     changed = true;
                 }
@@ -222,6 +250,11 @@ impl Pane {
             self.rx = None;
             self.dirty_sort = true;
             changed = true;
+            // `refresh` keeps the old selection; forget paths that are no longer listed.
+            if !self.selected.is_empty() {
+                let listed: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
+                self.selected.retain(|p| listed.contains(p.as_path()));
+            }
         }
         if self.dirty_sort {
             // While streaming, re-sort at most every ~150ms; always sort when done.
@@ -247,6 +280,7 @@ impl Pane {
     pub fn resort(&mut self) {
         let cursor_path = self.cursor_entry().map(|e| e.path.clone());
         listing::sort_entries(&mut self.entries, self.sort);
+        self.listing_changed();
         self.dirty_sort = false;
         self.last_sort = Instant::now();
         self.rebuild_visible();
@@ -281,6 +315,7 @@ impl Pane {
     }
 
     pub fn rebuild_visible(&mut self) {
+        self.listing_changed();
         let plain = self.filter_text.trim().to_lowercase();
         self.visible = self
             .entries
@@ -408,6 +443,31 @@ impl Pane {
         self.cursor = Some(vis);
     }
 
+    /// Select every member represented by a collapsed stack while preserving Explorer's
+    /// Ctrl and Shift selection behavior around the stack's first visible position.
+    pub fn click_group(&mut self, vis: usize, members: &[PathBuf], ctrl: bool, shift: bool) {
+        if shift {
+            self.click(vis, ctrl, true);
+            self.selected.extend(members.iter().cloned());
+            return;
+        }
+        if ctrl {
+            let all_selected = members.iter().all(|path| self.selected.contains(path));
+            for path in members {
+                if all_selected {
+                    self.selected.remove(path);
+                } else {
+                    self.selected.insert(path.clone());
+                }
+            }
+        } else {
+            self.selected.clear();
+            self.selected.extend(members.iter().cloned());
+        }
+        self.anchor = Some(vis);
+        self.cursor = Some(vis);
+    }
+
     /// Move the cursor by `delta` rows (keyboard navigation).
     pub fn move_cursor(&mut self, delta: isize, shift: bool, ctrl: bool) {
         if self.visible.is_empty() {
@@ -421,10 +481,6 @@ impl Pane {
             self.click(next, false, shift);
         }
         self.scroll_to_cursor = true;
-    }
-
-    pub fn total_selected_size(&self) -> u64 {
-        self.selected_entries().iter().map(|e| e.size).sum()
     }
 
     /// Jump to the next entry whose name starts with the typed prefix (type-ahead find).
