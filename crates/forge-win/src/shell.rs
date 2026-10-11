@@ -276,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "sends a file to the real Recycle Bin; run with --ignored"]
     fn recycle_removes_file_from_disk() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("to-recycle.txt");

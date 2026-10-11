@@ -1,7 +1,14 @@
 # Feature checklist
 
-Checked against the current working tree (commit `476021b` plus uncommitted changes) on
-2026-10-10/11.
+Checked against commit `dfd43d9` (branch `main`, clean working tree) on 2026-10-11.
+
+Verification run for this pass (see [TESTING.md](TESTING.md) for commands):
+
+* `CARGO_TARGET_DIR=target/docs cargo test --workspace --no-fail-fast`: 396 passed, 0 failed,
+  2 ignored. The ignored tests are opt-in: `demo_contact_sheet_from_photos` (writes a demo
+  sheet from a hard-coded folder) and `thumbnail_throughput_24mp` (benchmark, release only).
+* `cargo test -p forge-app --test e2e -- --test-threads=1`: 10 passed, 0 failed.
+* FFmpeg and ffprobe are not installed on this machine, so no video tool was run live.
 
 Status means:
 
@@ -12,160 +19,279 @@ Status means:
 
 A passing engine test does not prove visual correctness or Windows shell interoperability.
 The exact commands and limits are in [TESTING.md](TESTING.md) and
-[BENCHMARKS.md](BENCHMARKS.md).
+[BENCHMARKS.md](BENCHMARKS.md). Known gaps are listed in [LIMITATIONS.md](LIMITATIONS.md).
 
 ## Navigation
 
 * 🟡 Browse a directory by path, open parent folders, and keep back/forward history —
-  `forge-app/src/pane.rs`. Only the 50k-folder engine listing is measured; the rendered
-  navigation path is not automated.
+  `forge-app/src/pane.rs`. The e2e scripts navigate to folders by path; back/forward history
+  and parent-folder steps are not asserted by any test. Only the 50k-folder engine listing is
+  measured.
 * 🟡 Tabs, dual panes, session restore, address/breadcrumb navigation, and drive sidebar —
-  `forge-app/src/{app,pane,breadcrumb,sidebar}.rs`. Interactive flows are not automated.
+  `forge-app/src/{app,pane,breadcrumb,sidebar}.rs`. Tabs restored after a restart and
+  dual-pane copy/move are e2e-verified (`tabs_are_restored_on_the_next_start`,
+  `copy_to_other_pane_duplicates_files_byte_for_byte`). The address bar, breadcrumb UI, and
+  drive sidebar are not automated.
 * ✅ Stream directory entries in batches (engine) — `forge-core/src/listing.rs`
-  (`list_dir_streaming`). The 50,000-entry flat-directory run in
+  (`lists_unicode_and_streams_batches`, `junctions_are_links`). The 50,000-entry run in
   [BENCHMARKS.md](BENCHMARKS.md) completed with zero listing errors.
-* 🟡 Cancel a superseded listing in the UI — the cancel token is wired in
-  `forge-app/src/pane.rs`; cancellation in the rendered app is not exercised.
-* 🟡 Browse a 50,000-file folder in the desktop UI — the screenshot hook loads the folder
-  and captures a frame; see the scenario result in [BENCHMARKS.md](BENCHMARKS.md). Frame
-  pacing and interactive responsiveness are not measured.
+* ✅ Cancel a listing (engine) — `forge-core/src/listing.rs::cancel_stops_listing`. Cancelling
+  a superseded listing from the rendered UI is not exercised.
+* 🟡 Browse a 50,000-file folder in the desktop UI — the screenshot hook loaded the folder and
+  captured a frame in an earlier run (not repeated for `dfd43d9`); see [BENCHMARKS.md](BENCHMARKS.md).
+  Frame pacing and interactive responsiveness are not measured.
+* ✅ Folder auto-refresh on new files — `forge-app/src/watcher.rs::detects_new_file_after_debounce`
+  (watcher wired in `main.rs` and `actions.rs`). The rendered list refresh is not driven by a test.
 
 ## File operations
 
-* 🟡 Copy, move, create-folder, and delete with conflict handling — engine code and unit
-  tests in `forge-core/src/ops.rs`; the UI path is not automated.
-* 🟡 Recycle Bin delete, open files, Open With, Properties, and reveal in Explorer —
-  `forge-win/src/shell.rs`. Windows shell behaviour is not exercised by any test here.
-* 🟡 Copy/cut/paste through the Windows clipboard — `forge-win/src/clipboard.rs` publishes
-  and reads `CF_HDROP`, preferred drop effect, and text paths; `forge-win` has 22 unit tests.
-  Explorer interoperability has not been checked.
-* 🟡 Permanent-delete confirmation, operation queue, pause/cancel, and report UI —
-  `forge-app/src/ops_ui.rs` and `forge-jobs`. Visual workflows are not automated.
+* ✅ New folder from the prompt — e2e `new_folder_is_created_from_the_prompt`.
+* ✅ Rename, then undo — e2e `rename_then_undo_restores_the_original_name`; engine
+  `forge-core/src/ops.rs::move_same_volume_rename_and_undo`.
+* ✅ Copy and move between panes, byte-identical — e2e
+  `copy_to_other_pane_duplicates_files_byte_for_byte` and `move_to_other_pane_removes_the_source`;
+  engine `ops.rs::copy_tree_unicode_preserves_mtime_and_readonly`, `move_cross_volume_fallback`.
+* ✅ Conflict handling, keep both — e2e `copy_with_conflict_keep_both_writes_a_numbered_copy`;
+  engine `ops.rs::conflict_policies`, `racing_destination_is_preserved_and_keep_both_retries`,
+  `ask_resolver_apply_to_all_and_cancel`.
+* ✅ Permanent delete asks for confirmation; cancelling keeps the file — e2e
+  `permanent_delete_removes_the_file_after_confirmation` and
+  `permanent_delete_cancelled_keeps_the_file`.
+* ✅ Recycle Bin removal (engine) — `forge-win/src/shell.rs::recycle_removes_file_from_disk`
+  and `recycle_missing_path_is_an_error` pass. The first test sends a temporary file to the
+  real Recycle Bin on each run (see [LIMITATIONS.md](LIMITATIONS.md)). The e2e suite
+  deliberately does not use the Recycle Bin.
+* ✅ Duplicates re-verified on disk before recycling — `forge-app/src/tools_ui.rs::recycle_reverifies_against_disk`
+  and `duplicate_selection_safety_refuses_to_remove_the_last_copy`.
+* 🟡 Open files, Open With, Properties, and reveal in Explorer — `forge-win/src/shell.rs`.
+  No test drives these Windows shell calls.
+* ✅ Clipboard engine: copy and move as `CF_HDROP` — `forge-win/src/clipboard.rs` tests
+  `files_round_trip_for_copy_and_move_including_long_unicode_paths`,
+  `setting_files_increments_clipboard_sequence`, `clear_if_owned_files_does_not_clear_a_changed_sequence`,
+  and `powershell_reads_file_drop_list` pass. The file-list round trip is what these tests prove; the preferred drop effect is
+  set by the same module but is not checked on its own.
+* 🟡 Clipboard interoperability with Explorer — paste into and out of Explorer has not been checked.
+* 🟡 Operation queue, pause/cancel, and report UI — `forge-app/src/ops_ui.rs` and `forge-jobs`.
+  The job pool, bounded queue, and cancellation tokens are tested (`forge-jobs`); the visual
+  queue workflow is not automated, and pause is not covered by a test.
+* ✅ Atomic, no-overwrite publishing of new files — `forge-core/src/paths.rs::never_replaces_and_moves_when_free`
+  (uses `rename_no_replace`), `ops.rs::racing_destination_without_keep_both_is_reported_and_preserved`,
+  `ingest.rs::ingest_manifest_publish_does_not_replace_a_racing_destination`, and
+  `extra_tools_ui.rs::contact_sheet_publish_never_replaces_an_existing_output`.
 
 ## Power-user tools
 
 * ✅ Batch rename preview and apply, with collision and problem checks — engine in
-  `forge-core/src/rename.rs`; CLI tests `rename_dry_run_changes_nothing_and_apply_renames`
-  and `rename_refuses_on_problems` in `forge-cli/tests/cli.rs`.
-* ✅ BLAKE3 hashing and verification — `hash_verify_roundtrip_detects_corruption` and
-  `hash_prints_b3sum_style_lines_without_manifest` in `forge-cli/tests/cli.rs`; full-file
-  throughput is measured in [BENCHMARKS.md](BENCHMARKS.md).
-* ✅ Duplicate detection — `dupes_finds_pair_and_deletes_nothing` in `forge-cli/tests/cli.rs`;
-  the 200k-file benchmark tree yields the expected 20 duplicate groups with zero errors.
-* 🟡 Folder size analysis — `forge-core/src/disk_usage.rs`; no end-to-end or benchmark
-  result is recorded.
-* 🟡 Compare folders/files, keyboard command palette, and dual-pane workflows — engine and
-  UI code exist (`forge-core/src/compare.rs`, `forge-app/src/palette.rs`); no interaction
-  path is automated.
+  `forge-core/src/rename.rs` (`apply_three_cycle_and_undo`, `apply_swaps_two_files`,
+  `collision_reported_when_target_is_not_vacated`); CLI tests `rename_dry_run_changes_nothing_and_apply_renames`
+  and `rename_refuses_on_problems`; e2e `batch_rename_with_default_template_numbers_the_selection`.
+* ✅ BLAKE3 hashing and verification — CLI tests `hash_verify_roundtrip_detects_corruption` and
+  `hash_prints_b3sum_style_lines_without_manifest`; `forge-core/src/hashing.rs`
+  (`blake3_matches_reference`, `manifest_roundtrip_and_corruption`). Full-file throughput is in
+  [BENCHMARKS.md](BENCHMARKS.md).
+* ✅ Duplicate detection — CLI test `dupes_finds_pair_and_deletes_nothing`;
+  `forge-core/src/duplicates.rs` (`staged_duplicate_detection`, `cancel_duplicates`). The
+  200,000-file benchmark tree yields the expected 20 duplicate groups with zero errors.
+* ✅ Folder size analysis — `forge-core/src/disk_usage.rs` (`tree_totals_top_files_and_extensions`,
+  `cancel_scan`). Not benchmarked.
+* ✅ Compare folders (engine) — `forge-core/src/compare.rs` (`compare_and_update_never_deletes`,
+  `mirror_makes_identical`, `non_mirror_plan_with_deletes_is_refused`).
+* 🟡 Compare folders in the UI — no interaction path is automated.
+* ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
+  palette is not automated.
+* ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).
 
 ## Photography browsing, culling, metadata, and integrations
 
-* 🟡 JPEG/PNG/TIFF/WebP/GIF/BMP thumbnail generation and cache — `forge-media` tests cover
-  formats and cache invalidation. The benchmark generates 256 px thumbnails from 200 x
-  24 MP JPEGs (cold and disk-cache passes, [BENCHMARKS.md](BENCHMARKS.md)); the PNG, TIFF,
-  WebP, GIF, and BMP paths are not benchmarked.
-* 🟡 EXIF/XMP reading, image orientation, and embedded RAW JPEG preview extraction —
-  `forge-media` integration tests use synthetic JPEG/TIFF/CR3/RAF/ORF/RW2 data. This is not
-  validation against real camera files from every vendor.
-* 🟡 Ratings, pick state, labels, tags, and collections persisted in SQLite — storage in
-  `forge-db` has tests; the annotation UI is not automated.
-* 🟡 Culling/compare viewer, zoom/pan, and filmstrip — `forge-app/src/viewer/` (cull, zoom,
-  loader, canvas) and `viewer_host.rs`. Unit tests exist for culling and zoom; no visual
-  interaction is certified.
-* 🟡 XMP sidecar and Windows shell integrations — parser and storage code exists; external
-  application interoperability was not exercised.
+* ✅ Thumbnail generation and cache, correctness — `forge-media` tests `other_formats_thumbnail`
+  (formats), `cache_hit_miss_and_mtime_invalidation`, `dedupe_and_priority_and_bad_files`,
+  `cancellation_drops_queued_requests`, and `forge-app/src/thumbs.rs::buckets`.
+  Throughput is measured only for JPEG (200 x 24 MP files, [BENCHMARKS.md](BENCHMARKS.md)).
+  HEIC/HEIF and AVIF are not decoded ([LIMITATIONS.md](LIMITATIONS.md)).
+* 🟡 EXIF, XMP reading, image orientation, and embedded RAW JPEG preview extraction —
+  `forge-media` tests (`jpeg_exif_metadata`, `tiff_raw_previews_and_metadata`,
+  `cr3_previews_and_metadata`, `raf_preview_and_metadata`, `orf_magic_is_handled`,
+  `jpeg_thumbnail_orientation_and_exif_thumb`, `corrupt_and_truncated_inputs_never_panic`) pass
+  on synthetic data only. Real camera files from every vendor have not been tested.
+* ✅ Ratings, pick state, labels, tags, and collections persisted in SQLite — `forge-db`
+  (`annotations::batch_annotations`, `collections::manual_collection_crud_and_order`,
+  `indexer::annotations_survive_missing_and_relink`); `forge-core/src/query.rs::labels_and_picks_roundtrip`.
+* ✅ Tag suggestions and multi-selection tags (logic) — `forge-app/src/tags_ui.rs` (7 tests:
+  suggestion ranking, excluded tags, mixed tags for selections, comma splitting) and
+  `library.rs::tag_rename_then_annotation_add_share_writer_order`.
+* 🟡 Notes editor — the notes field saves on Enter or focus loss (`tags_ui.rs`), but no test
+  covers it and the UI flow is not automated. Notes are stored in the app library and are not
+  written to XMP.
+* 🟡 Culling and compare viewer, zoom/pan, and filmstrip — `forge-app/src/viewer/` (`cull`, `zoom`,
+  `cache`, `loader`, `decode`, `meta`). Unit tests cover culling logic, zoom math, cache budget,
+  and corrupt input; no visual interaction is certified.
+* ✅ Corrupt JPEG in the grid and preview does not crash — e2e `corrupt_jpeg_in_grid_and_preview_does_not_crash`.
+* 🟡 XMP sidecar sync (opt-in) — writer and merge safety are tested: `forge-media/src/xmp_write.rs`
+  (29 tests: lossless merge that keeps unrelated content, BOM and UTF-16 handling, namespace
+  alias and custom prefix resolution, same-process serialised updates, external edit during a
+  merge is re-merged, backup refresh, temp-file uniqueness). `library.rs` tests cover when sidecars
+  are written (only when sync is enabled), failure summaries, and picks not touching sidecars.
+  Not verified with Lightroom, Capture One, or darktable, and the cross-process race window
+  described in [LIMITATIONS.md](LIMITATIONS.md) remains.
 
 ## Video
 
-* 🟡 Parse `ffprobe` metadata and derive representative frames with external tools —
-  `forge-media/src/video.rs`. Requires local FFmpeg executables, which are not bundled or
-  exercised here.
-* ⬜ In-app video playback — not implemented. The UI states "video playback is out of
-  scope" (`forge-app/src/video_ui.rs`); videos open in an external application.
-* 🟡 Filmstrip/scrubbing, related clips, and proxy generation — `forge-app/src/video_ui.rs`
-  (landed, verification in progress). Its unit tests exist but the workflow is not
-  certified.
+* 🟡 Parse `ffprobe` metadata and derive representative frames — `forge-media/src/video.rs`.
+  Tests `timeout_kills_child`, `output_cap_enforced`, `cancel_and_failure_and_missing`,
+  `video_functions_report_tool_missing`, `ffprobe_portrait_hlg`, `ffprobe_vfr_pq_and_legacy_rotate`,
+  and `pix_fmt_table` pass against canned tool output. No real `ffprobe` or `ffmpeg` process has
+  been run here: FFmpeg is not installed and is not bundled.
+* ⬜ In-app video playback — not implemented. The UI states "video playback is out of scope"
+  (`forge-app/src/video_ui.rs`); videos open in an external application.
+* 🟡 Filmstrip, scrubbing, related clips, and proxy generation — `forge-app/src/video_ui.rs`.
+  Unit tests pass for proxy placement (`placing_a_proxy_never_replaces_an_existing_file`,
+  `proxy_temp_collision_and_cleanup_never_delete_a_foreign_file`), GoPro chapter and camera
+  sequence grouping, related-media lookup, size and time estimates, proxy argument quoting, progress
+  parsing, and timecode offsets. Proxy generation with a real FFmpeg has not been run.
 
 ## Ingest
 
 * ✅ Plan an import, apply verified copies, and leave the source intact — CLI test
-  `ingest_dry_run_copies_nothing_apply_copies_and_verifies` in `forge-cli/tests/cli.rs`.
-* 🟡 Ingest UI, template editing, progress/report display, and cancellation —
-  `forge-app/src/ingest_ui.rs`. The UI workflow is not automated.
+  `ingest_dry_run_copies_nothing_apply_copies_and_verifies`.
+* ✅ Ingest rules (engine) — `forge-core/src/ingest.rs`: `ingest_verifies_is_idempotent_and_checks_format_safety`,
+  `conflicts_keep_both_and_rerun_recognises_renamed_copies`,
+  `already_imported_execution_rejects_same_size_destination_changes`,
+  `shallow_format_check_rehashes_content_changed_after_report`, `refuses_overlapping_dest`.
+* ✅ Camera-card detection prompt (decision logic) — `forge-app/src/sidebar.rs` tests
+  `camera_folder_prompts_and_plain_card_does_not`, `dismissed_card_stays_quiet_until_removed`,
+  `removed_and_reinserted_card_discards_the_old_generation`, `removal_before_check_finishes_drops_the_prompt`;
+  `ingest_ui.rs::detects_camera_photo_and_video_directories`. The rendered prompt is not automated.
+* 🟡 Ingest UI: template editing, preview, progress and report display, and cancellation —
+  `forge-app/src/ingest_ui.rs`. Tests cover preview debounce, report clearing when inputs change,
+  destination space checks, and a registered ingest job that copies, verifies, and runs the format
+  check. The visual workflow is not automated.
 
 ## Search
 
-* ✅ Evaluate structured filters over listing entries — the benchmark runs
-  `Query::matches_entry` over 50,000 entries (12,500 matches for `ext:jpg OR ext:cr3`) in
-  [BENCHMARKS.md](BENCHMARKS.md). Parser unit tests in `forge-core/src/query.rs` were not
-  re-run in this pass.
-* ✅ Index folders in SQLite and search indexed metadata — `forge-db` indexer/search tests,
-  CLI test `search_after_index_finds_file`, and the 200,000-file index/search benchmark.
-* 🟡 Resume interrupted scans — `forge-db` indexer tests exist; interrupted-scan recovery is
-  not benchmarked or exercised end to end.
-* 🟡 Saved searches and exclusions — database paths exist and the collections UI exposes
-  saved searches (`forge-app/src/collections_ui.rs`, landed, verification in progress).
+* ✅ Evaluate structured filters over listing entries — `forge-core/src/query.rs` tests
+  (`matches_entries`, `three_valued_logic_for_db_only_fields`, `negation_or_and_parentheses`,
+  `relative_dates`). The benchmark runs `Query::matches_entry` over 50,000 entries (12,500 matches
+  for `ext:jpg OR ext:cr3`) in [BENCHMARKS.md](BENCHMARKS.md).
+* ✅ Index folders in SQLite and search indexed metadata — `forge-db/src/search.rs`
+  (`every_filter_type`, `sorting_paging_scope_and_offline`, `user_values_are_parameters_not_sql`),
+  `forge-db/tests/indexer.rs`, CLI test `search_after_index_finds_file`, and the 200,000-file
+  index and search benchmark.
+* ✅ Resume an interrupted scan — `forge-db/tests/indexer.rs::interrupted_pass_resumes_from_checkpoint`.
+  Interrupted-scan recovery is not benchmarked.
+* ✅ Saved searches and smart collections (database path) — `forge-db/src/collections.rs`
+  (`smart_collections_and_saved_searches`, `import_reports_smart_collection_query_conflict_without_replacing`).
+  The management UI is 🟡 (see Library and collections).
 
 ## Library and collections
 
-* 🟡 Store index roots, offline rows, ratings/tags, collections, and saved searches in the
-  local database — `forge-db/src/collections.rs` includes export/import round-trip tests
-  (landed, verification in progress).
-* 🟡 Library/collection browser, editing, backup/relink, and saved-search management —
-  `forge-app/src/collections_ui.rs` (landed, verification in progress). User interaction is
-  not verified.
+* ✅ Store index roots, offline rows, ratings, tags, collections, and saved searches in the local
+  database — `forge-db/src/collections.rs::export_import_roundtrip_with_placeholders`,
+  `indexer.rs::deleted_files_become_offline_and_return`, `indexer.rs::relink_simple_prefix_rewrite_then_present_again`.
+* ✅ Relink merges annotations, tags, and collection memberships on collision —
+  `forge-db/src/files.rs::relink_collision_merges_annotations_tags_and_memberships`,
+  `relink_marks_existing_destination_present`, `relink_reports_missing_destination_offline`.
+* ✅ Collection import conflicts do not replace existing data —
+  `collections.rs::import_reports_smart_collection_query_conflict_without_replacing`.
+* ✅ Collection export replaces the destination only after a complete write —
+  `forge-app/src/collections_ui.rs::export_replaces_destination_only_after_complete_temp_write`,
+  `failed_export_keeps_existing_destination_intact`. Relink preview counts exact prefixes only
+  (`relink_preview_counts_exact_prefix_and_not_siblings`).
+* 🟡 Library and collection browser, editing, and saved-search management UI —
+  `forge-app/src/collections_ui.rs` (reorder, picker filtering). User interaction is not automated.
 
 ## Archives and extra tools
 
-* 🟡 Browse, extract, and create ZIP archives; create contact sheets; split and join
-  files — `forge-core/src/{archive,split}.rs` and `forge-app/src/extra_tools_ui.rs`
-  (landed, verification in progress). 7z and RAR are not implemented.
+* ✅ ZIP create, list, and extract (engine) — `forge-core/src/archive.rs`: `create_list_extract_roundtrip`,
+  `listing_stops_at_the_entry_cap`, `zip_slip_is_rejected_before_writing`, `zip_bomb_limits`,
+  `symlink_entries_skipped`.
+* ✅ Extract selected ZIP entries only — `archive.rs::selected_extraction_writes_only_requested_entries_and_checks_all_names`.
+* ✅ Contact sheets: pagination, bounded layout, and captions with system fonts —
+  `forge-app/src/extra_tools_ui.rs` (`contact_sheet_pagination_uses_rows_times_columns`,
+  `contact_sheet_page_loader_holds_at_most_one_page_of_thumbnails`,
+  `contact_sheet_layout_is_bounded_and_accounts_for_title_and_captions`,
+  `unicode_caption_draws_pixels_with_system_fonts`). Sample sheets have not been reviewed visually.
+* ✅ Split and join (engine) — `forge-core/src/split.rs` (15 tests): round trip with Unicode and
+  non-multiple sizes, changed and truncated part detection, whole-file hash mismatch publishes nothing,
+  cancellation leaves no output, a simulated crash before publish leaves no final name, overwrite
+  refused, symlinked parts rejected.
+* 🟡 Archive, split/join, and contact-sheet UI workflows — `forge-app/src/extra_tools_ui.rs`.
+  The engine is tested; the dialogs and progress display are not automated.
+* ⬜ 7z and RAR archives — not implemented.
 
 ## Performance
 
-* ✅ Streaming directory listing in the engine (`list_dir_streaming`) — 50,000-entry runs
-  in [BENCHMARKS.md](BENCHMARKS.md).
-* 🟡 Listing off the UI thread, and the bounded duplicate-hash worker pool (8 partial-hash
-  and 4 full-hash I/O threads, `forge-core/src/duplicates.rs:168,198`) — the duplicate scan
-  returns correct results in the benchmark, but thread behaviour and the UI-thread split are
-  not measured.
-* 🟡 Virtualised table/grid painting — `egui::show_rows` is used in `forge-app/src/views.rs`
-  (details list and thumbnail grid); the frame-pacing effect is not measured.
-* ✅ Thumbnail disk cache, DB indexing, and file hashing — measured by the benchmark
-  harness under concurrent build load. Numbers are not regression baselines.
+* ✅ Streaming directory listing in the engine (`list_dir_streaming`) — 50,000-entry runs in
+  [BENCHMARKS.md](BENCHMARKS.md).
+* 🟡 Listing off the UI thread, and the bounded duplicate-hash worker pool (8 partial-hash and 4
+  full-hash I/O threads, `forge-core/src/duplicates.rs`) — the duplicate scan returns correct results
+  in the benchmark, but thread behaviour and the UI-thread split are not measured.
+* 🟡 Virtualised table and grid painting — `egui::show_rows` is used in `forge-app/src/views.rs`
+  (details list at line 878, thumbnail grid at line 1166); frame pacing is not measured.
+* ✅ Thumbnail disk cache, DB indexing, and file hashing — measured by the benchmark harness under
+  concurrent build load. Numbers are not regression baselines.
 
 ## UI/UX
 
-* 🟡 egui desktop shell, list/grid modes, keyboard commands, themes, preview pane — source
-  is present; visual review is not complete.
-* 🟡 AccessKit accessibility nodes (landed, verification in progress) — the `eframe`
-  `accesskit` feature is enabled in `Cargo.toml`, and `forge-app/src/views.rs` builds the
-  nodes. No screen-reader test has been run.
-* 🟡 `ZXRAW_SCREENSHOT`, `ZXRAW_CMDS`, and `ZXRAW_SELECT` smoke hook — `forge-app/src/testhook.rs`.
-  It does not assert pixels or simulate pointer input.
+* 🟡 egui desktop shell, list/grid modes, keyboard commands, themes, preview pane — source is
+  present and commands are driven by the e2e scripts; visual review is not complete.
+* ✅ Colour contrast meets WCAG AA for selected rows, hyperlinks, and focus rings — `forge-app/src/theme.rs`
+  (`selected_row_text_meets_wcag_aa`, `hyperlink_color_meets_wcag_aa_on_its_theme_panel`,
+  `focus_ring_meets_non_text_contrast_on_selection_and_panel`). Selection and focus colours come from one source.
+* ✅ AccessKit tree for the details list — `forge-app/src/views.rs::details_rows_emit_named_selected_accesskit_nodes`.
+* ✅ Keyboard-adjustable column splitter exposes its value and range to AccessKit —
+  `views.rs::column_splitter_exposes_current_value_and_allowed_range`. Key-press resizing is not separately tested.
+* 🟡 Screen reader and other assistive technology — the AccessKit nodes are checked by unit tests
+  only. No real assistive technology (for example NVDA or Narrator) has been run.
+* ✅ Automation hook — `forge-app/src/testhook.rs` runs step scripts (`ZXRAW_SCRIPT`) with filesystem
+  assertions; the 10-scenario e2e suite passes. The hook asserts files, not pixels, and does not simulate
+  pointer or keyboard input. The `ZXRAW_SCREENSHOT` and `ZXRAW_CMDS` smoke modes remain.
 
 ## Reliability, privacy, and packaging
 
-* 🟡 Recursive operations avoid following links implicitly; copies stage to a temp name;
-  ZIP extraction rejects unsafe paths — engine code and tests exist; run status is recorded
-  with the test results in [TESTING.md](TESTING.md).
-* 🟡 SQLite migrations, WAL/foreign keys, integrity checks, and corrupt-database recovery —
-  `forge-db` unit and integration tests cover these paths (`forge-db/tests/indexer.rs`).
-* 🟡 Worker panics are caught and long jobs support cancellation and pause — `forge-jobs`
-  has 4 unit tests; the `forge-app/src/crash.rs` crash-report path is landed and in
-  verification.
-* 🟡 Crash reports (landed, verification in progress) — `forge-app/src/crash.rs` writes a
-  report on panic and prunes old reports; it is not triggered end to end here.
-* 🟡 Packaging (landed, verification in progress) — `packaging/build-release.ps1`,
-  `packaging/zxraw.iss` (Inno Setup), and `packaging/generate_icon.py`. No installer has been
-  built or installed in this pass.
-* 🟡 Local-first/no-telemetry direction is stated in `README.md`; no network-monitoring audit
-  has been performed.
+* ✅ Links and reparse points are not followed by recursive operations — `forge-core/src/ops.rs`
+  (`links_are_not_followed`, `links_are_not_followed_windows`), `listing.rs::junctions_are_links`,
+  `forge-db/tests/indexer.rs::junctions_are_recorded_but_not_followed`.
+* ✅ Copies stage to a temporary name and are cleaned up on cancel — `ops.rs::cancel_mid_copy_leaves_no_partial_files`.
+* ✅ ZIP extraction rejects unsafe paths before writing — `archive.rs::zip_slip_is_rejected_before_writing`.
+* ✅ SQLite migrations, WAL and integrity, and corrupt-database recovery — `forge-db/src/lib.rs`
+  (`migrations_are_idempotent`, `corrupt_file_is_moved_aside_and_recreated`,
+  `damaged_header_of_real_database_is_recovered`) and `forge-db/tests/indexer.rs`.
+* ✅ Worker panics are caught; jobs support cancellation — `forge-jobs`
+  (`pool_runs_tasks_and_survives_panics`, `child_token_inherits_cancel`, `bounded_queue_evicts_low_priority`).
+* ✅ Crash reports — `forge-app/src/crash.rs` (`deliberate_harness_panic_writes_a_report_and_retains_only_twenty`,
+  `pending_report_is_returned_once_per_startup`, `pending_report_is_suppressed_when_startup_marker_cannot_be_written`).
+  The startup notice in the rendered app is not exercised.
+* ✅ Test runs use their own profile — every e2e run passes `ZXRAW_PROFILE_DIR` and a sandbox folder;
+  without it the hook uses a throwaway profile (`forge-app/src/settings.rs`, around line 111). Session restore in
+  tests therefore does not read the user's tabs.
+* ✅ Windows shell registration lifecycle — `forge-win/src/integration.rs` tests run against an isolated HKCU
+  test key (`registration_lifecycle_uses_an_isolated_hkcu_test_root`). The Explorer context-menu entries are not
+  visually checked.
+* 🟡 Packaging — `packaging/build-release.ps1`, `packaging/zxraw.iss`, `packaging/generate_icon.py`,
+  `packaging/generate-third-party.ps1`, and the VERSIONINFO resource in `crates/forge-app/build.rs`.
+  Commit `e3bfbd2` records a release zip that was built and whose executable launched; that build is not
+  reproduced in this pass and no `dist/` output exists in this checkout. The Inno Setup installer has not
+  been compiled (`ISCC` is not installed). The release script builds with `--no-default-features`, which
+  removes the automation hook; this was not checked in a release binary here.
+* 🟡 Third-party inventory and licence notes — `packaging/THIRD_PARTY.md` lists the runtime dependencies for
+  the Windows target and flags three for licence review. The notices those licences require are not yet
+  shipped (see [LIMITATIONS.md](LIMITATIONS.md)).
+* 🟡 Local-first, no-telemetry direction is stated in `README.md`; no network-monitoring audit has been performed.
 
-## In-progress work
+## Recently hardened
 
-The following are present in the working tree and remain 🟡 until their tests pass and
-their user-facing workflows are exercised: viewer/culling, ingest UI, power-user tools,
-settings and external tools, the Windows clipboard, folder watching, collections, the video
-workflow, contact sheets and archive/split-join tools, accessibility nodes, and packaging
-with crash reports.
+These areas changed in review-fix commits (`91407a3` to `dfd43d9`). Each is covered by the tests named above
+where a test exists:
+
+* Atomic, no-overwrite publishing of files, contact sheets, archives, and split parts (`rename_no_replace`).
+* Split and join: publish, cancellation, and changed-part handling; ZIP selected extraction and path checks.
+* XMP writer integrity: namespace binding, Unicode and UTF-16 sidecars, serialised updates, external edits during a merge.
+* Collections: relink merges annotations, tags, and memberships; import conflicts keep existing data; export
+  replaces its destination only after a complete write.
+* Tags: ordered tag operations; unresolved annotation paths report an error and revert the optimistic cache.
+* Ingest: stale reports are cleared; already-imported checks reject changed destinations.
+* Automation: hook is gated behind debug builds or the `automation` feature; script paths are sandboxed and
+  Recycle Bin commands are rejected before dispatch (`testhook.rs` tests).
+* Context-menu refresh after registration changes, licence notices (`packaging/`), and accessibility
+  (selection and focus colours, column splitter).
+* Crash reports on panic and test-profile isolation.

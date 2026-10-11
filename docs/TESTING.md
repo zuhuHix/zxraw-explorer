@@ -229,3 +229,10 @@ rather than stderr when running a release binary.
 
 A failing scenario that exposes a real application bug stays in the suite and is marked
 `#[ignore = "bug: …"]` until the bug is fixed.
+
+### Tests that touch the real system (opt-in)
+
+`forge-win`'s `recycle_removes_file_from_disk` sends a temporary file to the user's real
+Recycle Bin, so it is `#[ignore]`d by default. Run it explicitly with
+`cargo test -p forge-win -- --ignored recycle_removes_file_from_disk`.
+All other tests (including the e2e suite) use temporary directories and isolated profiles.

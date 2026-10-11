@@ -1,9 +1,9 @@
 # Known limitations
 
-This list describes the checked-out implementation (commit `476021b` plus the uncommitted
-working tree), not the intended roadmap. The app is still in early development; a feature
-appearing in a menu or module is not evidence of a complete end-to-end workflow. Feature
-status is in [FEATURES.md](FEATURES.md).
+This list describes commit `dfd43d9` (branch `main`, clean working tree), checked on 2026-10-11.
+It is not the intended roadmap. The app is still in early development; a feature appearing in a
+menu or module is not evidence of a complete end-to-end workflow. Feature status, with the tests
+that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Formats and media
 
@@ -12,36 +12,59 @@ status is in [FEATURES.md](FEATURES.md).
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF
   and AVIF pixels are not decoded: the thumbnail path returns "not available yet"
-  (`forge-media/src/thumbs.rs:781`), and only their EXIF is read (`image_meta.rs:25`). The
+  (`forge-media/src/thumbs.rs:781`), and only their EXIF is read (`image_meta.rs`). The
   WIC fallback is planned work (`thumbs.rs:710`), not present.
 * Thumbnail throughput is limited. On this machine, under concurrent build load, 256 px
   thumbnails from 24 MP JPEGs were generated at a median of 3.7 images/s with an empty disk
-  cache (about 272 ms per image). Cache hits take about 1 ms. See [BENCHMARKS.md](BENCHMARKS.md).
-* Video metadata and thumbnails depend on external `ffprobe` and `ffmpeg` executables, which
-  are not bundled. There is no in-app video playback: the video UI says "video playback is
-  out of scope" (`forge-app/src/video_ui.rs`). Filmstrip, scrubbing, and proxy generation
-  exist but are landed and still in verification.
+  cache (about 272 ms per image). Cache hits take about 1 ms. Only JPEG throughput has been
+  measured. See [BENCHMARKS.md](BENCHMARKS.md).
+* There is no in-app video playback: the video UI says "video playback is out of scope"
+  (`forge-app/src/video_ui.rs:557`). Videos open in an external application.
+* FFmpeg and ffprobe are not bundled and were not installed on the verification machine. Video
+  metadata parsing and proxy argument handling are tested with canned tool output and fake tools
+  only. Real proxy generation, filmstrip rendering, and scrubbing have not been run. Proxy
+  placement never replaces an existing file (tested).
 
 ## Windows shell and file exchange
 
 * `eframe` accepts files and folders dropped into the app. There is no outgoing OLE drag
   source (`IDropSource`/`DoDragDrop` do not appear in the source), so ZXraw cannot drag files
   out to another application.
-* The Windows file clipboard publishes and reads `CF_HDROP`, the preferred drop effect, and
-  text paths (`forge-win/src/clipboard.rs`). Its unit tests run, but Explorer
-  interoperability and the complete copy/cut/paste workflow have not been verified.
-* Shell operations (Recycle Bin delete, Open With, Properties, Explorer reveal) are
-  Windows-only. Their non-Windows implementations return unsupported results or empty data.
-* Session restore reopens tabs from the user's real profile. The UI test hook runs against
-  that profile too, so a test run shows the user's own tabs.
+* The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
+  tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
+  of other applications, has not been checked.
+* Shell operations are Windows-only. Their non-Windows implementations return unsupported results
+  or empty data. Recycle Bin removal is tested; Open With, Properties, and Explorer reveal are not
+  tested by any automated test.
+
+## Installer, packaging, and licences
+
+* The installer is not compiled. `packaging/zxraw.iss` (Inno Setup) has not been built, because
+  Inno Setup (`ISCC`) is not installed on the verification machine.
+* The release zip was built and its executable launched (commit `e3bfbd2`). That build was not
+  repeated for this checkout, and no `dist/` output is present. The release script builds with
+  `--no-default-features`, so the automation hook is compiled out. This was not checked in a
+  release binary.
+* Licence notices that must ship before any distribution (flagged in `packaging/THIRD_PARTY.md`):
+  * `epaint_default_fonts` 0.36.2, `(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0`. The
+    SIL Open Font License 1.1 and Ubuntu Font Licence 1.0 texts and the font copyright notices must
+    be included with the release. The release script currently copies only `LICENSE-MIT`,
+    `LICENSE-APACHE`, `README.md`, `THIRD_PARTY.md`, and `LICENSES-NOTE.md`, so this is not yet met.
+  * `option-ext` 0.2.0, `MPL-2.0`. This is weak copyleft. The MPL-2.0 licence text and the
+    crate's notices must ship, and the source of the crate must remain available under MPL-2.0.
+    ZXraw has not modified the crate.
+  * `self_cell` 1.3.0, `Apache-2.0 OR GPL-2.0-only`. ZXraw elects Apache-2.0, so the Apache-2.0
+    text (already shipped as `LICENSE-APACHE`) applies. GPL-2.0 is not elected.
+* FFmpeg and ffprobe are not bundled. If they are ever bundled, their own licences (LGPL or GPL,
+  depending on the build) apply and must be shipped.
 
 ## Scale and background work
 
 * A pane keeps the complete `FileEntry` list and a separate visible-index list
   (`forge-app/src/pane.rs:33,35`). Natural sorting covers the whole list, and rebuilding a
-  filter examines every entry. Virtualised table and grid painting (`show_rows`,
-  `views.rs:821,1109`) bounds row widgets to the visible region. It does not make listing,
-  sorting, or filtering constant-time or constant-memory.
+  filter examines every entry. Virtualised table and grid painting (`show_rows`, in
+  `views.rs` at lines 878 and 1166) bounds row widgets to the visible region. It does not make
+  listing, sorting, or filtering constant-time or constant-memory.
 * Measured at the median on a 50,000-entry folder (under concurrent build load): first batch
   44 ms, complete listing 414 ms, sort per resort 33 ms, filter 94 ms. Listing a 200,000-file
   tree and indexing it takes about 68 s fresh and 20 s to re-index unchanged. See
@@ -60,11 +83,46 @@ status is in [FEATURES.md](FEATURES.md).
 * Indexing and thumbnail jobs are local. There is no cloud catalog, remote database, or
   multi-machine synchronisation.
 
+## Metadata and XMP sync
+
+* XMP sidecar sync is opt-in. When it is enabled, only ratings, labels, and keywords are written.
+  Picks and notes stay in the app library (`library.rs`) and are not written to sidecars.
+* The sidecar writer is tested for lossless merges, namespaces, and same-process serialisation,
+  but it has not been tested with Lightroom, Capture One, or darktable.
+* A small cross-process race window remains. Updates within ZXraw are serialised. Another process
+  writing the same sidecar at the same moment is not excluded by a lock.
+* EXIF and XMP reading is tested on synthetic JPEG, TIFF, PNG, WebP, CR3, RAF, and ORF data. It has
+  not been validated against real camera files from every vendor.
+
+## Accessibility
+
+* The AccessKit nodes are checked by unit tests. No screen reader or other assistive technology
+  (for example NVDA or Narrator) has been run against the app.
+* The colour-contrast tests cover the selected row, hyperlinks, and the focus ring. Other colours in
+  the UI are not covered by a test.
+
 ## Verification boundary
 
-Unit and integration tests verify the tested engine paths, not every Windows shell call,
-screen-reader workflow, GPU rendering path, or behaviour on a real photo or video library.
-The UI test hook captures a screenshot after commands and does not assert pixel-level
-correctness or automate pointer or keyboard input. The 50,000-folder screenshot run shows
-that the list renders; it does not establish frame pacing or interactive responsiveness.
-See [TESTING.md](TESTING.md) and [FEATURES.md](FEATURES.md) for current status.
+* The unit and integration suites verify the tested engine paths and UI logic. They do not verify
+  every Windows shell call, screen-reader workflow, GPU rendering path, or behaviour on a real
+  photo or video library.
+* The e2e suite (`crates/forge-app/tests/e2e.rs`, 10 scenarios) drives commands and dialogs through
+  the app's command layer and asserts on files. It does not assert pixels and does not simulate
+  pointer or keyboard input.
+* The 50,000-folder screenshot in [BENCHMARKS.md](BENCHMARKS.md) shows that the list renders; it does
+  not establish frame pacing or interactive responsiveness. That run predates `dfd43d9`.
+* `forge-win`'s `recycle_removes_file_from_disk` test sends a temporary file to the real Recycle Bin on
+  every run. The e2e suite avoids the Recycle Bin on purpose, but the unit test does not.
+
+## Fixed since commit 476021b
+
+These limitations from the earlier version of this list no longer apply:
+
+* The UI test hook ran against the user's real profile. It now uses a throwaway profile unless
+  `ZXRAW_PROFILE_DIR` is set (`forge-app/src/settings.rs`), and the e2e suite uses its own profile
+  (commit `25b10cd`).
+* Publishing could replace an existing output. Files, archives, contact sheets, and split parts now
+  publish without replacing existing files, using `rename_no_replace` (commits `91407a3`, `9968bbd`,
+  `f67d83c`).
+* Collection relink did not merge annotations on a path collision, and collection import conflicts
+  were not reported. Relink now merges them and import reports conflicts (commit `e99b827`).
