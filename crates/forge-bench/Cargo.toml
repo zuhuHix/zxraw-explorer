@@ -1,0 +1,20 @@
+[package]
+name = "forge-bench"
+description = "Reproducible data generator and performance harness for ZXraw Explorer."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forge-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+forge-core.workspace = true
+forge-db.workspace = true
+forge-jobs.workspace = true
+forge-media.workspace = true
+image.workspace = true

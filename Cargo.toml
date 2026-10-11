@@ -8,6 +8,7 @@ members = [
     "crates/forge-win",
     "crates/forge-app",
     "crates/forge-cli",
+    "crates/forge-bench",
 ]
 default-members = ["crates/forge-app", "crates/forge-cli"]
 
@@ -83,4 +84,9 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 # Media decoding is unbearably slow unoptimized; keep deps fast in dev builds.
+opt-level = 2
+
+[profile.dev.package.forge-media]
+# Our own decode/resize code is hot too (the viewer agent observed ~2 s per preview decode
+# in an unoptimised dev build; not re-measured).
 opt-level = 2
