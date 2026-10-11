@@ -539,7 +539,7 @@ fn show_contents(
             section_title(ui, "1", "Source cards and folders");
             ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(!state.card_scan_busy, egui::Button::new("Add folder…")).clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    && let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new())
                 {
                     changed |= add_source(&mut state.sources, path);
                 }
@@ -608,7 +608,7 @@ fn show_contents(
                 );
                 changed |= response.changed();
                 if ui.button("Browse…").clicked()
-                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                    && let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new())
                 {
                     state.destination = path.to_string_lossy().into_owned();
                     changed = true;

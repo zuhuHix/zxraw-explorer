@@ -7,6 +7,7 @@ mod breadcrumb;
 mod collections_ui;
 mod commands;
 mod crash;
+mod dialogs;
 mod extra_tools_ui;
 mod fonts;
 mod ingest_ui;
@@ -23,6 +24,12 @@ mod tags_ui;
 mod settings;
 mod settings_ui;
 mod sidebar;
+// The automation hook exists only in debug builds or with the `automation` feature;
+// release builds get an inert stub with the same surface.
+#[cfg(any(debug_assertions, feature = "automation"))]
+mod testhook;
+#[cfg(not(any(debug_assertions, feature = "automation")))]
+#[path = "testhook_off.rs"]
 mod testhook;
 mod theme;
 mod thumbs;

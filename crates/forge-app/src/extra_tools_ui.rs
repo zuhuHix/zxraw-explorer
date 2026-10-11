@@ -521,9 +521,9 @@ fn render_contact_sheet(
                 ui.label("Output folder");
                 ui.text_edit_singleline(&mut state.output_text);
                 if ui.button("Choose…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_directory(&state.options.output_dir)
-                        .pick_folder()
+                    && let Some(path) = crate::dialogs::pick_folder(
+                        rfd::FileDialog::new().set_directory(&state.options.output_dir),
+                    )
                 {
                     state.output_text = path.to_string_lossy().into_owned();
                 }
@@ -1540,9 +1540,9 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
                 ui.label("Extract to");
                 ui.text_edit_singleline(&mut state.destination_text);
                 if ui.button("Choose…").clicked()
-                    && let Some(path) = rfd::FileDialog::new()
-                        .set_directory(&state.destination)
-                        .pick_folder()
+                    && let Some(path) = crate::dialogs::pick_folder(
+                        rfd::FileDialog::new().set_directory(&state.destination),
+                    )
                 {
                     state.destination_text = path.to_string_lossy().into_owned();
                 }

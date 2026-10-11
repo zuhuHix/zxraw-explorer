@@ -102,6 +102,11 @@ impl ZxrawApp {
             viewer: None,
             settings,
         };
+        if app.testhook.active() {
+            // Automated runs never show native dialogs or touch the real Recycle Bin.
+            crate::dialogs::set_automated();
+            forge_win::set_recycle_sandbox(Some(app.paths.data.join("recycle-sandbox")));
+        }
         app.restore_session(session);
         // `forge.exe <folder>` opens that folder in a new tab.
         if let Some(arg) = std::env::args_os().nth(1) {
@@ -204,15 +209,19 @@ impl ZxrawApp {
     }
 
     pub fn toast(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.testhook.record_toast(&text, false);
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             error: false,
             until: Instant::now() + Duration::from_secs(4),
         });
     }
     pub fn toast_err(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.testhook.record_toast(&text, true);
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             error: true,
             until: Instant::now() + Duration::from_secs(8),
         });
@@ -742,6 +751,10 @@ impl ZxrawApp {
 }
 
 impl eframe::App for ZxrawApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        crate::testhook::raw_input(self, raw_input);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut changed = false;
         for t in &mut self.tabs {

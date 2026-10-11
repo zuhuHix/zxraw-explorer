@@ -987,7 +987,7 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                 ui.label(RichText::new(shown).small());
                 if ui.button("Choose folder…").clicked() {
                     let picker = rfd::FileDialog::new();
-                    if let Some(path) = picker.pick_folder() {
+                    if let Some(path) = crate::dialogs::pick_folder(picker) {
                         dialog.destination = Some(path);
                         destination_changed = true;
                     }

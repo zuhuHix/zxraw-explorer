@@ -1145,10 +1145,9 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
     for intent in intents {
         match intent {
             SettingsIntent::PickFfmpegFolder => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose FFmpeg folder")
-                    .pick_folder()
-                {
+                if let Some(path) = crate::dialogs::pick_folder(
+                    rfd::FileDialog::new().set_title("Choose FFmpeg folder"),
+                ) {
                     app.settings.ffmpeg_dir = Some(path);
                     rebuild_thumb_manager(app);
                     start_probe_check(
@@ -1164,10 +1163,9 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
                 start_probe_check(&mut app.ops.settings_ui, None, ctx);
             }
             SettingsIntent::PickLibraryRoot => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Add indexed folder")
-                    .pick_folder()
-                {
+                if let Some(path) = crate::dialogs::pick_folder(
+                    rfd::FileDialog::new().set_title("Add indexed folder"),
+                ) {
                     add_library_root(app, path, ctx);
                 }
             }
@@ -1204,11 +1202,11 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
             SettingsIntent::CheckIntegrity => check_integrity(app, ctx),
             SettingsIntent::DetectApps => detect_apps_background(&mut app.ops.settings_ui, ctx),
             SettingsIntent::BrowseToolExecutable => {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_title("Choose application executable")
-                    .add_filter("Applications", &["exe"])
-                    .pick_file()
-                    && let Some(draft) = &mut app.ops.settings_ui.tool_draft
+                if let Some(path) = crate::dialogs::pick_file(
+                    rfd::FileDialog::new()
+                        .set_title("Choose application executable")
+                        .add_filter("Applications", &["exe"]),
+                ) && let Some(draft) = &mut app.ops.settings_ui.tool_draft
                 {
                     draft.exe = path;
                     draft.error = None;

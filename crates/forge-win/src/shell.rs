@@ -4,6 +4,65 @@ use std::path::{Path, PathBuf};
 
 use crate::{Result, WinError};
 
+static RECYCLE_SANDBOX: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Test seam: while set, [`recycle`] moves items into `dir` instead of the real Recycle
+/// Bin. Automated UI runs set this so they can never touch the user's Recycle Bin.
+pub fn set_recycle_sandbox(dir: Option<PathBuf>) {
+    *RECYCLE_SANDBOX.lock().unwrap_or_else(|p| p.into_inner()) = dir;
+}
+
+/// Whether [`recycle`] currently goes to a sandbox instead of the real Recycle Bin.
+pub fn recycle_sandbox_active() -> bool {
+    recycle_sandbox().is_some()
+}
+
+fn recycle_sandbox() -> Option<PathBuf> {
+    RECYCLE_SANDBOX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Sends each path to the Recycle Bin (or the sandbox set by [`set_recycle_sandbox`]).
+pub fn recycle(paths: &[PathBuf]) -> Result<()> {
+    match recycle_sandbox() {
+        Some(dir) => recycle_to_sandbox(&dir, paths),
+        None => recycle_shell(paths),
+    }
+}
+
+/// Sandbox "Recycle Bin": every item is renamed into a fresh, newly created numbered
+/// folder under `dir` (`dir/<n>/<name>`), so nothing already there can be replaced. Like
+/// the shell, a missing item fails the whole call before anything is moved. Items on
+/// another volume than `dir` fail with an error instead of being copied.
+pub fn recycle_to_sandbox(dir: &Path, paths: &[PathBuf]) -> Result<()> {
+    let io = |op: &'static str, path: &Path| {
+        let path = path.to_path_buf();
+        move |source| WinError::Io { op, path, source }
+    };
+    for p in paths {
+        std::fs::symlink_metadata(p).map_err(io("recycle (sandbox)", p))?;
+    }
+    std::fs::create_dir_all(dir).map_err(io("create recycle sandbox", dir))?;
+    for p in paths {
+        let name = p
+            .file_name()
+            .ok_or_else(|| WinError::Invalid(format!("cannot recycle {}", p.display())))?;
+        let slot = (0u32..)
+            .map(|n| dir.join(n.to_string()))
+            .find_map(|slot| match std::fs::create_dir(&slot) {
+                Ok(()) => Some(Ok(slot)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(e) => Some(Err(e)),
+            })
+            .expect("unbounded range")
+            .map_err(io("create recycle sandbox slot", dir))?;
+        std::fs::rename(p, slot.join(name)).map_err(io("recycle (sandbox)", p))?;
+    }
+    Ok(())
+}
+
 /// Sends each path to the Recycle Bin with `IFileOperation`.
 ///
 /// Runs on the calling thread, which gets its own apartment-threaded COM initialisation
@@ -12,7 +71,7 @@ use crate::{Result, WinError};
 /// failures come back as errors. If the shell aborted any item, returns
 /// [`WinError::Aborted`].
 #[cfg(windows)]
-pub fn recycle(paths: &[PathBuf]) -> Result<()> {
+fn recycle_shell(paths: &[PathBuf]) -> Result<()> {
     use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
     use windows::Win32::UI::Shell::{
         FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -64,7 +123,7 @@ pub fn recycle(paths: &[PathBuf]) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn recycle(_paths: &[PathBuf]) -> Result<()> {
+fn recycle_shell(_paths: &[PathBuf]) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
@@ -290,6 +349,44 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let missing = d.path().join("nope.txt");
         assert!(recycle(&[missing]).is_err());
+    }
+
+    #[test]
+    fn sandbox_recycle_moves_items_without_replacing() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        let a = d.path().join("same.txt");
+        std::fs::write(&a, b"first").unwrap();
+        recycle_to_sandbox(&bin, std::slice::from_ref(&a)).unwrap();
+        std::fs::write(&a, b"second").unwrap();
+        let folder = d.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("inner.txt"), b"x").unwrap();
+        recycle_to_sandbox(&bin, &[a.clone(), folder.clone()]).unwrap();
+        assert!(!a.exists() && !folder.exists());
+        assert_eq!(
+            std::fs::read(bin.join("0").join("same.txt")).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(bin.join("1").join("same.txt")).unwrap(),
+            b"second"
+        );
+        assert!(bin.join("2").join("folder").join("inner.txt").is_file());
+    }
+
+    #[test]
+    fn sandbox_recycle_with_a_missing_item_moves_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let bin = d.path().join("bin");
+        let present = d.path().join("present.txt");
+        std::fs::write(&present, b"keep").unwrap();
+        let missing = d.path().join("missing.txt");
+        assert!(recycle_to_sandbox(&bin, &[present.clone(), missing]).is_err());
+        assert!(
+            present.exists(),
+            "nothing may move when one item is missing"
+        );
     }
 
     #[test]

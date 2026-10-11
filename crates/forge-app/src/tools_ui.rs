@@ -1717,16 +1717,15 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
         if ui
             .add_enabled(state.entries.is_some(), egui::Button::new("Save manifest…"))
             .clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .set_file_name("checksums.b3")
-                .save_file()
+            && let Some(path) =
+                crate::dialogs::save_file(rfd::FileDialog::new().set_file_name("checksums.b3"))
         {
             save_path = Some(path);
         }
         if ui.button("Verify manifest…").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("BLAKE3 manifest", &["b3", "txt"])
-                .pick_file()
+            && let Some(path) = crate::dialogs::pick_file(
+                rfd::FileDialog::new().add_filter("BLAKE3 manifest", &["b3", "txt"]),
+            )
         {
             verify_path = Some(path);
         }
@@ -1932,7 +1931,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
             ui.label(RichText::new("Choose a folder").weak());
         }
         if ui.button("Choose right folder…").clicked() {
-            picked_right = rfd::FileDialog::new().pick_folder();
+            picked_right = crate::dialogs::pick_folder(rfd::FileDialog::new());
         }
         ui.checkbox(&mut state.use_hash, "Compare file contents with BLAKE3");
         if state.right.is_some() && ui.button("Compare / refresh").clicked() {

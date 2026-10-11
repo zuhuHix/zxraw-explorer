@@ -1403,11 +1403,11 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             collection_id,
             name,
         } => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("JSON", &["json"])
-                .set_file_name(format!("{name}.json"))
-                .save_file()
-            {
+            if let Some(path) = crate::dialogs::save_file(
+                rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name(format!("{name}.json")),
+            ) {
                 start_operation(app, ctx, OperationFlags::EXPORT, move |db| {
                     let json = db
                         .export_collections_json(&[collection_id])
@@ -1419,9 +1419,8 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             }
         }
         UiCommand::ChooseImport => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("JSON", &["json"])
-                .pick_file()
+            if let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new()
+                .add_filter("JSON", &["json"]))
             {
                 start_import_preview(app, ctx, path);
             }
@@ -1440,14 +1439,14 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
         }
         UiCommand::CancelImport => app.ops.collections_ui.import_prompt = None,
         UiCommand::ChooseRelinkOld => {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            if let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) {
                 let state = &mut app.ops.collections_ui;
                 state.relink_old = Some(path);
                 clear_relink_preview(state);
             }
         }
         UiCommand::ChooseRelinkNew => {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            if let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) {
                 let state = &mut app.ops.collections_ui;
                 state.relink_new = Some(path);
                 clear_relink_preview(state);
