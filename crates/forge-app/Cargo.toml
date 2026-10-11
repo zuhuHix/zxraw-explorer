@@ -33,6 +33,7 @@ forge-db.workspace = true
 forge-media.workspace = true
 forge-win.workspace = true
 notify = { version = "8.2", default-features = false }
+ab_glyph = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

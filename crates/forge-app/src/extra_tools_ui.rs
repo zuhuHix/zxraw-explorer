@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
+use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use crossbeam_channel::{Receiver, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{ArchiveEntry, ExtractOptions};
@@ -625,6 +626,8 @@ fn build_contact_sheets(
         paths: Vec::with_capacity(page_paths.len()),
         keep: false,
     };
+    // Fonts are read once per job, not per glyph or per page.
+    let text = TextEngine::load();
 
     let mut tiles = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
@@ -671,7 +674,7 @@ fn build_contact_sheets(
         if options.captions_rating
             && let Some(rating) = source.rating
         {
-            details.push(format!("RATING {rating}/5"));
+            details.push(format!("Rating {rating}/5"));
         }
         if let Some(meta) = meta {
             if let Some(date) = meta.date_taken {
@@ -706,17 +709,13 @@ fn build_contact_sheets(
                 details.push(exposure.join(" "));
             }
         }
-        let mut captions = Vec::new();
-        if options.captions_file_name {
-            captions.push(file_name);
-        }
-        if !details.is_empty() {
-            captions.push(details.join(" · "));
-        }
+        let name = options.captions_file_name.then_some(file_name);
+        let details = (!details.is_empty()).then(|| details.join(" · "));
         ctx.progress.add_items(1);
         tiles.push(SheetTile {
             image: thumb,
-            captions,
+            name,
+            details,
         });
     }
 
@@ -732,7 +731,7 @@ fn build_contact_sheets(
             String::new()
         } else if ranges.len() > 1 {
             format!(
-                "{}  ·  PAGE {} OF {}",
+                "{}  ·  Page {} of {}",
                 options.page_title.trim(),
                 page_index + 1,
                 ranges.len()
@@ -745,6 +744,7 @@ fn build_contact_sheets(
             layout,
             &title,
             options.dark_background,
+            &text,
         );
         let mut encoded = Cursor::new(Vec::new());
         match options.format {
@@ -795,7 +795,10 @@ impl Drop for OutputCleanup {
 #[derive(Clone)]
 struct SheetTile {
     image: Option<image::RgbaImage>,
-    captions: Vec<String>,
+    /// File name line; middle-shortened so the extension stays visible.
+    name: Option<String>,
+    /// Secondary line with date, camera and exposure or rating.
+    details: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -910,11 +913,18 @@ fn sanitize_filename(value: &str) -> String {
     }
 }
 
+const TITLE_PX: f32 = 24.0;
+const NAME_PX: f32 = 14.0;
+const DETAIL_PX: f32 = 12.5;
+/// Vertical distance between caption lines, measured from the top of each line box.
+const CAPTION_LINE_HEIGHT: f32 = 22.0;
+
 fn render_sheet_page(
     tiles: &[SheetTile],
     layout: SheetLayout,
     title: &str,
     dark: bool,
+    text: &TextEngine,
 ) -> image::RgbaImage {
     let bg = if dark {
         image::Rgba([28, 31, 36, 255])
@@ -938,15 +948,15 @@ fn render_sheet_page(
     };
     let mut canvas = image::RgbaImage::from_pixel(layout.width, layout.height, bg);
     if !title.is_empty() {
-        draw_text_fit(
-            &mut canvas,
-            title,
-            24,
-            18,
-            layout.width.saturating_sub(48),
-            3,
-            ink,
-        );
+        let title_box = TextBox {
+            x: 24.0,
+            y: 18.0,
+            width: layout.width.saturating_sub(48) as f32,
+            px: TITLE_PX,
+            bold: true,
+            color: ink,
+        };
+        draw_text_fit(&mut canvas, text, title, title_box, Fit::End);
     }
     for (index, tile) in tiles.iter().enumerate() {
         let col = index % layout.columns;
@@ -978,27 +988,39 @@ fn render_sheet_page(
                     image::Rgba([220, 223, 227, 255])
                 },
             );
-            draw_text_fit(
-                &mut canvas,
-                "IMAGE UNAVAILABLE",
-                x + 20,
-                y + 24,
-                layout.thumbnail_size.saturating_sub(12),
-                2,
-                muted,
-            );
+            // Centred in the thumbnail box, vertically around its middle.
+            let label = "Image unavailable";
+            let label_width = text.width(label, NAME_PX, false);
+            let label_box = TextBox {
+                x: (x + 14) as f32 + (layout.thumbnail_size as f32 - label_width).max(0.0) / 2.0,
+                y: (y + 10) as f32 + layout.thumbnail_size as f32 / 2.0 - NAME_PX / 2.0,
+                width: layout.thumbnail_size as f32,
+                px: NAME_PX,
+                bold: false,
+                color: muted,
+            };
+            draw_text_fit(&mut canvas, text, label, label_box, Fit::End);
         }
-        let caption_y = y + 14 + layout.thumbnail_size;
-        for (line_index, caption) in tile.captions.iter().take(2).enumerate() {
-            draw_text_fit(
-                &mut canvas,
-                caption,
-                x + 12,
-                caption_y + line_index as u32 * 20,
-                layout.cell_width.saturating_sub(28),
-                2,
-                if line_index == 0 { ink } else { muted },
-            );
+        // Captions sit under the thumbnail, aligned with its left edge.
+        let mut caption_y = (y + 18 + layout.thumbnail_size) as f32;
+        let caption_box = |caption_y: f32, px: f32, color| TextBox {
+            x: (x + 14) as f32,
+            y: caption_y,
+            width: layout.thumbnail_size as f32,
+            px,
+            bold: false,
+            color,
+        };
+        if let Some(name) = &tile.name {
+            let boxed = caption_box(caption_y, NAME_PX, ink);
+            draw_text_fit(&mut canvas, text, name, boxed, Fit::FileName);
+            caption_y += CAPTION_LINE_HEIGHT;
+        }
+        if let Some(details) = &tile.details {
+            // Secondary detail is muted unless it is the only caption line.
+            let color = if tile.name.is_some() { muted } else { ink };
+            let boxed = caption_box(caption_y, DETAIL_PX, color);
+            draw_text_fit(&mut canvas, text, details, boxed, Fit::End);
         }
     }
     canvas
@@ -1021,27 +1043,297 @@ fn fill_rect(
     }
 }
 
-fn draw_text_fit(
-    img: &mut image::RgbaImage,
-    text: &str,
-    x: u32,
-    y: u32,
-    max_width: u32,
-    scale: u32,
+/// Windows UI faces as `(file, collection index, bold)`. Faces are tried in order for each
+/// character; the first one that has the glyph is used, so CJK and symbols fall through.
+const SYSTEM_FONTS: &[(&str, u32, bool)] = &[
+    ("segoeui.ttf", 0, false),
+    ("segoeuib.ttf", 0, true),
+    ("msyh.ttc", 0, false),
+    ("msyhbd.ttc", 0, true),
+    ("YuGothM.ttc", 0, false),
+    ("malgun.ttf", 0, false),
+    ("malgunbd.ttf", 0, true),
+    ("seguisym.ttf", 0, false),
+];
+
+/// Shown when a caption is cut. A single character, so it never reads as "..".
+const ELLIPSIS: char = '…';
+
+/// Characters of a file-name stem kept after the middle ellipsis (usually a counter).
+const MIDDLE_TAIL_CHARS: usize = 5;
+
+/// Text backend for captions and titles. Built once per sheet job.
+enum TextEngine {
+    Vector(SystemFonts),
+    /// Used when no Windows UI font can be read (non-Windows or missing fonts).
+    Bitmap,
+}
+
+struct SystemFonts {
+    faces: Vec<FontVec>,
+    /// Face indices in lookup order for regular and bold text. Both orders include every face.
+    regular: Vec<usize>,
+    bold: Vec<usize>,
+}
+
+/// A glyph placed in a laid-out line; `x` is relative to the line start.
+struct PlacedGlyph {
+    face: usize,
+    id: GlyphId,
+    x: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TextBox {
+    x: f32,
+    /// Top of the line box; the baseline sits at `y` plus the font ascent.
+    y: f32,
+    width: f32,
+    px: f32,
+    bold: bool,
     color: image::Rgba<u8>,
-) {
-    let char_width = 6 * scale;
-    let max_chars = (max_width / char_width.max(1)) as usize;
-    if max_chars == 0 {
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    /// Plain end ellipsis.
+    End,
+    /// Keeps the extension and the end of the stem: "Very long name…_0001.jpg".
+    FileName,
+}
+
+impl TextEngine {
+    fn load() -> Self {
+        SystemFonts::load().map_or(Self::Bitmap, Self::Vector)
+    }
+
+    /// Advance width of `text` in pixels.
+    fn width(&self, text: &str, px: f32, bold: bool) -> f32 {
+        match self {
+            Self::Vector(fonts) => fonts.layout(text, px, bold).1,
+            Self::Bitmap => bitmap_cell_width(px) * text.chars().count() as f32,
+        }
+    }
+
+    fn draw(&self, img: &mut image::RgbaImage, text: &str, boxed: TextBox) {
+        match self {
+            Self::Vector(fonts) => fonts.draw(img, text, boxed),
+            Self::Bitmap => draw_bitmap_text(img, text, boxed),
+        }
+    }
+}
+
+impl SystemFonts {
+    fn load() -> Option<Self> {
+        let dir = windows_font_dir();
+        let mut faces = Vec::new();
+        let mut bold_flags = Vec::new();
+        for &(file, index, bold) in SYSTEM_FONTS {
+            let Ok(data) = fs::read(dir.join(file)) else {
+                continue;
+            };
+            let Ok(face) = FontVec::try_from_vec_and_index(data, index) else {
+                continue;
+            };
+            faces.push(face);
+            bold_flags.push(bold);
+        }
+        if faces.is_empty() {
+            return None;
+        }
+        let order = |want_bold: bool| -> Vec<usize> {
+            (0..faces.len())
+                .filter(|&i| bold_flags[i] == want_bold)
+                .chain((0..faces.len()).filter(|&i| bold_flags[i] != want_bold))
+                .collect()
+        };
+        Some(Self {
+            regular: order(false),
+            bold: order(true),
+            faces,
+        })
+    }
+
+    fn order(&self, bold: bool) -> &[usize] {
+        if bold { &self.bold } else { &self.regular }
+    }
+
+    /// First face in `order` that has `ch`; falls back to the primary face (its .notdef glyph).
+    fn pick(&self, order: &[usize], ch: char) -> usize {
+        order
+            .iter()
+            .copied()
+            .find(|&i| self.faces[i].glyph_id(ch).0 != 0)
+            .unwrap_or(order[0])
+    }
+
+    /// Places the glyphs of `text` with kerning (within one face) and returns the advance width.
+    fn layout(&self, text: &str, px: f32, bold: bool) -> (Vec<PlacedGlyph>, f32) {
+        let scale = PxScale::from(px);
+        let order = self.order(bold);
+        let mut placed = Vec::with_capacity(text.len());
+        let mut pen = 0.0f32;
+        let mut prev: Option<(usize, GlyphId)> = None;
+        for ch in text.chars() {
+            let ch = if ch.is_control() { ' ' } else { ch };
+            let face = self.pick(order, ch);
+            let font = self.faces[face].as_scaled(scale);
+            let id = self.faces[face].glyph_id(ch);
+            if let Some((prev_face, prev_id)) = prev
+                && prev_face == face
+            {
+                pen += font.kern(prev_id, id);
+            }
+            placed.push(PlacedGlyph { face, id, x: pen });
+            pen += font.h_advance(id);
+            prev = Some((face, id));
+        }
+        (placed, pen)
+    }
+
+    fn draw(&self, img: &mut image::RgbaImage, text: &str, boxed: TextBox) {
+        let scale = PxScale::from(boxed.px);
+        let primary = self.order(boxed.bold)[0];
+        let baseline = boxed.y + self.faces[primary].as_scaled(scale).ascent();
+        let (glyphs, _) = self.layout(text, boxed.px, boxed.bold);
+        for glyph in glyphs {
+            let face = &self.faces[glyph.face];
+            let positioned = glyph
+                .id
+                .with_scale_and_position(scale, point(boxed.x + glyph.x, baseline));
+            let Some(outlined) = face.outline_glyph(positioned) else {
+                continue;
+            };
+            let bounds = outlined.px_bounds();
+            let (left, top) = (bounds.min.x.floor() as i64, bounds.min.y.floor() as i64);
+            outlined.draw(|gx, gy, coverage| {
+                blend_pixel(
+                    img,
+                    left + i64::from(gx),
+                    top + i64::from(gy),
+                    coverage,
+                    boxed.color,
+                );
+            });
+        }
+    }
+}
+
+fn windows_font_dir() -> PathBuf {
+    let windir =
+        std::env::var_os("WINDIR").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    windir.join("Fonts")
+}
+
+/// Source-over blend of `color` at `coverage` onto an opaque pixel; alpha is left unchanged.
+fn blend_pixel(img: &mut image::RgbaImage, x: i64, y: i64, coverage: f32, color: image::Rgba<u8>) {
+    if coverage <= 0.0
+        || x < 0
+        || y < 0
+        || x >= i64::from(img.width())
+        || y >= i64::from(img.height())
+    {
         return;
     }
-    let mut chars: Vec<char> = text.chars().collect();
-    if chars.len() > max_chars {
-        chars.truncate(max_chars.saturating_sub(1));
-        chars.push('.');
+    let alpha = coverage.min(1.0);
+    let dst = img.get_pixel_mut(x as u32, y as u32);
+    for channel in 0..3 {
+        let fg = f32::from(color.0[channel]);
+        let bg = f32::from(dst.0[channel]);
+        dst.0[channel] = (fg * alpha + bg * (1.0 - alpha)).round() as u8;
     }
-    for (i, c) in chars.into_iter().enumerate() {
-        draw_glyph(img, c, x + i as u32 * char_width, y, scale, color);
+}
+
+/// Draws `text` into `boxed.width`, shortening it when it does not fit.
+fn draw_text_fit(
+    img: &mut image::RgbaImage,
+    engine: &TextEngine,
+    text: &str,
+    boxed: TextBox,
+    fit: Fit,
+) {
+    let measure = |s: &str| engine.width(s, boxed.px, boxed.bold);
+    let fitted = match fit {
+        Fit::End => fit_end(text, boxed.width, measure),
+        Fit::FileName => fit_file_name(text, boxed.width, measure),
+    };
+    if !fitted.is_empty() {
+        engine.draw(img, &fitted, boxed);
+    }
+}
+
+/// Joins the kept `head` (trailing spaces trimmed), one ellipsis and `tail`.
+fn join_ellipsis(head: &[char], tail: &str) -> String {
+    let mut out: String = head.iter().collect();
+    let kept = out.trim_end().len();
+    out.truncate(kept);
+    out.push(ELLIPSIS);
+    out.push_str(tail);
+    out
+}
+
+/// Cuts `text` at a char boundary and appends one "…" so it fits `max_width`.
+/// Returns an empty string when not even the ellipsis fits.
+fn fit_end<M: Fn(&str) -> f32>(text: &str, max_width: f32, measure: M) -> String {
+    if measure(text) <= max_width {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    (0..chars.len())
+        .rev()
+        .map(|keep| join_ellipsis(&chars[..keep], ""))
+        .find(|candidate| measure(candidate) <= max_width)
+        .unwrap_or_default()
+}
+
+/// Shortens a file name from the middle so the extension and the last few stem characters
+/// survive: "Very long name with many words_0001.jpg" → "Very long name…_0001.jpg".
+fn fit_file_name<M: Fn(&str) -> f32>(name: &str, max_width: f32, measure: M) -> String {
+    if measure(name) <= max_width {
+        return name.to_owned();
+    }
+    let (stem, ext) = split_extension(name);
+    let stem: Vec<char> = stem.chars().collect();
+    let tail_len = MIDDLE_TAIL_CHARS.min(stem.len() / 2);
+    let head_len = stem.len() - tail_len;
+    let tail = stem[head_len..].iter().collect::<String>() + ext;
+    (0..head_len)
+        .rev()
+        .map(|keep| join_ellipsis(&stem[..keep], &tail))
+        .find(|candidate| measure(candidate) <= max_width)
+        .unwrap_or_else(|| fit_end(name, max_width, &measure))
+}
+
+/// Splits `name.ext` into `("name", ".ext")`. The extension is empty when there is no
+/// plausible one (no dot, leading dot, or an implausibly long or spaced suffix).
+fn split_extension(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(dot)
+            if dot > 0
+                && name.len() - dot <= 10
+                && !name[dot..].chars().any(char::is_whitespace) =>
+        {
+            (&name[..dot], &name[dot..])
+        }
+        _ => (name, ""),
+    }
+}
+
+/// Bitmap-font scale: about 8 px per glyph cell, at least 1.
+fn bitmap_scale(px: f32) -> u32 {
+    (px / 8.0).round().max(1.0) as u32
+}
+
+fn bitmap_cell_width(px: f32) -> f32 {
+    (6 * bitmap_scale(px)) as f32
+}
+
+fn draw_bitmap_text(img: &mut image::RgbaImage, text: &str, boxed: TextBox) {
+    let scale = bitmap_scale(boxed.px);
+    let x = boxed.x.max(0.0).round() as u32;
+    let y = boxed.y.max(0.0).round() as u32;
+    for (i, ch) in text.chars().enumerate() {
+        draw_glyph(img, ch, x + i as u32 * 6 * scale, y, scale, boxed.color);
     }
 }
 
@@ -1120,6 +1412,7 @@ fn glyph_rows(ch: char) -> [u8; 7] {
         ')' => [8, 4, 2, 2, 2, 4, 8],
         '+' => [0, 4, 4, 31, 4, 4, 0],
         '!' => [4, 4, 4, 4, 4, 0, 4],
+        '…' => [0, 0, 0, 0, 0, 0, 21],
         '?' => [14, 17, 1, 2, 4, 0, 4],
         '[' => [14, 8, 8, 8, 8, 8, 14],
         ']' => [14, 2, 2, 2, 2, 2, 14],
@@ -1243,7 +1536,11 @@ fn render_archive(state: &mut ArchiveWindow, ctx: &egui::Context, actions: &mut 
                                         RichText::new(&entry.name)
                                     },
                                 );
-                                table_cell(ui, ARCHIVE_SIZE_W, RichText::new(format_size(entry.size)));
+                                table_cell(
+                                    ui,
+                                    ARCHIVE_SIZE_W,
+                                    RichText::new(format_size(entry.size)),
+                                );
                                 table_cell(
                                     ui,
                                     ARCHIVE_SIZE_W,
@@ -1862,6 +2159,99 @@ mod tests {
         assert!(sheet_layout(usize::MAX, usize::MAX, u32::MAX, 9, true).height <= 16_384);
     }
 
+    /// Mono-spaced stand-in for real advances: every character is 7 px wide.
+    fn mono(text: &str) -> f32 {
+        text.chars().count() as f32 * 7.0
+    }
+
+    #[test]
+    fn end_ellipsis_is_single_char_and_never_double_dot() {
+        let text = "DSC_0001.final.export.jpg";
+        for max in (0..=200u32).step_by(3) {
+            let max = max as f32;
+            let out = fit_end(text, max, mono);
+            assert!(!out.contains(".."), "{out:?}");
+            assert!(mono(&out) <= max, "{out:?} wider than {max}");
+            // An empty result means not even the ellipsis fits; otherwise exactly one ellipsis.
+            if !out.is_empty() && out != text {
+                assert!(out.ends_with(ELLIPSIS), "{out:?}");
+                assert_eq!(out.matches(ELLIPSIS).count(), 1, "{out:?}");
+            }
+        }
+        assert_eq!(fit_end(text, 6.0, mono), "");
+    }
+
+    #[test]
+    fn text_that_fits_is_unchanged() {
+        let name = "DSC_0001.jpg";
+        assert_eq!(fit_end(name, mono(name), mono), name);
+        assert_eq!(fit_file_name(name, mono(name), mono), name);
+        assert_eq!(fit_end("", 0.0, mono), "");
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_extension_and_counter() {
+        let name = "Very long name with many words_0001.jpg";
+        let out = fit_file_name(name, 22.0 * 7.0, mono);
+        assert!(out.ends_with("_0001.jpg"), "{out:?}");
+        assert!(out.starts_with("Very"), "{out:?}");
+        assert!(out.contains(ELLIPSIS), "{out:?}");
+        assert!(!out.contains(".."), "{out:?}");
+        assert!(mono(&out) <= 22.0 * 7.0);
+
+        // When the tail alone is too wide, fall back to an end ellipsis within bounds.
+        let tiny = fit_file_name(name, 3.0 * 7.0, mono);
+        assert_eq!(tiny, "Ve…");
+    }
+
+    #[test]
+    fn split_extension_handles_dotless_and_dotfile_names() {
+        assert_eq!(split_extension("IMG_01.jpg"), ("IMG_01", ".jpg"));
+        assert_eq!(split_extension("README"), ("README", ""));
+        assert_eq!(split_extension(".hidden"), (".hidden", ""));
+        assert_eq!(split_extension("a. b"), ("a. b", ""));
+    }
+
+    #[test]
+    fn text_width_is_monotonic_in_length() {
+        let text = "Ünïcödé 日本 test_0001.jpg";
+        for engine in [TextEngine::Bitmap, TextEngine::load()] {
+            let mut last = 0.0f32;
+            for end in 0..=text.chars().count() {
+                let prefix: String = text.chars().take(end).collect();
+                let width = engine.width(&prefix, 14.0, false);
+                assert!(width >= last, "{prefix:?}: {width} < {last}");
+                last = width;
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_caption_draws_pixels_with_system_fonts() {
+        if !windows_font_dir().join("segoeui.ttf").exists() {
+            eprintln!("skipped: segoeui.ttf not found");
+            return;
+        }
+        let engine = TextEngine::load();
+        let mut canvas = image::RgbaImage::from_pixel(260, 40, image::Rgba([0, 0, 0, 255]));
+        let blank = canvas.clone();
+        let boxed = TextBox {
+            x: 4.0,
+            y: 8.0,
+            width: 252.0,
+            px: 16.0,
+            bold: false,
+            color: image::Rgba([255, 255, 255, 255]),
+        };
+        draw_text_fit(&mut canvas, &engine, "Ünïcödé 日本 test", boxed, Fit::End);
+        let changed = canvas
+            .pixels()
+            .zip(blank.pixels())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(changed > 0);
+    }
+
     /// Renders a real sheet from the demo photos into `%TEMP%`; run with `--ignored`.
     #[test]
     #[ignore = "writes a demo contact sheet from C:\\tmp\\forge-demo\\Photos"]
@@ -1890,7 +2280,7 @@ mod tests {
             captions_file_name: true,
             captions_rating: true,
             captions_exif: true,
-            page_title: "Forge demo photos".into(),
+            page_title: "ZXraw Explorer demo".into(),
             dark_background: true,
             format: SheetFormat::Png,
             output_dir: output_dir.clone(),
@@ -1898,12 +2288,8 @@ mod tests {
         };
         let cancel = forge_jobs::CancelToken::new();
         let progress = forge_jobs::Progress::default();
-        let pages = build_contact_sheets(
-            &sources,
-            &options,
-            &JobCtx::new(&cancel, &progress),
-        )
-        .unwrap();
+        let pages =
+            build_contact_sheets(&sources, &options, &JobCtx::new(&cancel, &progress)).unwrap();
         assert_eq!(pages.len(), 1);
         println!("contact sheet: {}", pages[0].display());
     }
