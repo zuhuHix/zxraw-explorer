@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
@@ -19,6 +20,9 @@ pub struct FolderWatcher {
     rx: Receiver<PathBuf>,
     /// Directories shown by panes.
     watched: HashSet<PathBuf>,
+    /// Copy of `watched` for the notify thread, which probes the filesystem so the UI
+    /// thread never has to (an offline network path can block for seconds).
+    shown: Arc<Mutex<HashSet<PathBuf>>>,
     /// Directories registered with notify, including parents so a shown folder's
     /// external deletion can be noticed.
     registered: HashSet<PathBuf>,
@@ -32,6 +36,8 @@ impl FolderWatcher {
     pub fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = unbounded();
         let repaint = ctx.clone();
+        let shown = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+        let shown_by_notify = Arc::clone(&shown);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 // Ignore pure access events; everything else may change the listing.
@@ -42,6 +48,22 @@ impl FolderWatcher {
                     let _ = tx.send(p.clone());
                     if let Some(parent) = p.parent() {
                         let _ = tx.send(parent.to_path_buf());
+                        // Windows may report a shown folder's deletion only as an event in
+                        // its parent. Probe the parent's shown children here, on notify's
+                        // thread, and report the ones that are gone.
+                        let gone: Vec<PathBuf> = shown_by_notify
+                            .lock()
+                            .map(|shown| {
+                                shown
+                                    .iter()
+                                    .filter(|dir| dir.parent() == Some(parent) || dir.parent() == Some(p.as_path()))
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for dir in gone.into_iter().filter(|dir| !dir.is_dir()) {
+                            let _ = tx.send(dir);
+                        }
                     }
                 }
                 repaint.request_repaint_after(DEBOUNCE);
@@ -53,6 +75,7 @@ impl FolderWatcher {
             watcher,
             rx,
             watched: HashSet::new(),
+            shown,
             registered: HashSet::new(),
             pending: HashMap::new(),
             last_refresh: HashMap::new(),
@@ -94,6 +117,9 @@ impl FolderWatcher {
         for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
             self.pending.remove(&gone);
         }
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.clone_from(&want);
+        }
         self.watched = want;
     }
 
@@ -102,19 +128,10 @@ impl FolderWatcher {
     pub fn due(&mut self, size_of: impl Fn(&Path) -> usize) -> Vec<PathBuf> {
         let now = Instant::now();
         while let Ok(dir) = self.rx.try_recv() {
+            // A deleted shown folder arrives as its own path (see the notify callback),
+            // so only shown folders need handling; no filesystem probe on this thread.
             if self.watched.contains(&dir) {
                 self.pending.insert(dir, now);
-            } else {
-                // When the directory being shown is deleted, Windows may report only an
-                // event in its parent. Refresh the pane whose root disappeared so the UI
-                // can show its normal listing error instead of remaining stale.
-                for removed in self
-                    .watched
-                    .iter()
-                    .filter(|shown| shown.parent() == Some(dir.as_path()) && !shown.is_dir())
-                {
-                    self.pending.insert(removed.clone(), now);
-                }
             }
         }
         let mut out = Vec::new();

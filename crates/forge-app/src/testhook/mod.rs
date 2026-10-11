@@ -182,11 +182,13 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         hook.frames_after_cmds += 1;
     }
     // Give async listings/thumbnails a moment to land, then capture.
-    if hook.ran_cmds && hook.frames_after_cmds > 90 && !hook.requested {
-        if hook.screenshot.is_some() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
-            hook.requested = true;
-        }
+    if hook.ran_cmds
+        && hook.frames_after_cmds > 90
+        && !hook.requested
+        && hook.screenshot.is_some()
+    {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+        hook.requested = true;
     }
     let shot = screenshot_event(ctx);
     if let (Some(img), Some(path)) = (shot, hook.screenshot.clone()) {

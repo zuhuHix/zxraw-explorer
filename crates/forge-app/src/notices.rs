@@ -44,7 +44,7 @@ impl Notices {
         let first_run = !marker.exists() && (!automated || forced);
         Self {
             crash,
-            welcome: first_run.then(|| Welcome { video_tools: None }),
+            welcome: first_run.then_some(Welcome { video_tools: None }),
             marker,
             automated,
         }
