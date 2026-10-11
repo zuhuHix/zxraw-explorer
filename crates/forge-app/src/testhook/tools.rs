@@ -85,11 +85,11 @@ pub(super) fn step(
                 .trim()
                 .parse()
                 .map_err(|_| "part size must be a number of bytes")?;
-            extra_tools_ui::automation_split(app, PathBuf::from(file.trim()), bytes)
+            extra_tools_ui::automation_split(app, inside(file)?, bytes)
                 .map(|()| Flow::Done)
         }
         "join" => {
-            extra_tools_ui::automation_join(app, PathBuf::from(one_path(args)?));
+            extra_tools_ui::automation_join(app, inside(one_path(args)?)?);
             Ok(Flow::Done)
         }
         _ => Err(format!("unknown `ui tools` verb `{verb}`")),
@@ -100,7 +100,7 @@ fn duplicates_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result
     let (sub, rest) = split_verb(args);
     match sub {
         "open" => {
-            tools_ui::automation_open_duplicates(app, PathBuf::from(one_path(rest)?));
+            tools_ui::automation_open_duplicates(app, inside(one_path(rest)?)?);
             Ok(Flow::Done)
         }
         "wait" => {
@@ -139,11 +139,11 @@ fn compare_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
     let (sub, rest) = split_verb(args);
     match sub {
         "open" => {
-            tools_ui::automation_open_compare(app, PathBuf::from(one_path(rest)?));
+            tools_ui::automation_open_compare(app, inside(one_path(rest)?)?);
             Ok(Flow::Done)
         }
         "set-right" => {
-            let right = PathBuf::from(one_path(rest)?);
+            let right = inside(one_path(rest)?)?;
             tools_ui::automation_compare_set_right(app, right).map(|()| Flow::Done)
         }
         "start" => {
@@ -302,7 +302,7 @@ fn archive_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
     let (sub, rest) = split_verb(args);
     match sub {
         "open" => {
-            extra_tools_ui::automation_open_archive(app, PathBuf::from(one_path(rest)?));
+            extra_tools_ui::automation_open_archive(app, inside(one_path(rest)?)?);
             Ok(Flow::Done)
         }
         "wait" => {
@@ -336,7 +336,7 @@ fn archive_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
             }
         }
         "extract" => {
-            let destination = PathBuf::from(one_path(rest)?);
+            let destination = inside(one_path(rest)?)?;
             extra_tools_ui::automation_archive_extract(app, destination).map(|()| Flow::Done)
         }
         "create" => {
@@ -345,11 +345,14 @@ fn archive_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
             if parts.len() < 3 {
                 return Err("expected `<dir> | <name> | <source>…`".into());
             }
-            let sources = parts[2..].iter().map(PathBuf::from).collect();
+            let sources = parts[2..]
+                .iter()
+                .map(|p| inside(p))
+                .collect::<Result<Vec<_>, _>>()?;
             extra_tools_ui::automation_create_archive(
                 app,
                 sources,
-                PathBuf::from(parts[0]),
+                inside(parts[0])?,
                 parts[1].to_string(),
             )
             .map(|()| Flow::Done)
@@ -375,7 +378,7 @@ fn external_step(args: &str) -> Result<Flow, String> {
     let (sub, rest) = split_verb(args);
     match sub {
         "create" => {
-            let path = PathBuf::from(one_path(rest)?);
+            let path = entry_inside(one_path(rest)?)?;
             create_new(&path, &[b'x'; 4096])?;
         }
         "create-many" => {
@@ -386,7 +389,7 @@ fn external_step(args: &str) -> Result<Flow, String> {
             if count > BURST_LIMIT {
                 return Err(format!("at most {BURST_LIMIT} files per burst"));
             }
-            let dir = PathBuf::from(dir.trim());
+            let dir = inside(dir)?;
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             for index in 0..count {
                 let path = dir.join(format!("burst-{index:05}.txt"));
@@ -398,10 +401,10 @@ fn external_step(args: &str) -> Result<Flow, String> {
             if to.symlink_metadata().is_ok() {
                 return Err(format!("{} already exists", to.display()));
             }
-            fs::rename(&from, &to).map_err(|e| e.to_string())?;
+            forge_core::paths::rename_no_replace(&from, &to).map_err(|e| e.to_string())?;
         }
         "delete" => {
-            let path = PathBuf::from(one_path(rest)?);
+            let path = entry_inside(one_path(rest)?)?;
             let md = path.symlink_metadata().map_err(|e| e.to_string())?;
             if md.is_dir() {
                 fs::remove_dir_all(&path).map_err(|e| e.to_string())?;
@@ -414,7 +417,7 @@ fn external_step(args: &str) -> Result<Flow, String> {
             use std::io::Write;
             let mut file = fs::OpenOptions::new()
                 .append(true)
-                .open(path.trim())
+                .open(entry_inside(path)?)
                 .map_err(|e| e.to_string())?;
             file.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
         }
@@ -457,6 +460,16 @@ fn split_verb(args: &str) -> (&str, &str) {
     }
 }
 
+/// A path argument, confined to the script sandbox.
+fn inside(path: &str) -> Result<PathBuf, String> {
+    super::sandboxed(Path::new(path.trim()))
+}
+
+/// A path argument naming an entry the step itself creates, renames or deletes.
+fn entry_inside(path: &str) -> Result<PathBuf, String> {
+    super::sandboxed_entry(Path::new(path.trim()))
+}
+
 fn one_path(args: &str) -> Result<&str, String> {
     let path = args.trim();
     if path.is_empty() {
@@ -468,7 +481,7 @@ fn one_path(args: &str) -> Result<&str, String> {
 
 fn two_paths(args: &str) -> Result<(PathBuf, PathBuf), String> {
     let (first, second) = args.split_once(" | ").ok_or("expected `<path> | <path>`")?;
-    Ok((PathBuf::from(first.trim()), PathBuf::from(second.trim())))
+    Ok((entry_inside(first)?, entry_inside(second)?))
 }
 
 fn no_args(args: &str) -> Result<(), String> {

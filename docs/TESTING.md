@@ -246,8 +246,8 @@ loaded. Waiting steps give up after 30 s unless given their own limit.
 | `pointer <x> <y>` / `click <x> <y>` / `scroll <dy>` | Move, click or scroll the real pointer |
 | `dialog <path>\|cancel` | Answer the next native file dialog |
 | `wait-jobs [seconds]` / `wait-frames <n>` / `sleep <ms>` | Wait for operations, frames or time |
-| `wait-exists\|wait-missing <path> [seconds]` | Wait for the filesystem |
-| `wait-entry\|wait-no-entry <name> [seconds]` | Wait for the focused pane's listing |
+| `wait-exists\|wait-missing <path> [\| <seconds>]` | Wait for the filesystem |
+| `wait-entry\|wait-no-entry <name> [\| <seconds>]` | Wait for the focused pane's listing |
 | `limit <seconds>` | Raise the script limit (1–600) |
 | `screenshot <png>` | Save the rendered frame |
 | `assert-tabs <n>` / `assert-path <path>` | Check the tab count or the focused pane's folder |

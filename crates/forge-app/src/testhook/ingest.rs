@@ -64,7 +64,9 @@ pub(super) fn step(
             match split_pair(args) {
                 None if args.is_empty() => state.automation_open(),
                 Some((source, destination)) => {
-                    state.automation_open_with(Path::new(source), Path::new(destination), ctx);
+                    let source = super::sandboxed(Path::new(source))?;
+                    let destination = super::sandboxed(Path::new(destination))?;
+                    state.automation_open_with(&source, &destination, ctx);
                 }
                 None => return Err("expected nothing, or `<source> | <destination>`".into()),
             }
@@ -271,13 +273,13 @@ fn fault_step(args: &str) -> Result<Flow, String> {
                 .rsplit_once(char::is_whitespace)
                 .ok_or("expected `source-gone <prefix> <bytes>`")?;
             let bytes = parse_count(bytes.trim(), "a byte count")?;
-            fault::arm_source_gone_after(Path::new(prefix.trim()), bytes as u64)?;
+            fault::arm_source_gone_after(&super::sandboxed(Path::new(prefix.trim()))?, bytes as u64)?;
         }
         "corrupt" => {
             if rest.is_empty() {
                 return Err("expected `corrupt <prefix>`".into());
             }
-            fault::arm_corrupt_before_verify(Path::new(rest))?;
+            fault::arm_corrupt_before_verify(&super::sandboxed(Path::new(rest))?)?;
         }
         "off" => fault::disarm(),
         other => return Err(format!("unknown fault rule `{other}`")),

@@ -897,6 +897,14 @@ fn show_contents(
     start_import
 }
 
+/// Source, destination and status column widths. They leave room for the spacing between
+/// the three cells: shares of the full width would overflow by that spacing, and the
+/// window would grow a little every frame until it no longer fit on screen.
+fn preview_columns(ui: &Ui) -> [f32; 3] {
+    let width = (ui.available_width() - 2.0 * ui.spacing().item_spacing.x).max(0.0);
+    [width * 0.38, width * 0.46, width * 0.16]
+}
+
 fn show_preview(ui: &mut Ui, state: &IngestState) {
     if state.sources.is_empty() {
         ui.label(RichText::new("Select a source to plan the ingest.").weak());
@@ -991,11 +999,7 @@ fn show_preview(ui: &mut Ui, state: &IngestState) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let widths = [
-            ui.available_width() * 0.38,
-            ui.available_width() * 0.46,
-            ui.available_width() * 0.16,
-        ];
+        let widths = preview_columns(ui);
         ui.add_sized(
             [widths[0], 24.0],
             egui::Label::new(RichText::new("SOURCE").small().strong()),
@@ -1016,11 +1020,7 @@ fn show_preview(ui: &mut Ui, state: &IngestState) {
         .show_rows(ui, 24.0, plan.items.len(), |ui, rows| {
             for index in rows {
                 let item = &plan.items[index];
-                let widths = [
-                    ui.available_width() * 0.38,
-                    ui.available_width() * 0.46,
-                    ui.available_width() * 0.16,
-                ];
+                let widths = preview_columns(ui);
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [widths[0], 24.0],

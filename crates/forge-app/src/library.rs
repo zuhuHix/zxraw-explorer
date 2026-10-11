@@ -415,7 +415,9 @@ pub fn plan_resume(
 }
 
 /// Restarts every interrupted index pass in the background, as its own job, so startup
-/// never waits for it. Runs once per session as soon as the library is open.
+/// never waits for it. Runs once per session as soon as the library is open. The DB reads
+/// and the reachability check (an offline network root can block for seconds) run on a
+/// worker thread, never the UI thread.
 pub fn resume_on_start(app: &mut ZxrawApp, ctx: &egui::Context) {
     let library = &mut app.ops.library;
     if library.resume_checked {
@@ -425,35 +427,60 @@ pub fn resume_on_start(app: &mut ZxrawApp, ctx: &egui::Context) {
         return;
     };
     library.resume_checked = true;
+    let jobs = app.ops.jobs.clone();
+    let tx = app.ops.tx.clone();
+    let ctx = ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("index-resume".into())
+        .spawn(move || resume_pending(&db, &jobs, &tx, &ctx));
+    if let Err(e) = spawned {
+        app.toast_err(format!("Could not check for interrupted indexing: {e}"));
+    }
+}
+
+fn resume_pending(
+    db: &Arc<Db>,
+    jobs: &JobRegistry,
+    tx: &crossbeam_channel::Sender<crate::actions::Event>,
+    ctx: &egui::Context,
+) {
+    use crate::actions::Event;
+    let send = |event: Event| {
+        let _ = tx.send(event);
+        ctx.request_repaint();
+    };
     let roots = match db.index_roots() {
         Ok(roots) => roots,
         Err(e) => {
-            app.toast_err(format!("Could not read indexed folders: {e}"));
+            send(Event::Error(format!("Could not read indexed folders: {e}")));
             return;
         }
     };
     for root in roots {
         let state = db.index_state(root.id).ok().flatten();
+        if !root.enabled || !state.as_ref().is_some_and(IndexState::is_resumable) {
+            continue;
+        }
         let reachable = std::fs::symlink_metadata(&root.path).is_ok_and(|m| m.is_dir());
         match plan_resume(&root, state.as_ref(), reachable) {
             Some(ResumePlan::Resume(path)) => {
-                app.toast(format!(
+                send(Event::Toast(format!(
                     "Resuming interrupted indexing of {}",
                     path.display()
-                ));
-                let tx = app.ops.tx.clone();
+                )));
+                let tx = tx.clone();
                 let c = ctx.clone();
-                start_index_job(&app.ops.jobs, db.clone(), path, move |m| {
-                    let _ = tx.send(crate::actions::Event::Toast(m));
+                start_index_job(jobs, db.clone(), path, move |m| {
+                    let _ = tx.send(Event::Toast(m));
                     c.request_repaint();
                 });
             }
             Some(ResumePlan::Drop(path)) => {
                 let _ = db.reset_index_state(root.id);
-                app.toast_err(format!(
+                send(Event::Error(format!(
                     "Interrupted indexing of {} was dropped: the folder is no longer available",
                     path.display()
-                ));
+                )));
             }
             None => {}
         }

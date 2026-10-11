@@ -110,7 +110,7 @@ pub(super) fn step(
             }
         }
         "index" => {
-            let folder = PathBuf::from(non_empty(args, "expected a folder")?);
+            let folder = super::sandboxed(Path::new(&non_empty(args, "expected a folder")?))?;
             let db = library_db(app)?;
             let tx = app.ops.tx.clone();
             let c = ctx.clone();
@@ -541,14 +541,14 @@ fn path_and_set(args: &str) -> Result<(PathBuf, BTreeSet<String>), String> {
     } else {
         name_set(rest)?
     };
-    Ok((PathBuf::from(path), set))
+    Ok((super::sandboxed(Path::new(path))?, set))
 }
 
 /// `<path> | <text>`; `none` stands for the empty text.
 fn path_and_text(args: &str) -> Result<(PathBuf, String), String> {
     let (path, text) = two_parts(args)?;
     Ok((
-        PathBuf::from(path),
+        super::sandboxed(Path::new(path))?,
         if text == "none" {
             String::new()
         } else {

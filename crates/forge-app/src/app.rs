@@ -77,6 +77,68 @@ pub struct ZxrawApp {
     applied_theme: Option<(bool, f32)>,
     type_ahead: (String, Instant),
     last_session_save: Instant,
+    selection_summary: SelectionSummary,
+}
+
+/// The status bar's "N selected (size)". Walking every listed entry each frame cost
+/// ~200 ms per frame in a 50,000-entry folder (debug build) while anything was selected,
+/// so the visible entries are indexed once per listing and a selection change costs time
+/// proportional to the selection, not the folder.
+#[derive(Default)]
+struct SelectionSummary {
+    listing: Option<(PathBuf, usize, usize, usize, bool)>,
+    /// Visible entry path → size.
+    index: std::collections::HashMap<PathBuf, u64>,
+    selection: Option<(usize, u64)>,
+    count: usize,
+    size: u64,
+}
+
+impl SelectionSummary {
+    fn get(&mut self, p: &crate::pane::Pane) -> (usize, u64) {
+        // Sorting reorders entries in place, which a path → size index doesn't mind. A
+        // reload passes through the loading state, which is part of the key.
+        let listing = (
+            p.path.clone(),
+            p.entries.as_ptr() as usize,
+            p.entries.len(),
+            p.visible.len(),
+            matches!(p.load, LoadState::Loading { .. }),
+        );
+        if self.listing.as_ref() != Some(&listing) {
+            self.index = p
+                .visible
+                .iter()
+                .map(|&i| (p.entries[i].path.clone(), p.entries[i].size))
+                .collect();
+            self.listing = Some(listing);
+            self.selection = None;
+        }
+        // Small selections are fingerprinted by content (selecting another single file
+        // keeps the length); large ones by length, which every bulk change alters.
+        let fingerprint = if p.selected.len() <= 256 {
+            let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+            p.selected
+                .iter()
+                .fold(0u64, |acc, path| acc ^ std::hash::BuildHasher::hash_one(&hasher, path))
+        } else {
+            0
+        };
+        let selection = (p.selected.len(), fingerprint);
+        if self.selection != Some(selection) {
+            let mut count = 0;
+            let mut size = 0;
+            for path in &p.selected {
+                if let Some(&bytes) = self.index.get(path) {
+                    count += 1;
+                    size += bytes;
+                }
+            }
+            (self.count, self.size) = (count, size);
+            self.selection = Some(selection);
+        }
+        (self.count, self.size)
+    }
 }
 
 impl ZxrawApp {
@@ -103,6 +165,7 @@ impl ZxrawApp {
             applied_theme: None,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
+            selection_summary: SelectionSummary::default(),
             testhook: crate::testhook::TestHook::from_env(),
             viewer: None,
             notices: Default::default(),
@@ -673,18 +736,23 @@ impl ZxrawApp {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
+        let mut summary = std::mem::take(&mut self.selection_summary);
         ui.horizontal(|ui| {
             let p = self.pane();
             let n = p.visible.len();
             let total = p.entries.len();
-            let sel = p.selected.len();
             let mut s = if n == total {
                 format!("{n} items")
             } else {
                 format!("{n} of {total} items")
             };
-            if sel > 0 {
-                s += &format!("   ·   {sel} selected ({})", format_size(p.total_selected_size()));
+            // Count only selected entries that are still listed: a move or an outside
+            // change can leave names in the selection set that are no longer there.
+            if !p.selected.is_empty() {
+                let (sel, size) = summary.get(p);
+                if sel > 0 {
+                    s += &format!("   ·   {sel} selected ({})", format_size(size));
+                }
             }
             ui.label(s);
             match &p.load {
@@ -707,6 +775,7 @@ impl ZxrawApp {
                 crate::actions::status_widgets(self, ui);
             });
         });
+        self.selection_summary = summary;
     }
 
     fn pane_ui(&mut self, ui: &mut Ui, side: Side) {
@@ -1021,5 +1090,73 @@ mod key_tests {
                 assert!(seen.insert((sc.logical_key, sc.modifiers.shift, sc.modifiers.alt, sc.modifiers.command)), "duplicate shortcut for {c:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_summary_tests {
+    use super::*;
+    use forge_core::listing::SortSpec;
+    use forge_core::model::{EntryKind, FileEntry};
+
+    fn file(dir: &Path, name: &str, size: u64) -> FileEntry {
+        FileEntry {
+            path: dir.join(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            ext: "txt".into(),
+        }
+    }
+
+    fn pane(names: &[(&str, u64)]) -> Pane {
+        let dir = Path::new(r"C:\fixture");
+        let mut p = Pane::new(dir.to_path_buf(), SortSpec::default(), ViewMode::Details);
+        p.entries = names.iter().map(|(n, s)| file(dir, n, *s)).collect();
+        p.load = LoadState::Ready { errors: 0 };
+        p.rebuild_visible();
+        p
+    }
+
+    #[test]
+    fn counts_only_selected_entries_that_are_still_listed() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20)]);
+        p.selected.insert(p.path.join("a.txt"));
+        p.selected.insert(p.path.join("gone.txt"));
+        let mut summary = SelectionSummary::default();
+        assert_eq!(summary.get(&p), (1, 10));
+    }
+
+    #[test]
+    fn follows_selection_changes_of_the_same_length_and_listing_changes() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20)]);
+        let mut summary = SelectionSummary::default();
+        p.selected.insert(p.path.join("a.txt"));
+        assert_eq!(summary.get(&p), (1, 10));
+        // Another single file: same selection length, different content.
+        p.selected.clear();
+        p.selected.insert(p.path.join("b.txt"));
+        assert_eq!(summary.get(&p), (1, 20));
+        // The selected file disappears from the listing.
+        p.entries.retain(|e| e.name != "b.txt");
+        p.rebuild_visible();
+        assert_eq!(summary.get(&p), (0, 0));
+    }
+
+    #[test]
+    fn sorting_in_place_keeps_sizes_attached_to_their_files() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20), ("c.txt", 30)]);
+        let mut summary = SelectionSummary::default();
+        p.selected.insert(p.path.join("c.txt"));
+        assert_eq!(summary.get(&p), (1, 30));
+        p.entries.reverse();
+        p.rebuild_visible();
+        p.selected.insert(p.path.join("a.txt"));
+        assert_eq!(summary.get(&p), (2, 40));
     }
 }

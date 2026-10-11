@@ -530,6 +530,17 @@ pub(crate) fn sandboxed(requested: &Path) -> Result<PathBuf, String> {
     sandbox_path(root, requested)
 }
 
+/// [`sandboxed`] for a path whose last component must not be resolved, because the step
+/// creates, renames or deletes that entry itself (it may be a link): the parent folder is
+/// resolved and checked, and the name is kept as given.
+pub(crate) fn sandboxed_entry(requested: &Path) -> Result<PathBuf, String> {
+    let name = requested
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", requested.display()))?;
+    let parent = requested.parent().unwrap_or(Path::new(""));
+    Ok(sandboxed(parent)?.join(name))
+}
+
 /// Recycle Bin commands only run while the automated recycle sandbox is active, so a
 /// script can never reach the user's real Recycle Bin (checked when the step runs).
 fn script_command_allowed(command: Cmd) -> bool {
