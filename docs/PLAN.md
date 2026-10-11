@@ -54,13 +54,14 @@ the screenshots.
 * 🟡 Adversarial review of wave 1 and fixes.
 
 ### Wave 2 — missing features
-* ⬜ Near-duplicate / burst grouping in the browser (dHash/aHash).
-* ⬜ GPS panel (offline) + "open in maps" link-out (no network by default).
-* ⬜ Metadata report export (CSV/JSON).
+* ✅ Near-duplicate / burst grouping in the browser (`feca463`).
+* ✅ GPS panel (offline) + "open in maps" link-out (`ac833bb`).
+* ✅ Metadata report export (CSV/JSON) (`ac833bb`).
 * ⬜ Locate proxies for videos.
 * ⬜ Associate exports with originals (configurable filename rules).
-* ⬜ OLE drag-out to other apps (feasibility first; forge-win module or documented why not).
-* ⬜ HEIC/AVIF thumbnails via WIC (bounded, off the UI thread).
+* 🟡 OLE drag-out to other apps (`2e8d8de`): implemented and unit tested; the drop into a
+  real external app is manually unverified.
+* ✅ HEIC/AVIF thumbnails and viewer via WIC (`2e8d8de`).
 * ⬜ Adversarial review of wave 2 and fixes.
 
 ### Wave 3 — packaging polish

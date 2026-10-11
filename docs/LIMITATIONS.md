@@ -11,9 +11,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * ZXraw does not develop RAW files. RAW preview support extracts an embedded JPEG preview;
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF
-  and AVIF pixels are not decoded: the thumbnail path returns "not available yet"
-  (`forge-media/src/thumbs.rs:781`), and only their EXIF is read (`image_meta.rs`). The
-  WIC fallback is planned work (`thumbs.rs:710`), not present.
+  and AVIF go through Windows Imaging Component (`forge-media/src/wic.rs`), so they need the
+  Microsoft HEIF/HEVC (and AV1) extensions; without them the thumbnail and viewer show a
+  "codec not installed" error. WIC decoding was tested with fixtures encoded on this machine,
+  not with camera or phone files.
 * Thumbnail throughput is limited. On this machine, under concurrent build load, 256 px
   thumbnails from 24 MP JPEGs were generated at a median of 3.7 images/s with an empty disk
   cache (about 272 ms per image). Cache hits take about 1 ms. Only JPEG throughput has been
@@ -27,9 +28,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Windows shell and file exchange
 
-* `eframe` accepts files and folders dropped into the app. There is no outgoing OLE drag
-  source (`IDropSource`/`DoDragDrop` do not appear in the source), so ZXraw cannot drag files
-  out to another application.
+* Files and folders can be dropped into the app. Dragging files past the window edge starts a
+  Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
+  The data object and the trigger are unit tested, but a drop into Explorer or another
+  application has not been verified: it is modal and cannot be automated here. The drag starts
+  only at the window edge, so the drop target must be outside ZXraw.
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
   of other applications, has not been checked.
@@ -59,6 +62,17 @@ that back each line, is in [FEATURES.md](FEATURES.md).
     text (already shipped as `LICENSE-APACHE`) applies. GPL-2.0 is not elected.
 * FFmpeg and ffprobe are not bundled. If they are ever bundled, their own licences (LGPL or GPL,
   depending on the build) apply and must be shipped.
+
+## Organising and metadata
+
+* Burst and similar-photo grouping works in the grid view only (not details). It uses
+  capture time (EXIF, else modification time) and a 64-bit difference hash (dHash) of the thumbnail, so heavily
+  edited versions or crops of the same shot are not grouped, and unrelated photos with very
+  similar composition can be. Groups are recomputed when the folder is reloaded.
+* The GPS panel is offline; "Open in maps" opens the configured http/https URL in the
+  default browser only when clicked. There is no embedded map and no reverse geocoding.
+* Metadata export needs the library database to be open (it is opened at startup), and
+  video fields stay empty without `ffprobe`.
 
 ## Scale and background work
 
