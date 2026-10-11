@@ -106,16 +106,19 @@ impl SelectionSummary {
             self.listing = Some(listing);
             self.selection = None;
         }
-        // Small selections are fingerprinted by content (selecting another single file
-        // keeps the length); large ones by length, which every bulk change alters.
-        let fingerprint = if p.selected.len() <= 256 {
-            let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-            p.selected
-                .iter()
-                .fold(0u64, |acc, path| acc ^ std::hash::BuildHasher::hash_one(&hasher, path))
-        } else {
-            0
-        };
+        // Fingerprint the selection by its length and its first 64 paths in the set's own
+        // iteration order: the whole content for small selections (selecting another single
+        // file keeps the length), and for large ones a same-size swap to different files
+        // almost surely changes which paths come first. At most 64 hashes per frame.
+        let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let fingerprint = p
+            .selected
+            .iter()
+            .take(64)
+            .enumerate()
+            .fold(0u64, |acc, (i, path)| {
+                acc.rotate_left(7) ^ std::hash::BuildHasher::hash_one(&hasher, (i, path))
+            });
         let selection = (p.selected.len(), fingerprint);
         if self.selection != Some(selection) {
             let mut count = 0;
@@ -1153,6 +1156,20 @@ mod selection_summary_tests {
         p.entries.retain(|e| e.name != "b.txt");
         p.rebuild_visible();
         assert_eq!(summary.get(&p), (0, 0));
+    }
+
+    #[test]
+    fn a_same_size_swap_of_a_large_selection_is_noticed() {
+        let names: Vec<(String, u64)> = (0..600).map(|i| (format!("f{i:03}.txt"), i)).collect();
+        let refs: Vec<(&str, u64)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let mut p = pane(&refs);
+        let mut summary = SelectionSummary::default();
+        p.selected = (0..300).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        let first = summary.get(&p);
+        p.selected = (300..600).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        let second = summary.get(&p);
+        assert_eq!(first, (300, (0..300).sum()));
+        assert_eq!(second, (300, (300..600).sum()));
     }
 
     #[test]

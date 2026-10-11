@@ -114,6 +114,7 @@ impl TestHook {
             || hook.screenshot.is_some()
             || !hook.cmds.is_empty()
             || hook.select.is_some();
+        RECORD_RECTS.store(hook.automated, std::sync::atomic::Ordering::Relaxed);
         hook
     }
 
@@ -269,6 +270,8 @@ enum Step {
     WaitFrames(u32),
     Screenshot(PathBuf),
     AssertTabs(usize),
+    /// Number of selected entries the focused pane lists.
+    AssertSelected(usize),
     AssertPath(PathBuf),
     AssertExists(PathBuf),
     AssertMissing(PathBuf),
@@ -280,6 +283,10 @@ enum Step {
     Text(String),
     Pointer(egui::Pos2),
     Click(egui::Pos2),
+    /// Real pointer clicks on a listed entry's row or tile (`double` = two clicks).
+    ClickEntry { name: String, double: bool },
+    /// A real click on the list area below the last row or tile.
+    ClickEmpty,
     Scroll(f32),
     Dialog(Option<PathBuf>),
     WaitExists(PathBuf, Duration),
@@ -454,6 +461,15 @@ fn sandbox_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Something exists here but doesn't resolve: a dangling link or junction.
+                // A later write through it would land wherever it points, so refuse.
+                if std::fs::symlink_metadata(ancestor).is_ok() {
+                    return Err(format!(
+                        "path {} goes through an unresolvable link ({})",
+                        requested.display(),
+                        ancestor.display()
+                    ));
+                }
                 let Some(name) = ancestor.file_name() else {
                     return Err(format!(
                         "cannot verify path {} is inside script sandbox {}: {error}",
@@ -506,6 +522,21 @@ fn screenshot_path(sandbox_root: &Path, rest: &str) -> Result<PathBuf, String> {
         return Ok(path);
     }
     sandbox_path(sandbox_root, requested)
+}
+
+/// Where a step may write a JSON report (e.g. `ui perf end`): inside the script sandbox,
+/// or under `ZXRAW_SCREENSHOT_DIR`, the same collection folder screenshots may use.
+pub(crate) fn report_path(requested: &Path) -> Result<PathBuf, String> {
+    let is_json = requested
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+    if is_json
+        && let Some(dir) = std::env::var_os("ZXRAW_SCREENSHOT_DIR")
+        && let Ok(path) = sandbox_path(Path::new(&dir), requested)
+    {
+        return Ok(path);
+    }
+    sandboxed_entry(requested)
 }
 
 /// `\\?\C:\x` → `C:\x` and `\\?\UNC\server\share` → `\\server\share`; other paths unchanged.
@@ -651,6 +682,7 @@ fn parse_step(
         "wait-frames" => Step::WaitFrames(number("a frame count")? as u32),
         "screenshot" => Step::Screenshot(screenshot_path(sandbox_root, rest)?),
         "assert-tabs" => Step::AssertTabs(number("a tab count")? as usize),
+        "assert-selected" => Step::AssertSelected(number("a selection count")? as usize),
         "assert-path" => Step::AssertPath(path()?),
         "assert-exists" => Step::AssertExists(path()?),
         "assert-missing" => Step::AssertMissing(path()?),
@@ -666,6 +698,11 @@ fn parse_step(
         "text" => Step::Text(verbatim.to_string()),
         "pointer" => Step::Pointer(parse_pos(rest)?),
         "click" => Step::Click(parse_pos(rest)?),
+        "click-entry" | "double-click-entry" => Step::ClickEntry {
+            name: non_empty(rest)?,
+            double: verb == "double-click-entry",
+        },
+        "click-empty" => Step::ClickEmpty,
         "scroll" => Step::Scroll(
             rest.parse::<f32>()
                 .map_err(|_| format!("expected a number, got `{rest}`"))?,
@@ -893,6 +930,7 @@ fn needs_listing(step: &Step) -> bool {
             | Step::WaitJobs(_)
             | Step::Exit
             | Step::AssertTabs(_)
+            | Step::AssertSelected(_)
             | Step::AssertPath(_)
             | Step::AssertExists(_)
             | Step::AssertMissing(_)
@@ -902,6 +940,8 @@ fn needs_listing(step: &Step) -> bool {
             | Step::Text(_)
             | Step::Pointer(_)
             | Step::Click(_)
+            | Step::ClickEntry { .. }
+            | Step::ClickEmpty
             | Step::Scroll(_)
             | Step::Dialog(_)
             | Step::WaitExists(..)
@@ -920,6 +960,72 @@ fn needs_listing(step: &Step) -> bool {
 
 /// Queues `events` for the next frame, then waits until a frame has processed them.
 /// Uses `st.phase` 0 → 1; callers that need several injections reset it.
+/// Set when the run is automated, so the views record where entries are drawn (and pay
+/// nothing in an ordinary session).
+static RECORD_RECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn entry_rect_id(path: &Path) -> egui::Id {
+    egui::Id::new(("testhook-entry-rect", path))
+}
+
+fn view_rect_id() -> egui::Id {
+    egui::Id::new("testhook-view-rect")
+}
+
+fn note_rect(ui: &egui::Ui, id: egui::Id, rect: egui::Rect) {
+    if !RECORD_RECTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let visible = rect.intersect(ui.clip_rect());
+    if visible.is_positive() {
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|d| d.insert_temp(id, (frame, visible)));
+    }
+}
+
+/// Records where a row or tile was drawn (the visible part), in points, so scripts can
+/// click it with real pointer input at any display scale.
+pub(crate) fn note_entry_rect(ui: &egui::Ui, path: &Path, rect: egui::Rect) {
+    note_rect(ui, entry_rect_id(path), rect);
+}
+
+/// Records the file list's area (where a click on empty space lands).
+pub(crate) fn note_view_rect(ui: &egui::Ui, rect: egui::Rect) {
+    note_rect(ui, view_rect_id(), rect);
+}
+
+/// A rect recorded during the last couple of frames, so a row that scrolled away or
+/// a view that closed is not clicked at a stale position.
+fn drawn_rect(ctx: &egui::Context, id: egui::Id) -> Option<egui::Rect> {
+    let (frame, rect) = ctx.data(|d| d.get_temp::<(u64, egui::Rect)>(id))?;
+    (ctx.cumulative_frame_nr().saturating_sub(frame) <= 2).then_some(rect)
+}
+
+/// `clicks` real primary-button clicks at `pos`, each press and release in its own frame,
+/// back to back so two clicks register as a double-click.
+fn pointer_clicks(app: &mut ZxrawApp, st: &mut StepState, pos: egui::Pos2, clicks: u32) -> Result<Flow, String> {
+    app.testhook.input.pointer = Some(pos);
+    let pressed = st.frames % 2 == 0;
+    let mut events = Vec::new();
+    if st.frames == 0 {
+        events.push(egui::Event::PointerMoved(pos));
+    }
+    events.push(egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    });
+    match inject(app, st, &events) {
+        Flow::Done if st.frames + 1 < clicks * 2 => {
+            st.frames += 1;
+            st.phase = 0;
+            Ok(Flow::Wait("clicking".into()))
+        }
+        other => Ok(other),
+    }
+}
+
 pub(crate) fn inject(app: &mut ZxrawApp, st: &mut StepState, events: &[egui::Event]) -> Flow {
     let input = &mut app.testhook.input;
     if st.phase == 0 {
@@ -1061,6 +1167,14 @@ fn exec(
                 Ok(Flow::Wait("capture requested".into()))
             }
         },
+        Step::AssertSelected(expected) => {
+            let found = app.pane().selected_entries().len();
+            if found == *expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("expected {expected} selected, found {found}"))
+            }
+        }
         Step::AssertTabs(expected) => {
             let found = app.tabs.len();
             if found == *expected {
@@ -1134,6 +1248,44 @@ fn exec(
                 }
                 other => Ok(other),
             }
+        }
+        Step::ClickEntry { name, double } => {
+            if st.data.is_none() {
+                let Some(path) = app
+                    .pane()
+                    .entries
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(name))
+                    .map(|e| e.path.clone())
+                else {
+                    return Err(format!("`{name}` is not listed"));
+                };
+                let Some(rect) = drawn_rect(ctx, entry_rect_id(&path)) else {
+                    return Ok(Flow::Wait(format!("`{name}` is not on screen")));
+                };
+                st.data = Some(Box::new(rect.center()));
+            }
+            let pos = *st.data.as_ref().unwrap().downcast_ref::<egui::Pos2>().unwrap();
+            pointer_clicks(app, st, pos, if *double { 2 } else { 1 })
+        }
+        Step::ClickEmpty => {
+            if st.data.is_none() {
+                let Some(view) = drawn_rect(ctx, view_rect_id()) else {
+                    return Ok(Flow::Wait("the file list is not drawn yet".into()));
+                };
+                // Just above the bottom of the list area, which the rows don't reach in a
+                // short listing.
+                let pos = egui::pos2(view.center().x, view.bottom() - 6.0);
+                let covered = app.pane().entries.iter().any(|e| {
+                    drawn_rect(ctx, entry_rect_id(&e.path)).is_some_and(|r| r.contains(pos))
+                });
+                if covered {
+                    return Err("the list has no empty area to click".into());
+                }
+                st.data = Some(Box::new(pos));
+            }
+            let pos = *st.data.as_ref().unwrap().downcast_ref::<egui::Pos2>().unwrap();
+            pointer_clicks(app, st, pos, 1)
         }
         Step::Scroll(dy) => {
             let mut events = Vec::new();
@@ -1418,6 +1570,33 @@ mod tests {
         let sandbox = tempfile::tempdir().unwrap();
         let resolved = sandbox_path(sandbox.path(), Path::new("sub")).unwrap();
         assert!(!resolved.to_string_lossy().starts_with(r"\\?\"), "{}", resolved.display());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dangling_junctions_inside_the_sandbox_are_refused() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("gone");
+        std::fs::create_dir(&target).unwrap();
+        let link = sandbox.path().join("link");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("mklink unavailable; skipping");
+            return;
+        }
+        std::fs::remove_dir(&target).unwrap();
+        let err = sandbox_path(sandbox.path(), &link.join("file.txt")).unwrap_err();
+        // Refused either way: as a dangling link, or because it can't be resolved at all.
+        assert!(
+            err.contains("unresolvable link") || err.contains("cannot verify"),
+            "{err}"
+        );
     }
 
     #[test]

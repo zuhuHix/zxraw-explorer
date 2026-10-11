@@ -136,8 +136,10 @@ pub(super) fn step(
             if !clock.recording {
                 return Err("`ui perf end` without `ui perf begin`".into());
             }
+            // Confined like every other path: the sandbox, or the screenshot folder.
+            let path = super::report_path(Path::new(args))?;
             clock.recording = false;
-            write_report(clock, Path::new(args))?;
+            write_report(clock, &path)?;
             Ok(Flow::Done)
         }
         other => Err(format!("unknown `ui perf` verb `{other}`")),

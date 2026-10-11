@@ -1073,16 +1073,19 @@ pub fn locate_proxies(app: &mut ZxrawApp) {
 }
 
 pub fn generate_proxies(app: &mut ZxrawApp) {
-    let targets = app.pane().action_targets();
-    let entries = &app.pane().entries;
-    let sources: Vec<PathBuf> = targets
+    // One pass over the listing, then a set lookup per target: a nested search was
+    // O(selected × listed) on the UI thread.
+    let pane = app.pane();
+    let clips = pane
+        .entries
+        .iter()
+        .filter(|entry| is_clip_entry(entry))
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let sources: Vec<PathBuf> = pane
+        .action_targets()
         .into_iter()
-        .filter(|path| {
-            entries
-                .iter()
-                .find(|entry| entry.path == *path)
-                .is_some_and(is_clip_entry)
-        })
+        .filter(|path| clips.contains(path))
         .collect();
     if sources.is_empty() {
         app.toast("Select one or more video files to generate proxies");
