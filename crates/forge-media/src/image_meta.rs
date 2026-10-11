@@ -146,6 +146,12 @@ pub struct ImageMetadata {
     pub gps_lat: Option<f64>,
     pub gps_lon: Option<f64>,
     pub gps_alt_m: Option<f64>,
+    /// GPS image direction in degrees, if recorded.
+    #[serde(default)]
+    pub gps_direction_deg: Option<f64>,
+    /// True when GPS tags were present but malformed or outside their valid ranges.
+    #[serde(default)]
+    pub gps_invalid: bool,
     /// EXIF orientation 1..=8.
     pub orientation: Option<u16>,
     pub color_space: Option<String>,
@@ -513,17 +519,6 @@ fn num(f: &Field) -> Option<f64> {
     v.is_finite().then_some(v)
 }
 
-fn rationals(f: &Field) -> Option<Vec<f64>> {
-    match &f.value {
-        Value::Rational(v) => Some(
-            v.iter()
-                .map(|r| if r.denom == 0 { f64::NAN } else { r.to_f64() })
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
 /// "1/250", "1/2.5", "2s", "1.3s".
 pub fn format_shutter(t: f64) -> Option<String> {
     if !(t.is_finite() && t > 0.0) {
@@ -632,33 +627,46 @@ fn fill_from_exif(m: &mut ImageMetadata, exifs: &[Exif]) {
         }
     }
 
-    // GPS
-    let coord = |val: Tag, refr: Tag, pos: &str| -> Option<f64> {
-        let v = rationals(find(exifs, val)?)?;
-        let mut d = *v.first()?;
-        if let Some(mn) = v.get(1) {
-            d += mn / 60.0;
+    // GPS coordinates are untrusted input. A partial tuple, malformed rational, invalid
+    // hemisphere, or out-of-range component is surfaced as invalid instead of silently
+    // falling back to a plausible-looking coordinate.
+    let gps_tags = [
+        Tag::GPSLatitude,
+        Tag::GPSLatitudeRef,
+        Tag::GPSLongitude,
+        Tag::GPSLongitudeRef,
+        Tag::GPSAltitude,
+        Tag::GPSAltitudeRef,
+        Tag::GPSImgDirection,
+        Tag::GPSImgDirectionRef,
+    ];
+    if gps_tags.iter().any(|tag| find(exifs, *tag).is_some()) {
+        let parsed = (|| {
+            let lat = gps_coord(exifs, Tag::GPSLatitude, Tag::GPSLatitudeRef, "N", "S", 90.0)?;
+            let lon = gps_coord(
+                exifs,
+                Tag::GPSLongitude,
+                Tag::GPSLongitudeRef,
+                "E",
+                "W",
+                180.0,
+            )?;
+            let (Some(lat), Some(lon)) = (lat, lon) else {
+                return Err(());
+            };
+            let altitude = gps_altitude(exifs)?;
+            let direction = gps_direction(exifs)?;
+            Ok((lat, lon, altitude, direction))
+        })();
+        match parsed {
+            Ok((lat, lon, altitude, direction)) => {
+                m.gps_lat = Some(lat);
+                m.gps_lon = Some(lon);
+                m.gps_alt_m = altitude;
+                m.gps_direction_deg = direction;
+            }
+            Err(()) => m.gps_invalid = true,
         }
-        if let Some(s) = v.get(2) {
-            d += s / 3600.0;
-        }
-        if !d.is_finite() {
-            return None;
-        }
-        let r = find(exifs, refr)
-            .and_then(ascii)
-            .unwrap_or_else(|| pos.into());
-        Some(if r.eq_ignore_ascii_case(pos) { d } else { -d })
-    };
-    let lat = coord(Tag::GPSLatitude, Tag::GPSLatitudeRef, "N").filter(|v| v.abs() <= 90.0);
-    let lon = coord(Tag::GPSLongitude, Tag::GPSLongitudeRef, "E").filter(|v| v.abs() <= 180.0);
-    if lat.is_some() && lon.is_some() {
-        m.gps_lat = lat;
-        m.gps_lon = lon;
-        m.gps_alt_m = find(exifs, Tag::GPSAltitude).and_then(num).map(|a| {
-            let below = find(exifs, Tag::GPSAltitudeRef).and_then(|f| f.value.get_uint(0));
-            if below == Some(1) { -a } else { a }
-        });
     }
 
     // Raw tag list for the details panel.
@@ -692,6 +700,110 @@ fn fill_from_exif(m: &mut ImageMetadata, exifs: &[Exif]) {
                 value,
             });
         }
+    }
+}
+
+fn gps_coord(
+    exifs: &[Exif],
+    value_tag: Tag,
+    ref_tag: Tag,
+    positive_ref: &str,
+    negative_ref: &str,
+    maximum: f64,
+) -> Result<Option<f64>, ()> {
+    let Some(field) = find(exifs, value_tag) else {
+        return Ok(None);
+    };
+    let Value::Rational(parts) = &field.value else {
+        return Err(());
+    };
+    if parts.len() != 3 || parts.iter().any(|r| r.denom == 0) {
+        return Err(());
+    }
+    let [degrees, minutes, seconds] = [parts[0].to_f64(), parts[1].to_f64(), parts[2].to_f64()];
+    if !degrees.is_finite()
+        || !minutes.is_finite()
+        || !seconds.is_finite()
+        || !(0.0..=maximum).contains(&degrees)
+        || !(0.0..60.0).contains(&minutes)
+        || !(0.0..60.0).contains(&seconds)
+        || (degrees == maximum && (minutes != 0.0 || seconds != 0.0))
+    {
+        return Err(());
+    }
+    let reference = find(exifs, ref_tag).and_then(ascii).ok_or(())?;
+    let sign = if reference.eq_ignore_ascii_case(positive_ref) {
+        1.0
+    } else if reference.eq_ignore_ascii_case(negative_ref) {
+        -1.0
+    } else {
+        return Err(());
+    };
+    let coordinate = sign * (degrees + minutes / 60.0 + seconds / 3600.0);
+    coordinate.is_finite().then_some(Some(coordinate)).ok_or(())
+}
+
+fn gps_altitude(exifs: &[Exif]) -> Result<Option<f64>, ()> {
+    let value = find(exifs, Tag::GPSAltitude);
+    let reference = find(exifs, Tag::GPSAltitudeRef);
+    match (value, reference) {
+        (None, None) => Ok(None),
+        (Some(field), reference) => {
+            let altitude = gps_scalar(field)?;
+            if altitude < 0.0 {
+                return Err(());
+            }
+            let below = reference
+                .map(|field| match &field.value {
+                    Value::Byte(bytes) if bytes.len() == 1 => Ok(bytes[0]),
+                    _ => Err(()),
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let signed = match below {
+                0 => altitude,
+                1 => -altitude,
+                _ => return Err(()),
+            };
+            Ok(Some(signed))
+        }
+        (None, Some(_)) => Err(()),
+    }
+}
+
+fn gps_scalar(field: &Field) -> Result<f64, ()> {
+    let Value::Rational(values) = &field.value else {
+        return Err(());
+    };
+    let [value] = values.as_slice() else {
+        return Err(());
+    };
+    if value.denom == 0 {
+        return Err(());
+    }
+    let value = value.to_f64();
+    value.is_finite().then_some(value).ok_or(())
+}
+
+fn gps_direction(exifs: &[Exif]) -> Result<Option<f64>, ()> {
+    let value = find(exifs, Tag::GPSImgDirection);
+    let reference = find(exifs, Tag::GPSImgDirectionRef);
+    match (value, reference) {
+        (None, None) => Ok(None),
+        (Some(field), reference) => {
+            let direction = gps_scalar(field)?;
+            if !(0.0..=360.0).contains(&direction) {
+                return Err(());
+            }
+            if let Some(field) = reference {
+                let reference = ascii(field).ok_or(())?;
+                if !reference.eq_ignore_ascii_case("T") && !reference.eq_ignore_ascii_case("M") {
+                    return Err(());
+                }
+            }
+            Ok(Some(direction))
+        }
+        (None, Some(_)) => Err(()),
     }
 }
 
