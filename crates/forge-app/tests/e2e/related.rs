@@ -137,10 +137,12 @@ fn same_folder_selection_and_nearby_export_folders_work() {
         "select IMG_1234-Edit.jpg".into(),
         "ui related select-originals".into(),
         "ui related assert-selection IMG_1234.jpg".into(),
+        "assert-toast Selected 1 counterpart(s)".into(),
         "select IMG_1234.jpg".into(),
         "ui related assert-exports IMG_1234-Edit.jpg,IMG_1234-Edit-2.jpg".into(),
         "ui related select-exports".into(),
         "ui related assert-selection IMG_1234-Edit.jpg,IMG_1234-Edit-2.jpg".into(),
+        "assert-toast Selected 2 counterpart(s)".into(),
         path_step("screenshot", &shots_same),
         path_step("navigate", &raw_folder),
         "select IMG_5678.jpg".into(),
@@ -250,6 +252,39 @@ fn invalid_media_link_rules_are_rejected_and_defaults_keep_working() {
         ],
     );
     expect_ok(&after);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn select_commands_report_when_no_counterpart_is_listed() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path();
+    let folder = root.join("solo");
+    let profile = root.join("profile");
+    jpeg_file(&folder.join("IMG_3000.jpg"), [70, 70, 70]);
+    jpeg_file(&folder.join("IMG_3001.jpg"), [90, 60, 60]);
+    jpeg_file(&folder.join("IMG_3001-Edit.jpg"), [120, 60, 60]);
+    let shots_none = shot("select-no-counterpart.png");
+
+    let steps = vec![
+        path_step("navigate", &folder),
+        "cmd TogglePreview".into(),
+        // IMG_3000 has no export in this folder.
+        "select IMG_3000.jpg".into(),
+        "ui related select-exports".into(),
+        "ui related wait-selection".into(),
+        "assert-toast No matching exports are in this folder".into(),
+        // IMG_3001 is itself an original, and its export is not an original of IMG_3001.
+        "select IMG_3001.jpg".into(),
+        "ui related select-originals".into(),
+        "ui related wait-selection".into(),
+        "assert-toast No matching originals are in this folder".into(),
+        "assert-no-error-toast".into(),
+        path_step("screenshot", &shots_none),
+        "exit".into(),
+    ];
+    let outcome = run_script(root, &profile, &steps);
+    expect_ok(&outcome);
     assert_no_crash(&profile);
 }
 

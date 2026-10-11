@@ -4,8 +4,9 @@
 //! - `assert-proxies <name>[, <name>...]`: wait for local or located proxy matches.
 //! - `assert-no-proxies <name>[, <name>...]`: wait for the proxy scan, then require that none of the names match.
 //! - `assert-originals <name>[, <name>...]` and `assert-exports ...`: wait for filename-rule matches.
-//! - `select-originals`, `select-exports`: run the pane selection commands.
-//! - `assert-selection <name>[, <name>...]`: check the selected pane entries.
+//! - `select-originals`, `select-exports`: start the pane selection commands. They match on a worker thread.
+//! - `wait-selection`: wait until the last selection command has been applied.
+//! - `assert-selection <name>[, <name>...]`: wait for a pending selection, then check the selected pane entries.
 //! - `settings-edit-rule <1-based row> <rule>`: edit through the Settings UI validator.
 
 use std::collections::HashSet;
@@ -40,7 +41,8 @@ pub(super) fn step(
             crate::export_assoc::select_exports(app);
             Ok(Flow::Done)
         }
-        "assert-selection" => assert_selection(app, args),
+        "wait-selection" => wait_selection(st),
+        "assert-selection" => assert_selection(app, args, st),
         "settings-edit-rule" => edit_rule(app, args),
         _ => Err(format!("unknown `ui related` verb `{verb}`")),
     }
@@ -160,8 +162,21 @@ fn assert_associations(
     }
 }
 
-fn assert_selection(app: &ZxrawApp, args: &str) -> Result<Flow, String> {
+/// The select commands apply their result a frame or more after they start, so waiting here keeps
+/// scripts from reading the selection too early.
+fn wait_selection(st: &mut StepState) -> Result<Flow, String> {
+    if crate::export_assoc::selection_pending() {
+        wait_timed_out(st, "the pane selection")?;
+        return Ok(Flow::Wait("pane selection is still being matched".into()));
+    }
+    Ok(Flow::Done)
+}
+
+fn assert_selection(app: &ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
     let expected = names(args)?;
+    if let Flow::Wait(reason) = wait_selection(st)? {
+        return Ok(Flow::Wait(reason));
+    }
     let actual = names_in_paths(app.pane().selected.iter().cloned());
     if actual != expected {
         return Err(format!(

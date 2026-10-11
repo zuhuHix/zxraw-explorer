@@ -647,6 +647,8 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     }
     let mut changed = app.ops.thumbs.begin_frame(folders) || !due.is_empty();
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
+    // A finished "Select originals/exports" match (computed off the UI thread).
+    changed |= crate::export_assoc::poll(app);
     while let Ok(ev) = app.ops.rx.try_recv() {
         changed = true;
         match ev {

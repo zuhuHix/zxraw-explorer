@@ -1,9 +1,11 @@
 //! Finds photo exports from configurable filename rules.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 use egui::{RichText, Ui};
 use forge_core::model::{EntryKind, FileEntry, MediaKind, ext_of, media_kind_for_ext};
@@ -11,12 +13,12 @@ use forge_core::model::{EntryKind, FileEntry, MediaKind, ext_of, media_kind_for_
 use crate::app::ZxrawApp;
 
 const MAX_QUERY_CACHE: usize = 96;
+/// Folder scans waiting for the worker. The newest requests run first, and the oldest are dropped.
+const MAX_QUEUED_SCANS: usize = 8;
 const MAX_NEARBY_DIRS: usize = 32;
 const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const MAX_DIRECTORY_DISCOVERY_ENTRIES: usize = 512;
 pub const MAX_EXPORT_RULES: usize = 64;
-const MAX_COMMAND_TARGETS: usize = 256;
-const MAX_COMMAND_CANDIDATES: usize = 4096;
 
 pub const DEFAULT_EXPORT_RULES: [&str; 6] = [
     "{base}-Edit",
@@ -94,36 +96,130 @@ pub fn validate_rule(rule: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn matches_export(rule: &str, original_stem: &str, export_stem: &str) -> bool {
-    if validate_rule(rule).is_err() {
-        return false;
-    }
-    // Split before substituting `{base}`, so a literal `{n}` in a filename cannot act as the number token.
-    if let Some((prefix, suffix)) = rule.split_once("{n}") {
-        let prefix = prefix.replace("{base}", original_stem);
-        let suffix = suffix.replace("{base}", original_stem);
-        if export_stem.len() < prefix.len() + suffix.len() {
-            return false;
-        }
-        let Some(found_prefix) = export_stem.get(..prefix.len()) else {
-            return false;
-        };
-        let Some(found_suffix) = export_stem.get(export_stem.len() - suffix.len()..) else {
-            return false;
-        };
-        if !found_prefix.eq_ignore_ascii_case(&prefix)
-            || !found_suffix.eq_ignore_ascii_case(&suffix)
-        {
-            return false;
-        }
-        let number = export_stem.get(prefix.len()..export_stem.len() - suffix.len());
-        number.is_some_and(|value| {
-            !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+fn all_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// A validated rule, split at `{n}`. `{base}` stays in the text and is filled in per stem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedRule {
+    /// Text before `{n}`, or the whole rule when it has no `{n}`.
+    head: String,
+    /// Text after `{n}`, when the rule has one.
+    tail: Option<String>,
+}
+
+impl PreparedRule {
+    fn new(rule: &str) -> Option<Self> {
+        validate_rule(rule).ok()?;
+        // Split before substituting `{base}`, so a literal `{n}` in a filename cannot act as the number token.
+        Some(match rule.split_once("{n}") {
+            Some((head, tail)) => Self {
+                head: head.to_string(),
+                tail: Some(tail.to_string()),
+            },
+            None => Self {
+                head: rule.to_string(),
+                tail: None,
+            },
         })
-    } else {
-        rule.replace("{base}", original_stem)
-            .eq_ignore_ascii_case(export_stem)
     }
+
+    fn matches(&self, original_stem: &str, export_stem: &str) -> bool {
+        let head = self.head.replace("{base}", original_stem);
+        let Some(tail) = &self.tail else {
+            return head.eq_ignore_ascii_case(export_stem);
+        };
+        let tail = tail.replace("{base}", original_stem);
+        if export_stem.len() < head.len() + tail.len() {
+            return false;
+        }
+        let Some(found_head) = export_stem.get(..head.len()) else {
+            return false;
+        };
+        let Some(found_tail) = export_stem.get(export_stem.len() - tail.len()..) else {
+            return false;
+        };
+        if !found_head.eq_ignore_ascii_case(&head) || !found_tail.eq_ignore_ascii_case(&tail) {
+            return false;
+        }
+        export_stem
+            .get(head.len()..export_stem.len() - tail.len())
+            .is_some_and(all_digits)
+    }
+
+    /// Lower-cased original stems this rule could have produced `export_stem` from. Every stem
+    /// that `matches` accepts is in the list; `matches` still confirms each pair.
+    fn original_keys(&self, export_stem: &str) -> Vec<String> {
+        let export = export_stem.to_ascii_lowercase();
+        let head = self.head.to_ascii_lowercase();
+        let mut keys = Vec::new();
+        match &self.tail {
+            None => {
+                // `before{base}after`: the original is whatever lies between the literal parts.
+                if let Some((before, after)) = head.split_once("{base}")
+                    && let Some(stem) = export
+                        .strip_prefix(before)
+                        .and_then(|rest| rest.strip_suffix(after))
+                {
+                    keys.push(stem.to_string());
+                }
+            }
+            Some(tail) => {
+                let tail = tail.to_ascii_lowercase();
+                if let Some((before, between)) = head.split_once("{base}") {
+                    // `before{base}between{n}tail`: the middle reads `stem between digits`.
+                    let Some(middle) = export
+                        .strip_prefix(before)
+                        .and_then(|rest| rest.strip_suffix(tail.as_str()))
+                    else {
+                        return keys;
+                    };
+                    for position in 0..=middle.len() {
+                        let (Some(stem), Some(digits)) = (
+                            middle.get(..position),
+                            middle.get(position + between.len()..),
+                        ) else {
+                            continue;
+                        };
+                        if middle[position..].starts_with(between) && all_digits(digits) {
+                            keys.push(stem.to_string());
+                        }
+                    }
+                } else if let Some((before, after)) = tail.split_once("{base}") {
+                    // `head{n}before{base}after`: the middle reads `digits before stem`.
+                    let Some(middle) = export
+                        .strip_prefix(head.as_str())
+                        .and_then(|rest| rest.strip_suffix(after))
+                    else {
+                        return keys;
+                    };
+                    for position in 0..=middle.len() {
+                        let (Some(digits), Some(stem)) = (
+                            middle.get(..position),
+                            middle.get(position + before.len()..),
+                        ) else {
+                            continue;
+                        };
+                        if middle[position..].starts_with(before) && all_digits(digits) {
+                            keys.push(stem.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        keys
+    }
+}
+
+/// Validates and splits each active rule once, so a command or scan does not repeat that work for every file.
+fn prepare_rules(rules: &[String]) -> Vec<PreparedRule> {
+    rules
+        .iter()
+        .take(MAX_EXPORT_RULES)
+        .map(String::as_str)
+        .filter_map(PreparedRule::new)
+        .collect()
 }
 
 #[cfg(windows)]
@@ -147,17 +243,18 @@ pub(crate) fn is_link_or_junction(entry: &fs::DirEntry, file_type: &fs::FileType
                 .is_ok_and(|metadata| has_reparse_attribute(&metadata)))
 }
 
-fn is_export_of(original: &Path, export: &Path, rules: &[String]) -> bool {
-    let (Some(original_stem), Some(export_stem)) = (original.file_stem(), export.file_stem())
-    else {
+fn stem_of(path: &Path) -> Option<String> {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+}
+
+fn is_export_of(original: &Path, export: &Path, rules: &[PreparedRule]) -> bool {
+    let (Some(original_stem), Some(export_stem)) = (stem_of(original), stem_of(export)) else {
         return false;
     };
-    let original_stem = original_stem.to_string_lossy();
-    let export_stem = export_stem.to_string_lossy();
     rules
         .iter()
-        .take(MAX_EXPORT_RULES)
-        .any(|rule| matches_export(rule, &original_stem, &export_stem))
+        .any(|rule| rule.matches(&original_stem, &export_stem))
 }
 
 fn normalized_path(path: &Path) -> String {
@@ -237,6 +334,7 @@ fn nearby_directories(path: &Path) -> Vec<PathBuf> {
 }
 
 fn scan_for(path: &Path, rules: &[String]) -> Associations {
+    let rules = prepare_rules(rules);
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
     let mut entries_seen = 0usize;
@@ -280,11 +378,11 @@ fn scan_for(path: &Path, rules: &[String]) -> Associations {
         if normalized_path(&candidate) == normalized_path(path) {
             continue;
         }
-        if is_export_of(path, &candidate, rules) {
+        if is_export_of(path, &candidate, &rules) {
             if exports.insert(normalized_path(&candidate)) {
                 associations.exports.push(candidate);
             }
-        } else if is_export_of(&candidate, path, rules)
+        } else if is_export_of(&candidate, path, &rules)
             && originals.insert(normalized_path(&candidate))
         {
             associations.originals.push(candidate);
@@ -302,6 +400,82 @@ pub fn invalidate_cache() {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .retain(|_, state| *state == QueryState::Pending);
+}
+
+struct ScanJob {
+    key: QueryKey,
+    repaint: egui::Context,
+}
+
+/// Queued scans. The worker takes the newest job first, so a folder the user is looking at is
+/// not stuck behind scans for files they already passed.
+static SCAN_QUEUE: Mutex<VecDeque<ScanJob>> = Mutex::new(VecDeque::new());
+static SCAN_READY: Condvar = Condvar::new();
+static SCAN_WORKER: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Pushes `item` and returns the oldest items pushed out to keep the queue within `limit`.
+fn push_bounded<T>(queue: &mut VecDeque<T>, item: T, limit: usize) -> Vec<T> {
+    queue.push_back(item);
+    let mut dropped = Vec::new();
+    while queue.len() > limit {
+        dropped.extend(queue.pop_front());
+    }
+    dropped
+}
+
+fn enqueue_scan(job: ScanJob) -> Result<(), String> {
+    SCAN_WORKER
+        .get_or_init(|| {
+            std::thread::Builder::new()
+                .name("export-association-scan".into())
+                .spawn(scan_worker)
+                .map(|_handle| ())
+                .map_err(|error| error.to_string())
+        })
+        .clone()?;
+    let dropped = push_bounded(
+        &mut SCAN_QUEUE.lock().unwrap_or_else(|error| error.into_inner()),
+        job,
+        MAX_QUEUED_SCANS,
+    );
+    SCAN_READY.notify_one();
+    if !dropped.is_empty() {
+        // Dropped requests were never run, so forget them; a later frame can request them again.
+        let mut cache = query_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for job in dropped {
+            cache.remove(&job.key);
+        }
+    }
+    Ok(())
+}
+
+fn scan_worker() {
+    loop {
+        let job = {
+            let mut queue = SCAN_QUEUE.lock().unwrap_or_else(|error| error.into_inner());
+            loop {
+                if let Some(job) = queue.pop_back() {
+                    break job;
+                }
+                queue = SCAN_READY
+                    .wait(queue)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        };
+        let state =
+            match panic::catch_unwind(AssertUnwindSafe(|| scan_for(&job.key.path, &job.key.rules)))
+            {
+                Ok(associations) => QueryState::Complete(associations),
+                Err(_) => QueryState::Failed("the scan stopped unexpectedly".into()),
+            };
+        query_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(job.key, state);
+        job.repaint.request_repaint();
+    }
 }
 
 pub fn request_for(path: &Path, rules: &[String], ctx: &egui::Context) {
@@ -326,28 +500,15 @@ pub fn request_for(path: &Path, rules: &[String], ctx: &egui::Context) {
         cache.insert(key.clone(), QueryState::Pending);
     }
 
-    let repaint = ctx.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("export-association-scan".into())
-        .spawn(move || {
-            let state = QueryState::Complete(scan_for(&key.path, &key.rules));
-            query_cache()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(key, state);
-            repaint.request_repaint();
-        })
-    {
+    let job = ScanJob {
+        key: key.clone(),
+        repaint: ctx.clone(),
+    };
+    if let Err(error) = enqueue_scan(job) {
         query_cache()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                QueryKey {
-                    path: path.to_path_buf(),
-                    rules: active_rules(rules),
-                },
-                QueryState::Failed(error.to_string()),
-            );
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key, QueryState::Failed(error));
     }
 }
 
@@ -466,14 +627,37 @@ pub fn select_exports(app: &mut ZxrawApp) {
     select_counterparts(app, true);
 }
 
+/// The latest select command. Matching runs on its own thread, and `poll` applies the result.
+struct PendingSelection {
+    id: u64,
+    folder: PathBuf,
+    want_exports: bool,
+    /// `None` while matching runs.
+    matches: Option<Vec<PathBuf>>,
+}
+
+static PENDING_SELECTION: Mutex<Option<PendingSelection>> = Mutex::new(None);
+static NEXT_SELECTION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn pending_selection() -> MutexGuard<'static, Option<PendingSelection>> {
+    PENDING_SELECTION
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Whether a select command is still matching, or has a result that `poll` has not applied yet.
+pub fn selection_pending() -> bool {
+    pending_selection().is_some()
+}
+
 fn select_counterparts(app: &mut ZxrawApp, want_exports: bool) {
     let rules = active_rules(&app.settings.export_rules);
     let pane = app.pane();
+    let folder = pane.path.clone();
     let targets = pane
         .action_targets()
         .into_iter()
         .filter(|target| is_media_file(target))
-        .take(MAX_COMMAND_TARGETS)
         .collect::<Vec<_>>();
     let candidates = pane
         .visible
@@ -481,47 +665,175 @@ fn select_counterparts(app: &mut ZxrawApp, want_exports: bool) {
         .filter_map(|&index| pane.entries.get(index))
         .filter(|entry| entry.kind == EntryKind::File && is_media_file(&entry.path))
         .map(|entry| entry.path.clone())
-        .take(MAX_COMMAND_CANDIDATES)
         .collect::<Vec<_>>();
-    let mut matches = Vec::new();
-    let mut seen = HashSet::new();
-    for target in targets {
-        for candidate in &candidates {
-            if normalized_path(candidate) == normalized_path(&target) {
-                continue;
-            }
-            let found = if want_exports {
-                is_export_of(&target, candidate, &rules)
-            } else {
-                is_export_of(candidate, &target, &rules)
-            };
-            if found && seen.insert(normalized_path(candidate)) {
-                matches.push(candidate.clone());
-            }
+    // A new command replaces an unfinished one; the older thread then finds its id is gone.
+    let id = NEXT_SELECTION_ID.fetch_add(1, Ordering::Relaxed);
+    *pending_selection() = Some(PendingSelection {
+        id,
+        folder,
+        want_exports,
+        matches: None,
+    });
+    let repaint = app.ops.ctx.clone();
+    let spawned = std::thread::Builder::new()
+        .name("export-association-select".into())
+        .spawn(move || {
+            // A panic must still finish the command, or it would stay pending forever.
+            let matches = std::panic::catch_unwind(|| {
+                let rules = prepare_rules(&rules);
+                match_counterparts(&targets, &candidates, &rules, want_exports)
+            })
+            .unwrap_or_else(|_| {
+                tracing::error!("export-association matching panicked");
+                Vec::new()
+            });
+            finish_selection(id, matches);
+            repaint.request_repaint();
+        });
+    if let Err(error) = spawned {
+        *pending_selection() = None;
+        app.toast_err(format!("Could not start the selection: {error}"));
+    }
+}
+
+fn finish_selection(id: u64, matches: Vec<PathBuf>) {
+    let mut pending = pending_selection();
+    if let Some(pending) = pending.as_mut().filter(|pending| pending.id == id) {
+        pending.matches = Some(matches);
+    }
+}
+
+/// Applies a finished select command, on the first frame after it finishes. Returns whether
+/// the pane changed.
+pub fn poll(app: &mut ZxrawApp) -> bool {
+    let ready = {
+        let mut pending = pending_selection();
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.matches.is_some())
+        {
+            pending.take()
+        } else {
+            None
+        }
+    };
+    let Some(PendingSelection {
+        folder,
+        want_exports,
+        matches: Some(matches),
+        ..
+    }) = ready
+    else {
+        return false;
+    };
+    if app.pane().path != folder {
+        app.toast("Selection cancelled: the folder changed while it was being matched");
+        return true;
+    }
+
+    // Only entries still listed are selected, in case the folder refreshed while matching ran.
+    let matched = matches
+        .iter()
+        .map(|path| normalized_path(path))
+        .collect::<HashSet<_>>();
+    let pane = app.pane();
+    let mut found = Vec::new();
+    let mut cursor = None;
+    for (position, &index) in pane.visible.iter().enumerate() {
+        let Some(entry) = pane.entries.get(index) else {
+            continue;
+        };
+        if matched.contains(&normalized_path(&entry.path)) {
+            found.push(entry.path.clone());
+            cursor.get_or_insert(position);
         }
     }
-    if matches.is_empty() {
+    if found.is_empty() {
         let what = if want_exports { "exports" } else { "originals" };
         app.show_preview = true;
         app.toast(format!(
             "No matching {what} are in this folder. Nearby matches appear in the preview with Show in folder."
         ));
-        return;
+        return true;
     }
-    let matched = matches
-        .iter()
-        .map(|path| normalized_path(path))
-        .collect::<HashSet<_>>();
+    let count = found.len();
     let pane = app.pane_mut();
     pane.selected.clear();
-    pane.selected.extend(matches.iter().cloned());
-    pane.cursor = pane.visible.iter().position(|&index| {
-        pane.entries
-            .get(index)
-            .is_some_and(|entry| matched.contains(&normalized_path(&entry.path)))
-    });
+    pane.selected.extend(found);
+    pane.cursor = cursor;
     pane.scroll_to_cursor = true;
-    app.toast(format!("Selected {} counterpart(s)", matches.len()));
+    app.toast(format!("Selected {count} counterpart(s)"));
+    true
+}
+
+/// Pairs `targets` with `candidates` through an index of original stems. Each export-side file
+/// is indexed once by the originals its rules could come from, and each original-side file
+/// looks up its own stem, so the work does not grow with the number of pairs. Every pair the
+/// index proposes is still confirmed by `PreparedRule::matches`.
+///
+/// Returns the candidates that are counterparts of a target, in listing order.
+fn match_counterparts(
+    targets: &[PathBuf],
+    candidates: &[PathBuf],
+    rules: &[PreparedRule],
+    want_exports: bool,
+) -> Vec<PathBuf> {
+    // Targets are the originals when selecting exports, and candidates are the originals otherwise.
+    let (originals, exports) = if want_exports {
+        (targets, candidates)
+    } else {
+        (candidates, targets)
+    };
+    let export_stems = exports.iter().map(|path| stem_of(path)).collect::<Vec<_>>();
+    let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (position, export_stem) in export_stems.iter().enumerate() {
+        let Some(export_stem) = export_stem else {
+            continue;
+        };
+        let mut keys = rules
+            .iter()
+            .flat_map(|rule| rule.original_keys(export_stem))
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        for key in keys {
+            index.entry(key).or_default().push(position);
+        }
+    }
+
+    let mut matched = HashSet::new();
+    for original in originals {
+        let Some(original_stem) = stem_of(original) else {
+            continue;
+        };
+        let Some(positions) = index.get(&original_stem.to_ascii_lowercase()) else {
+            continue;
+        };
+        for &position in positions {
+            let export = &exports[position];
+            if normalized_path(original) == normalized_path(export) {
+                continue;
+            }
+            let Some(export_stem) = &export_stems[position] else {
+                continue;
+            };
+            if rules
+                .iter()
+                .any(|rule| rule.matches(&original_stem, export_stem))
+            {
+                matched.insert(normalized_path(if want_exports {
+                    export
+                } else {
+                    original
+                }));
+            }
+        }
+    }
+    candidates
+        .iter()
+        .filter(|candidate| matched.contains(&normalized_path(candidate)))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -534,9 +846,39 @@ mod tests {
         fs::write(path, b"fixture").unwrap();
     }
 
+    fn prepared(rules: &[String]) -> Vec<PreparedRule> {
+        prepare_rules(rules)
+    }
+
+    /// The full pairwise comparison that `match_counterparts` replaces. Its results are the reference.
+    fn full_comparison(
+        targets: &[PathBuf],
+        candidates: &[PathBuf],
+        rules: &[PreparedRule],
+        want_exports: bool,
+    ) -> Vec<PathBuf> {
+        candidates
+            .iter()
+            .filter(|candidate| {
+                targets.iter().any(|target| {
+                    if normalized_path(candidate) == normalized_path(target) {
+                        return false;
+                    }
+                    if want_exports {
+                        is_export_of(target, candidate, rules)
+                    } else {
+                        is_export_of(candidate, target, rules)
+                    }
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn default_rules_match_all_supported_export_names() {
         let original = Path::new("IMG_1234.CR3");
+        let rules = prepared(&default_rules());
         for export in [
             "IMG_1234-Edit.jpg",
             "IMG_1234-Edit-2.jpg",
@@ -546,7 +888,7 @@ mod tests {
             "IMG_1234-3.jpg",
         ] {
             assert!(
-                is_export_of(original, Path::new(export), &default_rules()),
+                is_export_of(original, Path::new(export), &rules),
                 "{export}"
             );
         }
@@ -554,7 +896,7 @@ mod tests {
 
     #[test]
     fn matching_is_exact_and_numeric_tokens_do_not_accept_text() {
-        let rules = default_rules();
+        let rules = prepared(&default_rules());
         assert!(!is_export_of(
             Path::new("IMG_12345.CR3"),
             Path::new("IMG_1234-Edit.jpg"),
@@ -574,7 +916,7 @@ mod tests {
 
     #[test]
     fn numeric_token_needs_digits_and_literal_braces_in_names_are_plain_text() {
-        let rules = default_rules();
+        let rules = prepared(&default_rules());
         for export in ["IMG_1234--1.jpg", "IMG_1234-+1.jpg", "IMG_1234-.jpg"] {
             assert!(
                 !is_export_of(Path::new("IMG_1234.CR3"), Path::new(export), &rules),
@@ -606,12 +948,120 @@ mod tests {
         ] {
             assert!(validate_rule(rule).is_err(), "{rule}");
         }
-        let rules = vec!["{base}.*".to_string()];
+        let rules = prepared(&["{base}.*".to_string()]);
+        assert!(rules.is_empty());
         assert!(!is_export_of(
             Path::new("photo.jpg"),
             Path::new("photo.anything.jpg"),
             &rules
         ));
+    }
+
+    #[test]
+    fn index_proposes_every_pair_a_full_comparison_accepts() {
+        let temp = TempDir::new().unwrap();
+        let folder = temp.path();
+        let names = [
+            "IMG_1234.CR3",
+            "IMG_1234-Edit.jpg",
+            "IMG_1234-Edit-2.jpg",
+            "IMG_1234-Edit-x.jpg",
+            "IMG_1234-9.jpg",
+            "IMG_1234_edited.TIF",
+            "IMG_1234-HDR.jpg",
+            "IMG_12-3.jpg",
+            "IMG_12.jpg",
+            "IMG{n}.CR3",
+            "IMG{n}-7.jpg",
+            "IMG-7.jpg",
+            "7-IMG_1234.jpg",
+            "IMG_1234-12.jpg",
+            "IMG_1234-12-Edit.jpg",
+            "x-IMG_1234y5z.jpg",
+            "xIMG_1234yz.jpg",
+            "IMG_1234y5zHDR.jpg",
+            "IMG_1234-1-Edit.jpg",
+            "IMG_1234-1-1.jpg",
+        ];
+        let files = names
+            .iter()
+            .map(|name| folder.join(name))
+            .collect::<Vec<_>>();
+        // Extra rules put `{n}` before and after `{base}`, adjoin them, and include one that is invalid.
+        let mut rule_text = default_rules();
+        rule_text.extend(
+            [
+                "{n}-{base}",
+                "{base}{n}",
+                "x{base}y{n}z",
+                "{n}{base}-HDR",
+                "{base}-{n}-{n}",
+            ]
+            .map(String::from),
+        );
+        let rules = prepared(&rule_text);
+        for want_exports in [true, false] {
+            for target in &files {
+                let targets = std::slice::from_ref(target);
+                assert_eq!(
+                    match_counterparts(targets, &files, &rules, want_exports),
+                    full_comparison(targets, &files, &rules, want_exports),
+                    "target {} (exports: {want_exports})",
+                    target.display()
+                );
+            }
+            assert_eq!(
+                match_counterparts(&files, &files, &rules, want_exports),
+                full_comparison(&files, &files, &rules, want_exports),
+            );
+        }
+    }
+
+    #[test]
+    fn large_selection_finishes_quickly_with_the_same_counterparts() {
+        // 2,048 originals and their exports: 4,096 candidates, selected against 256 targets.
+        let originals = (0..2048)
+            .map(|index| PathBuf::from(format!("C:\\shoot\\IMG_{index:04}.CR3")))
+            .collect::<Vec<_>>();
+        let exports = (0..2048)
+            .map(|index| PathBuf::from(format!("C:\\shoot\\IMG_{index:04}-Edit.jpg")))
+            .collect::<Vec<_>>();
+        let candidates = originals
+            .iter()
+            .chain(&exports)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rule_text = default_rules();
+        rule_text.extend((0..MAX_EXPORT_RULES - 6).map(|index| format!("{{base}}-r{index}-{{n}}")));
+        let rules = prepared(&rule_text);
+        assert_eq!(rules.len(), MAX_EXPORT_RULES);
+
+        let started = std::time::Instant::now();
+        let mut found = match_counterparts(&originals[..256], &candidates, &rules, true);
+        let mut from_exports = match_counterparts(&exports[..256], &candidates, &rules, false);
+        let elapsed = started.elapsed();
+
+        found.sort();
+        from_exports.sort();
+        assert_eq!(found, exports[..256].to_vec());
+        assert_eq!(from_exports, originals[..256].to_vec());
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "matching took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn push_bounded_drops_the_oldest_requests_and_keeps_the_newest() {
+        let mut queue = VecDeque::new();
+        let mut dropped = Vec::new();
+        for item in 0..20 {
+            dropped.extend(push_bounded(&mut queue, item, MAX_QUEUED_SCANS));
+        }
+        assert_eq!(dropped, (0..12).collect::<Vec<_>>());
+        assert_eq!(queue.len(), MAX_QUEUED_SCANS);
+        // The worker takes from the back, so the newest request runs first.
+        assert_eq!(queue.pop_back(), Some(19));
     }
 
     #[test]
