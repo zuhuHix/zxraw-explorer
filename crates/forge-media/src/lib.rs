@@ -18,6 +18,7 @@ pub mod image_meta;
 pub mod raw_preview;
 pub mod thumbs;
 pub mod video;
+pub mod wic;
 pub mod xmp_write;
 
 pub use analysis::{

@@ -17,6 +17,7 @@ use thiserror::Error;
 
 mod clipboard;
 mod integration;
+pub mod dragout;
 pub mod drives;
 pub mod files;
 pub mod process;
@@ -35,7 +36,8 @@ pub use integration::{
 pub use process::launch;
 pub use restart::file_locking_processes;
 pub use shell::{
-    known_folders, open_default, open_with_dialog, recycle, reveal_in_explorer, show_properties,
+    known_folders, open_default, open_with_dialog, recycle, recycle_sandbox_active,
+    recycle_to_sandbox, reveal_in_explorer, set_recycle_sandbox, show_properties,
 };
 pub use watch::{DriveEvent, DriveWatcher, drive_change_watcher};
 

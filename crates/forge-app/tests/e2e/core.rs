@@ -1,146 +1,10 @@
-//! End-to-end UI scenarios.
-//!
-//! Each test starts the real `zxraw` window with `ZXRAW_SCRIPT` pointing at a small step
-//! script (grammar: `crates/forge-app/src/testhook.rs`), drives it through the same command
-//! and dialog code paths the user reaches with menus and keys, and then asserts on the
-//! filesystem. Every run gets a fresh profile, so no user settings, session or library data
-//! is read or written.
-//!
-//! The app opens a real window, so these tests run one at a time (a static lock enforces
-//! it; `--test-threads=1` is still recommended). Recycle Bin behaviour is deliberately not
-//! covered: these tests must never touch the user's real Recycle Bin.
+//! Core file-manager scenarios: folders, rename/undo, copy/move, delete, batch rename,
+//! session restore, and the script hook's own generic verbs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
-/// Hard limit for one app run. The scripts themselves finish in a few seconds.
-const RUN_LIMIT: Duration = Duration::from_secs(75);
-
-static WINDOW: Mutex<()> = Mutex::new(());
-
-struct Outcome {
-    status: ExitStatus,
-    /// Contents of the script result file, trimmed: `OK` or `SCRIPT ERROR: …`.
-    result: String,
-    /// Tail of the app's stderr log.
-    stderr: String,
-}
-
-/// Runs `script` in a fresh window with the given profile and waits for it to finish.
-/// Panics with a clear message when the window never ran the script.
-fn run_app(work: &Path, profile: &Path, script: &str) -> Outcome {
-    let _window = WINDOW.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    fs::create_dir_all(work).unwrap();
-    let script_path = work.join("steps.txt");
-    fs::write(&script_path, script).unwrap();
-    let result_path = work.join("steps.result");
-    let stderr_path = work.join("stderr.log");
-    let stderr = fs::File::create(&stderr_path).unwrap();
-
-    let mut child = Command::new(env!("CARGO_BIN_EXE_zxraw"))
-        .env("ZXRAW_SCRIPT", &script_path)
-        .env("ZXRAW_SCRIPT_RESULT", &result_path)
-        .env(
-            "ZXRAW_SCRIPT_SANDBOX",
-            profile.parent().expect("profile sandbox"),
-        )
-        .env("ZXRAW_PROFILE_DIR", profile)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
-        .unwrap_or_else(|e| panic!("cannot start zxraw: {e}"));
-
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if started.elapsed() > RUN_LIMIT {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!(
-                "zxraw did not finish within {} s; stderr tail:\n{}",
-                RUN_LIMIT.as_secs(),
-                tail(&stderr_path)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-
-    let result = fs::read_to_string(&result_path).unwrap_or_default();
-    if result.trim().is_empty() {
-        panic!(
-            "zxraw exited with {status} without writing a script result. Either no window could \
-             be created (GPU or display problem) or the app crashed. stderr tail:\n{}",
-            tail(&stderr_path)
-        );
-    }
-    Outcome {
-        status,
-        result: result.trim().to_string(),
-        stderr: tail(&stderr_path),
-    }
-}
-
-/// Asserts that the script ran to the end without a step failing.
-fn expect_ok(outcome: &Outcome) {
-    assert!(
-        outcome.status.success() && outcome.result == "OK",
-        "script failed: exit {}, result `{}`\nstderr tail:\n{}",
-        outcome.status,
-        outcome.result,
-        outcome.stderr
-    );
-}
-
-fn tail(path: &Path) -> String {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    let start = text.len().saturating_sub(3000);
-    let start = (start..=text.len())
-        .find(|&i| text.is_char_boundary(i))
-        .unwrap_or(text.len());
-    text[start..].to_string()
-}
-
-/// Fixture bytes: deterministic pseudo-random data so copies can be compared byte for byte.
-fn noise(len: usize, seed: u32) -> Vec<u8> {
-    let mut state = seed;
-    (0..len)
-        .map(|_| {
-            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            (state >> 16) as u8
-        })
-        .collect()
-}
-
-fn write_file(path: &Path, bytes: &[u8]) {
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, bytes).unwrap();
-}
-
-fn shown(path: &Path) -> String {
-    path.display().to_string()
-}
-
-/// Scenario setup for the copy/move tests: a source folder and an empty destination folder,
-/// shown side by side in dual-pane mode (left = source, right = destination).
-fn dual_pane_script(src: &Path, dst: &Path, steps: &[&str]) -> String {
-    let mut script = format!(
-        "navigate {}\ncmd ToggleDualPane\nfocus right\nnavigate {}\nfocus left\n",
-        shown(src),
-        shown(dst)
-    );
-    for step in steps {
-        script.push_str(step);
-        script.push('\n');
-    }
-    script.push_str("exit\n");
-    script
-}
+use crate::*;
 
 #[test]
 fn new_folder_is_created_from_the_prompt() {
@@ -157,7 +21,10 @@ fn new_folder_is_created_from_the_prompt() {
 
     expect_ok(&outcome);
     assert!(dir.join("Fresh folder").is_dir());
-    assert!(!dir.join("New folder").exists(), "the default name must not be left behind");
+    assert!(
+        !dir.join("New folder").exists(),
+        "the default name must not be left behind"
+    );
 }
 
 #[test]
@@ -211,8 +78,16 @@ fn copy_to_other_pane_duplicates_files_byte_for_byte() {
     expect_ok(&outcome);
     assert_eq!(fs::read(dst.join("a.txt")).unwrap(), text);
     assert_eq!(fs::read(dst.join("b.bin")).unwrap(), binary);
-    assert_eq!(fs::read(src.join("a.txt")).unwrap(), text, "copy must keep the source");
-    assert_eq!(fs::read(src.join("b.bin")).unwrap(), binary, "copy must keep the source");
+    assert_eq!(
+        fs::read(src.join("a.txt")).unwrap(),
+        text,
+        "copy must keep the source"
+    );
+    assert_eq!(
+        fs::read(src.join("b.bin")).unwrap(),
+        binary,
+        "copy must keep the source"
+    );
 }
 
 #[test]
@@ -257,7 +132,10 @@ fn move_to_other_pane_removes_the_source() {
     let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
 
     expect_ok(&outcome);
-    assert!(!src.join("move.txt").exists(), "the source must be gone after a move");
+    assert!(
+        !src.join("move.txt").exists(),
+        "the source must be gone after a move"
+    );
     assert_eq!(fs::read(dst.join("move.txt")).unwrap(), bytes);
 }
 
@@ -335,13 +213,19 @@ fn corrupt_jpeg_in_grid_and_preview_does_not_crash() {
     let outcome = run_app(sandbox.path(), &profile, &script);
 
     expect_ok(&outcome);
-    assert!(fs::metadata(&shot).map(|m| m.len() > 0).unwrap_or(false), "no screenshot was saved");
+    assert!(
+        fs::metadata(&shot).map(|m| m.len() > 0).unwrap_or(false),
+        "no screenshot was saved"
+    );
     let crashes = profile.join("data").join("crashes");
     // `crash-*.txt` files are reports; `.last-startup-nanos` is the startup marker.
     let reports: Vec<PathBuf> = fs::read_dir(&crashes)
         .map(|d| {
             d.filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("crash-")))
+                .filter(|p| {
+                    p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with("crash-"))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -349,10 +233,18 @@ fn corrupt_jpeg_in_grid_and_preview_does_not_crash() {
         .iter()
         .map(|r| {
             let body = fs::read_to_string(r).unwrap_or_default();
-            format!("{}:\n{}\n", r.display(), body.chars().take(2000).collect::<String>())
+            format!(
+                "{}:\n{}\n",
+                r.display(),
+                body.chars().take(2000).collect::<String>()
+            )
         })
         .collect();
-    assert!(reports.is_empty(), "the app wrote {} crash report(s):\n{details}", reports.len());
+    assert!(
+        reports.is_empty(),
+        "the app wrote {} crash report(s):\n{details}",
+        reports.len()
+    );
 }
 
 #[test]
@@ -378,10 +270,194 @@ fn tabs_are_restored_on_the_next_start() {
     let outcome = run_app(
         &sandbox.path().join("run2"),
         &profile,
+        &format!("assert-tabs 2\nassert-path {}\nexit\n", shown(&second)),
+    );
+    expect_ok(&outcome);
+}
+
+#[test]
+fn delete_key_recycles_into_the_sandbox_not_the_real_recycle_bin() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    write_file(&dir.join("binned.txt"), b"recycle me");
+    write_file(&dir.join("kept.txt"), b"stay");
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        // Recycling asks for confirmation only when `confirm_recycle` is on (off by default).
+        "navigate {dir}\nselect binned.txt\nkey Delete\nwait-jobs 20\n\
+         wait-missing {binned}\nwait-no-entry binned.txt | 10\nassert-entry kept.txt\n\
+         assert-toast Recycle Bin\nassert-no-error-toast\nexit\n",
+        dir = shown(&dir),
+        binned = shown(&dir.join("binned.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    let recycled = recycle_sandbox(&profile).join("0").join("binned.txt");
+    assert_eq!(
+        fs::read(&recycled).unwrap(),
+        b"recycle me",
+        "the item must be in the sandbox"
+    );
+    assert_eq!(fs::read(dir.join("kept.txt")).unwrap(), b"stay");
+}
+
+#[test]
+fn keyboard_shortcut_runs_through_real_input() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let script = format!(
+        "navigate {}\nassert-tabs 1\nkey ctrl+T\nassert-tabs 2\nexit\n",
+        shown(&dir)
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+}
+
+#[test]
+fn a_failing_step_is_reported_with_its_line() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let script = format!(
+        "navigate {}\nassert-entry not-there.txt\nexit\n",
+        shown(&dir)
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_script_error(&outcome, "line 2");
+}
+
+#[test]
+fn first_run_welcome_shows_once_per_profile() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let profile = sandbox.path().join("profile");
+    let shot = sandbox.path().join("welcome.png");
+    let opts = RunOpts {
+        env: vec![("ZXRAW_FIRST_RUN".into(), "1".into())],
+        ..Default::default()
+    };
+
+    let first = run_app_with(
+        &sandbox.path().join("run1"),
+        &profile,
         &format!(
-            "assert-tabs 2\nassert-path {}\nexit\n",
-            shown(&second)
+            "navigate {}\nassert-notice welcome\nwait-frames 10\nscreenshot {}\ndismiss-notices\nassert-notice none\nexit\n",
+            shown(&dir),
+            shown(&shot)
+        ),
+        &opts,
+    );
+    expect_ok(&first);
+    assert!(profile.join("config").join("first-run.done").is_file());
+
+    let second = run_app_with(
+        &sandbox.path().join("run2"),
+        &profile,
+        &format!("navigate {}\nassert-notice none\nexit\n", shown(&dir)),
+        &opts,
+    );
+    expect_ok(&second);
+    if let Ok(keep) = std::env::var("ZXFR_SHOTS") {
+        let _ = fs::copy(&shot, PathBuf::from(keep).join("welcome.png"));
+    }
+}
+
+#[test]
+fn crash_report_from_the_last_session_is_announced_once() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(&dir).unwrap();
+    let profile = sandbox.path().join("profile");
+    write_file(
+        &profile.join("data").join("crashes").join("crash-20261011-000000.txt"),
+        b"ZXraw Explorer crash report\npanic: synthetic test report\n",
+    );
+    let shot = sandbox.path().join("crash-notice.png");
+
+    let first = run_app(
+        &sandbox.path().join("run1"),
+        &profile,
+        &format!(
+            "navigate {}\nassert-notice crash\nwait-frames 10\nscreenshot {}\nexit\n",
+            shown(&dir),
+            shown(&shot)
         ),
     );
+    expect_ok(&first);
+
+    let second = run_app(
+        &sandbox.path().join("run2"),
+        &profile,
+        &format!("navigate {}\nassert-notice none\nexit\n", shown(&dir)),
+    );
+    expect_ok(&second);
+    if let Ok(keep) = std::env::var("ZXFR_SHOTS") {
+        let _ = fs::copy(&shot, PathBuf::from(keep).join("crash-notice.png"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real pointer clicks on rows and tiles. Positions come from where the view drew each
+// entry (in points), so these hold at fractional display scaling: at 1.2 the view's
+// background widget used to sit above the rows and swallow every click.
+// ---------------------------------------------------------------------------
+
+fn folder_with_subfolder(sandbox: &Path) -> (PathBuf, PathBuf) {
+    let dir = sandbox.join("work");
+    let sub = dir.join("Shoot 2024");
+    fs::create_dir_all(&sub).unwrap();
+    write_file(&sub.join("inside.txt"), b"x");
+    write_file(&dir.join("notes.txt"), b"y");
+    (dir, sub)
+}
+
+fn click_scenario(view: &str, steps: &str) {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (dir, sub) = folder_with_subfolder(sandbox.path());
+    let script = format!(
+        "navigate {dir}\ncmd {view}\nwait-frames 5\n{steps}\nwait-entry inside.txt\nassert-path {sub}\nexit\n",
+        dir = shown(&dir),
+        sub = shown(&sub),
+    );
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn double_clicking_a_folder_row_opens_it() {
+    click_scenario("ViewDetails", "double-click-entry Shoot 2024");
+}
+
+#[test]
+fn double_clicking_a_folder_tile_opens_it() {
+    click_scenario("ViewGrid", "double-click-entry Shoot 2024");
+}
+
+#[test]
+fn clicking_a_folder_row_then_enter_opens_it() {
+    click_scenario(
+        "ViewDetails",
+        "click-entry Shoot 2024\nassert-selected 1\nkey Enter",
+    );
+}
+
+#[test]
+fn clicking_empty_space_below_the_rows_clears_the_selection() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (dir, _) = folder_with_subfolder(sandbox.path());
+    let script = format!(
+        "navigate {dir}\ncmd ViewDetails\nwait-frames 5\nclick-entry notes.txt\nassert-selected 1\n\
+         click-empty\nassert-selected 0\nassert-path {dir}\nexit\n",
+        dir = shown(&dir),
+    );
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
     expect_ok(&outcome);
 }

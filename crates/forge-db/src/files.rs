@@ -752,6 +752,29 @@ impl Db {
         })
     }
 
+    /// Folders to re-list after a relink: `root` itself and every folder that holds a row
+    /// below it. Re-listing refreshes the `present` flags that [`Db::relink`] leaves alone.
+    pub fn folders_under(&self, root: &Path) -> Result<Vec<PathBuf>> {
+        let root_s = normalize_dir(&path_str(root));
+        let (lo, hi) = subtree_bounds(&root_s);
+        self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT DISTINCT parent_path FROM files
+                 WHERE path = ?1 OR (path >= ?2 AND path < ?3)",
+            )?;
+            let mut dirs = st
+                .query_map(params![root_s, lo, hi], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>();
+            dirs.push(PathBuf::from(&root_s));
+            dirs.sort();
+            dirs.dedup();
+            Ok(dirs)
+        })
+    }
+
     /// Store content hashes computed elsewhere (hex strings).
     pub fn set_hashes(&self, id: FileId, partial: Option<&str>, full: Option<&str>) -> Result<()> {
         self.with_conn(|c| {
@@ -1083,6 +1106,27 @@ mod tests {
             mtime: Some(mtime),
             ctime: None,
         }
+    }
+
+    #[test]
+    fn folders_under_lists_each_folder_below_the_root_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_files(&[
+            nf(r"C:\shoot\a.jpg", 1, 1),
+            nf(r"C:\shoot\day1\b.jpg", 1, 1),
+            nf(r"C:\shoot\day2\deep\c.jpg", 1, 1),
+            nf(r"C:\shoot\day2\deep\d.jpg", 1, 1),
+            nf(r"C:\other\e.jpg", 1, 1),
+        ])
+        .unwrap();
+        assert_eq!(
+            db.folders_under(Path::new(r"C:\shoot")).unwrap(),
+            [
+                PathBuf::from(r"C:\shoot"),
+                PathBuf::from(r"C:\shoot\day1"),
+                PathBuf::from(r"C:\shoot\day2\deep"),
+            ]
+        );
     }
 
     fn plan(db: &Db, sql: &str) -> String {

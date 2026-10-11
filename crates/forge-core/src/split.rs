@@ -5,6 +5,8 @@
 //! Joining streams into a temporary file and publishes it only after both the
 //! per-part and whole-file BLAKE3 hashes have been checked.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -21,6 +23,46 @@ const IO_CHUNK: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_PARTS: usize = 1_000_000;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+type AfterSplitPublishHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_SPLIT_PUBLISH: RefCell<Option<AfterSplitPublishHook>> = RefCell::new(None);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishedState {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl PublishedState {
+    fn capture(path: &Path) -> io::Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !is_regular_non_reparse(&metadata) {
+            return Err(io::Error::other("published output is not a regular file"));
+        }
+        Ok(Self {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    fn still_matches(self, path: &Path) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            is_regular_non_reparse(&metadata)
+                && metadata.len() == self.size
+                && metadata.modified().ok() == self.modified
+        })
+    }
+}
+
+struct CommittedOutput {
+    path: PathBuf,
+    state: PublishedState,
+}
 
 /// A part entry in a `.b3split` manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +152,7 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
     ctx.progress.add_total_items(part_count as u64 + 1);
     ctx.progress.add_total_bytes(source_size);
     let mut source_file = source_file;
-    let mut committed = Vec::<PathBuf>::with_capacity(part_count + 1);
+    let mut committed = Vec::<CommittedOutput>::with_capacity(part_count + 1);
     let operation = (|| {
         let mut parts = Vec::with_capacity(part_count);
         let mut whole = blake3::Hasher::new();
@@ -149,9 +191,20 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
                 .sync_all()
                 .map_err(|e| CoreError::io(&temp_path, e))?;
             drop(output);
+            let published_state =
+                PublishedState::capture(&temp_path).map_err(|e| CoreError::io(&temp_path, e))?;
             publish_temp(&temp_path, dest)?;
             guard.disarm();
-            committed.push(dest.clone());
+            committed.push(CommittedOutput {
+                path: dest.clone(),
+                state: published_state,
+            });
+            #[cfg(test)]
+            AFTER_SPLIT_PUBLISH.with(|hook| {
+                if let Some(f) = &*hook.borrow() {
+                    f(dest);
+                }
+            });
             parts.push(SplitPart {
                 name: dest.file_name().unwrap().to_string_lossy().into_owned(),
                 size: part_written,
@@ -188,9 +241,20 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
             .map_err(|e| CoreError::io(&temp_path, e))?;
         drop(output);
         ctx.cancel.check()?;
+        let published_state =
+            PublishedState::capture(&temp_path).map_err(|e| CoreError::io(&temp_path, e))?;
         publish_temp(&temp_path, &manifest_path)?;
         guard.disarm();
-        committed.push(manifest_path.clone());
+        committed.push(CommittedOutput {
+            path: manifest_path.clone(),
+            state: published_state,
+        });
+        #[cfg(test)]
+        AFTER_SPLIT_PUBLISH.with(|hook| {
+            if let Some(f) = &*hook.borrow() {
+                f(&manifest_path);
+            }
+        });
         ctx.progress.add_items(1);
         ctx.progress.set_current("Split complete");
         Ok(SplitReport {
@@ -200,12 +264,35 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
         })
     })();
 
-    if operation.is_err() {
-        for path in committed.iter().rev() {
-            let _ = fs::remove_file(path);
+    match operation {
+        Err(operation_error) => {
+            let mut rollback_issues = Vec::new();
+            for output in committed.iter().rev() {
+                if !output.state.still_matches(&output.path) {
+                    rollback_issues.push(format!(
+                        "rollback left changed published output {} in place",
+                        output.path.display()
+                    ));
+                    continue;
+                }
+                if let Err(error) = fs::remove_file(&output.path) {
+                    rollback_issues.push(format!(
+                        "rollback could not remove published output {}: {error}",
+                        output.path.display()
+                    ));
+                }
+            }
+            if rollback_issues.is_empty() {
+                Err(operation_error)
+            } else {
+                Err(CoreError::Invalid(format!(
+                    "{operation_error}; {}",
+                    rollback_issues.join("; ")
+                )))
+            }
         }
+        Ok(report) => Ok(report),
     }
-    operation
 }
 
 /// Join a `.b3split` manifest or its first `.001` part.
@@ -699,6 +786,39 @@ mod tests {
         let joined = run_join(&report.manifest).unwrap();
         assert_eq!(joined.output, input);
         assert_eq!(fs::read(input).unwrap(), bytes);
+    }
+
+    #[test]
+    fn rollback_leaves_a_replaced_published_part_in_place() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("rollback.bin");
+        fs::write(&input, b"first partsecond part").unwrap();
+        let cancel = CancelToken::new();
+        let cancel_hook = cancel.clone();
+        let progress = Progress::default();
+        let published = input.with_file_name("rollback.bin.001");
+        let replacement = b"replacement saved after publish".to_vec();
+        let hook_replacement = replacement.clone();
+        AFTER_SPLIT_PUBLISH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path.extension().is_some_and(|extension| extension == "001") {
+                    fs::write(path, &hook_replacement).unwrap();
+                    cancel_hook.cancel();
+                }
+            }))
+        });
+
+        let result = split_file(&input, 11, &ctx(&cancel, &progress));
+        AFTER_SPLIT_PUBLISH.with(|hook| *hook.borrow_mut() = None);
+
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("rollback left changed published output"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&published).unwrap(), replacement);
+        assert!(!input.with_file_name("rollback.bin.002").exists());
+        assert!(!input.with_file_name("rollback.bin.b3split").exists());
     }
 
     #[test]

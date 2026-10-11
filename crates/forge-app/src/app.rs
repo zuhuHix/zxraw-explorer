@@ -73,13 +73,75 @@ pub struct ZxrawApp {
     pub ops: crate::actions::Actions,
     pub testhook: crate::testhook::TestHook,
     pub viewer: Option<crate::viewer::Viewer>,
+    pub notices: crate::notices::Notices,
     applied_theme: Option<(bool, f32)>,
     type_ahead: (String, Instant),
     last_session_save: Instant,
+    selection_summary: SelectionSummary,
+}
+
+/// The status bar's "N selected (size)". Walking every listed entry each frame cost
+/// ~200 ms per frame in a 50,000-entry folder (debug build) while anything was selected,
+/// so the visible entries are indexed once per listing revision and a selection change
+/// costs time proportional to the selection, not the folder.
+#[derive(Default)]
+struct SelectionSummary {
+    listing: Option<u64>,
+    /// Visible entry path → size.
+    index: std::collections::HashMap<PathBuf, u64>,
+    selection: Option<(usize, u64)>,
+    count: usize,
+    size: u64,
+}
+
+impl SelectionSummary {
+    fn get(&mut self, p: &crate::pane::Pane) -> (usize, u64) {
+        let listing = p.listing_rev();
+        if self.listing != Some(listing) {
+            self.index = p
+                .visible
+                .iter()
+                .map(|&i| (p.entries[i].path.clone(), p.entries[i].size))
+                .collect();
+            self.listing = Some(listing);
+            self.selection = None;
+        }
+        // Fingerprint the selection by its length and its first 64 paths in the set's own
+        // iteration order: the whole content for small selections (selecting another single
+        // file keeps the length), and for large ones a same-size swap to different files
+        // almost surely changes which paths come first. At most 64 hashes per frame.
+        let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let fingerprint = p
+            .selected
+            .iter()
+            .take(64)
+            .enumerate()
+            .fold(0u64, |acc, (i, path)| {
+                acc.rotate_left(7) ^ std::hash::BuildHasher::hash_one(&hasher, (i, path))
+            });
+        let selection = (p.selected.len(), fingerprint);
+        if self.selection != Some(selection) {
+            let mut count = 0;
+            let mut size = 0;
+            for path in &p.selected {
+                if let Some(&bytes) = self.index.get(path) {
+                    count += 1;
+                    size += bytes;
+                }
+            }
+            (self.count, self.size) = (count, size);
+            self.selection = Some(selection);
+        }
+        (self.count, self.size)
+    }
 }
 
 impl ZxrawApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        paths: Paths,
+        pending_crash: Option<PathBuf>,
+    ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
         let settings: Settings = settings::load_json(&paths.config.join("settings.json"));
         let session: Session = settings::load_json(&paths.config.join("session.json"));
@@ -98,10 +160,22 @@ impl ZxrawApp {
             applied_theme: None,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
+            selection_summary: SelectionSummary::default(),
             testhook: crate::testhook::TestHook::from_env(),
             viewer: None,
+            notices: Default::default(),
             settings,
         };
+        app.notices = crate::notices::Notices::new(
+            &app.paths.config,
+            pending_crash,
+            app.testhook.active(),
+        );
+        if app.testhook.active() {
+            // Automated runs never show native dialogs or touch the real Recycle Bin.
+            crate::dialogs::set_automated();
+            forge_win::set_recycle_sandbox(Some(app.paths.data.join("recycle-sandbox")));
+        }
         app.restore_session(session);
         // `forge.exe <folder>` opens that folder in a new tab.
         if let Some(arg) = std::env::args_os().nth(1) {
@@ -130,6 +204,18 @@ impl ZxrawApp {
             .unwrap_or_else(|| PathBuf::from(r"C:\"))
     }
 
+    /// Folder for a new window without a restored session. Automated runs start in an
+    /// empty folder inside their profile so they never list the user's real home folder.
+    fn start_folder(&self) -> PathBuf {
+        if self.testhook.active() {
+            let dir = self.paths.data.join("start");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                return dir;
+            }
+        }
+        Self::home()
+    }
+
     fn new_pane(&self, path: PathBuf, view: ViewMode) -> Pane {
         let mut p = Pane::new(path, self.settings.default_sort, view);
         p.show_hidden = self.settings.show_hidden;
@@ -140,7 +226,8 @@ impl ZxrawApp {
     fn restore_session(&mut self, s: Session) {
         for t in &s.tabs {
             // Restore folders that still exist; fall back to home for vanished/offline ones.
-            let pick = |p: &PathBuf| if p.is_dir() { p.clone() } else { Self::home() };
+            let home = self.start_folder();
+            let pick = |p: &PathBuf| if p.is_dir() { p.clone() } else { home.clone() };
             let left = self.new_pane(pick(&t.left), t.view);
             let right = t.right.as_ref().map(|r| self.new_pane(pick(r), t.view));
             self.tabs.push(Tab {
@@ -150,7 +237,7 @@ impl ZxrawApp {
             });
         }
         if self.tabs.is_empty() {
-            let left = self.new_pane(Self::home(), self.settings.default_view);
+            let left = self.new_pane(self.start_folder(), self.settings.default_view);
             self.tabs.push(Tab {
                 left,
                 right: None,
@@ -203,16 +290,33 @@ impl ZxrawApp {
         self.tab_mut().focused_mut()
     }
 
+    /// Number of selected entries the focused pane still lists, from the same cache as the
+    /// status bar: cheap enough to call every frame, even in a 50,000-entry folder.
+    pub(crate) fn selected_listed_count(&mut self) -> usize {
+        let mut summary = std::mem::take(&mut self.selection_summary);
+        let count = if self.pane().selected.is_empty() {
+            0
+        } else {
+            summary.get(self.pane()).0
+        };
+        self.selection_summary = summary;
+        count
+    }
+
     pub fn toast(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.testhook.record_toast(&text, false);
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             error: false,
             until: Instant::now() + Duration::from_secs(4),
         });
     }
     pub fn toast_err(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.testhook.record_toast(&text, true);
         self.toasts.push(Toast {
-            text: text.into(),
+            text,
             error: true,
             until: Instant::now() + Duration::from_secs(8),
         });
@@ -235,6 +339,8 @@ impl ZxrawApp {
     }
 
     pub fn refresh_all_showing(&mut self, dir: &Path) {
+        // Exports may have appeared or gone; their associations are re-scanned on demand.
+        crate::export_assoc::invalidate_cache();
         for t in &mut self.tabs {
             if t.left.path == dir {
                 t.left.refresh();
@@ -640,18 +746,23 @@ impl ZxrawApp {
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
+        let mut summary = std::mem::take(&mut self.selection_summary);
         ui.horizontal(|ui| {
             let p = self.pane();
             let n = p.visible.len();
             let total = p.entries.len();
-            let sel = p.selected.len();
             let mut s = if n == total {
                 format!("{n} items")
             } else {
                 format!("{n} of {total} items")
             };
-            if sel > 0 {
-                s += &format!("   ·   {sel} selected ({})", format_size(p.total_selected_size()));
+            // Count only selected entries that are still listed: a move or an outside
+            // change can leave names in the selection set that are no longer there.
+            if !p.selected.is_empty() {
+                let (sel, size) = summary.get(p);
+                if sel > 0 {
+                    s += &format!("   ·   {sel} selected ({})", format_size(size));
+                }
             }
             ui.label(s);
             match &p.load {
@@ -674,6 +785,7 @@ impl ZxrawApp {
                 crate::actions::status_widgets(self, ui);
             });
         });
+        self.selection_summary = summary;
     }
 
     fn pane_ui(&mut self, ui: &mut Ui, side: Side) {
@@ -742,6 +854,10 @@ impl ZxrawApp {
 }
 
 impl eframe::App for ZxrawApp {
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        crate::testhook::raw_input(self, raw_input);
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut changed = false;
         for t in &mut self.tabs {
@@ -780,9 +896,13 @@ impl eframe::App for ZxrawApp {
         }
 
         self.handle_keys(&ctx);
+        crate::dragout::tick(self, &ctx);
 
         if crate::viewer_host::show(self, ui) {
             crate::actions::modals(self, ui);
+            // The palette must be drawn here too: an open palette blocks the viewer's keys,
+            // so if it were not shown it could never be closed.
+            self.palette_ui(&ctx);
             self.toasts_ui(&ctx);
             crate::testhook::tick(self, &ctx);
             return;
@@ -834,13 +954,8 @@ impl eframe::App for ZxrawApp {
         });
 
         crate::actions::modals(self, ui);
-        if let Some(mut pal) = self.palette.take() {
-            if let Some(cmd) = pal.show(&ctx) {
-                self.run(cmd, &ctx);
-            } else if pal.open {
-                self.palette = Some(pal);
-            }
-        }
+        crate::notices::show(self, &ctx);
+        self.palette_ui(&ctx);
         self.toasts_ui(&ctx);
         crate::testhook::tick(self, &ctx);
     }
@@ -856,6 +971,16 @@ impl eframe::App for ZxrawApp {
 }
 
 impl ZxrawApp {
+    fn palette_ui(&mut self, ctx: &egui::Context) {
+        if let Some(mut pal) = self.palette.take() {
+            if let Some(cmd) = pal.show(ctx) {
+                self.run(cmd, ctx);
+            } else if pal.open {
+                self.palette = Some(pal);
+            }
+        }
+    }
+
     fn toasts_ui(&mut self, ctx: &egui::Context) {
         self.toasts.retain(|t| t.until > Instant::now());
         if self.toasts.is_empty() {
@@ -975,5 +1100,87 @@ mod key_tests {
                 assert!(seen.insert((sc.logical_key, sc.modifiers.shift, sc.modifiers.alt, sc.modifiers.command)), "duplicate shortcut for {c:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod selection_summary_tests {
+    use super::*;
+    use forge_core::listing::SortSpec;
+    use forge_core::model::{EntryKind, FileEntry};
+
+    fn file(dir: &Path, name: &str, size: u64) -> FileEntry {
+        FileEntry {
+            path: dir.join(name),
+            name: name.into(),
+            kind: EntryKind::File,
+            size,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            ext: "txt".into(),
+        }
+    }
+
+    fn pane(names: &[(&str, u64)]) -> Pane {
+        let dir = Path::new(r"C:\fixture");
+        let mut p = Pane::new(dir.to_path_buf(), SortSpec::default(), ViewMode::Details);
+        p.entries = names.iter().map(|(n, s)| file(dir, n, *s)).collect();
+        p.load = LoadState::Ready { errors: 0 };
+        p.rebuild_visible();
+        p
+    }
+
+    #[test]
+    fn counts_only_selected_entries_that_are_still_listed() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20)]);
+        p.selected.insert(p.path.join("a.txt"));
+        p.selected.insert(p.path.join("gone.txt"));
+        let mut summary = SelectionSummary::default();
+        assert_eq!(summary.get(&p), (1, 10));
+    }
+
+    #[test]
+    fn follows_selection_changes_of_the_same_length_and_listing_changes() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20)]);
+        let mut summary = SelectionSummary::default();
+        p.selected.insert(p.path.join("a.txt"));
+        assert_eq!(summary.get(&p), (1, 10));
+        // Another single file: same selection length, different content.
+        p.selected.clear();
+        p.selected.insert(p.path.join("b.txt"));
+        assert_eq!(summary.get(&p), (1, 20));
+        // The selected file disappears from the listing.
+        p.entries.retain(|e| e.name != "b.txt");
+        p.rebuild_visible();
+        assert_eq!(summary.get(&p), (0, 0));
+    }
+
+    #[test]
+    fn a_same_size_swap_of_a_large_selection_is_noticed() {
+        let names: Vec<(String, u64)> = (0..600).map(|i| (format!("f{i:03}.txt"), i)).collect();
+        let refs: Vec<(&str, u64)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let mut p = pane(&refs);
+        let mut summary = SelectionSummary::default();
+        p.selected = (0..300).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        let first = summary.get(&p);
+        p.selected = (300..600).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        let second = summary.get(&p);
+        assert_eq!(first, (300, (0..300).sum()));
+        assert_eq!(second, (300, (300..600).sum()));
+    }
+
+    #[test]
+    fn sorting_in_place_keeps_sizes_attached_to_their_files() {
+        let mut p = pane(&[("a.txt", 10), ("b.txt", 20), ("c.txt", 30)]);
+        let mut summary = SelectionSummary::default();
+        p.selected.insert(p.path.join("c.txt"));
+        assert_eq!(summary.get(&p), (1, 30));
+        p.entries.reverse();
+        p.rebuild_visible();
+        p.selected.insert(p.path.join("a.txt"));
+        assert_eq!(summary.get(&p), (2, 40));
     }
 }

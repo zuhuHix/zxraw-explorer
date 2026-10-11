@@ -221,6 +221,24 @@ impl Viewer {
         self.cur
     }
 
+    /// Whether the current item has a decoded preview or a reported decode failure.
+    #[allow(dead_code)] // Used by the script hook only; the standalone demo does not run it.
+    pub fn current_decode_complete(&self) -> bool {
+        !self.items.is_empty()
+            && (self.current_decode_error().is_some()
+                || self.loader.has_level(self.cur, Level::Quick)
+                || self.loader.has_level(self.cur, Level::Screen))
+    }
+
+    /// Decode error currently shown in the empty canvas for the current item.
+    #[allow(dead_code)] // Used by the script hook only; the standalone demo does not run it.
+    pub fn current_decode_error(&self) -> Option<String> {
+        self.loader
+            .error((self.cur, Level::Screen))
+            .or_else(|| self.loader.error((self.cur, Level::Quick)))
+            .map(ToString::to_string)
+    }
+
     /// Prevents viewer keyboard and pointer controls from acting behind an app modal.
     #[allow(dead_code)] // Host API; the standalone demo has no app modals.
     pub fn set_input_blocked(&mut self, blocked: bool) {

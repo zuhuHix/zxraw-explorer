@@ -14,6 +14,8 @@
 //!
 //! 7z/RAR/TAR are not supported (documented limitation).
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -33,6 +35,14 @@ use crate::ops::{
 use crate::paths;
 
 const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 100_000;
+
+#[cfg(test)]
+type BeforeParentCreateHook = Box<dyn Fn(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_PARENT_CREATE: RefCell<Option<BeforeParentCreateHook>> = RefCell::new(None);
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveEntry {
@@ -363,6 +373,12 @@ fn extract_zip_filtered(
             ..Default::default()
         };
         let label = PathBuf::from(&p.name);
+        // ZIP data can take a while to stream. Recheck every parent immediately before
+        // write_stream_placed creates its temp file beneath them.
+        if let Err(e) = ensure_dirs_no_links(dest_dir, parent_rel) {
+            report.failed.push(OpIssue::new(&dest, e.to_string()));
+            continue;
+        }
         match ops::write_stream_placed(&mut f, &label, &dest, sopts, keep_both, ctx) {
             Ok((out, placed)) => {
                 remaining = remaining.saturating_sub(out.bytes);
@@ -381,33 +397,64 @@ fn extract_zip_filtered(
 
 /// Create `base/rel` one component at a time, refusing to pass through links or files.
 fn ensure_dirs_no_links(base: &Path, rel: &Path) -> Result<()> {
+    verify_real_directory(base)?;
     let mut cur = base.to_path_buf();
     for c in rel.components() {
         cur.push(c);
         match fs::symlink_metadata(&cur) {
-            Ok(md) => match node_kind(&md) {
-                NodeKind::Dir => {}
-                NodeKind::Link => {
-                    return Err(CoreError::UnsafePath(format!(
-                        "{} is a link; refusing to extract through it",
-                        cur.display()
-                    )));
+            Ok(_) => verify_real_directory(&cur)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                #[cfg(test)]
+                BEFORE_PARENT_CREATE.with(|hook| {
+                    if let Some(f) = &*hook.borrow() {
+                        f(&cur);
+                    }
+                });
+                match fs::create_dir(&cur) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(CoreError::io(&cur, error)),
                 }
-                NodeKind::File => {
-                    return Err(CoreError::Invalid(format!(
-                        "{} exists and is not a folder",
-                        cur.display()
-                    )));
-                }
-            },
-            Err(_) => match fs::create_dir(&cur) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(CoreError::io(&cur, e)),
-            },
+                // `AlreadyExists` may mean that a link or junction won the race.
+                verify_real_directory(&cur)?;
+            }
+            Err(error) => return Err(CoreError::io(&cur, error)),
         }
     }
     Ok(())
+}
+
+fn verify_real_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| CoreError::io(path, error))?;
+    if metadata.is_dir() && !is_link_or_reparse(&metadata) {
+        Ok(())
+    } else if is_link_or_reparse(&metadata) {
+        Err(CoreError::UnsafePath(format!(
+            "{} is a link; refusing to extract through it",
+            path.display()
+        )))
+    } else {
+        Err(CoreError::Invalid(format!(
+            "{} exists and is not a folder",
+            path.display()
+        )))
+    }
+}
+
+fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +614,10 @@ pub fn create_zip(sources: &[PathBuf], out: &Path, ctx: &JobCtx<'_>) -> Result<Z
 mod tests {
     use super::*;
     use forge_jobs::{CancelToken, Progress};
+    #[cfg(windows)]
+    use std::sync::Arc;
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn ctx_parts() -> (CancelToken, Progress) {
         (CancelToken::new(), Progress::default())
@@ -677,6 +728,63 @@ mod tests {
         assert!(matches!(error, CoreError::UnsafePath(_)));
         assert_eq!(fs::read_dir(&malicious_dest).unwrap().count(), 0);
         assert!(!d.path().join("escape.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn extraction_rejects_a_junction_created_during_parent_creation() {
+        let d = tempfile::tempdir().unwrap();
+        let archive = d.path().join("race.zip");
+        raw_zip(&archive, &[("parent/escaped.txt", b"must stay inside")]);
+        let dest = d.path().join("extract");
+        let outside = d.path().join("outside");
+        fs::create_dir(&dest).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let junction = dest.join("parent");
+        let created = Arc::new(AtomicBool::new(false));
+        let created_hook = Arc::clone(&created);
+        let hook_junction = junction.clone();
+        let hook_target = outside.clone();
+        BEFORE_PARENT_CREATE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path| {
+                if path == hook_junction.as_path() && !created_hook.load(Ordering::SeqCst) {
+                    let made = std::process::Command::new("cmd")
+                        .args(["/C", "mklink", "/J"])
+                        .arg(&hook_junction)
+                        .arg(&hook_target)
+                        .output()
+                        .is_ok_and(|output| output.status.success());
+                    created_hook.store(made, Ordering::SeqCst);
+                }
+            }))
+        });
+        let (cancel, progress) = ctx_parts();
+
+        let report = extract_zip(
+            &archive,
+            &dest,
+            &ExtractOptions::default(),
+            &JobCtx::new(&cancel, &progress),
+        )
+        .unwrap();
+        BEFORE_PARENT_CREATE.with(|hook| *hook.borrow_mut() = None);
+
+        if !created.load(Ordering::SeqCst) {
+            eprintln!("mklink unavailable; skipping junction race assertion");
+            return;
+        }
+        assert!(report.extracted.is_empty(), "{report:?}");
+        assert!(
+            report
+                .failed
+                .iter()
+                .any(|issue| issue.reason.contains("link")),
+            "{report:?}"
+        );
+        assert!(
+            !outside.join("escaped.txt").exists(),
+            "archive data must not be written through a junction"
+        );
     }
 
     #[test]

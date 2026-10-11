@@ -14,6 +14,7 @@ pub mod compare;
 pub mod disk_usage;
 pub mod duplicates;
 pub mod error;
+pub mod fault;
 pub mod hashing;
 pub mod ingest;
 pub mod listing;

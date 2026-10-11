@@ -10,6 +10,9 @@ use crate::error::{DbError, Result};
 use crate::files::FileId;
 use crate::{Db, now_ms};
 
+/// Maximum accepted tag length in Unicode characters.
+pub const MAX_TAG_NAME_CHARS: usize = 256;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Annotation {
     pub rating: u8,
@@ -65,16 +68,8 @@ impl Db {
         {
             return Err(DbError::Invalid(format!("rating {r} is out of range 0-5")));
         }
-        let add: Vec<String> = change
-            .add_tags
-            .iter()
-            .filter_map(|t| clean_tag(t))
-            .collect();
-        let remove: Vec<String> = change
-            .remove_tags
-            .iter()
-            .filter_map(|t| clean_tag(t))
-            .collect();
+        let add = validated_tags(&change.add_tags)?;
+        let remove = validated_tags(&change.remove_tags)?;
         let touches_row = change.rating.is_some()
             || change.label.is_some()
             || change.pick.is_some()
@@ -243,6 +238,11 @@ impl Db {
     /// Rename a tag; if `new` already exists the two tags are merged.
     pub fn rename_tag(&self, old: &str, new: &str) -> Result<()> {
         let new = clean_tag(new).ok_or_else(|| DbError::Invalid("tag name is empty".into()))?;
+        if new.chars().count() > MAX_TAG_NAME_CHARS {
+            return Err(DbError::Invalid(format!(
+                "tag name exceeds {MAX_TAG_NAME_CHARS} characters"
+            )));
+        }
         self.with_tx(|tx| {
             let Some(old_id) = tag_id_tx(tx, old, false)? else {
                 return Err(DbError::NotFound(format!("tag '{old}'")));
@@ -274,6 +274,21 @@ impl Db {
             )? > 0)
         })
     }
+}
+
+fn validated_tags(tags: &[String]) -> Result<Vec<String>> {
+    tags.iter()
+        .filter_map(|tag| clean_tag(tag))
+        .map(|tag| {
+            if tag.chars().count() > MAX_TAG_NAME_CHARS {
+                Err(DbError::Invalid(format!(
+                    "tag name exceeds {MAX_TAG_NAME_CHARS} characters"
+                )))
+            } else {
+                Ok(tag)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

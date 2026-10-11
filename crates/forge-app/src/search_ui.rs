@@ -19,6 +19,9 @@ const EXAMPLES: &[&str] = &[
 ];
 
 pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
+    // Runs every frame until the library is open, then once: picks up index passes that an
+    // earlier run left unfinished. It starts background jobs and never blocks.
+    crate::library::resume_on_start(app, ctx);
     if !app.ops.library.search.open {
         return;
     }
@@ -135,14 +138,14 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     if let Some(p) = navigate {
         app.navigate(p);
     }
-    if let Some(root) = index_now {
-        if let Some(db) = app.ops.library.db.clone() {
-            let tx = app.ops.tx.clone();
-            let c = ctx.clone();
-            crate::library::start_index_job(&app.ops.jobs, db, root, move |m| {
-                let _ = tx.send(crate::actions::Event::Toast(m));
-                c.request_repaint();
-            });
-        }
+    if let Some(root) = index_now
+        && let Some(db) = app.ops.library.db.clone()
+    {
+        let tx = app.ops.tx.clone();
+        let c = ctx.clone();
+        crate::library::start_index_job(&app.ops.jobs, db, root, move |m| {
+            let _ = tx.send(crate::actions::Event::Toast(m));
+            c.request_repaint();
+        });
     }
 }

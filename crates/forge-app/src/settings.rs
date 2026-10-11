@@ -54,6 +54,11 @@ pub struct Settings {
     pub index_exclusions: Vec<String>,
     /// Mirror ratings, labels and keywords into `.xmp` sidecars next to the photos.
     pub xmp_sidecar_sync: bool,
+    /// URL opened by "Open in maps"; `{lat}` and `{lon}` are replaced. Never fetched by
+    /// the app itself: the link is handed to the default browser on an explicit click.
+    pub map_url_template: String,
+    /// Filename rules associating exports with their originals (see `export_assoc`).
+    pub export_rules: Vec<String>,
 }
 
 impl Default for Settings {
@@ -76,6 +81,8 @@ impl Default for Settings {
             index_roots: Vec::new(),
             index_exclusions: vec!["$RECYCLE.BIN".into(), "System Volume Information".into()],
             xmp_sidecar_sync: false,
+            map_url_template: "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}".into(),
+            export_rules: crate::export_assoc::default_rules(),
         }
     }
 }

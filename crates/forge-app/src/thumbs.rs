@@ -34,6 +34,7 @@ pub struct ThumbManager {
     pending: HashSet<Key>,
     failed: HashSet<Key>,
     ready: Vec<(Key, Arc<ThumbImage>)>,
+    error_texture: Option<egui::TextureHandle>,
     generation: u64,
     context_key: Vec<PathBuf>,
     pub annotations: HashMap<PathBuf, Annotation>,
@@ -55,6 +56,7 @@ impl ThumbManager {
             pending: HashSet::new(),
             failed: HashSet::new(),
             ready: Vec::new(),
+            error_texture: None,
             generation: 1,
             context_key: Vec::new(),
             annotations: HashMap::new(),
@@ -76,6 +78,10 @@ impl ThumbManager {
         }
         let mut changed = false;
         while let Ok(r) = self.service.results().try_recv() {
+            // Work for folders the user has left can finish before it is cancelled: drop it.
+            if !is_current_result(self.generation, r.generation) {
+                continue;
+            }
             let key = (r.path, r.size);
             self.pending.remove(&key);
             match r.image {
@@ -130,6 +136,37 @@ impl ThumbManager {
         !self.pending.is_empty() || !self.ready.is_empty()
     }
 
+    /// Thumbnail requests still queued, running, or waiting for a texture upload.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len() + self.ready.len()
+    }
+
+    /// No thumbnail work or completed result remains to be applied.
+    pub fn is_idle(&self) -> bool {
+        self.pending.is_empty()
+            && self.ready.is_empty()
+            && self.service.results().is_empty()
+            && self.service.is_idle()
+    }
+
+    /// Whether any requested size for `path` failed to decode.
+    pub fn failed_path(&self, path: &Path) -> bool {
+        self.failed.iter().any(|(failed, _)| failed == path)
+    }
+
+    fn error_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(texture) = &self.error_texture {
+            return texture.clone();
+        }
+        let texture = ctx.load_texture(
+            "thumb-error-placeholder",
+            error_placeholder_image(),
+            egui::TextureOptions::NEAREST,
+        );
+        self.error_texture = Some(texture.clone());
+        texture
+    }
+
     /// Forget failures (e.g. after installing ffmpeg) and textures for a folder that changed.
     pub fn invalidate_dir(&mut self, dir: &Path) {
         self.failed.retain(|(p, _)| p.parent() != Some(dir));
@@ -166,7 +203,7 @@ impl ThumbProvider for ThumbManager {
             return Some(t.clone());
         }
         if self.failed.contains(&key) {
-            return None;
+            return Some(self.error_texture(ui.ctx()));
         }
         // Fall back to any other bucket already on the GPU while the right one loads.
         let fallback = BUCKETS
@@ -200,9 +237,48 @@ impl ThumbProvider for ThumbManager {
     }
 }
 
+/// A result is applied only when it was requested for the current folder set.
+fn is_current_result(current: u64, result: u64) -> bool {
+    result >= current
+}
+
+fn error_placeholder_image() -> egui::ColorImage {
+    const WIDTH: usize = 96;
+    const HEIGHT: usize = 72;
+    let background = egui::Color32::from_rgb(40, 43, 51);
+    let border = egui::Color32::from_rgb(155, 75, 79);
+    let mark = egui::Color32::from_rgb(238, 111, 111);
+    let mut image = egui::ColorImage::filled([WIDTH, HEIGHT], background);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            if !(2..WIDTH - 2).contains(&x) || !(2..HEIGHT - 2).contains(&y) {
+                image.pixels[y * WIDTH + x] = border;
+            }
+        }
+    }
+    for y in 22..47 {
+        for x in 45..51 {
+            image.pixels[y * WIDTH + x] = mark;
+        }
+    }
+    for y in 53..59 {
+        for x in 45..51 {
+            image.pixels[y * WIDTH + x] = mark;
+        }
+    }
+    image
+}
+
 #[cfg(test)]
 mod tests {
-    use super::bucket_for;
+    use super::{bucket_for, error_placeholder_image, is_current_result};
+
+    #[test]
+    fn only_results_for_the_current_folder_set_are_applied() {
+        assert!(is_current_result(3, 3));
+        assert!(is_current_result(3, 4));
+        assert!(!is_current_result(3, 2));
+    }
 
     #[test]
     fn buckets() {
@@ -210,5 +286,20 @@ mod tests {
         assert_eq!(bucket_for(128), 128);
         assert_eq!(bucket_for(200), 256);
         assert_eq!(bucket_for(5000), 512);
+    }
+
+    #[test]
+    fn error_placeholder_is_a_bounded_visible_card() {
+        let image = error_placeholder_image();
+        assert_eq!(image.size, [96, 72]);
+        assert_eq!(image.pixels[0], egui::Color32::from_rgb(155, 75, 79));
+        assert_eq!(
+            image.pixels[30 * 96 + 48],
+            egui::Color32::from_rgb(238, 111, 111)
+        );
+        assert_eq!(
+            image.pixels[30 * 96 + 20],
+            egui::Color32::from_rgb(40, 43, 51)
+        );
     }
 }

@@ -42,7 +42,7 @@ is based on those suites.
 
 ## UI automation hook
 
-`forge-app/src/testhook.rs` reads three environment variables:
+`forge-app/src/testhook/mod.rs` reads these environment variables (script mode is described under [End-to-end tests](#end-to-end-tests)):
 
 * `ZXRAW_CMDS` is a comma-separated list of `Cmd` debug names, for example
   `ViewGrid,ToggleDualPane` or `ViewDetails` (see `crates/forge-app/src/commands.rs`).
@@ -77,7 +77,7 @@ if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 
 Without `ZXRAW_PROFILE_DIR`, automation uses a unique throwaway profile for this process,
 so the screenshot does not include the user's session-restore tabs. The screenshot hook is
-a smoke-test aid. It does not assert visual correctness or simulate mouse or keyboard input.
+a smoke-test aid and does not assert visual correctness. Script mode (below) injects real key and pointer input.
 
 ## Reproducible benchmark data and harness
 
@@ -186,27 +186,51 @@ after the commands, and a run closes itself after 120 s at most.
 
 ## End-to-end tests
 
-`crates/forge-app/tests/e2e.rs` drives the real `zxraw` window through `ZXRAW_SCRIPT` and asserts
-on the filesystem afterwards. Each test builds its own fixtures in a temp directory and uses a
-fresh profile (`ZXRAW_PROFILE_DIR`), so no user settings, session or library data is touched.
-The runner sets `ZXRAW_SCRIPT_SANDBOX` to that fixture root. If omitted, the script file's
-directory is the sandbox. Relative sandbox roots are resolved against the script directory.
-Every `navigate`, `assert-path`, `assert-exists`, `assert-missing`, and `screenshot` path
-must resolve inside the sandbox; paths through symlinks or junctions are checked against their
-canonical target. Script mode rejects Recycle Bin commands before dispatch because no test-only
-Recycle Bin backend is injected.
+`crates/forge-app/tests/e2e/` drives the real `zxraw` window through `ZXRAW_SCRIPT` and asserts on
+the filesystem and the app's own state afterwards. `main.rs` holds the runner and helpers; each
+other file is one area (`core`, `ingest`, `library`, `tools`, `viewer`, `perf`, `browser`, `media`,
+`related`, `system`). Each test builds its own fixtures in a temp directory and uses a fresh
+profile (`ZXRAW_PROFILE_DIR`), so no user settings, session, library data or Recycle Bin is
+touched.
 
 ```powershell
-$env:CARGO_TARGET_DIR = 'target/fixg'
+$env:CARGO_TARGET_DIR = 'target/fr-e2e'
+$env:CARGO_PROFILE_DEV_DEBUG = '0'   # each debug target is ~6 GB with debug info
 cargo test -p forge-app --test e2e -- --test-threads=1
+cargo test -p forge-app --test e2e -- --test-threads=1 tools::   # one area
 cargo test -p forge-app --bin zxraw
 ```
 
 Each run opens a real window, so run the tests one at a time (a static lock enforces this too).
-Every run must finish within 75 s; the script itself has a 60 s limit.
+A run must finish within 75 s (`RunOpts::limit` raises it); the script has its own limit, 60 s by
+default and changed with `limit <seconds>`.
+
+### Isolation and seams
+
+Automated runs (any of `ZXRAW_SCRIPT`, `ZXRAW_CMDS`, `ZXRAW_SELECT`, `ZXRAW_SCREENSHOT`) are fixed
+as automated at startup and then:
+
+* use a throwaway profile, and start in `<profile>/data/start` instead of the user's home folder;
+* answer native file dialogs from the script (`dialog <path>` / `dialog cancel`, queued before the
+  click that opens the dialog). An unexpected dialog fails the script instead of blocking;
+* send Recycle Bin operations to `<profile>/data/recycle-sandbox` (`forge_win::set_recycle_sandbox`).
+  Recycle commands in a script are refused unless that sandbox is active;
+* turn off egui animations so frame counts are deterministic;
+* skip the first-run welcome unless `ZXRAW_FIRST_RUN=1`.
+
+`ZXRAW_SCRIPT_SANDBOX` (set by the runner to the fixture root; default: the script's directory)
+confines every path a step names. Paths through symlinks or junctions are checked against their
+canonical target, and the `\?\` prefix is removed after the check. Screenshots may also go under
+`ZXRAW_SCREENSHOT_DIR` (the runner uses `%TEMP%\zxfr-shots\<area>`), so they survive the fixture.
+
+Fault injection (`forge-core/src/fault.rs`, armed only by `ui ingest` verbs) makes a source read
+fail with `ERROR_DEVICE_NOT_CONNECTED` after N bytes, or corrupts a copy before verification, to
+simulate a card pulled mid-copy.
+
+### Script steps
 
 A script is one step per line; `#` starts a comment. Steps run one per frame after all panes have
-loaded. Waiting steps give up after 30 s (`wait-jobs` takes its own limit).
+loaded. Waiting steps give up after 30 s unless given their own limit.
 
 | Step | Meaning |
 |---|---|
@@ -217,11 +241,43 @@ loaded. Waiting steps give up after 30 s (`wait-jobs` takes its own limit).
 | `type <text>` | Replace the text of the active Prompt dialog |
 | `accept` / `cancel` | Accept or dismiss the active dialog (batch rename included) |
 | `conflict keep-both\|skip\|replace\|replace-if-newer\|cancel [all]` | Answer the oldest file conflict |
-| `wait-jobs [seconds]` / `wait-frames <n>` | Wait for operations to finish, or for frames to pass |
+| `key [ctrl+][shift+][alt+]<Key>` | Send a real key press and release through egui input (`key 3`, `key ctrl+A`, `key ArrowRight`) |
+| `text <text>` | Send text input to the focused widget |
+| `pointer <x> <y>` / `click <x> <y>` / `scroll <dy>` | Move, click or scroll the real pointer |
+| `click-entry <name>` / `double-click-entry <name>` | Real pointer click(s) where the view drew that row or tile (points, so any display scale) |
+| `click-empty` | Real click on the file list below its last row or tile |
+| `assert-selected <n>` | Number of selected entries the focused pane lists |
+| `dialog <path>\|cancel` | Answer the next native file dialog |
+| `wait-jobs [seconds]` / `wait-frames <n>` / `sleep <ms>` | Wait for operations, frames or time |
+| `wait-exists\|wait-missing <path> [\| <seconds>]` | Wait for the filesystem |
+| `wait-entry\|wait-no-entry <name> [\| <seconds>]` | Wait for the focused pane's listing |
+| `limit <seconds>` | Raise the script limit (1–600) |
 | `screenshot <png>` | Save the rendered frame |
 | `assert-tabs <n>` / `assert-path <path>` | Check the tab count or the focused pane's folder |
 | `assert-exists <path>` / `assert-missing <path>` | Check the filesystem |
+| `assert-same <a> <b>` / `assert-contains <file> <text>` | Compare file contents |
+| `assert-entry\|assert-no-entry <name>` | Check the focused pane's listing |
+| `assert-toast <text>` / `assert-no-error-toast` | Check toasts raised during the run |
+| `assert-notice crash\|welcome\|none` / `dismiss-notices` | Startup notices |
+| `ui <area> <verb> …` | Area-specific steps, see below |
 | `exit` | Stop early (optional) |
+
+Area verbs live next to the code they drive, in `crates/forge-app/src/testhook/<area>.rs`:
+`viewer` (open, cull, decode and thumbnail state), `ingest` (card fixtures, fault injection,
+verification report), `library` (index, search, tags, collections, resume), `tools` (zip,
+split/join, duplicates, compare/sync, external filesystem changes), `perf` (frame timing),
+`browser`, `media`, `related` and `system`. Each file's `step` function documents its verbs.
+
+`ui perf begin` starts recording per-frame work time (from the raw-input hook to the end of the
+frame) and frame interval; `ui perf end <json>` writes count, mean, p50, p95, p99 and max for both.
+The report goes inside the sandbox or under `ZXRAW_SCREENSHOT_DIR`. The `perf::` e2e scenarios
+record a 50,000-file folder (details and grid scrolling, keyboard paging) and 5,000 burst photos
+(grouping analysis, grouped scrolling, a 1,000-file selection), and fail when p95 frame work
+exceeds 100 ms in a debug build. Release-build numbers are in [BENCHMARKS.md](BENCHMARKS.md).
+
+Prefer `click-entry` over `select` when a scenario is about what the user does: `select` sets the
+selection directly and would not have caught a widget layered over the rows (a double-click
+regression at 125 % display scaling was found by a user, not by the suite).
 
 The outcome goes to `ZXRAW_SCRIPT_RESULT` (default `<script>.result`): `OK`, or `SCRIPT ERROR: …` with
 exit code 2. Release builds use the Windows subsystem and have no console, so read the result file

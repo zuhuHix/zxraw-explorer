@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, unbounded};
@@ -17,7 +18,14 @@ const MIN_GAP_LARGE: Duration = Duration::from_secs(4);
 pub struct FolderWatcher {
     watcher: Option<RecommendedWatcher>,
     rx: Receiver<PathBuf>,
+    /// Directories shown by panes.
     watched: HashSet<PathBuf>,
+    /// Copy of `watched` for the notify thread, which probes the filesystem so the UI
+    /// thread never has to (an offline network path can block for seconds).
+    shown: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Directories registered with notify, including parents so a shown folder's
+    /// external deletion can be noticed.
+    registered: HashSet<PathBuf>,
     /// dir -> time of the most recent event
     pending: HashMap<PathBuf, Instant>,
     last_refresh: HashMap<PathBuf, Instant>,
@@ -28,6 +36,8 @@ impl FolderWatcher {
     pub fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = unbounded();
         let repaint = ctx.clone();
+        let shown = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+        let shown_by_notify = Arc::clone(&shown);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(ev) = res {
                 // Ignore pure access events; everything else may change the listing.
@@ -35,8 +45,25 @@ impl FolderWatcher {
                     return;
                 }
                 for p in ev.paths {
+                    let _ = tx.send(p.clone());
                     if let Some(parent) = p.parent() {
                         let _ = tx.send(parent.to_path_buf());
+                        // Windows may report a shown folder's deletion only as an event in
+                        // its parent. Probe the parent's shown children here, on notify's
+                        // thread, and report the ones that are gone.
+                        let gone: Vec<PathBuf> = shown_by_notify
+                            .lock()
+                            .map(|shown| {
+                                shown
+                                    .iter()
+                                    .filter(|dir| dir.parent() == Some(parent) || dir.parent() == Some(p.as_path()))
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for dir in gone.into_iter().filter(|dir| !dir.is_dir()) {
+                            let _ = tx.send(dir);
+                        }
                     }
                 }
                 repaint.request_repaint_after(DEBOUNCE);
@@ -48,6 +75,8 @@ impl FolderWatcher {
             watcher,
             rx,
             watched: HashSet::new(),
+            shown,
+            registered: HashSet::new(),
             pending: HashMap::new(),
             last_refresh: HashMap::new(),
             ctx,
@@ -60,18 +89,38 @@ impl FolderWatcher {
             return;
         };
         let want: HashSet<PathBuf> = dirs.iter().cloned().collect();
-        for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
+        let mut register = want.clone();
+        register.extend(
+            want.iter()
+                .filter_map(|dir| dir.parent().map(Path::to_path_buf)),
+        );
+        for gone in self
+            .registered
+            .difference(&register)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             let _ = w.unwatch(&gone);
-            self.watched.remove(&gone);
-            self.pending.remove(&gone);
+            self.registered.remove(&gone);
         }
-        for new in want.difference(&self.watched).cloned().collect::<Vec<_>>() {
+        for new in register
+            .difference(&self.registered)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
             // Unwatchable folders (some network shares, removed drives) just don't
             // auto-refresh; F5 still works.
             if w.watch(&new, RecursiveMode::NonRecursive).is_ok() {
-                self.watched.insert(new);
+                self.registered.insert(new);
             }
         }
+        for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
+            self.pending.remove(&gone);
+        }
+        if let Ok(mut shown) = self.shown.lock() {
+            shown.clone_from(&want);
+        }
+        self.watched = want;
     }
 
     /// Folders that should be refreshed now. `size_of` gives the entry count for a dir so
@@ -79,6 +128,8 @@ impl FolderWatcher {
     pub fn due(&mut self, size_of: impl Fn(&Path) -> usize) -> Vec<PathBuf> {
         let now = Instant::now();
         while let Ok(dir) = self.rx.try_recv() {
+            // A deleted shown folder arrives as its own path (see the notify callback),
+            // so only shown folders need handling; no filesystem probe on this thread.
             if self.watched.contains(&dir) {
                 self.pending.insert(dir, now);
             }
@@ -142,5 +193,23 @@ mod tests {
         }
         assert_eq!(got.len(), 1, "expected one refresh for the watched folder");
         assert!(forge_core::paths::paths_equal(&got[0], &dir));
+    }
+
+    #[test]
+    fn detects_external_deletion_of_a_shown_folder() {
+        let parent = tempfile::tempdir().unwrap();
+        let shown = parent.path().join("shown");
+        std::fs::create_dir(&shown).unwrap();
+        let mut watcher = FolderWatcher::new(egui::Context::default());
+        watcher.sync(std::slice::from_ref(&shown));
+        std::fs::remove_dir(&shown).unwrap();
+
+        let started = Instant::now();
+        let mut due = Vec::new();
+        while started.elapsed() < Duration::from_secs(5) && due.is_empty() {
+            std::thread::sleep(Duration::from_millis(100));
+            due = watcher.due(|_| 0);
+        }
+        assert_eq!(due, vec![shown]);
     }
 }

@@ -144,7 +144,7 @@ struct ImportPrompt {
 }
 
 #[derive(Clone)]
-enum EditKind {
+pub(crate) enum EditKind {
     CreateManual { add_files: Vec<NewFile> },
     CreateSmart,
     CreateSavedSearch,
@@ -153,7 +153,7 @@ enum EditKind {
 }
 
 #[derive(Clone)]
-struct EditDialog {
+pub(crate) struct EditDialog {
     kind: EditKind,
     name: String,
     query: String,
@@ -178,12 +178,12 @@ impl EditDialog {
 }
 
 #[derive(Clone)]
-enum DeleteTarget {
+pub(crate) enum DeleteTarget {
     Collection { id: CollectionId, name: String },
     SavedSearch { name: String },
 }
 
-enum UiCommand {
+pub(crate) enum UiCommand {
     AddFiles {
         collection_id: CollectionId,
         files: Vec<NewFile>,
@@ -341,6 +341,57 @@ pub fn add_selection(app: &mut ZxrawApp) {
     state.picker_files = files;
     state.picker_filter.clear();
     state.picker_open = true;
+}
+
+/// Test hook: a manual collection holding the current selection, created through the same
+/// save path as the picker's "New collection" button.
+pub(crate) fn create_manual_from_selection(app: &mut ZxrawApp, ctx: &egui::Context, name: &str) {
+    let targets: std::collections::HashSet<PathBuf> =
+        app.pane().action_targets().into_iter().collect();
+    let add_files: Vec<NewFile> = app
+        .pane()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File && targets.contains(&entry.path))
+        .map(NewFile::from)
+        .collect();
+    let form = EditDialog {
+        kind: EditKind::CreateManual { add_files },
+        name: name.to_string(),
+        query: String::new(),
+    };
+    start_save_edit(app, ctx, form);
+}
+
+/// Test hook: nothing queued or loading, so the window shows settled state.
+pub(crate) fn testhook_idle(app: &ZxrawApp) -> bool {
+    let state = &app.ops.collections_ui;
+    !state.operation_pending
+        && !state.catalog_loading
+        && !state.rows_loading
+        && !state.relink_preview_running
+}
+
+/// Test hook: names of the rows the open collection shows, once they have loaded for `id`.
+pub(crate) fn testhook_shown_rows(app: &ZxrawApp, id: CollectionId) -> Option<Vec<String>> {
+    let state = &app.ops.collections_ui;
+    let shows = matches!(&state.detail, Some(Detail::Collection { id: shown, .. }) if *shown == id);
+    (shows && !state.rows_loading).then(|| state.rows.iter().map(|row| row.name.clone()).collect())
+}
+
+/// Test hook: `Ok(Some(count))` once the relink preview has finished.
+pub(crate) fn testhook_relink_preview(app: &ZxrawApp) -> Result<Option<u64>, String> {
+    let state = &app.ops.collections_ui;
+    if let Some(error) = &state.relink_preview_error {
+        return Err(error.clone());
+    }
+    Ok(if state.relink_preview_running { None } else { state.relink_preview_count })
+}
+
+/// Test hook: the old and new folders chosen in the relink dialog, once both are set.
+pub(crate) fn testhook_relink_paths(app: &ZxrawApp) -> Option<(PathBuf, PathBuf)> {
+    let state = &app.ops.collections_ui;
+    Some((state.relink_old.clone()?, state.relink_new.clone()?))
 }
 
 /// Open the management window on a collection. Used by the sidebar.
@@ -708,7 +759,7 @@ fn atomic_export(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         file.flush()?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(&temporary, path)
+        forge_core::paths::rename_no_replace(&temporary, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -1362,7 +1413,7 @@ fn render_import_dialog(
     }
 }
 
-fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) {
+pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) {
     match command {
         UiCommand::AddFiles {
             collection_id,
@@ -1403,25 +1454,29 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             collection_id,
             name,
         } => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("JSON", &["json"])
-                .set_file_name(format!("{name}.json"))
-                .save_file()
-            {
+            if let Some(path) = crate::dialogs::save_file(
+                rfd::FileDialog::new()
+                    .add_filter("JSON", &["json"])
+                    .set_file_name(format!("{name}.json")),
+            ) {
                 start_operation(app, ctx, OperationFlags::EXPORT, move |db| {
                     let json = db
                         .export_collections_json(&[collection_id])
                         .map_err(|e| e.to_string())?;
-                    atomic_export(&path, json.as_bytes())
-                        .map_err(|e| format!("Could not write export: {e}"))?;
+                    atomic_export(&path, json.as_bytes()).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            format!("{} already exists; export not saved", path.display())
+                        } else {
+                            format!("Could not write export: {error}")
+                        }
+                    })?;
                     Ok(format!("Exported collection to {}", path.display()))
                 });
             }
         }
         UiCommand::ChooseImport => {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("JSON", &["json"])
-                .pick_file()
+            if let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new()
+                .add_filter("JSON", &["json"]))
             {
                 start_import_preview(app, ctx, path);
             }
@@ -1440,14 +1495,14 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
         }
         UiCommand::CancelImport => app.ops.collections_ui.import_prompt = None,
         UiCommand::ChooseRelinkOld => {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            if let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) {
                 let state = &mut app.ops.collections_ui;
                 state.relink_old = Some(path);
                 clear_relink_preview(state);
             }
         }
         UiCommand::ChooseRelinkNew => {
-            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            if let Some(path) = crate::dialogs::pick_folder(rfd::FileDialog::new()) {
                 let state = &mut app.ops.collections_ui;
                 state.relink_new = Some(path);
                 clear_relink_preview(state);
@@ -1459,6 +1514,15 @@ fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: UiCommand) 
             start_operation(app, ctx, OperationFlags::RELINK, move |db| {
                 let report: RelinkReport =
                     db.relink(&old, &new, None).map_err(|e| e.to_string())?;
+                // Relink moves the rows but not their presence flags. Re-list the new folders
+                // so the files that exist there come back online; missing ones stay offline.
+                let indexer = forge_db::Indexer::new(&db)
+                    .volume_resolver(crate::library::volume_info);
+                for dir in db.folders_under(&new).map_err(|e| e.to_string())? {
+                    indexer
+                        .reconcile_dir(&dir)
+                        .map_err(|e| format!("relinked, but could not refresh {}: {e}", dir.display()))?;
+                }
                 Ok(relink_summary(&report))
             });
             app.ops.collections_ui.relink_open = false;
@@ -1712,18 +1776,19 @@ mod tests {
     }
 
     #[test]
-    fn export_replaces_destination_only_after_complete_temp_write() {
+    fn export_refuses_to_replace_existing_destination() {
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("collections.json");
         std::fs::write(&destination, b"old data").unwrap();
 
-        atomic_export(&destination, b"complete json").unwrap();
+        let error = atomic_export(&destination, b"complete json").unwrap_err();
 
-        assert_eq!(std::fs::read(&destination).unwrap(), b"complete json");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"old data");
         assert_eq!(
             std::fs::read_dir(temp.path()).unwrap().count(),
             1,
-            "temporary sibling should be renamed away"
+            "the temporary file should be removed after refusing replacement"
         );
     }
 

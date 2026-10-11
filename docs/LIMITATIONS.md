@@ -11,9 +11,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * ZXraw does not develop RAW files. RAW preview support extracts an embedded JPEG preview;
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF
-  and AVIF pixels are not decoded: the thumbnail path returns "not available yet"
-  (`forge-media/src/thumbs.rs:781`), and only their EXIF is read (`image_meta.rs`). The
-  WIC fallback is planned work (`thumbs.rs:710`), not present.
+  and AVIF go through Windows Imaging Component (`forge-media/src/wic.rs`), so they need the
+  Microsoft HEIF/HEVC (and AV1) extensions; when no installed decoder accepts a file, the
+  thumbnail and viewer show an error naming the extension that may be missing. WIC decoding was tested with fixtures encoded on this machine,
+  not with camera or phone files.
 * Thumbnail throughput is limited. On this machine, under concurrent build load, 256 px
   thumbnails from 24 MP JPEGs were generated at a median of 3.7 images/s with an empty disk
   cache (about 272 ms per image). Cache hits take about 1 ms. Only JPEG throughput has been
@@ -27,15 +28,21 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Windows shell and file exchange
 
-* `eframe` accepts files and folders dropped into the app. There is no outgoing OLE drag
-  source (`IDropSource`/`DoDragDrop` do not appear in the source), so ZXraw cannot drag files
-  out to another application.
+* Files and folders can be dropped into the app. Dragging files past the window edge starts a
+  Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
+  The data object and the trigger are unit tested, but a drop into Explorer or another
+  application has not been verified: it is modal and cannot be automated here. The drag starts
+  only at the window edge, so the drop target must be outside ZXraw. At most 500 items can be
+  dragged out at once (each costs a shell parse on the UI thread); larger selections are
+  refused with a message pointing to copy and paste.
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
   of other applications, has not been checked.
 * Shell operations are Windows-only. Their non-Windows implementations return unsupported results
-  or empty data. Recycle Bin removal is tested; Open With, Properties, and Explorer reveal are not
-  tested by any automated test.
+  or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
+* Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox
+  folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
+  (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
 
 ## Installer, packaging, and licences
 
@@ -57,6 +64,39 @@ that back each line, is in [FEATURES.md](FEATURES.md).
     text (already shipped as `LICENSE-APACHE`) applies. GPL-2.0 is not elected.
 * FFmpeg and ffprobe are not bundled. If they are ever bundled, their own licences (LGPL or GPL,
   depending on the build) apply and must be shipped.
+
+## Organising and metadata
+
+* Burst and similar-photo grouping works in the grid view only (not details). It uses
+  capture time (EXIF, else modification time) and a 64-bit difference hash (dHash) of the thumbnail, so heavily
+  edited versions or crops of the same shot are not grouped, and unrelated photos with very
+  similar composition can be. Hidden files take part in the analysis (so a filter change needs no
+  re-run), so a hidden shot can link two visible ones into one stack; stacks only ever select,
+  drag or tag the files the listing shows.
+* The GPS panel is offline; "Open in maps" opens the configured http/https URL in the
+  default browser only when clicked. There is no embedded map and no reverse geocoding.
+* Metadata export needs the library database to be open (it is opened at startup), and
+  video fields stay empty without `ffprobe`.
+
+## Folder compare and sync
+
+* Sync re-checks every planned action against the preview before acting. A destination it would
+  overwrite is guarded by a full BLAKE3 hash, checked again right before the finished copy is
+  published; only the instant between that check and the rename is unguarded. Sources and
+  right-only files that Mirror recycles are guarded by size, modification time, and a sampled
+  hash above 1 MiB (five 64 KiB blocks), so an edit between the samples with the timestamp put
+  back is not noticed: the newer source bytes are copied, or the edited file is recycled
+  (recoverable from the Recycle Bin).
+* A Replace chosen in a copy or move conflict, and split/join rollback, check the destination's
+  kind, size and modification time right before acting, not its content or Windows file ID: a
+  same-size replacement that keeps the exact timestamp would not be noticed.
+* Mirror recycles a deleted folder's previewed files one by one and then removes the folders
+  only if they are empty, so a file created inside during the sync keeps its folder (reported
+  as skipped). The Recycle Bin then holds the files individually rather than the folder.
+* Copies and deletes check the last path component for links and junctions. A junction swapped
+  into the middle of a path while a sync runs is followed.
+* When Windows cannot recycle an item (for example on some network drives), the shell asks
+  whether to delete it permanently. Answering yes deletes it outside the preview.
 
 ## Scale and background work
 
@@ -82,6 +122,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   application pass over data or a missing ZXraw disk-cache entry.
 * Indexing and thumbnail jobs are local. There is no cloud catalog, remote database, or
   multi-machine synchronisation.
+* A WIC decode (HEIC/AVIF) runs inside the Windows codec and cannot be interrupted. If a codec
+  or a network-backed file stalls, the thumbnail worker waits, and closing the app waits for it.
+* Export-association previews are scanned by a single worker; a scan stuck on an unreachable
+  network folder delays the previews queued behind it.
+* The copy path keeps the fault-injection reader used by the e2e "card pulled" tests in release
+  builds. When not armed it costs one relaxed atomic load per read chunk.
 
 ## Metadata and XMP sync
 
@@ -106,13 +152,15 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * The unit and integration suites verify the tested engine paths and UI logic. They do not verify
   every Windows shell call, screen-reader workflow, GPU rendering path, or behaviour on a real
   photo or video library.
-* The e2e suite (`crates/forge-app/tests/e2e.rs`, 10 scenarios) drives commands and dialogs through
-  the app's command layer and asserts on files. It does not assert pixels and does not simulate
-  pointer or keyboard input.
-* The 50,000-folder screenshot in [BENCHMARKS.md](BENCHMARKS.md) shows that the list renders; it does
-  not establish frame pacing or interactive responsiveness. That run predates `dfd43d9`.
-* `forge-win`'s `recycle_removes_file_from_disk` test sends a temporary file to the real Recycle Bin on
-  every run. The e2e suite avoids the Recycle Bin on purpose, but the unit test does not.
+* The e2e suite (`crates/forge-app/tests/e2e/`) drives the real window with injected egui key and
+  pointer events and scripted file-dialog answers, and asserts on files and app state. It does not
+  exercise the native dialogs themselves, OS-level input (IME, touch, pen), multi-monitor DPI
+  changes, or real removable media: a "card" is a temp folder, and a pulled card is simulated by
+  fault injection in the copy reader. Screenshots are inspected by a person, not compared pixel by
+  pixel. See [TESTING.md](TESTING.md).
+* Frame times for a 50,000-file folder (scrolling details and grid, keyboard paging) were measured
+  in a release build on one machine; see [BENCHMARKS.md](BENCHMARKS.md). Listing, thumbnail decoding,
+  grouping analysis on large real photo sets, and network folders were not part of that measurement.
 
 ## Fixed since commit 476021b
 

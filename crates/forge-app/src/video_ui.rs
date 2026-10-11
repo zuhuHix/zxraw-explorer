@@ -6,9 +6,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::panic::{self, AssertUnwindSafe};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -22,6 +23,7 @@ use lru::LruCache;
 
 use crate::actions::Event;
 use crate::app::ZxrawApp;
+use crate::export_assoc::{has_reparse_attribute, is_link_or_junction};
 
 const FILMSTRIP_FRAMES: usize = 8;
 const FILMSTRIP_FRAME_EDGE: u32 = 256;
@@ -33,6 +35,15 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const RELATED_FOLDER_CACHE_CAPACITY: usize = 16;
 const RELATED_PATHS_PER_FOLDER: usize = 64;
+const MAX_LOCAL_RELATED_ENTRIES: usize = 10_000;
+const MAX_LOCAL_RELATED_DEPTH: usize = 8;
+const MAX_DRAWN_RELATED_ROWS: usize = 50;
+const MAX_PROXY_SCAN_ENTRIES: usize = 40_000;
+const MAX_PROXY_SCAN_DIRECTORIES: usize = 4_096;
+const MAX_PROXY_SCAN_DEPTH: usize = 32;
+const MAX_PROXY_SCAN_MATCHES: usize = 1_000;
+const MAX_PROXY_SCAN_SOURCES: usize = 256;
+const MAX_PROXY_SCAN_TIME: Duration = Duration::from_secs(30);
 
 type MediaResult<T> = Result<T, String>;
 
@@ -102,12 +113,27 @@ enum VideoMessage {
         take_label: Option<String>,
         related: Vec<Related>,
     },
+    ProxyScan {
+        scan_id: u64,
+        result: Result<ProxyScanResults, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Related {
     pub path: PathBuf,
     pub label: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProxyScanResults {
+    related: Vec<Related>,
+    truncated: bool,
+}
+
+struct ProxyScanRequest {
+    root: PathBuf,
+    sources: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,13 +151,146 @@ pub struct ClipGroup {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RelatedFolderKey {
     directory: PathBuf,
-    modified: Option<SystemTime>,
+    modified: Option<(SystemTime, SystemTime)>,
 }
 
 #[derive(Clone)]
 struct RelatedScan {
     take_label: Option<String>,
     related: Vec<Related>,
+}
+
+struct RelationScanRequest {
+    id: u64,
+    path: PathBuf,
+    media: MediaKey,
+    generation: u64,
+    cancel: CancelToken,
+    cache: Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
+    tx: Sender<VideoMessage>,
+    repaint: egui::Context,
+}
+
+#[derive(Default)]
+struct RelatedScanState {
+    pending: Option<RelationScanRequest>,
+    running: Option<(u64, CancelToken)>,
+    shutdown: bool,
+}
+
+struct RelatedScanWorker {
+    state: Mutex<RelatedScanState>,
+    ready: Condvar,
+}
+
+static RELATED_SCAN_WORKER: OnceLock<Option<Arc<RelatedScanWorker>>> = OnceLock::new();
+static NEXT_RELATED_SCAN_ID: AtomicU64 = AtomicU64::new(1);
+
+impl RelatedScanWorker {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RelatedScanState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&self, request: RelationScanRequest) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, cancel)) = &state.running {
+            cancel.cancel();
+        }
+        if let Some(pending) = state.pending.replace(request) {
+            pending.cancel.cancel();
+        }
+        self.ready.notify_one();
+    }
+
+    #[cfg(test)]
+    fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.shutdown = true;
+        if let Some((_, cancel)) = &state.running {
+            cancel.cancel();
+        }
+        if let Some(pending) = state.pending.take() {
+            pending.cancel.cancel();
+        }
+        self.ready.notify_one();
+    }
+}
+
+fn related_scan_worker() -> Option<Arc<RelatedScanWorker>> {
+    RELATED_SCAN_WORKER
+        .get_or_init(|| {
+            let worker = Arc::new(RelatedScanWorker::new());
+            let thread_worker = worker.clone();
+            std::thread::Builder::new()
+                .name("video-related-scan".into())
+                .spawn(move || {
+                    run_related_scan_worker(thread_worker, |request| {
+                        related_scan_cached(&request.path, &request.cache, &request.cancel)
+                    });
+                })
+                .ok()?;
+            Some(worker)
+        })
+        .clone()
+}
+
+fn run_related_scan_worker<F>(worker: Arc<RelatedScanWorker>, scan: F)
+where
+    F: Fn(&RelationScanRequest) -> Option<RelatedScan> + Send + 'static,
+{
+    loop {
+        let request = {
+            let mut state = worker
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(request) = state.pending.take() {
+                    state.running = Some((request.id, request.cancel.clone()));
+                    break request;
+                }
+                state = worker
+                    .ready
+                    .wait(state)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        };
+
+        let result = panic::catch_unwind(AssertUnwindSafe(|| scan(&request)))
+            .unwrap_or_else(|_| Some(RelatedScan {
+                take_label: None,
+                related: Vec::new(),
+            }));
+        if !request.cancel.is_cancelled()
+            && let Some(result) = result
+        {
+            let _ = request.tx.send(VideoMessage::Relations {
+                media: request.media,
+                generation: request.generation,
+                take_label: result.take_label,
+                related: result.related,
+            });
+            request.repaint.request_repaint();
+        }
+
+        let mut state = worker
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if state
+            .running
+            .as_ref()
+            .is_some_and(|(id, _)| *id == request.id)
+        {
+            state.running = None;
+        }
+    }
 }
 
 /// State for preview extraction. GPU textures and frame data are cached by file path,
@@ -161,9 +320,17 @@ pub struct VideoUi {
     exact_scrub_time: bool,
     relation_key: Option<MediaKey>,
     relation_pending: bool,
+    relation_scan_cancel: Option<CancelToken>,
     relation_cache: Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
     take_label: Option<String>,
     related: Vec<Related>,
+    proxy_scan_request: Option<ProxyScanRequest>,
+    proxy_scan_id: u64,
+    proxy_scan_cancel: Option<CancelToken>,
+    proxy_scan_pending: bool,
+    proxy_scan_error: Option<String>,
+    proxy_scan_truncated: bool,
+    located_proxies: Vec<Related>,
     proxy_dialog: Option<ProxyDialog>,
 }
 
@@ -195,17 +362,30 @@ impl Default for VideoUi {
             exact_scrub_time: false,
             relation_key: None,
             relation_pending: false,
+            relation_scan_cancel: None,
             relation_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(RELATED_FOLDER_CACHE_CAPACITY).expect("non-zero"),
             ))),
             take_label: None,
             related: Vec::new(),
+            proxy_scan_request: None,
+            proxy_scan_id: 0,
+            proxy_scan_cancel: None,
+            proxy_scan_pending: false,
+            proxy_scan_error: None,
+            proxy_scan_truncated: false,
+            located_proxies: Vec::new(),
             proxy_dialog: None,
         }
     }
 }
 
 impl VideoUi {
+    /// Whether the selected clip cannot be previewed because FFmpeg tools are unavailable.
+    pub fn tools_unavailable(&self) -> bool {
+        self.missing_tools.is_some()
+    }
+
     fn sync_selection(
         &mut self,
         entry: Option<&FileEntry>,
@@ -221,6 +401,9 @@ impl VideoUi {
         }
 
         self.generation_cancel.cancel();
+        if let Some(cancel) = self.relation_scan_cancel.take() {
+            cancel.cancel();
+        }
         if let Some(cancel) = &self.hover_cancel {
             cancel.cancel();
         }
@@ -243,6 +426,8 @@ impl VideoUi {
         self.relation_pending = false;
         self.take_label = None;
         self.related.clear();
+        // Located proxies belong to the clips that were selected when the scan was requested.
+        self.cancel_proxy_scan();
 
         let Some(media) = media else { return };
         // A new FFmpeg location may repair a previous missing-tool probe for this file.
@@ -415,41 +600,139 @@ impl VideoUi {
                         && self.relation_key.as_ref() == Some(&media)
                     {
                         self.relation_pending = false;
+                        self.relation_scan_cancel = None;
                         self.take_label = take_label;
                         self.related = related;
                     }
                 }
+                VideoMessage::ProxyScan { scan_id, result } if scan_id == self.proxy_scan_id => {
+                    self.proxy_scan_pending = false;
+                    self.proxy_scan_cancel = None;
+                    match result {
+                        Ok(results) => {
+                            self.located_proxies = results.related;
+                            self.proxy_scan_truncated = results.truncated;
+                            self.proxy_scan_error = None;
+                        }
+                        Err(error) => {
+                            self.located_proxies.clear();
+                            self.proxy_scan_truncated = false;
+                            self.proxy_scan_error = Some(error);
+                        }
+                    }
+                }
+                VideoMessage::ProxyScan { .. } => {}
             }
         }
+    }
+
+    fn start_proxy_scan_if_requested(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.proxy_scan_request.take() else {
+            return;
+        };
+        if let Some(cancel) = &self.proxy_scan_cancel {
+            cancel.cancel();
+        }
+        self.proxy_scan_id = self.proxy_scan_id.wrapping_add(1);
+        let scan_id = self.proxy_scan_id;
+        let cancel = CancelToken::new();
+        self.proxy_scan_cancel = Some(cancel.clone());
+        self.proxy_scan_pending = true;
+        self.proxy_scan_error = None;
+        self.proxy_scan_truncated = false;
+        self.located_proxies.clear();
+
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        let spawn = std::thread::Builder::new()
+            .name("video-proxy-locate".into())
+            .spawn(move || {
+                let result = locate_proxy_tree(&request.root, &request.sources, &cancel);
+                let _ = tx.send(VideoMessage::ProxyScan { scan_id, result });
+                repaint.request_repaint();
+            });
+        if let Err(error) = spawn {
+            self.proxy_scan_pending = false;
+            self.proxy_scan_cancel = None;
+            self.proxy_scan_error = Some(format!("Could not start proxy scan: {error}"));
+        }
+    }
+
+    fn cancel_proxy_scan(&mut self) {
+        if let Some(cancel) = &self.proxy_scan_cancel {
+            cancel.cancel();
+        }
+        self.proxy_scan_id = self.proxy_scan_id.wrapping_add(1);
+        self.proxy_scan_request = None;
+        self.proxy_scan_cancel = None;
+        self.proxy_scan_pending = false;
+        self.proxy_scan_error = None;
+        self.proxy_scan_truncated = false;
+        self.located_proxies.clear();
+    }
+
+    pub fn related_results(&self) -> &[Related] {
+        &self.related
+    }
+
+    pub fn ensure_related_scan(
+        &mut self,
+        entry: &FileEntry,
+        ffmpeg_dir: Option<&Path>,
+        ctx: &egui::Context,
+    ) {
+        self.sync_selection(Some(entry), ffmpeg_dir, ctx);
+        self.drain_messages(ctx);
+        let media = MediaKey::from_entry(entry);
+        if self.relation_key.as_ref() != Some(&media) {
+            self.request_relation_scan(entry, ctx);
+        }
+    }
+
+    pub fn relation_scan_pending(&self) -> bool {
+        self.relation_pending
+    }
+
+    pub fn located_proxy_results(&self) -> &[Related] {
+        &self.located_proxies
+    }
+
+    pub fn proxy_scan_pending(&self) -> bool {
+        self.proxy_scan_pending || self.proxy_scan_request.is_some()
+    }
+
+    pub fn proxy_scan_error(&self) -> Option<&str> {
+        self.proxy_scan_error.as_deref()
     }
 
     fn request_relation_scan(&mut self, entry: &FileEntry, ctx: &egui::Context) {
         let Some(media) = self.selection.clone() else {
             return;
         };
+        if let Some(cancel) = self.relation_scan_cancel.take() {
+            cancel.cancel();
+        }
         let generation = self.generation;
         let path = entry.path.clone();
         let cache = self.relation_cache.clone();
-        let tx = self.tx.clone();
-        let repaint = ctx.clone();
         self.relation_key = Some(media.clone());
         self.relation_pending = true;
-
-        let spawn = std::thread::Builder::new()
-            .name("video-related-scan".into())
-            .spawn(move || {
-                let result = related_scan_cached(&path, &cache);
-                let _ = tx.send(VideoMessage::Relations {
-                    media,
-                    generation,
-                    take_label: result.take_label,
-                    related: result.related,
-                });
-                repaint.request_repaint();
-            });
-        if spawn.is_err() {
+        let Some(worker) = related_scan_worker() else {
             self.relation_pending = false;
-        }
+            return;
+        };
+        let cancel = CancelToken::new();
+        self.relation_scan_cancel = Some(cancel.clone());
+        worker.enqueue(RelationScanRequest {
+            id: NEXT_RELATED_SCAN_ID.fetch_add(1, Ordering::Relaxed),
+            path,
+            media,
+            generation,
+            cancel,
+            cache,
+            tx: self.tx.clone(),
+            repaint: ctx.clone(),
+        });
     }
 
     fn insert_texture(&mut self, ctx: &egui::Context, key: FrameKey, image: &RgbaImage) {
@@ -539,18 +822,18 @@ impl VideoUi {
         self.frame_cache.get(&nearest).cloned()
     }
 
-    fn draw(&mut self, ui: &mut Ui, entry: &FileEntry) -> VideoAction {
+    fn draw(&mut self, ui: &mut Ui, entry: &FileEntry) -> Vec<VideoAction> {
         let media = self
             .selection
             .as_ref()
             .expect("preview selection synchronized")
             .clone();
-        let mut action = VideoAction::None;
+        let mut actions = Vec::new();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading("Video");
             if ui.button("Open in default player").clicked() {
-                action = VideoAction::OpenPlayer(entry.path.clone());
+                actions.push(VideoAction::OpenPlayer(entry.path.clone()));
             }
         });
         ui.label(
@@ -568,6 +851,7 @@ impl VideoUi {
                 ui.label("Scanning related files…");
             });
         }
+        draw_related_section(ui, self, &mut actions);
 
         if let Some(missing) = &self.missing_tools {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -741,31 +1025,136 @@ impl VideoUi {
                 });
         }
 
-        if !self.related.is_empty() {
-            ui.separator();
-            ui.label(RichText::new("Related files").strong());
-            for related in &self.related {
-                let name = related
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| related.path.display().to_string());
-                if ui
-                    .selectable_label(false, format!("{}  ·  {name}", related.label))
-                    .clicked()
-                {
-                    action = VideoAction::SelectRelated(related.path.clone());
-                }
-            }
-        }
-        action
+        actions
     }
 }
 
+fn draw_related_section(ui: &mut Ui, video: &VideoUi, actions: &mut Vec<VideoAction>) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Related files").strong());
+        if ui.button("Locate proxies…").clicked() {
+            actions.push(VideoAction::LocateProxies);
+        }
+    });
+    if video.proxy_scan_pending {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Searching the selected folder tree for proxies…");
+            if ui.small_button("Cancel").clicked() {
+                actions.push(VideoAction::CancelProxyScan);
+            }
+        });
+    }
+    if let Some(error) = &video.proxy_scan_error {
+        ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+    }
+    let (rows, hidden_count) = visible_related_rows(&video.related, &video.located_proxies);
+    for related in rows {
+        let name = related
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| related.path.display().to_string());
+        // Buttons first, from the right, so the label gets exactly the width that is left
+        // and truncates; a fixed reservation overflowed and pushed the whole panel left.
+        let row = egui::Layout::right_to_left(egui::Align::Center);
+        let size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+        let row = ui.allocate_ui_with_layout(size, row, |ui| {
+            if ui.small_button("Select in pane").clicked() {
+                actions.push(VideoAction::SelectRelated(related.path.clone()));
+            }
+            if ui.small_button("Reveal").clicked() {
+                actions.push(VideoAction::RevealRelated(related.path.clone()));
+            }
+            if ui.small_button("Open").clicked() {
+                actions.push(VideoAction::OpenRelated(related.path.clone()));
+            }
+            let label = related_display_label(&related.label);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(RichText::new(format!("{label}  ·  {name}")).small()).truncate())
+                    .on_hover_text(&related.label);
+            });
+        });
+        crate::testhook::note_entry_rect(
+            ui,
+            &related_row_test_key(&related.path),
+            row.response.rect,
+        );
+    }
+    if hidden_count > 0 {
+        ui.label(
+            RichText::new(format!("{hidden_count} more related files not shown"))
+                .small()
+                .weak(),
+        );
+    }
+    if video.proxy_scan_truncated {
+        ui.label(
+            RichText::new("Proxy scan reached its safety limit; some folders were skipped.")
+                .small()
+                .weak(),
+        );
+    }
+}
+
+fn visible_related_rows<'a>(
+    related: &'a [Related],
+    located: &'a [Related],
+) -> (Vec<&'a Related>, usize) {
+    let mut seen = HashSet::new();
+    let mut rows = Vec::with_capacity(MAX_DRAWN_RELATED_ROWS);
+    let mut hidden = 0;
+    for item in related.iter().chain(located) {
+        if !seen.insert(normalized_path(&item.path)) {
+            continue;
+        }
+        if rows.len() < MAX_DRAWN_RELATED_ROWS {
+            rows.push(item);
+        } else {
+            hidden += 1;
+        }
+    }
+    (rows, hidden)
+}
+
+fn related_row_test_key(path: &Path) -> PathBuf {
+    let mut key = path.as_os_str().to_os_string();
+    key.push("::related-row");
+    PathBuf::from(key)
+}
+
+fn related_display_label(label: &str) -> String {
+    let (location, label) = if let Some(located) = label.strip_prefix("Located for ") {
+        (
+            "Located · ",
+            located
+                .split_once(": ")
+                .map(|(_, label)| label)
+                .unwrap_or(located),
+        )
+    } else {
+        ("", label)
+    };
+    let label = match label {
+        "GoPro low-resolution companion" => "GoPro LRV",
+        "DJI low-resolution companion" => "DJI LRF",
+        "Sony XAVC S proxy sub-clip" => "Sony sub-clip",
+        "GoPro thumbnail companion" => "GoPro thumbnail",
+        "Proxy / optimized media" => "Proxy",
+        "Same-basename variant" => "Video variant",
+        label => label,
+    };
+    format!("{location}{label}")
+}
+
 enum VideoAction {
-    None,
     OpenPlayer(PathBuf),
+    OpenRelated(PathBuf),
+    RevealRelated(PathBuf),
     SelectRelated(PathBuf),
+    LocateProxies,
+    CancelProxyScan,
 }
 
 /// Extra preview-panel content for a video file, drawn below generic information/metadata.
@@ -781,15 +1170,24 @@ pub fn preview(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &FileEntry) {
         app.ops.video_ui.request_relation_scan(entry, ui.ctx());
     }
 
-    let action = app.ops.video_ui.draw(ui, entry);
-    match action {
-        VideoAction::None => {}
-        VideoAction::OpenPlayer(path) => {
-            app.ops.spawn_shell("Open in default player", move || {
-                forge_win::open_default(&path)
-            });
+    let actions = app.ops.video_ui.draw(ui, entry);
+    for action in actions {
+        match action {
+            VideoAction::OpenPlayer(path) => {
+                app.ops.spawn_shell("Open in default player", move || {
+                    forge_win::open_default(&path)
+                });
+            }
+            VideoAction::OpenRelated(path) => crate::actions::open_file(app, &path),
+            VideoAction::RevealRelated(path) => {
+                app.ops.spawn_shell("Reveal related file", move || {
+                    forge_win::reveal_in_explorer(&path)
+                })
+            }
+            VideoAction::SelectRelated(path) => app.navigate(path),
+            VideoAction::LocateProxies => locate_proxies(app),
+            VideoAction::CancelProxyScan => app.ops.video_ui.cancel_proxy_scan(),
         }
-        VideoAction::SelectRelated(path) => app.navigate(path),
     }
 }
 
@@ -804,6 +1202,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     app.ops
         .video_ui
         .sync_selection(selected.as_ref(), ffmpeg_dir.as_deref(), ctx);
+    app.ops.video_ui.start_proxy_scan_if_requested(ctx);
     app.ops.video_ui.drain_messages(ctx);
     proxy_window(app, ctx);
 }
@@ -814,17 +1213,56 @@ fn place_no_replace(temp: &Path, output: &Path) -> std::io::Result<()> {
     rename_no_replace(temp, output)
 }
 
-pub fn generate_proxies(app: &mut ZxrawApp) {
-    let targets = app.pane().action_targets();
-    let entries = &app.pane().entries;
-    let sources: Vec<PathBuf> = targets
+/// Pick a root folder, then locate matching proxies in a bounded background scan.
+pub fn locate_proxies(app: &mut ZxrawApp) {
+    let pane = app.pane();
+    let clips = pane
+        .entries
+        .iter()
+        .filter(|entry| is_clip_entry(entry))
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let sources = pane
+        .action_targets()
         .into_iter()
-        .filter(|path| {
-            entries
-                .iter()
-                .find(|entry| entry.path == *path)
-                .is_some_and(is_clip_entry)
-        })
+        .filter(|path| clips.contains(path))
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        app.toast("Select one or more video clips before locating proxies");
+        return;
+    }
+    let dialog = rfd::FileDialog::new().set_directory(pane.path.clone());
+    let Some(root) = crate::dialogs::pick_folder(dialog) else {
+        return;
+    };
+    let omitted = sources.len().saturating_sub(MAX_PROXY_SCAN_SOURCES);
+    let sources = sources.into_iter().take(MAX_PROXY_SCAN_SOURCES).collect();
+    app.ops.video_ui.proxy_scan_request = Some(ProxyScanRequest { root, sources });
+    app.ops.video_ui.proxy_scan_pending = true;
+    app.ops.video_ui.proxy_scan_error = None;
+    if omitted == 0 {
+        app.toast("Proxy search queued");
+    } else {
+        app.toast(format!(
+            "Proxy search queued for the first {MAX_PROXY_SCAN_SOURCES} clips; {omitted} selected clips were skipped"
+        ));
+    }
+}
+
+pub fn generate_proxies(app: &mut ZxrawApp) {
+    // One pass over the listing, then a set lookup per target: a nested search was
+    // O(selected × listed) on the UI thread.
+    let pane = app.pane();
+    let clips = pane
+        .entries
+        .iter()
+        .filter(|entry| is_clip_entry(entry))
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    let sources: Vec<PathBuf> = pane
+        .action_targets()
+        .into_iter()
+        .filter(|path| clips.contains(path))
         .collect();
     if sources.is_empty() {
         app.toast("Select one or more video files to generate proxies");
@@ -987,7 +1425,7 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                 ui.label(RichText::new(shown).small());
                 if ui.button("Choose folder…").clicked() {
                     let picker = rfd::FileDialog::new();
-                    if let Some(path) = picker.pick_folder() {
+                    if let Some(path) = crate::dialogs::pick_folder(picker) {
                         dialog.destination = Some(path);
                         destination_changed = true;
                     }
@@ -2005,7 +2443,11 @@ fn clip_label(entries: &[FileEntry], path: &Path) -> Option<String> {
 fn related_scan_cached(
     path: &Path,
     cache: &Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
-) -> RelatedScan {
+    cancel: &CancelToken,
+) -> Option<RelatedScan> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let directory = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -2013,9 +2455,17 @@ fn related_scan_cached(
     let modified = fs::metadata(&directory)
         .ok()
         .and_then(|metadata| metadata.modified().ok());
+    // The related scan also reads the grandparent for sibling proxy folders, so its modified time is part of the key.
+    let sibling_modified = directory
+        .parent()
+        .and_then(|parent| fs::metadata(parent).ok())
+        .and_then(|metadata| metadata.modified().ok());
     let folder_key = RelatedFolderKey {
         directory,
-        modified,
+        modified: Some((
+            modified.unwrap_or(SystemTime::UNIX_EPOCH),
+            sibling_modified.unwrap_or(SystemTime::UNIX_EPOCH),
+        )),
     };
 
     {
@@ -2025,15 +2475,23 @@ fn related_scan_cached(
             .and_then(|scans| scans.get(path))
             .cloned()
         {
-            return scan;
+            return (!cancel.is_cancelled()).then_some(scan);
         }
     }
 
+    let take_label = scan_clip_label(path, cancel);
+    if cancel.is_cancelled() {
+        return None;
+    }
+    let related = related_media_cancellable(path, cancel)?;
     let scan = RelatedScan {
-        take_label: scan_clip_label(path),
-        related: related_media(path),
+        take_label,
+        related,
     };
     let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if cancel.is_cancelled() {
+        return None;
+    }
     let mut scans = cache.pop(&folder_key).unwrap_or_default();
     if scans.len() >= RELATED_PATHS_PER_FOLDER
         && !scans.contains_key(path)
@@ -2043,39 +2501,46 @@ fn related_scan_cached(
     }
     scans.insert(path.to_path_buf(), scan.clone());
     cache.put(folder_key, scans);
-    scan
+    Some(scan)
 }
 
-fn scan_clip_label(path: &Path) -> Option<String> {
+fn scan_clip_label(path: &Path, cancel: &CancelToken) -> Option<String> {
     let directory = path.parent()?;
-    let entries = fs::read_dir(directory)
-        .ok()?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            if !entry.file_type().ok()?.is_file() {
-                return None;
-            }
-            let path = entry.path();
-            let ext = ext_of(&path);
-            if forge_core::model::media_kind_for_ext(&ext) != MediaKind::Video {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            Some(FileEntry {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                path,
-                kind: EntryKind::File,
-                size: metadata.len(),
-                modified: metadata.modified().ok(),
-                created: metadata.created().ok(),
-                hidden: false,
-                readonly: metadata.permissions().readonly(),
-                system: false,
-                ext,
-            })
-        })
-        .collect::<Vec<_>>();
-    clip_label(&entries, path)
+    let entries = fs::read_dir(directory).ok()?;
+    let mut files = Vec::new();
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let candidate = entry.path();
+        let ext = ext_of(&candidate);
+        if forge_core::model::media_kind_for_ext(&ext) != MediaKind::Video {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        files.push(FileEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: candidate,
+            kind: EntryKind::File,
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            hidden: false,
+            readonly: metadata.permissions().readonly(),
+            system: false,
+            ext,
+        });
+    }
+    clip_label(&files, path)
 }
 
 fn sequence_name(path: &Path) -> Option<SequenceName> {
@@ -2174,26 +2639,66 @@ fn capture_gap_exceeded(a: &FileEntry, b: &FileEntry, max_gap: Duration) -> bool
 }
 
 /// Finds likely proxy/derivative files, GoPro companions, and same-basename variants.
+#[cfg(test)]
 pub fn related_media(path: &Path) -> Vec<Related> {
+    related_media_cancellable(path, &CancelToken::new()).unwrap_or_default()
+}
+
+fn related_media_cancellable(path: &Path, cancel: &CancelToken) -> Option<Vec<Related>> {
+    if cancel.is_cancelled() {
+        return None;
+    }
     let Some(parent) = path.parent() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    let base = normalized_stem(path);
-    if base.is_empty() {
-        return Vec::new();
+    if path.file_stem().is_none() {
+        return Some(Vec::new());
     }
     let mut found = HashMap::<String, Related>::new();
-    scan_related_directory(path, parent, &base, &mut found);
-    for folder in ["Proxy", "Proxies", "Optimized Media"] {
-        let proxy_dir = parent.join(folder);
-        scan_related_directory(path, &proxy_dir, &base, &mut found);
-    }
+    let mut scanned_entries = 0;
+    scan_related_directory(path, parent, &mut found, 0, &mut scanned_entries, cancel).ok()?;
     if parent
         .file_name()
         .is_some_and(|name| is_proxy_folder(&name.to_string_lossy()))
         && let Some(source_dir) = parent.parent()
     {
-        scan_related_directory(path, source_dir, &base, &mut found);
+        scan_related_directory(path, source_dir, &mut found, 0, &mut scanned_entries, cancel)
+            .ok()?;
+    }
+    if cancel.is_cancelled() {
+        return None;
+    }
+    if let Some(grandparent) = parent.parent()
+        && let Ok(entries) = fs::read_dir(grandparent)
+    {
+        for entry in entries.take(MAX_LOCAL_RELATED_ENTRIES).flatten() {
+            if cancel.is_cancelled() {
+                return None;
+            }
+            if entry.path() == parent || scanned_entries >= MAX_LOCAL_RELATED_ENTRIES {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir()
+                && !file_type.is_symlink()
+                && is_proxy_folder(&entry.file_name().to_string_lossy())
+            {
+                scan_related_directory(
+                    path,
+                    &entry.path(),
+                    &mut found,
+                    0,
+                    &mut scanned_entries,
+                    cancel,
+                )
+                .ok()?;
+            }
+        }
+    }
+    if cancel.is_cancelled() {
+        return None;
     }
     let mut values: Vec<_> = found.into_values().collect();
     values.sort_by(|a, b| {
@@ -2204,26 +2709,51 @@ pub fn related_media(path: &Path) -> Vec<Related> {
                 .cmp(&b.path.to_string_lossy().to_lowercase())
         })
     });
-    values
+    Some(values)
 }
 
 fn scan_related_directory(
     path: &Path,
     directory: &Path,
-    base: &str,
     found: &mut HashMap<String, Related>,
-) {
+    depth: usize,
+    scanned_entries: &mut usize,
+    cancel: &CancelToken,
+) -> Result<(), ()> {
+    if cancel.is_cancelled() {
+        return Err(());
+    }
+    if *scanned_entries >= MAX_LOCAL_RELATED_ENTRIES || depth > MAX_LOCAL_RELATED_DEPTH {
+        return Ok(());
+    }
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return Ok(());
     };
     for entry in entries.flatten() {
+        if cancel.is_cancelled() {
+            return Err(());
+        }
+        if *scanned_entries >= MAX_LOCAL_RELATED_ENTRIES {
+            break;
+        }
+        *scanned_entries += 1;
         let candidate = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        if is_link_or_junction(&entry, &file_type) {
+            continue;
+        }
         if file_type.is_dir() {
             if is_proxy_folder(&entry.file_name().to_string_lossy()) {
-                scan_related_directory(path, &candidate, base, found);
+                scan_related_directory(
+                    path,
+                    &candidate,
+                    found,
+                    depth + 1,
+                    scanned_entries,
+                    cancel,
+                )?;
             }
             continue;
         }
@@ -2233,22 +2763,9 @@ fn scan_related_directory(
         {
             continue;
         }
-        if normalized_stem(&candidate) != base {
+        let Some(label) = proxy_match_label(path, &candidate) else {
             continue;
-        }
-        let extension = ext_of(&candidate);
-        let in_proxy_folder = candidate
-            .parent()
-            .and_then(Path::file_name)
-            .is_some_and(|name| is_proxy_folder(&name.to_string_lossy()));
-        let label = match extension.as_str() {
-            "lrv" => "GoPro low-resolution companion",
-            "thm" => "GoPro thumbnail companion",
-            _ if in_proxy_folder => "Proxy / optimized media",
-            _ if is_proxy_suffix(&candidate) => "Proxy derivative",
-            _ => "Same-basename variant",
-        }
-        .to_string();
+        };
         found.insert(
             normalized_path(&candidate),
             Related {
@@ -2257,24 +2774,25 @@ fn scan_related_directory(
             },
         );
     }
+    Ok(())
 }
 
 fn is_media_derivative(path: &Path) -> bool {
-    matches!(ext_of(path).as_str(), "lrv" | "thm")
+    matches!(ext_of(path).as_str(), "lrv" | "lrf" | "thm")
         || MediaKind::Video == forge_core::model::media_kind_for_ext(&ext_of(path))
 }
 
 fn is_proxy_folder(name: &str) -> bool {
     matches!(
         name.trim().to_ascii_lowercase().as_str(),
-        "proxy" | "proxies" | "optimized media"
+        "proxy" | "proxies" | "_proxies" | "optimized media" | "sub"
     )
 }
 
 fn is_proxy_suffix(path: &Path) -> bool {
     path.file_stem()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
-        .is_some_and(|s| s.ends_with("_proxy") || s.ends_with("-proxy"))
+        .is_some_and(|s| s.ends_with("_proxy") || s.ends_with("-proxy") || s.ends_with(".proxy"))
 }
 
 fn normalized_stem(path: &Path) -> String {
@@ -2291,13 +2809,186 @@ fn normalized_stem(path: &Path) -> String {
     {
         value = root.to_string();
     }
-    for suffix in ["_proxy", "-proxy"] {
+    if let Some((root, _)) = value.split_once(".proxy.") {
+        value = root.to_string();
+    }
+    for suffix in ["_proxy", "-proxy", ".proxy"] {
         if let Some(root) = value.strip_suffix(suffix) {
             value = root.to_string();
             break;
         }
     }
     value.trim_end_matches(['_', '-']).to_string()
+}
+
+// Sony's HXR-NX80 manual shows C0001.MP4 under M4ROOT/CLIP and its proxy
+// C0001S03.MP4 under M4ROOT/SUB, so S plus two digits identifies the sub-clip.
+fn sony_xavc_base(stem: &str) -> Option<(String, bool)> {
+    let upper = stem.to_ascii_uppercase();
+    let digits = upper.strip_prefix('C')?;
+    let (clip_number, is_subclip) = match digits.split_once('S') {
+        Some((clip_number, suffix))
+            if suffix.len() == 2 && suffix.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            (clip_number, true)
+        }
+        Some(_) => return None,
+        None => (digits, false),
+    };
+    ((4..=6).contains(&clip_number.len()) && clip_number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| (format!("C{clip_number}"), is_subclip))
+}
+
+fn proxy_match_label(source: &Path, candidate: &Path) -> Option<String> {
+    let source_stem = source.file_stem()?.to_string_lossy();
+    let candidate_stem = candidate.file_stem()?.to_string_lossy();
+    let source_upper = source_stem.to_ascii_uppercase();
+    let candidate_upper = candidate_stem.to_ascii_uppercase();
+    let extension = ext_of(candidate);
+    let in_proxy_folder = candidate
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| is_proxy_folder(&name.to_string_lossy()));
+
+    let gopro_lrv = extension == "lrv"
+        && (source_upper.starts_with("GX") || source_upper.starts_with("GH"))
+        && source_upper.len() == 8
+        && source_upper[2..].bytes().all(|byte| byte.is_ascii_digit())
+        && candidate_upper == format!("GL{}", &source_upper[2..]);
+    let sony_subclip = match (
+        sony_xavc_base(&source_stem),
+        sony_xavc_base(&candidate_stem),
+    ) {
+        (Some((source_base, source_is_subclip)), Some((candidate_base, candidate_is_subclip))) => {
+            source_base == candidate_base && (source_is_subclip || candidate_is_subclip)
+        }
+        _ => false,
+    };
+    let same_stem = normalized_stem(source) == normalized_stem(candidate);
+
+    if gopro_lrv {
+        Some("GoPro low-resolution companion".into())
+    } else if extension == "lrf" && same_stem {
+        Some("DJI low-resolution companion".into())
+    } else if sony_subclip {
+        Some("Sony XAVC S proxy sub-clip".into())
+    } else if same_stem {
+        Some(
+            match extension.as_str() {
+                "lrv" => "GoPro low-resolution companion",
+                "lrf" => "DJI low-resolution companion",
+                "thm" => "GoPro thumbnail companion",
+                _ if in_proxy_folder => "Proxy / optimized media",
+                _ if is_proxy_suffix(candidate) => "Proxy derivative",
+                _ => "Same-basename variant",
+            }
+            .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+fn locate_proxy_tree(
+    root: &Path,
+    sources: &[PathBuf],
+    cancel: &CancelToken,
+) -> Result<ProxyScanResults, String> {
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("Cannot read selected folder: {error}"))?;
+    let root_type = root_metadata.file_type();
+    if root_type.is_symlink() || has_reparse_attribute(&root_metadata) {
+        return Err("The selected root is a link or junction; choose a regular folder".into());
+    }
+    if !root_type.is_dir() {
+        return Err("The selected root is not a folder".into());
+    }
+
+    let started = Instant::now();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut entries_seen = 0usize;
+    let mut directories_seen = 0usize;
+    let mut found = HashMap::<String, Related>::new();
+    let mut truncated = false;
+
+    while let Some((directory, depth)) = stack.pop() {
+        if cancel.is_cancelled() {
+            return Err("Proxy scan cancelled".into());
+        }
+        if started.elapsed() >= MAX_PROXY_SCAN_TIME
+            || entries_seen >= MAX_PROXY_SCAN_ENTRIES
+            || directories_seen >= MAX_PROXY_SCAN_DIRECTORIES
+            || found.len() >= MAX_PROXY_SCAN_MATCHES
+        {
+            truncated = true;
+            break;
+        }
+        directories_seen += 1;
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            if cancel.is_cancelled() {
+                return Err("Proxy scan cancelled".into());
+            }
+            if started.elapsed() >= MAX_PROXY_SCAN_TIME
+                || entries_seen >= MAX_PROXY_SCAN_ENTRIES
+                || found.len() >= MAX_PROXY_SCAN_MATCHES
+            {
+                truncated = true;
+                break;
+            }
+            let Ok(entry) = entry else { continue };
+            entries_seen += 1;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // Symlinks and junctions are never followed, so the scan stays inside the chosen tree.
+            if is_link_or_junction(&entry, &file_type) {
+                continue;
+            }
+            let candidate = entry.path();
+            if file_type.is_dir() {
+                if depth < MAX_PROXY_SCAN_DEPTH {
+                    stack.push((candidate, depth + 1));
+                } else {
+                    truncated = true;
+                }
+                continue;
+            }
+            if !file_type.is_file() || !is_media_derivative(&candidate) {
+                continue;
+            }
+            for source in sources {
+                if normalized_path(source) == normalized_path(&candidate) {
+                    continue;
+                }
+                let Some(label) = proxy_match_label(source, &candidate) else {
+                    continue;
+                };
+                let source_name = source
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_default();
+                found.entry(normalized_path(&candidate)).or_insert(Related {
+                    path: candidate.clone(),
+                    label: format!("Located for {source_name}: {label}"),
+                });
+                break;
+            }
+        }
+    }
+
+    let mut related: Vec<_> = found.into_values().collect();
+    related.sort_by(|a, b| {
+        a.label.cmp(&b.label).then_with(|| {
+            a.path
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&b.path.to_string_lossy().to_lowercase())
+        })
+    });
+    Ok(ProxyScanResults { related, truncated })
 }
 
 // -----------------------------------------------------------------------------
@@ -2400,7 +3091,7 @@ mod tests {
         assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign output");
         assert!(private_dir.exists());
 
-        let mut owned = ProxyTemp::create(destination.path(), &output, 45, 1).unwrap();
+        let owned = ProxyTemp::create(destination.path(), &output, 45, 1).unwrap();
         std::fs::write(owned.path(), b"job output").unwrap();
         let foreign_sibling = owned.directory.join("foreign.txt");
         std::fs::write(&foreign_sibling, b"keep this").unwrap();
@@ -2414,6 +3105,100 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn related_rows_are_bounded_and_report_hidden_matches() {
+        let related = (0..320)
+            .map(|index| Related {
+                path: PathBuf::from(format!(r"C:\Media\clip-{index:03}_proxy.mp4")),
+                label: "Proxy".into(),
+            })
+            .collect::<Vec<_>>();
+        let located = related[..12].to_vec();
+
+        let (rows, hidden) = visible_related_rows(&related, &located);
+
+        assert_eq!(rows.len(), MAX_DRAWN_RELATED_ROWS);
+        assert_eq!(hidden, related.len() - MAX_DRAWN_RELATED_ROWS);
+    }
+
+    #[test]
+    fn related_scan_worker_cancels_and_coalesces_rapid_requests() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let worker = Arc::new(RelatedScanWorker::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(AtomicBool::new(false));
+        let (started_tx, started_rx) = unbounded();
+        let (messages_tx, messages_rx) = unbounded();
+        let scan_active = active.clone();
+        let scan_max_active = max_active.clone();
+        let scan_first_started = first_started.clone();
+        let scan = move |request: &RelationScanRequest| {
+            let count = scan_active.fetch_add(1, Ordering::SeqCst) + 1;
+            scan_max_active.fetch_max(count, Ordering::SeqCst);
+            if !scan_first_started.swap(true, Ordering::SeqCst) {
+                started_tx.send(()).unwrap();
+            }
+            for _ in 0..200 {
+                if request.cancel.is_cancelled() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            scan_active.fetch_sub(1, Ordering::SeqCst);
+            (!request.cancel.is_cancelled()).then_some(RelatedScan {
+                take_label: None,
+                related: Vec::new(),
+            })
+        };
+        let thread_worker = worker.clone();
+        let handle = std::thread::spawn(move || run_related_scan_worker(thread_worker, scan));
+        let cache = Arc::new(Mutex::new(LruCache::new(
+            NonZeroUsize::new(RELATED_FOLDER_CACHE_CAPACITY).unwrap(),
+        )));
+        let context = egui::Context::default();
+        let make_request = |number: u64| RelationScanRequest {
+            id: number,
+            path: PathBuf::from(format!(r"C:\Media\clip-{number}.mp4")),
+            media: MediaKey {
+                path: PathBuf::from(format!(r"C:\Media\clip-{number}.mp4")),
+                modified: None,
+            },
+            generation: number,
+            cancel: CancelToken::new(),
+            cache: cache.clone(),
+            tx: messages_tx.clone(),
+            repaint: context.clone(),
+        };
+
+        worker.enqueue(make_request(1));
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first request starts");
+        for number in 2..=80 {
+            worker.enqueue(make_request(number));
+        }
+
+        match messages_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the latest request completes")
+        {
+            VideoMessage::Relations {
+                media, generation, ..
+            } => {
+                assert_eq!(generation, 80);
+                assert_eq!(media.path, PathBuf::from(r"C:\Media\clip-80.mp4"));
+            }
+            _ => panic!("expected the latest related-scan result"),
+        }
+        assert!(messages_rx.try_recv().is_err());
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+
+        worker.shutdown();
+        handle.join().unwrap();
+    }
 
     fn entry(name: &str, at: Option<SystemTime>) -> FileEntry {
         let path = PathBuf::from(r"C:\Media").join(name);
@@ -2546,6 +3331,101 @@ mod tests {
                 .iter()
                 .any(|r| r.path == proxy && r.label.contains("Proxy"))
         );
+    }
+
+    #[test]
+    fn related_media_finds_generated_proxies_and_all_named_proxy_folders() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source = root.join("clip.mp4");
+        let candidates = [
+            root.join("Proxy").join("clip_proxy.mp4"),
+            root.join("Proxies").join("clip_Proxy.mp4"),
+            root.join("_Proxies").join("clip.proxy.1080.mp4"),
+        ];
+        touch(&source);
+        for candidate in &candidates {
+            touch(candidate);
+        }
+        let found: HashSet<_> = related_media(&source)
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        for candidate in candidates {
+            assert!(found.contains(&candidate), "{}", candidate.display());
+        }
+    }
+
+    #[test]
+    fn related_media_finds_gopro_dji_and_sony_xavc_proxy_names() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let gopro = root.join("GX010001.MP4");
+        let gopro_lrv = root.join("GL010001.LRV");
+        let dji = root.join("DJI_0001.MP4");
+        let dji_lrf = root.join("DJI_0001.LRF");
+        let sony = root.join("C0001.MP4");
+        let sony_proxy = root.join("SUB").join("C0001S03.MP4");
+        for path in [&gopro, &gopro_lrv, &dji, &dji_lrf, &sony, &sony_proxy] {
+            touch(path);
+        }
+
+        let found_paths = |path: &Path| {
+            related_media(path)
+                .into_iter()
+                .map(|item| item.path)
+                .collect::<HashSet<_>>()
+        };
+        assert!(found_paths(&gopro).contains(&gopro_lrv));
+        assert!(found_paths(&dji).contains(&dji_lrf));
+        let sony_results = related_media(&sony);
+        assert!(
+            sony_results
+                .iter()
+                .any(|item| { item.path == sony_proxy && item.label.contains("Sony XAVC S") })
+        );
+        assert_eq!(sony_xavc_base("C0001S03"), Some(("C0001".into(), true)));
+        assert_eq!(sony_xavc_base("C0001S3"), None);
+    }
+
+    #[test]
+    fn related_media_finds_proxy_in_a_sibling_folder_but_not_a_neighboring_name() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source = root.join("Originals").join("clip.mp4");
+        let proxy = root.join("Proxies").join("clip_proxy.mp4");
+        let unrelated = root.join("Proxies").join("clip_backup.mp4");
+        touch(&source);
+        touch(&proxy);
+        touch(&unrelated);
+
+        let paths: HashSet<_> = related_media(&source)
+            .into_iter()
+            .map(|item| item.path)
+            .collect();
+        assert!(paths.contains(&proxy));
+        assert!(!paths.contains(&unrelated));
+    }
+
+    #[test]
+    fn locate_proxy_tree_scans_selected_root_and_honors_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("Originals").join("clip.mp4");
+        let root = temp.path().join("elsewhere");
+        let proxy = root
+            .join("day-one")
+            .join("optimized")
+            .join("clip_proxy.mp4");
+        touch(&source);
+        touch(&proxy);
+
+        let result =
+            locate_proxy_tree(&root, std::slice::from_ref(&source), &CancelToken::new()).unwrap();
+        assert!(result.related.iter().any(|item| item.path == proxy));
+
+        let cancelled = CancelToken::new();
+        cancelled.cancel();
+        assert!(locate_proxy_tree(&root, &[source], &cancelled).is_err());
     }
 
     #[test]

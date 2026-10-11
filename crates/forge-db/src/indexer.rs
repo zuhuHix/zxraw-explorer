@@ -176,15 +176,16 @@ impl<'a> Indexer<'a> {
         fs::read_dir(dir)
     }
 
-    fn entry_metadata(&self, entry: &fs::DirEntry, _path: &Path) -> std::io::Result<fs::Metadata> {
+    /// Metadata of an entry without following links, so a junction is judged as itself.
+    fn entry_metadata(&self, path: &Path) -> std::io::Result<fs::Metadata> {
         #[cfg(test)]
-        if self.fail_metadata_paths.contains(_path) {
+        if self.fail_metadata_paths.contains(path) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "injected metadata failure",
             ));
         }
-        entry.metadata()
+        fs::symlink_metadata(path)
     }
 
     /// Mark rows under an entry as observed despite an enumeration error. When the entry's
@@ -260,7 +261,7 @@ impl<'a> Indexer<'a> {
 
         // Root reachable?
         let root_md = match fs::symlink_metadata(&root_path) {
-            Ok(md) if md.is_dir() => md,
+            Ok(md) if kind_of(&md) == EntryKind::Dir => md,
             Ok(_) => {
                 return Err(DbError::Invalid(format!(
                     "index root {root_s} is not a folder"
@@ -291,14 +292,7 @@ impl<'a> Indexer<'a> {
         // Resume or start a pass.
         let state = self.db.index_state(root.id)?;
         let (scan_id, mut stack, resumed) = match state {
-            Some(s)
-                if matches!(
-                    s.status,
-                    ScanStatus::Running | ScanStatus::Interrupted | ScanStatus::Unavailable
-                ) && !s.pending.is_empty() =>
-            {
-                (s.scan_id, s.pending, true)
-            }
+            Some(s) if s.is_resumable() => (s.scan_id, s.pending, true),
             _ => (now_ms(), vec![root_path.clone()], false),
         };
         report.resumed = resumed;
@@ -403,7 +397,7 @@ impl<'a> Indexer<'a> {
                 if exclusions.excludes_name(&name_lc) {
                     continue;
                 }
-                let md = match self.entry_metadata(&de, &path) {
+                let md = match self.entry_metadata(&path) {
                     Ok(md) => md,
                     Err(e) => {
                         report.errors += 1;
@@ -551,8 +545,20 @@ impl<'a> Indexer<'a> {
         let dir_s = normalize_dir(&path_str(dir));
         let dir_path = PathBuf::from(&dir_s);
         let mut report = ReconcileReport::default();
+        self.cancel.check()?;
         let md = match fs::symlink_metadata(&dir_path) {
-            Ok(md) if md.is_dir() => md,
+            Ok(md) if kind_of(&md) == EntryKind::Dir => md,
+            Ok(md) if kind_of(&md) == EntryKind::Link => {
+                let volume = self.volume_for(&dir_path)?;
+                let rows = [new_file(&dir_path, EntryKind::Link, &md)];
+                self.db.with_tx(|tx| {
+                    upsert_files_tx(tx, &rows, Some(volume), None, &mut VolumeCache::new())?;
+                    report.upserted = 1;
+                    report.marked_missing = mark_subtree_missing_tx(tx, &dir_s, false)?;
+                    Ok(())
+                })?;
+                return Ok(report);
+            }
             _ => {
                 report.marked_missing = self
                     .db
@@ -562,9 +568,11 @@ impl<'a> Indexer<'a> {
         };
         let exclusions = self.db.exclusions()?;
         let mut rows = vec![new_file(&dir_path, EntryKind::Dir, &md)];
+        self.cancel.check()?;
         let rd = self
             .read_dir(&dir_path)
             .map_err(|e| DbError::io(&dir_path, e))?;
+        self.cancel.check()?;
         for de in rd {
             self.cancel.check()?;
             let de = de.map_err(|e| DbError::io(&dir_path, e))?;
@@ -574,7 +582,7 @@ impl<'a> Indexer<'a> {
                 continue;
             }
             let md = self
-                .entry_metadata(&de, &path)
+                .entry_metadata(&path)
                 .map_err(|e| DbError::io(&path, e))?;
             let kind = kind_of(&md);
             let excluded = match kind {
@@ -745,5 +753,44 @@ mod tests {
         assert_eq!(report.marked_missing, 0);
         assert!(db.file_by_path(&dir).unwrap().unwrap().present);
         assert!(db.file_by_path(&file).unwrap().unwrap().present);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconcile_records_junction_without_enumerating_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let target = temp.path().join("target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let target_file = target.join("keep.jpg");
+        fs::write(&target_file, b"outside root").unwrap();
+        let junction = root.join("junction");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&target)
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !made {
+            eprintln!("mklink unavailable; skipping");
+            return;
+        }
+
+        let db = Db::open_in_memory().unwrap();
+        let root_id = db.add_index_root(&root).unwrap();
+        Indexer::new(&db).index_root(root_id).unwrap();
+        assert_eq!(
+            db.file_by_path(&junction).unwrap().unwrap().kind,
+            EntryKind::Link
+        );
+        assert!(db.file_by_path(&target_file).unwrap().is_none());
+
+        Indexer::new(&db).reconcile_dir(&junction).unwrap();
+        assert_eq!(
+            db.file_by_path(&junction).unwrap().unwrap().kind,
+            EntryKind::Link
+        );
+        assert!(db.file_by_path(&target_file).unwrap().is_none());
     }
 }

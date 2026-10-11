@@ -20,6 +20,9 @@ quick-xml = "0.41"
 forge-core.workspace = true
 forge-jobs.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Com_StructuredStorage", "Win32_System_Variant"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

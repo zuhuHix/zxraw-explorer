@@ -7,12 +7,18 @@ mod breadcrumb;
 mod collections_ui;
 mod commands;
 mod crash;
+mod dialogs;
+mod dragout;
+mod export_assoc;
 mod extra_tools_ui;
 mod fonts;
+mod gps_ui;
 mod ingest_ui;
 mod library;
 mod media_meta;
+mod meta_export;
 mod modal;
+mod notices;
 mod ops_ui;
 mod pane;
 mod palette;
@@ -23,6 +29,13 @@ mod tags_ui;
 mod settings;
 mod settings_ui;
 mod sidebar;
+mod similar;
+// The automation hook exists only in debug builds or with the `automation` feature;
+// release builds get an inert stub with the same surface.
+#[cfg(any(debug_assertions, feature = "automation"))]
+mod testhook;
+#[cfg(not(any(debug_assertions, feature = "automation")))]
+#[path = "testhook_off.rs"]
 mod testhook;
 mod theme;
 mod thumbs;
@@ -116,7 +129,8 @@ fn main() -> eframe::Result {
         default_hook(info);
     }));
     tracing::info!("ZXraw Explorer {} starting", env!("CARGO_PKG_VERSION"));
-    if let Some(report) = crash::pending_crash_report(&paths) {
+    let pending_crash = crash::pending_crash_report(&paths);
+    if let Some(report) = &pending_crash {
         tracing::warn!(
             "the previous session ended with a crash; report saved at {}",
             report.display()
@@ -143,6 +157,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ZXraw Explorer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths)))),
+        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))),
     )
 }

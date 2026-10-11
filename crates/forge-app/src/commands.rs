@@ -85,6 +85,11 @@ pub enum Cmd {
     CreateArchive,
     SplitFile,
     JoinFiles,
+    GroupSimilar,
+    ExportMetadata,
+    LocateProxies,
+    SelectOriginals,
+    SelectExports,
 }
 
 impl Cmd {
@@ -169,6 +174,11 @@ impl Cmd {
         Cmd::CreateArchive,
         Cmd::SplitFile,
         Cmd::JoinFiles,
+        Cmd::GroupSimilar,
+        Cmd::ExportMetadata,
+        Cmd::LocateProxies,
+        Cmd::SelectOriginals,
+        Cmd::SelectExports,
     ];
 
     pub fn label(self) -> &'static str {
@@ -254,6 +264,11 @@ impl Cmd {
             CreateArchive => "Create zip archive…",
             SplitFile => "Split file into parts…",
             JoinFiles => "Join split parts…",
+            GroupSimilar => "Group bursts & similar photos",
+            ExportMetadata => "Export metadata report…",
+            LocateProxies => "Locate video proxies…",
+            SelectOriginals => "Select originals of exports",
+            SelectExports => "Select exports of originals",
         }
     }
 

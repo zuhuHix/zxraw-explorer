@@ -29,6 +29,7 @@ use chrono::{Datelike, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
+use crate::fault;
 use crate::hashing::{self, Digest, ManifestEntry};
 use crate::ops::{
     self, CopyFileOptions, JobCtx, NodeKind, OpIssue, WalkItem, node_kind, walk_tree,
@@ -535,6 +536,18 @@ pub fn execute_ingest(plan: &IngestPlan, ctx: &JobCtx<'_>) -> Result<IngestRepor
         }
         ctx.progress.add_items(1);
         ctx.progress.set_current(item.source.display().to_string());
+        if fault::source_is_gone(&item.source) {
+            report.missing.push(item.source.clone());
+            ctx.progress.add_error();
+            ctx.log(format!(
+                "missing after device disconnect: {}",
+                item.source.display()
+            ));
+            if item.status != IngestStatus::AlreadyImported {
+                ctx.progress.add_bytes(item.size);
+            }
+            continue;
+        }
         let src_md = match fs::symlink_metadata(&item.source) {
             Ok(m) => m,
             Err(_) => {
