@@ -2,17 +2,19 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Read};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::{RichText, Sense, TextureHandle, Ui};
 use forge_core::model::{EntryKind, FileEntry, MediaKind, ext_of, format_size};
+use forge_core::paths::rename_no_replace;
 use forge_jobs::{CancelToken, JobHandle};
 use forge_media::{FfTools, FilmstripFrame, VideoMetadata};
 use image::RgbaImage;
@@ -29,6 +31,8 @@ const STRIP_CACHE_CAPACITY: usize = 12;
 const MAX_SESSION_GAP: Duration = Duration::from_secs(30 * 60);
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+const RELATED_FOLDER_CACHE_CAPACITY: usize = 16;
+const RELATED_PATHS_PER_FOLDER: usize = 64;
 
 type MediaResult<T> = Result<T, String>;
 
@@ -92,6 +96,12 @@ enum VideoMessage {
         generation: u64,
         result: MediaResult<ProxyEstimate>,
     },
+    Relations {
+        media: MediaKey,
+        generation: u64,
+        take_label: Option<String>,
+        related: Vec<Related>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +120,18 @@ pub enum ClipGroupKind {
 pub struct ClipGroup {
     pub files: Vec<PathBuf>,
     pub kind: ClipGroupKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RelatedFolderKey {
+    directory: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct RelatedScan {
+    take_label: Option<String>,
+    related: Vec<Related>,
 }
 
 /// State for preview extraction. GPU textures and frame data are cached by file path,
@@ -138,6 +160,8 @@ pub struct VideoUi {
     scrub_time: f64,
     exact_scrub_time: bool,
     relation_key: Option<MediaKey>,
+    relation_pending: bool,
+    relation_cache: Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
     take_label: Option<String>,
     related: Vec<Related>,
     proxy_dialog: Option<ProxyDialog>,
@@ -170,6 +194,10 @@ impl Default for VideoUi {
             scrub_time: 0.0,
             exact_scrub_time: false,
             relation_key: None,
+            relation_pending: false,
+            relation_cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(RELATED_FOLDER_CACHE_CAPACITY).expect("non-zero"),
+            ))),
             take_label: None,
             related: Vec::new(),
             proxy_dialog: None,
@@ -212,6 +240,7 @@ impl VideoUi {
         self.scrub_time = 0.0;
         self.exact_scrub_time = false;
         self.relation_key = None;
+        self.relation_pending = false;
         self.take_label = None;
         self.related.clear();
 
@@ -375,7 +404,51 @@ impl VideoUi {
                         }
                     }
                 }
+                VideoMessage::Relations {
+                    media,
+                    generation,
+                    take_label,
+                    related,
+                } => {
+                    if self.selection.as_ref() == Some(&media)
+                        && self.generation == generation
+                        && self.relation_key.as_ref() == Some(&media)
+                    {
+                        self.relation_pending = false;
+                        self.take_label = take_label;
+                        self.related = related;
+                    }
+                }
             }
+        }
+    }
+
+    fn request_relation_scan(&mut self, entry: &FileEntry, ctx: &egui::Context) {
+        let Some(media) = self.selection.clone() else {
+            return;
+        };
+        let generation = self.generation;
+        let path = entry.path.clone();
+        let cache = self.relation_cache.clone();
+        let tx = self.tx.clone();
+        let repaint = ctx.clone();
+        self.relation_key = Some(media.clone());
+        self.relation_pending = true;
+
+        let spawn = std::thread::Builder::new()
+            .name("video-related-scan".into())
+            .spawn(move || {
+                let result = related_scan_cached(&path, &cache);
+                let _ = tx.send(VideoMessage::Relations {
+                    media,
+                    generation,
+                    take_label: result.take_label,
+                    related: result.related,
+                });
+                repaint.request_repaint();
+            });
+        if spawn.is_err() {
+            self.relation_pending = false;
         }
     }
 
@@ -488,6 +561,12 @@ impl VideoUi {
 
         if let Some(label) = &self.take_label {
             ui.label(RichText::new(label).strong().color(crate::theme::ACCENT));
+        }
+        if self.relation_pending {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Scanning related files…");
+            });
         }
 
         if let Some(missing) = &self.missing_tools {
@@ -699,12 +778,7 @@ pub fn preview(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &FileEntry) {
 
     let media = MediaKey::from_entry(entry);
     if app.ops.video_ui.relation_key.as_ref() != Some(&media) {
-        let take_label = clip_label(&app.pane().entries, &entry.path);
-        let related = related_media(&entry.path);
-        let state = &mut app.ops.video_ui;
-        state.relation_key = Some(media);
-        state.take_label = take_label;
-        state.related = related;
+        app.ops.video_ui.request_relation_scan(entry, ui.ctx());
     }
 
     let action = app.ops.video_ui.draw(ui, entry);
@@ -736,22 +810,8 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
 
 /// Opens the proxy dialog for selected video files (or the cursor video if none is selected).
 /// Move a finished temp file to `output` without ever replacing an existing file.
-/// `std::fs::rename` replaces on Windows, so a hard link (which fails if the target exists)
-/// is tried first; file systems without hard links (FAT/exFAT) fall back to a checked rename.
 fn place_no_replace(temp: &Path, output: &Path) -> std::io::Result<()> {
-    match std::fs::hard_link(temp, output) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(temp);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
-        Err(_) => {
-            if output.exists() {
-                return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "output already exists"));
-            }
-            std::fs::rename(temp, output)
-        }
-    }
+    rename_no_replace(temp, output)
 }
 
 pub fn generate_proxies(app: &mut ZxrawApp) {
@@ -1194,17 +1254,30 @@ fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
                     job.progress.add_items(1);
                     continue;
                 }
-                if output.exists() {
+                if forge_core::paths::exists_no_follow(&output) {
                     let line = format!("skipped {}: output already exists", output.display());
                     job.log(line.clone());
                     skipped.push(line);
                     job.progress.add_items(1);
                     continue;
                 }
-                let temp = proxy_temp_path(&output, job.id, index);
-                let args = build_proxy_args(source, &temp, preset);
+                let mut temp = match ProxyTemp::create(&directory, &output, job.id, index) {
+                    Ok(temp) => temp,
+                    Err(error) => {
+                        let line = format!(
+                            "{}: could not create private proxy temp: {error}",
+                            source.display()
+                        );
+                        job.log(line.clone());
+                        failures.push(line);
+                        job.progress.add_error();
+                        job.progress.add_items(1);
+                        continue;
+                    }
+                };
+                let args = build_proxy_args(source, temp.path(), preset);
                 match run_proxy_child(&ffmpeg, &args, *duration, job, &name) {
-                    Ok(()) if !temp.is_file() => {
+                    Ok(()) if !temp.path().is_file() => {
                         let line = format!(
                             "{}: ffmpeg completed without creating a proxy file",
                             source.display()
@@ -1215,36 +1288,37 @@ fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
                         job.progress.add_items(1);
                     }
                     Ok(()) => {
-                        if output.exists() {
-                            let _ = std::fs::remove_file(&temp);
-                            let line = format!(
-                                "skipped {}: output appeared while encoding",
-                                output.display()
-                            );
-                            job.log(line.clone());
-                            skipped.push(line);
-                        } else if let Err(error) = place_no_replace(&temp, &output) {
-                            let _ = std::fs::remove_file(&temp);
-                            let line = format!(
-                                "{}: could not finalize {}: {error}",
-                                source.display(),
-                                output.display()
-                            );
-                            job.log(line.clone());
-                            failures.push(line);
-                            job.progress.add_error();
-                        } else {
-                            completed += 1;
-                            job.log(format!("created {}", output.display()));
+                        match place_no_replace(temp.path(), &output) {
+                            Ok(()) => {
+                                temp.disarm_file();
+                                completed += 1;
+                                job.log(format!("created {}", output.display()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                                let line = format!(
+                                    "skipped {}: output appeared while encoding",
+                                    output.display()
+                                );
+                                job.log(line.clone());
+                                skipped.push(line);
+                            }
+                            Err(error) => {
+                                let line = format!(
+                                    "{}: could not finalize {}: {error}",
+                                    source.display(),
+                                    output.display()
+                                );
+                                job.log(line.clone());
+                                failures.push(line);
+                                job.progress.add_error();
+                            }
                         }
                         job.progress.add_items(1);
                     }
                     Err(error) if error == "operation cancelled" || job.cancel.is_cancelled() => {
-                        let _ = std::fs::remove_file(&temp);
                         break;
                     }
                     Err(error) => {
-                        let _ = std::fs::remove_file(&temp);
                         let line = format!("{}: {error}", source.display());
                         job.log(line.clone());
                         failures.push(line);
@@ -1300,16 +1374,76 @@ fn proxy_output_path(source: &Path, directory: &Path, preset: ProxyPreset) -> Pa
     directory.join(format!("{stem}_proxy.{}", preset.extension()))
 }
 
-fn proxy_temp_path(output: &Path, job_id: u64, index: usize) -> PathBuf {
+struct ProxyTemp {
+    directory: PathBuf,
+    path: PathBuf,
+    owns_file: bool,
+}
+
+impl ProxyTemp {
+    fn create(destination: &Path, output: &Path, job_id: u64, index: usize) -> io::Result<Self> {
+        loop {
+            let directory = create_proxy_temp_dir(destination, job_id, index)?;
+            match Self::reserve(&directory, output) {
+                Ok(temp) => return Ok(temp),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn reserve(directory: &Path, output: &Path) -> io::Result<Self> {
+        let filename = output.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "proxy output has no file name")
+        })?;
+        let path = directory.join(filename);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                drop(file);
+                Ok(Self {
+                    directory: directory.to_path_buf(),
+                    path,
+                    owns_file: true,
+                })
+            }
+            Err(error) => {
+                // This removes only an empty directory we created. If a foreign file is in it,
+                // remove_dir fails and leaves that file untouched.
+                let _ = fs::remove_dir(directory);
+                Err(error)
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm_file(&mut self) {
+        self.owns_file = false;
+    }
+}
+
+impl Drop for ProxyTemp {
+    fn drop(&mut self) {
+        if self.owns_file {
+            let _ = fs::remove_file(&self.path);
+        }
+        // Never recurse into the private directory; a non-empty directory may contain files
+        // this job did not create.
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+fn create_proxy_temp_dir(destination: &Path, job_id: u64, index: usize) -> io::Result<PathBuf> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = output.parent().unwrap_or_else(|| Path::new("."));
-    let stem = output.file_stem().unwrap_or_default().to_string_lossy();
-    let ext = output.extension().unwrap_or_default().to_string_lossy();
     loop {
         let unique = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{stem}.zxraw-{job_id}-{index}-{unique}.{ext}"));
-        if !candidate.exists() {
-            return candidate;
+        let candidate = destination.join(format!(".zxraw-proxy-{job_id}-{index}-{unique}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -1868,6 +2002,82 @@ fn clip_label(entries: &[FileEntry], path: &Path) -> Option<String> {
     })
 }
 
+fn related_scan_cached(
+    path: &Path,
+    cache: &Arc<Mutex<LruCache<RelatedFolderKey, HashMap<PathBuf, RelatedScan>>>>,
+) -> RelatedScan {
+    let directory = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let modified = fs::metadata(&directory)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let folder_key = RelatedFolderKey {
+        directory,
+        modified,
+    };
+
+    {
+        let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(scan) = cache
+            .get(&folder_key)
+            .and_then(|scans| scans.get(path))
+            .cloned()
+        {
+            return scan;
+        }
+    }
+
+    let scan = RelatedScan {
+        take_label: scan_clip_label(path),
+        related: related_media(path),
+    };
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    let mut scans = cache.pop(&folder_key).unwrap_or_default();
+    if scans.len() >= RELATED_PATHS_PER_FOLDER
+        && !scans.contains_key(path)
+        && let Some(oldest_path) = scans.keys().next().cloned()
+    {
+        scans.remove(&oldest_path);
+    }
+    scans.insert(path.to_path_buf(), scan.clone());
+    cache.put(folder_key, scans);
+    scan
+}
+
+fn scan_clip_label(path: &Path) -> Option<String> {
+    let directory = path.parent()?;
+    let entries = fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            let path = entry.path();
+            let ext = ext_of(&path);
+            if forge_core::model::media_kind_for_ext(&ext) != MediaKind::Video {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            Some(FileEntry {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path,
+                kind: EntryKind::File,
+                size: metadata.len(),
+                modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+                hidden: false,
+                readonly: metadata.permissions().readonly(),
+                system: false,
+                ext,
+            })
+        })
+        .collect::<Vec<_>>();
+    clip_label(&entries, path)
+}
+
 fn sequence_name(path: &Path) -> Option<SequenceName> {
     let stem = path.file_stem()?.to_string_lossy().to_ascii_uppercase();
     if let Some(number) = stem.strip_prefix("MVI_").and_then(parse_digits) {
@@ -2178,6 +2388,30 @@ mod tests {
         assert!(!temp.exists());
     }
 
+    #[test]
+    fn proxy_temp_collision_and_cleanup_never_delete_a_foreign_file() {
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("clip_proxy.mp4");
+        let private_dir = create_proxy_temp_dir(destination.path(), 44, 0).unwrap();
+        let foreign = private_dir.join(output.file_name().unwrap());
+        std::fs::write(&foreign, b"foreign output").unwrap();
+
+        assert!(ProxyTemp::reserve(&private_dir, &output).is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign output");
+        assert!(private_dir.exists());
+
+        let mut owned = ProxyTemp::create(destination.path(), &output, 45, 1).unwrap();
+        std::fs::write(owned.path(), b"job output").unwrap();
+        let foreign_sibling = owned.directory.join("foreign.txt");
+        std::fs::write(&foreign_sibling, b"keep this").unwrap();
+        let owned_path = owned.path().to_path_buf();
+        let owned_directory = owned.directory.clone();
+        drop(owned);
+        assert!(!owned_path.exists());
+        assert_eq!(std::fs::read(&foreign_sibling).unwrap(), b"keep this");
+        assert!(owned_directory.exists());
+    }
+
     use super::*;
     use tempfile::TempDir;
 
@@ -2256,7 +2490,11 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].kind, ClipGroupKind::Chapter);
         assert_eq!(groups[0].files.len(), 2);
-        assert!(groups[0].files[0].to_string_lossy().ends_with("GH010456.MP4"));
+        assert!(
+            groups[0].files[0]
+                .to_string_lossy()
+                .ends_with("GH010456.MP4")
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, Result};
 use crate::ops::JobCtx;
+use crate::paths;
 
 const IO_CHUNK: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
@@ -93,6 +94,7 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
         .ok_or_else(|| {
             CoreError::Invalid(format!("split would create more than {MAX_PARTS} parts"))
         })?;
+    preflight_manifest_size(&original_name, source_size, part_size, part_count)?;
 
     let mut final_parts = Vec::with_capacity(part_count);
     for index in 1..=part_count {
@@ -175,6 +177,7 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
         };
         let bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| CoreError::Invalid(format!("could not encode split manifest: {e}")))?;
+        ensure_manifest_size(&bytes)?;
         let (temp_path, mut output, mut guard) = create_temp(&manifest_path)?;
         output
             .write_all(&bytes)
@@ -210,6 +213,14 @@ pub fn split_file(source: &Path, part_size: u64, ctx: &JobCtx<'_>) -> Result<Spl
 /// The output is placed beside the manifest under `original_name`. It is only
 /// published after all lengths and hashes match, and an existing output is an error.
 pub fn join_files(input: &Path, ctx: &JobCtx<'_>) -> Result<JoinReport> {
+    join_files_with_free_space(input, ctx, free_space_available)
+}
+
+fn join_files_with_free_space(
+    input: &Path,
+    ctx: &JobCtx<'_>,
+    free_space: impl Fn(&Path) -> io::Result<u64>,
+) -> Result<JoinReport> {
     let manifest_path = manifest_path_for(input)?;
     let metadata = fs::metadata(&manifest_path).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
@@ -232,6 +243,7 @@ pub fn join_files(input: &Path, ctx: &JobCtx<'_>) -> Result<JoinReport> {
     validate_manifest(&manifest)?;
     let parent = manifest_path.parent().unwrap_or(Path::new("."));
     let output_path = parent.join(&manifest.original_name);
+    ensure_free_space(parent, manifest.original_size, free_space)?;
     if exists(&output_path) {
         return Err(CoreError::AlreadyExists(output_path));
     }
@@ -251,12 +263,12 @@ pub fn join_files(input: &Path, ctx: &JobCtx<'_>) -> Result<JoinReport> {
                 manifest.parts.len()
             ));
             let part_path = parent.join(&part.name);
-            let mut input = match File::open(&part_path) {
+            let mut input = match open_regular_part(&part_path) {
                 Ok(f) => f,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(CoreError::NotFound(_)) => {
                     return Err(CoreError::Invalid(format!("missing part {}", part.name)));
                 }
-                Err(e) => return Err(CoreError::io(&part_path, e)),
+                Err(e) => return Err(e),
             };
             let actual_size = input
                 .metadata()
@@ -420,6 +432,154 @@ fn validate_manifest(manifest: &SplitManifest) -> Result<()> {
     Ok(())
 }
 
+fn preflight_manifest_size(
+    original_name: &str,
+    original_size: u64,
+    part_size: u64,
+    part_count: usize,
+) -> Result<()> {
+    // Even a minimal pretty-printed part uses more than 100 bytes. Reject larger counts
+    // before allocating the upper-bound manifest used to account for actual name lengths.
+    if (part_count as u64).saturating_mul(100) > MAX_MANIFEST_BYTES {
+        return Err(manifest_too_large());
+    }
+    let parts = (1..=part_count)
+        .map(|index| SplitPart {
+            name: format!("{original_name}.{index:03}"),
+            size: part_size,
+            blake3: "0".repeat(64),
+        })
+        .collect();
+    let upper_bound = SplitManifest {
+        original_name: original_name.to_owned(),
+        original_size,
+        part_size,
+        parts,
+        whole_blake3: "0".repeat(64),
+    };
+    let bytes = serde_json::to_vec_pretty(&upper_bound)
+        .map_err(|e| CoreError::Invalid(format!("could not size split manifest: {e}")))?;
+    ensure_manifest_size(&bytes)
+}
+
+fn ensure_manifest_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(manifest_too_large());
+    }
+    Ok(())
+}
+
+fn manifest_too_large() -> CoreError {
+    CoreError::Invalid(format!(
+        "split manifest would exceed {MAX_MANIFEST_BYTES} bytes, the join limit"
+    ))
+}
+
+fn ensure_free_space(
+    volume_path: &Path,
+    required: u64,
+    free_space: impl Fn(&Path) -> io::Result<u64>,
+) -> Result<()> {
+    let available = free_space(volume_path).map_err(|e| CoreError::io(volume_path, e))?;
+    if available < required {
+        return Err(CoreError::Invalid(format!(
+            "not enough free space on the output volume: need {required} bytes, have {available}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn free_space_available(path: &Path) -> io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available = 0u64;
+    // SAFETY: wide is NUL-terminated and all output pointers remain valid for the call.
+    unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&mut available), None, None) }
+        .map_err(io::Error::other)?;
+    Ok(available)
+}
+
+#[cfg(not(windows))]
+fn free_space_available(_path: &Path) -> io::Result<u64> {
+    // The production target is Windows; keep other targets buildable where the standard
+    // library does not expose a portable free-space query.
+    Ok(u64::MAX)
+}
+
+fn open_regular_part(path: &Path) -> Result<File> {
+    let expected = fs::symlink_metadata(path).map_err(|e| CoreError::io(path, e))?;
+    if !is_regular_non_reparse(&expected) {
+        return Err(CoreError::UnsafePath(format!(
+            "split part {} is not a regular file (links and reparse points are not allowed)",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    let file = options.open(path).map_err(|e| CoreError::io(path, e))?;
+    let opened = file.metadata().map_err(|e| CoreError::io(path, e))?;
+    if !is_regular_non_reparse(&opened) || !same_file(&expected, &opened) {
+        return Err(CoreError::UnsafePath(format!(
+            "split part {} changed while it was opened",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn is_regular_non_reparse(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    // The part is opened with FILE_FLAG_OPEN_REPARSE_POINT and the opened handle is
+    // re-checked to be a non-reparse regular file, so links are never followed. The file
+    // index API is unstable on stable Rust; a regular file swapped in between is caught by
+    // size/timestamps here and by the per-part BLAKE3 verification anyway.
+    use std::os::windows::fs::MetadataExt;
+    left.file_size() == right.file_size()
+        && left.last_write_time() == right.last_write_time()
+        && left.creation_time() == right.creation_time()
+}
+
+#[cfg(unix)]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+}
+
 fn is_single_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -461,25 +621,22 @@ fn create_temp(final_path: &Path) -> Result<(PathBuf, File, TempGuard)> {
 }
 
 fn publish_temp(temp: &Path, final_path: &Path) -> Result<()> {
-    // std::fs::rename replaces an existing destination on Windows and POSIX, and hard links
-    // are unavailable on FAT32. Reserve the name exclusively first; the rename then only
-    // replaces our own empty placeholder, so a file created after the earlier existence
-    // check is never clobbered.
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(final_path)
-    {
-        Ok(_) => {}
+    publish_temp_with(temp, final_path, || Ok(()))
+}
+
+fn publish_temp_with(
+    temp: &Path,
+    final_path: &Path,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    before_publish()?;
+    match paths::rename_no_replace(temp, final_path) {
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return Err(CoreError::AlreadyExists(final_path.to_path_buf()));
+            Err(CoreError::AlreadyExists(final_path.to_path_buf()))
         }
-        Err(e) => return Err(CoreError::io(final_path, e)),
+        Err(e) => Err(CoreError::io(final_path, e)),
     }
-    fs::rename(temp, final_path).map_err(|e| {
-        let _ = fs::remove_file(final_path);
-        CoreError::io(final_path, e)
-    })
 }
 
 fn read_retry(reader: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
@@ -769,6 +926,88 @@ mod tests {
         ));
         assert_eq!(fs::read(&final_path).unwrap(), b"someone else's file");
         assert!(staged.exists());
+    }
+
+    #[test]
+    fn simulated_crash_before_publish_leaves_no_final_name() {
+        let temp = TempDir::new().unwrap();
+        let staged = temp.path().join("staged.tmp");
+        let final_path = temp.path().join("complete.bin");
+        fs::write(&staged, b"complete data").unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            let _ = publish_temp_with(&staged, &final_path, || {
+                panic!("simulated process crash before publish")
+            });
+        });
+        assert!(result.is_err());
+        assert!(!final_path.exists());
+        assert!(staged.exists());
+    }
+
+    #[test]
+    fn split_rejects_many_parts_that_would_exceed_join_manifest_limit() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("many.bin");
+        fs::write(&input, vec![7u8; 60_000]).unwrap();
+
+        let error = run_split(&input, 1).unwrap_err().to_string();
+        assert!(error.contains("manifest would exceed"), "{error}");
+        assert!(!temp.path().join("many.bin.001").exists());
+        assert!(!temp.path().join("many.bin.b3split").exists());
+    }
+
+    #[test]
+    fn join_refuses_insufficient_space_before_creating_output() {
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("space.bin");
+        fs::write(&input, b"content needing space").unwrap();
+        let report = run_split(&input, 5).unwrap();
+        fs::remove_file(&input).unwrap();
+
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let error =
+            join_files_with_free_space(&report.manifest, &ctx(&cancel, &progress), |_| Ok(0))
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("not enough free space"), "{error}");
+        assert!(!input.exists());
+        assert!(!temp.path().read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".forge-partial-")
+        }));
+    }
+
+    #[test]
+    fn join_rejects_symlinked_part() {
+        let temp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let input = temp.path().join("linked.bin");
+        let target = outside.path().join("target.bin");
+        fs::write(&input, b"part data").unwrap();
+        fs::write(&target, b"part data").unwrap();
+        let report = run_split(&input, 4).unwrap();
+        fs::remove_file(&input).unwrap();
+        fs::remove_file(&report.parts[0]).unwrap();
+
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&target, &report.parts[0]);
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_file(&target, &report.parts[0]);
+        if link_result.is_err() {
+            return;
+        }
+
+        let error = run_join(&report.manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("not a regular file") || error.contains("changed while it was opened"),
+            "{error}"
+        );
+        assert!(!input.exists());
     }
 
     #[test]

@@ -65,7 +65,35 @@ struct CardMessage {
     sources: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IngestBinding {
+    sources: Vec<PathBuf>,
+    destination: PathBuf,
+    folder_template: String,
+    file_template: String,
+    project: String,
+    client: String,
+    shoot: String,
+    extensions: Option<Vec<String>>,
+}
+
+impl IngestBinding {
+    fn from_spec(spec: &IngestSpec) -> Self {
+        Self {
+            sources: spec.sources.clone(),
+            destination: spec.dest_root.clone(),
+            folder_template: spec.folder_template.clone(),
+            file_template: spec.file_template.clone(),
+            project: spec.project.clone(),
+            client: spec.client.clone(),
+            shoot: spec.shoot.clone(),
+            extensions: spec.extensions.clone(),
+        }
+    }
+}
+
 struct ImportCompletion {
+    binding: IngestBinding,
     report: IngestReport,
     format_check: Option<FormatCheck>,
     format_error: Option<String>,
@@ -170,6 +198,7 @@ impl IngestState {
 
     fn invalidate_preview(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        self.report = None;
         if let Some(cancel) = &self.preview_cancel {
             cancel.cancel();
         }
@@ -194,6 +223,19 @@ impl IngestState {
         // name. Keep a manifest so a later safety check can be audited.
         spec.write_manifest = true;
         spec
+    }
+
+    fn report_binding(&self) -> IngestBinding {
+        IngestBinding {
+            sources: self.sources.clone(),
+            destination: PathBuf::from(self.destination.trim()),
+            folder_template: self.folder_template.clone(),
+            file_template: self.file_template.clone(),
+            project: self.project.clone(),
+            client: self.client.clone(),
+            shoot: self.shoot.clone(),
+            extensions: filter_extensions(self.filter),
+        }
     }
 
     fn prefs(&self) -> IngestPrefs {
@@ -244,10 +286,11 @@ impl IngestState {
             self.import_running = false;
             self.import_job = None;
             match message {
-                Ok(report) => {
-                    self.report = Some(report);
+                Ok(completion) if completion.binding == self.report_binding() => {
+                    self.report = Some(completion);
                     self.import_error = None;
                 }
+                Ok(_) => self.report = None,
                 Err(error) => self.import_error = Some(error),
             }
         }
@@ -640,7 +683,11 @@ fn show_contents(
             show_preview(ui, state);
 
             ui.add_space(10.0);
-            if let Some(report) = &state.report {
+            if let Some(report) = state
+                .report
+                .as_ref()
+                .filter(|report| report.binding == state.report_binding())
+            {
                 show_report(ui, report);
             }
             if let Some(error) = &state.import_error {
@@ -1127,6 +1174,7 @@ fn execute_import(plan: &IngestPlan, job: &JobHandle) -> Result<ImportCompletion
         Err(error) => (None, Some(error.to_string())),
     };
     Ok(ImportCompletion {
+        binding: IngestBinding::from_spec(&plan.spec),
         report,
         format_check,
         format_error,
@@ -1228,6 +1276,57 @@ mod tests {
         assert!(state.preview_due.is_some());
         assert_eq!(state.planned_revision, None);
         assert!(!should_launch_plan(state.preview_due, Instant::now()));
+    }
+
+    #[test]
+    fn ingest_report_is_cleared_when_sources_destination_or_templates_change() {
+        fn completion(binding: IngestBinding) -> ImportCompletion {
+            ImportCompletion {
+                binding,
+                report: IngestReport::default(),
+                format_check: None,
+                format_error: None,
+            }
+        }
+
+        let mut state = IngestState::default();
+        state.sources = vec![PathBuf::from("card-a")];
+        state.destination = "library".into();
+        let card_a_binding = state.report_binding();
+        state.report = Some(completion(card_a_binding.clone()));
+        state.sources = vec![PathBuf::from("card-b")];
+        state.invalidate_preview();
+        assert!(state.import_tx.send(Ok(completion(card_a_binding))).is_ok());
+        state.poll();
+        assert!(state.report.is_none());
+
+        state.report = Some(completion(state.report_binding()));
+        state.destination = "other-library".into();
+        state.invalidate_preview();
+        assert!(state.report.is_none());
+
+        state.report = Some(completion(state.report_binding()));
+        state.folder_template = "{YYYY}".into();
+        state.invalidate_preview();
+        assert!(state.report.is_none());
+
+        state.report = Some(completion(state.report_binding()));
+        state.file_template = "{orig_name}-{seq}".into();
+        state.invalidate_preview();
+        assert!(state.report.is_none());
+
+        let old_template_values = state.report_binding();
+        state.report = Some(completion(old_template_values.clone()));
+        state.client = "new client".into();
+        state.invalidate_preview();
+        assert!(
+            state
+                .import_tx
+                .send(Ok(completion(old_template_values)))
+                .is_ok()
+        );
+        state.poll();
+        assert!(state.report.is_none());
     }
 
     #[test]

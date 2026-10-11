@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use egui::{RichText, Ui};
@@ -38,9 +38,10 @@ pub struct CardWatch {
     /// Roots the user dismissed ("Not now" or imported). Cleared when the card is removed.
     dismissed: HashSet<PathBuf>,
     /// Cards whose camera-folder check is running.
-    pending: HashMap<PathBuf, Drive>,
-    results_tx: Sender<(PathBuf, bool)>,
-    results_rx: Receiver<(PathBuf, bool)>,
+    pending: HashMap<PathBuf, (Drive, u64)>,
+    next_generation: u64,
+    results_tx: Sender<(PathBuf, u64, bool)>,
+    results_rx: Receiver<(PathBuf, u64, bool)>,
     /// Cards that have a camera folder and are waiting for an answer.
     pub prompts: Vec<Drive>,
 }
@@ -52,6 +53,7 @@ impl Default for CardWatch {
             present: HashSet::new(),
             dismissed: HashSet::new(),
             pending: HashMap::new(),
+            next_generation: 0,
             results_tx,
             results_rx,
             prompts: Vec::new(),
@@ -75,7 +77,9 @@ impl CardWatch {
             .cloned()
             .collect::<Vec<_>>();
         for card in &arrived {
-            self.pending.insert(card.root.clone(), card.clone());
+            self.next_generation = self.next_generation.wrapping_add(1);
+            self.pending
+                .insert(card.root.clone(), (card.clone(), self.next_generation));
         }
         self.present = current;
         arrived
@@ -83,8 +87,15 @@ impl CardWatch {
 
     /// Record a finished check. Only a card that is still present, has a camera folder and was
     /// not dismissed gets a prompt; results for removed cards are dropped.
-    fn finish(&mut self, root: &Path, has_camera_folder: bool) {
-        let Some(card) = self.pending.remove(root) else {
+    fn finish(&mut self, root: &Path, generation: u64, has_camera_folder: bool) {
+        if !self
+            .pending
+            .get(root)
+            .is_some_and(|(_, pending_generation)| *pending_generation == generation)
+        {
+            return;
+        }
+        let Some((card, _)) = self.pending.remove(root) else {
             return;
         };
         if has_camera_folder && self.present.contains(root) && !self.dismissed.contains(root) {
@@ -110,18 +121,23 @@ impl CardWatch {
             let tx = self.results_tx.clone();
             let repaint = ctx.clone();
             let root = card.root.clone();
+            let generation = self
+                .pending
+                .get(&root)
+                .map(|(_, generation)| *generation)
+                .expect("arrived card has a pending generation");
             let spawned = std::thread::Builder::new()
                 .name("card-check".into())
                 .spawn(move || {
-                    let _ = tx.send((root.clone(), has_camera_folder(&root)));
+                    let _ = tx.send((root.clone(), generation, has_camera_folder(&root)));
                     repaint.request_repaint();
                 });
             if spawned.is_err() {
                 self.pending.remove(&card.root);
             }
         }
-        while let Ok((root, has_camera_folder)) = self.results_rx.try_recv() {
-            self.finish(&root, has_camera_folder);
+        while let Ok((root, generation, has_camera_folder)) = self.results_rx.try_recv() {
+            self.finish(&root, generation, has_camera_folder);
         }
     }
 }
@@ -345,11 +361,19 @@ mod card_tests {
         cards.iter().map(|c| c.root.clone()).collect()
     }
 
+    fn finish_current(watch: &mut CardWatch, root: &Path, has_camera_folder: bool) {
+        let generation = watch.pending.get(root).unwrap().1;
+        watch.finish(root, generation, has_camera_folder);
+    }
+
     #[test]
     fn arrival_requests_one_check() {
         let mut watch = CardWatch::default();
         let e = card(r"E:\");
-        assert_eq!(roots(&watch.observe(std::slice::from_ref(&e))), vec![e.root.clone()]);
+        assert_eq!(
+            roots(&watch.observe(std::slice::from_ref(&e))),
+            vec![e.root.clone()]
+        );
         assert!(watch.observe(std::slice::from_ref(&e)).is_empty());
     }
 
@@ -358,8 +382,8 @@ mod card_tests {
         let mut watch = CardWatch::default();
         let (e, f) = (card(r"E:\"), card(r"F:\"));
         watch.observe(&[e.clone(), f.clone()]);
-        watch.finish(&e.root, true);
-        watch.finish(&f.root, false);
+        finish_current(&mut watch, &e.root, true);
+        finish_current(&mut watch, &f.root, false);
         assert_eq!(roots(&watch.prompts), vec![e.root]);
     }
 
@@ -368,19 +392,41 @@ mod card_tests {
         let mut watch = CardWatch::default();
         let e = card(r"E:\");
         watch.observe(std::slice::from_ref(&e));
-        watch.finish(&e.root, true);
+        finish_current(&mut watch, &e.root, true);
         watch.dismiss(&e.root);
         assert!(watch.prompts.is_empty());
 
         // Still inserted: no new check, so no prompt even if a late result arrives.
         assert!(watch.observe(std::slice::from_ref(&e)).is_empty());
-        watch.finish(&e.root, true);
         assert!(watch.prompts.is_empty());
 
         // Removed, then inserted again: it is a new card and prompts again.
         assert!(watch.observe(&[]).is_empty());
-        assert_eq!(roots(&watch.observe(std::slice::from_ref(&e))), vec![e.root.clone()]);
-        watch.finish(&e.root, true);
+        assert_eq!(
+            roots(&watch.observe(std::slice::from_ref(&e))),
+            vec![e.root.clone()]
+        );
+        finish_current(&mut watch, &e.root, true);
+        assert_eq!(roots(&watch.prompts), vec![e.root]);
+    }
+
+    #[test]
+    fn removed_and_reinserted_card_discards_the_old_generation() {
+        let mut watch = CardWatch::default();
+        let e = card(r"E:\");
+        watch.observe(std::slice::from_ref(&e));
+        let old_generation = watch.pending.get(&e.root).unwrap().1;
+
+        watch.observe(&[]);
+        watch.observe(std::slice::from_ref(&e));
+        let new_generation = watch.pending.get(&e.root).unwrap().1;
+        assert_ne!(new_generation, old_generation);
+
+        watch.finish(&e.root, old_generation, true);
+        assert!(watch.prompts.is_empty());
+        assert_eq!(watch.pending.get(&e.root).unwrap().1, new_generation);
+
+        watch.finish(&e.root, new_generation, true);
         assert_eq!(roots(&watch.prompts), vec![e.root]);
     }
 
@@ -389,8 +435,9 @@ mod card_tests {
         let mut watch = CardWatch::default();
         let e = card(r"E:\");
         watch.observe(std::slice::from_ref(&e));
+        let generation = watch.pending.get(&e.root).unwrap().1;
         assert!(watch.observe(&[]).is_empty());
-        watch.finish(&e.root, true);
+        watch.finish(&e.root, generation, true);
         assert!(watch.prompts.is_empty());
     }
 
@@ -399,7 +446,7 @@ mod card_tests {
         let mut watch = CardWatch::default();
         let e = card(r"E:\");
         watch.observe(std::slice::from_ref(&e));
-        watch.finish(&e.root, true);
+        finish_current(&mut watch, &e.root, true);
         assert_eq!(watch.prompts.len(), 1);
         watch.observe(&[]);
         assert!(watch.prompts.is_empty());
@@ -410,8 +457,8 @@ mod card_tests {
         let mut watch = CardWatch::default();
         let (e, f) = (card(r"E:\"), card(r"F:\"));
         watch.observe(&[e.clone(), f.clone()]);
-        watch.finish(&e.root, true);
-        watch.finish(&f.root, true);
+        finish_current(&mut watch, &e.root, true);
+        finish_current(&mut watch, &f.root, true);
         watch.dismiss(&e.root);
         assert_eq!(roots(&watch.prompts), vec![f.root]);
     }

@@ -20,7 +20,8 @@
 //! appended. `{seq}` numbers files in capture-time order within one plan.
 
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -749,15 +750,70 @@ fn write_ingest_manifest(dest_root: &Path, report: &IngestReport) -> Result<Path
         .collect();
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let b3 = paths::unique_name(dest_root, &format!("forge-ingest-{stamp}.b3"));
-    hashing::write_manifest(&b3, &entries)?;
+    let base_name = format!("forge-ingest-{stamp}.b3");
+    let manifest_text = hashing::format_manifest(&entries);
+    let mut b3 = paths::unique_name(dest_root, &base_name);
+    let mut manifest_written = false;
+    for _ in 0..32 {
+        match write_ingest_atomic_no_replace(&b3, manifest_text.as_bytes()) {
+            Ok(()) => {
+                manifest_written = true;
+                break;
+            }
+            Err(CoreError::AlreadyExists(_)) => {
+                b3 = paths::unique_name(dest_root, &base_name);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !manifest_written {
+        return Err(CoreError::AlreadyExists(b3));
+    }
     let json = b3.with_extension("json");
     if !paths::exists_no_follow(&json) {
         let text =
             serde_json::to_string_pretty(report).map_err(|e| CoreError::Invalid(e.to_string()))?;
-        hashing::write_atomic(&json, text.as_bytes())?;
+        match write_ingest_atomic_no_replace(&json, text.as_bytes()) {
+            Ok(()) | Err(CoreError::AlreadyExists(_)) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(b3)
+}
+
+fn write_ingest_atomic_no_replace(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    for _ in 0..32 {
+        let temp = dir.join(ops::partial_name());
+        let mut output = match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(CoreError::io(&temp, e)),
+        };
+        let write_result = (|| -> io::Result<()> {
+            output.write_all(data)?;
+            output.sync_all()
+        })();
+        drop(output);
+        if let Err(e) = write_result {
+            let _ = fs::remove_file(&temp);
+            return Err(CoreError::io(&temp, e));
+        }
+        match paths::rename_no_replace(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = fs::remove_file(&temp);
+                return Err(CoreError::io(path, e));
+            }
+        }
+    }
+    Err(CoreError::Invalid(format!(
+        "could not create a temporary manifest beside {}",
+        path.display()
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +976,17 @@ mod tests {
 
     fn ctx_parts() -> (CancelToken, Progress) {
         (CancelToken::new(), Progress::default())
+    }
+
+    #[test]
+    fn ingest_manifest_publish_does_not_replace_a_racing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let dest = temp.path().join("manifest.b3");
+        fs::write(&dest, b"racing file").unwrap();
+
+        let error = write_ingest_atomic_no_replace(&dest, b"new manifest").unwrap_err();
+        assert!(matches!(error, CoreError::AlreadyExists(_)));
+        assert_eq!(fs::read(&dest).unwrap(), b"racing file");
     }
 
     struct Card {

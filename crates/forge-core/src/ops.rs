@@ -415,15 +415,17 @@ pub fn copy_file_atomic(
     ctx: &JobCtx<'_>,
 ) -> Result<CopyOutcome> {
     let mut counted = 0;
-    copy_file_counted(src, dest, opts, ctx, &mut counted)
+    let mut dest = dest.to_path_buf();
+    copy_file_counted(src, &mut dest, opts, ctx, &mut counted, false)
 }
 
 fn copy_file_counted(
     src: &Path,
-    dest: &Path,
+    dest: &mut PathBuf,
     opts: CopyFileOptions,
     ctx: &JobCtx<'_>,
     counted: &mut u64,
+    keep_both: bool,
 ) -> Result<CopyOutcome> {
     let f = File::open(src).map_err(|e| CoreError::io(src, e))?;
     let md = f.metadata().map_err(|e| CoreError::io(src, e))?;
@@ -443,7 +445,7 @@ fn copy_file_counted(
         limit: None,
         attributes,
     };
-    stream_into_place(f, src, dest, sopts, ctx, counted)
+    stream_into_place(f, src, dest, sopts, ctx, counted, keep_both)
 }
 
 /// Write an arbitrary stream (e.g. an archive entry) to `dest` with the same temp-file +
@@ -455,17 +457,33 @@ pub fn write_stream_atomic<R: Read>(
     opts: StreamOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<CopyOutcome> {
+    write_stream_placed(reader, label, dest, opts, false, ctx).map(|(out, _)| out)
+}
+
+/// Like [`write_stream_atomic`], but when `keep_both` is set and `dest` is taken at publish
+/// time, the next free name is used. Returns the final path actually written.
+pub(crate) fn write_stream_placed<R: Read>(
+    reader: R,
+    label: &Path,
+    dest: &Path,
+    opts: StreamOptions,
+    keep_both: bool,
+    ctx: &JobCtx<'_>,
+) -> Result<(CopyOutcome, PathBuf)> {
     let mut counted = 0;
-    stream_into_place(reader, label, dest, opts, ctx, &mut counted)
+    let mut placed = dest.to_path_buf();
+    let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, keep_both)?;
+    Ok((out, placed))
 }
 
 fn stream_into_place<R: Read>(
     mut reader: R,
     label: &Path,
-    dest: &Path,
+    dest: &mut PathBuf,
     opts: StreamOptions,
     ctx: &JobCtx<'_>,
     counted: &mut u64,
+    keep_both: bool,
 ) -> Result<CopyOutcome> {
     let dir = dest
         .parent()
@@ -481,7 +499,9 @@ fn stream_into_place<R: Read>(
             oo.attributes(opts.attributes);
         }
     }
-    let mut out = oo.open(&tmp).map_err(|e| CoreError::io(dest, e))?;
+    let mut out = oo
+        .open(&tmp)
+        .map_err(|e| CoreError::io(dest.as_path(), e))?;
     let mut guard = TempGuard(Some(tmp.clone()));
 
     let mut hasher = (opts.verify || opts.want_hash).then(blake3::Hasher::new);
@@ -505,7 +525,7 @@ fn stream_into_place<R: Read>(
             )));
         }
         out.write_all(&buf[..n])
-            .map_err(|e| CoreError::io(dest, e))?;
+            .map_err(|e| CoreError::io(dest.as_path(), e))?;
         if let Some(h) = hasher.as_mut() {
             h.update(&buf[..n]);
         }
@@ -526,7 +546,8 @@ fn stream_into_place<R: Read>(
             dest.display()
         ));
     }
-    out.sync_all().map_err(|e| CoreError::io(dest, e))?;
+    out.sync_all()
+        .map_err(|e| CoreError::io(dest.as_path(), e))?;
     drop(out);
 
     let source_hash = hasher.map(|h| *h.finalize().as_bytes());
@@ -541,7 +562,23 @@ fn stream_into_place<R: Read>(
         }
     }
     ctx.cancel.check()?;
-    place(&tmp, dest, opts.overwrite)?;
+    let mut placed = false;
+    for _ in 0..1024 {
+        match place(&tmp, dest, opts.overwrite) {
+            Ok(()) => {
+                placed = true;
+                break;
+            }
+            Err(CoreError::AlreadyExists(_)) if keep_both && !opts.overwrite => {
+                let dir = dest.parent().unwrap_or(Path::new(""));
+                *dest = paths::unique_name(dir, &paths::name_of(dest));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if !placed {
+        return Err(CoreError::AlreadyExists(dest.clone()));
+    }
     guard.disarm();
     if opts.readonly
         && let Err(e) = set_readonly(dest)
@@ -554,7 +591,7 @@ fn stream_into_place<R: Read>(
     })
 }
 
-/// Move a finished temp file to its final name.
+/// Move a finished temp file to its final name, respecting an explicit overwrite policy.
 pub(crate) fn place(tmp: &Path, dest: &Path, overwrite: bool) -> Result<()> {
     let io = |e| CoreError::io(dest, e);
     if overwrite {
@@ -563,24 +600,13 @@ pub(crate) fn place(tmp: &Path, dest: &Path, overwrite: bool) -> Result<()> {
         }
         return fs::rename(tmp, dest).map_err(io);
     }
-    // No-replace placement: a hard link fails atomically if `dest` exists. Filesystems
-    // without hard links (FAT/exFAT) fall back to check-then-rename.
-    match fs::hard_link(tmp, dest) {
-        Ok(()) => {
-            if let Err(e) = fs::remove_file(tmp) {
-                tracing::warn!("could not remove temp link {}: {e}", tmp.display());
-            }
-            Ok(())
-        }
+    // No check-then-rename fallback: rename_no_replace keeps publication atomic.
+    match paths::rename_no_replace(tmp, dest) {
+        Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
             Err(CoreError::AlreadyExists(dest.to_path_buf()))
         }
-        Err(_) => {
-            if paths::exists_no_follow(dest) {
-                return Err(CoreError::AlreadyExists(dest.to_path_buf()));
-            }
-            fs::rename(tmp, dest).map_err(io)
-        }
+        Err(e) => Err(io(e)),
     }
 }
 
@@ -1014,10 +1040,7 @@ pub fn undo(rec: &UndoRecord) -> Result<()> {
 }
 
 fn rename_back(current: &Path, original: &Path) -> Result<()> {
-    if paths::exists_no_follow(original) {
-        return Err(CoreError::AlreadyExists(original.to_path_buf()));
-    }
-    fs::rename(current, original).map_err(|e| CoreError::io(current, e))
+    paths::rename_no_replace(current, original).map_err(|e| CoreError::io(original, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,6 +1090,7 @@ pub fn execute_with(
 
 enum Placement {
     New(PathBuf),
+    KeepBoth(PathBuf),
     Merge(PathBuf),
     Overwrite(PathBuf),
     Skip(String),
@@ -1196,7 +1220,7 @@ impl Executor<'_, '_, '_> {
     ) -> Result<Placement> {
         if is_root && paths::paths_equal(src, &dest) {
             // Copy into the folder it already lives in: always keep both.
-            return Ok(Placement::New(Self::unique(&dest, item.kind)));
+            return Ok(Placement::KeepBoth(Self::unique(&dest, item.kind)));
         }
         let Ok(dmd) = fs::symlink_metadata(&dest) else {
             return Ok(Placement::New(dest));
@@ -1204,7 +1228,7 @@ impl Executor<'_, '_, '_> {
         let dkind = node_kind(&dmd);
         if item.kind == NodeKind::Dir && dkind == NodeKind::Dir {
             if is_root && self.policy == ConflictPolicy::KeepBoth {
-                return Ok(Placement::New(Self::unique(&dest, item.kind)));
+                return Ok(Placement::KeepBoth(Self::unique(&dest, item.kind)));
             }
             return Ok(Placement::Merge(dest));
         }
@@ -1230,7 +1254,7 @@ impl Executor<'_, '_, '_> {
         };
         Ok(match self.decide(&info)? {
             ConflictDecision::Skip => Placement::Skip("already exists at the destination".into()),
-            ConflictDecision::KeepBoth => Placement::New(Self::unique(&dest, item.kind)),
+            ConflictDecision::KeepBoth => Placement::KeepBoth(Self::unique(&dest, item.kind)),
             d @ (ConflictDecision::Overwrite | ConflictDecision::OverwriteIfNewer) => {
                 let newer = matches!(
                     (info.source_modified, info.dest_modified),
@@ -1250,6 +1274,87 @@ impl Executor<'_, '_, '_> {
             }
             ConflictDecision::Cancel => unreachable!("handled in decide"),
         })
+    }
+
+    fn create_new_dir(&mut self, path: PathBuf, keep_both: bool) -> Option<PathBuf> {
+        let mut path = path;
+        for _ in 0..1024 {
+            match fs::create_dir(&path) {
+                Ok(()) => return Some(path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && keep_both => {
+                    path = Self::unique(&path, NodeKind::Dir);
+                }
+                Err(e) => {
+                    self.fail(&path, CoreError::io(&path, e).to_string());
+                    return None;
+                }
+            }
+        }
+        self.fail(&path, CoreError::AlreadyExists(path.clone()).to_string());
+        None
+    }
+
+    fn prepare_new_root_dir(
+        &mut self,
+        src_root: &Path,
+        items: &[PlanItem],
+        root_bytes: u64,
+        mut dest: PathBuf,
+        keep_both: bool,
+    ) -> Option<PathBuf> {
+        if self.try_rename {
+            for _ in 0..1024 {
+                match paths::rename_no_replace(src_root, &dest) {
+                    Ok(()) => {
+                        self.consume(items);
+                        self.report.bytes += root_bytes;
+                        self.report.done.push(dest.clone());
+                        self.report.undo.push(UndoRecord::Moved {
+                            from: src_root.to_path_buf(),
+                            to: dest,
+                        });
+                        return None;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && keep_both => {
+                        dest = Self::unique(&dest, NodeKind::Dir);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        self.fail(src_root, CoreError::AlreadyExists(dest).to_string());
+                        self.consume(items);
+                        return None;
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound
+                            && !paths::exists_no_follow(src_root) =>
+                    {
+                        self.fail(src_root, VANISHED);
+                        self.consume(items);
+                        return None;
+                    }
+                    Err(e) => {
+                        self.try_rename = false;
+                        self.ctx.log(format!(
+                            "{}: rename not possible ({e}); copying instead",
+                            src_root.display()
+                        ));
+                        break;
+                    }
+                }
+            }
+            if self.try_rename {
+                self.fail(
+                    src_root,
+                    "could not find a free destination after repeated conflicts",
+                );
+                self.consume(items);
+                return None;
+            }
+        }
+        let created = self.create_new_dir(dest, keep_both);
+        if created.is_none() {
+            self.consume(items);
+        }
+        created
     }
 
     fn run_root(&mut self, root: &PlanRoot, items: &[PlanItem]) -> Result<()> {
@@ -1283,40 +1388,21 @@ impl Executor<'_, '_, '_> {
         let src_root = &root.source;
         let (dest_root, fresh) =
             match self.placement(src_root, &items[0], root.dest.clone(), true)? {
-                Placement::New(p) => {
-                    // Same-volume move of a whole tree: a single rename.
-                    if self.try_rename {
-                        match fs::rename(src_root, &p) {
-                            Ok(()) => {
-                                self.consume(items);
-                                self.report.bytes += root.bytes;
-                                self.report.done.push(p.clone());
-                                self.report.undo.push(UndoRecord::Moved {
-                                    from: src_root.clone(),
-                                    to: p,
-                                });
-                                return Ok(());
-                            }
-                            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                                self.fail(src_root, VANISHED);
-                                self.consume(items);
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                self.try_rename = false;
-                                self.ctx.log(format!(
-                                    "{}: rename not possible ({e}); copying instead",
-                                    src_root.display()
-                                ));
-                            }
-                        }
+                Placement::New(p) => match self.prepare_new_root_dir(
+                    src_root,
+                    items,
+                    root.bytes,
+                    p,
+                    self.policy == ConflictPolicy::KeepBoth,
+                ) {
+                    Some(p) => (p, true),
+                    None => return Ok(()),
+                },
+                Placement::KeepBoth(p) => {
+                    match self.prepare_new_root_dir(src_root, items, root.bytes, p, true) {
+                        Some(p) => (p, true),
+                        None => return Ok(()),
                     }
-                    if let Err(e) = fs::create_dir(&p) {
-                        self.fail(&p, CoreError::io(&p, e).to_string());
-                        self.consume(items);
-                        return Ok(());
-                    }
-                    (p, true)
                 }
                 Placement::Merge(p) => (p, false),
                 Placement::Skip(r) => {
@@ -1354,8 +1440,12 @@ impl Executor<'_, '_, '_> {
                     } else {
                         match self.placement(&src, item, dest, false)? {
                             Placement::New(p) => {
-                                if let Err(e) = fs::create_dir(&p) {
-                                    self.fail(&p, CoreError::io(&p, e).to_string());
+                                if self.create_new_dir(p, false).is_none() {
+                                    blocked.push(&item.rel);
+                                }
+                            }
+                            Placement::KeepBoth(p) => {
+                                if self.create_new_dir(p, true).is_none() {
                                     blocked.push(&item.rel);
                                 }
                             }
@@ -1425,9 +1515,10 @@ impl Executor<'_, '_, '_> {
             self.consume(std::slice::from_ref(item));
             return Ok(true);
         }
-        let (dest, overwrite) = match self.placement(src, item, dest, is_root)? {
-            Placement::New(p) => (p, false),
-            Placement::Overwrite(p) => (p, true),
+        let (mut dest, overwrite, keep_both) = match self.placement(src, item, dest, is_root)? {
+            Placement::New(p) => (p, false, self.policy == ConflictPolicy::KeepBoth),
+            Placement::KeepBoth(p) => (p, false, true),
+            Placement::Overwrite(p) => (p, true, false),
             Placement::Skip(r) => {
                 self.skip(src, r);
                 self.consume(std::slice::from_ref(item));
@@ -1443,28 +1534,47 @@ impl Executor<'_, '_, '_> {
         self.ctx.progress.set_current(src.display().to_string());
         let mv = self.is_move();
         if self.try_rename {
-            if overwrite {
-                let _ = clear_readonly(&dest);
-            }
-            match fs::rename(src, &dest) {
-                Ok(()) => {
-                    self.consume(std::slice::from_ref(item));
-                    self.report.bytes += item.size;
-                    self.report.done.push(dest.clone());
-                    if !overwrite {
-                        self.report.undo.push(UndoRecord::Moved {
-                            from: src.to_path_buf(),
-                            to: dest,
-                        });
+            loop {
+                if overwrite {
+                    let _ = clear_readonly(&dest);
+                }
+                let result = if overwrite {
+                    fs::rename(src, &dest)
+                } else {
+                    paths::rename_no_replace(src, &dest)
+                };
+                match result {
+                    Ok(()) => {
+                        self.consume(std::slice::from_ref(item));
+                        self.report.bytes += item.size;
+                        self.report.done.push(dest.clone());
+                        if !overwrite {
+                            self.report.undo.push(UndoRecord::Moved {
+                                from: src.to_path_buf(),
+                                to: dest,
+                            });
+                        }
+                        return Ok(false);
                     }
-                    return Ok(false);
+                    Err(e)
+                        if e.kind() == io::ErrorKind::AlreadyExists && keep_both && !overwrite =>
+                    {
+                        dest = Self::unique(&dest, NodeKind::File);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        self.fail(src, CoreError::AlreadyExists(dest.clone()).to_string());
+                        self.consume(std::slice::from_ref(item));
+                        return Ok(false);
+                    }
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound && !paths::exists_no_follow(src) =>
+                    {
+                        self.fail(src, VANISHED);
+                        self.consume(std::slice::from_ref(item));
+                        return Ok(true);
+                    }
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound && !paths::exists_no_follow(src) => {
-                    self.fail(src, VANISHED);
-                    self.consume(std::slice::from_ref(item));
-                    return Ok(true);
-                }
-                Err(_) => {} // different volume (or locked): fall back to copy + delete
             }
         }
         let opts = CopyFileOptions {
@@ -1473,7 +1583,7 @@ impl Executor<'_, '_, '_> {
             want_hash: false,
         };
         let mut counted = 0;
-        let res = copy_file_counted(src, &dest, opts, self.ctx, &mut counted);
+        let res = copy_file_counted(src, &mut dest, opts, self.ctx, &mut counted, keep_both);
         self.ctx.progress.add_items(1);
         match res {
             Ok(out) => {
@@ -1531,8 +1641,9 @@ impl Executor<'_, '_, '_> {
             self.fail(src, VANISHED);
             return Ok(true);
         }
-        let dest = match self.placement(src, item, dest, is_root)? {
-            Placement::New(p) => p,
+        let (mut dest, keep_both) = match self.placement(src, item, dest, is_root)? {
+            Placement::New(p) => (p, self.policy == ConflictPolicy::KeepBoth),
+            Placement::KeepBoth(p) => (p, true),
             Placement::Skip(r) => {
                 self.skip(src, r);
                 return Ok(false);
@@ -1547,32 +1658,71 @@ impl Executor<'_, '_, '_> {
             }
             Placement::Merge(_) => unreachable!("links never merge"),
         };
-        if self.try_rename && fs::rename(src, &dest).is_ok() {
-            self.report.done.push(dest.clone());
-            self.report.undo.push(UndoRecord::Moved {
-                from: src.to_path_buf(),
-                to: dest,
-            });
-            return Ok(false);
+        if self.try_rename {
+            for _ in 0..1024 {
+                match paths::rename_no_replace(src, &dest) {
+                    Ok(()) => {
+                        self.report.done.push(dest.clone());
+                        self.report.undo.push(UndoRecord::Moved {
+                            from: src.to_path_buf(),
+                            to: dest,
+                        });
+                        return Ok(false);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && keep_both => {
+                        dest = Self::unique(&dest, NodeKind::Link);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        self.fail(src, CoreError::AlreadyExists(dest).to_string());
+                        return Ok(false);
+                    }
+                    Err(_) => {
+                        self.try_rename = false;
+                        break;
+                    }
+                }
+            }
+            if self.try_rename && keep_both {
+                self.fail(
+                    src,
+                    "could not find a free destination after repeated conflicts",
+                );
+                return Ok(false);
+            }
         }
-        match copy_link(src, &dest) {
-            Ok(()) => {
-                if self.is_move()
-                    && let Err(e) = remove_link(src)
-                {
-                    self.fail(
+        for _ in 0..1024 {
+            match copy_link(src, &dest) {
+                Ok(()) => {
+                    if self.is_move()
+                        && let Err(e) = remove_link(src)
+                    {
+                        self.fail(
+                            src,
+                            format!("link copied, but the original could not be removed: {e}"),
+                        );
+                        return Ok(false);
+                    }
+                    self.report.done.push(dest);
+                    return Ok(false);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && keep_both => {
+                    dest = Self::unique(&dest, NodeKind::Link);
+                }
+                Err(e) => {
+                    self.skip(
                         src,
-                        format!("link copied, but the original could not be removed: {e}"),
+                        format!(
+                            "link not copied (links are never followed; recreating it failed: {e})"
+                        ),
                     );
                     return Ok(false);
                 }
-                self.report.done.push(dest);
             }
-            Err(e) => self.skip(
-                src,
-                format!("link not copied (links are never followed; recreating it failed: {e})"),
-            ),
         }
+        self.fail(
+            src,
+            "could not find a free destination after repeated conflicts",
+        );
         Ok(false)
     }
 }
@@ -1647,13 +1797,13 @@ pub fn rename_entry(path: &Path, new_name: &str) -> Result<(PathBuf, UndoRecord)
             return Err(CoreError::AlreadyExists(target));
         }
         let tmp = parent.join(format!(".forge-rename-{}", random_hex()));
-        fs::rename(path, &tmp).map_err(|e| CoreError::io(path, e))?;
-        if let Err(e) = fs::rename(&tmp, &target) {
-            let _ = fs::rename(&tmp, path);
+        paths::rename_no_replace(path, &tmp).map_err(|e| CoreError::io(path, e))?;
+        if let Err(e) = paths::rename_no_replace(&tmp, &target) {
+            let _ = paths::rename_no_replace(&tmp, path);
             return Err(io_t(e));
         }
     } else {
-        fs::rename(path, &target).map_err(io_t)?;
+        paths::rename_no_replace(path, &target).map_err(io_t)?;
     }
     Ok((
         target.clone(),
@@ -1937,6 +2087,67 @@ mod tests {
         // Ask + skip via SkipConflicts.
         let (f, _) = conflict_fx(ConflictPolicy::Ask, true);
         assert_eq!(fs::read(f.dst.join("x.txt")).unwrap(), b"old");
+        assert!(no_partials(&f.dst));
+    }
+
+    #[test]
+    fn racing_destination_is_preserved_and_keep_both_retries() {
+        let f = fx();
+        let source = f.src.join("race.txt");
+        fs::write(&source, b"new payload").unwrap();
+        let raced_dest = f.dst.join("race.txt");
+        let hook_dest = raced_dest.clone();
+        AFTER_CHUNK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                if !hook_dest.exists() {
+                    fs::write(&hook_dest, b"created during copy").unwrap();
+                }
+            }))
+        });
+
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::KeepBoth),
+        );
+        AFTER_CHUNK.with(|hook| *hook.borrow_mut() = None);
+
+        assert!(report.is_clean(), "{report:?}");
+        assert_eq!(fs::read(&raced_dest).unwrap(), b"created during copy");
+        assert_eq!(
+            fs::read(f.dst.join("race (2).txt")).unwrap(),
+            b"new payload"
+        );
+        assert!(no_partials(&f.dst));
+    }
+
+    #[test]
+    fn racing_destination_without_keep_both_is_reported_and_preserved() {
+        let f = fx();
+        let source = f.src.join("race.txt");
+        fs::write(&source, b"new payload").unwrap();
+        let raced_dest = f.dst.join("race.txt");
+        let hook_dest = raced_dest.clone();
+        AFTER_CHUNK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, _| {
+                if !hook_dest.exists() {
+                    fs::write(&hook_dest, b"created during copy").unwrap();
+                }
+            }))
+        });
+
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Skip),
+        );
+        AFTER_CHUNK.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert_eq!(fs::read(&raced_dest).unwrap(), b"created during copy");
+        assert!(!f.dst.join("race (2).txt").exists());
         assert!(no_partials(&f.dst));
     }
 

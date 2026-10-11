@@ -1,10 +1,10 @@
 //! Contact sheets, archive browsing/extraction/creation, and file split/join.
 
 use std::collections::HashSet;
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Cursor, Write};
 use std::ops::Range;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -13,13 +13,14 @@ use crossbeam_channel::{Receiver, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{ArchiveEntry, ExtractOptions};
 use forge_core::model::{EntryKind, MediaKind};
-use forge_core::ops::{JobCtx, StreamOptions};
+use forge_core::ops::JobCtx;
+use forge_core::paths::rename_no_replace;
 use forge_jobs::{JobHandle, JobRegistry};
 
 use crate::actions::Event;
 use crate::app::ZxrawApp;
 
-static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct ExtraToolsUi {
@@ -642,28 +643,11 @@ fn build_contact_sheets(
             index + 1,
             sources.len()
         ));
-        let thumb = forge_media::generate_thumbnail(
-            &source.path,
-            options.thumbnail_size,
-            &forge_media::DecodeLimits::default(),
-            None,
-            0,
-            Some(ctx.cancel),
-        )
-        .ok()
-        .and_then(|t| t.to_rgba_image());
         let meta = if options.captions_exif {
             forge_media::read_image_metadata(&source.path).ok()
         } else {
             None
         };
-        if thumb.is_none() {
-            ctx.progress.add_error();
-            ctx.log(format!(
-                "{}: could not decode image; a placeholder was included",
-                source.path.display()
-            ));
-        }
         let file_name = source
             .path
             .file_name()
@@ -711,9 +695,8 @@ fn build_contact_sheets(
         }
         let name = options.captions_file_name.then_some(file_name);
         let details = (!details.is_empty()).then(|| details.join(" · "));
-        ctx.progress.add_items(1);
         tiles.push(SheetTile {
-            image: thumb,
+            image: None,
             name,
             details,
         });
@@ -727,6 +710,33 @@ fn build_contact_sheets(
             page_index + 1,
             ranges.len()
         ));
+        let page_tiles = load_sheet_page(range.clone(), |index| {
+            ctx.cancel.check()?;
+            let source = &sources[index];
+            let image = forge_media::generate_thumbnail(
+                &source.path,
+                options.thumbnail_size,
+                &forge_media::DecodeLimits::default(),
+                None,
+                0,
+                Some(ctx.cancel),
+            )
+            .ok()
+            .and_then(|thumbnail| thumbnail.to_rgba_image());
+            if image.is_none() {
+                ctx.progress.add_error();
+                ctx.log(format!(
+                    "{}: could not decode image; a placeholder was included",
+                    source.path.display()
+                ));
+            }
+            ctx.progress.add_items(1);
+            Ok(SheetTile {
+                image,
+                name: tiles[index].name.clone(),
+                details: tiles[index].details.clone(),
+            })
+        })?;
         let title = if options.page_title.trim().is_empty() {
             String::new()
         } else if ranges.len() > 1 {
@@ -739,13 +749,7 @@ fn build_contact_sheets(
         } else {
             options.page_title.trim().to_owned()
         };
-        let page = render_sheet_page(
-            &tiles[range.clone()],
-            layout,
-            &title,
-            options.dark_background,
-            &text,
-        );
+        let page = render_sheet_page(&page_tiles, layout, &title, options.dark_background, &text);
         let mut encoded = Cursor::new(Vec::new());
         match options.format {
             SheetFormat::Png => image::DynamicImage::ImageRgba8(page)
@@ -761,13 +765,8 @@ fn build_contact_sheets(
             }
         }
         let path = &page_paths[page_index];
-        forge_core::ops::write_stream_atomic(
-            Cursor::new(encoded.into_inner()),
-            path,
-            path,
-            StreamOptions::default(),
-            ctx,
-        )?;
+        publish_bytes_no_replace(path, &encoded.into_inner())
+            .map_err(|error| forge_core::CoreError::io(path, error))?;
         cleanup.paths.push(path.clone());
         output_paths.push(path.clone());
         ctx.progress.add_items(1);
@@ -775,6 +774,53 @@ fn build_contact_sheets(
     ctx.progress.set_current("Contact sheet complete");
     cleanup.keep = true;
     Ok(output_paths)
+}
+
+fn load_sheet_page<T>(
+    range: Range<usize>,
+    mut load: impl FnMut(usize) -> forge_core::Result<T>,
+) -> forge_core::Result<Vec<T>> {
+    let mut page = Vec::with_capacity(range.len());
+    for index in range {
+        page.push(load(index)?);
+    }
+    Ok(page)
+}
+
+fn publish_bytes_no_replace(destination: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    loop {
+        let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".zxraw-output-{}-{sequence:016x}.tmp",
+            std::process::id()
+        ));
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(file);
+        match rename_no_replace(&temporary, destination) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
+    }
 }
 
 struct OutputCleanup {
@@ -1711,10 +1757,18 @@ fn extract_selected(
     ctx: &JobCtx<'_>,
 ) -> forge_core::Result<(usize, Vec<String>)> {
     ensure_output_root(destination)?;
-    let stage = create_staging_dir()?;
-    let _guard = StagingGuard(stage.clone());
-    let report =
-        forge_core::archive::extract_zip(archive, &stage, &ExtractOptions::default(), ctx)?;
+    let selected: Vec<String> = entries
+        .iter()
+        .filter(|entry| is_selected_entry(entry, selected_names))
+        .map(|entry| entry.name.clone())
+        .collect();
+    let report = forge_core::archive::extract_zip_entries(
+        archive,
+        destination,
+        &selected,
+        &ExtractOptions::default(),
+        ctx,
+    )?;
     if report.cancelled {
         return Err(forge_core::CoreError::Cancelled);
     }
@@ -1729,55 +1783,7 @@ fn extract_selected(
     for issue in report.failed {
         failures.push(format!("Failed {}: {}", issue.path.display(), issue.reason));
     }
-    let mut copied = 0;
-    for entry in entries
-        .iter()
-        .filter(|entry| is_selected_entry(entry, selected_names))
-    {
-        ctx.cancel.check()?;
-        if !entry.safe_name {
-            failures.push(format!("Skipped {}: unsafe path", entry.name));
-            continue;
-        }
-        let rel =
-            match forge_core::paths::validate_relative(entry.name.trim_end_matches(['/', '\\'])) {
-                Ok(path) => path,
-                Err(error) => {
-                    failures.push(format!("Skipped {}: {error}", entry.name));
-                    continue;
-                }
-            };
-        let source = stage.join(&rel);
-        let target = destination.join(&rel);
-        if entry.is_dir {
-            match ensure_output_dirs(destination, &rel) {
-                Ok(()) => copied += 1,
-                Err(error) => failures.push(format!("Failed {}: {error}", entry.name)),
-            }
-            continue;
-        }
-        if !source.is_file() {
-            failures.push(format!(
-                "Skipped {}: entry was encrypted, a link, or unavailable",
-                entry.name
-            ));
-            continue;
-        }
-        if let Some(parent) = rel.parent()
-            && let Err(error) = ensure_output_dirs(destination, parent)
-        {
-            failures.push(format!("Failed {}: {error}", entry.name));
-            continue;
-        }
-        match forge_core::ops::copy_file_atomic(&source, &target, Default::default(), ctx) {
-            Ok(_) => copied += 1,
-            Err(forge_core::CoreError::AlreadyExists(_)) => {
-                failures.push(format!("Skipped {}: already exists", entry.name))
-            }
-            Err(error) => failures.push(format!("Failed {}: {error}", entry.name)),
-        }
-    }
-    Ok((copied, failures))
+    Ok((report.extracted.len(), failures))
 }
 
 fn is_selected_entry(entry: &ArchiveEntry, selected_names: &HashSet<String>) -> bool {
@@ -1804,62 +1810,6 @@ fn ensure_output_root(path: &Path) -> forge_core::Result<()> {
         )));
     }
     Ok(())
-}
-
-fn ensure_output_dirs(base: &Path, relative: &Path) -> forge_core::Result<()> {
-    let mut current = base.to_path_buf();
-    for component in relative.components() {
-        match component {
-            Component::Normal(name) => current.push(name),
-            Component::CurDir => continue,
-            _ => {
-                return Err(forge_core::CoreError::UnsafePath(
-                    relative.display().to_string(),
-                ));
-            }
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(md) if md.is_dir() && !md.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(forge_core::CoreError::UnsafePath(format!(
-                    "{} is not a plain folder",
-                    current.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current).map_err(|e| forge_core::CoreError::io(&current, e))?;
-            }
-            Err(error) => return Err(forge_core::CoreError::io(&current, error)),
-        }
-    }
-    Ok(())
-}
-
-fn create_staging_dir() -> forge_core::Result<PathBuf> {
-    let base = std::env::temp_dir();
-    for _ in 0..32 {
-        let number = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = base.join(format!(
-            "zxraw-archive-stage-{}-{number:016x}",
-            std::process::id()
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => return Ok(path),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(forge_core::CoreError::io(path, error)),
-        }
-    }
-    Err(forge_core::CoreError::Invalid(
-        "could not create a temporary archive staging folder".into(),
-    ))
-}
-
-struct StagingGuard(PathBuf);
-
-impl Drop for StagingGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 fn render_create_archive(
@@ -1914,8 +1864,20 @@ fn start_create_archive(
     let ctx = app_ctx.clone();
     jobs.spawn("archive-create", title, move |job| {
         let job_ctx = JobCtx::from_job(job);
-        match forge_core::archive::create_zip(&sources, &output, &job_ctx) {
-            Ok(report) => {
+        let result = match ArchiveStaging::create(&directory) {
+            Ok(mut staging) => {
+                match forge_core::archive::create_zip(&sources, staging.path(), &job_ctx) {
+                    Ok(report) => {
+                        staging.owns_archive = true;
+                        staging.publish(&requested).map(|output| (report, output))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok((report, output)) => {
                 for issue in &report.skipped {
                     job.log(format!(
                         "Skipped {}: {}",
@@ -1969,6 +1931,82 @@ fn unique_path(requested: &Path) -> PathBuf {
         }
     }
     requested.with_file_name(format!("{}-{}.zip", stem, std::process::id()))
+}
+
+struct ArchiveStaging {
+    directory: PathBuf,
+    path: PathBuf,
+    owns_archive: bool,
+}
+
+impl ArchiveStaging {
+    fn create(destination: &Path) -> forge_core::Result<Self> {
+        loop {
+            let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = destination.join(format!(
+                ".zxraw-archive-{}-{sequence:016x}",
+                std::process::id()
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: directory.join("archive.zip"),
+                        directory,
+                        owns_archive: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(forge_core::CoreError::io(&directory, error)),
+            }
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(&mut self, requested: &Path) -> forge_core::Result<PathBuf> {
+        for suffix in 1usize.. {
+            let output = numbered_archive_path(requested, suffix);
+            match rename_no_replace(&self.path, &output) {
+                Ok(()) => {
+                    self.owns_archive = false;
+                    return Ok(output);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(forge_core::CoreError::io(&output, error)),
+            }
+        }
+        Err(forge_core::CoreError::Invalid(
+            "could not find an unused ZIP output name".into(),
+        ))
+    }
+}
+
+impl Drop for ArchiveStaging {
+    fn drop(&mut self) {
+        if self.owns_archive {
+            let _ = fs::remove_file(&self.path);
+        }
+        let _ = fs::remove_dir(&self.directory);
+    }
+}
+
+fn numbered_archive_path(requested: &Path, suffix: usize) -> PathBuf {
+    if suffix == 1 {
+        return requested.to_path_buf();
+    }
+    let stem = requested.file_stem().unwrap_or_default().to_string_lossy();
+    let extension = requested
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let filename = if extension.is_empty() {
+        format!("{stem} ({suffix})")
+    } else {
+        format!("{stem} ({suffix}).{extension}")
+    };
+    requested.with_file_name(filename)
 }
 
 fn render_split(state: &mut SplitWindow, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -2138,6 +2176,7 @@ fn format_system_time(time: Option<SystemTime>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn contact_sheet_pagination_uses_rows_times_columns() {
@@ -2145,6 +2184,60 @@ mod tests {
         assert_eq!(page_ranges(12, 4, 3), vec![0..12]);
         assert_eq!(page_ranges(13, 4, 3), vec![0..12, 12..13]);
         assert_eq!(page_ranges(11, 3, 2), vec![0..6, 6..11]);
+    }
+
+    #[test]
+    fn contact_sheet_page_loader_holds_at_most_one_page_of_thumbnails() {
+        struct LiveThumbnail(Arc<std::sync::atomic::AtomicUsize>);
+
+        impl Drop for LiveThumbnail {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+
+        let capacity = 6;
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut maximum = 0;
+        for range in page_ranges(31, 3, 2) {
+            let page = load_sheet_page(range, |_| {
+                let held = live.fetch_add(1, Ordering::Relaxed) + 1;
+                maximum = maximum.max(held);
+                Ok(LiveThumbnail(live.clone()))
+            })
+            .unwrap();
+            assert!(page.len() <= capacity);
+            assert_eq!(live.load(Ordering::Relaxed), page.len());
+            drop(page);
+            assert_eq!(live.load(Ordering::Relaxed), 0);
+        }
+        assert!(maximum <= capacity);
+    }
+
+    #[test]
+    fn contact_sheet_publish_never_replaces_an_existing_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("sheet.png");
+        fs::write(&output, b"existing").unwrap();
+
+        let error = publish_bytes_no_replace(&output, b"new sheet").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(output).unwrap(), b"existing");
+    }
+
+    #[test]
+    fn archive_publish_chooses_a_free_name_without_replacing_existing_zip() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("archive.zip");
+        fs::write(&requested, b"existing archive").unwrap();
+        let mut staging = ArchiveStaging::create(directory.path()).unwrap();
+        fs::write(staging.path(), b"new archive").unwrap();
+        staging.owns_archive = true;
+
+        let published = staging.publish(&requested).unwrap();
+        assert_ne!(published, requested);
+        assert_eq!(fs::read(&requested).unwrap(), b"existing archive");
+        assert_eq!(fs::read(&published).unwrap(), b"new archive");
     }
 
     #[test]

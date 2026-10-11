@@ -32,6 +32,8 @@ use crate::ops::{
 };
 use crate::paths;
 
+const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 100_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveEntry {
     /// Name as stored (`/`-separated; directories end with `/`).
@@ -88,7 +90,17 @@ fn system_to_zip_time(t: SystemTime) -> zip::DateTime {
 
 /// List the entries of a ZIP file without extracting anything.
 pub fn list_zip(path: &Path) -> Result<Vec<ArchiveEntry>> {
+    list_zip_with_limit(path, DEFAULT_MAX_ARCHIVE_ENTRIES)
+}
+
+fn list_zip_with_limit(path: &Path, max_entries: usize) -> Result<Vec<ArchiveEntry>> {
     let mut za = open_zip(path)?;
+    if za.len() > max_entries {
+        return Err(CoreError::Invalid(format!(
+            "archive has {} entries (listing limit {max_entries})",
+            za.len()
+        )));
+    }
     let mut out = Vec::with_capacity(za.len());
     for i in 0..za.len() {
         let f = za.by_index_raw(i).map_err(|e| zip_err(path, e))?;
@@ -120,7 +132,7 @@ pub struct ExtractLimits {
 impl Default for ExtractLimits {
     fn default() -> Self {
         Self {
-            max_entries: 100_000,
+            max_entries: DEFAULT_MAX_ARCHIVE_ENTRIES,
             max_total_bytes: 64 * 1024 * 1024 * 1024,
             max_ratio: 1_000,
         }
@@ -160,6 +172,34 @@ pub fn extract_zip(
     opts: &ExtractOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<ExtractReport> {
+    extract_zip_filtered(archive, dest_dir, opts, None, ctx)
+}
+
+/// Extract only the named ZIP entries into the existing destination folder.
+/// Every entry name in the archive is still validated before any output is written.
+pub fn extract_zip_entries(
+    zip: &Path,
+    dest: &Path,
+    entries: &[String],
+    opts: &ExtractOptions,
+    ctx: &JobCtx<'_>,
+) -> Result<ExtractReport> {
+    extract_zip_filtered(
+        zip,
+        dest,
+        opts,
+        Some(entries.iter().cloned().collect()),
+        ctx,
+    )
+}
+
+fn extract_zip_filtered(
+    archive: &Path,
+    dest_dir: &Path,
+    opts: &ExtractOptions,
+    mut selection: Option<HashSet<String>>,
+    ctx: &JobCtx<'_>,
+) -> Result<ExtractReport> {
     if !fs::metadata(dest_dir)
         .map_err(|e| CoreError::io(dest_dir, e))?
         .is_dir()
@@ -190,7 +230,8 @@ pub fn extract_zip(
     // Pass 1: validate everything before touching the disk.
     let mut report = ExtractReport::default();
     let mut planned = Vec::new();
-    let mut total: u64 = 0;
+    let mut archive_total: u64 = 0;
+    let mut selected_total: u64 = 0;
     for i in 0..za.len() {
         let f = za.by_index_raw(i).map_err(|e| zip_err(archive, e))?;
         let name = entry_name(f.name_raw(), f.name().ok().map(|c| c.into_owned()));
@@ -199,17 +240,24 @@ pub fn extract_zip(
             continue; // "/" root entry
         }
         let rel = paths::validate_relative(trimmed)?;
+        let selected = selection
+            .as_mut()
+            .is_none_or(|requested| requested.remove(&name));
         if f.is_symlink() {
-            report.skipped.push(OpIssue::new(
-                &rel,
-                "symbolic link entries are not extracted",
-            ));
+            if selected {
+                report.skipped.push(OpIssue::new(
+                    &rel,
+                    "symbolic link entries are not extracted",
+                ));
+            }
             continue;
         }
         if f.encrypted() {
-            report
-                .skipped
-                .push(OpIssue::new(&rel, "encrypted entries are not supported"));
+            if selected {
+                report
+                    .skipped
+                    .push(OpIssue::new(&rel, "encrypted entries are not supported"));
+            }
             continue;
         }
         let size = f.size();
@@ -219,23 +267,34 @@ pub fn extract_zip(
                 "{name}: suspicious compression ratio (zip bomb)"
             )));
         }
-        total = total.saturating_add(size);
-        if total > limits.max_total_bytes {
+        archive_total = archive_total.saturating_add(size);
+        if archive_total > limits.max_total_bytes {
             return Err(CoreError::Invalid(format!(
                 "archive expands to more than {} bytes",
                 limits.max_total_bytes
             )));
         }
-        planned.push(Planned {
-            index: i,
-            name,
-            rel,
-            is_dir: f.is_dir(),
-            size,
-        });
+        if selected {
+            selected_total = selected_total.saturating_add(size);
+            planned.push(Planned {
+                index: i,
+                name,
+                rel,
+                is_dir: f.is_dir(),
+                size,
+            });
+        }
+    }
+    if let Some(missing) = selection {
+        for name in missing {
+            report.failed.push(OpIssue::new(
+                Path::new(&name),
+                "selected ZIP entry was not found",
+            ));
+        }
     }
     ctx.progress.add_total_items(planned.len() as u64);
-    ctx.progress.add_total_bytes(total);
+    ctx.progress.add_total_bytes(selected_total);
 
     // Pass 2: extract.
     let mut seen: HashSet<String> = HashSet::new();
@@ -266,8 +325,8 @@ pub fn extract_zip(
         if p.is_dir {
             continue;
         }
-        let (dest, overwrite) = match fs::symlink_metadata(&target) {
-            Err(_) => (target, false),
+        let (dest, overwrite, keep_both) = match fs::symlink_metadata(&target) {
+            Err(_) => (target, false, false),
             Ok(md) if node_kind(&md) != NodeKind::File => {
                 report.failed.push(OpIssue::new(
                     &target,
@@ -276,11 +335,9 @@ pub fn extract_zip(
                 continue;
             }
             Ok(_) => match opts.policy {
-                ConflictPolicy::Overwrite => (target, true),
-                ConflictPolicy::KeepBoth => {
-                    let dir = target.parent().unwrap_or(dest_dir).to_path_buf();
-                    (paths::unique_name(&dir, &paths::name_of(&target)), false)
-                }
+                ConflictPolicy::Overwrite => (target, true, false),
+                // The name is re-checked at publish time; a racing file gets the next name.
+                ConflictPolicy::KeepBoth => (target, false, true),
                 _ => {
                     report.skipped.push(OpIssue::new(&target, "already exists"));
                     ctx.progress.add_bytes(p.size);
@@ -306,11 +363,11 @@ pub fn extract_zip(
             ..Default::default()
         };
         let label = PathBuf::from(&p.name);
-        match ops::write_stream_atomic(&mut f, &label, &dest, sopts, ctx) {
-            Ok(out) => {
+        match ops::write_stream_placed(&mut f, &label, &dest, sopts, keep_both, ctx) {
+            Ok((out, placed)) => {
                 remaining = remaining.saturating_sub(out.bytes);
                 report.bytes += out.bytes;
-                report.extracted.push(dest);
+                report.extracted.push(placed);
             }
             Err(CoreError::Cancelled) => {
                 report.cancelled = true;
@@ -570,6 +627,56 @@ mod tests {
         };
         extract_zip(&out, &x, &kb, &ctx).unwrap();
         assert!(x.join("single (2).md").exists());
+    }
+
+    #[test]
+    fn listing_stops_at_the_entry_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let z = d.path().join("many.zip");
+        raw_zip(&z, &[("a", b"a"), ("b", b"b"), ("c", b"c")]);
+        let error = list_zip_with_limit(&z, 2).unwrap_err().to_string();
+        assert!(error.contains("listing limit 2"), "{error}");
+    }
+
+    #[test]
+    fn selected_extraction_writes_only_requested_entries_and_checks_all_names() {
+        let d = tempfile::tempdir().unwrap();
+        let z = d.path().join("selected.zip");
+        raw_zip(
+            &z,
+            &[("chosen.txt", b"chosen"), ("ignored.txt", b"ignored")],
+        );
+        let dest = d.path().join("selected");
+        fs::create_dir(&dest).unwrap();
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+
+        let report = extract_zip_entries(
+            &z,
+            &dest,
+            &["chosen.txt".to_owned()],
+            &ExtractOptions::default(),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(report.extracted, vec![dest.join("chosen.txt")]);
+        assert_eq!(fs::read(dest.join("chosen.txt")).unwrap(), b"chosen");
+        assert!(!dest.join("ignored.txt").exists());
+
+        raw_zip(&z, &[("safe.txt", b"safe"), ("../escape.txt", b"unsafe")]);
+        let malicious_dest = d.path().join("malicious");
+        fs::create_dir(&malicious_dest).unwrap();
+        let error = extract_zip_entries(
+            &z,
+            &malicious_dest,
+            &["safe.txt".to_owned()],
+            &ExtractOptions::default(),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(matches!(error, CoreError::UnsafePath(_)));
+        assert_eq!(fs::read_dir(&malicious_dest).unwrap().count(), 0);
+        assert!(!d.path().join("escape.txt").exists());
     }
 
     #[test]
