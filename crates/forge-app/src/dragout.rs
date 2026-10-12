@@ -35,7 +35,13 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         }
         None => ctx.data(|d| d.get_temp::<egui::Pos2>(last_id)),
     };
-    if !should_start_os_drag(true, pointer.or(last_inside), window, primary_down, pointer_gone) {
+    if !should_start_os_drag(
+        true,
+        pointer.or(last_inside),
+        window,
+        primary_down,
+        pointer_gone,
+    ) {
         return;
     }
 
@@ -52,12 +58,34 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
     // The OLE drag is modal; a scripted run has no one to drop it and would hang.
     if app.testhook.active() {
-        tracing::info!("automated run: not starting an OS drag-out of {} item(s)", paths.len());
+        tracing::info!(
+            "automated run: not starting an OS drag-out of {} item(s)",
+            paths.len()
+        );
         return;
     }
+    let entry = paths.first().and_then(|path| {
+        app.pane()
+            .entries
+            .iter()
+            .find(|entry| entry.path == *path && entry.kind == forge_core::EntryKind::File)
+            .cloned()
+    });
+    let thumbnail = entry
+        .as_ref()
+        .and_then(|entry| app.ops.thumbs.cached_drag_thumbnail(entry));
+    let drag_thumbnail = thumbnail
+        .as_deref()
+        .map(|image| forge_win::dragout::DragThumbnail {
+            width: image.width,
+            height: image.height,
+            rgba: &image.rgba,
+        });
     match forge_win::dragout::active_window() {
         Ok(hwnd) => {
-            if let Err(error) = forge_win::dragout::drag_out(hwnd, &paths, false) {
+            if let Err(error) =
+                forge_win::dragout::drag_out_with_thumbnail(hwnd, &paths, false, drag_thumbnail)
+            {
                 tracing::warn!("OS drag-out failed: {error}");
             }
             // Re-list the source pane after the modal OLE drag returns. MOVE is disabled by
@@ -141,9 +169,27 @@ mod tests {
             false,
         ));
         // Pointer gone: only when last seen near an edge.
-        assert!(should_start_os_drag(true, Some(egui::pos2(20.0, 300.0)), rect, true, true));
-        assert!(!should_start_os_drag(true, Some(egui::pos2(400.0, 300.0)), rect, true, true));
+        assert!(should_start_os_drag(
+            true,
+            Some(egui::pos2(20.0, 300.0)),
+            rect,
+            true,
+            true
+        ));
+        assert!(!should_start_os_drag(
+            true,
+            Some(egui::pos2(400.0, 300.0)),
+            rect,
+            true,
+            true
+        ));
         assert!(!should_start_os_drag(true, None, rect, true, true));
-        assert!(!should_start_os_drag(true, Some(egui::pos2(20.0, 300.0)), rect, false, true));
+        assert!(!should_start_os_drag(
+            true,
+            Some(egui::pos2(20.0, 300.0)),
+            rect,
+            false,
+            true
+        ));
     }
 }
