@@ -15,6 +15,8 @@
 //! * `ZXRAW_SCRIPT_SANDBOX=dir` — allowed root for navigation and asserted paths; defaults
 //!   to the script file's directory.
 //! * `ZXRAW_SCREENSHOT_DIR=dir` — a second allowed root, for `screenshot` PNGs only.
+//! * `ZXRAW_SHOW_WINDOW=1` — show the window normally. Otherwise automated runs open
+//!   off-screen, unfocused and deaf to real mouse and keyboard input ([`hide_window`]).
 //!
 //! Timing: commands run once the first listing finishes (or after 30 s regardless); the
 //! capture happens ~90 frames *after* the commands; a run is closed after 120 s at most.
@@ -78,6 +80,8 @@ pub struct TestHook {
     /// Fixed at startup: the script is taken out of `self` while a step runs, so
     /// "is a script present" cannot answer "is this an automated run".
     automated: bool,
+    /// Fixed at startup: see [`hide_window`].
+    hidden: bool,
     animations_off: bool,
     pub(crate) input: InputQueue,
     pub(crate) perf: perf::FrameClock,
@@ -89,6 +93,15 @@ pub fn env_requests_automation() -> bool {
     ["ZXRAW_SCREENSHOT", "ZXRAW_CMDS", "ZXRAW_SELECT", "ZXRAW_SCRIPT"]
         .iter()
         .any(|v| std::env::var_os(v).is_some())
+}
+
+/// True when an automated run should keep its window out of the user's way: it opens
+/// off-screen, unfocused and without a taskbar button, and ignores real mouse and keyboard
+/// input, so working on the PC while tests run can neither disturb a script nor be
+/// disturbed by it. Scripts inject their own input, so they run the same either way.
+/// `ZXRAW_SHOW_WINDOW=1` shows the window normally, to watch a script run.
+pub fn hide_window() -> bool {
+    env_requests_automation() && std::env::var_os("ZXRAW_SHOW_WINDOW").is_none()
 }
 
 impl TestHook {
@@ -114,6 +127,7 @@ impl TestHook {
             || hook.screenshot.is_some()
             || !hook.cmds.is_empty()
             || hook.select.is_some();
+        hook.hidden = hook.automated && hide_window();
         RECORD_RECTS.store(hook.automated, std::sync::atomic::Ordering::Relaxed);
         hook
     }
@@ -136,6 +150,18 @@ pub fn raw_input(app: &mut ZxrawApp, raw: &mut egui::RawInput) {
         return;
     }
     hook.perf.frame_started();
+    if hook.hidden {
+        // Only the script drives a hidden window; keep what the OS reports that isn't
+        // user input (screenshot results, focus changes).
+        raw.events.retain(|e| {
+            matches!(
+                e,
+                egui::Event::Screenshot { .. } | egui::Event::WindowFocused(_)
+            )
+        });
+        raw.hovered_files.clear();
+        raw.dropped_files.clear();
+    }
     if !hook.input.pending.is_empty() {
         raw.events.append(&mut hook.input.pending);
         hook.input.delivered_frames = 0;

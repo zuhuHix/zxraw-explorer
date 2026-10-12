@@ -20,6 +20,10 @@ pub fn env_requests_automation() -> bool {
     false
 }
 
+pub fn hide_window() -> bool {
+    false
+}
+
 pub fn raw_input(_app: &mut crate::app::ZxrawApp, _raw: &mut egui::RawInput) {}
 
 pub fn tick(_app: &mut crate::app::ZxrawApp, _ctx: &egui::Context) {}

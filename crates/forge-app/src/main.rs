@@ -141,18 +141,29 @@ fn main() -> eframe::Result {
     let icon = image::load_from_memory(include_bytes!("../../../assets/zxraw.png"))
         .expect("embedded application icon PNG must be valid")
         .to_rgba8();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("ZXraw Explorer")
+        .with_inner_size([1360.0, 840.0])
+        .with_min_inner_size([640.0, 400.0])
+        .with_icon(egui::IconData {
+            width: icon.width(),
+            height: icon.height(),
+            rgba: icon.into_raw(),
+        })
+        .with_drag_and_drop(true);
+    let hidden = testhook::hide_window();
+    if hidden {
+        // Automated runs render off-screen where nobody can click them (see
+        // `testhook::hide_window`); their geometry is not saved, so a restart in the same
+        // profile cannot pull the window back onto a monitor.
+        viewport = viewport
+            .with_position([-20000.0, -20000.0])
+            .with_active(false)
+            .with_taskbar(false);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("ZXraw Explorer")
-            .with_inner_size([1360.0, 840.0])
-            .with_min_inner_size([640.0, 400.0])
-            .with_icon(egui::IconData {
-                width: icon.width(),
-                height: icon.height(),
-                rgba: icon.into_raw(),
-            })
-            .with_drag_and_drop(true),
-        persist_window: true,
+        viewport,
+        persist_window: !hidden,
         ..Default::default()
     };
     eframe::run_native(
