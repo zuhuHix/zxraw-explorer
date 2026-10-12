@@ -150,13 +150,14 @@ fn main() -> eframe::Result {
         .with_drag_and_drop(true);
     let hidden = testhook::hide_window();
     if hidden {
-        // Automated runs render off-screen where nobody can click them (see
-        // `testhook::hide_window`); their geometry is not saved, so a restart in the same
-        // profile cannot pull the window back onto a monitor.
-        viewport = viewport
-            .with_position([-20000.0, -20000.0])
-            .with_active(false)
-            .with_taskbar(false);
+        // Automated runs open on a private desktop that is never shown, so nobody can see or
+        // click them (see `testhook::hide_window`). Their geometry is not saved.
+        let desktop = format!("zxraw-automation-{}", std::process::id());
+        if let Err(e) = forge_win::desktop::move_thread_to_private_desktop(&desktop) {
+            // Still usable: the window then just appears on the user's desktop.
+            tracing::warn!("could not open the automation desktop: {e}");
+        }
+        viewport = viewport.with_active(false).with_taskbar(false);
     }
     let options = eframe::NativeOptions {
         viewport,
