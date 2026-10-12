@@ -14,6 +14,14 @@ pub enum ThemeChoice {
     System,
 }
 
+/// Which logo the window, taskbar and the app's shortcuts show (see `app_icon`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AppIcon {
+    #[default]
+    Square,
+    Round,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ViewMode {
     #[default]
@@ -38,6 +46,7 @@ pub struct ExternalTool {
 pub struct Settings {
     pub theme: ThemeChoice,
     pub ui_scale: f32,
+    pub app_icon: AppIcon,
     pub show_hidden: bool,
     pub show_system: bool,
     pub confirm_recycle: bool,
@@ -66,6 +75,7 @@ impl Default for Settings {
         Self {
             theme: ThemeChoice::Dark,
             ui_scale: 1.0,
+            app_icon: AppIcon::Square,
             show_hidden: false,
             show_system: false,
             confirm_recycle: false,

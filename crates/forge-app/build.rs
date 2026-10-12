@@ -3,15 +3,17 @@ use std::{env, fs, path::PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../assets/zxraw.ico");
+    println!("cargo:rerun-if-changed=../../assets/zxraw-round.ico");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    let icon_path = fs::canonicalize("../../assets/zxraw.ico")
-        .expect("the generated Windows icon must exist before building");
-    let icon_path = icon_path.to_string_lossy().replace('\\', "\\\\");
+    // Icon 1 (the square logo) is the file's own icon; icon 2 (the round logo) is what the
+    // app points its shortcuts at when Settings > Appearance > App icon is Round.
+    let icon_path = rc_path("../../assets/zxraw.ico");
+    let round_icon_path = rc_path("../../assets/zxraw-round.ico");
 
     let major = env::var("CARGO_PKG_VERSION_MAJOR").expect("Cargo package major version");
     let minor = env::var("CARGO_PKG_VERSION_MINOR").expect("Cargo package minor version");
@@ -22,6 +24,7 @@ fn main() {
     let resource = format!(
         r#"
 1 ICON "{icon_path}"
+2 ICON "{round_icon_path}"
 
 1 VERSIONINFO
  FILEVERSION {version_info}
@@ -57,4 +60,12 @@ END
     embed_resource::compile(resource_path, embed_resource::NONE)
         .manifest_optional()
         .expect("compile Windows icon and version resources");
+}
+
+/// Absolute path of a generated icon, escaped for a resource script string.
+fn rc_path(relative: &str) -> String {
+    fs::canonicalize(relative)
+        .expect("the generated Windows icons must exist before building")
+        .to_string_lossy()
+        .replace('\\', "\\\\")
 }

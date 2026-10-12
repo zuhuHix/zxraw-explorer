@@ -1,69 +1,52 @@
 #!/usr/bin/env python3
-"""Generate the ZXraw Explorer window PNG and multi-size Windows ICO."""
+"""Generate the ZXraw Explorer window PNGs and multi-size Windows ICOs from the logo masters.
+
+Inputs (high-resolution artwork with a transparent background):
+    assets/logo/zxraw-square.png  -> assets/zxraw.png, assets/zxraw.ico (the default icon)
+    assets/logo/zxraw-round.png   -> assets/zxraw-round.png, assets/zxraw-round.ico
+
+Each master is trimmed to its solid shape (dropping the faint outer shadow), centred on a
+square canvas with a small margin, and downscaled per size so small icons stay sharp.
+"""
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
-
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "assets"
-SIZES = (16, 24, 32, 48, 64, 128, 256)
-SUPERSAMPLE = 4
+SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+# Pixels at least this opaque count as the shape; the softer shadow around it is trimmed.
+SOLID_ALPHA = 200
+MARGIN = 0.02
 
 
-def render(size: int) -> Image.Image:
-    scale = SUPERSAMPLE
-    canvas = Image.new("RGBA", (size * scale, size * scale), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(canvas)
+def square_master(path: Path) -> Image.Image:
+    image = Image.open(path).convert("RGBA")
+    solid = image.getchannel("A").point(lambda a: 255 if a >= SOLID_ALPHA else 0)
+    left, top, right, bottom = solid.getbbox()
+    shape = image.crop((left, top, right, bottom))
+    side = round(max(shape.size) * (1 + 2 * MARGIN))
+    canvas = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    canvas.alpha_composite(shape, ((side - shape.width) // 2, (side - shape.height) // 2))
+    return canvas
 
-    def box(bounds):
-        return tuple(round(value * size * scale / 256) for value in bounds)
 
-    # A deep blue rounded tile holds a bright folder and a simple shutter mark.
-    draw.rounded_rectangle(box((8, 8, 248, 248)), radius=box((52, 52, 0, 0))[0], fill="#102033")
-
-    # Folder tab and body are deliberately geometric so the silhouette reads at 16 px.
-    draw.polygon(
-        [tuple(round(v * size * scale / 256) for v in point) for point in
-         ((29, 68), (99, 68), (119, 88), (223, 88), (223, 203), (29, 203))],
-        fill="#30C7B1",
+def build(master_name: str, png_name: str, ico_name: str) -> None:
+    master = square_master(ASSETS / "logo" / master_name)
+    frames = [master.resize((size, size), Image.Resampling.LANCZOS) for size in SIZES]
+    frames[-1].save(ASSETS / png_name, format="PNG", optimize=True)
+    frames[-1].save(
+        ASSETS / ico_name,
+        format="ICO",
+        sizes=[(size, size) for size in SIZES],
+        append_images=frames[:-1],
     )
-    draw.line(
-        [tuple(round(v * size * scale / 256) for v in point) for point in
-         ((30, 89), (221, 89))],
-        fill="#82F0DC",
-        width=max(1, round(size * scale / 38)),
-    )
-
-    # Six overlapping shutter blades create a recognizable aperture inside the folder.
-    cx = cy = 145 * size * scale / 256
-    outer = 42 * size * scale / 256
-    inner = 11 * size * scale / 256
-    for blade in range(6):
-        angle = blade * 60
-        points = []
-        for radius, degrees in ((inner, angle + 8), (outer, angle + 40), (outer, angle + 58), (inner, angle + 68)):
-            import math
-
-            radians = math.radians(degrees)
-            points.append((round(cx + radius * math.cos(radians)), round(cy + radius * math.sin(radians))))
-        draw.polygon(points, fill="#E8FFF8")
-    draw.ellipse(box((136, 136, 154, 154)), fill="#102033")
-    draw.ellipse(box((141, 141, 149, 149)), fill="#FFB45E")
-
-    return canvas.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def main() -> None:
-    ASSETS.mkdir(parents=True, exist_ok=True)
-    render(256).save(ASSETS / "zxraw.png", format="PNG", optimize=True)
-    render(256).save(
-        ASSETS / "zxraw.ico",
-        format="ICO",
-        sizes=[(size, size) for size in SIZES],
-    )
-    print(f"Wrote {ASSETS / 'zxraw.png'} and {ASSETS / 'zxraw.ico'} ({', '.join(map(str, SIZES))} px)")
+    build("zxraw-square.png", "zxraw.png", "zxraw.ico")
+    build("zxraw-round.png", "zxraw-round.png", "zxraw-round.ico")
 
 
 if __name__ == "__main__":

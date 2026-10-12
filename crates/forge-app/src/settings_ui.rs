@@ -459,6 +459,31 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
             .weak()
             .small(),
     );
+    ui.add_space(14.0);
+    ui.label("App icon");
+    ui.horizontal(|ui| {
+        for (choice, label) in crate::app_icon::ALL {
+            let preview = crate::app_icon::preview(ui.ctx(), choice);
+            let image = egui::Image::new(&preview).fit_to_exact_size(egui::vec2(48.0, 48.0));
+            if ui
+                .add(
+                    egui::Button::image_and_text(image, label)
+                        .selected(settings.app_icon == choice),
+                )
+                .clicked()
+            {
+                settings.app_icon = choice;
+            }
+        }
+    });
+    ui.label(
+        RichText::new(
+            "Used for the window, the taskbar and your ZXraw Explorer shortcuts. A pinned \
+             taskbar icon may only change after you sign out or restart Explorer.",
+        )
+        .weak()
+        .small(),
+    );
 }
 
 fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
