@@ -249,7 +249,7 @@ loaded. Waiting steps give up after 30 s unless given their own limit.
 | `key [ctrl+][shift+][alt+]<Key>` | Send a real key press and release through egui input (`key 3`, `key ctrl+A`, `key ArrowRight`) |
 | `text <text>` | Send text input to the focused widget |
 | `pointer <x> <y>` / `click <x> <y>` / `scroll <dy>` | Move, click or scroll the real pointer |
-| `click-entry <name>` / `double-click-entry <name>` | Real pointer click(s) where the view drew that row or tile (points, so any display scale) |
+| `click-entry <name>` / `double-click-entry <name>` / `right-click-entry <name>` | Real pointer click(s) where the view drew that row or tile (points, so any display scale) |
 | `click-empty` | Real click on the file list below its last row or tile |
 | `assert-selected <n>` | Number of selected entries the focused pane lists |
 | `dialog <path>\|cancel` | Answer the next native file dialog |

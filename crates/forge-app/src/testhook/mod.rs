@@ -323,10 +323,12 @@ enum Step {
         modifiers: egui::Modifiers,
     },
     ReleasePointer,
-    /// Real pointer clicks on a listed entry's row or tile (`double` = two clicks).
+    /// Real pointer clicks on a listed entry's row or tile (`double` = two clicks,
+    /// `secondary` = one right-click).
     ClickEntry {
         name: String,
         double: bool,
+        secondary: bool,
     },
     /// A real click on the list area below the last row or tile.
     ClickEmpty,
@@ -788,9 +790,10 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
             }
             Step::ReleasePointer
         }
-        "click-entry" | "double-click-entry" => Step::ClickEntry {
+        "click-entry" | "double-click-entry" | "right-click-entry" => Step::ClickEntry {
             name: non_empty(rest)?,
             double: verb == "double-click-entry",
+            secondary: verb == "right-click-entry",
         },
         "click-empty" => Step::ClickEmpty,
         "scroll" => Step::Scroll(
@@ -1095,13 +1098,14 @@ fn drawn_rect(ctx: &egui::Context, id: egui::Id) -> Option<egui::Rect> {
     (ctx.cumulative_frame_nr().saturating_sub(frame) <= 2).then_some(rect)
 }
 
-/// `clicks` real primary-button clicks at `pos`, each press and release in its own frame,
+/// `clicks` real `button` clicks at `pos`, each press and release in its own frame,
 /// back to back so two clicks register as a double-click.
 fn pointer_clicks(
     app: &mut ZxrawApp,
     st: &mut StepState,
     pos: egui::Pos2,
     clicks: u32,
+    button: egui::PointerButton,
 ) -> Result<Flow, String> {
     app.testhook.input.pointer = Some(pos);
     let pressed = st.frames.is_multiple_of(2);
@@ -1111,7 +1115,7 @@ fn pointer_clicks(
     }
     events.push(egui::Event::PointerButton {
         pos,
-        button: egui::PointerButton::Primary,
+        button,
         pressed,
         modifiers: egui::Modifiers::NONE,
     });
@@ -1469,7 +1473,11 @@ fn exec(
                 other => Ok(other),
             }
         }
-        Step::ClickEntry { name, double } => {
+        Step::ClickEntry {
+            name,
+            double,
+            secondary,
+        } => {
             if st.data.is_none() {
                 let Some(path) = app
                     .pane()
@@ -1491,7 +1499,12 @@ fn exec(
                 .unwrap()
                 .downcast_ref::<egui::Pos2>()
                 .unwrap();
-            pointer_clicks(app, st, pos, if *double { 2 } else { 1 })
+            let button = if *secondary {
+                egui::PointerButton::Secondary
+            } else {
+                egui::PointerButton::Primary
+            };
+            pointer_clicks(app, st, pos, if *double { 2 } else { 1 }, button)
         }
         Step::ClickEmpty => {
             if st.data.is_none() {
@@ -1515,7 +1528,7 @@ fn exec(
                 .unwrap()
                 .downcast_ref::<egui::Pos2>()
                 .unwrap();
-            pointer_clicks(app, st, pos, 1)
+            pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
         }
         Step::Marquee {
             from,
