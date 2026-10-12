@@ -91,6 +91,76 @@ Explorer is a file manager designed around that workflow:
 
 ---
 
+## See it in action
+
+<p align="center">
+  <img src="docs/images/screens/browse.jpg" alt="ZXraw Explorer showing a folder of travel photos as thumbnails, with a preview panel listing camera, lens, aperture, shutter and ISO">
+  <br><sub>Thumbnails, a large preview and the camera details for every shot.</sub>
+</p>
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/images/screens/cull.jpg" alt="Full-screen culling viewer with a five-star, picked portrait and a filmstrip">
+      <b>Cull at full screen.</b> Press <kbd>1</kbd>–<kbd>5</kbd> to rate, <kbd>P</kbd> to pick
+      and <kbd>X</kbd> to reject. The next photo comes up automatically, and the filmstrip
+      shows what you've already rated.
+    </td>
+    <td width="50%">
+      <img src="docs/images/screens/compare.jpg" alt="Compare mode showing four frames of a burst side by side">
+      <b>Compare a burst side by side.</b> Up to four frames, with zoom and pan kept in sync,
+      so the sharpest frame is easy to find.
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="docs/images/screens/bursts.jpg" alt="Grid where burst sequences are collapsed into stacks with frame counts">
+      <b>Bursts collapse into stacks.</b> One click groups burst sequences and look-alike
+      shots, so a 23-photo folder reads like the 16 moments you actually shot.
+    </td>
+    <td>
+      <img src="docs/images/screens/dual-pane.jpg" alt="Two folders side by side in dual-pane view">
+      <b>Two folders side by side.</b> Press <kbd>F3</kbd> to split the view, then
+      <kbd>F6</kbd> to copy the selection to the other pane, or <kbd>Shift</kbd>+<kbd>F6</kbd>
+      to move it.
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="docs/images/screens/import.jpg" alt="Media ingest window planning a verified copy from a camera card into dated folders">
+      <b>Plan the import before it copies.</b> The card on <code>X:</code> is mapped into dated
+      folders under <code>P:\Photos</code>, every file is verified after copying, and the
+      source is never modified.
+    </td>
+    <td>
+      <img src="docs/images/screens/batch-rename.jpg" alt="Batch rename dialog previewing new numbered file names">
+      <b>Batch rename with a live preview.</b> Chain rules and tokens (name, number, date,
+      parent folder), see every new name first, and undo afterwards.
+    </td>
+  </tr>
+  <tr>
+    <td>
+      <img src="docs/images/screens/search.jpg" alt="Library search for rating 4 or more, listing eight results">
+      <b>Search the whole library.</b> Filter by <code>rating:&gt;=4</code>, camera, lens, ISO,
+      date, tags and more, across every folder you've indexed.
+    </td>
+    <td>
+      <img src="docs/images/screens/duplicates.jpg" alt="Duplicate finder listing three groups of identical files">
+      <b>Find true duplicates.</b> Files are compared by content (BLAKE3), and the app
+      re-checks each copy before anything goes to the Recycle Bin.
+    </td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/screens/palette.jpg" width="80%" alt="Command palette filtered to rating commands">
+  <br><sub>Every action is in the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>), with its shortcut.</sub>
+</p>
+
+<sub>Screenshots are of the real app. The sample photos in them were generated for this page.</sub>
+
+---
+
 ## Import from a card, safely
 
 <p align="center">
@@ -139,12 +209,12 @@ so Windows SmartScreen may warn the first time: choose *More info → Run anyway
 </p>
 
 **ZXraw Explorer is free and will stay free.** No paid tier, no ads, no locked features. If it saves
-you time on your next shoot, you can support its development. Even starring the repo or telling a
+you time on your next shoot, you can buy me a coffee. Even starring the repo or telling a
 photographer friend helps.
 
-<!-- Donation links go here once the account is set up, e.g.
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-2F6FEB)](https://github.com/sponsors/USERNAME)
--->
+<p align="center">
+  <a href="https://buymeacoffee.com/zuhu"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-support%20ZXraw%20Explorer-2F6FEB?style=for-the-badge&logo=buymeacoffee&logoColor=white" alt="Buy me a coffee"></a>
+</p>
 
 ---
 
