@@ -98,12 +98,13 @@ fn video_proxy_conventions_and_external_root_scan_are_visible() {
         "wait-frames 2".into(),
         path_step("dialog", &external),
         "ui related proxies-locate".into(),
-        // Scroll to the end of the preview so the located rows are inside the captured area.
-        "pointer 1200 700".into(),
-        "scroll 800".into(),
+        // Wait for the asynchronous scan before scrolling; its results extend the preview.
+        "ui related assert-no-proxies GX010002_proxy.mp4".into(),
+        // Scroll just far enough to bring the located row into the visible Related section.
+        "pointer 1250 700".into(),
+        "scroll 120".into(),
         "wait-frames 2".into(),
         "ui related assert-proxies GX010001.proxy.mp4".into(),
-        "ui related assert-no-proxies GX010002_proxy.mp4".into(),
         path_step("screenshot", &shots_external),
         // A dismissed folder picker must leave the completed results available.
         "dialog cancel".into(),
