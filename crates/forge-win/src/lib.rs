@@ -12,12 +12,15 @@
 //! * [`process`] — launching external tools without a shell.
 //! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download).
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
+//! * Opt-in per-user integration: the folder context menu and photo file types
+//!   ("Open with" / Settings > Default apps).
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
 mod clipboard;
+mod file_types;
 mod integration;
 pub mod desktop;
 pub mod dragout;
@@ -33,6 +36,10 @@ pub use clipboard::{
     ClipboardEffect, clear_if_owned_files, clipboard_sequence, get_files, set_files,
 };
 pub use drives::{DriveInfo, DriveKind, list_drives};
+pub use file_types::{
+    DefaultApp, FileType, default_app, file_types_registered, open_default_apps_settings,
+    refresh_file_types_if_registered, register_file_types, unregister_file_types,
+};
 pub use files::{hard_link_count, is_removable, set_attributes, volume_serial};
 pub use integration::{
     is_registered, refresh_if_registered, register_context_menu, unregister_context_menu,

@@ -25,12 +25,13 @@ enum SettingsPage {
     MediaLinks,
     Library,
     ExternalTools,
+    DefaultApp,
     Privacy,
     Shortcuts,
 }
 
 impl SettingsPage {
-    const ALL: [(Self, &'static str); 10] = [
+    const ALL: [(Self, &'static str); 11] = [
         (Self::Appearance, "Appearance"),
         (Self::Browsing, "Browsing"),
         (Self::Performance, "Performance"),
@@ -39,6 +40,7 @@ impl SettingsPage {
         (Self::MediaLinks, "Media links"),
         (Self::Library, "Library"),
         (Self::ExternalTools, "External tools"),
+        (Self::DefaultApp, "Default app"),
         (Self::Privacy, "Privacy"),
         (Self::Shortcuts, "Keyboard shortcuts"),
     ];
@@ -137,10 +139,13 @@ enum SettingsIntent {
     CheckIntegrity,
     DetectApps,
     BrowseToolExecutable,
+    DefaultApp(crate::default_app::Action),
 }
 
 pub struct SettingsUi {
     pub open: bool,
+    /// Which apps open photos; shared with the first-run welcome.
+    pub default_app: crate::default_app::State,
     page: SettingsPage,
     was_open: bool,
     picker_open: bool,
@@ -175,6 +180,7 @@ impl Default for SettingsUi {
         let (tx, rx) = unbounded();
         Self {
             open: false,
+            default_app: Default::default(),
             page: SettingsPage::Appearance,
             was_open: false,
             picker_open: false,
@@ -404,6 +410,9 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                     ),
                                     SettingsPage::ExternalTools => {
                                         external_tools_page(ui, settings, state, &mut intents)
+                                    }
+                                    SettingsPage::DefaultApp => {
+                                        default_app_page(ui, state, &mut intents)
                                     }
                                     SettingsPage::Privacy => privacy_page(ui),
                                     SettingsPage::Shortcuts => shortcuts_page(ui, ctx),
@@ -1145,6 +1154,25 @@ fn external_tools_page(
     }
 }
 
+fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec<SettingsIntent>) {
+    page_heading(
+        ui,
+        "Default app",
+        "Open photos and RAW files in ZXraw Explorer's viewer when you double-click them.",
+    );
+    ui.add_space(10.0);
+    let mut action = None;
+    crate::default_app::controls(ui, &mut state.default_app, false, &mut action);
+    intents.extend(action.map(SettingsIntent::DefaultApp));
+    ui.add_space(12.0);
+    ui.label(
+        RichText::new(
+            "Windows only lets you choose the default app yourself, in Settings. Some programs skip that choice and open the type's registered app directly; ZXraw Explorer registers itself there too, for your account only, so those programs open it as well. \"Stop using as default\" puts back what was there before.",
+        )
+        .weak(),
+    );
+}
+
 fn privacy_page(ui: &mut egui::Ui) {
     page_heading(
         ui,
@@ -1332,6 +1360,7 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
             }
             SettingsIntent::CheckIntegrity => check_integrity(app, ctx),
             SettingsIntent::DetectApps => detect_apps_background(&mut app.ops.settings_ui, ctx),
+            SettingsIntent::DefaultApp(action) => crate::default_app::run(app, action),
             SettingsIntent::BrowseToolExecutable => {
                 if let Some(path) = crate::dialogs::pick_file(
                     rfd::FileDialog::new()

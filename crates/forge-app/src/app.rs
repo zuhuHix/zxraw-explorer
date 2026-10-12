@@ -74,6 +74,9 @@ pub struct ZxrawApp {
     pub testhook: crate::testhook::TestHook,
     pub viewer: Option<crate::viewer::Viewer>,
     pub notices: crate::notices::Notices,
+    /// A photo passed on the command line (a double-click when ZXraw Explorer is the default
+    /// app): shown in the viewer once its folder has loaded.
+    launch_photo: Option<PathBuf>,
     applied_theme: Option<(bool, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
     applied_icon: settings::AppIcon,
@@ -167,6 +170,7 @@ impl ZxrawApp {
             testhook: crate::testhook::TestHook::from_env(),
             viewer: None,
             notices: Default::default(),
+            launch_photo: None,
             settings,
         };
         app.notices = crate::notices::Notices::new(
@@ -184,21 +188,34 @@ impl ZxrawApp {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
             crate::app_icon::apply_to_shortcuts(app.settings.app_icon);
         }
-        // `forge.exe <folder>` opens that folder in a new tab.
+        // `zxraw.exe <folder>` opens that folder in a new tab; `zxraw.exe <photo>` opens its
+        // folder with the photo selected and shows it in the viewer.
         if let Some(arg) = std::env::args_os().nth(1) {
             let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
-            if p.exists() {
+            let folder = if p.is_file() { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
+            if let Some(folder) = folder.filter(|folder| folder.exists()) {
                 // Reuse a restored tab already showing this folder instead of piling up tabs.
                 let existing = app
                     .tabs
                     .iter()
-                    .position(|t| forge_core::paths::paths_equal(&t.left.path, &p));
+                    .position(|t| forge_core::paths::paths_equal(&t.left.path, &folder));
                 match existing {
                     Some(i) => app.active = i,
-                    None => {
-                        app.run(Cmd::NewTab, &cc.egui_ctx);
-                        app.navigate(p);
+                    None => app.run(Cmd::NewTab, &cc.egui_ctx),
+                }
+                if p.is_file() {
+                    app.tab_mut().focus = Side::Left;
+                    let kind = forge_core::model::media_kind_for_ext(
+                        &p.extension()
+                            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                            .unwrap_or_default(),
+                    );
+                    if matches!(kind, forge_core::MediaKind::Image | forge_core::MediaKind::Raw) {
+                        app.launch_photo = Some(p.clone());
                     }
+                    app.navigate(p);
+                } else if existing.is_none() {
+                    app.navigate(p);
                 }
             }
         }
@@ -874,6 +891,11 @@ impl eframe::App for ZxrawApp {
             }
         }
         changed |= crate::actions::poll(self);
+        if !self.pane().is_loading()
+            && let Some(photo) = self.launch_photo.take()
+        {
+            crate::viewer_host::open_launched(self, photo);
+        }
         if changed || self.ops.thumbs.busy() || self.tabs.iter().any(|t| t.left.is_loading()) {
             ctx.request_repaint_after(Duration::from_millis(30));
         }

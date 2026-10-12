@@ -139,6 +139,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
     let mut open = true;
     let mut done = false;
     let mut run: Option<Cmd> = None;
+    let mut default_app = None;
     let mut view_changed = false;
     egui::Window::new("Welcome to ZXraw Explorer")
         .id(egui::Id::new("welcome"))
@@ -179,6 +180,11 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
                 );
                 ui.end_row();
             });
+            ui.add_space(8.0);
+
+            ui.heading("Default app");
+            ui.label("Open photos and RAW files in ZXraw Explorer when you double-click them, or when another program opens them.");
+            crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
             ui.add_space(8.0);
 
             ui.heading("Video");
@@ -228,6 +234,9 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
     if !open || done {
         app.notices.mark_welcome_done();
         app.save_all();
+    }
+    if let Some(action) = default_app {
+        crate::default_app::run(app, action);
     }
     if let Some(cmd) = run {
         app.run(cmd, ctx);

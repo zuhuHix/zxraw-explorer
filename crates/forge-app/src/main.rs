@@ -8,6 +8,7 @@ mod breadcrumb;
 mod collections_ui;
 mod commands;
 mod crash;
+mod default_app;
 mod dialogs;
 mod dragout;
 mod export_assoc;
@@ -50,32 +51,40 @@ mod watcher;
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
+/// Installer / uninstaller switches: each does its job and exits without opening a window.
+fn run_switch(argument: &std::ffi::OsStr) -> Option<anyhow::Result<&'static str>> {
+    let exe = || std::env::current_exe().map_err(anyhow::Error::from);
+    Some(match argument.to_str()? {
+        "--register-context-menu" => exe()
+            .and_then(|exe| forge_win::register_context_menu(exe).map_err(Into::into))
+            .map(|()| "Explorer context menu registered."),
+        "--unregister-context-menu" => forge_win::unregister_context_menu()
+            .map_err(Into::into)
+            .map(|()| "Explorer context menu removed."),
+        "--register-file-types" => exe()
+            .and_then(|exe| {
+                forge_win::register_file_types(exe, &default_app::file_types()).map_err(Into::into)
+            })
+            .map(|()| "Photo file types registered; confirm the default in Settings > Default apps."),
+        "--unregister-file-types" => forge_win::unregister_file_types()
+            .map_err(Into::into)
+            .map(|()| "Photo file types removed."),
+        _ => return None,
+    })
+}
+
 fn main() -> eframe::Result {
-    if let Some(argument) = std::env::args_os().nth(1) {
-        let register = argument == "--register-context-menu";
-        let unregister = argument == "--unregister-context-menu";
-        if register || unregister {
-            let result = if register {
-                std::env::current_exe()
-                    .map_err(anyhow::Error::from)
-                    .and_then(|exe| {
-                        forge_win::register_context_menu(exe).map_err(anyhow::Error::from)
-                    })
-            } else {
-                forge_win::unregister_context_menu().map_err(anyhow::Error::from)
-            };
-            match result {
-                Ok(()) => {
-                    println!(
-                        "Explorer context menu {}.",
-                        if register { "registered" } else { "removed" }
-                    );
-                    return Ok(());
-                }
-                Err(error) => {
-                    eprintln!("Could not update the Explorer context menu: {error}");
-                    std::process::exit(1);
-                }
+    if let Some(argument) = std::env::args_os().nth(1)
+        && let Some(result) = run_switch(&argument)
+    {
+        match result {
+            Ok(message) => {
+                println!("{message}");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("{}: {error}", argument.to_string_lossy());
+                std::process::exit(1);
             }
         }
     }
@@ -107,6 +116,7 @@ fn main() -> eframe::Result {
                 )
             }
         }
+        default_app::refresh_registration();
     }
 
     let default_hook = std::panic::take_hook();
