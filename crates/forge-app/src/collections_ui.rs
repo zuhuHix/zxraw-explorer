@@ -19,6 +19,8 @@ const SEARCH_RESULT_LIMIT: u32 = 5_000;
 
 pub struct CollectionsUi {
     pub open: bool,
+    /// Outer rect of the window as drawn last frame; `None` while it is closed.
+    window_rect: Option<egui::Rect>,
     tx: Sender<UiMessage>,
     rx: Receiver<UiMessage>,
     collections: Vec<Collection>,
@@ -52,6 +54,7 @@ impl Default for CollectionsUi {
         let (tx, rx) = unbounded();
         Self {
             open: false,
+            window_rect: None,
             tx,
             rx,
             collections: Vec::new(),
@@ -295,9 +298,10 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
 
     if app.ops.collections_ui.open {
         let mut open = app.ops.collections_ui.open;
-        egui::Window::new("Collections & saved searches")
+        let response = egui::Window::new("Collections & saved searches")
             .open(&mut open)
-            .default_size([940.0, 640.0])
+            .default_size([760.0, 480.0])
+            .min_size([520.0, 320.0])
             .resizable(true)
             .show(ctx, |ui| {
                 render_main(
@@ -308,6 +312,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
                     &mut commands,
                 );
             });
+        app.ops.collections_ui.window_rect = response.map(|r| r.response.rect);
         app.ops.collections_ui.open = open;
     }
 
@@ -377,6 +382,19 @@ pub(crate) fn testhook_shown_rows(app: &ZxrawApp, id: CollectionId) -> Option<Ve
     let state = &app.ops.collections_ui;
     let shows = matches!(&state.detail, Some(Detail::Collection { id: shown, .. }) if *shown == id);
     (shows && !state.rows_loading).then(|| state.rows.iter().map(|row| row.name.clone()).collect())
+}
+
+/// Test hook: the size of the management window, `None` while it is closed.
+pub(crate) fn testhook_window_size(app: &ZxrawApp) -> Option<egui::Vec2> {
+    app.ops.collections_ui.window_rect.map(|rect| rect.size())
+}
+
+/// Test hook: the point inside the window's bottom-right resize grip.
+pub(crate) fn testhook_window_grip(app: &ZxrawApp) -> Option<egui::Pos2> {
+    app.ops
+        .collections_ui
+        .window_rect
+        .map(|rect| rect.max - egui::vec2(4.0, 4.0))
 }
 
 /// Test hook: `Ok(Some(count))` once the relink preview has finished.
@@ -848,9 +866,11 @@ fn render_main(
 
 fn render_catalog(ui: &mut egui::Ui, state: &mut CollectionsUi, commands: &mut Vec<UiCommand>) {
     ui.label(RichText::new("Collections").strong());
+    // Half the column each for collections and saved searches; the lower list takes the rest.
     egui::ScrollArea::vertical()
         .id_salt("collections-catalog")
-        .max_height(ui.available_height())
+        .auto_shrink([false, false])
+        .max_height(ui.available_height() * 0.5)
         .show(ui, |ui| {
             for collection in state.collections.clone() {
                 let count = if collection.kind == CollectionKind::Manual {
@@ -903,6 +923,7 @@ fn render_catalog(ui: &mut egui::Ui, state: &mut CollectionsUi, commands: &mut V
 fn render_saved_searches(ui: &mut egui::Ui, state: &mut CollectionsUi) {
     egui::ScrollArea::vertical()
         .id_salt("saved-search-catalog")
+        .auto_shrink([false, false])
         .max_height(ui.available_height())
         .show(ui, |ui| {
             for saved in state.saved_searches.clone() {

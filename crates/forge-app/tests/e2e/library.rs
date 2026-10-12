@@ -123,6 +123,31 @@ fn collection_holds_the_selected_files_and_lists_them_when_opened() {
 }
 
 #[test]
+fn collections_window_resizes_both_ways_and_fills_the_height() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        "cmd Collections\n\
+         ui library collection-window-size 700 440\n\
+         screenshot {before}\n\
+         ui library collection-resize 0 200\n\
+         ui library collection-window-size 700 620\n\
+         ui library collection-resize 160 0\n\
+         ui library collection-window-size 840 620\n\
+         screenshot {after}\n\
+         exit\n",
+        before = shown(&shot("collection-window-default.png")),
+        after = shown(&shot("collection-window-resized.png")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(shot("collection-window-resized.png").is_file());
+}
+
+#[test]
 fn a_collection_assertion_that_does_not_hold_fails_the_script() {
     let sandbox = tempfile::tempdir().unwrap();
     let dir = sandbox.path().join("shoot");

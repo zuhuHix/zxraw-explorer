@@ -24,6 +24,10 @@
 //! - `collection-assert <name> | <names>`: exact member set read from the database,
 //!   offline members included.
 //! - `collection-assert-offline <name> | <names>`: the members that are offline.
+//! - `collection-window-size <min-width> <min-height>`: the window is at least this big
+//!   (waits up to 10 s for it to grow to that size).
+//! - `collection-resize <dx> <dy>`: drags the window's bottom-right grip by the offset in
+//!   points.
 //! - `choose import|export <name>|relink-old|relink-new`: the window's dialog buttons. A
 //!   `dialog <path>` step queued before answers them. Waits for the operation.
 //! - `relink-preview <count>`: preview the relink of the chosen folders; `count` must match.
@@ -49,7 +53,7 @@ use std::time::Duration;
 
 use forge_db::{AnnotationChange, Db, FileId};
 
-use super::{Flow, StepState};
+use super::{Flow, StepState, inject};
 use crate::actions::Event;
 use crate::app::ZxrawApp;
 use crate::collections_ui::{self, UiCommand};
@@ -194,6 +198,8 @@ pub(super) fn step(
             );
             check_set(&format!("members of `{name}`"), &expected, &found, st)
         }
+        "collection-window-size" => collection_window_size(app, args, st),
+        "collection-resize" => collection_resize(app, args, st),
         "choose" => choose(app, ctx, args, st),
         "relink-preview" => {
             let expected = parse_count(args)?;
@@ -307,6 +313,57 @@ pub(super) fn step(
 // ---------------------------------------------------------------------------
 // Verbs
 // ---------------------------------------------------------------------------
+
+/// `collection-window-size <min-width> <min-height>`: the collections window is at least this
+/// big. Waits for it to appear, or to grow to the size.
+fn collection_window_size(app: &ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
+    let (min_w, min_h) = float_pair(args)?;
+    match collections_ui::testhook_window_size(app) {
+        Some(size) if size.x >= min_w && size.y >= min_h => Ok(Flow::Done),
+        Some(size) => wait(st, &format!("window is {:.0} x {:.0}", size.x, size.y)),
+        None => wait(st, "collections window is not shown"),
+    }
+}
+
+/// `collection-resize <dx> <dy>`: drags the collections window's bottom-right grip by the
+/// offset in points. Press, move and release land in three frames, like a real drag.
+fn collection_resize(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
+    let (dx, dy) = float_pair(args)?;
+    if st.data.is_none() {
+        let Some(grip) = collections_ui::testhook_window_grip(app) else {
+            return wait(st, "collections window is not shown");
+        };
+        st.data = Some(Box::new((grip, grip + egui::vec2(dx, dy))));
+    }
+    let (from, to) = *st
+        .data
+        .as_ref()
+        .and_then(|data| data.downcast_ref::<(egui::Pos2, egui::Pos2)>())
+        .ok_or("invalid collection-resize state")?;
+    let press = |pos, pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let (pos, events) = match st.frames {
+        0 => (
+            from,
+            vec![egui::Event::PointerMoved(from), press(from, true)],
+        ),
+        1 => (to, vec![egui::Event::PointerMoved(to)]),
+        _ => (to, vec![press(to, false)]),
+    };
+    app.testhook.input.pointer = Some(pos);
+    match inject(app, st, &events) {
+        Flow::Done if st.frames < 2 => {
+            st.frames += 1;
+            st.phase = 0;
+            Ok(Flow::Wait("drag in progress".into()))
+        }
+        other => Ok(other),
+    }
+}
 
 fn search(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
     let query = non_empty(args, "expected a search query")?;
@@ -561,6 +618,14 @@ fn two_parts(args: &str) -> Result<(&str, &str), String> {
     match args.split_once(" | ") {
         Some((a, b)) if !a.trim().is_empty() => Ok((a.trim(), b.trim())),
         _ => Err("expected `<first> | <second>`".into()),
+    }
+}
+
+fn float_pair(args: &str) -> Result<(f32, f32), String> {
+    let mut parts = args.split_whitespace().map(str::parse::<f32>);
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(x)), Some(Ok(y)), None) => Ok((x, y)),
+        _ => Err(format!("expected `<x> <y>` numbers, got `{args}`")),
     }
 }
 
