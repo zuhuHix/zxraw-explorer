@@ -672,16 +672,21 @@ impl ZxrawApp {
                     title
                 };
                 let selected = i == self.active;
-                // The active tab sits on the content surface with an accent bar beneath;
-                // the others are plain text until hovered.
+                // The active tab is a raised chip in the card colour with a glowing accent
+                // bar beneath; the others are recessed plain text until hovered.
                 let r = if selected {
-                    let fill = theme::palette(ui.ctx()).content;
-                    let r = ui.add(egui::Button::new(title).selected(true).fill(fill).stroke(egui::Stroke::NONE));
+                    let p = theme::palette(ui.ctx());
+                    let shadow = ui.painter().add(egui::Shape::Noop);
+                    let text = RichText::new(title).color(ui.visuals().strong_text_color());
+                    let button = egui::Button::new(text).selected(true).fill(p.content).stroke(egui::Stroke::new(1.0, p.card_border));
+                    let r = ui.add(button.corner_radius(8).min_size(egui::vec2(0.0, 26.0)));
+                    let lift = egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: egui::Color32::from_black_alpha(if p.dark { 90 } else { 18 }) };
+                    ui.painter().set(shadow, lift.as_shape(r.rect, egui::CornerRadius::same(8)));
                     theme::paint_indicator(ui, r.rect, false);
                     r
                 } else {
                     let text = RichText::new(title).color(theme::muted(ui));
-                    ui.add(egui::Button::new(text).selected(false).frame_when_inactive(false))
+                    ui.add(egui::Button::new(text).selected(false).frame_when_inactive(false).corner_radius(8).min_size(egui::vec2(0.0, 26.0)))
                 };
                 if r.clicked() {
                     select = Some(i);
@@ -705,7 +710,7 @@ impl ZxrawApp {
             if let Some(i) = close {
                 self.close_tab(i);
             }
-            if ui.button("+").on_hover_text("New tab (Ctrl+T)").clicked() {
+            if ui.add(theme::ghost_button("+")).on_hover_text("New tab (Ctrl+T)").clicked() {
                 self.run(Cmd::NewTab, &ui.ctx().clone());
             }
         });
@@ -716,46 +721,59 @@ impl ZxrawApp {
         ui.horizontal(|ui| {
             let p = self.pane();
             let (cb, cf) = (p.can_back(), p.can_forward());
-            if ui.add_enabled(cb, egui::Button::new("⏴")).on_hover_text("Back (Alt+Left)").clicked() {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            if ui.add_enabled(cb, theme::ghost_button("⏴")).on_hover_text("Back (Alt+Left)").clicked() {
                 self.run(Cmd::Back, &ctx);
             }
-            if ui.add_enabled(cf, egui::Button::new("⏵")).on_hover_text("Forward (Alt+Right)").clicked() {
+            if ui.add_enabled(cf, theme::ghost_button("⏵")).on_hover_text("Forward (Alt+Right)").clicked() {
                 self.run(Cmd::Forward, &ctx);
             }
-            if ui.button("⏶").on_hover_text("Up (Alt+Up)").clicked() {
+            if ui.add(theme::ghost_button("⏶")).on_hover_text("Up (Alt+Up)").clicked() {
                 self.run(Cmd::Up, &ctx);
             }
-            if ui.button("⟳").on_hover_text("Refresh (F5)").clicked() {
+            if ui.add(theme::ghost_button("⟳")).on_hover_text("Refresh (F5)").clicked() {
                 self.run(Cmd::Refresh, &ctx);
             }
+            ui.add_space(4.0);
 
             // Right-aligned controls first so the address bar gets the remaining width.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("☰").on_hover_text("Command palette (Ctrl+Shift+P)").clicked() {
+                if ui.add(theme::ghost_button("☰")).on_hover_text("Command palette (Ctrl+Shift+P)").clicked() {
                     self.run(Cmd::CommandPalette, &ctx);
                 }
+                ui.add_space(4.0);
                 let view = self.pane().view;
-                if ui.selectable_label(view == ViewMode::Grid, "▦").on_hover_text("Thumbnails").clicked() {
+                if theme::pill_toggle(ui, view == ViewMode::Grid, "▦").on_hover_text("Thumbnails").clicked() {
                     self.run(Cmd::ViewGrid, &ctx);
                 }
-                if ui.selectable_label(view == ViewMode::Details, "☷").on_hover_text("Details").clicked() {
+                if theme::pill_toggle(ui, view == ViewMode::Details, "☷").on_hover_text("Details").clicked() {
                     self.run(Cmd::ViewDetails, &ctx);
                 }
                 let dual = self.tab().right.is_some();
-                if ui.selectable_label(dual, "◫").on_hover_text("Dual pane (F3)").clicked() {
+                if theme::pill_toggle(ui, dual, "◫").on_hover_text("Dual pane (F3)").clicked() {
                     self.run(Cmd::ToggleDualPane, &ctx);
                 }
-                if ui.selectable_label(self.show_preview, "▣").on_hover_text("Preview panel (Alt+P)").clicked() {
+                if theme::pill_toggle(ui, self.show_preview, "▣").on_hover_text("Preview panel (Alt+P)").clicked() {
                     self.run(Cmd::TogglePreview, &ctx);
                 }
-                // Filter box
+                ui.add_space(6.0);
+                // Filter box: a rounded pill with a search icon.
                 let mut filter = self.pane().filter_text.clone();
                 let err = self.pane().filter_error.clone();
-                let fr = ui.add(
-                    egui::TextEdit::singleline(&mut filter)
-                        .hint_text("Filter  (e.g. ext:cr3 size:>20mb)")
-                        .desired_width(240.0),
-                );
+                let fr = ui
+                    .scope(|ui| {
+                        theme::pill_field_style(ui);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut filter)
+                                .prefix(RichText::new("🔍").color(theme::muted(ui)))
+                                .hint_text("Filter  (e.g. ext:cr3 size:>20mb)")
+                                .background_color(theme::palette(ui.ctx()).field)
+                                .margin(egui::Margin::symmetric(10, 4))
+                                .desired_width(240.0),
+                        )
+                    })
+                    .inner;
+                ui.add_space(4.0);
                 let fr = match &err {
                     Some(e) => fr.on_hover_text(format!("Query error — using plain text match:\n{e}")),
                     None => fr,
@@ -773,6 +791,8 @@ impl ZxrawApp {
                 }
                 // Address / breadcrumb takes the rest.
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    // A long path must not paint over the filter and view buttons.
+                    ui.shrink_clip_rect(ui.max_rect());
                     crate::breadcrumb::address_bar(self, ui);
                 });
             });
@@ -958,19 +978,24 @@ impl eframe::App for ZxrawApp {
         let title = format!("{} — ZXraw Explorer", self.pane().path.display());
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.tab_bar(ui);
-        });
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(2.0);
-            self.toolbar(ui);
-            ui.add_space(2.0);
-        });
-        egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        // The tab strip, toolbar, sidebar and status bar are one continuous chrome surface;
+        // the listing and the preview float on it as raised cards.
+        egui::Panel::top("tabs")
+            .frame(theme::chrome_frame(&ctx, egui::Margin { left: 8, right: 8, top: 6, bottom: 2 }))
+            .show_separator_line(false)
+            .show(ui, |ui| self.tab_bar(ui));
+        egui::Panel::top("toolbar")
+            .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(8, 5)))
+            .show_separator_line(false)
+            .show(ui, |ui| self.toolbar(ui));
+        egui::Panel::bottom("status")
+            .frame(theme::chrome_frame(&ctx, egui::Margin { left: 12, right: 12, top: 0, bottom: 4 }))
+            .show_separator_line(false)
+            .show(ui, |ui| self.status_bar(ui));
         if self.show_sidebar {
             egui::Panel::left("sidebar")
                 .frame(theme::sidebar_frame(&ctx))
+                .show_separator_line(false)
                 .resizable(true)
                 .default_size(210.0)
                 .size_range(140.0..=420.0)
@@ -979,27 +1004,30 @@ impl eframe::App for ZxrawApp {
         if self.show_preview {
             egui::Panel::right("preview")
                 .frame(theme::content_side_frame(&ctx))
+                .show_separator_line(false)
                 .resizable(true)
                 .default_size(340.0)
                 .size_range(220.0..=900.0)
-                .show(ui, |ui| crate::actions::preview_panel(self, ui));
+                .show(ui, |ui| theme::card(ui, false, |ui| crate::actions::preview_panel(self, ui)));
         }
         egui::CentralPanel::default().frame(theme::content_frame(&ctx)).show(ui, |ui| {
             if self.tab().right.is_some() {
+                let gap = 8.0;
                 let w = ui.available_width();
                 let h = ui.available_height();
+                let focus = self.tab().focus;
                 ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(egui::vec2(w / 2.0 - 4.0, h), Layout::top_down(Align::Min), |ui| {
-                        ui.set_min_size(egui::vec2(w / 2.0 - 4.0, h));
-                        self.pane_ui(ui, Side::Left);
+                    ui.spacing_mut().item_spacing.x = gap;
+                    ui.allocate_ui_with_layout(egui::vec2((w - gap) / 2.0, h), Layout::top_down(Align::Min), |ui| {
+                        ui.set_min_size(egui::vec2((w - gap) / 2.0, h));
+                        theme::card(ui, focus == Side::Left, |ui| self.pane_ui(ui, Side::Left));
                     });
-                    ui.separator();
                     ui.allocate_ui_with_layout(ui.available_size(), Layout::top_down(Align::Min), |ui| {
-                        self.pane_ui(ui, Side::Right);
+                        theme::card(ui, focus == Side::Right, |ui| self.pane_ui(ui, Side::Right));
                     });
                 });
             } else {
-                self.pane_ui(ui, Side::Left);
+                theme::card(ui, false, |ui| self.pane_ui(ui, Side::Left));
             }
         });
 

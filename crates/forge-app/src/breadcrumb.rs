@@ -59,10 +59,12 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
     let editing = app.pane().editing_path.is_some() || app.focus_address;
     if !editing {
         let path = app.pane().path.clone();
+        let palette = crate::theme::palette(ui.ctx());
         let frame = egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
-            .corner_radius(4)
-            .inner_margin(egui::Margin::symmetric(4, 2));
+            .fill(palette.field)
+            .stroke(egui::Stroke::new(1.0, palette.card_border))
+            .corner_radius(13)
+            .inner_margin(egui::Margin::symmetric(6, 1));
         let resp = frame
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -75,7 +77,11 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
                             ui.label(RichText::new(" › ").weak());
                         }
                         if ui
-                            .add(egui::Button::new(label.as_str()).frame_when_inactive(false))
+                            .add(
+                                egui::Button::new(label.as_str())
+                                    .frame_when_inactive(false)
+                                    .corner_radius(9),
+                            )
                             .clicked()
                         {
                             nav = Some(target.clone());

@@ -326,15 +326,28 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
                 nav_item(app, ui, icon, &label, &d.root, None);
                 if d.total > 0 {
                     let used = 1.0 - d.free as f32 / d.total as f32;
-                    let bar = egui::ProgressBar::new(used)
-                        .desired_height(3.0)
-                        .desired_width(ui.available_width() - 8.0)
-                        .fill(if used > 0.9 {
-                            ui.visuals().error_fg_color
-                        } else {
-                            theme::accent(ui.ctx())
-                        });
-                    ui.add(bar).on_hover_text(format!(
+                    // A slim track with an accent gradient (red when nearly full).
+                    let (rect, bar) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width() - 8.0, 4.0),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
+                    let filled = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width() * used.clamp(0.0, 1.0), rect.height()),
+                    );
+                    let (from, to) = if used > 0.9 {
+                        let red = ui.visuals().error_fg_color;
+                        (red, red)
+                    } else {
+                        (
+                            theme::accent(ui.ctx()),
+                            theme::accent_gradient_end(ui.ctx()),
+                        )
+                    };
+                    theme::paint_hgradient(&painter.with_clip_rect(filled), rect, from, to);
+                    bar.on_hover_text(format!(
                         "{} free of {}",
                         forge_core::model::format_size(d.free),
                         forge_core::model::format_size(d.total)

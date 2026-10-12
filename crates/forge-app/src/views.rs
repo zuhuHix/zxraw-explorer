@@ -79,10 +79,13 @@ pub fn icon_color(e: &FileEntry) -> Color32 {
             MediaKind::Video => Color32::from_rgb(170, 120, 220),
             MediaKind::Audio => Color32::from_rgb(90, 180, 200),
             MediaKind::Archive => Color32::from_rgb(190, 150, 100),
-            _ => Color32::from_gray(150),
+            _ => NEUTRAL_ICON,
         },
     }
 }
+
+/// [`icon_color`] of plain files; the grid tints it towards the accent.
+const NEUTRAL_ICON: Color32 = Color32::from_gray(150);
 
 pub fn format_time(t: Option<SystemTime>) -> String {
     match t {
@@ -663,17 +666,14 @@ pub fn details(
     let header_width = width.max(columns.iter().map(|column| column.width).sum());
     let (header_rect, _) = ui.allocate_exact_size(vec2(header_width, row_h), Sense::hover());
     let header_painter = ui.painter_at(header_rect);
-    header_painter.line_segment(
-        [header_rect.left_bottom(), header_rect.right_bottom()],
-        ui.visuals().widgets.noninteractive.bg_stroke,
-    );
+    header_painter.rect_filled(header_rect, 6.0, theme::palette(ui.ctx()).header);
     let mut x = header_rect.left();
     for (index, column) in columns.iter().enumerate() {
         let rect = Rect::from_min_size(pos2(x, header_rect.top()), vec2(column.width, row_h));
         let response = ui.interact(rect, id.with(("hdr", index)), Sense::click());
         remember_accessible_focus(ui, id, &response);
         if response.hovered() {
-            header_painter.rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+            header_painter.rect_filled(rect, 6.0, theme::palette(ui.ctx()).hover);
         }
         let sorted = column.sort.is_some_and(|key| pane.sort.key == key);
         let arrow = if sorted {
@@ -901,25 +901,27 @@ pub fn details(
             } else {
                 false
             };
+            // Selected and hovered rows are rounded pills inset from the card edge.
+            let pill = rect.shrink2(vec2(2.0, 1.0));
             if selected {
-                painter.rect_filled(rect, 3.0, ui.visuals().selection.bg_fill);
+                painter.rect_filled(pill, 6.0, ui.visuals().selection.bg_fill);
             } else if response.hovered() || drop_hover {
-                painter.rect_filled(rect, 3.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                painter.rect_filled(pill, 6.0, theme::palette(ui.ctx()).hover);
             } else if vis % 2 == 1 {
                 painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color.gamma_multiply(0.5));
             }
             if drop_hover {
                 painter.rect_stroke(
-                    rect,
-                    3.0,
+                    pill,
+                    6.0,
                     Stroke::new(1.5, theme::accent(ui.ctx())),
                     egui::StrokeKind::Inside,
                 );
             }
             if focused && pane.cursor == Some(vis) {
                 painter.rect_stroke(
-                    rect.shrink(1.0),
-                    3.0,
+                    pill,
+                    6.0,
                     Stroke::new(2.0, theme::focus_ring(ui.ctx())),
                     egui::StrokeKind::Inside,
                 );
@@ -1466,11 +1468,35 @@ pub fn grid(
                         .map(|members| members.iter().all(|path| pane.selected.contains(path)))
                         .unwrap_or_else(|| pane.is_selected(&entry));
                     let p = ui.painter_at(rect);
-                    let inner = rect.shrink(3.0);
+                    let inner = rect.shrink(4.0);
+                    // Hovered and selected tiles lift onto a small card (shadows only here,
+                    // never on every tile); selection is accent-tinted with an accent edge.
+                    let palette = theme::palette(ui.ctx());
+                    if selected || resp.hovered() || drop_hover {
+                        let lift = egui::Shadow {
+                            offset: [0, 2],
+                            blur: 8,
+                            spread: 0,
+                            color: Color32::from_black_alpha(if palette.dark { 80 } else { 20 }),
+                        };
+                        p.add(lift.as_shape(inner, egui::CornerRadius::same(8)));
+                    }
                     if selected {
-                        p.rect_filled(inner, 6.0, ui.visuals().selection.bg_fill);
+                        p.rect(
+                            inner,
+                            8.0,
+                            palette.accent_soft,
+                            Stroke::new(2.0, palette.accent),
+                            egui::StrokeKind::Inside,
+                        );
                     } else if resp.hovered() || drop_hover {
-                        p.rect_filled(inner, 6.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                        p.rect(
+                            inner,
+                            8.0,
+                            palette.hover,
+                            Stroke::new(1.0, palette.card_border),
+                            egui::StrokeKind::Inside,
+                        );
                     }
                     let cursor_here = pane.cursor == Some(vis)
                         || item.visible_members.as_ref().is_some_and(|members| {
@@ -1478,9 +1504,9 @@ pub fn grid(
                         });
                     if focused && cursor_here {
                         p.rect_stroke(
-                            inner,
-                            6.0,
-                            Stroke::new(2.0, theme::focus_ring(ui.ctx())),
+                            inner.expand(2.5),
+                            10.0,
+                            Stroke::new(1.5, theme::focus_ring(ui.ctx())),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -1500,11 +1526,12 @@ pub fn grid(
                             let sz = tex.size_vec2();
                             let scale = (thumb_size / sz.x).min(thumb_size / sz.y);
                             let r = Rect::from_center_size(img_rect.center(), sz * scale);
-                            p.image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-                                Color32::WHITE,
+                            p.add(
+                                egui::epaint::RectShape::filled(r, 6.0, Color32::WHITE)
+                                    .with_texture(
+                                        tex.id(),
+                                        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                                    ),
                             );
                             badge_rect = r;
                             if entry.media_kind() == MediaKind::Video {
@@ -1531,7 +1558,10 @@ pub fn grid(
                             Align2::CENTER_CENTER,
                             icon_for(&entry),
                             FontId::proportional((thumb_size * 0.45).clamp(16.0, 96.0)),
-                            icon_color(&entry),
+                            match icon_color(&entry) {
+                                c if c == NEUTRAL_ICON => theme::neutral_icon(ui.ctx()),
+                                c => c,
+                            },
                         );
                     }
                     let annotation = thumbs.annotation(&entry.path);
@@ -1595,13 +1625,13 @@ pub fn grid(
                         pos2(rect.right() - 4.0, rect.bottom() - 2.0),
                     );
                     let label_color = if selected {
-                        ui.visuals().selection.stroke.color
+                        ui.visuals().strong_text_color()
                     } else {
                         ui.visuals().text_color()
                     };
                     let galley = ui.painter().layout(
                         entry.name.clone(),
-                        FontId::proportional(12.0),
+                        FontId::proportional(11.5),
                         label_color,
                         text_rect.width(),
                     );
