@@ -2,7 +2,8 @@
 //! installs only `ffmpeg.exe`, `ffprobe.exe` and the licence into the profile's data
 //! folder, then points Settings › Video at it.
 //!
-//! This is the app's only network access, and it happens only after the user confirms.
+//! Besides the daily update check (`updater`), this is the app's only network access, and
+//! it happens only after the user confirms.
 //! The build is pinned (URL, size and checksum are compiled in), so a changed or
 //! tampered file on the server is refused rather than installed. Nothing is written
 //! outside `<data>\tools`, and a failed or cancelled download leaves nothing behind.
@@ -173,8 +174,9 @@ pub fn confirm(app: &mut ZxrawApp) {
         body: format!(
             "ZXraw Explorer will download FFmpeg {version} ({size}) from {host} and install \
              ffmpeg.exe and ffprobe.exe into:\n{dir}\n\n\
-             The file's SHA-256 checksum is checked before anything is installed. This is the \
-             only time the app connects to the internet, and only because you asked.\n\n\
+             The file's SHA-256 checksum is checked before anything is installed. Apart from \
+             the daily update check, this is the only time the app connects to the internet, \
+             and only because you asked.\n\n\
              FFmpeg is free software (GPL v3) from the FFmpeg project, built by Gyan Doshi; \
              its licence is installed alongside it.",
             version = package.version,

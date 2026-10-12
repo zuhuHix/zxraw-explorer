@@ -921,6 +921,7 @@ impl eframe::App for ZxrawApp {
             }
         }
         changed |= crate::actions::poll(self);
+        crate::updater::tick(self);
         if !self.pane().is_loading()
             && let Some(photo) = self.launch_photo.take()
         {

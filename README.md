@@ -183,9 +183,15 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 
 - No account and no telemetry.
 - Your ratings, tags, index and thumbnail cache live in a local database on your PC.
-- The app makes **no network connections at all**, with one exception: the optional FFmpeg
-  download, which only runs when you click it and confirm, and is checked against a pinned
-  checksum.
+- Your files and their contents never leave your PC. The app makes only these network
+  connections:
+  - **A daily update check.** Once a day it asks `api.github.com` for the latest release of
+    ZXraw Explorer. It's a standard web request whose only app-specific detail is the version
+    in the User-Agent. It's on by default; turn it off in Settings › Updates.
+  - **Updates you click.** *Update now* downloads the installer from this project's GitHub
+    releases and runs it only if its SHA-256 matches the release's `SHA256SUMS.txt`.
+  - **The optional FFmpeg download.** It only runs when you click it and confirm, and is
+    checked against a pinned checksum.
 
 ---
 
@@ -230,6 +236,12 @@ packaging\build-release.ps1    # tested release build + portable zip in dist\
 ```
 
 The installer is built from `packaging\zxraw.iss` with Inno Setup 6.
+
+To cut a release, run `packaging\release.ps1 -Version 1.2.3` (add `-SkipTests` to skip the
+test run, `-Draft` for a draft release). It sets the version in `Cargo.toml`, `Cargo.lock`
+and `zxraw.iss`, builds the zip and the installer, writes `dist\SHA256SUMS.txt` and prints the
+`gh release create` command to publish them. Publish all three files: the in-app updater
+refuses an installer that `SHA256SUMS.txt` doesn't list.
 
 Optional: video thumbnails and technical metadata need `ffmpeg.exe` and `ffprobe.exe`.
 ZXraw Explorer does not bundle FFmpeg. Use **Download FFmpeg…** (in Settings › Video, the

@@ -309,7 +309,15 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   the Windows target and flags three for licence review. The notices those licences require are not yet
   shipped (see [LIMITATIONS.md](LIMITATIONS.md)).
 * 🟡 Local-first, no-telemetry direction is stated in `README.md`; no network-monitoring audit has been performed.
-  The only network code is the user-confirmed FFmpeg download (`forge-win/src/http.rs`).
+  All network code goes through `forge-win/src/http.rs` (WinHTTP). It is used by the daily update check (on by
+  default; Settings › Updates), the user-clicked update download, and the user-confirmed FFmpeg download.
+* ✅ Update check and one-click update — `forge-app/src/updater.rs` asks the GitHub releases API at most once a
+  day and shows a notice for a newer stable release. *Update now* downloads `SHA256SUMS.txt` and the installer
+  only from the project's release URLs (and GitHub's download CDN after redirects), checks size and SHA-256,
+  then runs the installer silently with `/RELAUNCH` and closes the app. Portable copies open the release page
+  instead. Unit tests cover version comparison, release parsing, asset selection, checksum lists, the URL
+  allow-list and the daily throttle; e2e scenarios (`tests/e2e/system.rs`) serve a fake release from a local
+  listener and check that a matching installer is accepted and a tampered one refused (no installer is run).
 
 ## Recently hardened
 

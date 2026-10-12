@@ -10,7 +10,8 @@
 //! * [`files`] — attributes, hard-link count, volume serial, removable check.
 //! * [`restart`] — which processes hold a file open (Restart Manager).
 //! * [`process`] — launching external tools without a shell.
-//! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download).
+//! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download and the
+//!   update check).
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
 //! * Opt-in per-user integration: the folder context menu and photo file types
 //!   ("Open with" / Settings > Default apps).

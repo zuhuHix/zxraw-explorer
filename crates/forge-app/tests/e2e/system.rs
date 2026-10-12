@@ -216,3 +216,118 @@ fn download_ffmpeg_with_a_bad_checksum_installs_nothing_and_says_why() {
         "settings are unchanged: {settings}"
     );
 }
+
+/// Serves fixed bodies by path over plain HTTP on the loopback address; unknown paths get
+/// 404. `routes` receives the server's base URL so bodies can link back to it.
+fn serve_routes(routes: impl FnOnce(&str) -> Vec<(String, Vec<u8>)>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let routes = routes(&base);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap_or(0);
+            let head = String::from_utf8_lossy(&request[..n]).into_owned();
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+            let response = match routes.iter().find(|(p, _)| *p == path) {
+                Some((_, body)) => {
+                    let mut r = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    r.extend_from_slice(body);
+                    r
+                }
+                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            };
+            let _ = stream.write_all(&response);
+        }
+    });
+    base
+}
+
+/// A fake GitHub "latest release" for 99.0.0 whose installer download serves `served`
+/// while SHA256SUMS.txt lists the checksum of `genuine`.
+fn fake_release(genuine: &[u8], served: Vec<u8>) -> String {
+    let name = "ZXraw-Explorer-99.0.0-Setup-x64.exe";
+    let sums = format!("{}  {name}\n", sha256_hex(genuine)).into_bytes();
+    let size = genuine.len();
+    serve_routes(|base| {
+        let release = serde_json::json!({
+            "tag_name": "v99.0.0",
+            "html_url": format!("{base}/release"),
+            "draft": false,
+            "prerelease": false,
+            "body": "Fixture release",
+            "assets": [
+                {"name": name, "size": size,
+                 "browser_download_url": format!("{base}/download/{name}")},
+                {"name": "SHA256SUMS.txt", "size": sums.len(),
+                 "browser_download_url": format!("{base}/download/SHA256SUMS.txt")},
+            ],
+        });
+        vec![
+            ("/api".into(), release.to_string().into_bytes()),
+            (format!("/download/{name}"), served),
+            ("/download/SHA256SUMS.txt".into(), sums),
+        ]
+    })
+}
+
+fn update_opts(base: &str) -> RunOpts {
+    RunOpts {
+        env: vec![
+            ("ZXRAW_UPDATE_API".into(), format!("{base}/api")),
+            // Behave like the installed copy so "Update now" downloads the installer.
+            ("ZXRAW_UPDATE_INSTALLED".into(), "1".into()),
+        ],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn update_check_offers_a_newer_release_and_verifies_the_installer() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let installer = noise(300_000, 7);
+    let base = fake_release(&installer, installer.clone());
+    let shot = shots_dir().join("update-notice.png");
+    let script = format!(
+        "dismiss-notices\nui system wait-update 99.0.0\nwait-frames 10\nscreenshot {}\n\
+         ui system update-now\nwait-jobs 30\nwait-frames 5\n\
+         assert-toast Update verified; would run\nassert-no-error-toast\n\
+         ui system assert-no-update\nexit\n",
+        shown(&shot)
+    );
+    let outcome = run_app_with(sandbox.path(), &profile, &script, &update_opts(&base));
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(profile.join("config").join("settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        settings["last_update_check"].as_i64().is_some(),
+        "the check time is remembered for the daily throttle: {settings}"
+    );
+}
+
+#[test]
+fn update_with_a_tampered_installer_is_refused() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let installer = noise(300_000, 7);
+    let mut tampered = installer.clone();
+    tampered[1000] ^= 0x55;
+    let base = fake_release(&installer, tampered);
+    let script = "dismiss-notices\nui system wait-update 99.0.0\nui system update-now\n\
+                  wait-jobs 30\nwait-frames 5\n\
+                  assert-toast does not match its SHA-256 checksum, so it was not run\nexit\n";
+    let outcome = run_app_with(sandbox.path(), &profile, script, &update_opts(&base));
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}

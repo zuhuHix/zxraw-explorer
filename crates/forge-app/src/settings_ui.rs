@@ -26,12 +26,13 @@ enum SettingsPage {
     Library,
     ExternalTools,
     DefaultApp,
+    Updates,
     Privacy,
     Shortcuts,
 }
 
 impl SettingsPage {
-    const ALL: [(Self, &'static str); 11] = [
+    const ALL: [(Self, &'static str); 12] = [
         (Self::Appearance, "Appearance"),
         (Self::Browsing, "Browsing"),
         (Self::Performance, "Performance"),
@@ -41,6 +42,7 @@ impl SettingsPage {
         (Self::Library, "Library"),
         (Self::ExternalTools, "External tools"),
         (Self::DefaultApp, "Default app"),
+        (Self::Updates, "Updates"),
         (Self::Privacy, "Privacy"),
         (Self::Shortcuts, "Keyboard shortcuts"),
     ];
@@ -140,6 +142,9 @@ enum SettingsIntent {
     DetectApps,
     BrowseToolExecutable,
     DefaultApp(crate::default_app::Action),
+    CheckForUpdates,
+    ShowUpdate,
+    InstallUpdate,
 }
 
 pub struct SettingsUi {
@@ -360,6 +365,19 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| app.paths.data.join("forge.db"));
     let ffmpeg_download = app.ops.ffmpeg_setup.status();
+    let updates = UpdatesView {
+        checking: app.ops.updater.checking(),
+        last_result: app.ops.updater.last_result.clone(),
+        available: app
+            .ops
+            .updater
+            .available
+            .as_ref()
+            .map(|u| u.version.clone()),
+        downloading: app.ops.updater.download_status().running,
+        ready: app.ops.updater.ready.is_some(),
+        busy: app.ops.jobs.running_count() > 0,
+    };
 
     {
         let (settings, state) = (&mut app.settings, &mut app.ops.settings_ui);
@@ -413,6 +431,9 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                     }
                                     SettingsPage::DefaultApp => {
                                         default_app_page(ui, state, &mut intents)
+                                    }
+                                    SettingsPage::Updates => {
+                                        updates_page(ui, settings, &updates, &mut intents)
                                     }
                                     SettingsPage::Privacy => privacy_page(ui),
                                     SettingsPage::Shortcuts => shortcuts_page(ui, ctx),
@@ -1215,6 +1236,105 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     );
 }
 
+/// What the Updates page shows, read before the settings window borrows the app.
+struct UpdatesView {
+    checking: bool,
+    last_result: Option<crate::updater::CheckResult>,
+    available: Option<String>,
+    downloading: bool,
+    ready: bool,
+    busy: bool,
+}
+
+fn updates_page(
+    ui: &mut egui::Ui,
+    settings: &mut Settings,
+    view: &UpdatesView,
+    intents: &mut Vec<SettingsIntent>,
+) {
+    use crate::updater::CheckResult;
+    page_heading(
+        ui,
+        "Updates",
+        "Find out about new versions of ZXraw Explorer.",
+    );
+    ui.add_space(10.0);
+    ui.label(format!(
+        "You have ZXraw Explorer {}.",
+        crate::updater::CURRENT
+    ));
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut settings.check_updates,
+        "Check for updates automatically",
+    );
+    ui.label(
+        RichText::new(
+            "Once a day ZXraw Explorer asks api.github.com for the latest release. The request carries only the app version (in the User-Agent); updates are never installed without your click.",
+        )
+        .weak(),
+    );
+    ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!view.checking, egui::Button::new("Check now"))
+            .clicked()
+        {
+            intents.push(SettingsIntent::CheckForUpdates);
+        }
+        if view.checking {
+            ui.spinner();
+            ui.label("Checking…");
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
+        } else {
+            match &view.last_result {
+                Some(CheckResult::UpToDate) => {
+                    ui.label("You're up to date.");
+                }
+                Some(CheckResult::Available(version)) => {
+                    ui.label(RichText::new(format!("{version} is available.")).strong());
+                }
+                Some(CheckResult::Failed(error)) => {
+                    ui.label(
+                        RichText::new(format!("Could not check: {error}"))
+                            .color(ui.visuals().warn_fg_color),
+                    );
+                }
+                None => {}
+            }
+        }
+    });
+    if view.available.is_some() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if view.ready {
+                if ui
+                    .add_enabled(!view.busy, egui::Button::new("Restart and update"))
+                    .on_disabled_hover_text("Wait for the running operations to finish")
+                    .clicked()
+                {
+                    intents.push(SettingsIntent::InstallUpdate);
+                }
+            } else if view.downloading {
+                ui.spinner();
+                ui.label("Downloading the update…");
+            } else if ui.button("Show update…").clicked() {
+                intents.push(SettingsIntent::ShowUpdate);
+            }
+        });
+    }
+    if let Some(skipped) = settings.skipped_update.clone() {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("Skipped version: {skipped}")).weak());
+            if ui.small_button("Forget").clicked() {
+                settings.skipped_update = None;
+            }
+        });
+    }
+}
+
 fn privacy_page(ui: &mut egui::Ui) {
     page_heading(
         ui,
@@ -1223,10 +1343,20 @@ fn privacy_page(ui: &mut egui::Ui) {
     );
     ui.add_space(14.0);
     ui.group(|ui| {
-        ui.label(RichText::new("No telemetry; nothing leaves this computer.").strong());
+        ui.label(RichText::new("No telemetry; your files never leave this computer.").strong());
         ui.label(
             RichText::new(
                 "ZXraw Explorer does not send usage data or file information to a server.",
+            )
+            .weak(),
+        );
+    });
+    ui.add_space(8.0);
+    ui.group(|ui| {
+        ui.label(RichText::new("Network access").strong());
+        ui.label(
+            RichText::new(
+                "Once a day the app asks api.github.com whether a newer version exists. It is a standard web request that carries only the app version in its User-Agent; turn it off under Updates. FFmpeg and app updates are downloaded only when you click to get them, and are checked against their SHA-256 checksums.",
             )
             .weak(),
         );
@@ -1363,6 +1493,11 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
             }
             SettingsIntent::UseFfmpegPath => use_ffmpeg_dir(app, None),
             SettingsIntent::DownloadFfmpeg => crate::ffmpeg_setup::confirm(app),
+            SettingsIntent::CheckForUpdates => crate::updater::check_now(app),
+            SettingsIntent::ShowUpdate => {
+                app.notices.update = app.ops.updater.available.clone();
+            }
+            SettingsIntent::InstallUpdate => crate::updater::install_when_idle(app, ctx),
             SettingsIntent::PickLibraryRoot => {
                 if let Some(path) = crate::dialogs::pick_folder(
                     rfd::FileDialog::new().set_title("Add indexed folder"),

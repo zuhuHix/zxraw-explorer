@@ -49,6 +49,10 @@ pub enum Event {
     },
     /// "Download FFmpeg" finished; the folder holds ffmpeg.exe and ffprobe.exe.
     FfmpegInstalled(PathBuf),
+    /// An update check finished.
+    UpdateChecked(crate::updater::Checked),
+    /// "Update now" downloaded and verified the installer, or failed.
+    UpdateDownloaded(Result<PathBuf, String>),
 }
 
 /// Operations that can genuinely be reverted. Copies, overwrites and permanent deletes are
@@ -130,6 +134,7 @@ pub struct Actions {
     pub extra_tools: crate::extra_tools_ui::ExtraToolsUi,
     pub tags_ui: crate::tags_ui::TagsUi,
     pub ffmpeg_setup: crate::ffmpeg_setup::FfmpegSetup,
+    pub updater: crate::updater::Updater,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -180,6 +185,7 @@ impl Actions {
             extra_tools: Default::default(),
             tags_ui: Default::default(),
             ffmpeg_setup: Default::default(),
+            updater: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -449,6 +455,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Ingest => app.ops.ingest.open = true,
         Cmd::Settings => app.ops.settings_ui.open = true,
         Cmd::DownloadFfmpeg => crate::ffmpeg_setup::confirm(app),
+        Cmd::CheckForUpdates => crate::updater::check_now(app),
         Cmd::OpenIn => crate::settings_ui::open_in(app),
         Cmd::Collections => app.ops.collections_ui.open = true,
         Cmd::AddToCollection => crate::collections_ui::add_selection(app),
@@ -717,6 +724,8 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 app.save_all();
                 app.toast("FFmpeg installed: video thumbnails and clip metadata are on");
             }
+            Event::UpdateChecked(checked) => crate::updater::checked(app, checked),
+            Event::UpdateDownloaded(result) => crate::updater::downloaded(app, result),
             Event::Undo(u) => {
                 app.ops.undo.push(u);
                 if app.ops.undo.len() > 50 {

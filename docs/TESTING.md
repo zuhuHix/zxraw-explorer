@@ -216,7 +216,12 @@ as automated at startup and then:
 * send Recycle Bin operations to `<profile>/data/recycle-sandbox` (`forge_win::set_recycle_sandbox`).
   Recycle commands in a script are refused unless that sandbox is active;
 * turn off egui animations so frame counts are deterministic;
-* skip the first-run welcome unless `ZXRAW_FIRST_RUN=1`.
+* skip the first-run welcome unless `ZXRAW_FIRST_RUN=1`;
+* never check for updates, unless `ZXRAW_UPDATE_API` points the check at a test server
+  (`http://127.0.0.1:<port>/…` also allows plain-HTTP loopback downloads), and never run a
+  downloaded installer. `ZXRAW_UPDATE_INSTALLED=1` makes *Update now* behave as in an installed
+  copy. Both variables exist only in debug and `automation` builds. Script verbs:
+  `ui system wait-update <version>`, `ui system update-now`, `ui system assert-no-update`.
 
 `ZXRAW_SCRIPT_SANDBOX` (set by the runner to the fixture root; default: the script's directory)
 confines every path a step names. Paths through symlinks or junctions are checked against their

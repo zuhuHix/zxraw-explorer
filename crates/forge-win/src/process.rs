@@ -48,6 +48,27 @@ pub fn launch(_exe: &Path, _args: &[OsString], _cwd: Option<&Path>) -> Result<()
     Err(WinError::Unsupported)
 }
 
+/// Creates the named mutex `name` and keeps it until the process exits, so an installer
+/// (Inno Setup's `AppMutex`) can tell that the app is running. Never fails the caller's
+/// startup: an error only means the installer cannot see this instance.
+#[cfg(windows)]
+pub fn hold_named_mutex(name: &str) -> Result<()> {
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::PCWSTR;
+
+    let wide = crate::to_wide(name);
+    // The handle is deliberately leaked: Windows closes it when the process ends, which is
+    // exactly when the installer may go ahead.
+    unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
+        .map(|_| ())
+        .map_err(|e| crate::api_err("CreateMutexW", e))
+}
+
+#[cfg(not(windows))]
+pub fn hold_named_mutex(_name: &str) -> Result<()> {
+    Err(WinError::Unsupported)
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

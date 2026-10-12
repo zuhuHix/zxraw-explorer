@@ -85,6 +85,15 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   depending on the build) apply and must be shipped. **Download FFmpeg…** fetches a GPL v3 build
   from its publisher at the user's request and installs its licence alongside it; ZXraw Explorer
   does not redistribute it.
+* The update check asks `api.github.com` once a day, unauthenticated. GitHub allows 60 such
+  requests an hour per IP address, so on a shared network the check can be refused; it then
+  stays silent and tries again the next day (**Check now** shows the error). The installer is
+  checked against `SHA256SUMS.txt` from the same GitHub release, which protects against a
+  corrupted or swapped download but not against someone who controls the release itself; the
+  installer is not code-signed.
+* An in-app update closes the app and runs the installer silently. If another ZXraw Explorer
+  window is still open after 30 seconds, the installer stops without changing anything, and
+  the app has to be started again by hand.
 * The FFmpeg download is pinned to one build (9.0.2). A newer FFmpeg needs a new app release
   (or installing it yourself). If the publisher removes that release, the download fails with
   an HTTP error and nothing is installed.

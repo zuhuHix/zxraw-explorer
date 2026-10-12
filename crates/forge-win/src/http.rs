@@ -3,7 +3,8 @@
 //!
 //! Only `https://` URLs are accepted, except plain `http://` to the loopback address (used
 //! by tests that serve files from a local listener). Redirects are followed, but never
-//! from HTTPS down to HTTP.
+//! from HTTPS down to HTTP; [`Options::final_url`] lets a caller also refuse redirects to
+//! hosts it does not trust.
 
 use std::ops::ControlFlow;
 
@@ -65,19 +66,40 @@ fn parse_url(url: &str) -> Result<Url> {
     })
 }
 
+/// Extra request settings for [`download_with`].
+#[derive(Default)]
+pub struct Options<'a> {
+    /// Request headers as `(name, value)`; the User-Agent is always
+    /// `ZXraw-Explorer/<version>`.
+    pub headers: &'a [(&'a str, &'a str)],
+    /// Checked against the URL the response finally came from (after any redirects)
+    /// before a single byte is handed to `on_data`; returning `false` fails the download.
+    pub final_url: Option<&'a dyn Fn(&str) -> bool>,
+}
+
 /// Downloads `url`, handing each received chunk to `on_data` in order. Returns the number
 /// of bytes received.
 ///
 /// `on_data` returning [`ControlFlow::Break`] stops the transfer with
 /// [`WinError::Aborted`]; callers use that for cancellation and size limits, and keep their
 /// own reason. Any status other than 200 is an error. Blocks the calling thread.
+pub fn download(url: &str, on_data: impl FnMut(&[u8]) -> ControlFlow<()>) -> Result<u64> {
+    download_with(url, &Options::default(), on_data)
+}
+
+/// [`download`] with request headers and a check of the final (redirected) URL.
 #[cfg(windows)]
-pub fn download(url: &str, mut on_data: impl FnMut(&[u8]) -> ControlFlow<()>) -> Result<u64> {
+pub fn download_with(
+    url: &str,
+    options: &Options<'_>,
+    mut on_data: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> Result<u64> {
     use windows::Win32::Networking::WinHttp::*;
     use windows::core::{PCWSTR, w};
 
     use crate::to_wide;
 
+    let headers = header_block(options.headers)?;
     let url = parse_url(url)?;
     let agent = to_wide(concat!("ZXraw-Explorer/", env!("CARGO_PKG_VERSION")));
     let host = to_wide(&url.host);
@@ -134,10 +156,27 @@ pub fn download(url: &str, mut on_data: impl FnMut(&[u8]) -> ControlFlow<()>) ->
                 flags,
             ),
         )?;
-        WinHttpSendRequest(request.0, None, None, 0, 0, 0)
-            .map_err(|_| last_http_error("WinHttpSendRequest"))?;
+        let headers: Vec<u16> = headers.encode_utf16().collect();
+        WinHttpSendRequest(
+            request.0,
+            (!headers.is_empty()).then_some(headers.as_slice()),
+            None,
+            0,
+            0,
+            0,
+        )
+        .map_err(|_| last_http_error("WinHttpSendRequest"))?;
         WinHttpReceiveResponse(request.0, std::ptr::null_mut())
             .map_err(|_| last_http_error("WinHttpReceiveResponse"))?;
+
+        if let Some(allowed) = options.final_url {
+            let final_url = final_url(request.0)?;
+            if !allowed(&final_url) {
+                return Err(WinError::Invalid(format!(
+                    "the download was redirected to an unexpected address: {final_url}"
+                )));
+            }
+        }
 
         let mut status = 0u32;
         let mut len = size_of::<u32>() as u32;
@@ -180,9 +219,51 @@ pub fn download(url: &str, mut on_data: impl FnMut(&[u8]) -> ControlFlow<()>) ->
 }
 
 #[cfg(not(windows))]
-pub fn download(url: &str, _on_data: impl FnMut(&[u8]) -> ControlFlow<()>) -> Result<u64> {
+pub fn download_with(
+    url: &str,
+    options: &Options<'_>,
+    _on_data: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> Result<u64> {
+    header_block(options.headers)?;
     parse_url(url)?;
     Err(WinError::Unsupported)
+}
+
+/// `Name: value\r\n` lines for WinHTTP. Names and values must not break the header block.
+fn header_block(headers: &[(&str, &str)]) -> Result<String> {
+    let mut block = String::new();
+    for (name, value) in headers {
+        let bad_name = name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if bad_name || value.contains(['\r', '\n']) {
+            return Err(WinError::Invalid(format!("bad request header {name:?}")));
+        }
+        block.push_str(&format!("{name}: {value}\r\n"));
+    }
+    Ok(block)
+}
+
+/// The URL a request's response came from, after redirects.
+#[cfg(windows)]
+fn final_url(request: *mut core::ffi::c_void) -> Result<String> {
+    use windows::Win32::Networking::WinHttp::{WINHTTP_OPTION_URL, WinHttpQueryOption};
+
+    let mut buf = vec![0u16; 2048];
+    let mut len = (buf.len() * 2) as u32;
+    unsafe {
+        WinHttpQueryOption(
+            request,
+            WINHTTP_OPTION_URL,
+            Some(buf.as_mut_ptr().cast()),
+            &mut len,
+        )
+    }
+    .map_err(|_| last_http_error("WinHttpQueryOption"))?;
+    let chars = (len as usize / 2).min(buf.len());
+    let url = String::from_utf16_lossy(&buf[..chars]);
+    Ok(url.trim_end_matches('\0').to_string())
 }
 
 /// An open WinHTTP handle, closed on drop.
@@ -265,6 +346,79 @@ mod tests {
                 "{url} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn header_blocks_refuse_injected_lines() {
+        assert_eq!(
+            header_block(&[("Accept", "application/json"), ("X-Test", "1")]).unwrap(),
+            "Accept: application/json\r\nX-Test: 1\r\n"
+        );
+        assert!(header_block(&[("Accept", "a\r\nHost: evil")]).is_err());
+        assert!(header_block(&[("Bad Name", "x")]).is_err());
+        assert!(header_block(&[("", "x")]).is_err());
+    }
+
+    /// Serves one request with `response` and returns what the client sent.
+    #[cfg(windows)]
+    fn serve_once(response: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let n = stream.read(&mut request).unwrap_or(0);
+            let _ = stream.write_all(&response);
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://127.0.0.1:{port}/latest"), server)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sends_headers_and_checks_the_final_url() {
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec();
+        let (url, server) = serve_once(ok.clone());
+        let mut got = Vec::new();
+        let seen = std::cell::Cell::new(String::new());
+        let check = |u: &str| {
+            seen.set(u.to_string());
+            true
+        };
+        let options = Options {
+            headers: &[("Accept", "application/vnd.github+json")],
+            final_url: Some(&check),
+        };
+        download_with(&url, &options, |chunk| {
+            got.extend_from_slice(chunk);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(got, b"{}");
+        assert_eq!(seen.take(), url);
+        let request = server.join().unwrap();
+        assert!(
+            request.contains("Accept: application/vnd.github+json\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("User-Agent: ZXraw-Explorer/"), "{request}");
+
+        let (url, server) = serve_once(ok);
+        let refuse = |_: &str| false;
+        let options = Options {
+            headers: &[],
+            final_url: Some(&refuse),
+        };
+        let mut received = 0;
+        let err = download_with(&url, &options, |chunk| {
+            received += chunk.len();
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected address"), "{err}");
+        assert_eq!(received, 0, "no data is handed over from a refused address");
+        server.join().unwrap();
     }
 
     #[cfg(windows)]

@@ -83,6 +83,12 @@ pub struct Settings {
     pub map_url_template: String,
     /// Filename rules associating exports with their originals (see `export_assoc`).
     pub export_rules: Vec<String>,
+    /// Ask GitHub once a day whether a newer release exists (see `updater`).
+    pub check_updates: bool,
+    /// When the last update check started (Unix seconds).
+    pub last_update_check: Option<i64>,
+    /// A version the user chose to skip: its notice is not shown again.
+    pub skipped_update: Option<String>,
 }
 
 impl Default for Settings {
@@ -109,6 +115,9 @@ impl Default for Settings {
             xmp_sidecar_sync: false,
             map_url_template: "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}".into(),
             export_rules: crate::export_assoc::default_rules(),
+            check_updates: true,
+            last_update_check: None,
+            skipped_update: None,
         }
     }
 }

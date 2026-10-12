@@ -5,6 +5,10 @@
 //! - `assert-thumbnail-ready <filename>`: require a generated grid thumbnail in the media
 //!   cache.
 //! - `assert-thumbnail-error <filename>`: require the grid's decode-error placeholder.
+//! - `wait-update <version>`: wait until the "update available" notice offers `version`
+//!   (the check runs a few seconds after startup; needs `ZXRAW_UPDATE_API`).
+//! - `update-now`: press the notice's "Update now".
+//! - `assert-no-update`: require that no update notice is showing.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -52,6 +56,33 @@ pub(super) fn step(
                 Err(format!("thumbnail for `{name}` has no error placeholder"))
             }
         }
+        "wait-update" => {
+            let version = filename(args)?;
+            match &app.notices.update {
+                Some(update) if update.version == version => Ok(Flow::Done),
+                Some(update) => Err(format!(
+                    "the update notice offers {}, not {version}",
+                    update.version
+                )),
+                None if elapsed(st) >= WAIT_LIMIT => {
+                    Err(format!("no update notice for {version} within 30 s"))
+                }
+                None => Ok(Flow::Wait("waiting for the update notice".into())),
+            }
+        }
+        "update-now" => {
+            let update = app
+                .notices
+                .update
+                .clone()
+                .ok_or("no update notice is showing")?;
+            crate::updater::update_now(app, &update);
+            Ok(Flow::Done)
+        }
+        "assert-no-update" => match &app.notices.update {
+            None => Ok(Flow::Done),
+            Some(update) => Err(format!("an update notice offers {}", update.version)),
+        },
         _ => Err(format!("unknown `ui system` verb `{verb}`")),
     }
 }

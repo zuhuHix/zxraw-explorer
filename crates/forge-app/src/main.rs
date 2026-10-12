@@ -43,6 +43,7 @@ mod testhook;
 mod theme;
 mod thumbs;
 mod tools_ui;
+mod updater;
 mod video_ui;
 mod viewer;
 mod viewer_host;
@@ -105,6 +106,10 @@ fn main() -> eframe::Result {
 
     #[cfg(windows)]
     if !testhook::env_requests_automation() {
+        // Lets the installer see that the app is running (`AppMutex` in zxraw.iss).
+        if let Err(error) = forge_win::process::hold_named_mutex(updater::APP_MUTEX) {
+            tracing::warn!("could not create the app mutex: {error}");
+        }
         match std::env::current_exe() {
             Ok(current_exe) => match forge_win::refresh_if_registered(&current_exe) {
                 Ok(true) => tracing::info!("refreshed the Explorer context-menu command path"),

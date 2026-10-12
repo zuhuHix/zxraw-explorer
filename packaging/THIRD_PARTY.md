@@ -83,13 +83,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | flate2 | 1.1.10 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.2.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | gif | 0.14.2 | MIT OR Apache-2.0 | https://github.com/image-rs/image-gif | Permissive |
@@ -124,6 +124,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log | Permissive |
 | lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git | Permissive |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers | Permissive |
+| md-5 | 0.10.6 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr | Permissive |
 | mime | 0.3.17 | MIT OR Apache-2.0 | https://github.com/hyperium/mime | Permissive |
 | mime_guess2 | 2.3.1 | MIT | https://github.com/ttys3/mime_guess2 | Permissive |

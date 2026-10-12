@@ -1,6 +1,7 @@
-//! Startup notices: the first-run welcome and the "closed unexpectedly" crash notice.
+//! Startup notices: the first-run welcome, the "closed unexpectedly" crash notice and the
+//! "update available" notice.
 //!
-//! Both are ordinary non-modal windows; neither blocks the file browser. The welcome is
+//! All are ordinary non-modal windows; none blocks the file browser. The welcome is
 //! shown once per profile (a `first-run.done` marker in the config folder). The crash
 //! notice is shown when the previous session left a crash report
 //! ([`crate::crash::pending_crash_report`]); reports stay on this PC and nothing is sent.
@@ -21,6 +22,8 @@ pub struct Notices {
     pub crash: Option<PathBuf>,
     /// The welcome window, while open.
     pub welcome: Option<Welcome>,
+    /// A newer release found by the update check, until dismissed (see `updater`).
+    pub update: Option<crate::updater::UpdateInfo>,
     marker: PathBuf,
     automated: bool,
 }
@@ -45,6 +48,7 @@ impl Notices {
         Self {
             crash,
             welcome: first_run.then_some(Welcome { video_tools: None }),
+            update: None,
             marker,
             automated,
         }
@@ -77,6 +81,107 @@ impl Notices {
 pub fn show(app: &mut ZxrawApp, ctx: &egui::Context) {
     crash_notice(app, ctx);
     welcome(app, ctx);
+    update_notice(app, ctx);
+}
+
+fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let Some(update) = app.notices.update.clone() else {
+        return;
+    };
+    let download = app.ops.updater.download_status();
+    let ready = app.ops.updater.ready.is_some();
+    let busy = app.ops.jobs.running_count() > 0;
+    let installed = crate::updater::is_installed_copy();
+    let mut open = true;
+    let mut dismiss = false;
+    let mut action = None;
+    egui::Window::new("Update available")
+        .id(egui::Id::new("update-notice"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::RIGHT_TOP, [-16.0, 84.0])
+        .show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.label(RichText::new(format!("ZXraw Explorer {} is available", update.version)).strong());
+            ui.label(RichText::new(format!("You have {}.", crate::updater::CURRENT)).weak());
+            if !update.notes.is_empty() {
+                egui::CollapsingHeader::new("Release notes").id_salt("update-notes").show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&update.notes).small()).wrap());
+                    });
+                });
+            }
+            ui.add_space(6.0);
+            if download.running {
+                ui.horizontal(|ui| {
+                    match download.fraction {
+                        Some(f) => {
+                            ui.add(egui::ProgressBar::new(f).desired_width(160.0).show_percentage());
+                        }
+                        None => {
+                            ui.spinner();
+                        }
+                    }
+                    ui.label("Downloading…");
+                    if ui.button("Cancel").clicked() {
+                        app.ops.updater.cancel_download();
+                    }
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            } else if ready {
+                ui.label("The update is downloaded and verified. ZXraw Explorer closes, updates and starts again.");
+                let restart = ui.add_enabled(!busy, egui::Button::new(RichText::new("Restart and update").strong()));
+                if busy {
+                    restart.on_disabled_hover_text("Wait for the running operations to finish");
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                } else if restart.clicked() {
+                    action = Some(UpdateAction::Install);
+                }
+            } else {
+                if installed {
+                    ui.label(RichText::new("Update now downloads the installer, checks its SHA-256, then restarts ZXraw Explorer.").weak());
+                }
+                ui.horizontal(|ui| {
+                    let label = if installed { "Update now" } else { "Download" };
+                    let hover = if installed {
+                        "Download, verify and install the update, then restart"
+                    } else {
+                        "This is a portable copy: opens the release page to download the new zip"
+                    };
+                    if ui.button(RichText::new(label).strong()).on_hover_text(hover).clicked() {
+                        action = Some(UpdateAction::Update);
+                    }
+                    if ui.button("What's new").clicked() {
+                        action = Some(UpdateAction::Page);
+                    }
+                    if ui.button("Skip this version").clicked() {
+                        action = Some(UpdateAction::Skip);
+                    }
+                    if ui.button("Not now").clicked() {
+                        dismiss = true;
+                    }
+                });
+            }
+        });
+    match action {
+        Some(UpdateAction::Update) => crate::updater::update_now(app, &update),
+        Some(UpdateAction::Page) => crate::updater::open_release_page(app, &update),
+        Some(UpdateAction::Skip) => crate::updater::skip(app, &update),
+        Some(UpdateAction::Install) => crate::updater::install_when_idle(app, ctx),
+        None => {}
+    }
+    if !open || dismiss {
+        app.ops.updater.cancel_download();
+        app.notices.update = None;
+    }
+}
+
+enum UpdateAction {
+    Update,
+    Page,
+    Skip,
+    Install,
 }
 
 fn crash_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
@@ -155,7 +260,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
                 ui.label("A fast file manager for photographers and videographers.");
             });
             ui.label(
-                RichText::new("Everything stays on this PC: no account, no telemetry, and no network access unless you ask for the optional FFmpeg download.")
+                RichText::new("Everything stays on this PC: no account and no telemetry. The only network access is a daily update check (Settings › Updates can turn it off) and the optional FFmpeg download.")
                     .weak(),
             );
             ui.add_space(8.0);

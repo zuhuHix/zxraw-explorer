@@ -91,6 +91,7 @@ pub enum Cmd {
     SelectOriginals,
     SelectExports,
     DownloadFfmpeg,
+    CheckForUpdates,
 }
 
 impl Cmd {
@@ -181,6 +182,7 @@ impl Cmd {
         Cmd::SelectOriginals,
         Cmd::SelectExports,
         Cmd::DownloadFfmpeg,
+        Cmd::CheckForUpdates,
     ];
 
     pub fn label(self) -> &'static str {
@@ -272,6 +274,7 @@ impl Cmd {
             SelectOriginals => "Select originals of exports",
             SelectExports => "Select exports of originals",
             DownloadFfmpeg => "Download FFmpeg (video tools)…",
+            CheckForUpdates => "Check for updates",
         }
     }
 
