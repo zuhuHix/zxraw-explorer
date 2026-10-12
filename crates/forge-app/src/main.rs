@@ -190,6 +190,12 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        // eframe stores viewport geometry separately from ZXraw's own settings. Keep it in
+        // the same throwaway profile when UI automation or an explicit profile is active.
+        persistence_path: (cfg!(any(debug_assertions, feature = "automation"))
+            && (testhook::env_requests_automation()
+                || std::env::var_os("ZXRAW_PROFILE_DIR").is_some()))
+        .then(|| paths.data.join("eframe.ron")),
         persist_window: !hidden,
         ..Default::default()
     };
