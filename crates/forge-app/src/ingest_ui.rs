@@ -1156,7 +1156,11 @@ fn show_report(ui: &mut Ui, completion: &ImportCompletion) {
 
 fn section_title(ui: &mut Ui, number: &str, title: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(number).strong().color(crate::theme::ACCENT));
+        ui.label(
+            RichText::new(number)
+                .strong()
+                .color(crate::theme::accent(ui.ctx())),
+        );
         ui.heading(title);
     });
 }

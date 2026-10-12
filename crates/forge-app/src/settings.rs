@@ -22,6 +22,20 @@ pub enum AppIcon {
     Round,
 }
 
+/// The accent colour preset (see `theme::ACCENTS`): selection, focus, indicators, links
+/// and the app icon's tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum Accent {
+    #[default]
+    Blue,
+    Purple,
+    Pink,
+    Red,
+    Orange,
+    Green,
+    Teal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ViewMode {
     #[default]
@@ -47,6 +61,7 @@ pub struct Settings {
     pub theme: ThemeChoice,
     pub ui_scale: f32,
     pub app_icon: AppIcon,
+    pub accent: Accent,
     pub show_hidden: bool,
     pub show_system: bool,
     pub confirm_recycle: bool,
@@ -76,6 +91,7 @@ impl Default for Settings {
             theme: ThemeChoice::Dark,
             ui_scale: 1.0,
             app_icon: AppIcon::Square,
+            accent: Accent::Blue,
             show_hidden: false,
             show_system: false,
             confirm_recycle: false,

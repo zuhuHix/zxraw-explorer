@@ -912,7 +912,7 @@ pub fn details(
                 painter.rect_stroke(
                     rect,
                     3.0,
-                    Stroke::new(1.5, theme::ACCENT),
+                    Stroke::new(1.5, theme::accent(ui.ctx())),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -920,7 +920,7 @@ pub fn details(
                 painter.rect_stroke(
                     rect.shrink(1.0),
                     3.0,
-                    Stroke::new(2.0, theme::focus_ring(ui.visuals().dark_mode)),
+                    Stroke::new(2.0, theme::focus_ring(ui.ctx())),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -1091,7 +1091,7 @@ fn background_interactions(
         ui.painter().rect_stroke(
             bg.rect.shrink(1.0),
             4.0,
-            Stroke::new(1.5, theme::ACCENT),
+            Stroke::new(1.5, theme::accent(ui.ctx())),
             egui::StrokeKind::Inside,
         );
     }
@@ -1480,7 +1480,7 @@ pub fn grid(
                         p.rect_stroke(
                             inner,
                             6.0,
-                            Stroke::new(2.0, theme::focus_ring(ui.visuals().dark_mode)),
+                            Stroke::new(2.0, theme::focus_ring(ui.ctx())),
                             egui::StrokeKind::Inside,
                         );
                     }

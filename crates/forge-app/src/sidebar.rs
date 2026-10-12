@@ -199,11 +199,22 @@ fn nav_item(
         Some(s) => format!("{icon}  {label}   {s}"),
         None => format!("{icon}  {label}"),
     };
-    let r = ui.add(
-        egui::Button::selectable(current, text)
+    // The current folder gets a quiet fill and an accent bar rather than the full selection
+    // colour, so the sidebar stays calm next to the file list's selection.
+    let button = if current {
+        egui::Button::new(text)
+            .selected(true)
+            .fill(theme::palette(ui.ctx()).nav_selected)
+            .stroke(egui::Stroke::NONE)
+    } else {
+        egui::Button::new(text)
+            .selected(false)
             .frame_when_inactive(false)
-            .min_size(egui::vec2(ui.available_width(), 0.0)),
-    );
+    };
+    let r = ui.add(button.min_size(egui::vec2(ui.available_width(), 0.0)));
+    if current {
+        theme::paint_indicator(ui, r.rect, true);
+    }
     let r = r.on_hover_text(path.to_string_lossy());
     if r.clicked() {
         app.navigate(path.clone());
@@ -321,7 +332,7 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
                         .fill(if used > 0.9 {
                             ui.visuals().error_fg_color
                         } else {
-                            theme::ACCENT
+                            theme::accent(ui.ctx())
                         });
                     ui.add(bar).on_hover_text(format!(
                         "{} free of {}",

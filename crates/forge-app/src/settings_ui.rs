@@ -453,6 +453,14 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 ui.selectable_value(&mut settings.theme, ThemeChoice::Light, "Light");
                 ui.selectable_value(&mut settings.theme, ThemeChoice::System, "System");
             });
+        ui.add_space(18.0);
+        ui.label("Accent")
+            .on_hover_text("Used for selections, highlights and the app icon.");
+        for (accent, name) in crate::theme::ACCENTS {
+            if accent_swatch(ui, accent, name, settings.accent == accent).clicked() {
+                settings.accent = accent;
+            }
+        }
     });
     ui.add_space(8.0);
     ui.horizontal(|ui| {
@@ -472,7 +480,7 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.label("App icon");
     ui.horizontal(|ui| {
         for (choice, label) in crate::app_icon::ALL {
-            let preview = crate::app_icon::preview(ui.ctx(), choice);
+            let preview = crate::app_icon::preview(ui.ctx(), choice, settings.accent);
             let image = egui::Image::new(&preview).fit_to_exact_size(egui::vec2(48.0, 48.0));
             if ui
                 .add(
@@ -493,6 +501,40 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
         .weak()
         .small(),
     );
+}
+
+/// A round, clickable colour swatch; the chosen one is ringed.
+fn accent_swatch(
+    ui: &mut egui::Ui,
+    accent: crate::settings::Accent,
+    name: &str,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, true, selected, name)
+    });
+    let painter = ui.painter();
+    let center = rect.center();
+    let ring = if selected {
+        Some(egui::Stroke::new(2.0, ui.visuals().strong_text_color()))
+    } else if response.hovered() {
+        Some(egui::Stroke::new(1.0, ui.visuals().weak_text_color()))
+    } else {
+        None
+    };
+    if let Some(ring) = ring {
+        painter.circle_stroke(center, 11.0, ring);
+    }
+    painter.circle_filled(center, 8.0, crate::theme::accent_base(accent));
+    if response.has_focus() {
+        painter.circle_stroke(
+            center,
+            12.0,
+            egui::Stroke::new(1.0, crate::theme::focus_ring(ui.ctx())),
+        );
+    }
+    response.on_hover_text(name)
 }
 
 fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {

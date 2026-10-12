@@ -77,9 +77,9 @@ pub struct ZxrawApp {
     /// A photo passed on the command line (a double-click when ZXraw Explorer is the default
     /// app): shown in the viewer once its folder has loaded.
     launch_photo: Option<PathBuf>,
-    applied_theme: Option<(bool, f32)>,
+    applied_theme: Option<(bool, settings::Accent, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
-    applied_icon: settings::AppIcon,
+    applied_icon: (settings::AppIcon, settings::Accent),
     type_ahead: (String, Instant),
     last_session_save: Instant,
     selection_summary: SelectionSummary,
@@ -163,7 +163,7 @@ impl ZxrawApp {
             focus_address: false,
             focus_filter: false,
             applied_theme: None,
-            applied_icon: settings.app_icon,
+            applied_icon: (settings.app_icon, settings.accent),
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
@@ -184,9 +184,9 @@ impl ZxrawApp {
             forge_win::set_recycle_sandbox(Some(app.paths.data.join("recycle-sandbox")));
         }
         app.restore_session(session);
-        if app.settings.app_icon != settings::AppIcon::default() && !app.testhook.active() {
+        if app.applied_icon != Default::default() && !app.testhook.active() {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
-            crate::app_icon::apply_to_shortcuts(app.settings.app_icon);
+            crate::app_icon::apply_to_shortcuts(app.settings.app_icon, app.settings.accent);
         }
         // `zxraw.exe <folder>` opens that folder in a new tab; `zxraw.exe <photo>` opens its
         // folder with the photo selected and shows it in the viewer.
@@ -672,7 +672,17 @@ impl ZxrawApp {
                     title
                 };
                 let selected = i == self.active;
-                let r = ui.add(egui::Button::selectable(selected, title).frame_when_inactive(false));
+                // The active tab sits on the content surface with an accent bar beneath;
+                // the others are plain text until hovered.
+                let r = if selected {
+                    let fill = theme::palette(ui.ctx()).content;
+                    let r = ui.add(egui::Button::new(title).selected(true).fill(fill).stroke(egui::Stroke::NONE));
+                    theme::paint_indicator(ui, r.rect, false);
+                    r
+                } else {
+                    let text = RichText::new(title).color(theme::muted(ui));
+                    ui.add(egui::Button::new(text).selected(false).frame_when_inactive(false))
+                };
                 if r.clicked() {
                     select = Some(i);
                 }
@@ -827,7 +837,7 @@ impl ZxrawApp {
             if dual {
                 // Mini header for each pane so it's obvious which one has focus.
                 let (txt, col) = if focused {
-                    (pane.path.to_string_lossy().into_owned(), theme::ACCENT)
+                    (pane.path.to_string_lossy().into_owned(), theme::accent(ui.ctx()))
                 } else {
                     (pane.path.to_string_lossy().into_owned(), ui.visuals().weak_text_color())
                 };
@@ -912,15 +922,17 @@ impl eframe::App for ZxrawApp {
             ThemeChoice::Light => false,
             ThemeChoice::System => ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark),
         };
-        if self.applied_theme != Some((dark, self.settings.ui_scale)) {
-            theme::apply(&ctx, dark, self.settings.ui_scale);
-            self.applied_theme = Some((dark, self.settings.ui_scale));
+        let look = (dark, self.settings.accent, self.settings.ui_scale);
+        if self.applied_theme != Some(look) {
+            theme::apply(&ctx, dark, self.settings.accent, self.settings.ui_scale);
+            self.applied_theme = Some(look);
         }
-        if self.applied_icon != self.settings.app_icon {
-            self.applied_icon = self.settings.app_icon;
-            crate::app_icon::apply_to_window(&ctx, self.applied_icon);
+        let icon = (self.settings.app_icon, self.settings.accent);
+        if self.applied_icon != icon {
+            self.applied_icon = icon;
+            crate::app_icon::apply_to_window(&ctx, icon.0, icon.1);
             if !self.testhook.active() {
-                crate::app_icon::apply_to_shortcuts(self.applied_icon);
+                crate::app_icon::apply_to_shortcuts(icon.0, icon.1);
             }
         }
 
@@ -958,6 +970,7 @@ impl eframe::App for ZxrawApp {
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
         if self.show_sidebar {
             egui::Panel::left("sidebar")
+                .frame(theme::sidebar_frame(&ctx))
                 .resizable(true)
                 .default_size(210.0)
                 .size_range(140.0..=420.0)
@@ -965,12 +978,13 @@ impl eframe::App for ZxrawApp {
         }
         if self.show_preview {
             egui::Panel::right("preview")
+                .frame(theme::content_side_frame(&ctx))
                 .resizable(true)
                 .default_size(340.0)
                 .size_range(220.0..=900.0)
                 .show(ui, |ui| crate::actions::preview_panel(self, ui));
         }
-        egui::CentralPanel::default().show(ui, |ui| {
+        egui::CentralPanel::default().frame(theme::content_frame(&ctx)).show(ui, |ui| {
             if self.tab().right.is_some() {
                 let w = ui.available_width();
                 let h = ui.available_height();

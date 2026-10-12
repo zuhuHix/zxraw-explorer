@@ -1519,7 +1519,7 @@ fn render_extension_bars(report: &UsageReport, ui: &mut egui::Ui) {
                     ui.painter().rect_filled(
                         Rect::from_min_size(rect.min, vec2(fill_width.max(1.0), rect.height())),
                         3.0,
-                        theme::ACCENT,
+                        theme::accent(ui.ctx()),
                     );
                     let percent = item.bytes as f64 * 100.0 / total as f64;
                     ui.label(format!("{} · {:.1}%", format_size(item.bytes), percent));
