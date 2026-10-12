@@ -244,13 +244,19 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * 🟡 egui desktop shell, list/grid modes, keyboard commands, themes, preview pane — source is
   present and commands are driven by the e2e scripts; visual review is not complete.
 * ✅ App icon choice (Settings › Appearance: Square or Round) — `forge-app/src/app_icon.rs`.
-  Both logos are embedded in `zxraw.exe` (square is the file icon). The choice switches the
-  window/taskbar icon live and repoints the user's own shortcuts to the app (Start menu,
-  desktop, pinned taskbar) — `forge-win/src/shell.rs::shortcut_icons_change_only_for_shortcuts_to_the_app`.
+  The transparent logo sits on a tile in the accent colour; every shape × accent is embedded
+  in `zxraw.exe` (square on blue is the file icon). The choice switches the window/taskbar
+  icon live and repoints the user's own shortcuts to the app (Start menu, desktop, pinned
+  taskbar) — `forge-win/src/shell.rs::shortcut_icons_change_only_for_shortcuts_to_the_app`,
+  `app_icon::tests::exe_icon_resources_match_the_window_icons`.
   Pinned taskbar icons can lag until Explorer restarts.
-* ✅ Colour contrast meets WCAG AA for selected rows, hyperlinks, and focus rings — `forge-app/src/theme.rs`
-  (`selected_row_text_meets_wcag_aa`, `hyperlink_color_meets_wcag_aa_on_its_theme_panel`,
-  `focus_ring_meets_non_text_contrast_on_selection_and_panel`). Selection and focus colours come from one source.
+* ✅ Accent colour (Settings › Appearance: Blue, Purple, Pink, Red, Orange, Green, Teal) drives
+  selection, focus rings, links, tab/sidebar indicators, progress bars and the icon tile; the
+  neutral surfaces are faintly tinted towards it — `forge-app/src/theme.rs`.
+* ✅ Colour contrast meets WCAG AA for selected rows, accent text and links, and focus rings, for
+  every accent in both themes — `forge-app/src/theme.rs` (`selected_row_text_meets_wcag_aa`,
+  `accent_text_meets_wcag_aa_on_every_surface`, `focus_ring_meets_non_text_contrast_on_selection_and_panel`).
+  Selection and focus colours come from one source.
 * ✅ AccessKit tree for the details list — `forge-app/src/views.rs::details_rows_emit_named_selected_accesskit_nodes`.
 * ✅ Keyboard-adjustable column splitter exposes its value and range to AccessKit —
   `views.rs::column_splitter_exposes_current_value_and_allowed_range`. Key-press resizing is not separately tested.

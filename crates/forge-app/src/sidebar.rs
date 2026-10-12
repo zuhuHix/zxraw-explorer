@@ -199,11 +199,22 @@ fn nav_item(
         Some(s) => format!("{icon}  {label}   {s}"),
         None => format!("{icon}  {label}"),
     };
-    let r = ui.add(
-        egui::Button::selectable(current, text)
+    // The current folder gets a quiet fill and an accent bar rather than the full selection
+    // colour, so the sidebar stays calm next to the file list's selection.
+    let button = if current {
+        egui::Button::new(text)
+            .selected(true)
+            .fill(theme::palette(ui.ctx()).nav_selected)
+            .stroke(egui::Stroke::NONE)
+    } else {
+        egui::Button::new(text)
+            .selected(false)
             .frame_when_inactive(false)
-            .min_size(egui::vec2(ui.available_width(), 0.0)),
-    );
+    };
+    let r = ui.add(button.min_size(egui::vec2(ui.available_width(), 0.0)));
+    if current {
+        theme::paint_indicator(ui, r.rect, true);
+    }
     let r = r.on_hover_text(path.to_string_lossy());
     if r.clicked() {
         app.navigate(path.clone());
@@ -315,15 +326,28 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
                 nav_item(app, ui, icon, &label, &d.root, None);
                 if d.total > 0 {
                     let used = 1.0 - d.free as f32 / d.total as f32;
-                    let bar = egui::ProgressBar::new(used)
-                        .desired_height(3.0)
-                        .desired_width(ui.available_width() - 8.0)
-                        .fill(if used > 0.9 {
-                            ui.visuals().error_fg_color
-                        } else {
-                            theme::ACCENT
-                        });
-                    ui.add(bar).on_hover_text(format!(
+                    // A slim track with an accent gradient (red when nearly full).
+                    let (rect, bar) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width() - 8.0, 4.0),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
+                    let filled = egui::Rect::from_min_size(
+                        rect.min,
+                        egui::vec2(rect.width() * used.clamp(0.0, 1.0), rect.height()),
+                    );
+                    let (from, to) = if used > 0.9 {
+                        let red = ui.visuals().error_fg_color;
+                        (red, red)
+                    } else {
+                        (
+                            theme::accent(ui.ctx()),
+                            theme::accent_gradient_end(ui.ctx()),
+                        )
+                    };
+                    theme::paint_hgradient(&painter.with_clip_rect(filled), rect, from, to);
+                    bar.on_hover_text(format!(
                         "{} free of {}",
                         forge_core::model::format_size(d.free),
                         forge_core::model::format_size(d.total)

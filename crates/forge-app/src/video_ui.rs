@@ -848,7 +848,11 @@ impl VideoUi {
         );
 
         if let Some(label) = &self.take_label {
-            ui.label(RichText::new(label).strong().color(crate::theme::ACCENT));
+            ui.label(
+                RichText::new(label)
+                    .strong()
+                    .color(crate::theme::accent(ui.ctx())),
+            );
         }
         if self.relation_pending {
             ui.horizontal(|ui| {

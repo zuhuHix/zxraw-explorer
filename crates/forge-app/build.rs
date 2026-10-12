@@ -2,18 +2,28 @@ use std::{env, fs, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../../assets/zxraw.ico");
-    println!("cargo:rerun-if-changed=../../assets/zxraw-round.ico");
+    println!("cargo:rerun-if-changed=../../assets/icons/icons.txt");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "windows" {
         return;
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    // Icon 1 (the square logo) is the file's own icon; icon 2 (the round logo) is what the
-    // app points its shortcuts at when Settings > Appearance > App icon is Round.
-    let icon_path = rc_path("../../assets/zxraw.ico");
-    let round_icon_path = rc_path("../../assets/zxraw-round.ico");
+    // One icon per logo shape and accent colour, in the order `generate_icon.py` lists them:
+    // icon 1 (the square logo on blue) is the file's own icon; the app points its shortcuts
+    // at the others to follow Settings > Appearance (see `app_icon::resource_index`).
+    let manifest =
+        fs::read_to_string("../../assets/icons/icons.txt").expect("read assets/icons/icons.txt");
+    let icons: String = manifest
+        .lines()
+        .filter(|name| !name.trim().is_empty())
+        .enumerate()
+        .map(|(i, name)| {
+            let relative = format!("../../assets/icons/{}", name.trim());
+            println!("cargo:rerun-if-changed={relative}");
+            format!("{} ICON \"{}\"\n", i + 1, rc_path(&relative))
+        })
+        .collect();
 
     let major = env::var("CARGO_PKG_VERSION_MAJOR").expect("Cargo package major version");
     let minor = env::var("CARGO_PKG_VERSION_MINOR").expect("Cargo package minor version");
@@ -23,9 +33,7 @@ fn main() {
 
     let resource = format!(
         r#"
-1 ICON "{icon_path}"
-2 ICON "{round_icon_path}"
-
+{icons}
 1 VERSIONINFO
  FILEVERSION {version_info}
  PRODUCTVERSION {version_info}

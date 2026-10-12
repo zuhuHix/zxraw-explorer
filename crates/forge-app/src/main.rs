@@ -150,13 +150,12 @@ fn main() -> eframe::Result {
     }
 
     // Read early so the window opens with the chosen icon instead of switching after.
-    let app_icon = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"))
-        .app_icon;
+    let startup = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ZXraw Explorer")
         .with_inner_size([1360.0, 840.0])
         .with_min_inner_size([640.0, 400.0])
-        .with_icon(app_icon::icon_data(app_icon))
+        .with_icon(app_icon::icon_data(startup.app_icon, startup.accent))
         .with_drag_and_drop(true);
     let hidden = testhook::hide_window();
     if hidden {

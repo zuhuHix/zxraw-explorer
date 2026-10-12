@@ -149,7 +149,11 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.set_max_width(500.0);
-            ui.label("A fast file manager for photographers and videographers.");
+            let logo = crate::app_icon::preview(ctx, app.settings.app_icon, app.settings.accent);
+            ui.horizontal(|ui| {
+                ui.image((logo.id(), egui::vec2(36.0, 36.0)));
+                ui.label("A fast file manager for photographers and videographers.");
+            });
             ui.label(
                 RichText::new("Everything stays on this PC: no account, no telemetry, and no network access unless you ask for the optional FFmpeg download.")
                     .weak(),
