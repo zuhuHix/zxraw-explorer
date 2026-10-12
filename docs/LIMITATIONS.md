@@ -46,10 +46,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Installer, packaging, and licences
 
-* The installer is not compiled. `packaging/zxraw.iss` (Inno Setup) has not been built, because
-  Inno Setup (`ISCC`) is not installed on the verification machine.
-* The release zip was built and its executable launched (commit `e3bfbd2`). That build was not
-  repeated for this checkout, and no `dist/` output is present. The release script builds with
+* The installer (`packaging/zxraw.iss`, Inno Setup 6.7.3) was compiled from `ed5fc58`. A silent
+  install into a temporary folder, a launch of the installed app and a silent uninstall all
+  succeeded. The interactive wizard and the optional context-menu task were not exercised.
+  Neither the installer nor the executables are code-signed, so SmartScreen warns on first run.
+* The release zip was built from `ed5fc58` and its executable launched. The release script builds with
   `--no-default-features`, so the automation hook is compiled out. This was not checked in a
   release binary.
 * Licence notices that must ship before any distribution (flagged in `packaging/THIRD_PARTY.md`):
@@ -63,7 +64,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   * `self_cell` 1.3.0, `Apache-2.0 OR GPL-2.0-only`. ZXraw elects Apache-2.0, so the Apache-2.0
     text (already shipped as `LICENSE-APACHE`) applies. GPL-2.0 is not elected.
 * FFmpeg and ffprobe are not bundled. If they are ever bundled, their own licences (LGPL or GPL,
-  depending on the build) apply and must be shipped.
+  depending on the build) apply and must be shipped. **Download FFmpeg…** fetches a GPL v3 build
+  from its publisher at the user's request and installs its licence alongside it; ZXraw Explorer
+  does not redistribute it.
+* The FFmpeg download is pinned to one build (9.0.2). A newer FFmpeg needs a new app release
+  (or installing it yourself). If the publisher removes that release, the download fails with
+  an HTTP error and nothing is installed.
 
 ## Organising and metadata
 

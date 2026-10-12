@@ -72,7 +72,10 @@ the screenshots.
   fixed with real-pointer e2e regressions (`05c17e4`).
 
 ### Wave 3 — packaging polish
-* 🟡 Inno Setup installer: `packaging/zxraw.iss` exists, but ISCC is not installed on the build
-  machine, so the installer was not compiled on this branch (see LIMITATIONS.md).
+* ✅ Inno Setup installer: compiled from `ed5fc58` (Inno Setup 6.7.3); silent install, launch and
+  uninstall verified. Not code-signed (see LIMITATIONS.md).
+* ✅ Download FFmpeg: pinned, checksum-verified FFmpeg 9.0.2 download into the profile's data
+  folder, offered wherever video tools are missing (`ffmpeg_setup.rs`, `forge-win/src/http.rs`).
+  Unit and e2e tests against a local server; one real download from GitHub verified by hand.
 * ✅ First-run experience (`67a5147`).
 * ✅ In-app crash-report notice (`67a5147`).

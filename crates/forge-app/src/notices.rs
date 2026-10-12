@@ -50,6 +50,13 @@ impl Notices {
         }
     }
 
+    /// FFmpeg was installed or reconfigured: re-detect it the next time the welcome draws.
+    pub fn video_tools_changed(&mut self) {
+        if let Some(welcome) = &mut self.welcome {
+            welcome.video_tools = None;
+        }
+    }
+
     /// Records that the welcome was seen. Never replaces anything: the marker is created
     /// with `create_new`, and an existing marker already means "seen".
     pub fn mark_welcome_done(&mut self) {
@@ -127,6 +134,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
         }
     });
     let (has_ffmpeg, has_ffprobe) = (tools.ffmpeg, tools.ffprobe);
+    let download = app.ops.ffmpeg_setup.status();
 
     let mut open = true;
     let mut done = false;
@@ -142,7 +150,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             ui.set_max_width(500.0);
             ui.label("A fast file manager for photographers and videographers.");
             ui.label(
-                RichText::new("Everything stays on this PC: no account, no telemetry, no network access.")
+                RichText::new("Everything stays on this PC: no account, no telemetry, and no network access unless you ask for the optional FFmpeg download.")
                     .weak(),
             );
             ui.add_space(8.0);
@@ -177,8 +185,9 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             if has_ffmpeg && has_ffprobe {
                 ui.label("FFmpeg found: video thumbnails and clip metadata are on.");
             } else {
-                ui.label("FFmpeg was not found, so video thumbnails and clip metadata are off. ZXraw Explorer does not bundle it; install FFmpeg and point Settings at its folder to turn them on.");
-                if ui.button("Open Settings…").clicked() {
+                ui.label("FFmpeg was not found, so video thumbnails and clip metadata are off. ZXraw Explorer does not bundle it: download it here, or install it yourself and point Settings at its folder.");
+                crate::ffmpeg_setup::offer(ui, download, || run = Some(Cmd::DownloadFfmpeg));
+                if !download.running && ui.button("Open Settings…").clicked() {
                     run = Some(Cmd::Settings);
                 }
             }

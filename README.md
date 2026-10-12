@@ -16,8 +16,10 @@ cargo test --workspace
 cargo run -p forge-app         # launch the UI (debug)
 ```
 
-Optional: put `ffmpeg.exe` and `ffprobe.exe` on `PATH` (or configure their location in
-Settings) to enable video thumbnails and technical metadata. ZXraw Explorer does not bundle FFmpeg.
+Optional: video thumbnails and technical metadata need `ffmpeg.exe` and `ffprobe.exe`.
+ZXraw Explorer does not bundle FFmpeg. Use **Download FFmpeg…** (Settings › Video, the
+welcome window or the command palette) to fetch a pinned, checksum-verified build into the
+app's data folder, or put the tools on `PATH` / choose their folder in Settings.
 
 ## Docs
 
@@ -29,4 +31,5 @@ Settings) to enable video thumbnails and technical metadata. ZXraw Explorer does
 
 ## Privacy
 
-No accounts, no telemetry, no network access. Indexes and caches stay on your machine.
+No accounts, no telemetry, and no network access except the optional FFmpeg download, which
+runs only when you click it and confirm. Indexes and caches stay on your machine.
