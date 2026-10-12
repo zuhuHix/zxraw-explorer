@@ -22,15 +22,10 @@ DisableProgramGroupPage=yes
 
 [Tasks]
 Name: "contextmenu"; Description: "Add &Open in ZXraw Explorer to folder and drive menus"; Flags: unchecked
-Name: "filetypes"; Description: "Offer ZXraw Explorer as the &default app for photos and RAW files (confirm in Settings)"; Flags: unchecked
+Name: "filetypes"; Description: "Register ZXraw Explorer for photo and RAW file types"; Flags: unchecked
 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-[Registry]
-Root: HKCU; Subkey: "Software\Classes\Directory\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
-Root: HKCU; Subkey: "Software\Classes\Drive\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
 
 [Icons]
 Name: "{autoprograms}\ZXraw Explorer"; Filename: "{app}\zxraw.exe"
@@ -40,5 +35,6 @@ Filename: "{app}\zxraw.exe"; Parameters: "--register-context-menu"; Description:
 Filename: "{app}\zxraw.exe"; Parameters: "--register-file-types"; Description: "Register photo file types"; Flags: runhidden postinstall skipifsilent waituntilterminated; Tasks: filetypes
 
 [UninstallRun]
+Filename: "{app}\zxraw.exe"; Parameters: "--unregister-default-folder"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreZXrawExplorerFolderDefault"
 Filename: "{app}\zxraw.exe"; Parameters: "--unregister-context-menu"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveZXrawExplorerContextMenu"
-Filename: "{app}\zxraw.exe"; Parameters: "--unregister-file-types"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveZXrawExplorerFileTypes"
+Filename: "{app}\zxraw.exe"; Parameters: "--unregister-file-types"; Flags: runhidden waituntilterminated; RunOnceId: "RestoreZXrawExplorerPhotoDefaults"

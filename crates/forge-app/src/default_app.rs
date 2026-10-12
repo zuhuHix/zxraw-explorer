@@ -1,9 +1,7 @@
-//! "Open photos with ZXraw Explorer": the opt-in default-app setup offered by the first-run
-//! welcome and Settings > Default app.
-//!
-//! Windows does not let a program make itself the default: [`make_default`] registers the
-//! photo types for this user (see `forge_win::register_file_types`, which also covers
-//! programs that bypass the Settings choice) and opens Settings, where the user confirms.
+//! One-click photo and RAW defaults, with optional filesystem-folder defaults, offered by the
+//! first-run welcome and Settings > Default app. After the user's explicit click, the Windows
+//! integration registers photo types and writes per-user `UserChoice` values, then applies the
+//! reversible `Directory` and `Drive` shell verbs when selected.
 
 use std::time::{Duration, Instant};
 
@@ -50,6 +48,8 @@ fn describe(extension: &str) -> String {
 pub struct Status {
     /// The user opted in (ZXraw Explorer is registered for the types).
     pub registered: bool,
+    /// Whether Directory and Drive open with ZXraw Explorer.
+    pub folders: bool,
     /// `(extension, app name)`, and whether that app is ZXraw Explorer.
     pub types: Vec<(String, Option<String>, bool)>,
 }
@@ -66,6 +66,7 @@ impl Status {
             .collect();
         Self {
             registered: forge_win::file_types_registered().unwrap_or(false),
+            folders: forge_win::default_folder_handler_enabled().unwrap_or(false),
             types,
         }
     }
@@ -73,26 +74,27 @@ impl Status {
     pub fn ours(&self) -> usize {
         self.types.iter().filter(|(_, _, ours)| *ours).count()
     }
-
-    fn all_ours(&self) -> bool {
-        self.ours() == self.types.len()
-    }
-
-    /// The app JPEGs open with, the type people notice.
-    fn jpeg_app(&self) -> Option<&str> {
-        self.types
-            .iter()
-            .find(|(extension, _, _)| extension == "jpg")
-            .and_then(|(_, app, _)| app.as_deref())
-    }
 }
 
 /// Background-refreshed [`Status`] for whichever window shows it.
-#[derive(Default)]
 pub struct State {
     status: Option<Status>,
     checked: Option<Instant>,
     rx: Option<Receiver<Status>>,
+    pub photos_selected: bool,
+    pub folders_selected: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            status: None,
+            checked: None,
+            rx: None,
+            photos_selected: true,
+            folders_selected: true,
+        }
+    }
 }
 
 impl State {
@@ -128,55 +130,75 @@ impl State {
 /// What the user asked for in [`controls`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    MakeDefault,
+    Apply { photos: bool, folders: bool },
     OpenWindowsSettings,
-    Remove,
+    RestorePreviousApps,
 }
 
 /// Status line plus buttons. `compact` (the welcome) leaves out the per-type list and
 /// "Stop using".
 pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mut Option<Action>) {
     let ctx = ui.ctx().clone();
+    ui.checkbox(
+        &mut state.photos_selected,
+        "Open photo and RAW files in ZXraw Explorer",
+    );
+    ui.checkbox(
+        &mut state.folders_selected,
+        "Open folders in ZXraw Explorer",
+    )
+    .on_hover_text(
+        "Changes the Directory and Drive open verbs. Win+E, the taskbar File Explorer icon, and other apps' Show in folder commands still open Windows Explorer.",
+    );
+    ui.add_space(4.0);
+    let photos_selected = state.photos_selected;
+    let folders_selected = state.folders_selected;
     let Some(status) = state.current(&ctx) else {
         ui.horizontal(|ui| {
             ui.spinner();
-            ui.label("Checking which apps open your photos…");
+            ui.label("Checking current defaults…");
         });
         return;
     };
     let total = status.types.len();
-    if status.all_ours() {
-        ui.label("ZXraw Explorer is your default photo app.");
-    } else if status.registered {
-        ui.label(format!(
-            "ZXraw Explorer opens {} of {total} photo and RAW types. To finish, on its page in Windows Settings, click the single \"Set default\" button at the top to set every registered photo and RAW type at once.",
-            status.ours()
-        ));
-    } else if let Some(app) = status.jpeg_app() {
-        ui.label(RichText::new(format!("JPEG photos currently open in {app}.")).weak());
+    if status.ours() == total && status.folders {
+        ui.label("ZXraw Explorer opens your photos, RAW files and folders.");
+    } else if status.ours() > 0 || status.folders {
+        ui.label("ZXraw Explorer defaults are partially applied.");
+    } else {
+        ui.label("Choose which files and folders ZXraw Explorer should open.");
     }
     ui.horizontal(|ui| {
-        if !status.registered {
-            if ui
-                .button("Make ZXraw Explorer the default photo viewer…")
-                .on_hover_text("Registers the photo and RAW types for you, then opens ZXraw Explorer's Windows Settings page. Click its single \"Set default\" button to set them all at once.")
+        ui.label(format!("Photos: {}/{} types", status.ours(), total));
+        ui.label(format!(
+            "Folders: {}",
+            if status.folders { "yes" } else { "no" }
+        ));
+    });
+    ui.horizontal(|ui| {
+        if ui
+            .button("Make ZXraw Explorer my default")
+            .on_hover_text("Applies the selected options. Uncheck either option and click again to restore that part's previous app.")
+            .clicked()
+        {
+            *action = Some(Action::Apply {
+                photos: photos_selected,
+                folders: folders_selected,
+            });
+        }
+        if status.registered
+            && status.ours() < total
+            && ui
+                .button("Open Windows Settings for remaining photo types…")
+                .on_hover_text("Use the ZXraw Explorer Default apps page only for the types Windows did not accept here.")
                 .clicked()
-            {
-                *action = Some(Action::MakeDefault);
-            }
-        } else if !status.all_ours()
-            && ui.button("Open Windows Settings…").clicked()
         {
             *action = Some(Action::OpenWindowsSettings);
         }
-        if !compact
-            && status.registered
-            && ui
-                .button("Stop using as default")
-                .on_hover_text("Removes ZXraw Explorer's file types and restores what other apps used before.")
-                .clicked()
+        if (status.registered || status.ours() > 0 || status.folders)
+            && ui.button("Restore previous apps").clicked()
         {
-            *action = Some(Action::Remove);
+            *action = Some(Action::RestorePreviousApps);
         }
     });
     if compact {
@@ -204,7 +226,6 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
                 });
         });
 }
-
 /// Carries out an [`Action`] from [`controls`].
 pub fn run(app: &mut ZxrawApp, action: Action) {
     if app.testhook.active() {
@@ -213,43 +234,106 @@ pub fn run(app: &mut ZxrawApp, action: Action) {
         return;
     }
     match action {
-        Action::MakeDefault => {
-            let registered = std::env::current_exe()
-                .map_err(|error| error.to_string())
-                .and_then(|exe| {
-                    forge_win::register_file_types(exe, &file_types())
-                        .map_err(|error| error.to_string())
-                });
-            if let Err(error) = registered {
-                app.toast_err(format!(
-                    "Could not register ZXraw Explorer for photos: {error}"
-                ));
-                return;
-            }
-            open_windows_settings(app);
-        }
+        Action::Apply { photos, folders } => apply_selected(app, photos, folders),
         Action::OpenWindowsSettings => open_windows_settings(app),
-        Action::Remove => match forge_win::unregister_file_types() {
-            Ok(()) => app.toast("Photos open with your previous apps again"),
-            Err(error) => app.toast_err(format!(
-                "Could not remove ZXraw Explorer's file types: {error}"
-            )),
-        },
+        Action::RestorePreviousApps => restore_previous_apps(app),
     }
     app.ops.settings_ui.default_app.invalidate();
+}
+
+fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
+    let mut errors = Vec::new();
+    if photos {
+        let registered = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| {
+                forge_win::register_file_types(exe, &file_types())
+                    .map_err(|error| error.to_string())
+            });
+        match registered {
+            Ok(()) => match forge_win::set_file_type_defaults(&file_types()) {
+                Ok(report) if report.all_succeeded() => {
+                    tracing::info!(
+                        "set ZXraw as the default for {} photo types",
+                        report.succeeded()
+                    );
+                }
+                Ok(report) => errors.push(format!(
+                    "Some photo types need Windows Settings: {}",
+                    report.failure_summary()
+                )),
+                Err(error) => errors.push(format!("Could not set photo defaults: {error}")),
+            },
+            Err(error) => errors.push(format!("Could not register photo types: {error}")),
+        }
+    } else {
+        match forge_win::restore_file_type_defaults() {
+            Ok(report) if report.all_succeeded() => match forge_win::unregister_file_types() {
+                Ok(()) => app.toast("Previous photo apps restored"),
+                Err(error) => errors.push(format!("Could not remove photo registration: {error}")),
+            },
+            Ok(report) => errors.push(format!(
+                "Some photo apps could not be restored; registration was kept: {}",
+                report.failure_summary()
+            )),
+            Err(error) => errors.push(format!("Could not restore photo apps: {error}")),
+        }
+    }
+
+    if folders {
+        let result = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| {
+                forge_win::register_default_folder_handler(exe).map_err(|error| error.to_string())
+            });
+        if let Err(error) = result {
+            errors.push(format!("Could not set folder defaults: {error}"));
+        }
+    } else if let Err(error) = forge_win::unregister_default_folder_handler() {
+        errors.push(format!("Could not restore folder opening: {error}"));
+    }
+
+    if errors.is_empty() {
+        app.toast("ZXraw Explorer default updated");
+    } else {
+        app.toast_err(errors.join(". "));
+    }
+}
+
+fn restore_previous_apps(app: &mut ZxrawApp) {
+    let mut errors = Vec::new();
+    match forge_win::restore_file_type_defaults() {
+        Ok(report) if report.all_succeeded() => {
+            if let Err(error) = forge_win::unregister_file_types() {
+                errors.push(format!("Could not remove photo registration: {error}"));
+            }
+        }
+        Ok(report) => errors.push(format!(
+            "Some photo apps could not be restored; registration was kept: {}",
+            report.failure_summary()
+        )),
+        Err(error) => errors.push(format!("Could not restore photo apps: {error}")),
+    }
+    if let Err(error) = forge_win::unregister_default_folder_handler() {
+        errors.push(format!("Could not restore folder opening: {error}"));
+    }
+    if errors.is_empty() {
+        app.toast("Previous photo apps and folder settings restored");
+    } else {
+        app.toast_err(errors.join(". "));
+    }
 }
 
 fn open_windows_settings(app: &mut ZxrawApp) {
     match forge_win::open_default_apps_settings() {
         Ok(()) => app.toast(
-            "In Windows Settings, click the single \"Set default\" button at the top to set all photo and RAW types",
+            "In Windows Settings, select only the photo types ZXraw could not set",
         ),
         Err(error) => app.toast_err(format!(
             "Could not open Windows Settings ({error}). Open Settings > Apps > Default apps > ZXraw Explorer."
         )),
     }
 }
-
 /// Re-points the registration at this executable after it moved, if the user opted in.
 pub fn refresh_registration() {
     let current_exe = match std::env::current_exe() {

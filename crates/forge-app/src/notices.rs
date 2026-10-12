@@ -183,7 +183,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             ui.add_space(8.0);
 
             ui.heading("Default app");
-            ui.label("Open photos and RAW files in ZXraw Explorer when you double-click them, or when another program opens them.");
+            ui.label("Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders.");
             crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
             ui.add_space(8.0);
 
@@ -251,7 +251,10 @@ mod tests {
     fn welcome_shows_once_per_profile() {
         let dir = tempfile::tempdir().unwrap();
         let mut notices = Notices::new(dir.path(), None, false);
-        assert!(notices.welcome.is_some(), "a fresh profile gets the welcome");
+        assert!(
+            notices.welcome.is_some(),
+            "a fresh profile gets the welcome"
+        );
         notices.mark_welcome_done();
         assert!(notices.welcome.is_none());
         assert!(dir.path().join(FIRST_RUN_MARKER).is_file());

@@ -1,8 +1,8 @@
 //! Opt-in, reversible, per-user registration of ZXraw Explorer as a handler for photo types.
 //!
-//! Windows 10 and 11 do not let a program make itself the default app: the user's choice
-//! (`...\Explorer\FileExts\.<ext>\UserChoice`) is hash-protected and only Settings writes
-//! it. What a program may do, and all this module does, is under `HKCU` only:
+//! Per-user photo type registration. This module registers the shell ProgIDs and Settings
+//! capabilities; [`crate::user_choice`] separately writes the currently observed legacy
+//! `UserChoice` format after explicit user action.
 //!
 //! * a ProgID per extension (`ZXrawExplorer.jpg`) whose open command passes the file;
 //! * `Software\Classes\.<ext>\OpenWithProgids`, so it is offered in "Open with";
@@ -66,9 +66,19 @@ pub fn register_file_types(exe: impl AsRef<Path>, types: &[FileType]) -> Result<
 pub fn unregister_file_types() -> Result<()> {
     #[cfg(windows)]
     {
+        let restored = super::user_choice::restore_saved_defaults();
         let result = unregister_at(&Layout::user());
         notify_association_change();
-        result
+        result?;
+        let restored = restored?;
+        if restored.all_succeeded() {
+            Ok(())
+        } else {
+            Err(WinError::Invalid(format!(
+                "some previous photo apps could not be restored: {}",
+                restored.failure_summary()
+            )))
+        }
     }
     #[cfg(not(windows))]
     {
@@ -138,8 +148,8 @@ pub fn default_app(extension: &str) -> Option<DefaultApp> {
     }
 }
 
-/// Opens Settings > Default apps on ZXraw Explorer's own page; there the user confirms with
-/// "Set default". Returns launch errors instead of silently opening the generic type list.
+/// Opens Settings > Default apps on ZXraw Explorer's page for types the direct UserChoice
+/// operation could not set. Returns launch errors instead of silently opening the generic list.
 pub fn open_default_apps_settings() -> Result<()> {
     #[cfg(windows)]
     {
@@ -493,7 +503,7 @@ fn matches_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<bool> {
 }
 
 #[cfg(windows)]
-fn notify_association_change() {
+pub(crate) fn notify_association_change() {
     use windows::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
 
     // Explorer caches associations and icons; this tells it to re-read them.

@@ -281,14 +281,18 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Windows shell registration lifecycle — `forge-win/src/integration.rs` tests run against an isolated HKCU
   test key (`registration_lifecycle_uses_an_isolated_hkcu_test_root`). The Explorer context-menu entries are not
   visually checked.
-* ✅ Default photo app (opt-in, first-run welcome and Settings > Default app) — `forge-win/src/file_types.rs`
-  registers per-user ProgIDs, "Open with" entries, `Capabilities`/`RegisteredApplications` and the per-user class
-  default (for programs that bypass the Settings choice), saving and restoring the class defaults it replaces
-  (`registration_lifecycle_restores_previous_class_defaults`,
-  `unregistering_keeps_a_class_default_another_app_took_since`, both on an isolated HKCU key). A photo passed on
-  the command line opens in the viewer with its folder
-  (`a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder`). Registration against the real
-  `HKCU\Software\Classes` and the Settings deep link were not exercised.
+* ✅ Default photo and RAW app (opt-in, first-run welcome and Settings > Default app) — `forge-win/src/file_types.rs`
+  registers per-user ProgIDs, "Open with" entries, `Capabilities`/`RegisteredApplications`, and per-user class
+  defaults. The UserChoice v1 hash implementation matches read-only values for the current user's `.jpg`, `.cr3`,
+  `.png`, and `.txt` associations. An ignored Windows test wrote a dummy extension and confirmed that
+  `AssocQueryStringW` honors its valid hash and falls back for an invalid hash; no real photo association was
+  written during development. Isolated HKCU tests cover registration restore. A photo passed on the command line
+  opens in the viewer with its folder (`a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder`).
+  The Default apps fallback page was not exercised.
+* ✅ Default filesystem folder app (opt-in, same flow) — `forge-win/src/integration.rs` sets only the `Directory`
+  and `Drive` shell defaults, leaving `Folder` untouched. An ignored Windows test verified that both associations
+  resolve to the built ZXraw executable, then restored the real HKCU values and confirmed the original defaults,
+  verb entries, and backup state were restored.
 * 🟡 Packaging — `packaging/build-release.ps1`, `packaging/zxraw.iss`, `packaging/generate_icon.py`,
   `packaging/generate-third-party.ps1`, and the VERSIONINFO resource in `crates/forge-app/build.rs`.
   Commit `e3bfbd2` records a release zip that was built and whose executable launched; that build is not

@@ -127,15 +127,43 @@ fn recycle_shell(_paths: &[PathBuf]) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
-/// Opens `path` with its registered default handler (ShellExecuteW verb "open").
-/// The path is passed as a single argument; no command string is built.
+/// Opens files with their registered handler. Existing directories are always sent directly to
+/// Windows Explorer so making ZXraw the Directory default cannot route its own reveal/open flows
+/// back into itself.
 #[cfg(windows)]
 pub fn open_default(path: &Path) -> Result<()> {
-    shell_execute("open", path)
+    if path.is_dir() {
+        open_folder_in_explorer(path)
+    } else {
+        shell_execute("open", path)
+    }
 }
 
 #[cfg(not(windows))]
 pub fn open_default(_path: &Path) -> Result<()> {
+    Err(WinError::Unsupported)
+}
+
+/// Opens a filesystem folder or drive through `explorer.exe` explicitly.
+#[cfg(windows)]
+pub fn open_folder_in_explorer(path: &Path) -> Result<()> {
+    let windows_dir = std::env::var_os("WINDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let explorer = windows_dir.join("explorer.exe");
+    std::process::Command::new(&explorer)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|source| WinError::Io {
+            op: "open folder in Explorer",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(windows))]
+pub fn open_folder_in_explorer(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
