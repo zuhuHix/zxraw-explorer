@@ -396,13 +396,9 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                     SettingsPage::FileOperations => {
                                         file_operations_page(ui, settings)
                                     }
-                                    SettingsPage::Video => video_page(
-                                        ui,
-                                        settings,
-                                        state,
-                                        ffmpeg_download,
-                                        &mut intents,
-                                    ),
+                                    SettingsPage::Video => {
+                                        video_page(ui, settings, state, ffmpeg_download, &mut intents)
+                                    }
                                     SettingsPage::MediaLinks => media_links_page(ui, settings),
                                     SettingsPage::Library => library_page(
                                         ui,
@@ -1171,7 +1167,7 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     ui.add_space(12.0);
     ui.label(
         RichText::new(
-            "Photo defaults use the current per-user Windows UserChoice hash format after your click. Microsoft does not document this format, and a Windows update may change it; types Windows rejects can be selected individually in Default apps. Folder opening changes only the Directory and Drive verbs. Win+E, the taskbar File Explorer icon, and other apps' Show in folder commands still open Windows Explorer. Restore previous apps puts back the saved choices.",
+            "The choice applies to this Windows account only. Win+E, the taskbar File Explorer button, and other apps' \"Show in folder\" commands still open Windows Explorer. Restore previous apps puts back the apps that were set before.",
         )
         .weak(),
     );

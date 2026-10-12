@@ -23,16 +23,16 @@ mod meta_export;
 mod modal;
 mod notices;
 mod ops_ui;
-mod palette;
 mod pane;
+mod palette;
 mod platform;
 mod preview;
 mod search_ui;
+mod tags_ui;
 mod settings;
 mod settings_ui;
 mod sidebar;
 mod similar;
-mod tags_ui;
 // The automation hook exists only in debug builds or with the `automation` feature;
 // release builds get an inert stub with the same surface.
 #[cfg(any(debug_assertions, feature = "automation"))]
@@ -68,9 +68,7 @@ fn run_switch(argument: &std::ffi::OsStr) -> Option<anyhow::Result<&'static str>
             .and_then(|exe| {
                 forge_win::register_file_types(exe, &default_app::file_types()).map_err(Into::into)
             })
-            .map(
-                |()| "Photo file types registered; confirm the default in Settings > Default apps.",
-            ),
+            .map(|()| "Photo file types registered; confirm the default in Settings > Default apps."),
         "--unregister-file-types" => forge_win::unregister_file_types()
             .map_err(Into::into)
             .map(|()| "Photo file types removed."),
@@ -167,8 +165,8 @@ fn main() -> eframe::Result {
     }
 
     // Read early so the window opens with the chosen icon instead of switching after.
-    let app_icon =
-        settings::load_json::<settings::Settings>(&paths.config.join("settings.json")).app_icon;
+    let app_icon = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"))
+        .app_icon;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ZXraw Explorer")
         .with_inner_size([1360.0, 840.0])

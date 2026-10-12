@@ -20,13 +20,13 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 mod clipboard;
+mod file_types;
+mod integration;
 pub mod desktop;
 pub mod dragout;
 pub mod drives;
-mod file_types;
 pub mod files;
 pub mod http;
-mod integration;
 pub mod process;
 pub mod restart;
 pub mod shell;

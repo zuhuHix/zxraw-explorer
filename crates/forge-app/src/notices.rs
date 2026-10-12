@@ -251,10 +251,7 @@ mod tests {
     fn welcome_shows_once_per_profile() {
         let dir = tempfile::tempdir().unwrap();
         let mut notices = Notices::new(dir.path(), None, false);
-        assert!(
-            notices.welcome.is_some(),
-            "a fresh profile gets the welcome"
-        );
+        assert!(notices.welcome.is_some(), "a fresh profile gets the welcome");
         notices.mark_welcome_done();
         assert!(notices.welcome.is_none());
         assert!(dir.path().join(FIRST_RUN_MARKER).is_file());

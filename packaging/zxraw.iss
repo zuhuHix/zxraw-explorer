@@ -27,6 +27,11 @@ Name: "filetypes"; Description: "Register ZXraw Explorer for photo and RAW file 
 [Files]
 Source: "{#PayloadDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\ZXrawExplorer"; Flags: uninsdeletekey dontcreatekey
+
 [Icons]
 Name: "{autoprograms}\ZXraw Explorer"; Filename: "{app}\zxraw.exe"
 

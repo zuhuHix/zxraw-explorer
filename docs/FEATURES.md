@@ -285,8 +285,8 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   registers per-user ProgIDs, "Open with" entries, `Capabilities`/`RegisteredApplications`, and per-user class
   defaults. The UserChoice v1 hash implementation matches read-only values for the current user's `.jpg`, `.cr3`,
   `.png`, and `.txt` associations. An ignored Windows test wrote a dummy extension and confirmed that
-  `AssocQueryStringW` honors its valid hash and falls back for an invalid hash; no real photo association was
-  written during development. Isolated HKCU tests cover registration restore. A photo passed on the command line
+  `AssocQueryStringW` honors its valid hash and falls back for an invalid hash. Isolated HKCU tests cover
+  registration restore. A photo passed on the command line
   opens in the viewer with its folder (`a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder`).
   The Default apps fallback page was not exercised.
 * ✅ Default filesystem folder app (opt-in, same flow) — `forge-win/src/integration.rs` sets only the `Directory`

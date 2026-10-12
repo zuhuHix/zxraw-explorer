@@ -554,10 +554,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_existing_zxraw_userchoice_is_removed_on_restore_not_saved_as_previous() {
-        assert_eq!(
-            previous_choice_snapshot(Some("ZXrawExplorer.jpg")),
-            "N:"
-        );
+        assert_eq!(previous_choice_snapshot(Some("ZXrawExplorer.jpg")), "N:");
         assert_eq!(
             previous_choice_snapshot(Some("Applications\\zxraw.exe")),
             "N:"
