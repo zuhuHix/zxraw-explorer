@@ -57,6 +57,8 @@ pub(crate) struct InputQueue {
     pub delivered_frames: u32,
     /// Where the mouse pointer was last placed by a script (for wheel events).
     pub pointer: Option<egui::Pos2>,
+    /// Modifier state held across scripted pointer steps.
+    pub modifiers: egui::Modifiers,
 }
 
 /// Per-step limit for steps that wait (listings, dialogs, jobs unless given explicitly).
@@ -90,9 +92,14 @@ pub struct TestHook {
 /// True when the environment asks for an automated run (checked before the app starts so
 /// the profile can be isolated).
 pub fn env_requests_automation() -> bool {
-    ["ZXRAW_SCREENSHOT", "ZXRAW_CMDS", "ZXRAW_SELECT", "ZXRAW_SCRIPT"]
-        .iter()
-        .any(|v| std::env::var_os(v).is_some())
+    [
+        "ZXRAW_SCREENSHOT",
+        "ZXRAW_CMDS",
+        "ZXRAW_SELECT",
+        "ZXRAW_SCRIPT",
+    ]
+    .iter()
+    .any(|v| std::env::var_os(v).is_some())
 }
 
 /// True when an automated run should keep its window out of the user's way: it opens on a
@@ -208,10 +215,7 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         hook.frames_after_cmds += 1;
     }
     // Give async listings/thumbnails a moment to land, then capture.
-    if hook.ran_cmds
-        && hook.frames_after_cmds > 90
-        && !hook.requested
-        && hook.screenshot.is_some()
+    if hook.ran_cmds && hook.frames_after_cmds > 90 && !hook.requested && hook.screenshot.is_some()
     {
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
         hook.requested = true;
@@ -259,6 +263,8 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// text <text>                inject typed text (verbatim, like `type`)
 /// pointer <x> <y>            move the mouse pointer (window points)
 /// click <x> <y>              press and release the primary button there (over two frames)
+/// marquee <from> <to> [ctrl|shift] drag from empty space below the view to two drawn entries
+/// release-pointer            release the primary button after a `marquee` step
 /// scroll <dy>                mouse wheel at the pointer; positive scrolls content down
 /// dialog <path> | cancel     queue the answer for the next native file/folder dialog
 /// wait-exists <path> [| s]   wait until the path exists (default 30 s)
@@ -266,6 +272,7 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// assert-same <a> | <b>      fail unless both files exist and have identical bytes
 /// assert-contains <p> | <t>  fail unless the UTF-8 (lossy) file contains the text
 /// assert-entry <name>        fail unless the focused pane's listing has that entry
+/// assert-selection <a>, <b>  fail unless exactly those entries are selected
 /// assert-no-entry <name>     fail if the focused pane's listing has that entry
 /// wait-entry <name> [| s]    wait until the focused pane lists the entry (no manual refresh)
 /// wait-no-entry <name> [| s] wait until the focused pane no longer lists the entry
@@ -297,6 +304,8 @@ enum Step {
     AssertTabs(usize),
     /// Number of selected entries the focused pane lists.
     AssertSelected(usize),
+    /// The exact set of selected entry names, case-insensitive.
+    AssertSelection(Vec<String>),
     AssertPath(PathBuf),
     AssertExists(PathBuf),
     AssertMissing(PathBuf),
@@ -308,8 +317,17 @@ enum Step {
     Text(String),
     Pointer(egui::Pos2),
     Click(egui::Pos2),
+    Marquee {
+        from: String,
+        to: String,
+        modifiers: egui::Modifiers,
+    },
+    ReleasePointer,
     /// Real pointer clicks on a listed entry's row or tile (`double` = two clicks).
-    ClickEntry { name: String, double: bool },
+    ClickEntry {
+        name: String,
+        double: bool,
+    },
     /// A real click on the list area below the last row or tile.
     ClickEmpty,
     Scroll(f32),
@@ -389,7 +407,10 @@ impl Script {
         let _ = std::fs::remove_file(&result);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
-            Err(e) => fail(&result, format!("cannot read script {}: {e}", path.display())),
+            Err(e) => fail(
+                &result,
+                format!("cannot read script {}: {e}", path.display()),
+            ),
         };
         let sandbox_root = match resolve_sandbox_root(&path) {
             Ok(root) => root,
@@ -454,12 +475,8 @@ fn sandbox_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
     }
     // Compare against the canonical root: on Windows `canonicalize` yields `\\?\` paths
     // (and normalised case), so a raw root such as a tempdir would never prefix-match.
-    let root = std::fs::canonicalize(root).map_err(|error| {
-        format!(
-            "cannot resolve script sandbox {}: {error}",
-            root.display()
-        )
-    })?;
+    let root = std::fs::canonicalize(root)
+        .map_err(|error| format!("cannot resolve script sandbox {}: {error}", root.display()))?;
     let root = root.as_path();
     let candidate = if requested.is_absolute() {
         requested.to_path_buf()
@@ -602,7 +619,9 @@ pub(crate) fn sandboxed_entry(requested: &Path) -> Result<PathBuf, String> {
 /// Recycle Bin commands only run while the automated recycle sandbox is active, so a
 /// script can never reach the user's real Recycle Bin (checked when the step runs).
 fn script_command_allowed(command: Cmd) -> bool {
-    !format!("{command:?}").to_ascii_lowercase().contains("recycle")
+    !format!("{command:?}")
+        .to_ascii_lowercase()
+        .contains("recycle")
         || forge_win::recycle_sandbox_active()
 }
 
@@ -631,12 +650,7 @@ fn parse_script(text: &str, sandbox_root: &Path) -> Result<Vec<(usize, Step)>, S
     Ok(steps)
 }
 
-fn parse_step(
-    verb: &str,
-    rest: &str,
-    verbatim: &str,
-    sandbox_root: &Path,
-) -> Result<Step, String> {
+fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Result<Step, String> {
     let path = || {
         if rest.is_empty() {
             Err("expected a path".to_string())
@@ -701,13 +715,29 @@ fn parse_step(
             Step::Conflict { decision, all }
         }
         "wait-jobs" => {
-            let secs = if rest.is_empty() { 30 } else { number("seconds")? };
+            let secs = if rest.is_empty() {
+                30
+            } else {
+                number("seconds")?
+            };
             Step::WaitJobs(Duration::from_secs(secs))
         }
         "wait-frames" => Step::WaitFrames(number("a frame count")? as u32),
         "screenshot" => Step::Screenshot(screenshot_path(sandbox_root, rest)?),
         "assert-tabs" => Step::AssertTabs(number("a tab count")? as usize),
         "assert-selected" => Step::AssertSelected(number("a selection count")? as usize),
+        "assert-selection" => {
+            let names: Vec<String> = rest
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(String::from)
+                .collect();
+            if names.is_empty() {
+                return Err("expected at least one selected entry name".into());
+            }
+            Step::AssertSelection(names)
+        }
         "assert-path" => Step::AssertPath(path()?),
         "assert-exists" => Step::AssertExists(path()?),
         "assert-missing" => Step::AssertMissing(path()?),
@@ -723,6 +753,41 @@ fn parse_step(
         "text" => Step::Text(verbatim.to_string()),
         "pointer" => Step::Pointer(parse_pos(rest)?),
         "click" => Step::Click(parse_pos(rest)?),
+        "marquee" => {
+            let mut args = rest.split_whitespace();
+            let from = args
+                .next()
+                .ok_or("expected a start and end entry")?
+                .to_string();
+            let to = args
+                .next()
+                .ok_or("expected a start and end entry")?
+                .to_string();
+            let mut modifiers = egui::Modifiers::NONE;
+            match args.next() {
+                None => {}
+                Some("ctrl") => {
+                    modifiers.ctrl = true;
+                    modifiers.command = true;
+                }
+                Some("shift") => modifiers.shift = true,
+                Some(other) => return Err(format!("expected `ctrl` or `shift`, got `{other}`")),
+            }
+            if args.next().is_some() {
+                return Err("too many marquee arguments".into());
+            }
+            Step::Marquee {
+                from,
+                to,
+                modifiers,
+            }
+        }
+        "release-pointer" => {
+            if !rest.is_empty() {
+                return Err("release-pointer takes no arguments".into());
+            }
+            Step::ReleasePointer
+        }
         "click-entry" | "double-click-entry" => Step::ClickEntry {
             name: non_empty(rest)?,
             double: verb == "double-click-entry",
@@ -899,7 +964,10 @@ fn advance(app: &mut ZxrawApp, ctx: &egui::Context, script: &mut Script) -> Resu
             .get(script.next)
             .map(|(line, _)| format!(" (at line {line})"))
             .unwrap_or_default();
-        return Err(format!("script ran longer than {} s{at}", script.limit.as_secs()));
+        return Err(format!(
+            "script ran longer than {} s{at}",
+            script.limit.as_secs()
+        ));
     }
     // Let the first folder listing and session restore start before the first step.
     if script.warmup_frames < 5 {
@@ -967,6 +1035,7 @@ fn needs_listing(step: &Step) -> bool {
             | Step::Click(_)
             | Step::ClickEntry { .. }
             | Step::ClickEmpty
+            | Step::ReleasePointer
             | Step::Scroll(_)
             | Step::Dialog(_)
             | Step::WaitExists(..)
@@ -1028,7 +1097,12 @@ fn drawn_rect(ctx: &egui::Context, id: egui::Id) -> Option<egui::Rect> {
 
 /// `clicks` real primary-button clicks at `pos`, each press and release in its own frame,
 /// back to back so two clicks register as a double-click.
-fn pointer_clicks(app: &mut ZxrawApp, st: &mut StepState, pos: egui::Pos2, clicks: u32) -> Result<Flow, String> {
+fn pointer_clicks(
+    app: &mut ZxrawApp,
+    st: &mut StepState,
+    pos: egui::Pos2,
+    clicks: u32,
+) -> Result<Flow, String> {
     app.testhook.input.pointer = Some(pos);
     let pressed = st.frames.is_multiple_of(2);
     let mut events = Vec::new();
@@ -1051,6 +1125,88 @@ fn pointer_clicks(app: &mut ZxrawApp, st: &mut StepState, pos: egui::Pos2, click
     }
 }
 
+fn marquee_drag(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+    from: &str,
+    to: &str,
+    modifiers: egui::Modifiers,
+) -> Result<Flow, String> {
+    if st.data.is_none() {
+        let find_path = |name: &str| {
+            app.pane()
+                .entries
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                .map(|entry| entry.path.clone())
+                .ok_or_else(|| format!("`{name}` is not listed"))
+        };
+        let from_path = find_path(from)?;
+        let to_path = find_path(to)?;
+        let Some(from_rect) = drawn_rect(ctx, entry_rect_id(&from_path)) else {
+            return Ok(Flow::Wait(format!("`{from}` is not on screen")));
+        };
+        let Some(to_rect) = drawn_rect(ctx, entry_rect_id(&to_path)) else {
+            return Ok(Flow::Wait(format!("`{to}` is not on screen")));
+        };
+        let Some(view) = drawn_rect(ctx, view_rect_id()) else {
+            return Ok(Flow::Wait("the file list is not drawn yet".into()));
+        };
+        let start = egui::pos2(from_rect.left() + 8.0, view.bottom() - 6.0);
+        let covered = app.pane().entries.iter().any(|entry| {
+            drawn_rect(ctx, entry_rect_id(&entry.path)).is_some_and(|rect| rect.contains(start))
+        });
+        if covered {
+            return Err("the list has no empty area below its rows or tiles".into());
+        }
+        st.data = Some(Box::new((start, to_rect.center(), modifiers)));
+    }
+    let (start, end, modifiers) = *st
+        .data
+        .as_ref()
+        .unwrap()
+        .downcast_ref::<(egui::Pos2, egui::Pos2, egui::Modifiers)>()
+        .unwrap();
+
+    match st.frames {
+        0 => {
+            app.testhook.input.pointer = Some(start);
+            let mut events = vec![egui::Event::PointerMoved(start)];
+            if modifiers != egui::Modifiers::NONE {
+                events.push(egui::Event::ModifiersChanged(modifiers));
+                app.testhook.input.modifiers = modifiers;
+            }
+            events.push(egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers,
+            });
+            match inject(app, st, &events) {
+                Flow::Done => {
+                    st.frames = 1;
+                    st.phase = 0;
+                    Ok(Flow::Wait("marquee button pressed".into()))
+                }
+                other => Ok(other),
+            }
+        }
+        1 => {
+            app.testhook.input.pointer = Some(end);
+            match inject(app, st, &[egui::Event::PointerMoved(end)]) {
+                Flow::Done => {
+                    st.frames = 2;
+                    st.phase = 0;
+                    Ok(Flow::Done)
+                }
+                other => Ok(other),
+            }
+        }
+        _ => Ok(Flow::Done),
+    }
+}
+
 pub(crate) fn inject(app: &mut ZxrawApp, st: &mut StepState, events: &[egui::Event]) -> Flow {
     let input = &mut app.testhook.input;
     if st.phase == 0 {
@@ -1067,7 +1223,10 @@ pub(crate) fn inject(app: &mut ZxrawApp, st: &mut StepState, events: &[egui::Eve
 }
 
 fn listed(app: &ZxrawApp, name: &str) -> bool {
-    app.pane().entries.iter().any(|e| e.name.eq_ignore_ascii_case(name))
+    app.pane()
+        .entries
+        .iter()
+        .any(|e| e.name.eq_ignore_ascii_case(name))
 }
 
 fn any_loading(app: &ZxrawApp) -> bool {
@@ -1166,7 +1325,9 @@ fn exec(
                 });
                 Ok(Flow::Done)
             }
-            None => Ok(Flow::Wait("no file conflict is waiting for an answer".into())),
+            None => Ok(Flow::Wait(
+                "no file conflict is waiting for an answer".into(),
+            )),
         },
         Step::WaitJobs(_) => match app.ops.jobs.running_count() {
             0 => Ok(Flow::Done),
@@ -1215,6 +1376,23 @@ fn exec(
                 Ok(Flow::Done)
             } else {
                 Err(format!("expected {expected} selected, found {found}"))
+            }
+        }
+        Step::AssertSelection(expected) => {
+            let mut expected: Vec<String> =
+                expected.iter().map(|name| name.to_lowercase()).collect();
+            expected.sort();
+            let mut found: Vec<String> = app
+                .pane()
+                .selected_entries()
+                .iter()
+                .map(|entry| entry.name.to_lowercase())
+                .collect();
+            found.sort();
+            if found == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("expected selection {expected:?}, found {found:?}"))
             }
         }
         Step::AssertTabs(expected) => {
@@ -1307,7 +1485,12 @@ fn exec(
                 };
                 st.data = Some(Box::new(rect.center()));
             }
-            let pos = *st.data.as_ref().unwrap().downcast_ref::<egui::Pos2>().unwrap();
+            let pos = *st
+                .data
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<egui::Pos2>()
+                .unwrap();
             pointer_clicks(app, st, pos, if *double { 2 } else { 1 })
         }
         Step::ClickEmpty => {
@@ -1326,8 +1509,34 @@ fn exec(
                 }
                 st.data = Some(Box::new(pos));
             }
-            let pos = *st.data.as_ref().unwrap().downcast_ref::<egui::Pos2>().unwrap();
+            let pos = *st
+                .data
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<egui::Pos2>()
+                .unwrap();
             pointer_clicks(app, st, pos, 1)
+        }
+        Step::Marquee {
+            from,
+            to,
+            modifiers,
+        } => marquee_drag(app, ctx, st, from, to, *modifiers),
+        Step::ReleasePointer => {
+            let Some(pos) = app.testhook.input.pointer else {
+                return Err("there is no pointer position to release".into());
+            };
+            let mut events = vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            if app.testhook.input.modifiers != egui::Modifiers::NONE {
+                events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+                app.testhook.input.modifiers = egui::Modifiers::NONE;
+            }
+            Ok(inject(app, st, &events))
         }
         Step::Scroll(dy) => {
             let mut events = Vec::new();
@@ -1379,12 +1588,18 @@ fn exec(
             if listed(app, name) {
                 Ok(Flow::Done)
             } else {
-                Err(format!("`{name}` is not listed in {}", app.pane().path.display()))
+                Err(format!(
+                    "`{name}` is not listed in {}",
+                    app.pane().path.display()
+                ))
             }
         }
         Step::AssertNoEntry(name) => {
             if listed(app, name) {
-                Err(format!("`{name}` is still listed in {}", app.pane().path.display()))
+                Err(format!(
+                    "`{name}` is still listed in {}",
+                    app.pane().path.display()
+                ))
             } else {
                 Ok(Flow::Done)
             }
@@ -1400,7 +1615,12 @@ fn exec(
             Flow::Done
         }),
         Step::AssertToast(text) => {
-            if app.testhook.toast_log.iter().any(|(t, _)| t.contains(text.as_str())) {
+            if app
+                .testhook
+                .toast_log
+                .iter()
+                .any(|(t, _)| t.contains(text.as_str()))
+            {
                 Ok(Flow::Done)
             } else {
                 Err(format!(
@@ -1469,7 +1689,10 @@ fn select_names(pane: &mut Pane, names: &[String]) -> Result<(), String> {
             .iter()
             .position(|&idx| pane.entries[idx].name.eq_ignore_ascii_case(name));
         let Some(visible) = visible else {
-            return Err(format!("no entry named `{name}` in {}", pane.path.display()));
+            return Err(format!(
+                "no entry named `{name}` in {}",
+                pane.path.display()
+            ));
         };
         pane.click(visible, i > 0, false);
     }
@@ -1490,7 +1713,8 @@ fn save_png(img: &egui::ColorImage, path: &Path) -> Result<(), String> {
     let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
     let buf = image::RgbaImage::from_raw(w as u32, h as u32, bytes)
         .ok_or("screenshot buffer size mismatch")?;
-    buf.save(path).map_err(|e| format!("screenshot save failed: {e}"))
+    buf.save(path)
+        .map_err(|e| format!("screenshot save failed: {e}"))
 }
 
 fn write_result(path: &Path, text: &str) {
@@ -1527,22 +1751,48 @@ mod tests {
         assert!(one("limit 0").is_err() && one("limit 601").is_err());
         assert!(matches!(one("sleep 250"), Ok(Step::Sleep(d)) if d.as_millis() == 250));
         assert!(matches!(one("dialog cancel"), Ok(Step::Dialog(None))));
-        assert!(matches!(one(r"dialog a b\c"), Ok(Step::Dialog(Some(p))) if p == in_temp(r"a b\c")));
-        assert!(matches!(one(r"wait-exists x y | 5"), Ok(Step::WaitExists(p, d)) if p == in_temp("x y") && d.as_secs() == 5));
-        assert!(one(r"dialog ..\escape").is_err(), "dialog answers stay inside the sandbox");
-        assert!(matches!(one("wait-entry a.txt"), Ok(Step::WaitEntry(n, d)) if n == "a.txt" && d.as_secs() == 30));
+        assert!(
+            matches!(one(r"dialog a b\c"), Ok(Step::Dialog(Some(p))) if p == in_temp(r"a b\c"))
+        );
+        assert!(
+            matches!(one(r"wait-exists x y | 5"), Ok(Step::WaitExists(p, d)) if p == in_temp("x y") && d.as_secs() == 5)
+        );
+        assert!(
+            one(r"dialog ..\escape").is_err(),
+            "dialog answers stay inside the sandbox"
+        );
+        assert!(
+            matches!(one("wait-entry a.txt"), Ok(Step::WaitEntry(n, d)) if n == "a.txt" && d.as_secs() == 30)
+        );
         assert!(matches!(one("assert-same a | b"), Ok(Step::AssertSame(..))));
         assert!(one("assert-same a").is_err());
-        assert!(matches!(one("assert-contains r.txt | 2 files"), Ok(Step::AssertContains(_, t)) if t == "2 files"));
+        assert!(
+            matches!(one("assert-contains r.txt | 2 files"), Ok(Step::AssertContains(_, t)) if t == "2 files")
+        );
         assert!(matches!(one("click 10 20.5"), Ok(Step::Click(p)) if p == egui::pos2(10.0, 20.5)));
         assert!(one("click 10").is_err());
+        assert!(
+            matches!(one("marquee 01.txt 02.txt ctrl"), Ok(Step::Marquee { from, to, modifiers }) if from == "01.txt" && to == "02.txt" && modifiers.ctrl && modifiers.command)
+        );
+        assert!(
+            matches!(one("marquee 01.txt 02.txt shift"), Ok(Step::Marquee { modifiers, .. }) if modifiers.shift)
+        );
+        assert!(one("marquee 01.txt 02.txt ctrl shift").is_err());
+        assert!(matches!(one("release-pointer"), Ok(Step::ReleasePointer)));
+        assert!(
+            matches!(one("assert-selection a.txt, b.txt"), Ok(Step::AssertSelection(names)) if names == ["a.txt", "b.txt"])
+        );
         assert!(matches!(one("scroll -120"), Ok(Step::Scroll(dy)) if dy == -120.0));
         assert!(matches!(one("text  two spaces"), Ok(Step::Text(t)) if t == " two spaces"));
         assert!(matches!(
             one("ui ingest start fast"),
             Ok(Step::Ui { area: Area::Ingest, verb, args }) if verb == "start" && args == "fast"
         ));
-        assert!(one("ui nowhere start").unwrap_err().contains("unknown area"));
+        assert!(
+            one("ui nowhere start")
+                .unwrap_err()
+                .contains("unknown area")
+        );
         assert!(one("ui viewer").is_err());
     }
 
@@ -1552,13 +1802,26 @@ mod tests {
             panic!("not a key step");
         };
         assert_eq!(events.len(), 2);
-        let egui::Event::Key { key, pressed, modifiers, .. } = &events[0] else {
+        let egui::Event::Key {
+            key,
+            pressed,
+            modifiers,
+            ..
+        } = &events[0]
+        else {
             panic!("not a key event");
         };
         assert_eq!(*key, egui::Key::F);
-        assert!(*pressed && modifiers.ctrl && modifiers.command && modifiers.shift && !modifiers.alt);
-        assert!(matches!(&events[1], egui::Event::Key { pressed: false, .. }));
-        assert!(matches!(one("key 3"), Ok(Step::Key(e)) if matches!(e[0], egui::Event::Key { key: egui::Key::Num3, .. })));
+        assert!(
+            *pressed && modifiers.ctrl && modifiers.command && modifiers.shift && !modifiers.alt
+        );
+        assert!(matches!(
+            &events[1],
+            egui::Event::Key { pressed: false, .. }
+        ));
+        assert!(
+            matches!(one("key 3"), Ok(Step::Key(e)) if matches!(e[0], egui::Event::Key { key: egui::Key::Num3, .. }))
+        );
         assert!(one("key hyper+X").unwrap_err().contains("modifier"));
         assert!(one("key NotAKey").unwrap_err().contains("unknown key"));
     }
@@ -1611,7 +1874,11 @@ mod tests {
         assert_eq!(p(r"\\?\Volume{abc}\x"), PathBuf::from(r"\\?\Volume{abc}\x"));
         let sandbox = tempfile::tempdir().unwrap();
         let resolved = sandbox_path(sandbox.path(), Path::new("sub")).unwrap();
-        assert!(!resolved.to_string_lossy().starts_with(r"\\?\"), "{}", resolved.display());
+        assert!(
+            !resolved.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            resolved.display()
+        );
     }
 
     #[cfg(windows)]
@@ -1653,7 +1920,8 @@ mod tests {
 
     #[test]
     fn errors_name_the_line() {
-        let err = parse_script("# comment\n\nnavigate .\nfrobnicate", &std::env::temp_dir()).unwrap_err();
+        let err =
+            parse_script("# comment\n\nnavigate .\nfrobnicate", &std::env::temp_dir()).unwrap_err();
         assert!(err.starts_with("line 4"), "{err}");
     }
 }
