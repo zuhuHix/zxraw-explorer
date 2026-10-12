@@ -10,6 +10,7 @@
 //! * [`files`] — attributes, hard-link count, volume serial, removable check.
 //! * [`restart`] — which processes hold a file open (Restart Manager).
 //! * [`process`] — launching external tools without a shell.
+//! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download).
 
 use std::path::PathBuf;
 
@@ -20,6 +21,7 @@ mod integration;
 pub mod dragout;
 pub mod drives;
 pub mod files;
+pub mod http;
 pub mod process;
 pub mod restart;
 pub mod shell;

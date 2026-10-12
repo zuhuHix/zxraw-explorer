@@ -43,6 +43,8 @@ impl Prompt {
 pub enum ConfirmKind {
     DeletePermanently(Vec<PathBuf>),
     Recycle(Vec<PathBuf>),
+    /// Download and install FFmpeg (see `ffmpeg_setup`).
+    DownloadFfmpeg,
 }
 
 pub struct Confirm {

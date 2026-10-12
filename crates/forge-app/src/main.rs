@@ -11,6 +11,7 @@ mod dialogs;
 mod dragout;
 mod export_assoc;
 mod extra_tools_ui;
+mod ffmpeg_setup;
 mod fonts;
 mod gps_ui;
 mod ingest_ui;

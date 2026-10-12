@@ -28,6 +28,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | bit-set | 0.10.0 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-set | Permissive |
 | bit-vec | 0.9.1 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-vec | Permissive |
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | https://github.com/BLAKE3-team/BLAKE3 | Permissive |
+| block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | https://github.com/fitzgen/bumpalo | Permissive |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck | Permissive |
 | bytemuck_derive | 1.12.1 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck | Permissive |
@@ -44,13 +45,16 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | color_quant | 1.1.0 | MIT | https://github.com/image-rs/color_quant.git | Permissive |
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git | Permissive |
 | constant_time_eq | 0.4.2 | CC0-1.0 OR MIT-0 OR Apache-2.0 | https://github.com/cesarb/constant_time_eq | Permissive |
+| cpufeatures | 0.2.17 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | cpufeatures | 0.3.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast | Permissive |
 | crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam | Permissive |
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam | Permissive |
+| crypto-common | 0.1.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
 | ctrlc | 3.5.2 | MIT/Apache-2.0 | https://github.com/Detegr/rust-ctrlc.git | Permissive |
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/cursor-icon | Permissive |
 | deranged | 0.5.8 | MIT OR Apache-2.0 | https://github.com/jhpratt/deranged | Permissive |
+| digest | 0.10.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
 | directories | 6.0.0 | MIT OR Apache-2.0 | https://github.com/soc/directories-rs | Permissive |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 | https://github.com/dirs-dev/dirs-sys-rs | Permissive |
 | document-features | 0.2.12 | MIT OR Apache-2.0 | https://github.com/slint-ui/document-features | Permissive |
@@ -86,6 +90,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | forge-jobs | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | forge-media | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | forge-win | 0.1.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | gif | 0.14.2 | MIT OR Apache-2.0 | https://github.com/image-rs/image-gif | Permissive |
 | glifo | 0.2.0 | Apache-2.0 OR MIT | https://github.com/linebender/vello | Permissive |
@@ -173,6 +178,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_json | 1.0.152 | MIT OR Apache-2.0 | https://github.com/serde-rs/json | Permissive |
+| sha2 | 0.10.9 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | sharded-slab | 0.1.7 | MIT | https://github.com/hawkw/sharded-slab | Permissive |
 | simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 | Permissive |
 | skrifa | 0.44.0 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
@@ -202,6 +208,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | typed-path | 0.12.3 | MIT OR Apache-2.0 | https://github.com/chipsenkbeil/typed-path | Permissive |
 | typeid | 1.0.3 | MIT OR Apache-2.0 | https://github.com/dtolnay/typeid | Permissive |
 | type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
+| typenum | 1.20.1 | MIT OR Apache-2.0 | https://github.com/paholg/typenum | Permissive |
 | unicase | 2.10.0 | MIT OR Apache-2.0 | https://github.com/seanmonstar/unicase | Permissive |
 | unicode-general-category | 1.1.0 | Apache-2.0 | https://github.com/yeslogic/unicode-general-category | Permissive |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident | Permissive |

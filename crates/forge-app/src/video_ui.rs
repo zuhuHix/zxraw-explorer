@@ -822,7 +822,12 @@ impl VideoUi {
         self.frame_cache.get(&nearest).cloned()
     }
 
-    fn draw(&mut self, ui: &mut Ui, entry: &FileEntry) -> Vec<VideoAction> {
+    fn draw(
+        &mut self,
+        ui: &mut Ui,
+        entry: &FileEntry,
+        download: crate::ffmpeg_setup::Status,
+    ) -> Vec<VideoAction> {
         let media = self
             .selection
             .as_ref()
@@ -862,6 +867,9 @@ impl VideoUi {
                 ui.label(
                     "Enable FFmpeg under Settings › Video by choosing its folder or using PATH.",
                 );
+                crate::ffmpeg_setup::offer(ui, download, || {
+                    actions.push(VideoAction::DownloadFfmpeg)
+                });
             });
         }
 
@@ -1155,6 +1163,7 @@ enum VideoAction {
     SelectRelated(PathBuf),
     LocateProxies,
     CancelProxyScan,
+    DownloadFfmpeg,
 }
 
 /// Extra preview-panel content for a video file, drawn below generic information/metadata.
@@ -1170,7 +1179,8 @@ pub fn preview(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &FileEntry) {
         app.ops.video_ui.request_relation_scan(entry, ui.ctx());
     }
 
-    let actions = app.ops.video_ui.draw(ui, entry);
+    let download = app.ops.ffmpeg_setup.status();
+    let actions = app.ops.video_ui.draw(ui, entry, download);
     for action in actions {
         match action {
             VideoAction::OpenPlayer(path) => {
@@ -1187,6 +1197,7 @@ pub fn preview(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &FileEntry) {
             VideoAction::SelectRelated(path) => app.navigate(path),
             VideoAction::LocateProxies => locate_proxies(app),
             VideoAction::CancelProxyScan => app.ops.video_ui.cancel_proxy_scan(),
+            VideoAction::DownloadFfmpeg => crate::ffmpeg_setup::confirm(app),
         }
     }
 }
@@ -1368,6 +1379,8 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     let mut open = true;
     let mut start = false;
     let mut destination_changed = false;
+    let download = app.ops.ffmpeg_setup.status();
+    let mut download_clicked = false;
     let ff = FfTools::discover_with(app.settings.ffmpeg_dir.as_deref());
     if let Some(exe) = ff.ffmpeg.as_deref() {
         ensure_encoder_probe(exe, ctx);
@@ -1447,6 +1460,7 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                         missing.push("ffprobe");
                     }
                     ui.label(format!("Missing {}. Enable the tools under Settings › Video.", missing.join(" and ")));
+                    crate::ffmpeg_setup::offer(ui, download, || download_clicked = true);
                 });
             }
 
@@ -1563,6 +1577,9 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
         start_proxy_job(app, dialog);
     } else if open {
         app.ops.video_ui.proxy_dialog = Some(dialog);
+    }
+    if download_clicked {
+        crate::ffmpeg_setup::confirm(app);
     }
 }
 

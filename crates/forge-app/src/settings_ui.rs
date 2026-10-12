@@ -128,6 +128,7 @@ enum SettingsMessage {
 enum SettingsIntent {
     PickFfmpegFolder,
     UseFfmpegPath,
+    DownloadFfmpeg,
     PickLibraryRoot,
     RemoveLibraryRoot(i64),
     AddExclusion(ExclusionKind, String),
@@ -352,6 +353,7 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
         .and_then(|db| db.path())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| app.paths.data.join("forge.db"));
+    let ffmpeg_download = app.ops.ffmpeg_setup.status();
 
     {
         let (settings, state) = (&mut app.settings, &mut app.ops.settings_ui);
@@ -389,7 +391,7 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                         file_operations_page(ui, settings)
                                     }
                                     SettingsPage::Video => {
-                                        video_page(ui, settings, state, &mut intents)
+                                        video_page(ui, settings, state, ffmpeg_download, &mut intents)
                                     }
                                     SettingsPage::MediaLinks => media_links_page(ui, settings),
                                     SettingsPage::Library => library_page(
@@ -554,6 +556,7 @@ fn video_page(
     ui: &mut egui::Ui,
     settings: &mut Settings,
     state: &SettingsUi,
+    download: crate::ffmpeg_setup::Status,
     intents: &mut Vec<SettingsIntent>,
 ) {
     page_heading(
@@ -600,6 +603,12 @@ fn video_page(
             }
         }
     });
+    if download.running || matches!(state.probe_status, ProbeStatus::Missing) {
+        ui.add_space(8.0);
+        crate::ffmpeg_setup::offer(ui, download, || {
+            intents.push(SettingsIntent::DownloadFfmpeg)
+        });
+    }
 }
 
 pub fn apply_export_rule(
@@ -1254,20 +1263,11 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
                 if let Some(path) = crate::dialogs::pick_folder(
                     rfd::FileDialog::new().set_title("Choose FFmpeg folder"),
                 ) {
-                    app.settings.ffmpeg_dir = Some(path);
-                    rebuild_thumb_manager(app);
-                    start_probe_check(
-                        &mut app.ops.settings_ui,
-                        app.settings.ffmpeg_dir.clone(),
-                        ctx,
-                    );
+                    use_ffmpeg_dir(app, Some(path));
                 }
             }
-            SettingsIntent::UseFfmpegPath => {
-                app.settings.ffmpeg_dir = None;
-                rebuild_thumb_manager(app);
-                start_probe_check(&mut app.ops.settings_ui, None, ctx);
-            }
+            SettingsIntent::UseFfmpegPath => use_ffmpeg_dir(app, None),
+            SettingsIntent::DownloadFfmpeg => crate::ffmpeg_setup::confirm(app),
             SettingsIntent::PickLibraryRoot => {
                 if let Some(path) = crate::dialogs::pick_folder(
                     rfd::FileDialog::new().set_title("Add indexed folder"),
@@ -1331,6 +1331,19 @@ fn add_library_root(app: &mut ZxrawApp, path: PathBuf, ctx: &egui::Context) {
             .map(|_| ())
             .map_err(|error| error.to_string())
     });
+}
+
+/// Points Settings › Video at `dir` (`None` = search PATH), restarts the thumbnail
+/// pipeline with it and re-checks for ffprobe.
+pub fn use_ffmpeg_dir(app: &mut ZxrawApp, dir: Option<PathBuf>) {
+    app.settings.ffmpeg_dir = dir;
+    rebuild_thumb_manager(app);
+    let ctx = app.ops.ctx.clone();
+    start_probe_check(
+        &mut app.ops.settings_ui,
+        app.settings.ffmpeg_dir.clone(),
+        &ctx,
+    );
 }
 
 fn rebuild_thumb_manager(app: &mut ZxrawApp) {

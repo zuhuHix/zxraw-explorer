@@ -47,6 +47,8 @@ pub enum Event {
         clipboard_generation: Option<u64>,
         expected_sequence: Option<u32>,
     },
+    /// "Download FFmpeg" finished; the folder holds ffmpeg.exe and ffprobe.exe.
+    FfmpegInstalled(PathBuf),
 }
 
 /// Operations that can genuinely be reverted. Copies, overwrites and permanent deletes are
@@ -127,6 +129,7 @@ pub struct Actions {
     pub video_ui: crate::video_ui::VideoUi,
     pub extra_tools: crate::extra_tools_ui::ExtraToolsUi,
     pub tags_ui: crate::tags_ui::TagsUi,
+    pub ffmpeg_setup: crate::ffmpeg_setup::FfmpegSetup,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -176,6 +179,7 @@ impl Actions {
             video_ui: Default::default(),
             extra_tools: Default::default(),
             tags_ui: Default::default(),
+            ffmpeg_setup: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -444,6 +448,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         }
         Cmd::Ingest => app.ops.ingest.open = true,
         Cmd::Settings => app.ops.settings_ui.open = true,
+        Cmd::DownloadFfmpeg => crate::ffmpeg_setup::confirm(app),
         Cmd::OpenIn => crate::settings_ui::open_in(app),
         Cmd::Collections => app.ops.collections_ui.open = true,
         Cmd::AddToCollection => crate::collections_ui::add_selection(app),
@@ -706,6 +711,12 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                     }
                 }
             }
+            Event::FfmpegInstalled(dir) => {
+                crate::settings_ui::use_ffmpeg_dir(app, Some(dir));
+                app.notices.video_tools_changed();
+                app.save_all();
+                app.toast("FFmpeg installed: video thumbnails and clip metadata are on");
+            }
             Event::Undo(u) => {
                 app.ops.undo.push(u);
                 if app.ops.undo.len() > 50 {
@@ -870,6 +881,7 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
             match c.kind {
                 ConfirmKind::Recycle(t) => recycle(app, t),
                 ConfirmKind::DeletePermanently(t) => delete_permanently(app, t),
+                ConfirmKind::DownloadFfmpeg => crate::ffmpeg_setup::start(app),
             }
             None
         }

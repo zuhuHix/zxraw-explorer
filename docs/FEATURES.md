@@ -148,6 +148,15 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `proxy_temp_collision_and_cleanup_never_delete_a_foreign_file`), GoPro chapter and camera
   sequence grouping, related-media lookup, size and time estimates, proxy argument quoting, progress
   parsing, and timecode offsets. Proxy generation with a real FFmpeg has not been run.
+* ✅ Download FFmpeg — `forge-app/src/ffmpeg_setup.rs`, `forge-win/src/http.rs`. Offered in
+  Settings › Video, the welcome window, the video preview panel, the proxy dialog and the command
+  palette. Downloads a pinned build (Gyan Doshi's 9.0.2 essentials build on GitHub) over WinHTTP,
+  checks its exact size and SHA-256, installs only `ffmpeg.exe`, `ffprobe.exe` and the licence into
+  `<data>	oolsfmpeg-<version>`, and points Settings › Video at it. Unit tests cover the install,
+  checksum and size mismatches, a zip without the tools, cancellation and cleanup; e2e scenarios
+  `download_ffmpeg_installs_the_tools_and_points_settings_at_them` and
+  `download_ffmpeg_with_a_bad_checksum_installs_nothing_and_says_why` drive it through the UI
+  against a local server.
 
 ## Ingest
 
@@ -277,6 +286,7 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   the Windows target and flags three for licence review. The notices those licences require are not yet
   shipped (see [LIMITATIONS.md](LIMITATIONS.md)).
 * 🟡 Local-first, no-telemetry direction is stated in `README.md`; no network-monitoring audit has been performed.
+  The only network code is the user-confirmed FFmpeg download (`forge-win/src/http.rs`).
 
 ## Recently hardened
 

@@ -90,6 +90,7 @@ pub enum Cmd {
     LocateProxies,
     SelectOriginals,
     SelectExports,
+    DownloadFfmpeg,
 }
 
 impl Cmd {
@@ -179,6 +180,7 @@ impl Cmd {
         Cmd::LocateProxies,
         Cmd::SelectOriginals,
         Cmd::SelectExports,
+        Cmd::DownloadFfmpeg,
     ];
 
     pub fn label(self) -> &'static str {
@@ -269,6 +271,7 @@ impl Cmd {
             LocateProxies => "Locate video proxies…",
             SelectOriginals => "Select originals of exports",
             SelectExports => "Select exports of originals",
+            DownloadFfmpeg => "Download FFmpeg (video tools)…",
         }
     }
 

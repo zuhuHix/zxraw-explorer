@@ -31,6 +31,8 @@ egui_extras.workspace = true
 rfd.workspace = true
 image = { workspace = true, features = ["png"] }
 regex.workspace = true
+sha2.workspace = true
+zip.workspace = true
 forge-core.workspace = true
 forge-jobs.workspace = true
 forge-db.workspace = true
