@@ -18,7 +18,7 @@ const NOT_VIEWABLE: &[&str] = &["psd", "jxl", "ico", "crw", "x3f", "mrw"];
 
 /// How long a status check stays fresh while it is on screen. The user changes defaults in
 /// Settings, outside the app, so the page keeps re-checking.
-const RECHECK: Duration = Duration::from_secs(2);
+const RECHECK: Duration = Duration::from_secs(1);
 
 /// The photo types offered, all of which the built-in viewer opens.
 pub fn file_types() -> Vec<forge_win::FileType> {
@@ -96,7 +96,8 @@ pub struct State {
 }
 
 impl State {
-    /// Latest status, re-checked off the UI thread while it is being shown.
+    /// Latest status, re-checked off the UI thread while it is being shown. The short poll keeps
+    /// this current while Windows Settings is in front and after the user returns to the app.
     fn current(&mut self, ctx: &egui::Context) -> Option<&Status> {
         if let Some(rx) = &self.rx
             && let Ok(status) = rx.try_recv()
@@ -145,12 +146,10 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
     };
     let total = status.types.len();
     if status.all_ours() {
-        ui.label(format!(
-            "ZXraw Explorer opens all {total} photo and RAW types."
-        ));
+        ui.label("ZXraw Explorer is your default photo app.");
     } else if status.registered {
         ui.label(format!(
-            "ZXraw Explorer opens {} of {total} photo and RAW types. To finish, Windows asks you to confirm: on ZXraw Explorer's page in Settings, click \"Set default\" at the top.",
+            "ZXraw Explorer opens {} of {total} photo and RAW types. To finish, on its page in Windows Settings, click the single \"Set default\" button at the top to set every registered photo and RAW type at once.",
             status.ours()
         ));
     } else if let Some(app) = status.jpeg_app() {
@@ -160,7 +159,7 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
         if !status.registered {
             if ui
                 .button("Make ZXraw Explorer the default photo viewer…")
-                .on_hover_text("Registers JPEG, PNG, TIFF, HEIC, WebP and RAW files for you only, then opens Windows Settings to confirm.")
+                .on_hover_text("Registers the photo and RAW types for you, then opens ZXraw Explorer's Windows Settings page. Click its single \"Set default\" button to set them all at once.")
                 .clicked()
             {
                 *action = Some(Action::MakeDefault);
@@ -242,7 +241,9 @@ pub fn run(app: &mut ZxrawApp, action: Action) {
 
 fn open_windows_settings(app: &mut ZxrawApp) {
     match forge_win::open_default_apps_settings() {
-        Ok(()) => app.toast("In Settings, click \"Set default\" to finish"),
+        Ok(()) => app.toast(
+            "In Windows Settings, click the single \"Set default\" button at the top to set all photo and RAW types",
+        ),
         Err(error) => app.toast_err(format!(
             "Could not open Windows Settings ({error}). Open Settings > Apps > Default apps > ZXraw Explorer."
         )),

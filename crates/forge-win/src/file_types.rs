@@ -21,7 +21,7 @@ use crate::integration::{registry, shell_command};
 use crate::{Result, WinError};
 
 /// The name shown in Settings > Default apps (and the `RegisteredApplications` value name).
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const APP_NAME: &str = "ZXraw Explorer";
 #[cfg(windows)]
 const APP_DESCRIPTION: &str = "A fast file manager and viewer for photos, RAW files and video.";
@@ -117,9 +117,15 @@ pub fn default_app(extension: &str) -> Option<DefaultApp> {
         use windows::Win32::UI::Shell::{ASSOCSTR_FRIENDLYAPPNAME, ASSOCSTR_PROGID};
 
         let _com = crate::shell::com::ComGuard::apartment_threaded().ok()?;
+        let extension = checked_extension(extension).ok()?;
         let assoc = format!(".{extension}");
-        let name = assoc_query(&assoc, ASSOCSTR_FRIENDLYAPPNAME)?;
-        let prog_id = assoc_query(&assoc, ASSOCSTR_PROGID).unwrap_or_default();
+        let prog_id = current_prog_id(
+            user_choice_prog_id(&extension),
+            assoc_query(&assoc, ASSOCSTR_PROGID),
+        )
+        .unwrap_or_default();
+        let name = assoc_query(&assoc, ASSOCSTR_FRIENDLYAPPNAME)
+            .or_else(|| is_own_prog_id(&prog_id).then(|| APP_NAME.to_string()))?;
         Some(DefaultApp {
             name,
             is_zxraw: is_own_prog_id(&prog_id),
@@ -132,22 +138,44 @@ pub fn default_app(extension: &str) -> Option<DefaultApp> {
     }
 }
 
-/// Opens Settings > Default apps, on ZXraw Explorer's own page where Windows supports that
-/// (Windows 11); there the user confirms with "Set default".
+/// Opens Settings > Default apps on ZXraw Explorer's own page; there the user confirms with
+/// "Set default". Returns launch errors instead of silently opening the generic type list.
 pub fn open_default_apps_settings() -> Result<()> {
     #[cfg(windows)]
     {
-        let app_page = format!(
-            "ms-settings:defaultapps?registeredAppUser={}",
-            APP_NAME.replace(' ', "%20")
-        );
-        crate::shell::open_default(Path::new(&app_page))
-            .or_else(|_| crate::shell::open_default(Path::new("ms-settings:defaultapps")))
+        crate::shell::open_default(Path::new(&default_apps_settings_uri(APP_NAME)))
     }
     #[cfg(not(windows))]
     {
         Err(WinError::Unsupported)
     }
+}
+
+#[cfg(any(windows, test))]
+fn default_apps_settings_uri(registered_app_name: &str) -> String {
+    format!(
+        "ms-settings:defaultapps?registeredAppUser={}",
+        escape_uri_component(registered_app_name)
+    )
+}
+
+#[cfg(any(windows, test))]
+fn escape_uri_component(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            escaped.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(escaped, "%{byte:02X}").expect("writing to a String cannot fail");
+        }
+    }
+    escaped
+}
+
+#[cfg(any(windows, test))]
+fn current_prog_id(user_choice: Option<String>, association: Option<String>) -> Option<String> {
+    user_choice.or(association)
 }
 
 fn prog_id(extension: &str) -> String {
@@ -176,12 +204,63 @@ fn checked_extension(extension: &str) -> Result<String> {
     }
 }
 
+#[cfg(windows)]
+fn user_choice_key(extension: &str) -> Result<String> {
+    let extension = checked_extension(extension)?;
+    Ok(format!(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.{extension}\\UserChoice"
+    ))
+}
+
+#[cfg(windows)]
+fn user_choice_prog_id(extension: &str) -> Option<String> {
+    let key = user_choice_key(extension).ok()?;
+    registry::string_value(&key, Some("ProgId"))
+        .ok()
+        .flatten()
+        .filter(|prog_id| !prog_id.is_empty())
+}
+
 /// Registry locations, relative to `HKCU`. Tests use an isolated root.
 #[cfg(windows)]
 struct Layout {
     classes: String,
     app: String,
     registered_apps: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryValue {
+    key: String,
+    name: Option<String>,
+    value: Vec<u16>,
+}
+
+#[cfg(windows)]
+impl RegistryValue {
+    fn string(key: String, name: Option<&str>, value: &str) -> Self {
+        Self {
+            key,
+            name: name.map(str::to_string),
+            value: value.encode_utf16().chain(std::iter::once(0)).collect(),
+        }
+    }
+
+    fn wide(key: String, name: Option<&str>, value: &[u16]) -> Self {
+        Self {
+            key,
+            name: name.map(str::to_string),
+            value: value.to_vec(),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistrationPlan {
+    extensions: Vec<String>,
+    values: Vec<RegistryValue>,
 }
 
 #[cfg(windows)]
@@ -237,32 +316,91 @@ fn icon_location(exe: &Path) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn register_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<()> {
-    let command = shell_command(exe, "%1")?;
-    let icon = icon_location(exe);
+fn registration_plan(
+    layout: &Layout,
+    types: &[FileType],
+    command: &[u16],
+    icon: &[u16],
+) -> Result<RegistrationPlan> {
     let wanted = types
         .iter()
         .map(|file_type| checked_extension(&file_type.extension))
         .collect::<Result<Vec<_>>>()?;
+    let capabilities = layout.capabilities();
+    let associations = layout.associations();
+    let mut values = vec![
+        RegistryValue::string(capabilities.clone(), Some("ApplicationName"), APP_NAME),
+        RegistryValue::string(
+            capabilities.clone(),
+            Some("ApplicationDescription"),
+            APP_DESCRIPTION,
+        ),
+        RegistryValue::wide(capabilities, Some("ApplicationIcon"), icon),
+    ];
+    for (extension, file_type) in wanted.iter().zip(types) {
+        let prog_id = prog_id(extension);
+        let prog_id_key = layout.prog_id_key(extension);
+        values.extend([
+            RegistryValue::string(prog_id_key.clone(), None, &file_type.description),
+            RegistryValue::wide(format!("{prog_id_key}\\DefaultIcon"), None, icon),
+            RegistryValue::wide(
+                format!("{prog_id_key}\\shell\\open\\command"),
+                None,
+                command,
+            ),
+            RegistryValue::string(
+                format!("{}\\OpenWithProgids", layout.extension_key(extension)),
+                Some(&prog_id),
+                "",
+            ),
+            RegistryValue::string(
+                associations.clone(),
+                Some(&format!(".{extension}")),
+                &prog_id,
+            ),
+        ]);
+    }
+    values.push(RegistryValue::string(
+        layout.registered_apps.clone(),
+        Some(APP_NAME),
+        &layout.capabilities(),
+    ));
+    Ok(RegistrationPlan {
+        extensions: wanted,
+        values,
+    })
+}
+
+#[cfg(windows)]
+fn register_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<()> {
+    let command = shell_command(exe, "%1")?;
+    let icon = icon_location(exe);
+    let plan = registration_plan(layout, types, &command, &icon)?;
 
     let result = (|| {
         for extension in layout.registered_extensions()? {
-            if !wanted.contains(&extension) {
+            if !plan.extensions.contains(&extension) {
                 unregister_extension_at(layout, &extension)?;
             }
         }
-        let capabilities = layout.capabilities();
-        registry::set_string(&capabilities, Some("ApplicationName"), APP_NAME)?;
-        registry::set_string(
-            &capabilities,
-            Some("ApplicationDescription"),
-            APP_DESCRIPTION,
-        )?;
-        registry::set_wide(&capabilities, Some("ApplicationIcon"), &icon)?;
-        for (extension, file_type) in wanted.iter().zip(types) {
-            register_extension_at(layout, extension, &file_type.description, &command, &icon)?;
+        for extension in &plan.extensions {
+            preserve_class_default_at(layout, extension)?;
         }
-        registry::set_string(&layout.registered_apps, Some(APP_NAME), &capabilities)
+        for value in &plan.values {
+            registry::set_wide(&value.key, value.name.as_deref(), &value.value)?;
+        }
+        for extension in &plan.extensions {
+            let prog_id = prog_id(extension);
+            let extension_key = layout.extension_key(extension);
+            let current = registry::string_value(&extension_key, None)?;
+            if !current
+                .as_deref()
+                .is_some_and(|current| current.eq_ignore_ascii_case(&prog_id))
+            {
+                registry::set_default_string(&extension_key, &prog_id)?;
+            }
+        }
+        Ok(())
     })();
     if result.is_err() {
         // Leave nothing half-registered; replaced class defaults are restored.
@@ -272,28 +410,10 @@ fn register_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn register_extension_at(
-    layout: &Layout,
-    extension: &str,
-    description: &str,
-    command: &[u16],
-    icon: &[u16],
-) -> Result<()> {
+fn preserve_class_default_at(layout: &Layout, extension: &str) -> Result<()> {
     let prog_id = prog_id(extension);
-    let prog_id_key = layout.prog_id_key(extension);
-    registry::set_default_string(&prog_id_key, description)?;
-    registry::set_default_wide(&format!("{prog_id_key}\\DefaultIcon"), icon)?;
-    registry::set_default_wide(&format!("{prog_id_key}\\shell\\open\\command"), command)?;
-
     let extension_key = layout.extension_key(extension);
-    registry::set_string(
-        &format!("{extension_key}\\OpenWithProgids"),
-        Some(&prog_id),
-        "",
-    )?;
     let dotted = format!(".{extension}");
-    registry::set_string(&layout.associations(), Some(&dotted), &prog_id)?;
-
     let current = registry::string_value(&extension_key, None)?;
     if !current
         .as_deref()
@@ -305,7 +425,6 @@ fn register_extension_at(
             }
             None => registry::delete_value(&layout.previous_defaults(), Some(&dotted))?,
         }
-        registry::set_default_string(&extension_key, &prog_id)?;
     }
     Ok(())
 }
@@ -431,6 +550,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_uri_escapes_the_registered_application_name() {
+        assert_eq!(
+            default_apps_settings_uri("ZXraw Explorer"),
+            "ms-settings:defaultapps?registeredAppUser=ZXraw%20Explorer"
+        );
+        assert_eq!(escape_uri_component("Photo & RAW"), "Photo%20%26%20RAW");
+    }
+
+    #[test]
     fn extensions_are_lowercased_and_must_be_alphanumeric() {
         assert_eq!(checked_extension("JPG").unwrap(), "jpg");
         assert_eq!(checked_extension("3fr").unwrap(), "3fr");
@@ -446,6 +574,168 @@ mod tests {
         assert!(is_own_prog_id("Applications\\zxraw.exe"));
         assert!(!is_own_prog_id("AppX43hnxtbyyps62jhe9sqpdzxn1790zetc"));
         assert!(!is_own_prog_id("jpegfile"));
+    }
+
+    #[test]
+    fn current_user_choice_prog_id_controls_jpeg_and_raw_ownership() {
+        let jpg =
+            current_prog_id(Some("ZXrawExplorer.jpg".into()), Some("Photos.Jpeg".into())).unwrap();
+        let raw = current_prog_id(
+            Some("ZXrawExplorer.cr3".into()),
+            Some("OtherViewer.CR3".into()),
+        )
+        .unwrap();
+        let user_choice_from_other_app =
+            current_prog_id(Some("Photos.Jpeg".into()), Some("ZXrawExplorer.jpg".into())).unwrap();
+
+        assert!(is_own_prog_id(&jpg));
+        assert!(is_own_prog_id(&raw));
+        assert!(!is_own_prog_id(&user_choice_from_other_app));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_choice_key_uses_a_checked_normalized_extension() {
+        assert_eq!(
+            user_choice_key("JPG").unwrap(),
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.jpg\\UserChoice"
+        );
+        assert_eq!(
+            user_choice_key("cr3").unwrap(),
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\.cr3\\UserChoice"
+        );
+        assert!(user_choice_key(".jpg").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_plan_lists_capabilities_and_each_handler_value() {
+        let layout = Layout {
+            classes: "Software\\ZXrawExplorer-Test\\Classes".into(),
+            app: "Software\\ZXrawExplorer-Test\\App".into(),
+            registered_apps: "Software\\ZXrawExplorer-Test\\RegisteredApplications".into(),
+        };
+        let command = r#""C:\Test Folder\zxraw.exe" "%1""#
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let icon = r#"C:\Test Folder\zxraw.exe,0"#
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let types = [
+            FileType {
+                extension: "JPG".into(),
+                description: "JPEG image".into(),
+            },
+            FileType {
+                extension: "cr3".into(),
+                description: "CR3 raw image".into(),
+            },
+        ];
+        let plan = registration_plan(&layout, &types, &command, &icon).unwrap();
+        let text = |key: &str, name: Option<&str>| {
+            plan.values
+                .iter()
+                .find(|entry| entry.key == key && entry.name.as_deref() == name)
+                .map(|entry| {
+                    let end = entry
+                        .value
+                        .iter()
+                        .position(|&unit| unit == 0)
+                        .unwrap_or(entry.value.len());
+                    String::from_utf16_lossy(&entry.value[..end])
+                })
+        };
+        assert_eq!(plan.extensions, ["jpg", "cr3"]);
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\App\\Capabilities",
+                Some("ApplicationName")
+            )
+            .as_deref(),
+            Some("ZXraw Explorer")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\App\\Capabilities",
+                Some("ApplicationDescription")
+            )
+            .as_deref(),
+            Some(APP_DESCRIPTION)
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\App\\Capabilities",
+                Some("ApplicationIcon")
+            )
+            .as_deref(),
+            Some(r#"C:\Test Folder\zxraw.exe,0"#)
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\App\\Capabilities\\FileAssociations",
+                Some(".jpg")
+            )
+            .as_deref(),
+            Some("ZXrawExplorer.jpg")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\App\\Capabilities\\FileAssociations",
+                Some(".cr3")
+            )
+            .as_deref(),
+            Some("ZXrawExplorer.cr3")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\Classes\\ZXrawExplorer.jpg",
+                None
+            )
+            .as_deref(),
+            Some("JPEG image")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\Classes\\ZXrawExplorer.cr3",
+                None
+            )
+            .as_deref(),
+            Some("CR3 raw image")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\Classes\\ZXrawExplorer.jpg\\DefaultIcon",
+                None
+            )
+            .as_deref(),
+            Some(r#"C:\Test Folder\zxraw.exe,0"#)
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\Classes\\ZXrawExplorer.jpg\\shell\\open\\command",
+                None
+            )
+            .as_deref(),
+            Some(r#""C:\Test Folder\zxraw.exe" "%1""#)
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\Classes\\.jpg\\OpenWithProgids",
+                Some("ZXrawExplorer.jpg")
+            )
+            .as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            text(
+                "Software\\ZXrawExplorer-Test\\RegisteredApplications",
+                Some("ZXraw Explorer")
+            )
+            .as_deref(),
+            Some("Software\\ZXrawExplorer-Test\\App\\Capabilities")
+        );
     }
 
     #[cfg(windows)]
