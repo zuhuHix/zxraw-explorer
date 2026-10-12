@@ -1389,7 +1389,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
@@ -1423,7 +1423,7 @@ dependencies = [
 
 [[package]]
 name = "forge-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "forge-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1455,7 +1455,7 @@ dependencies = [
 
 [[package]]
 name = "forge-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "chrono",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "forge-db"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "forge-core",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "forge-jobs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-channel",
  "parking_lot",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "forge-media"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "forge-win"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "md-5",
  "tempfile",

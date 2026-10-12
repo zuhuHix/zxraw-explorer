@@ -13,7 +13,7 @@ members = [
 default-members = ["crates/forge-app", "crates/forge-cli"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zuhuHix/zxraw-explorer"
