@@ -30,6 +30,7 @@ pub mod http;
 pub mod process;
 pub mod restart;
 pub mod shell;
+mod user_choice;
 pub mod watch;
 
 pub use clipboard::{
@@ -42,14 +43,20 @@ pub use file_types::{
 };
 pub use files::{hard_link_count, is_removable, set_attributes, volume_serial};
 pub use integration::{
-    is_registered, refresh_if_registered, register_context_menu, unregister_context_menu,
+    default_folder_handler_enabled, is_registered, refresh_default_folder_handler,
+    refresh_if_registered, register_context_menu, register_default_folder_handler,
+    unregister_context_menu, unregister_default_folder_handler,
 };
 pub use process::launch;
 pub use restart::file_locking_processes;
 pub use shell::{
-    known_folders, open_default, open_with_dialog, recycle, recycle_sandbox_active,
-    recycle_to_sandbox, reveal_in_explorer, set_recycle_sandbox, set_shortcut_icon,
-    show_properties,
+    known_folders, open_default, open_folder_in_explorer, open_with_dialog, recycle,
+    recycle_sandbox_active, recycle_to_sandbox, reveal_in_explorer, set_recycle_sandbox,
+    set_shortcut_icon, show_properties,
+};
+pub use user_choice::{
+    FileTypeDefaultReport, FileTypeDefaultResult, restore_file_type_defaults,
+    set_file_type_defaults,
 };
 pub use watch::{DriveEvent, DriveWatcher, drive_change_watcher};
 

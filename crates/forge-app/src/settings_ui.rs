@@ -1200,7 +1200,7 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     page_heading(
         ui,
         "Default app",
-        "Open photos and RAW files in ZXraw Explorer's viewer when you double-click them.",
+        "Choose whether photos, RAW files, and filesystem folders open in ZXraw Explorer.",
     );
     ui.add_space(10.0);
     let mut action = None;
@@ -1209,7 +1209,7 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     ui.add_space(12.0);
     ui.label(
         RichText::new(
-            "Windows only lets you choose the default app yourself, in Settings. Some programs skip that choice and open the type's registered app directly; ZXraw Explorer registers itself there too, for your account only, so those programs open it as well. \"Stop using as default\" puts back what was there before.",
+            "The choice applies to this Windows account only. Win+E, the taskbar File Explorer button, and other apps' \"Show in folder\" commands still open Windows Explorer. Restore previous apps puts back the apps that were set before.",
         )
         .weak(),
     );

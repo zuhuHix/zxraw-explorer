@@ -187,7 +187,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             ui.add_space(8.0);
 
             ui.heading("Default app");
-            ui.label("Open photos and RAW files in ZXraw Explorer when you double-click them, or when another program opens them.");
+            ui.label("Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders.");
             crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
             ui.add_space(8.0);
 

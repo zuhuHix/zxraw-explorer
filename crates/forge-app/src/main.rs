@@ -61,6 +61,9 @@ fn run_switch(argument: &std::ffi::OsStr) -> Option<anyhow::Result<&'static str>
         "--unregister-context-menu" => forge_win::unregister_context_menu()
             .map_err(Into::into)
             .map(|()| "Explorer context menu removed."),
+        "--unregister-default-folder" => forge_win::unregister_default_folder_handler()
+            .map_err(Into::into)
+            .map(|()| "Default folder and drive handlers restored."),
         "--register-file-types" => exe()
             .and_then(|exe| {
                 forge_win::register_file_types(exe, &default_app::file_types()).map_err(Into::into)
@@ -117,6 +120,18 @@ fn main() -> eframe::Result {
             }
         }
         default_app::refresh_registration();
+        match std::env::current_exe() {
+            Ok(current_exe) => match forge_win::refresh_default_folder_handler(&current_exe) {
+                Ok(true) => tracing::info!("refreshed the default-folder command path"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!("could not refresh the default-folder command: {error}")
+                }
+            },
+            Err(error) => tracing::warn!(
+                "could not determine the executable path for folder refresh: {error}"
+            ),
+        }
     }
 
     let default_hook = std::panic::take_hook();

@@ -720,7 +720,7 @@ fn start_contact_sheet(
                 };
                 let _ = tx.send(Event::Toast(message));
                 let _ = tx.send(Event::Changed(options.output_dir.clone()));
-                if let Err(error) = forge_win::open_default(&options.output_dir) {
+                if let Err(error) = forge_win::open_folder_in_explorer(&options.output_dir) {
                     let _ = tx.send(Event::Error(format!(
                         "Could not open result folder: {error}"
                     )));

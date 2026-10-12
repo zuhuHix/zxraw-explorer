@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+md-5.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Com_StructuredStorage", "Win32_Graphics_Gdi", "Win32_UI_Input_KeyboardAndMouse", "Win32_Networking_WinHttp", "Win32_System_StationsAndDesktops"] }

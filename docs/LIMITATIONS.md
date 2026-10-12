@@ -44,14 +44,23 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
   (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
 
-## Default photo app
+## Default apps and folder opening
 
-* Windows does not let a program set itself as the default app. "Make ZXraw Explorer the default photo
-  viewer" registers the types and opens Settings > Default apps, where the user still has to confirm
-  ("Set default" on Windows 11). On Windows 10 the deep link opens the general Default apps page.
-* Programs that launch a specific app themselves (for example a "Open in Photos" button) are not
-  affected; only programs that ask Windows, or read the class default, open ZXraw Explorer.
-* Each double-clicked photo starts a new ZXraw Explorer window; a running instance is not reused.
+* After the user clicks **Make ZXraw Explorer my default**, the app registers its photo ProgIDs and
+  writes each selected per-user `UserChoice` using the legacy hash format observed on Windows 11
+  build 26200. Microsoft does not document this format. A Windows update, the newer
+  `UserChoiceLatest` mechanism, or UCPD protection may reject a type; the UI lists failed types and
+  offers ZXraw Explorer's Default apps page as a fallback for those types.
+* The optional folder choice changes only `HKCU\Software\Classes\Directory\shell` and
+  `Drive\shell`; it leaves `Folder\shell` alone so virtual folders keep their Windows behavior.
+  Win+E, the taskbar File Explorer icon, and other apps' **Show in folder** actions that call
+  `SHOpenFolderAndSelectItems` still open Windows Explorer.
+* Apps that launch a specific program themselves (for example an **Open in Photos** button) are not
+  affected. Applications that ask the Windows shell to open a photo or filesystem folder use the
+  selected defaults.
+* Passing a folder or drive to ZXraw opens it in a tab in that process. ZXraw has no single-instance
+  IPC, so opening it from another app can start another window. Each double-clicked photo also starts
+  a new window.
 
 ## Installer, packaging, and licences
 
