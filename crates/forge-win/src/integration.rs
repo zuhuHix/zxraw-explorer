@@ -83,6 +83,12 @@ fn command_key(root: &str, location: &str) -> String {
 
 #[cfg(windows)]
 fn command_line(exe: &Path) -> Result<Vec<u16>> {
+    shell_command(exe, "%V")
+}
+
+/// `"<exe>" "<placeholder>"`, NUL-terminated, for a `shell\<verb>\command` default value.
+#[cfg(windows)]
+pub(crate) fn shell_command(exe: &Path, placeholder: &str) -> Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
     // A quote cannot occur in a valid Windows file name. Keeping the path as UTF-16 avoids
@@ -93,7 +99,7 @@ fn command_line(exe: &Path) -> Result<Vec<u16>> {
     }
     let mut result = vec![b'"' as u16];
     result.extend(executable);
-    result.extend("\" \"%V\"".encode_utf16());
+    result.extend(format!("\" \"{placeholder}\"").encode_utf16());
     result.push(0);
     Ok(result)
 }
@@ -150,7 +156,9 @@ fn refresh_if_registered_at(root: &str, current_exe: &Path) -> Result<bool> {
 }
 
 #[cfg(windows)]
-mod registry {
+pub(crate) mod registry {
+    //! Minimal `HKEY_CURRENT_USER` access; every path is relative to HKCU.
+
     use std::ffi::c_void;
 
     use crate::{Result, WinError};
@@ -165,6 +173,9 @@ mod registry {
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_PATH_NOT_FOUND: i32 = 3;
     const ERROR_MORE_DATA: i32 = 234;
+    const ERROR_NO_MORE_ITEMS: i32 = 259;
+    /// Registry value names are at most 16,383 characters.
+    const MAX_VALUE_NAME: usize = 16_384;
 
     #[link(name = "Advapi32")]
     unsafe extern "system" {
@@ -202,12 +213,32 @@ mod registry {
             data: *mut u8,
             data_size: *mut u32,
         ) -> i32;
+        fn RegEnumValueW(
+            hkey: HKey,
+            index: u32,
+            value_name: *mut u16,
+            value_name_len: *mut u32,
+            reserved: *mut u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            data_size: *mut u32,
+        ) -> i32;
+        fn RegDeleteValueW(hkey: HKey, value_name: *const u16) -> i32;
         fn RegCloseKey(hkey: HKey) -> i32;
         fn RegDeleteTreeW(hkey: HKey, sub_key: *const u16) -> i32;
     }
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// `None` names the key's default ("(Default)") value.
+    fn name_ptr(name: &Option<Vec<u16>>) -> *const u16 {
+        name.as_ref().map_or(std::ptr::null(), |name| name.as_ptr())
+    }
+
+    fn not_found(status: i32) -> bool {
+        status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
     }
 
     fn api_error(op: &'static str, code: i32) -> WinError {
@@ -241,12 +272,28 @@ mod registry {
         Ok(key)
     }
 
-    fn set_bytes(path: &str, bytes: &[u8]) -> Result<()> {
+    /// Opens an existing key; `None` when it does not exist.
+    fn open_key(path: &str, access: u32) -> Result<Option<HKey>> {
+        let path_wide = wide(path);
+        let mut key = std::ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path_wide.as_ptr(), 0, access, &mut key) };
+        if not_found(status) {
+            Ok(None)
+        } else if status != 0 {
+            Err(api_error("RegOpenKeyExW", status))
+        } else {
+            Ok(Some(key))
+        }
+    }
+
+    fn set_bytes(path: &str, name: Option<&str>, bytes: &[u8]) -> Result<()> {
+        let name = name.map(wide);
         let key = create_key(path)?;
         let status = unsafe {
             RegSetValueExW(
                 key,
-                std::ptr::null(),
+                name_ptr(&name),
                 0,
                 REG_SZ,
                 bytes.as_ptr(),
@@ -260,14 +307,23 @@ mod registry {
         Ok(())
     }
 
-    pub(super) fn set_default_string(path: &str, value: &str) -> Result<()> {
-        let mut encoded: Vec<u16> = value.encode_utf16().collect();
-        encoded.push(0);
-        set_bytes(path, bytemuck_u16_as_bytes(&encoded))
+    pub(crate) fn set_default_string(path: &str, value: &str) -> Result<()> {
+        set_string(path, None, value)
     }
 
-    pub(super) fn set_default_wide(path: &str, value: &[u16]) -> Result<()> {
-        set_bytes(path, bytemuck_u16_as_bytes(value))
+    /// Sets a `REG_SZ` value, creating the key if needed.
+    pub(crate) fn set_string(path: &str, name: Option<&str>, value: &str) -> Result<()> {
+        set_bytes(path, name, bytemuck_u16_as_bytes(&wide(value)))
+    }
+
+    /// Sets the default value from NUL-terminated UTF-16.
+    pub(crate) fn set_default_wide(path: &str, value: &[u16]) -> Result<()> {
+        set_wide(path, None, value)
+    }
+
+    /// Sets a `REG_SZ` value from NUL-terminated UTF-16.
+    pub(crate) fn set_wide(path: &str, name: Option<&str>, value: &[u16]) -> Result<()> {
+        set_bytes(path, name, bytemuck_u16_as_bytes(value))
     }
 
     fn bytemuck_u16_as_bytes(value: &[u16]) -> &[u8] {
@@ -275,46 +331,22 @@ mod registry {
         unsafe { std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), value.len() * 2) }
     }
 
-    pub(super) fn key_exists(path: &str) -> Result<bool> {
-        let path_wide = wide(path);
-        let mut key = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                path_wide.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut key,
-            )
-        };
-        if status == 0 {
-            unsafe { RegCloseKey(key) };
-            Ok(true)
-        } else if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
-            Ok(false)
-        } else {
-            Err(api_error("RegOpenKeyExW", status))
-        }
+    pub(crate) fn key_exists(path: &str) -> Result<bool> {
+        Ok(open_key(path, KEY_QUERY_VALUE)?
+            .map(|key| unsafe { RegCloseKey(key) })
+            .is_some())
     }
 
-    pub(super) fn default_wide(path: &str) -> Result<Option<Vec<u16>>> {
-        let path_wide = wide(path);
-        let mut key = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(
-                HKEY_CURRENT_USER,
-                path_wide.as_ptr(),
-                0,
-                KEY_QUERY_VALUE,
-                &mut key,
-            )
-        };
-        if status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+    pub(crate) fn default_wide(path: &str) -> Result<Option<Vec<u16>>> {
+        wide_value(path, None)
+    }
+
+    /// A string value without its terminating NULs. A value of another type reads as empty.
+    pub(crate) fn wide_value(path: &str, name: Option<&str>) -> Result<Option<Vec<u16>>> {
+        let Some(key) = open_key(path, KEY_QUERY_VALUE)? else {
             return Ok(None);
-        }
-        if status != 0 {
-            return Err(api_error("RegOpenKeyExW", status));
-        }
+        };
+        let name = name.map(wide);
 
         let result = (|| {
             let mut value_type = 0;
@@ -322,7 +354,7 @@ mod registry {
             let status = unsafe {
                 RegQueryValueExW(
                     key,
-                    std::ptr::null(),
+                    name_ptr(&name),
                     std::ptr::null_mut(),
                     &mut value_type,
                     std::ptr::null_mut(),
@@ -342,7 +374,7 @@ mod registry {
             let status = unsafe {
                 RegQueryValueExW(
                     key,
-                    std::ptr::null(),
+                    name_ptr(&name),
                     std::ptr::null_mut(),
                     &mut value_type,
                     value.as_mut_ptr().cast(),
@@ -368,10 +400,68 @@ mod registry {
         result
     }
 
-    pub(super) fn delete_tree(path: &str) -> Result<()> {
+    /// Like [`wide_value`], decoded lossily.
+    pub(crate) fn string_value(path: &str, name: Option<&str>) -> Result<Option<String>> {
+        Ok(wide_value(path, name)?.map(|value| String::from_utf16_lossy(&value)))
+    }
+
+    /// Deletes one value. A missing key or value is not an error.
+    pub(crate) fn delete_value(path: &str, name: Option<&str>) -> Result<()> {
+        let Some(key) = open_key(path, KEY_SET_VALUE)? else {
+            return Ok(());
+        };
+        let name = name.map(wide);
+        let status = unsafe { RegDeleteValueW(key, name_ptr(&name)) };
+        unsafe { RegCloseKey(key) };
+        if status == 0 || not_found(status) {
+            Ok(())
+        } else {
+            Err(api_error("RegDeleteValueW", status))
+        }
+    }
+
+    /// Names of the key's named values (not its default value); empty if the key is missing.
+    pub(crate) fn value_names(path: &str) -> Result<Vec<String>> {
+        let Some(key) = open_key(path, KEY_QUERY_VALUE)? else {
+            return Ok(Vec::new());
+        };
+        let mut names = Vec::new();
+        let mut buffer = vec![0_u16; MAX_VALUE_NAME];
+        let result = (|| {
+            for index in 0.. {
+                let mut length = buffer.len() as u32;
+                let status = unsafe {
+                    RegEnumValueW(
+                        key,
+                        index,
+                        buffer.as_mut_ptr(),
+                        &mut length,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if status == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if status != 0 {
+                    return Err(api_error("RegEnumValueW", status));
+                }
+                if length > 0 {
+                    names.push(String::from_utf16_lossy(&buffer[..length as usize]));
+                }
+            }
+            Ok(())
+        })();
+        unsafe { RegCloseKey(key) };
+        result.map(|()| names)
+    }
+
+    pub(crate) fn delete_tree(path: &str) -> Result<()> {
         let path_wide = wide(path);
         let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path_wide.as_ptr()) };
-        if status == 0 || status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND {
+        if status == 0 || not_found(status) {
             Ok(())
         } else {
             Err(api_error("RegDeleteTreeW", status))

@@ -188,6 +188,41 @@ fn culling_keys_persist_across_a_restart_and_leave_files_untouched() {
 }
 
 #[test]
+fn a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder() {
+    // What a double-click does once ZXraw Explorer is the default photo app.
+    let sandbox = tempfile::tempdir().unwrap();
+    let photos = sandbox.path().join("photos");
+    for (i, name) in ["a.jpg", "b.jpg", "c.jpg"].iter().enumerate() {
+        write_file(&photos.join(name), &jpeg(320, 214, i as u8 + 1));
+    }
+    let text = script(vec![
+        "limit 240".into(),
+        "wait-frames 10".into(),
+        "ui viewer assert-open single".into(),
+        "ui viewer assert-current b.jpg".into(),
+        "ui viewer wait-decoded".into(),
+        // The rest of the folder is there to step through.
+        "key ArrowRight".into(),
+        "ui viewer assert-current c.jpg".into(),
+        "key Escape".into(),
+        "ui viewer assert-open none".into(),
+        "exit".into(),
+    ]);
+    let opts = RunOpts {
+        limit: Some(Duration::from_secs(270)),
+        args: vec![photos.join("b.jpg").into_os_string()],
+        ..Default::default()
+    };
+    let outcome = run_app_with(
+        &sandbox.path().join("run"),
+        &sandbox.path().join("profile"),
+        &text,
+        &opts,
+    );
+    expect_ok(&outcome);
+}
+
+#[test]
 fn keys_typed_into_a_rename_prompt_do_not_rate_the_photo() {
     let sandbox = tempfile::tempdir().unwrap();
     let photos = sandbox.path().join("photos");

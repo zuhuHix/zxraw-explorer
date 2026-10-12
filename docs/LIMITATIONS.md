@@ -44,6 +44,15 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
   (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
 
+## Default photo app
+
+* Windows does not let a program set itself as the default app. "Make ZXraw Explorer the default photo
+  viewer" registers the types and opens Settings > Default apps, where the user still has to confirm
+  ("Set default" on Windows 11). On Windows 10 the deep link opens the general Default apps page.
+* Programs that launch a specific app themselves (for example a "Open in Photos" button) are not
+  affected; only programs that ask Windows, or read the class default, open ZXraw Explorer.
+* Each double-clicked photo starts a new ZXraw Explorer window; a running instance is not reused.
+
 ## Installer, packaging, and licences
 
 * The installer (`packaging/zxraw.iss`, Inno Setup 6.7.3) was compiled from `ed5fc58`. A silent

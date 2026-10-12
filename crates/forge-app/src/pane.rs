@@ -395,6 +395,8 @@ impl Pane {
     pub fn set_pending_select(&mut self, name: String) {
         if self.is_loading() {
             self.pending_select = Some(name);
+            // Supersedes a refresh's "keep the cursor where it was".
+            self.pending_select_keep = None;
         } else {
             self.select_name(&name);
         }

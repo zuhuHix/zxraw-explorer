@@ -444,7 +444,7 @@ fn from_wide(buf: &[u16]) -> String {
 
 /// Apartment-threaded COM initialisation for the current thread, undone on drop.
 #[cfg(windows)]
-mod com {
+pub(crate) mod com {
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
     use windows::core::HRESULT;
 

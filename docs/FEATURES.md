@@ -281,6 +281,14 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Windows shell registration lifecycle — `forge-win/src/integration.rs` tests run against an isolated HKCU
   test key (`registration_lifecycle_uses_an_isolated_hkcu_test_root`). The Explorer context-menu entries are not
   visually checked.
+* ✅ Default photo app (opt-in, first-run welcome and Settings > Default app) — `forge-win/src/file_types.rs`
+  registers per-user ProgIDs, "Open with" entries, `Capabilities`/`RegisteredApplications` and the per-user class
+  default (for programs that bypass the Settings choice), saving and restoring the class defaults it replaces
+  (`registration_lifecycle_restores_previous_class_defaults`,
+  `unregistering_keeps_a_class_default_another_app_took_since`, both on an isolated HKCU key). A photo passed on
+  the command line opens in the viewer with its folder
+  (`a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder`). Registration against the real
+  `HKCU\Software\Classes` and the Settings deep link were not exercised.
 * 🟡 Packaging — `packaging/build-release.ps1`, `packaging/zxraw.iss`, `packaging/generate_icon.py`,
   `packaging/generate-third-party.ps1`, and the VERSIONINFO resource in `crates/forge-app/build.rs`.
   Commit `e3bfbd2` records a release zip that was built and whose executable launched; that build is not

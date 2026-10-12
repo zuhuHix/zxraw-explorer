@@ -80,6 +80,26 @@ pub fn open(app: &mut ZxrawApp, mode: ViewerMode) {
         app.toast("No photos or videos in this folder");
         return;
     }
+    open_items(app, items, start, mode);
+}
+
+/// Open the viewer on a photo passed on the command line, once the focused pane (its
+/// folder, with the photo selected) has loaded: with the folder's other photos to step
+/// through when it is listed there, else on its own (e.g. a hidden file).
+pub fn open_launched(app: &mut ZxrawApp, photo: PathBuf) {
+    let listed = app
+        .pane()
+        .cursor_entry()
+        .is_some_and(|e| forge_core::paths::paths_equal(&e.path, &photo));
+    if listed {
+        open(app, ViewerMode::Single);
+    } else {
+        open_items(app, vec![photo], 0, ViewerMode::Single);
+    }
+}
+
+/// Open the viewer on `items`, starting at `items[start]`.
+pub fn open_items(app: &mut ZxrawApp, items: Vec<PathBuf>, start: usize, mode: ViewerMode) {
     let mut cfg = crate::viewer::ViewerConfig {
         budget_bytes: (app.settings.thumb_mem_cache_mb as usize).max(128) * 1024 * 1024,
         ..Default::default()
