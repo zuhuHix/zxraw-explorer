@@ -13,6 +13,7 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=ZXraw-Explorer-{#AppVersion}-Setup-x64
+SetupIconFile=..\assets\zxraw.ico
 UninstallDisplayIcon={app}\zxraw.exe
 Compression=lzma2
 SolidCompression=yes
