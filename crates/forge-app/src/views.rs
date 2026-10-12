@@ -522,11 +522,12 @@ fn draw_marquee(ui: &Ui, rect: Rect, viewport: Rect, scroll_offset: f32) {
         return;
     }
     let painter = ui.painter().with_clip_rect(viewport);
-    painter.rect_filled(rect, 0.0, theme::ACCENT.gamma_multiply(0.14));
+    let accent = theme::accent(ui.ctx());
+    painter.rect_filled(rect, 4.0, accent.gamma_multiply(0.14));
     painter.rect_stroke(
         rect,
-        0.0,
-        Stroke::new(1.0, theme::ACCENT),
+        4.0,
+        Stroke::new(1.0, accent),
         egui::StrokeKind::Inside,
     );
 }
