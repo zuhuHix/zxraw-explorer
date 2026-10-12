@@ -82,7 +82,7 @@ pub fn drag_out_with_thumbnail(
     // adds its bitmap to this shell data object; failure leaves the existing shell fallback in
     // place and must not prevent the file drag itself.
     let _drag_image = match initialize_drag_image(&data, &pidls[0], thumbnail) {
-        Ok(image) => Some(image),
+        Ok(helper) => Some(helper),
         Err(error) => {
             tracing::debug!("could not initialize file drag image: {error}");
             None
@@ -251,7 +251,7 @@ fn initialize_drag_image(
     data: &windows::Win32::System::Com::IDataObject,
     first_item: &Pidl,
     thumbnail: Option<DragThumbnail<'_>>,
-) -> Result<(DragBitmap, windows::Win32::UI::Shell::IDragSourceHelper2)> {
+) -> Result<windows::Win32::UI::Shell::IDragSourceHelper2> {
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
     use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
     use windows::Win32::UI::Shell::{
@@ -284,7 +284,10 @@ fn initialize_drag_image(
     // unpremultiplies the tested BGRA buffer at the Win32 boundary before passing the HBITMAP.
     unsafe { helper.InitializeFromBitmap(&image, data) }
         .map_err(|e| crate::api_err("IDragSourceHelper::InitializeFromBitmap", e))?;
-    Ok((bitmap, helper))
+    // On success the helper owns the bitmap and frees it when the drag ends; deleting it here
+    // too would free a handle Windows may already have reused. On failure `bitmap` drops above.
+    std::mem::forget(bitmap);
+    Ok(helper)
 }
 
 #[cfg(windows)]
