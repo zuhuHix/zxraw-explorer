@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::*;
 
@@ -460,4 +461,56 @@ fn clicking_empty_space_below_the_rows_clears_the_selection() {
     );
     let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
     expect_ok(&outcome);
+}
+
+#[test]
+fn dragging_a_marquee_selects_virtual_rows_and_grid_tiles() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let details = sandbox.path().join("details");
+    let grid = sandbox.path().join("grid");
+    fs::create_dir_all(&details).unwrap();
+    fs::create_dir_all(&grid).unwrap();
+    for number in 1..=8 {
+        write_file(&details.join(format!("{number:02}.txt")), b"details");
+    }
+    for number in 1..=2 {
+        write_file(&grid.join(format!("{number:02}.txt")), b"grid");
+    }
+
+    let details_shot = shots_dir().join("marquee-details-mid-drag.png");
+    let grid_shot = shots_dir().join("marquee-grid-mid-drag.png");
+    let script = format!(
+        "limit 180\nnavigate {details}\ncmd ViewDetails\nwait-frames 5\n\
+         marquee 06.txt 02.txt\nscreenshot {details_shot}\nrelease-pointer\
+         \nassert-selection 02.txt, 03.txt, 04.txt, 05.txt, 06.txt, 07.txt, 08.txt\n\
+         navigate {grid}\ncmd ViewGrid\nwait-frames 5\n\
+         marquee 01.txt 02.txt\nscreenshot {grid_shot}\nrelease-pointer\
+         \nassert-selection 01.txt, 02.txt\nexit\n",
+        details = shown(&details),
+        grid = shown(&grid),
+        details_shot = shown(&details_shot),
+        grid_shot = shown(&grid_shot),
+    );
+    let options = RunOpts {
+        limit: Some(Duration::from_secs(180)),
+        ..RunOpts::default()
+    };
+    let outcome = run_app_with(
+        sandbox.path(),
+        &sandbox.path().join("profile"),
+        &script,
+        &options,
+    );
+
+    expect_ok(&outcome);
+    assert!(
+        details_shot.is_file(),
+        "missing screenshot: {}",
+        details_shot.display()
+    );
+    assert!(
+        grid_shot.is_file(),
+        "missing screenshot: {}",
+        grid_shot.display()
+    );
 }

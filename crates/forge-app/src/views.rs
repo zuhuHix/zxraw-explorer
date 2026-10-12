@@ -1,11 +1,11 @@
 //! File list renderers. Both views are virtualized: only on-screen rows/tiles are laid out,
 //! so a folder with 100k entries costs the same per frame as one with 100.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
 use forge_core::model::{EntryKind, MediaKind, format_size};
@@ -232,6 +232,300 @@ fn row_click(resp: &egui::Response, pane: &mut Pane, vis: usize, out: &mut Vec<V
     if resp.double_clicked() {
         out.push(ViewEvent::Activate(vis));
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MarqueeMode {
+    #[default]
+    Replace,
+    Add,
+    Toggle,
+}
+
+#[derive(Clone, Default)]
+struct MarqueeDrag {
+    start: egui::Pos2,
+    start_scroll_offset: f32,
+    mode: MarqueeMode,
+    starting_selection: HashSet<PathBuf>,
+    listing_rev: u64,
+    last_touched: Option<usize>,
+    last_time: f64,
+}
+
+fn marquee_content_rect(drag: &MarqueeDrag, pointer: egui::Pos2, scroll_offset: f32) -> Rect {
+    let top = (drag.start.y + drag.start_scroll_offset).min(pointer.y + scroll_offset);
+    let bottom = (drag.start.y + drag.start_scroll_offset).max(pointer.y + scroll_offset);
+    let left = drag.start.x.min(pointer.x);
+    let right = drag.start.x.max(pointer.x);
+    Rect::from_min_max(
+        pos2(left, top),
+        pos2(
+            if right <= left { left + 1.0 } else { right },
+            if bottom <= top { top + 1.0 } else { bottom },
+        ),
+    )
+}
+
+/// Rows are laid out at a fixed height, so this finds every row crossed by the marquee,
+/// including rows that `ScrollArea::show_rows` did not paint this frame.
+fn intersecting_rows(
+    rect: Rect,
+    origin: egui::Pos2,
+    row_width: f32,
+    row_height: f32,
+    count: usize,
+) -> Vec<usize> {
+    if count == 0 || row_width <= 0.0 || row_height <= 0.0 || !rect.is_positive() {
+        return Vec::new();
+    }
+    let right = origin.x + row_width;
+    if rect.right() <= origin.x || rect.left() >= right {
+        return Vec::new();
+    }
+    let first =
+        (((rect.top() - origin.y) / row_height).floor() as isize).clamp(0, count as isize) as usize;
+    let end = (((rect.bottom() - origin.y) / row_height).ceil() as isize).clamp(0, count as isize)
+        as usize;
+    (first..end)
+        .filter(|&index| {
+            let top = origin.y + index as f32 * row_height;
+            rect.intersects(Rect::from_min_size(
+                pos2(origin.x, top),
+                vec2(row_width, row_height),
+            ))
+        })
+        .collect()
+}
+
+/// Finds every virtual grid cell crossed by the marquee without depending on the cells
+/// currently created by the virtualized row renderer.
+fn intersecting_grid_cells(
+    rect: Rect,
+    origin: egui::Pos2,
+    cell_width: f32,
+    cell_height: f32,
+    columns: usize,
+    count: usize,
+) -> Vec<usize> {
+    if count == 0 || columns == 0 || cell_width <= 0.0 || cell_height <= 0.0 || !rect.is_positive()
+    {
+        return Vec::new();
+    }
+    let first_col = (((rect.left() - origin.x) / cell_width).floor() as isize)
+        .clamp(0, columns as isize) as usize;
+    let end_col = (((rect.right() - origin.x) / cell_width).ceil() as isize)
+        .clamp(0, columns as isize) as usize;
+    let first_row = (((rect.top() - origin.y) / cell_height).floor() as isize)
+        .clamp(0, count.div_ceil(columns) as isize) as usize;
+    let end_row = (((rect.bottom() - origin.y) / cell_height).ceil() as isize)
+        .clamp(0, count.div_ceil(columns) as isize) as usize;
+    let mut cells = Vec::new();
+    for row in first_row..end_row {
+        for col in first_col..end_col {
+            let index = row * columns + col;
+            if index >= count {
+                break;
+            }
+            let cell = Rect::from_min_size(
+                pos2(
+                    origin.x + col as f32 * cell_width,
+                    origin.y + row as f32 * cell_height,
+                ),
+                vec2(cell_width, cell_height),
+            );
+            if rect.intersects(cell) {
+                cells.push(index);
+            }
+        }
+    }
+    cells
+}
+
+fn auto_scroll_target(ui: &Ui, id: egui::Id, viewport: Rect, current_offset: f32) -> Option<f32> {
+    let key = id.with("marquee");
+    let mut drag = ui.ctx().data(|data| data.get_temp::<MarqueeDrag>(key))?;
+    let (pointer, primary_down, now) = ui.ctx().input(|input| {
+        (
+            input.pointer.latest_pos(),
+            input.pointer.button_down(egui::PointerButton::Primary),
+            input.time,
+        )
+    });
+    if !primary_down {
+        return None;
+    }
+    let pointer = pointer?;
+    let elapsed = (now - drag.last_time).clamp(0.0, 0.05) as f32;
+    drag.last_time = now;
+    ui.ctx().data_mut(|data| data.insert_temp(key, drag));
+
+    let velocity = if pointer.y < viewport.top() {
+        -(240.0 + (viewport.top() - pointer.y) * 6.0).min(900.0)
+    } else if pointer.y > viewport.bottom() {
+        (240.0 + (pointer.y - viewport.bottom()) * 6.0).min(900.0)
+    } else {
+        return None;
+    };
+    ui.ctx().request_repaint_after(Duration::from_millis(16));
+    Some((current_offset + velocity * elapsed).max(0.0))
+}
+
+fn prepare_marquee(
+    ui: &Ui,
+    bg: &egui::Response,
+    id: egui::Id,
+    pane: &Pane,
+    scroll_offset: f32,
+    out: &mut Vec<ViewEvent>,
+) -> Option<(MarqueeDrag, egui::Pos2, bool)> {
+    let key = id.with("marquee");
+    let mut drag = ui.ctx().data(|data| data.get_temp::<MarqueeDrag>(key));
+    if bg.drag_started() {
+        let pointer = ui.ctx().input(|input| input.pointer.latest_pos())?;
+        let start = ui
+            .ctx()
+            .input(|input| input.pointer.press_origin())
+            .unwrap_or(pointer);
+        let modifiers = ui.ctx().input(|input| input.modifiers);
+        let mode = if modifiers.command {
+            MarqueeMode::Toggle
+        } else if modifiers.shift {
+            MarqueeMode::Add
+        } else {
+            MarqueeMode::Replace
+        };
+        drag = Some(MarqueeDrag {
+            start,
+            start_scroll_offset: scroll_offset,
+            mode,
+            starting_selection: if mode == MarqueeMode::Replace {
+                HashSet::new()
+            } else {
+                pane.selected.clone()
+            },
+            listing_rev: pane.listing_rev(),
+            last_touched: None,
+            last_time: ui.ctx().input(|input| input.time),
+        });
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(key, drag.clone().expect("marquee just started")));
+        out.push(ViewEvent::Focus);
+    }
+
+    let stopped = bg.drag_stopped();
+    if !(bg.dragged() || stopped) {
+        if drag.is_some()
+            && !ui
+                .ctx()
+                .input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        {
+            ui.ctx()
+                .data_mut(|data| data.remove_temp::<MarqueeDrag>(key));
+        }
+        return None;
+    }
+    let drag = drag?;
+    if drag.listing_rev != pane.listing_rev() {
+        ui.ctx()
+            .data_mut(|data| data.remove_temp::<MarqueeDrag>(key));
+        return None;
+    }
+    let pointer = ui.ctx().input(|input| input.pointer.latest_pos())?;
+    Some((drag, pointer, stopped))
+}
+
+fn update_marquee_selection(
+    pane: &mut Pane,
+    drag: &mut MarqueeDrag,
+    touched: HashSet<PathBuf>,
+    last_touched: Option<usize>,
+) {
+    if let Some(index) = last_touched {
+        drag.last_touched = Some(index);
+    }
+    pane.selected = marquee_selection(drag.mode, &drag.starting_selection, touched);
+    if let Some(index) = drag.last_touched {
+        pane.cursor = Some(index);
+        pane.anchor = Some(index);
+        pane.scroll_to_cursor = false;
+    }
+}
+
+fn marquee_selection(
+    mode: MarqueeMode,
+    starting_selection: &HashSet<PathBuf>,
+    touched: HashSet<PathBuf>,
+) -> HashSet<PathBuf> {
+    match mode {
+        MarqueeMode::Replace => touched,
+        MarqueeMode::Add => starting_selection.iter().cloned().chain(touched).collect(),
+        MarqueeMode::Toggle => {
+            let mut selected = starting_selection.clone();
+            for path in touched {
+                if !selected.insert(path.clone()) {
+                    selected.remove(&path);
+                }
+            }
+            selected
+        }
+    }
+}
+
+struct MarqueeUpdate {
+    stopped: bool,
+    scroll_offset: f32,
+    viewport: Rect,
+    content_rect: Rect,
+    touched: HashSet<PathBuf>,
+    last_touched: Option<usize>,
+}
+
+fn finish_marquee(
+    ui: &Ui,
+    id: egui::Id,
+    pane: &mut Pane,
+    mut drag: MarqueeDrag,
+    update: MarqueeUpdate,
+) {
+    update_marquee_selection(pane, &mut drag, update.touched, update.last_touched);
+    draw_marquee(
+        ui,
+        update.content_rect,
+        update.viewport,
+        update.scroll_offset,
+    );
+    let key = id.with("marquee");
+    if update.stopped {
+        ui.ctx()
+            .data_mut(|data| data.remove_temp::<MarqueeDrag>(key));
+    } else {
+        drag.last_time = ui.ctx().input(|input| input.time);
+        ui.ctx().data_mut(|data| data.insert_temp(key, drag));
+        if ui
+            .ctx()
+            .input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+        {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+    }
+}
+
+fn draw_marquee(ui: &Ui, rect: Rect, viewport: Rect, scroll_offset: f32) {
+    let rect = rect
+        .translate(vec2(0.0, -scroll_offset))
+        .intersect(viewport);
+    if !rect.is_positive() {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(viewport);
+    painter.rect_filled(rect, 0.0, theme::ACCENT.gamma_multiply(0.14));
+    painter.rect_stroke(
+        rect,
+        0.0,
+        Stroke::new(1.0, theme::ACCENT),
+        egui::StrokeKind::Inside,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +1159,16 @@ pub fn details(
         pane.scroll_to_cursor = false;
     }
 
+    let predicted_view = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let previous_offset = ui
+        .ctx()
+        .data(|data| data.get_temp::<f32>(id.with("off")))
+        .unwrap_or(0.0);
+    if let Some(offset) = auto_scroll_target(ui, id, predicted_view, previous_offset) {
+        scroll = scroll.vertical_scroll_offset(offset);
+        pane.scroll_to_cursor = false;
+    }
+
     if n == 0 {
         let message = match &pane.load {
             LoadState::Loading { .. } => "Loading folder...",
@@ -881,7 +1185,11 @@ pub fn details(
     // Register the background before the rows so every row sits above it. Registered after,
     // egui only lets a row win when the background fully contains it, which fractional
     // display scaling breaks by a fraction of a pixel: every click then hit the background.
-    let background = ui.interact(ui.available_rect_before_wrap(), id.with("bg"), Sense::click());
+    let background = ui.interact(
+        ui.available_rect_before_wrap(),
+        id.with("bg"),
+        Sense::click_and_drag(),
+    );
     crate::testhook::note_view_rect(ui, background.rect);
     let sa = scroll.show_rows(ui, row_h, n, |ui, range| {
         for vis in range {
@@ -1075,6 +1383,43 @@ pub fn details(
         .data_mut(|data| data.insert_temp(id.with("off"), sa.state.offset.y));
     ui.ctx()
         .accesskit_node_builder(sa.id, |node| node.set_role(egui::accesskit::Role::List));
+
+    if let Some((drag, pointer, stopped)) =
+        prepare_marquee(ui, &background, id, pane, sa.state.offset.y, &mut out)
+    {
+        let content_rect = marquee_content_rect(&drag, pointer, sa.state.offset.y);
+        let intersections =
+            intersecting_rows(content_rect, sa.inner_rect.min, table_width, row_h, n);
+        let pointer_content = pos2(pointer.x, pointer.y + sa.state.offset.y);
+        let last_touched = intersections
+            .iter()
+            .min_by(|&&a, &&b| {
+                let center_a = sa.inner_rect.top() + (a as f32 + 0.5) * row_h;
+                let center_b = sa.inner_rect.top() + (b as f32 + 0.5) * row_h;
+                (center_a - pointer_content.y)
+                    .abs()
+                    .total_cmp(&(center_b - pointer_content.y).abs())
+            })
+            .copied();
+        let touched = intersections
+            .into_iter()
+            .filter_map(|vis| pane.entry_at(vis).map(|entry| entry.path.clone()))
+            .collect();
+        finish_marquee(
+            ui,
+            id,
+            pane,
+            drag,
+            MarqueeUpdate {
+                stopped,
+                scroll_offset: sa.state.offset.y,
+                viewport: sa.inner_rect,
+                content_rect,
+                touched,
+                last_touched,
+            },
+        );
+    }
 
     background_interactions(ui, &background, pane, &mut out);
     out
@@ -1417,10 +1762,23 @@ pub fn grid(
         }
         pane.scroll_to_cursor = false;
     }
+    let predicted_view = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+    let previous_offset = ui
+        .ctx()
+        .data(|data| data.get_temp::<f32>(id.with("goff")))
+        .unwrap_or(0.0);
+    if let Some(offset) = auto_scroll_target(ui, id, predicted_view, previous_offset) {
+        scroll = scroll.vertical_scroll_offset(offset);
+        pane.scroll_to_cursor = false;
+    }
     let prev_spacing = ui.spacing().item_spacing;
     ui.spacing_mut().item_spacing = Vec2::ZERO;
     // See `details`: the background must be registered before the tiles.
-    let bg = ui.interact(ui.available_rect_before_wrap(), id.with("bg"), Sense::click());
+    let bg = ui.interact(
+        ui.available_rect_before_wrap(),
+        id.with("bg"),
+        Sense::click_and_drag(),
+    );
     crate::testhook::note_view_rect(ui, bg.rect);
     let sa = scroll.show_rows(ui, cell.y, rows, |ui, range| {
         for row in range {
@@ -1673,6 +2031,65 @@ pub fn grid(
     ui.spacing_mut().item_spacing = prev_spacing;
     ui.ctx()
         .data_mut(|d| d.insert_temp(id.with("goff"), sa.state.offset.y));
+
+    if let Some((drag, pointer, stopped)) =
+        prepare_marquee(ui, &bg, id, pane, sa.state.offset.y, &mut out)
+    {
+        let content_rect = marquee_content_rect(&drag, pointer, sa.state.offset.y);
+        let intersections =
+            intersecting_grid_cells(content_rect, sa.inner_rect.min, cell_w, cell.y, per_row, n);
+        let pointer_content = pos2(pointer.x, pointer.y + sa.state.offset.y);
+        let last_cell = intersections.iter().min_by(|&&a, &&b| {
+            let center = |index: usize| {
+                pos2(
+                    sa.inner_rect.left() + (index % per_row) as f32 * cell_w + cell_w / 2.0,
+                    sa.inner_rect.top() + (index / per_row) as f32 * cell.y + cell.y / 2.0,
+                )
+            };
+            center(a)
+                .distance_sq(pointer_content)
+                .total_cmp(&center(b).distance_sq(pointer_content))
+        });
+        let last_touched = last_cell.and_then(|&cell_index| {
+            grid_items
+                .as_ref()
+                .and_then(|layout| layout.items.get(cell_index))
+                .map_or(Some(cell_index), |item| Some(item.focus_vis))
+        });
+        let mut touched = HashSet::new();
+        for cell_index in intersections {
+            if let Some(item) = grid_items
+                .as_ref()
+                .and_then(|layout| layout.items.get(cell_index))
+            {
+                if let Some(members) = &item.visible_members {
+                    touched.extend(
+                        members
+                            .iter()
+                            .filter_map(|&vis| pane.entry_at(vis).map(|entry| entry.path.clone())),
+                    );
+                } else if let Some(entry) = pane.entry_at(item.vis) {
+                    touched.insert(entry.path.clone());
+                }
+            } else if let Some(entry) = pane.entry_at(cell_index) {
+                touched.insert(entry.path.clone());
+            }
+        }
+        finish_marquee(
+            ui,
+            id,
+            pane,
+            drag,
+            MarqueeUpdate {
+                stopped,
+                scroll_offset: sa.state.offset.y,
+                viewport: sa.inner_rect,
+                content_rect,
+                touched,
+                last_touched,
+            },
+        );
+    }
     ui.ctx()
         .accesskit_node_builder(sa.id, |node| node.set_role(egui::accesskit::Role::Grid));
     background_interactions(ui, &bg, pane, &mut out);
@@ -1982,6 +2399,70 @@ mod accessibility_tests {
             badge,
             Some(egui::accesskit::Role::Button),
             "named stack collapse button"
+        );
+    }
+}
+
+#[cfg(test)]
+mod marquee_tests {
+    use super::{MarqueeMode, intersecting_grid_cells, intersecting_rows, marquee_selection};
+    use egui::{Rect, pos2};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    #[test]
+    fn row_intersection_uses_virtual_geometry_beyond_the_painted_rows() {
+        let origin = pos2(10.0, 20.0);
+        let rect = Rect::from_min_max(pos2(30.0, 20_025.0), pos2(80.0, 20_065.0));
+
+        assert_eq!(
+            intersecting_rows(rect, origin, 200.0, 20.0, 50_000),
+            vec![1_000, 1_001, 1_002],
+        );
+    }
+
+    #[test]
+    fn grid_intersection_respects_cell_boundaries_and_the_final_partial_row() {
+        let origin = pos2(10.0, 20.0);
+        let rect = Rect::from_min_max(pos2(110.0, 140.0), pos2(210.0, 260.0));
+
+        assert_eq!(
+            intersecting_grid_cells(rect, origin, 100.0, 120.0, 3, 7),
+            vec![4],
+        );
+    }
+
+    #[test]
+    fn grid_intersection_finds_cells_outside_the_painted_rows() {
+        let origin = pos2(10.0, 20.0);
+        let top = 20.0 + 1_200.0 * 120.0;
+        let rect = Rect::from_min_max(pos2(115.0, top + 5.0), pos2(205.0, top + 100.0));
+
+        assert_eq!(
+            intersecting_grid_cells(rect, origin, 100.0, 120.0, 3, 50_000),
+            vec![3_601],
+        );
+    }
+
+    #[test]
+    fn marquee_modifiers_apply_against_the_selection_at_drag_start() {
+        let a = PathBuf::from("a.txt");
+        let b = PathBuf::from("b.txt");
+        let c = PathBuf::from("c.txt");
+        let starting = HashSet::from([a.clone(), b.clone()]);
+        let touched = HashSet::from([b.clone(), c.clone()]);
+
+        assert_eq!(
+            marquee_selection(MarqueeMode::Replace, &starting, touched.clone()),
+            HashSet::from([b.clone(), c.clone()]),
+        );
+        assert_eq!(
+            marquee_selection(MarqueeMode::Add, &starting, touched.clone()),
+            HashSet::from([a.clone(), b.clone(), c.clone()]),
+        );
+        assert_eq!(
+            marquee_selection(MarqueeMode::Toggle, &starting, touched),
+            HashSet::from([a, c]),
         );
     }
 }
