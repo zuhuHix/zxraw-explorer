@@ -8,10 +8,10 @@
 //! show native file dialogs (answers come from `dialog` steps) and recycle into a sandbox
 //! folder inside the profile, never the real Recycle Bin.
 //!
-//! The app opens a real window (off-screen and ignoring real input, so the PC stays usable;
-//! set `ZXRAW_SHOW_WINDOW=1` to watch), so these tests run one at a time (a static lock enforces
-//! it; `--test-threads=1` is still recommended). Areas live in their own modules; run one
-//! with e.g. `cargo test -p forge-app --test e2e viewer:: -- --test-threads=1`.
+//! The app opens a real window (on a private, invisible desktop, ignoring real input, so the
+//! PC stays usable; set `ZXRAW_SHOW_WINDOW=1` to watch), so these tests run one at a time (a
+//! static lock enforces it; `--test-threads=1` is still recommended). Areas live in their own
+//! modules; run one with e.g. `cargo test -p forge-app --test e2e viewer:: -- --test-threads=1`.
 
 #![allow(dead_code)]
 

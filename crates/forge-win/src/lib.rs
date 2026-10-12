@@ -11,6 +11,7 @@
 //! * [`restart`] — which processes hold a file open (Restart Manager).
 //! * [`process`] — launching external tools without a shell.
 //! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download).
+//! * [`desktop`] — a private, invisible desktop for automated UI runs.
 
 use std::path::PathBuf;
 
@@ -18,6 +19,7 @@ use thiserror::Error;
 
 mod clipboard;
 mod integration;
+pub mod desktop;
 pub mod dragout;
 pub mod drives;
 pub mod files;

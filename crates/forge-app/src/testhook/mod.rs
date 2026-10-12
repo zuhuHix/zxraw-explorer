@@ -15,8 +15,8 @@
 //! * `ZXRAW_SCRIPT_SANDBOX=dir` — allowed root for navigation and asserted paths; defaults
 //!   to the script file's directory.
 //! * `ZXRAW_SCREENSHOT_DIR=dir` — a second allowed root, for `screenshot` PNGs only.
-//! * `ZXRAW_SHOW_WINDOW=1` — show the window normally. Otherwise automated runs open
-//!   off-screen, unfocused and deaf to real mouse and keyboard input ([`hide_window`]).
+//! * `ZXRAW_SHOW_WINDOW=1` — show the window normally. Otherwise automated runs open on a
+//!   private, invisible desktop and ignore real mouse and keyboard input ([`hide_window`]).
 //!
 //! Timing: commands run once the first listing finishes (or after 30 s regardless); the
 //! capture happens ~90 frames *after* the commands; a run is closed after 120 s at most.
@@ -95,10 +95,9 @@ pub fn env_requests_automation() -> bool {
         .any(|v| std::env::var_os(v).is_some())
 }
 
-/// True when an automated run should keep its window out of the user's way: it opens
-/// off-screen, unfocused and without a taskbar button, and ignores real mouse and keyboard
-/// input, so working on the PC while tests run can neither disturb a script nor be
-/// disturbed by it. Scripts inject their own input, so they run the same either way.
+/// True when an automated run should keep its window out of the user's way: it opens on a
+/// private Windows desktop that is never shown, and ignores real mouse and keyboard input,
+/// so working on the PC while tests run can neither disturb a script nor be disturbed by it. Scripts inject their own input, so they run the same either way.
 /// `ZXRAW_SHOW_WINDOW=1` shows the window normally, to watch a script run.
 pub fn hide_window() -> bool {
     env_requests_automation() && std::env::var_os("ZXRAW_SHOW_WINDOW").is_none()
