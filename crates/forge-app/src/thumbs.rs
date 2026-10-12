@@ -67,6 +67,14 @@ impl ThumbManager {
         &self.service
     }
 
+    /// Return an already-decoded image for a drag preview without queuing work or doing I/O.
+    pub fn cached_drag_thumbnail(&self, entry: &FileEntry) -> Option<Arc<ThumbImage>> {
+        BUCKETS.iter().find_map(|size| {
+            self.service
+                .get_cached(&entry.path, *size, entry.modified, entry.size)
+        })
+    }
+
     /// Call once per frame with the folders currently on screen. When they change, queued
     /// work for the old folders is dropped so the new view gets the workers immediately.
     pub fn begin_frame(&mut self, folders: Vec<PathBuf>) -> bool {
