@@ -245,10 +245,9 @@ pub fn reveal_in_explorer(_path: &Path) -> Result<()> {
 /// omitted. Labels: Desktop, Downloads, Documents, Pictures, Videos, Music, Home.
 #[cfg(windows)]
 pub fn known_folders() -> Vec<(String, PathBuf)> {
-    use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::{
         FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Music,
-        FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Videos, SHGetKnownFolderPath,
+        FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Videos,
     };
 
     const LIST: &[(&str, &windows::core::GUID)] = &[
@@ -261,22 +260,186 @@ pub fn known_folders() -> Vec<(String, PathBuf)> {
         ("Home", &FOLDERID_Profile),
     ];
 
-    let mut out = Vec::new();
-    for (label, id) in LIST {
-        let res = unsafe { SHGetKnownFolderPath(*id, Default::default(), None) };
-        let Ok(pwstr) = res else { continue };
-        let path = unsafe { pwstr.to_string() };
-        unsafe { CoTaskMemFree(Some(pwstr.0 as *const _)) };
-        if let Ok(path) = path {
-            out.push(((*label).to_string(), PathBuf::from(path)));
-        }
-    }
-    out
+    LIST.iter()
+        .filter_map(|(label, id)| Some(((*label).to_string(), known_folder(id)?)))
+        .collect()
 }
 
 #[cfg(not(windows))]
 pub fn known_folders() -> Vec<(String, PathBuf)> {
     Vec::new()
+}
+
+/// Points this user's shortcuts that launch `exe` (Start menu, desktop and pinned taskbar
+/// items) at the icon resource `index` inside `exe`, so they match the app icon setting.
+/// Shortcuts to anything else are never modified, and shortcuts that cannot be read are
+/// skipped. Returns how many shortcuts changed. Pinned taskbar items may keep showing the
+/// old icon until Explorer restarts.
+pub fn set_shortcut_icon(exe: &Path, index: i32) -> Result<usize> {
+    #[cfg(windows)]
+    {
+        set_shortcut_icon_in(&shortcut_dirs(), exe, index)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, index);
+        Err(WinError::Unsupported)
+    }
+}
+
+/// [`set_shortcut_icon`] over the `.lnk` files directly inside `dirs`.
+#[cfg(windows)]
+pub fn set_shortcut_icon_in(dirs: &[PathBuf], exe: &Path, index: i32) -> Result<usize> {
+    use windows::Win32::UI::Shell::{SHCNE_UPDATEITEM, SHCNF_PATHW, SHChangeNotify};
+
+    let _com = com::ComGuard::apartment_threaded()?;
+    let app = same_file_key(exe);
+    let mut changed = 0;
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+            {
+                continue;
+            }
+            let updated = Link::open(&path).and_then(|link| {
+                if same_file_key(&link.target()?) != app {
+                    return Ok(false);
+                }
+                let (icon, current) = link.icon()?;
+                // No icon location means "the target's first icon".
+                let icon = if icon.as_os_str().is_empty() {
+                    exe.to_path_buf()
+                } else {
+                    icon
+                };
+                if current == index && same_file_key(&icon) == app {
+                    return Ok(false);
+                }
+                link.set_icon(exe, index)?;
+                Ok(true)
+            });
+            match updated {
+                Ok(true) => {
+                    changed += 1;
+                    let wide = crate::to_wide(&path);
+                    unsafe {
+                        SHChangeNotify(
+                            SHCNE_UPDATEITEM,
+                            SHCNF_PATHW,
+                            Some(wide.as_ptr().cast()),
+                            None,
+                        )
+                    };
+                }
+                Ok(false) => {}
+                Err(e) => tracing::debug!("skipping shortcut {}: {e}", path.display()),
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Folders holding this user's shortcuts that may launch the app.
+#[cfg(windows)]
+fn shortcut_dirs() -> Vec<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_RoamingAppData};
+
+    let mut dirs: Vec<PathBuf> = [&FOLDERID_Programs, &FOLDERID_Desktop]
+        .into_iter()
+        .filter_map(known_folder)
+        .collect();
+    if let Some(roaming) = known_folder(&FOLDERID_RoamingAppData) {
+        dirs.push(roaming.join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"));
+    }
+    dirs
+}
+
+#[cfg(windows)]
+fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::SHGetKnownFolderPath;
+
+    let pwstr = unsafe { SHGetKnownFolderPath(id, Default::default(), None) }.ok()?;
+    let path = unsafe { pwstr.to_string() };
+    unsafe { CoTaskMemFree(Some(pwstr.0 as *const _)) };
+    path.ok().map(PathBuf::from)
+}
+
+/// Comparable form of a path: resolved when it exists, lowercase either way.
+#[cfg(windows)]
+fn same_file_key(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_lowercase()
+}
+
+/// A `.lnk` shortcut opened for reading and updating. Needs COM on the calling thread.
+#[cfg(windows)]
+struct Link {
+    link: windows::Win32::UI::Shell::IShellLinkW,
+    file: windows::Win32::System::Com::IPersistFile,
+}
+
+#[cfg(windows)]
+impl Link {
+    fn open(path: &Path) -> Result<Self> {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, STGM_READWRITE};
+        use windows::Win32::UI::Shell::ShellLink;
+        use windows::core::{Interface, PCWSTR};
+
+        let wide = crate::to_wide(path);
+        unsafe {
+            let link: windows::Win32::UI::Shell::IShellLinkW =
+                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|e| crate::api_err("CoCreateInstance(ShellLink)", e))?;
+            let file: windows::Win32::System::Com::IPersistFile =
+                link.cast().map_err(|e| crate::api_err("IPersistFile", e))?;
+            file.Load(PCWSTR(wide.as_ptr()), STGM_READWRITE)
+                .map_err(|e| crate::api_err("IPersistFile::Load", e))?;
+            Ok(Self { link, file })
+        }
+    }
+
+    fn target(&self) -> Result<PathBuf> {
+        let mut buf = vec![0u16; 32_768];
+        unsafe { self.link.GetPath(&mut buf, std::ptr::null_mut(), 0) }
+            .map_err(|e| crate::api_err("IShellLink::GetPath", e))?;
+        Ok(PathBuf::from(from_wide(&buf)))
+    }
+
+    fn icon(&self) -> Result<(PathBuf, i32)> {
+        let mut buf = vec![0u16; 32_768];
+        let mut index = 0;
+        unsafe { self.link.GetIconLocation(&mut buf, &mut index) }
+            .map_err(|e| crate::api_err("IShellLink::GetIconLocation", e))?;
+        Ok((PathBuf::from(from_wide(&buf)), index))
+    }
+
+    fn set_icon(&self, exe: &Path, index: i32) -> Result<()> {
+        use windows::core::PCWSTR;
+
+        let wide = crate::to_wide(exe);
+        unsafe {
+            self.link
+                .SetIconLocation(PCWSTR(wide.as_ptr()), index)
+                .map_err(|e| crate::api_err("IShellLink::SetIconLocation", e))?;
+            self.file
+                .Save(PCWSTR::null(), true)
+                .map_err(|e| crate::api_err("IPersistFile::Save", e))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn from_wide(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 /// Apartment-threaded COM initialisation for the current thread, undone on drop.
@@ -392,5 +555,50 @@ mod tests {
     #[test]
     fn recycle_empty_list_is_ok() {
         recycle(&[]).unwrap();
+    }
+
+    #[test]
+    fn shortcut_icons_change_only_for_shortcuts_to_the_app() {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+        use windows::core::{Interface, PCWSTR};
+
+        let d = tempfile::tempdir().unwrap();
+        let app = d.path().join("zxraw.exe");
+        let other = d.path().join("other.exe");
+        std::fs::write(&app, b"").unwrap();
+        std::fs::write(&other, b"").unwrap();
+        let _com = com::ComGuard::apartment_threaded().unwrap();
+        let make = |name: &str, target: &Path| {
+            let lnk = d.path().join(name);
+            let target = crate::to_wide(target);
+            let path = crate::to_wide(&lnk);
+            unsafe {
+                let link: IShellLinkW =
+                    CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+                link.SetPath(PCWSTR(target.as_ptr())).unwrap();
+                let file: IPersistFile = link.cast().unwrap();
+                file.Save(PCWSTR(path.as_ptr()), true).unwrap();
+            }
+            lnk
+        };
+        let app_lnk = make("ZXraw Explorer.lnk", &app);
+        let other_lnk = make("Other.lnk", &other);
+        let icon = |lnk: &Path| Link::open(lnk).unwrap().icon().unwrap();
+        let dirs = [d.path().to_path_buf()];
+
+        // A fresh shortcut already shows the first icon, so asking for it changes nothing.
+        assert_eq!(set_shortcut_icon_in(&dirs, &app, 0).unwrap(), 0);
+        assert_eq!(set_shortcut_icon_in(&dirs, &app, 1).unwrap(), 1);
+        let (path, index) = icon(&app_lnk);
+        assert_eq!((same_file_key(&path), index), (same_file_key(&app), 1));
+        assert_eq!(
+            icon(&other_lnk),
+            (PathBuf::new(), 0),
+            "other shortcuts are untouched"
+        );
+        assert_eq!(set_shortcut_icon_in(&dirs, &app, 1).unwrap(), 0);
+        assert_eq!(set_shortcut_icon_in(&dirs, &app, 0).unwrap(), 1);
+        assert_eq!(icon(&app_lnk).1, 0);
     }
 }

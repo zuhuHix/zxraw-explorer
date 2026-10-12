@@ -243,6 +243,11 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 
 * 🟡 egui desktop shell, list/grid modes, keyboard commands, themes, preview pane — source is
   present and commands are driven by the e2e scripts; visual review is not complete.
+* ✅ App icon choice (Settings › Appearance: Square or Round) — `forge-app/src/app_icon.rs`.
+  Both logos are embedded in `zxraw.exe` (square is the file icon). The choice switches the
+  window/taskbar icon live and repoints the user's own shortcuts to the app (Start menu,
+  desktop, pinned taskbar) — `forge-win/src/shell.rs::shortcut_icons_change_only_for_shortcuts_to_the_app`.
+  Pinned taskbar icons can lag until Explorer restarts.
 * ✅ Colour contrast meets WCAG AA for selected rows, hyperlinks, and focus rings — `forge-app/src/theme.rs`
   (`selected_row_text_meets_wcag_aa`, `hyperlink_color_meets_wcag_aa_on_its_theme_panel`,
   `focus_ring_meets_non_text_contrast_on_selection_and_panel`). Selection and focus colours come from one source.

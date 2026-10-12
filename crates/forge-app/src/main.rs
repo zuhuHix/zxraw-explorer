@@ -2,6 +2,7 @@
 
 mod actions;
 mod app;
+mod app_icon;
 mod batch_rename;
 mod breadcrumb;
 mod collections_ui;
@@ -138,18 +139,14 @@ fn main() -> eframe::Result {
         );
     }
 
-    let icon = image::load_from_memory(include_bytes!("../../../assets/zxraw.png"))
-        .expect("embedded application icon PNG must be valid")
-        .to_rgba8();
+    // Read early so the window opens with the chosen icon instead of switching after.
+    let app_icon = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"))
+        .app_icon;
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ZXraw Explorer")
         .with_inner_size([1360.0, 840.0])
         .with_min_inner_size([640.0, 400.0])
-        .with_icon(egui::IconData {
-            width: icon.width(),
-            height: icon.height(),
-            rgba: icon.into_raw(),
-        })
+        .with_icon(app_icon::icon_data(app_icon))
         .with_drag_and_drop(true);
     let hidden = testhook::hide_window();
     if hidden {

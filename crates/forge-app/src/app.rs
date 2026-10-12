@@ -75,6 +75,8 @@ pub struct ZxrawApp {
     pub viewer: Option<crate::viewer::Viewer>,
     pub notices: crate::notices::Notices,
     applied_theme: Option<(bool, f32)>,
+    /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
+    applied_icon: settings::AppIcon,
     type_ahead: (String, Instant),
     last_session_save: Instant,
     selection_summary: SelectionSummary,
@@ -158,6 +160,7 @@ impl ZxrawApp {
             focus_address: false,
             focus_filter: false,
             applied_theme: None,
+            applied_icon: settings.app_icon,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
@@ -177,6 +180,10 @@ impl ZxrawApp {
             forge_win::set_recycle_sandbox(Some(app.paths.data.join("recycle-sandbox")));
         }
         app.restore_session(session);
+        if app.settings.app_icon != settings::AppIcon::default() && !app.testhook.active() {
+            // Re-applied each start: reinstalling recreates the shortcuts with the default.
+            crate::app_icon::apply_to_shortcuts(app.settings.app_icon);
+        }
         // `forge.exe <folder>` opens that folder in a new tab.
         if let Some(arg) = std::env::args_os().nth(1) {
             let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
@@ -886,6 +893,13 @@ impl eframe::App for ZxrawApp {
         if self.applied_theme != Some((dark, self.settings.ui_scale)) {
             theme::apply(&ctx, dark, self.settings.ui_scale);
             self.applied_theme = Some((dark, self.settings.ui_scale));
+        }
+        if self.applied_icon != self.settings.app_icon {
+            self.applied_icon = self.settings.app_icon;
+            crate::app_icon::apply_to_window(&ctx, self.applied_icon);
+            if !self.testhook.active() {
+                crate::app_icon::apply_to_shortcuts(self.applied_icon);
+            }
         }
 
         // Files dropped from other applications go into the focused pane's folder.
