@@ -26,6 +26,7 @@ mod integration;
 pub mod desktop;
 pub mod dragout;
 pub mod drives;
+pub mod ext_search;
 pub mod files;
 pub mod http;
 pub mod process;

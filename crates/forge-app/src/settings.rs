@@ -102,6 +102,9 @@ pub struct Settings {
     /// Keyboard shortcut overrides by command id (see `commands::Cmd::id`). Absent = the
     /// built-in default; `null` = unbound.
     pub keybindings: crate::commands::Keybindings,
+    /// Where the search window looks: "index" (the library index, default), "everything"
+    /// (voidtools Everything) or "windows" (Windows Search). Unknown values mean "index".
+    pub search_backend: String,
 }
 
 impl Default for Settings {
@@ -132,6 +135,7 @@ impl Default for Settings {
             last_update_check: None,
             skipped_update: None,
             keybindings: Default::default(),
+            search_backend: "index".into(),
         }
     }
 }
