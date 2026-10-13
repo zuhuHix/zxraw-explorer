@@ -835,11 +835,29 @@ fn matches_delete_snapshot(
 /// pair would copy a folder into itself (and Mirror could recycle files of the source). Real
 /// paths are compared when both resolve, so a junction or a differently spelled path is caught.
 fn roots_overlap(left: &Path, right: &Path) -> bool {
-    let (left, right) = match (fs::canonicalize(left), fs::canonicalize(right)) {
-        (Ok(l), Ok(r)) => (l, r),
-        _ => (left.to_path_buf(), right.to_path_buf()),
-    };
+    let (left, right) = (resolve_existing_prefix(left), resolve_existing_prefix(right));
     crate::paths::is_within(&left, &right) || crate::paths::is_within(&right, &left)
+}
+
+/// The real path of `path`: its longest existing ancestor is canonicalized (resolving
+/// junctions and spelling) and the missing remainder is appended unchanged. Both roots are
+/// resolved the same way, so a missing folder is still compared in canonical form.
+fn resolve_existing_prefix(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut missing = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(real) = fs::canonicalize(current) {
+            return missing.iter().rev().fold(real, |acc: PathBuf, part| acc.join(part));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return crate::paths::lexical_normalize(&absolute),
+        }
+    }
 }
 
 /// Like [`path_is_within_real_directories`] for a path that may not exist yet: every
@@ -985,6 +1003,14 @@ pub fn execute_sync(
     ctx: &JobCtx<'_>,
 ) -> OpReport {
     let mut report = OpReport::default();
+    // Checked again here: a folder may have been moved or recreated since the preview.
+    if !plan.actions.is_empty() && roots_overlap(&plan.left, &plan.right) {
+        report.failed.push(OpIssue::new(
+            &plan.right,
+            "the two folders are the same or one is inside the other; nothing was changed",
+        ));
+        return report;
+    }
     ctx.progress.add_total_items(plan.actions.len() as u64);
     ctx.progress.add_total_bytes(plan.bytes_to_copy);
     if plan.mode != SyncMode::Mirror && plan.deletes() > 0 {
@@ -1243,6 +1269,10 @@ pub fn execute_sync(
                 // published: a long copy leaves time for someone to edit the destination.
                 let destination_still_unchanged = || {
                     expected.is_some()
+                        && path_is_within_real_directories(
+                            dest_root,
+                            rel.parent().unwrap_or(Path::new("")),
+                        )
                         && matches_snapshot(&dest, dest_expect, dest_fp, Coverage::Full, ctx)
                 };
                 match ops::copy_file_atomic_guarded(
@@ -1787,6 +1817,31 @@ mod tests {
                 assert_eq!(plan.skipped.len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn overlap_is_found_when_the_inner_root_does_not_exist_yet() {
+        let d = tempfile::tempdir().unwrap();
+        let outer = d.path().join("Photos");
+        fs::create_dir_all(&outer).unwrap();
+        // Spelled differently (`.` component) and missing: still inside `outer`.
+        let inner = d.path().join(".").join("Photos").join("Backup").join("2026");
+        assert!(roots_overlap(&outer, &inner));
+        assert!(roots_overlap(&inner, &outer));
+        assert!(!roots_overlap(&outer, &d.path().join("Elsewhere")));
+    }
+
+    #[test]
+    fn execution_refuses_a_plan_whose_roots_now_overlap() {
+        let (_d, l, r) = two_way_fixture();
+        fs::write(l.join("a.txt"), b"a").unwrap();
+        let (mut plan, cancel, progress) = two_way_plan(&l, &r, &CompareOptions::default());
+        assert!(!plan.actions.is_empty());
+        plan.right = l.join("inside");
+        let result = execute_sync(&plan, true, None, &JobCtx::new(&cancel, &progress));
+        assert_eq!(result.failed.len(), 1, "{result:?}");
+        assert!(result.done.is_empty());
+        assert!(!l.join("inside").exists());
     }
 
     #[cfg(windows)]

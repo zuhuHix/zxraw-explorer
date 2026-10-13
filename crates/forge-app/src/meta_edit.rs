@@ -112,6 +112,10 @@ struct MetaEditUi {
     /// Sidecar state of the first `PREVIEW_LIMIT` targets; rebuilt when the selection changes.
     snapshots: Vec<Snapshot>,
     snapshot_key: Vec<PathBuf>,
+    /// Bumped for every preview request; a worker's result is kept only if it is the latest.
+    snapshot_generation: u64,
+    /// A preview worker is running. At most one runs; a newer selection waits for it.
+    snapshot_loading: bool,
     run: Option<Run>,
 }
 
@@ -143,17 +147,22 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
         // Sidecars are read on a worker thread so a slow share never stalls the UI; a result
         // for a selection that has changed in the meantime is dropped.
         let mut state = ui_state().lock();
-        if state.snapshot_key != key {
+        if state.snapshot_key != key && !state.snapshot_loading {
             state.snapshots.clear();
             state.snapshot_key = key.clone();
+            state.snapshot_generation += 1;
+            state.snapshot_loading = true;
+            let generation = state.snapshot_generation;
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 let snapshots: Vec<Snapshot> = key.iter().map(|path| snapshot(path)).collect();
                 let mut state = ui_state().lock();
-                if state.snapshot_key == key {
+                state.snapshot_loading = false;
+                if state.snapshot_generation == generation && state.snapshot_key == key {
                     state.snapshots = snapshots;
                 }
                 drop(state);
+                // The next frame starts a worker for a selection that changed meanwhile.
                 ctx.request_repaint();
             });
         }
@@ -355,7 +364,9 @@ fn report_finished_run(app: &mut ZxrawApp) {
             _ => None,
         };
         if notice.is_some() {
+            // Re-read the preview; a worker started before the edit must not overwrite it.
             state.snapshot_key.clear();
+            state.snapshot_generation += 1;
         }
         notice
     };
