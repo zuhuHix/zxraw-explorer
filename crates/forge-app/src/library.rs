@@ -636,6 +636,7 @@ fn sidecar_update(change: &AnnotationChange) -> SidecarUpdate {
         label: change.label.map(|l| l.map(|c| xmp_label(c).to_string())),
         add_keywords: change.add_tags.clone(),
         remove_keywords: change.remove_tags.clone(),
+        ..Default::default()
     }
 }
 
