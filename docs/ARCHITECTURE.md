@@ -8,7 +8,7 @@ project's working name; it never appears in the UI.
 | Area | Choice | Why |
 |---|---|---|
 | Language | Rust 2024 (MSRV 1.90) | Requirement; memory safety for untrusted media parsing. |
-| UI | **egui / eframe 0.36** (glow backend, AccessKit enabled) | Pure Rust, one process, no web runtime. Immediate mode makes virtualized lists/grids of 50k+ rows trivial (`show_rows`), redraws only on input/repaint requests, renders on the GPU. AccessKit gives UI Automation (screen readers). Trade-off vs Tauri: less "native" look, but no IPC/serialization boundary between the file engine and the view, and far lower memory. Native Windows dialogs/shell menus are still used via `rfd` / `forge-win`. |
+| UI | **egui / eframe 0.36** (wgpu on DX12, AccessKit enabled) | Pure Rust, one process, no web runtime. Immediate mode makes virtualized lists/grids of 50k+ rows trivial (`show_rows`), redraws only on input/repaint requests, renders on the GPU. AccessKit gives UI Automation (screen readers). Trade-off vs Tauri: less "native" look, but no IPC/serialization boundary between the file engine and the view, and far lower memory. Native Windows dialogs/shell menus are still used via `rfd` / `forge-win`. |
 | Database | SQLite via `rusqlite` (bundled) | Single-file, transactional, WAL mode, FTS-capable. |
 | Hashing | BLAKE3 (verification/duplicates), xxh3 (quick partial-hash prefilter) | BLAKE3 is fast and cryptographically strong; xxh3 is cheap for staging. |
 | Images | `image` crate (JPEG/PNG/TIFF/WebP/GIF/BMP) + WIC fallback (Phase 3) | Pure Rust decoders for the common path; WIC adds HEIC/AVIF/RAW codecs the user has installed. |
@@ -50,6 +50,15 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
 * Long user-visible jobs (copy queues, indexing, ingest, duplicate scans) are registered in
   `JobRegistry` with pause/cancel and a report log.
 * Panics inside workers are caught; a corrupt file cannot take down the app.
+
+## Startup
+
+* The window is created hidden and shown after the first frame is painted (eframe). A saved
+  maximized state is applied by `startup::maximize_hidden` while the window is DWM-cloaked,
+  not by winit, which would flash a blank window on screen while maximizing it.
+* Graphics use wgpu on DX12 only, so the Vulkan and OpenGL drivers are not loaded at startup.
+  WARP (software) is DX12's fallback when the GPU driver lacks DX12. Setting `WGPU_BACKEND`
+  (`vulkan`, `gl`, `dx12`) restores eframe's own backend choice.
 
 ## Data locations
 

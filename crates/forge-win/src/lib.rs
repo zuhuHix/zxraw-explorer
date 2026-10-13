@@ -13,6 +13,7 @@
 //! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download and the
 //!   update check).
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
+//! * [`window`] — window placement that never flashes on screen (hidden maximize).
 //! * Opt-in per-user integration: the folder context menu and photo file types
 //!   ("Open with" / Settings > Default apps).
 
@@ -34,6 +35,7 @@ pub mod restart;
 pub mod shell;
 mod user_choice;
 pub mod watch;
+pub mod window;
 
 pub use clipboard::{
     ClipboardEffect, clear_if_owned_files, clipboard_sequence, get_files, set_files,
