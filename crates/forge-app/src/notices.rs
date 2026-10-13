@@ -225,6 +225,7 @@ fn crash_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
 }
 
 fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let keys = app.settings.keybindings.clone();
     let Some(state) = app.notices.welcome.as_mut() else {
         return;
     };
@@ -254,7 +255,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.set_max_width(500.0);
-            let logo = crate::app_icon::preview(ctx, app.settings.app_icon, app.settings.accent);
+            let logo = crate::app_icon::preview(ctx, app.settings.app_icon);
             ui.horizontal(|ui| {
                 ui.image((logo.id(), egui::vec2(36.0, 36.0)));
                 ui.label("A fast file manager for photographers and videographers.");
@@ -311,7 +312,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             ui.heading("Handy keys");
             egui::Grid::new("welcome-keys").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
                 for cmd in [Cmd::CommandPalette, Cmd::Ingest, Cmd::CullMode, Cmd::Search, Cmd::ToggleDualPane, Cmd::Rename] {
-                    ui.label(RichText::new(cmd.shortcut_text(ui.ctx())).monospace());
+                    ui.label(RichText::new(cmd.binding_text(&keys)).monospace());
                     ui.label(cmd.label());
                     ui.end_row();
                 }

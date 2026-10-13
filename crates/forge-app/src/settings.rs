@@ -14,16 +14,26 @@ pub enum ThemeChoice {
     System,
 }
 
-/// Which logo the window, taskbar and the app's shortcuts show (see `app_icon`).
+/// The colour of the app icon's folder-camera mark (see `app_icon`). Independent of the UI
+/// accent. Settings files from before the colour choice ("Square" or "Round") load as
+/// Graphite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AppIcon {
     #[default]
-    Square,
-    Round,
+    #[serde(alias = "Square", alias = "Round")]
+    Graphite,
+    Blue,
+    Steel,
+    Sky,
+    Teal,
+    Green,
+    Purple,
+    Pink,
+    Red,
+    Orange,
 }
 
-/// The accent colour preset (see `theme::ACCENTS`): selection, focus, indicators, links
-/// and the app icon's tile.
+/// The accent colour preset (see `theme::ACCENTS`): selection, focus, indicators and links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Accent {
     #[default]
@@ -89,6 +99,9 @@ pub struct Settings {
     pub last_update_check: Option<i64>,
     /// A version the user chose to skip: its notice is not shown again.
     pub skipped_update: Option<String>,
+    /// Keyboard shortcut overrides by command id (see `commands::Cmd::id`). Absent = the
+    /// built-in default; `null` = unbound.
+    pub keybindings: crate::commands::Keybindings,
 }
 
 impl Default for Settings {
@@ -96,7 +109,7 @@ impl Default for Settings {
         Self {
             theme: ThemeChoice::Dark,
             ui_scale: 1.0,
-            app_icon: AppIcon::Square,
+            app_icon: AppIcon::Graphite,
             accent: Accent::Blue,
             show_hidden: false,
             show_system: false,
@@ -118,6 +131,7 @@ impl Default for Settings {
             check_updates: true,
             last_update_check: None,
             skipped_update: None,
+            keybindings: Default::default(),
         }
     }
 }
@@ -210,4 +224,21 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_square_and_round_icon_settings_load_as_graphite() {
+        for old in ["\"Square\"", "\"Round\""] {
+            let icon: AppIcon = serde_json::from_str(old).unwrap();
+            assert_eq!(icon, AppIcon::Graphite, "{old}");
+        }
+        let settings: Settings = serde_json::from_str(r#"{"app_icon":"Round"}"#).unwrap();
+        assert_eq!(settings.app_icon, AppIcon::Graphite);
+        let settings: Settings = serde_json::from_str(r#"{"app_icon":"Steel"}"#).unwrap();
+        assert_eq!(settings.app_icon, AppIcon::Steel);
+    }
 }

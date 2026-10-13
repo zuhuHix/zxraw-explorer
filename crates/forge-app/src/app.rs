@@ -79,7 +79,7 @@ pub struct ZxrawApp {
     launch_photo: Option<PathBuf>,
     applied_theme: Option<(bool, settings::Accent, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
-    applied_icon: (settings::AppIcon, settings::Accent),
+    applied_icon: settings::AppIcon,
     type_ahead: (String, Instant),
     last_session_save: Instant,
     selection_summary: SelectionSummary,
@@ -163,7 +163,7 @@ impl ZxrawApp {
             focus_address: false,
             focus_filter: false,
             applied_theme: None,
-            applied_icon: (settings.app_icon, settings.accent),
+            applied_icon: settings.app_icon,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
@@ -186,7 +186,7 @@ impl ZxrawApp {
         app.restore_session(session);
         if app.applied_icon != Default::default() && !app.testhook.active() {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
-            crate::app_icon::apply_to_shortcuts(app.settings.app_icon, app.settings.accent);
+            crate::app_icon::apply_to_shortcuts(app.settings.app_icon);
         }
         // `zxraw.exe <folder>` opens that folder in a new tab; `zxraw.exe <photo>` opens its
         // folder with the photo selected and shows it in the viewer.
@@ -522,14 +522,20 @@ impl ZxrawApp {
     // -----------------------------------------------------------------------
 
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        if self.viewer.is_some() || self.palette.is_some() || crate::actions::modal_open(self) {
+        // While the settings page is capturing a new shortcut, the keys belong to it.
+        if self.viewer.is_some()
+            || self.palette.is_some()
+            || crate::actions::modal_open(self)
+            || self.ops.settings_ui.capture.is_some()
+        {
             return;
         }
         let text_focus = ctx.memory(|m| m.focused().is_some());
         let mut cmds = Vec::new();
+        let overrides = &self.settings.keybindings;
         ctx.input_mut(|i| {
             for &c in Cmd::ALL {
-                if let Some(sc) = c.shortcut() {
+                if let Some(sc) = c.binding(overrides) {
                     // While typing, keys belong to the text field: only commands that cannot
                     // touch files or the selection are allowed through.
                     if text_focus && !allowed_while_typing(c) {
@@ -710,7 +716,7 @@ impl ZxrawApp {
             if let Some(i) = close {
                 self.close_tab(i);
             }
-            if ui.add(theme::ghost_button("+")).on_hover_text("New tab (Ctrl+T)").clicked() {
+            if ui.add(theme::ghost_button("+")).on_hover_text(crate::commands::tooltip("New tab", Cmd::NewTab, &self.settings.keybindings)).clicked() {
                 self.run(Cmd::NewTab, &ui.ctx().clone());
             }
         });
@@ -722,23 +728,26 @@ impl ZxrawApp {
             let p = self.pane();
             let (cb, cf) = (p.can_back(), p.can_forward());
             ui.spacing_mut().item_spacing.x = 2.0;
-            if ui.add_enabled(cb, theme::ghost_button("⏴")).on_hover_text("Back (Alt+Left)").clicked() {
+            if ui.add_enabled(cb, theme::ghost_button("⏴")).on_hover_text(crate::commands::tooltip("Back", Cmd::Back, &self.settings.keybindings)).clicked() {
                 self.run(Cmd::Back, &ctx);
             }
-            if ui.add_enabled(cf, theme::ghost_button("⏵")).on_hover_text("Forward (Alt+Right)").clicked() {
+            if ui.add_enabled(cf, theme::ghost_button("⏵")).on_hover_text(crate::commands::tooltip("Forward", Cmd::Forward, &self.settings.keybindings)).clicked() {
                 self.run(Cmd::Forward, &ctx);
             }
-            if ui.add(theme::ghost_button("⏶")).on_hover_text("Up (Alt+Up)").clicked() {
+            if ui.add(theme::ghost_button("⏶")).on_hover_text(crate::commands::tooltip("Up", Cmd::Up, &self.settings.keybindings)).clicked() {
                 self.run(Cmd::Up, &ctx);
             }
-            if ui.add(theme::ghost_button("⟳")).on_hover_text("Refresh (F5)").clicked() {
+            if ui.add(theme::ghost_button("⟳")).on_hover_text(crate::commands::tooltip("Refresh", Cmd::Refresh, &self.settings.keybindings)).clicked() {
                 self.run(Cmd::Refresh, &ctx);
             }
             ui.add_space(4.0);
 
             // Right-aligned controls first so the address bar gets the remaining width.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(theme::ghost_button("☰")).on_hover_text("Command palette (Ctrl+Shift+P)").clicked() {
+                if ui.add(theme::ghost_button("⚙")).on_hover_text(crate::commands::tooltip("Settings", Cmd::Settings, &self.settings.keybindings)).clicked() {
+                    self.run(Cmd::Settings, &ctx);
+                }
+                if ui.add(theme::ghost_button("☰")).on_hover_text(crate::commands::tooltip("Command palette", Cmd::CommandPalette, &self.settings.keybindings)).clicked() {
                     self.run(Cmd::CommandPalette, &ctx);
                 }
                 ui.add_space(4.0);
@@ -750,10 +759,10 @@ impl ZxrawApp {
                     self.run(Cmd::ViewDetails, &ctx);
                 }
                 let dual = self.tab().right.is_some();
-                if theme::pill_toggle(ui, dual, "◫").on_hover_text("Dual pane (F3)").clicked() {
+                if theme::pill_toggle(ui, dual, "◫").on_hover_text(crate::commands::tooltip("Dual pane", Cmd::ToggleDualPane, &self.settings.keybindings)).clicked() {
                     self.run(Cmd::ToggleDualPane, &ctx);
                 }
-                if theme::pill_toggle(ui, self.show_preview, "▣").on_hover_text("Preview panel (Alt+P)").clicked() {
+                if theme::pill_toggle(ui, self.show_preview, "▣").on_hover_text(crate::commands::tooltip("Preview panel", Cmd::TogglePreview, &self.settings.keybindings)).clicked() {
                     self.run(Cmd::TogglePreview, &ctx);
                 }
                 ui.add_space(6.0);
@@ -913,6 +922,11 @@ impl eframe::App for ZxrawApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        crate::commands::publish_key_state(
+            ctx,
+            &self.settings.keybindings,
+            self.ops.settings_ui.capture.is_some(),
+        );
         let mut changed = false;
         for t in &mut self.tabs {
             changed |= t.left.poll();
@@ -948,12 +962,12 @@ impl eframe::App for ZxrawApp {
             theme::apply(&ctx, dark, self.settings.accent, self.settings.ui_scale);
             self.applied_theme = Some(look);
         }
-        let icon = (self.settings.app_icon, self.settings.accent);
+        let icon = self.settings.app_icon;
         if self.applied_icon != icon {
             self.applied_icon = icon;
-            crate::app_icon::apply_to_window(&ctx, icon.0, icon.1);
+            crate::app_icon::apply_to_window(&ctx, icon);
             if !self.testhook.active() {
-                crate::app_icon::apply_to_shortcuts(icon.0, icon.1);
+                crate::app_icon::apply_to_shortcuts(icon);
             }
         }
 
@@ -1052,7 +1066,7 @@ impl eframe::App for ZxrawApp {
 impl ZxrawApp {
     fn palette_ui(&mut self, ctx: &egui::Context) {
         if let Some(mut pal) = self.palette.take() {
-            if let Some(cmd) = pal.show(ctx) {
+            if let Some(cmd) = pal.show(ctx, &self.settings.keybindings) {
                 self.run(cmd, ctx);
             } else if pal.open {
                 self.palette = Some(pal);

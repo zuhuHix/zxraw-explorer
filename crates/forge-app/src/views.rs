@@ -52,6 +52,60 @@ pub struct Annotation {
     pub pick: i8,
 }
 
+/// What a plain (non-media) file is, for its list/grid icon. Media kinds come from
+/// `forge_core::model::media_kind_for_ext`; this only splits the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainKind {
+    Code,
+    Text,
+    Sheet,
+    Executable,
+    Config,
+    Other,
+}
+
+const CODE_EXTS: &[&str] = &[
+    "py", "rs", "js", "mjs", "ts", "tsx", "jsx", "c", "cc", "cpp", "h", "hpp", "cs", "java", "go",
+    "kt", "swift", "rb", "php", "lua", "html", "htm", "css", "scss", "json", "toml", "yaml", "yml",
+    "xml", "sh", "ps1", "bat", "cmd",
+];
+const TEXT_EXTS: &[&str] = &[
+    "txt", "md", "log", "rtf", "pdf", "doc", "docx", "odt", "ppt", "pptx", "epub",
+];
+const SHEET_EXTS: &[&str] = &["xls", "xlsx", "xlsm", "ods", "csv", "tsv"];
+const EXECUTABLE_EXTS: &[&str] = &["exe", "msi", "dll", "com", "scr", "msix", "appx"];
+const CONFIG_EXTS: &[&str] = &["ini", "cfg", "conf", "env", "properties", "lock"];
+/// Extension-less files that are documentation rather than unknown data.
+const TEXT_NAMES: &[&str] = &["LICENSE", "COPYING", "NOTICE", "README", "CHANGELOG", "AUTHORS"];
+
+/// Category of a non-media file from its name and lowercase extension (`""` when none).
+pub fn plain_kind(name: &str, ext: &str) -> PlainKind {
+    if name.starts_with('.') {
+        // Dotfiles such as .gitignore or .editorconfig have no extension in Rust's sense.
+        return PlainKind::Config;
+    }
+    if ext.is_empty() {
+        return if TEXT_NAMES.contains(&name.to_ascii_uppercase().as_str()) {
+            PlainKind::Text
+        } else {
+            PlainKind::Other
+        };
+    }
+    if CODE_EXTS.contains(&ext) {
+        PlainKind::Code
+    } else if TEXT_EXTS.contains(&ext) {
+        PlainKind::Text
+    } else if SHEET_EXTS.contains(&ext) {
+        PlainKind::Sheet
+    } else if EXECUTABLE_EXTS.contains(&ext) {
+        PlainKind::Executable
+    } else if CONFIG_EXTS.contains(&ext) {
+        PlainKind::Config
+    } else {
+        PlainKind::Other
+    }
+}
+
 pub fn icon_for(e: &FileEntry) -> &'static str {
     match e.kind {
         EntryKind::Dir => "🗀",
@@ -60,11 +114,17 @@ pub fn icon_for(e: &FileEntry) -> &'static str {
             MediaKind::Image | MediaKind::Raw => "🖼",
             MediaKind::Video => "🎞",
             MediaKind::Audio => "🎵",
-            MediaKind::Archive => "🗄",
+            MediaKind::Archive => "🗜",
             MediaKind::Sidecar => "🏷",
             MediaKind::Project => "🎬",
-            MediaKind::Document => "🗋",
-            MediaKind::Other => "🗋",
+            MediaKind::Document | MediaKind::Other => match plain_kind(&e.name, &e.ext) {
+                PlainKind::Code => "⌨",
+                PlainKind::Text => "🖹",
+                PlainKind::Sheet => "📊",
+                PlainKind::Executable => "⚙",
+                PlainKind::Config => "🔧",
+                PlainKind::Other => "🗋",
+            },
         },
     }
 }
@@ -79,7 +139,15 @@ pub fn icon_color(e: &FileEntry) -> Color32 {
             MediaKind::Video => Color32::from_rgb(170, 120, 220),
             MediaKind::Audio => Color32::from_rgb(90, 180, 200),
             MediaKind::Archive => Color32::from_rgb(190, 150, 100),
-            _ => NEUTRAL_ICON,
+            MediaKind::Sidecar | MediaKind::Project => NEUTRAL_ICON,
+            MediaKind::Document | MediaKind::Other => match plain_kind(&e.name, &e.ext) {
+                PlainKind::Code => Color32::from_rgb(110, 150, 230),
+                PlainKind::Text => Color32::from_rgb(150, 170, 190),
+                PlainKind::Sheet => Color32::from_rgb(110, 185, 140),
+                PlainKind::Executable => Color32::from_rgb(220, 120, 120),
+                PlainKind::Config => Color32::from_rgb(165, 160, 205),
+                PlainKind::Other => NEUTRAL_ICON,
+            },
         },
     }
 }
@@ -155,13 +223,14 @@ const CONTEXT_BACKGROUND: &[Option<Cmd>] = &[
 ];
 
 fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], out: &mut Vec<ViewEvent>) {
+    let overrides = crate::commands::published_key_state(ui.ctx()).overrides;
     for it in items {
         match it {
             None => {
                 ui.separator();
             }
             Some(c) => {
-                let sc = c.shortcut_text(ui.ctx());
+                let sc = c.binding_text(&overrides);
                 if ui
                     .add(egui::Button::new(c.label()).shortcut_text(sc))
                     .clicked()
@@ -711,12 +780,16 @@ fn handle_focused_view_keys(
         return;
     }
 
+    let key_state = crate::commands::published_key_state(ui.ctx());
+    if key_state.capturing {
+        return;
+    }
     // The app's global handler treats every focused widget as a text field. Keep its
     // shortcuts and cursor navigation available while an accessible row/tile owns focus.
     let mut seen_commands = Vec::new();
     ui.ctx().input_mut(|input| {
         for command in Cmd::ALL {
-            if let Some(shortcut) = command.shortcut()
+            if let Some(shortcut) = command.binding(&key_state.overrides)
                 && consume_exact_shortcut(input, &shortcut)
                 && !seen_commands.contains(command)
             {
@@ -2613,5 +2686,24 @@ mod grouped_grid_tests {
         let expanded = grid_layout(&pane).expect("expanded stack");
         assert_eq!(expanded.items.len(), 4);
         assert_eq!(expanded.item_of_vis, vec![0, 1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod plain_kind_tests {
+    use super::{PlainKind, plain_kind};
+
+    #[test]
+    fn extensions_and_dotfiles_map_to_categories() {
+        assert_eq!(plain_kind("main.py", "py"), PlainKind::Code);
+        assert_eq!(plain_kind("Cargo.toml", "toml"), PlainKind::Code);
+        assert_eq!(plain_kind("notes.txt", "txt"), PlainKind::Text);
+        assert_eq!(plain_kind("manual.pdf", "pdf"), PlainKind::Text);
+        assert_eq!(plain_kind("budget.xlsx", "xlsx"), PlainKind::Sheet);
+        assert_eq!(plain_kind("setup.exe", "exe"), PlainKind::Executable);
+        assert_eq!(plain_kind(".gitignore", ""), PlainKind::Config);
+        assert_eq!(plain_kind("LICENSE", ""), PlainKind::Text);
+        assert_eq!(plain_kind("archive.bin", "bin"), PlainKind::Other);
+        assert_eq!(plain_kind("Makefile", ""), PlainKind::Other);
     }
 }

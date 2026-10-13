@@ -1,6 +1,8 @@
 //! Every user action is a [`Cmd`]: keyboard shortcuts, menus, toolbar buttons and the
 //! command palette all dispatch through the same enum so they stay consistent.
 
+use std::collections::BTreeMap;
+
 use egui::{Key, KeyboardShortcut, Modifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -185,6 +187,100 @@ impl Cmd {
         Cmd::CheckForUpdates,
     ];
 
+    /// Stable identifier used as the key in `Settings::keybindings`. Never rename one: it's
+    /// what saved user shortcuts refer to.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Back => "Back",
+            Self::Forward => "Forward",
+            Self::Up => "Up",
+            Self::Refresh => "Refresh",
+            Self::Open => "Open",
+            Self::NewTab => "NewTab",
+            Self::CloseTab => "CloseTab",
+            Self::NextTab => "NextTab",
+            Self::PrevTab => "PrevTab",
+            Self::ToggleDualPane => "ToggleDualPane",
+            Self::SwitchPane => "SwitchPane",
+            Self::FocusAddress => "FocusAddress",
+            Self::FocusFilter => "FocusFilter",
+            Self::SelectAll => "SelectAll",
+            Self::SelectNone => "SelectNone",
+            Self::InvertSelection => "InvertSelection",
+            Self::Copy => "Copy",
+            Self::Cut => "Cut",
+            Self::Paste => "Paste",
+            Self::CopyToOtherPane => "CopyToOtherPane",
+            Self::MoveToOtherPane => "MoveToOtherPane",
+            Self::Recycle => "Recycle",
+            Self::DeletePermanently => "DeletePermanently",
+            Self::Rename => "Rename",
+            Self::BatchRename => "BatchRename",
+            Self::NewFolder => "NewFolder",
+            Self::NewFile => "NewFile",
+            Self::CopyPath => "CopyPath",
+            Self::Properties => "Properties",
+            Self::OpenWith => "OpenWith",
+            Self::RevealInExplorer => "RevealInExplorer",
+            Self::ToggleHidden => "ToggleHidden",
+            Self::TogglePreview => "TogglePreview",
+            Self::ToggleSidebar => "ToggleSidebar",
+            Self::ViewDetails => "ViewDetails",
+            Self::ViewGrid => "ViewGrid",
+            Self::ThumbsBigger => "ThumbsBigger",
+            Self::ThumbsSmaller => "ThumbsSmaller",
+            Self::CommandPalette => "CommandPalette",
+            Self::BookmarkFolder => "BookmarkFolder",
+            Self::ShowJobs => "ShowJobs",
+            Self::Settings => "Settings",
+            Self::Search => "Search",
+            Self::FolderSize => "FolderSize",
+            Self::FindDuplicates => "FindDuplicates",
+            Self::ChecksumFiles => "ChecksumFiles",
+            Self::CompareFolders => "CompareFolders",
+            Self::CullMode => "CullMode",
+            Self::CompareImages => "CompareImages",
+            Self::Ingest => "Ingest",
+            Self::ToggleTheme => "ToggleTheme",
+            Self::Undo => "Undo",
+            Self::ZoomIn => "ZoomIn",
+            Self::ZoomOut => "ZoomOut",
+            Self::ZoomReset => "ZoomReset",
+            Self::Rate0 => "Rate0",
+            Self::Rate1 => "Rate1",
+            Self::Rate2 => "Rate2",
+            Self::Rate3 => "Rate3",
+            Self::Rate4 => "Rate4",
+            Self::Rate5 => "Rate5",
+            Self::LabelRed => "LabelRed",
+            Self::LabelYellow => "LabelYellow",
+            Self::LabelGreen => "LabelGreen",
+            Self::LabelBlue => "LabelBlue",
+            Self::LabelPurple => "LabelPurple",
+            Self::LabelNone => "LabelNone",
+            Self::MarkPick => "MarkPick",
+            Self::MarkReject => "MarkReject",
+            Self::Unflag => "Unflag",
+            Self::IndexFolder => "IndexFolder",
+            Self::OpenIn => "OpenIn",
+            Self::Collections => "Collections",
+            Self::AddToCollection => "AddToCollection",
+            Self::GenerateProxies => "GenerateProxies",
+            Self::ContactSheet => "ContactSheet",
+            Self::BrowseArchive => "BrowseArchive",
+            Self::CreateArchive => "CreateArchive",
+            Self::SplitFile => "SplitFile",
+            Self::JoinFiles => "JoinFiles",
+            Self::GroupSimilar => "GroupSimilar",
+            Self::ExportMetadata => "ExportMetadata",
+            Self::LocateProxies => "LocateProxies",
+            Self::SelectOriginals => "SelectOriginals",
+            Self::SelectExports => "SelectExports",
+            Self::DownloadFfmpeg => "DownloadFfmpeg",
+            Self::CheckForUpdates => "CheckForUpdates",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         use Cmd::*;
         match self {
@@ -346,9 +442,196 @@ impl Cmd {
         }
     }
 
-    pub fn shortcut_text(self, ctx: &egui::Context) -> String {
-        self.shortcut()
-            .map(|s| ctx.format_shortcut(&s))
-            .unwrap_or_default()
+    /// The shortcut in effect for this command: the user's override from settings if there
+    /// is one (`None` = unbound), otherwise the built-in default from [`Cmd::shortcut`].
+    /// An override that does not parse is ignored and the default applies.
+    pub fn binding(self, overrides: &Keybindings) -> Option<KeyboardShortcut> {
+        match overrides.get(self.id()) {
+            None => self.shortcut(),
+            Some(None) => None,
+            Some(Some(text)) if text.trim().is_empty() => None,
+            Some(Some(text)) => parse_shortcut(text).ok().or_else(|| self.shortcut()),
+        }
+    }
+
+    /// Display text of [`Cmd::binding`], empty when unbound.
+    pub fn binding_text(self, overrides: &Keybindings) -> String {
+        self.binding(overrides).map(|s| shortcut_text(&s)).unwrap_or_default()
+    }
+
+    /// Another command whose effective binding is already `text` (a canonical shortcut
+    /// string, see [`shortcut_text`]), if any.
+    pub fn conflicting(self, overrides: &Keybindings, text: &str) -> Option<Cmd> {
+        Cmd::ALL
+            .iter()
+            .copied()
+            .filter(|c| *c != self)
+            .find(|c| c.binding_text(overrides) == text)
+    }
+}
+
+/// User shortcut overrides keyed by [`Cmd::id`]. `None` (JSON `null`) means unbound; a
+/// missing key means the built-in default applies.
+pub type Keybindings = BTreeMap<String, Option<String>>;
+
+/// What the key handlers need each frame, published by the app's `logic` pass.
+#[derive(Clone, Default)]
+pub struct KeyState {
+    pub overrides: Keybindings,
+    /// The settings page is recording a new shortcut: no command may run.
+    pub capturing: bool,
+}
+
+fn key_state_id() -> egui::Id {
+    egui::Id::new("zxraw-key-state")
+}
+
+pub fn publish_key_state(ctx: &egui::Context, overrides: &Keybindings, capturing: bool) {
+    let state = KeyState { overrides: overrides.clone(), capturing };
+    ctx.data_mut(|d| d.insert_temp(key_state_id(), state));
+}
+
+/// The state published this frame (default before the first publish).
+pub fn published_key_state(ctx: &egui::Context) -> KeyState {
+    ctx.data(|d| d.get_temp::<KeyState>(key_state_id())).unwrap_or_default()
+}
+
+/// A tooltip such as `Back (Alt+Left)`, or just the label when the command is unbound.
+pub fn tooltip(label: &str, cmd: Cmd, overrides: &Keybindings) -> String {
+    let text = cmd.binding_text(overrides);
+    if text.is_empty() { label.to_string() } else { format!("{label} ({text})") }
+}
+
+/// Sets `cmd` to `text` (canonical, see [`shortcut_text`]) or unbinds it when `None`.
+pub fn set_binding(overrides: &mut Keybindings, cmd: Cmd, text: Option<String>) {
+    overrides.insert(cmd.id().to_string(), text);
+}
+
+/// Canonical text for a shortcut: modifiers in the order Ctrl, Alt, Shift, then the key
+/// name, e.g. `Ctrl+Shift+P`, `Alt+Left`, `F5`. Parsed back by [`parse_shortcut`].
+pub fn shortcut_text(sc: &KeyboardShortcut) -> String {
+    let m = sc.modifiers;
+    let mut out = String::new();
+    if m.command || m.ctrl {
+        out.push_str("Ctrl+");
+    }
+    if m.alt {
+        out.push_str("Alt+");
+    }
+    if m.shift {
+        out.push_str("Shift+");
+    }
+    out.push_str(sc.logical_key.name());
+    out
+}
+
+/// Parses text such as `Ctrl+Shift+P`, `alt+left` or `F5` (modifier and key names are
+/// case-insensitive; `Ctrl`/`Control`, `Alt`, `Shift` are the modifiers). Exactly one key
+/// is required and each modifier may appear at most once.
+pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return Err("empty shortcut".into());
+    }
+    // "+" is itself a key, so "Ctrl++" and "+" need special handling before splitting.
+    let (head, key_tok) = if t == "+" {
+        (None, "+")
+    } else if let Some(h) = t.strip_suffix("++") {
+        (Some(h), "+")
+    } else {
+        match t.rsplit_once('+') {
+            Some((h, k)) => (Some(h), k.trim()),
+            None => (None, t),
+        }
+    };
+    let key = Key::ALL
+        .iter()
+        .copied()
+        .find(|k| k.name().eq_ignore_ascii_case(key_tok))
+        .or_else(|| Key::from_name(key_tok))
+        .ok_or_else(|| format!("unknown key `{key_tok}` in `{text}`"))?;
+    let mut mods = Modifiers::NONE;
+    let mut seen = [false; 3];
+    if let Some(head) = head {
+        let head = head.strip_suffix('+').unwrap_or(head);
+        for part in head.split('+') {
+            let (idx, flag, name) = match part.trim().to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => (0, Modifiers::COMMAND, "Ctrl"),
+                "alt" => (1, Modifiers::ALT, "Alt"),
+                "shift" => (2, Modifiers::SHIFT, "Shift"),
+                "" => return Err(format!("empty modifier in `{text}`")),
+                other => return Err(format!("unknown modifier `{other}` in `{text}`")),
+            };
+            if seen[idx] {
+                return Err(format!("`{name}` given twice in `{text}`"));
+            }
+            seen[idx] = true;
+            mods |= flag;
+        }
+    }
+    Ok(KeyboardShortcut::new(mods, key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_shortcuts_round_trip_through_text() {
+        for c in Cmd::ALL {
+            if let Some(sc) = c.shortcut() {
+                let text = shortcut_text(&sc);
+                let back = parse_shortcut(&text).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+                assert_eq!(back, sc, "{c:?} via `{text}`");
+                assert_eq!(shortcut_text(&back), text);
+            }
+        }
+    }
+
+    #[test]
+    fn parses_human_forms() {
+        let p = |s: &str| parse_shortcut(s).unwrap();
+        assert_eq!(p("Ctrl+Shift+P"), KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::P));
+        assert_eq!(p("ctrl+shift+p"), p("Ctrl+Shift+P"));
+        assert_eq!(p("Control+T"), KeyboardShortcut::new(Modifiers::COMMAND, Key::T));
+        assert_eq!(p("Alt+Left"), KeyboardShortcut::new(Modifiers::ALT, Key::ArrowLeft));
+        assert_eq!(p("F5"), KeyboardShortcut::new(Modifiers::NONE, Key::F5));
+        assert_eq!(p("Ctrl+Plus"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus));
+        assert_eq!(p("Ctrl++"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus));
+        assert_eq!(p("Ctrl+1"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1));
+        assert_eq!(p("  Ctrl + Shift + Delete "), KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Delete));
+    }
+
+    #[test]
+    fn rejects_invalid_input() {
+        for bad in ["", "   ", "Ctrl+", "Ctrl+Shift", "Ctrl+Nope", "Hyper+P", "Ctrl+Ctrl+P", "Ctrl++Shift+P", "Ctrl+ +P"] {
+            assert!(parse_shortcut(bad).is_err(), "`{bad}` should be rejected");
+        }
+    }
+
+    #[test]
+    fn override_and_default_lookup() {
+        let mut map = Keybindings::new();
+        assert_eq!(Cmd::NewTab.binding(&map), Cmd::NewTab.shortcut());
+        set_binding(&mut map, Cmd::NewTab, Some("Ctrl+Shift+T".into()));
+        assert_eq!(Cmd::NewTab.binding_text(&map), "Ctrl+Shift+T");
+        set_binding(&mut map, Cmd::CloseTab, None);
+        assert_eq!(Cmd::CloseTab.binding(&map), None);
+        assert_eq!(Cmd::CloseTab.binding_text(&map), "");
+        map.insert(Cmd::Refresh.id().into(), Some("   ".into()));
+        assert_eq!(Cmd::Refresh.binding(&map), None);
+        map.insert(Cmd::Refresh.id().into(), Some("garbage+".into()));
+        assert_eq!(Cmd::Refresh.binding(&map), Cmd::Refresh.shortcut(), "invalid override falls back to default");
+        assert_eq!(Cmd::Copy.conflicting(&map, "Ctrl+Shift+T"), Some(Cmd::NewTab));
+        assert_eq!(Cmd::Copy.conflicting(&map, "Ctrl+Shift+Y"), None);
+    }
+
+    #[test]
+    fn ids_are_unique_and_keybindings_load_from_json() {
+        let ids: std::collections::HashSet<_> = Cmd::ALL.iter().map(|c| c.id()).collect();
+        assert_eq!(ids.len(), Cmd::ALL.len());
+        let map: Keybindings = serde_json::from_str(r#"{"NewTab":"Ctrl+Shift+T","CloseTab":null}"#).unwrap();
+        assert_eq!(map.get("CloseTab"), Some(&None));
+        assert_eq!(map.get("NewTab"), Some(&Some("Ctrl+Shift+T".to_string())));
     }
 }

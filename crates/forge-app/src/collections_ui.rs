@@ -47,6 +47,64 @@ pub struct CollectionsUi {
     relink_preview_error: Option<String>,
     relink_confirm: bool,
     import_prompt: Option<ImportPrompt>,
+    new_collection: Option<NewCollectionForm>,
+}
+
+/// The "New collection" window: one explicit choice of kind, then a name (and a query for smart).
+struct NewCollectionForm {
+    choice: NewChoice,
+    name: String,
+    query: String,
+    /// Files selected in the browser when the window opened.
+    selection: Vec<NewFile>,
+    /// True while the name is still the generated default, so switching kinds renames it.
+    auto_name: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewChoice {
+    Empty,
+    Selection,
+    Smart,
+}
+
+impl NewCollectionForm {
+    fn default_name(choice: NewChoice) -> &'static str {
+        match choice {
+            NewChoice::Smart => "Smart collection",
+            NewChoice::Empty | NewChoice::Selection => "New collection",
+        }
+    }
+
+    /// Why Create is disabled, shown as the button's hover text.
+    fn blocker(&self) -> Option<&'static str> {
+        if self.name.trim().is_empty() {
+            Some("Enter a name first")
+        } else if self.choice == NewChoice::Smart && self.query.trim().is_empty() {
+            Some("Enter a search query first")
+        } else if self.choice == NewChoice::Selection && self.selection.is_empty() {
+            Some("Select files in the browser first")
+        } else {
+            None
+        }
+    }
+
+    fn to_edit(&self) -> EditDialog {
+        let kind = match self.choice {
+            NewChoice::Empty => EditKind::CreateManual {
+                add_files: Vec::new(),
+            },
+            NewChoice::Selection => EditKind::CreateManual {
+                add_files: self.selection.clone(),
+            },
+            NewChoice::Smart => EditKind::CreateSmart,
+        };
+        EditDialog {
+            kind,
+            name: self.name.trim().to_string(),
+            query: self.query.trim().to_string(),
+        }
+    }
 }
 
 impl Default for CollectionsUi {
@@ -81,6 +139,7 @@ impl Default for CollectionsUi {
             relink_preview_error: None,
             relink_confirm: false,
             import_prompt: None,
+            new_collection: None,
         }
     }
 }
@@ -222,7 +281,10 @@ pub(crate) enum UiCommand {
         new: PathBuf,
     },
     Navigate(PathBuf),
-    CaptureSelection,
+    OpenNewCollection,
+    AddSelection {
+        collection_id: CollectionId,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -317,6 +379,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 
     render_picker(ctx, &mut app.ops.collections_ui, &mut commands);
+    render_new_collection(ctx, &mut app.ops.collections_ui, &mut commands);
     render_edit_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
     render_delete_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
     render_relink_dialog(ctx, &mut app.ops.collections_ui, &mut commands);
@@ -329,15 +392,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
 
 /// `Cmd::AddToCollection`: capture selected file rows and show the small picker.
 pub fn add_selection(app: &mut ZxrawApp) {
-    let targets: std::collections::HashSet<PathBuf> =
-        app.pane().action_targets().into_iter().collect();
-    let files: Vec<NewFile> = app
-        .pane()
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File && targets.contains(&entry.path))
-        .map(NewFile::from)
-        .collect();
+    let files = selected_files(app);
     if files.is_empty() {
         app.toast("Select one or more files first");
         return;
@@ -351,21 +406,45 @@ pub fn add_selection(app: &mut ZxrawApp) {
 /// Test hook: a manual collection holding the current selection, created through the same
 /// save path as the picker's "New collection" button.
 pub(crate) fn create_manual_from_selection(app: &mut ZxrawApp, ctx: &egui::Context, name: &str) {
-    let targets: std::collections::HashSet<PathBuf> =
-        app.pane().action_targets().into_iter().collect();
-    let add_files: Vec<NewFile> = app
-        .pane()
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File && targets.contains(&entry.path))
-        .map(NewFile::from)
-        .collect();
+    let add_files = selected_files(app);
     let form = EditDialog {
         kind: EditKind::CreateManual { add_files },
         name: name.to_string(),
         query: String::new(),
     };
     start_save_edit(app, ctx, form);
+}
+
+/// File rows currently selected in the focused browser pane.
+fn selected_files(app: &ZxrawApp) -> Vec<NewFile> {
+    let targets: std::collections::HashSet<PathBuf> =
+        app.pane().action_targets().into_iter().collect();
+    app.pane()
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File && targets.contains(&entry.path))
+        .map(NewFile::from)
+        .collect()
+}
+
+/// `"{base}"`, or `"{base} 2"`, `"{base} 3"`… whichever is not already a collection name.
+fn unique_name(collections: &[Collection], base: &str) -> String {
+    let taken = |name: &str| {
+        collections
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(name))
+    };
+    if !taken(base) {
+        return base.to_string();
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base} {n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Test hook: nothing queued or loading, so the window shows settled state.
@@ -403,7 +482,11 @@ pub(crate) fn testhook_relink_preview(app: &ZxrawApp) -> Result<Option<u64>, Str
     if let Some(error) = &state.relink_preview_error {
         return Err(error.clone());
     }
-    Ok(if state.relink_preview_running { None } else { state.relink_preview_count })
+    Ok(if state.relink_preview_running {
+        None
+    } else {
+        state.relink_preview_count
+    })
 }
 
 /// Test hook: the old and new folders chosen in the relink dialog, once both are set.
@@ -490,6 +573,7 @@ fn poll_messages(app: &mut ZxrawApp) {
                             toasts.push((text, false));
                             if close_edit {
                                 state.edit = None;
+                                state.new_collection = None;
                             }
                             if close_delete {
                                 state.delete_confirm = None;
@@ -793,27 +877,20 @@ fn render_main(
     commands: &mut Vec<UiCommand>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        if ui.button("New manual collection").clicked() {
-            state.edit = Some(EditDialog {
-                kind: EditKind::CreateManual {
-                    add_files: Vec::new(),
-                },
-                name: String::new(),
-                query: String::new(),
-            });
-        }
-        if ui.button("New smart collection").clicked() {
-            state.edit = Some(EditDialog {
-                kind: EditKind::CreateSmart,
-                name: String::new(),
-                query: String::new(),
-            });
+        if ui
+            .add(egui::Button::new(RichText::new("New collection…").strong()))
+            .on_hover_text("Create an empty, selection-based, or smart collection")
+            .clicked()
+        {
+            commands.push(UiCommand::OpenNewCollection);
         }
         if ui
             .add_enabled(
                 !search_query.trim().is_empty(),
                 egui::Button::new("Save current search as…"),
             )
+            .on_hover_text("Keep the search in the bar as a named saved search")
+            .on_disabled_hover_text("Type a search in the bar first")
             .clicked()
         {
             state.edit = Some(EditDialog {
@@ -822,13 +899,56 @@ fn render_main(
                 query: search_query.to_string(),
             });
         }
-        if ui.button("Import…").clicked() {
+        if ui
+            .button("Import…")
+            .on_hover_text("Load collections from a JSON file made by Export")
+            .clicked()
+        {
             commands.push(UiCommand::ChooseImport);
         }
-        if ui.button("Relink…").clicked() {
+        if ui
+            .button("Relink…")
+            .on_hover_text("Point collections at a folder that was moved or renamed")
+            .clicked()
+        {
             state.relink_open = true;
         }
     });
+    egui::CollapsingHeader::new("How collections work")
+        .id_salt("collections-help")
+        .default_open(state.collections.is_empty())
+        .show(ui, |ui| {
+            ui.label(
+                "A collection is a named group of files from your library, for gathering \
+                 selects, shoots, or any set you want to find again.",
+            );
+            ui.label(
+                "Files are never moved, copied, or renamed. A collection only remembers \
+                 where each file is.",
+            );
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new("• Manual: you add and remove files, and set their order.").weak(),
+            );
+            ui.label(
+                RichText::new(
+                    "• Smart: the files are whatever matches a search query, rechecked each \
+                     time the collection loads. Only the query is stored.",
+                )
+                .weak(),
+            );
+            ui.label(
+                RichText::new(
+                    "• Saved search: a named search from the search bar. It has no files of \
+                     its own.",
+                )
+                .weak(),
+            );
+            ui.label(
+                RichText::new("Deleting a collection removes only the grouping. Files stay.")
+                    .weak(),
+            );
+        });
 
     if state.operation_pending {
         ui.horizontal(|ui| {
@@ -915,7 +1035,10 @@ fn render_catalog(ui: &mut egui::Ui, state: &mut CollectionsUi, commands: &mut V
                 });
             }
             if state.collections.is_empty() && !state.catalog_loading {
-                ui.label(RichText::new("No collections yet").weak());
+                ui.label(
+                    RichText::new("No collections yet. Use New collection… to create one.")
+                        .weak(),
+                );
             }
         });
 }
@@ -956,50 +1079,150 @@ fn render_saved_searches(ui: &mut egui::Ui, state: &mut CollectionsUi) {
                 });
             }
             if state.saved_searches.is_empty() && !state.catalog_loading {
-                ui.label(RichText::new("No saved searches yet").weak());
+                ui.label(
+                    RichText::new(
+                        "No saved searches yet. Type a search in the bar, then use Save current search as….",
+                    )
+                    .weak(),
+                );
             }
         });
 }
 
-fn render_detail(ui: &mut egui::Ui, state: &CollectionsUi, commands: &mut Vec<UiCommand>) {
-    let Some(detail) = state.detail.as_ref() else {
+fn render_detail(ui: &mut egui::Ui, state: &mut CollectionsUi, commands: &mut Vec<UiCommand>) {
+    let Some(detail) = state.detail.clone() else {
         ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
-            ui.label(RichText::new("Choose a collection or saved search").weak());
+            ui.add_space(60.0);
+            ui.label(RichText::new("No collection selected").strong());
+            ui.label(
+                RichText::new(
+                    "Pick a collection or saved search on the left to see its files here.\n\
+                     Or create one with New collection….",
+                )
+                .weak(),
+            );
         });
         return;
     };
-    let (title, manual, query) = match detail {
+    let (title, manual, query, description) = match &detail {
         Detail::Collection { id, kind } => {
             let Some(collection) = state.collections.iter().find(|c| c.id == *id) else {
                 ui.label(RichText::new("Collection is not in the current library list").weak());
                 return;
             };
+            let manual = *kind == CollectionKind::Manual;
+            let description = if manual {
+                "Manual collection. Its files are referenced, not moved. Use ↑ ↓ to set their order."
+            } else {
+                "Smart collection. Its files come from the query below and are rechecked whenever it loads."
+            };
             (
                 collection.name.clone(),
-                *kind == CollectionKind::Manual,
+                manual,
                 collection.query.clone(),
+                description,
             )
         }
-        Detail::SavedSearch { name, query } => (name.clone(), false, Some(query.clone())),
+        Detail::SavedSearch { name, query } => (
+            name.clone(),
+            false,
+            Some(query.clone()),
+            "Saved search. It stores a query, not files.",
+        ),
     };
     ui.heading(&title);
-    if let Some(query) = query {
-        ui.label(RichText::new(query).small().weak());
+    ui.label(RichText::new(description).weak());
+    if let Some(query) = &query {
+        ui.label(RichText::new(format!("Query: {query}")).small().monospace());
     }
-    ui.horizontal(|ui| {
-        if manual && ui.button("Add current selection…").clicked() {
-            commands.push(UiCommand::CaptureSelection);
+
+    let collection_id = match &detail {
+        Detail::Collection { id, .. } => Some(*id),
+        Detail::SavedSearch { .. } => None,
+    };
+    let first_present = state
+        .rows
+        .iter()
+        .find(|row| row.present)
+        .map(|row| row.path.clone());
+    let mut rename = false;
+    let mut delete = false;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(
+                first_present.is_some(),
+                egui::Button::new("Open first item"),
+            )
+            .on_hover_text("Show the first available file in the browser")
+            .on_disabled_hover_text("No available files to open")
+            .clicked()
+            && let Some(path) = &first_present
+        {
+            commands.push(UiCommand::Navigate(path.clone()));
         }
-        if let Detail::Collection { id, .. } = detail
-            && ui.button("Export…").clicked()
+        if let Some(id) = collection_id
+            && manual
+            && ui
+                .button("Add selected files")
+                .on_hover_text("Add the files selected in the browser to this collection")
+                .clicked()
+        {
+            commands.push(UiCommand::AddSelection { collection_id: id });
+        }
+        if ui
+            .button("Rename")
+            .on_hover_text("Change the name only. Files are not affected.")
+            .clicked()
+        {
+            rename = true;
+        }
+        if let Some(id) = collection_id
+            && ui
+                .button("Export…")
+                .on_hover_text("Save this collection as a JSON file")
+                .clicked()
         {
             commands.push(UiCommand::ChooseExport {
-                collection_id: *id,
+                collection_id: id,
                 name: title.clone(),
             });
         }
+        if ui
+            .button("Delete…")
+            .on_hover_text("Remove this collection. Its files stay in the library.")
+            .clicked()
+        {
+            delete = true;
+        }
     });
+    if rename {
+        state.edit = match &detail {
+            Detail::Collection { id, .. } => Some(EditDialog {
+                kind: EditKind::RenameCollection(*id),
+                name: title.clone(),
+                query: String::new(),
+            }),
+            Detail::SavedSearch { name, .. } => state
+                .saved_searches
+                .iter()
+                .find(|saved| &saved.name == name)
+                .cloned()
+                .map(|saved| EditDialog {
+                    kind: EditKind::RenameSavedSearch(saved),
+                    name: name.clone(),
+                    query: String::new(),
+                }),
+        };
+    }
+    if delete {
+        state.delete_confirm = Some(match &detail {
+            Detail::Collection { id, .. } => DeleteTarget::Collection {
+                id: *id,
+                name: title.clone(),
+            },
+            Detail::SavedSearch { name, .. } => DeleteTarget::SavedSearch { name: name.clone() },
+        });
+    }
     ui.separator();
 
     if state.rows_loading {
@@ -1012,15 +1235,32 @@ fn render_detail(ui: &mut egui::Ui, state: &CollectionsUi, commands: &mut Vec<Ui
         ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
     }
     if !state.rows_loading && state.rows_error.is_none() {
-        ui.label(
-            RichText::new(format!("{} item(s)", state.rows.len()))
-                .small()
-                .weak(),
-        );
+        let offline = state.rows.iter().filter(|row| !row.present).count();
+        let summary = if offline > 0 {
+            format!("{} item(s), {offline} offline", state.rows.len())
+        } else {
+            format!("{} item(s)", state.rows.len())
+        };
+        ui.label(RichText::new(summary).small().weak());
+    }
+    if state.rows.is_empty() && !state.rows_loading && state.rows_error.is_none() {
+        ui.add_space(12.0);
+        let hint = if manual {
+            "This collection is empty. Select files in the browser, then click Add selected files. \
+             The files stay where they are."
+        } else if collection_id.is_some() {
+            "No files match this query right now. Check the query, or whether the folders it \
+             covers are online."
+        } else {
+            "This search has no matches right now."
+        };
+        ui.label(RichText::new(hint).weak());
+        return;
     }
 
     let rows = &state.rows;
     let current_ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let manual_id = if manual { collection_id } else { None };
     let mut navigate = None;
     egui::ScrollArea::vertical()
         .id_salt("collection-items")
@@ -1046,32 +1286,35 @@ fn render_detail(ui: &mut egui::Ui, state: &CollectionsUi, commands: &mut Vec<Ui
                         }
                         ui.label(RichText::new(row.path.display().to_string()).small().weak());
                     });
-                    if manual {
+                    if let Some(collection_id) = manual_id {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if ui
+                                .small_button("Remove")
+                                .on_hover_text("Take this file out of the collection. The file itself is not touched.")
+                                .clicked()
+                            {
                                 commands.push(UiCommand::RemoveItems {
-                                    collection_id: match detail {
-                                        Detail::Collection { id, .. } => *id,
-                                        Detail::SavedSearch { .. } => unreachable!(),
-                                    },
+                                    collection_id,
                                     file_ids: vec![row.id],
                                 });
                             }
-                            if ui.small_button("↓").clicked() {
+                            if ui
+                                .small_button("↓")
+                                .on_hover_text("Move down in this collection")
+                                .clicked()
+                            {
                                 commands.push(UiCommand::ReorderItems {
-                                    collection_id: match detail {
-                                        Detail::Collection { id, .. } => *id,
-                                        Detail::SavedSearch { .. } => unreachable!(),
-                                    },
+                                    collection_id,
                                     file_ids: move_file_id(&current_ids, row.id, 1),
                                 });
                             }
-                            if ui.small_button("↑").clicked() {
+                            if ui
+                                .small_button("↑")
+                                .on_hover_text("Move up in this collection")
+                                .clicked()
+                            {
                                 commands.push(UiCommand::ReorderItems {
-                                    collection_id: match detail {
-                                        Detail::Collection { id, .. } => *id,
-                                        Detail::SavedSearch { .. } => unreachable!(),
-                                    },
+                                    collection_id,
                                     file_ids: move_file_id(&current_ids, row.id, -1),
                                 });
                             }
@@ -1147,6 +1390,128 @@ fn render_picker(ctx: &egui::Context, state: &mut CollectionsUi, commands: &mut 
     }
     if !state.picker_open {
         state.picker_files.clear();
+    }
+}
+
+fn render_new_collection(
+    ctx: &egui::Context,
+    state: &mut CollectionsUi,
+    commands: &mut Vec<UiCommand>,
+) {
+    let Some(form) = state.new_collection.as_mut() else {
+        return;
+    };
+    let busy = state.operation_pending;
+    let collections = &state.collections;
+    let mut open = true;
+    let mut submit = false;
+    let mut close_requested = false;
+    egui::Window::new("New collection")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(460.0)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("What kind of collection?").strong());
+            let selected_count = form.selection.len();
+            let options = [
+                (
+                    NewChoice::Empty,
+                    "Empty collection".to_string(),
+                    "Start with nothing. Add files later by selecting them in the browser and \
+                     clicking Add selected files."
+                        .to_string(),
+                    true,
+                ),
+                (
+                    NewChoice::Selection,
+                    format!("From current selection ({selected_count} file(s))"),
+                    "Put the files selected in the browser into a new collection.".to_string(),
+                    selected_count > 0,
+                ),
+                (
+                    NewChoice::Smart,
+                    "Smart collection".to_string(),
+                    "Shows every file that matches a search query, so it stays up to date. \
+                     Nothing is copied or moved."
+                        .to_string(),
+                    true,
+                ),
+            ];
+            for (choice, title, hint, enabled) in options {
+                ui.add_space(4.0);
+                let response = ui.add_enabled(
+                    enabled,
+                    egui::Button::selectable(form.choice == choice, RichText::new(title).strong()),
+                );
+                let response = if enabled {
+                    response
+                } else {
+                    response.on_disabled_hover_text("Select files in the browser first")
+                };
+                if response.clicked() && form.choice != choice {
+                    form.choice = choice;
+                    if form.auto_name {
+                        form.name =
+                            unique_name(collections, NewCollectionForm::default_name(choice));
+                    }
+                }
+                ui.label(RichText::new(hint).small().weak());
+            }
+
+            ui.separator();
+            ui.label("Name");
+            let name = ui.add(
+                egui::TextEdit::singleline(&mut form.name)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Collection name"),
+            );
+            if name.changed() {
+                form.auto_name = false;
+            }
+            if form.choice == NewChoice::Smart {
+                ui.add_space(6.0);
+                ui.label("Search query");
+                ui.add(
+                    egui::TextEdit::multiline(&mut form.query)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("kind:raw rating:>=4"),
+                );
+                ui.label(
+                    RichText::new("Same syntax as the search bar.")
+                        .small()
+                        .weak(),
+                );
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let blocker = if busy {
+                    Some("Wait for the current change to finish")
+                } else {
+                    form.blocker()
+                };
+                let create =
+                    ui.add_enabled(blocker.is_none(), egui::Button::new("Create collection"));
+                let create = match blocker {
+                    Some(reason) => create.on_disabled_hover_text(reason),
+                    None => create,
+                };
+                if create.clicked() {
+                    submit = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+    if close_requested {
+        open = false;
+    }
+    if submit {
+        commands.push(UiCommand::SaveEdit(form.to_edit()));
+    } else if !open {
+        state.new_collection = None;
     }
 }
 
@@ -1496,8 +1861,8 @@ pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: 
             }
         }
         UiCommand::ChooseImport => {
-            if let Some(path) = crate::dialogs::pick_file(rfd::FileDialog::new()
-                .add_filter("JSON", &["json"]))
+            if let Some(path) =
+                crate::dialogs::pick_file(rfd::FileDialog::new().add_filter("JSON", &["json"]))
             {
                 start_import_preview(app, ctx, path);
             }
@@ -1537,19 +1902,50 @@ pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: 
                     db.relink(&old, &new, None).map_err(|e| e.to_string())?;
                 // Relink moves the rows but not their presence flags. Re-list the new folders
                 // so the files that exist there come back online; missing ones stay offline.
-                let indexer = forge_db::Indexer::new(&db)
-                    .volume_resolver(crate::library::volume_info);
+                let indexer =
+                    forge_db::Indexer::new(&db).volume_resolver(crate::library::volume_info);
                 for dir in db.folders_under(&new).map_err(|e| e.to_string())? {
-                    indexer
-                        .reconcile_dir(&dir)
-                        .map_err(|e| format!("relinked, but could not refresh {}: {e}", dir.display()))?;
+                    indexer.reconcile_dir(&dir).map_err(|e| {
+                        format!("relinked, but could not refresh {}: {e}", dir.display())
+                    })?;
                 }
                 Ok(relink_summary(&report))
             });
             app.ops.collections_ui.relink_open = false;
         }
         UiCommand::Navigate(path) => app.navigate(path),
-        UiCommand::CaptureSelection => add_selection(app),
+        UiCommand::OpenNewCollection => {
+            let selection = selected_files(app);
+            let choice = if selection.is_empty() {
+                NewChoice::Empty
+            } else {
+                NewChoice::Selection
+            };
+            let state = &mut app.ops.collections_ui;
+            let name = unique_name(&state.collections, NewCollectionForm::default_name(choice));
+            state.new_collection = Some(NewCollectionForm {
+                choice,
+                name,
+                query: String::new(),
+                selection,
+                auto_name: true,
+            });
+        }
+        UiCommand::AddSelection { collection_id } => {
+            let files = selected_files(app);
+            if files.is_empty() {
+                app.toast("Select one or more files in the browser first");
+            } else {
+                execute_command(
+                    app,
+                    ctx,
+                    UiCommand::AddFiles {
+                        collection_id,
+                        files,
+                    },
+                );
+            }
+        }
     }
 }
 
@@ -1794,6 +2190,49 @@ mod tests {
         let filtered = filtered_collections(&collections, "WEDD");
         assert_eq!(filtered.iter().map(|c| c.id).collect::<Vec<_>>(), [1]);
         assert_eq!(filtered_collections(&collections, "").len(), 2);
+    }
+
+    #[test]
+    fn new_collection_names_skip_existing_names() {
+        let collections = [
+            collection(1, "New collection", CollectionKind::Manual),
+            collection(2, "new collection 2", CollectionKind::Manual),
+        ];
+        assert_eq!(unique_name(&[], "New collection"), "New collection");
+        assert_eq!(
+            unique_name(&collections, "New collection"),
+            "New collection 3"
+        );
+        assert_eq!(
+            unique_name(&collections, "Smart collection"),
+            "Smart collection"
+        );
+    }
+
+    #[test]
+    fn new_collection_form_explains_what_blocks_create() {
+        let mut form = NewCollectionForm {
+            choice: NewChoice::Empty,
+            name: "  ".into(),
+            query: String::new(),
+            selection: Vec::new(),
+            auto_name: true,
+        };
+        assert_eq!(form.blocker(), Some("Enter a name first"));
+        form.name = "Picks".into();
+        assert_eq!(form.blocker(), None);
+        form.choice = NewChoice::Selection;
+        assert_eq!(form.blocker(), Some("Select files in the browser first"));
+        form.choice = NewChoice::Smart;
+        assert_eq!(form.blocker(), Some("Enter a search query first"));
+        form.query = "kind:raw".into();
+        assert_eq!(form.blocker(), None);
+        let edit = form.to_edit();
+        assert!(matches!(edit.kind, EditKind::CreateSmart));
+        assert_eq!(
+            (edit.name.as_str(), edit.query.as_str()),
+            ("Picks", "kind:raw")
+        );
     }
 
     #[test]

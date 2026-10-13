@@ -175,7 +175,7 @@ fn main() -> eframe::Result {
         .with_title("ZXraw Explorer")
         .with_inner_size([1360.0, 840.0])
         .with_min_inner_size([640.0, 400.0])
-        .with_icon(app_icon::icon_data(startup.app_icon, startup.accent))
+        .with_icon(app_icon::icon_data(startup.app_icon))
         .with_drag_and_drop(true);
     let hidden = testhook::hide_window();
     if hidden {
