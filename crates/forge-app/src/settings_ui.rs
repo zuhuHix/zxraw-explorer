@@ -1542,14 +1542,27 @@ fn take_shortcut(events: &mut Vec<egui::Event>, modifiers: Modifiers) -> Option<
             Some(Some(shortcut_text(&KeyboardShortcut::new(m, key))))
         }
     };
-    // The companion key press of the same clipboard shortcut must not be recorded next frame.
-    events.retain(|e| match (e, clip_key) {
-        (egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_), _) => false,
-        (egui::Event::Key { key, pressed: true, modifiers, .. }, Some(k)) => {
-            !(*key == k && modifiers.command)
+    // egui may report one Ctrl+C/X/V press twice (a key press and a clipboard event). Drop
+    // only that one companion so it is not recorded next frame; other presses stay queued.
+    let same_chord = |m: &Modifiers| m.command && m.alt == modifiers.alt && m.shift == modifiers.shift;
+    let companion = match (&event, clip_key) {
+        (_, Some(k)) => events.iter().position(|e| {
+            matches!(e, egui::Event::Key { key, pressed: true, modifiers: m, .. }
+                if *key == k && same_chord(m))
+        }),
+        (egui::Event::Key { key, modifiers: m, .. }, None) if same_chord(m) => {
+            events.iter().position(|e| match e {
+                egui::Event::Copy => *key == egui::Key::C,
+                egui::Event::Cut => *key == egui::Key::X,
+                egui::Event::Paste(_) => *key == egui::Key::V,
+                _ => false,
+            })
         }
-        _ => true,
-    });
+        _ => None,
+    };
+    if let Some(i) = companion {
+        events.remove(i);
+    }
     result
 }
 
@@ -2654,6 +2667,19 @@ mod shortcut_capture_tests {
         let mut events = vec![key(egui::Key::C, Modifiers::COMMAND), egui::Event::Copy];
         assert_eq!(take_shortcut(&mut events, Modifiers::COMMAND), Some(Some("Ctrl+C".into())));
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn only_the_companion_is_dropped_and_other_chords_stay_queued() {
+        let shifted = Modifiers { shift: true, ..Modifiers::COMMAND };
+        let mut events = vec![
+            egui::Event::Copy,
+            key(egui::Key::C, Modifiers::COMMAND),
+            key(egui::Key::C, shifted),
+            egui::Event::Cut,
+        ];
+        assert_eq!(take_shortcut(&mut events, Modifiers::COMMAND), Some(Some("Ctrl+C".into())));
+        assert_eq!(events, vec![key(egui::Key::C, shifted), egui::Event::Cut]);
     }
 
     #[test]
