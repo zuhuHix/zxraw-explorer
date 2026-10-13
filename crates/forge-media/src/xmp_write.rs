@@ -97,6 +97,14 @@ pub struct SidecarUpdate {
     pub label: Option<Option<String>>,
     pub add_keywords: Vec<String>,
     pub remove_keywords: Vec<String>,
+    /// `dc:title` (language alternative). `Some(None)` or a blank value removes it.
+    pub title: Option<Option<String>>,
+    /// `dc:description` (caption), same semantics as `title`.
+    pub description: Option<Option<String>>,
+    /// `dc:creator` (sequence). The value is split on `;` by [`split_creators`]; blank removes.
+    pub creator: Option<Option<String>>,
+    /// `dc:rights` (copyright), same semantics as `title`.
+    pub rights: Option<Option<String>>,
 }
 
 impl SidecarUpdate {
@@ -104,9 +112,71 @@ impl SidecarUpdate {
     pub fn is_empty(&self) -> bool {
         self.rating.is_none()
             && self.label.is_none()
+            && self.title.is_none()
+            && self.description.is_none()
+            && self.creator.is_none()
+            && self.rights.is_none()
             && self.add_keywords.iter().all(|k| k.trim().is_empty())
             && self.remove_keywords.iter().all(|k| k.trim().is_empty())
     }
+}
+
+/// Splits a creator field on `;` into trimmed, non-blank, exact-duplicate-free names.
+pub fn split_creators(input: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in input.split(';').map(str::trim).filter(|n| !n.is_empty()) {
+        if !out.iter().any(|existing| existing == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// Current dc-field values of the sidecar that belongs to an image, for display in the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarFields {
+    /// The sidecar that was read; `None` when there is none or it could not be read.
+    pub sidecar: Option<PathBuf>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub creator: Vec<String>,
+    pub rights: Option<String>,
+}
+
+/// Reads the title, caption, creator and copyright of the image's sidecar. Never fails: a
+/// missing, unreadable or unparseable sidecar yields empty fields.
+pub fn read_sidecar_fields(image: &Path) -> SidecarFields {
+    let mut out = SidecarFields::default();
+    if forge_core::model::ext_of(image) == "xmp" {
+        return out;
+    }
+    let path = sidecar_path(image);
+    let Ok(Some(bytes)) = read_snapshot(&path) else {
+        return out;
+    };
+    let Ok(text) = decode_for_write(&bytes, &path) else {
+        return out;
+    };
+    let Ok(doc) = Doc::parse(&text) else {
+        return out;
+    };
+    let Ok(description) = doc.description(image) else {
+        return out;
+    };
+    out.title = read_alt(&doc, &text, description, "title").ok().flatten();
+    out.description = read_alt(&doc, &text, description, "description")
+        .ok()
+        .flatten();
+    out.rights = read_alt(&doc, &text, description, "rights").ok().flatten();
+    out.creator = read_seq(&doc, &text, description, "creator").unwrap_or_default();
+    out.sidecar = Some(path);
+    out
+}
+
+/// The sidecar that `image` uses (darktable `IMG.CR3.xmp` wins over `IMG.xmp`). The file
+/// may not exist yet; this is the path an update would create.
+pub fn sidecar_path_for(image: &Path) -> PathBuf {
+    sidecar_path(image)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +567,37 @@ fn apply_update(text: &str, image_path: &Path, update: &SidecarUpdate) -> Result
         Some(None) => remove_simple(&doc, text, description, XMP_NS, "Label", &mut edits)?,
         None => {}
     }
+    let text_fields = TextFields::from_update(update);
+    for (local, requested) in text_fields.alternatives() {
+        match requested {
+            None => {}
+            Some(Some(value)) => set_alt(
+                &doc,
+                text,
+                description,
+                local,
+                &value,
+                &mut namespaces,
+                &mut edits,
+            )?,
+            Some(None) => remove_property(&doc, description, local, &mut edits)?,
+        }
+    }
+    if let Some(creators) = &text_fields.creator {
+        if creators.is_empty() {
+            remove_property(&doc, description, "creator", &mut edits)?;
+        } else {
+            set_seq(
+                &doc,
+                text,
+                description,
+                "creator",
+                creators,
+                &mut namespaces,
+                &mut edits,
+            )?;
+        }
+    }
     let (keywords, _) = keyword_edits(
         &doc,
         text,
@@ -554,10 +655,362 @@ fn verify(
             _ => return Err(corrupt("merged XMP label did not verify; left untouched")),
         }
     }
+    let text_fields = TextFields::from_update(update);
+    for (local, requested) in text_fields.alternatives() {
+        if let Some(expected) = requested
+            && read_alt(&after_doc, out, after_desc, local)? != expected
+        {
+            return Err(corrupt(format!(
+                "merged XMP dc:{local} did not verify; left untouched"
+            )));
+        }
+    }
+    if let Some(creators) = &text_fields.creator
+        && read_seq(&after_doc, out, after_desc, "creator")? != *creators
+    {
+        return Err(corrupt(
+            "merged XMP creator did not verify; left untouched",
+        ));
+    }
     if read_keywords(&after_doc, out, after_desc)? != keywords {
         return Err(corrupt(
             "merged XMP keywords did not verify; left untouched",
         ));
+    }
+    Ok(())
+}
+
+/// The dc text fields of an update. Blank values are already turned into removals.
+struct TextFields {
+    title: Option<Option<String>>,
+    description: Option<Option<String>>,
+    rights: Option<Option<String>>,
+    /// `Some(vec![])` removes the creator sequence.
+    creator: Option<Vec<String>>,
+}
+
+impl TextFields {
+    fn from_update(update: &SidecarUpdate) -> Self {
+        Self {
+            title: text_edit(&update.title),
+            description: text_edit(&update.description),
+            rights: text_edit(&update.rights),
+            creator: update
+                .creator
+                .as_ref()
+                .map(|v| v.as_deref().map(split_creators).unwrap_or_default()),
+        }
+    }
+
+    fn alternatives(&self) -> [(&'static str, Option<Option<String>>); 3] {
+        [
+            ("title", self.title.clone()),
+            ("description", self.description.clone()),
+            ("rights", self.rights.clone()),
+        ]
+    }
+}
+
+fn text_edit(value: &Option<Option<String>>) -> Option<Option<String>> {
+    value.as_ref().map(|v| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn non_blank(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn unescaped(text: &str, range: Range<usize>) -> Result<String> {
+    unescape(&text[range])
+        .map(|v| v.into_owned())
+        .map_err(|e| corrupt(format!("bad entity in property: {e}")))
+}
+
+fn child_element(doc: &Doc<'_>, parent: usize, namespace: &str, local: &str) -> Option<usize> {
+    doc.children(parent)
+        .into_iter()
+        .find(|&c| doc.element_is(c, namespace, local))
+}
+
+fn child_rdf(doc: &Doc<'_>, parent: usize, local: &str) -> Option<usize> {
+    child_element(doc, parent, RDF_NS, local)
+}
+
+fn refuse_attribute_form(doc: &Doc<'_>, description: usize, local: &str) -> Result<()> {
+    if doc.nodes[description]
+        .attrs
+        .iter()
+        .any(|attr| doc.attr_is(description, attr, DC_NS, local))
+    {
+        return Err(unsupported(format!(
+            "dc:{local} is stored as an attribute; left untouched"
+        )));
+    }
+    Ok(())
+}
+
+/// One item of an `rdf:Alt` or `rdf:Seq`: its `li` node, whether it is `x-default`, and value.
+struct Item {
+    node: usize,
+    is_default: bool,
+    value: String,
+}
+
+fn list_items(doc: &Doc<'_>, text: &str, container: usize) -> Result<Vec<Item>> {
+    let mut items = Vec::new();
+    for li in doc
+        .children(container)
+        .into_iter()
+        .filter(|&c| doc.element_is(c, RDF_NS, "li"))
+    {
+        let node = &doc.nodes[li];
+        let is_default = node.attrs.iter().any(|attr| {
+            attr.name == "xml:lang"
+                && unescaped(text, attr.value.clone()).is_ok_and(|lang| lang == "x-default")
+        });
+        let value = if node.empty {
+            String::new()
+        } else {
+            simple_content(text, node)?;
+            unescaped(text, node.tag_end..node.close)?.trim().to_owned()
+        };
+        items.push(Item {
+            node: li,
+            is_default,
+            value,
+        });
+    }
+    Ok(items)
+}
+
+/// Value of a dc language alternative: the `x-default` item, else the first item.
+fn read_alt(doc: &Doc<'_>, text: &str, description: usize, local: &str) -> Result<Option<String>> {
+    if let Some(attr) = doc.nodes[description]
+        .attrs
+        .iter()
+        .find(|attr| doc.attr_is(description, attr, DC_NS, local))
+    {
+        return Ok(non_blank(unescaped(text, attr.value.clone())?));
+    }
+    let Some(element) = child_element(doc, description, DC_NS, local) else {
+        return Ok(None);
+    };
+    let node = &doc.nodes[element];
+    if node.empty {
+        return Ok(None);
+    }
+    let Some(alt) = child_rdf(doc, element, "Alt") else {
+        simple_content(text, node)?;
+        return Ok(non_blank(unescaped(text, node.tag_end..node.close)?));
+    };
+    let items = list_items(doc, text, alt)?;
+    Ok(items
+        .iter()
+        .find(|item| item.is_default)
+        .or(items.first())
+        .and_then(|item| non_blank(item.value.clone())))
+}
+
+/// Values of a dc sequence (or bag). Plain text content is read as a single value.
+fn read_seq(doc: &Doc<'_>, text: &str, description: usize, local: &str) -> Result<Vec<String>> {
+    if let Some(attr) = doc.nodes[description]
+        .attrs
+        .iter()
+        .find(|attr| doc.attr_is(description, attr, DC_NS, local))
+    {
+        return Ok(non_blank(unescaped(text, attr.value.clone())?)
+            .into_iter()
+            .collect());
+    }
+    let Some(element) = child_element(doc, description, DC_NS, local) else {
+        return Ok(Vec::new());
+    };
+    let node = &doc.nodes[element];
+    if node.empty {
+        return Ok(Vec::new());
+    }
+    let Some(container) = child_rdf(doc, element, "Seq").or_else(|| child_rdf(doc, element, "Bag"))
+    else {
+        simple_content(text, node)?;
+        return Ok(non_blank(unescaped(text, node.tag_end..node.close)?)
+            .into_iter()
+            .collect());
+    };
+    Ok(list_items(doc, text, container)?
+        .into_iter()
+        .map(|item| item.value)
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
+fn alt_xml(name: &str, rdf: &str, value: &str) -> String {
+    format!("<{name}>{}</{name}>", alt_inner(rdf, value))
+}
+
+fn alt_inner(rdf: &str, value: &str) -> String {
+    format!(
+        "<{alt}>{item}</{alt}>",
+        alt = qualified_name(rdf, "Alt"),
+        item = default_li_xml(&qualified_name(rdf, "li"), value)
+    )
+}
+
+fn default_li_xml(li_name: &str, value: &str) -> String {
+    format!(
+        "<{li_name} xml:lang=\"x-default\">{}</{li_name}>",
+        escape(value)
+    )
+}
+
+fn seq_xml(name: &str, rdf: &str, items: &[String]) -> String {
+    format!("<{name}>{}</{name}>", seq_inner(rdf, items))
+}
+
+fn seq_inner(rdf: &str, items: &[String]) -> String {
+    format!(
+        "<{seq}>{}</{seq}>",
+        li_xml(items, rdf, ""),
+        seq = qualified_name(rdf, "Seq")
+    )
+}
+
+/// Sets a dc language alternative to `value` as its `x-default` item, keeping other languages.
+fn set_alt(
+    doc: &Doc<'_>,
+    text: &str,
+    description: usize,
+    local: &str,
+    value: &str,
+    namespaces: &mut NamespacePlan<'_, '_>,
+    edits: &mut Vec<Edit>,
+) -> Result<()> {
+    refuse_attribute_form(doc, description, local)?;
+    if read_alt(doc, text, description, local)?.as_deref() == Some(value) {
+        return Ok(());
+    }
+    let Some(element) = child_element(doc, description, DC_NS, local) else {
+        let dc = namespaces.prefix_for(description, DC_NS, "dc", false);
+        let rdf = namespaces.prefix_for(description, RDF_NS, "rdf", false);
+        let name = qualified_name(&dc, local);
+        return doc.append_child(text, description, &alt_xml(&name, &rdf, value), edits);
+    };
+    let node = &doc.nodes[element];
+    if node.empty {
+        let rdf = namespaces.prefix_for(element, RDF_NS, "rdf", false);
+        edits.push(Edit::replace(
+            node.start..node.end,
+            alt_xml(node.name, &rdf, value),
+        ));
+        return Ok(());
+    }
+    let Some(alt) = child_rdf(doc, element, "Alt") else {
+        simple_content(text, node)?;
+        let rdf = namespaces.prefix_for(element, RDF_NS, "rdf", false);
+        edits.push(Edit::replace(
+            node.start..node.end,
+            alt_xml(node.name, &rdf, value),
+        ));
+        return Ok(());
+    };
+    let alt_node = &doc.nodes[alt];
+    let items = list_items(doc, text, alt)?;
+    if let Some(default) = items.iter().find(|item| item.is_default) {
+        let li = &doc.nodes[default.node];
+        if li.empty {
+            let li_name = li.name;
+            edits.push(Edit::replace(
+                li.start..li.end,
+                default_li_xml(li_name, value),
+            ));
+        } else {
+            simple_content(text, li)?;
+            edits.push(Edit::replace(
+                li.tag_end..li.close,
+                escape(value).into_owned(),
+            ));
+        }
+        return Ok(());
+    }
+    // No x-default item yet: insert one first, so it leads the alternatives.
+    let li_name = qualified_name(split_qname(alt_node.name).0, "li");
+    if alt_node.empty {
+        edits.push(Edit::replace(
+            alt_node.start..alt_node.end,
+            format!(
+                "<{0}>{1}</{0}>",
+                alt_node.name,
+                default_li_xml(&li_name, value)
+            ),
+        ));
+    } else {
+        edits.push(Edit::insert(
+            alt_node.tag_end,
+            default_li_xml(&li_name, value),
+        ));
+    }
+    Ok(())
+}
+
+/// Sets a dc sequence to `items`, one `rdf:li` per item. Unchanged sequences add no edit.
+fn set_seq(
+    doc: &Doc<'_>,
+    text: &str,
+    description: usize,
+    local: &str,
+    items: &[String],
+    namespaces: &mut NamespacePlan<'_, '_>,
+    edits: &mut Vec<Edit>,
+) -> Result<()> {
+    refuse_attribute_form(doc, description, local)?;
+    if read_seq(doc, text, description, local)? == items {
+        return Ok(());
+    }
+    let Some(element) = child_element(doc, description, DC_NS, local) else {
+        let dc = namespaces.prefix_for(description, DC_NS, "dc", false);
+        let rdf = namespaces.prefix_for(description, RDF_NS, "rdf", false);
+        let name = qualified_name(&dc, local);
+        return doc.append_child(text, description, &seq_xml(&name, &rdf, items), edits);
+    };
+    let node = &doc.nodes[element];
+    let rdf = namespaces.prefix_for(element, RDF_NS, "rdf", false);
+    if node.empty {
+        edits.push(Edit::replace(
+            node.start..node.end,
+            seq_xml(node.name, &rdf, items),
+        ));
+    } else {
+        edits.push(Edit::replace(
+            node.tag_end..node.close,
+            seq_inner(&rdf, items),
+        ));
+    }
+    Ok(())
+}
+
+/// Removes a dc property in either form: a description attribute or child elements.
+fn remove_property(
+    doc: &Doc<'_>,
+    description: usize,
+    local: &str,
+    edits: &mut Vec<Edit>,
+) -> Result<()> {
+    for attr in doc.nodes[description]
+        .attrs
+        .iter()
+        .filter(|attr| doc.attr_is(description, attr, DC_NS, local))
+    {
+        edits.push(Edit::replace(attr.span.clone(), ""));
+    }
+    for child in doc.children(description) {
+        if doc.element_is(child, DC_NS, local) {
+            let node = &doc.nodes[child];
+            edits.push(Edit::replace(node.start..node.end, ""));
+        }
     }
     Ok(())
 }
@@ -2201,5 +2654,159 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read(&first).unwrap(), b"first");
         assert_eq!(std::fs::read(&second).unwrap(), b"second");
+    }
+
+    fn text_update() -> SidecarUpdate {
+        SidecarUpdate {
+            title: Some(Some(s("Sunset over Lisbon"))),
+            description: Some(Some(s("Golden hour on the Tagus"))),
+            creator: Some(Some(s("Ana Silva; Bruno Costa"))),
+            rights: Some(Some(s("(c) 2026 Ana Silva"))),
+            ..update()
+        }
+    }
+
+    #[test]
+    fn text_fields_set_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("t.CR3");
+        let outcome = update_sidecar(&img, &text_update()).unwrap();
+        assert!(matches!(outcome, SidecarOutcome::Created(_)));
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(
+            fields.sidecar.as_deref(),
+            Some(dir.path().join("t.xmp").as_path())
+        );
+        assert_eq!(fields.title.as_deref(), Some("Sunset over Lisbon"));
+        assert_eq!(
+            fields.description.as_deref(),
+            Some("Golden hour on the Tagus")
+        );
+        assert_eq!(fields.creator, vec![s("Ana Silva"), s("Bruno Costa")]);
+        assert_eq!(fields.rights.as_deref(), Some("(c) 2026 Ana Silva"));
+        // The existing tolerant reader agrees on the fields it knows about.
+        let xmp = read_xmp_sidecar(&img).unwrap().unwrap();
+        assert_eq!(xmp.title.as_deref(), Some("Sunset over Lisbon"));
+        assert_eq!(
+            xmp.description.as_deref(),
+            Some("Golden hour on the Tagus")
+        );
+        assert_eq!(xmp.creator.as_deref(), Some("Ana Silva"));
+    }
+
+    #[test]
+    fn text_field_is_written_as_alt_and_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("s.CR3");
+        update_sidecar(&img, &text_update()).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("s.xmp")).unwrap();
+        assert!(text.contains(
+            "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Sunset over Lisbon</rdf:li></rdf:Alt></dc:title>"
+        ));
+        assert!(text.contains(
+            "<dc:creator><rdf:Seq><rdf:li>Ana Silva</rdf:li><rdf:li>Bruno Costa</rdf:li></rdf:Seq></dc:creator>"
+        ));
+    }
+
+    #[test]
+    fn text_field_remove_leaves_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("r.CR3");
+        update_sidecar(&img, &text_update()).unwrap();
+        let outcome = update_sidecar(
+            &img,
+            &SidecarUpdate {
+                title: Some(None),
+                creator: Some(Some("   ".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, SidecarOutcome::Updated(_)));
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(fields.title, None);
+        assert!(fields.creator.is_empty());
+        assert_eq!(
+            fields.description.as_deref(),
+            Some("Golden hour on the Tagus")
+        );
+        assert_eq!(fields.rights.as_deref(), Some("(c) 2026 Ana Silva"));
+    }
+
+    #[test]
+    fn text_fields_escape_markup_and_keep_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("u.CR3");
+        let tricky = "Café <&\"> 日本 & \"quotes\" <b>";
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                description: Some(Some(s(tricky))),
+                creator: Some(Some(s("José <Ana> & \"Bruno\""))),
+                ..update()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(dir.path().join("u.xmp")).unwrap();
+        assert!(!text.contains("<b>"));
+        assert!(text.contains("&lt;&amp;"));
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(fields.description.as_deref(), Some(tricky));
+        assert_eq!(fields.creator, vec![s("José <Ana> & \"Bruno\"")]);
+    }
+
+    #[test]
+    fn text_field_keeps_other_languages_and_unrelated_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("l.CR3");
+        let body = LR_ELEMENTS.replace(
+            "   <dc:subject>",
+            "   <dc:title><rdf:Alt><rdf:li xml:lang=\"de\">Titel</rdf:li></rdf:Alt></dc:title>\n   <dc:subject>",
+        );
+        let side = write_file(dir.path(), "l.xmp", &body);
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                title: Some(Some(s("Title"))),
+                rating: Some(4),
+                ..update()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert!(text.contains("<rdf:li xml:lang=\"de\">Titel</rdf:li>"));
+        assert!(text.contains("<crs:ToneCurve>"));
+        assert!(text.contains("<rdf:li>studio &amp; lights</rdf:li>"));
+        assert!(text.contains("<xmp:Rating>4</xmp:Rating>"));
+        assert_eq!(read_sidecar_fields(&img).title.as_deref(), Some("Title"));
+    }
+
+    #[test]
+    fn unchanged_text_fields_return_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("n.CR3");
+        update_sidecar(&img, &text_update()).unwrap();
+        let before = std::fs::read(dir.path().join("n.xmp")).unwrap();
+        let outcome = update_sidecar(&img, &text_update()).unwrap();
+        assert!(matches!(outcome, SidecarOutcome::Unchanged(_)));
+        assert_eq!(std::fs::read(dir.path().join("n.xmp")).unwrap(), before);
+        assert!(!dir.path().join("n.xmp.bak").exists());
+    }
+
+    #[test]
+    fn text_fields_count_as_changes_and_split_creators() {
+        assert!(!text_update().is_empty());
+        assert!(
+            !SidecarUpdate {
+                rights: Some(None),
+                ..update()
+            }
+            .is_empty()
+        );
+        assert_eq!(
+            split_creators(" Ana ;; Bruno ;Ana; "),
+            vec![s("Ana"), s("Bruno")]
+        );
+        assert!(split_creators(" ; ").is_empty());
     }
 }
