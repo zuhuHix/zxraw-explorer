@@ -6,7 +6,9 @@
 //!   window flashed on screen several times. We keep `maximized` away from winit and maximize
 //!   the hidden window ourselves, cloaked (see [`maximize_hidden`]).
 //! - eframe's default wgpu setup loads the Vulkan and GL drivers as well, which takes seconds
-//!   on cold starts. We use DX12 alone (see [`wgpu_options`]).
+//!   on cold starts. We use DX12 alone (see [`wgpu_options`]). If that setup fails before the
+//!   app starts, main runs again with eframe's default backends (see
+//!   [`retry_with_default_backends`]).
 
 use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
 use eframe::wgpu::Backends;
@@ -40,7 +42,10 @@ pub fn maximize_hidden(cc: &eframe::CreationContext<'_>) {
         }
     };
     if let Err(error) = forge_win::window::maximize_hidden(hwnd) {
-        tracing::warn!("could not maximize the hidden window ({error}); maximizing through egui");
+        tracing::warn!("could not maximize the hidden window ({error}); trying to uncloak it");
+        if let Err(error) = forge_win::window::uncloak(hwnd) {
+            tracing::warn!("could not uncloak the window ({error}); window may stay invisible");
+        }
         maximize_through_egui(cc);
     }
 }
@@ -50,29 +55,38 @@ fn maximize_through_egui(cc: &eframe::CreationContext<'_>) {
         .send_viewport_cmd(egui::ViewportCommand::Maximized(true));
 }
 
-/// Picks the wgpu backends. `None` keeps eframe's default setup (Vulkan, DX12 and GL), which
-/// is used when the user chose a backend with `WGPU_BACKEND`.
+/// Whether to use DX12 alone. `false` when the `WGPU_BACKEND` environment variable is set, which
+/// restores eframe's own choice (Vulkan, DX12 and GL).
 ///
-/// Otherwise DX12 alone: Windows 10 and 11 always have it, wgpu prefers the hardware adapter,
-/// and the WARP software adapter is the fallback when the GPU driver has no DX12 support.
-/// Probing for a hardware adapter first was measured at 350-650 ms, more than it saves.
-fn choose_backends(env_override: bool) -> Option<Backends> {
-    (!env_override).then_some(Backends::DX12)
+/// DX12 alone is the default: Windows 10 and 11 always have it, wgpu prefers the hardware
+/// adapter, and the WARP software adapter is the fallback when the GPU driver has no DX12
+/// support. When DX12 cannot start at all, main retries with eframe's default backends (see
+/// [`retry_with_default_backends`]). Probing for a hardware adapter first was measured at
+/// 350-650 ms, more than it saves.
+pub fn dx12_only_by_default() -> bool {
+    std::env::var_os("WGPU_BACKEND").is_none()
 }
 
 /// The wgpu configuration for the main window: eframe's defaults, with the backends narrowed
-/// to DX12 when [`choose_backends`] says so.
-pub fn wgpu_options() -> WgpuConfiguration {
+/// to DX12 when `dx12_only` is set.
+pub fn wgpu_options(dx12_only: bool) -> WgpuConfiguration {
     let mut options = WgpuConfiguration::default();
-    match choose_backends(std::env::var_os("WGPU_BACKEND").is_some()) {
-        Some(backends) => {
-            let mut setup = WgpuSetupCreateNew::without_display_handle();
-            setup.instance_descriptor.backends = backends;
-            options.wgpu_setup = WgpuSetup::CreateNew(setup);
-        }
-        None => tracing::info!("graphics backends: eframe default (WGPU_BACKEND is set)"),
+    if dx12_only {
+        let mut setup = WgpuSetupCreateNew::without_display_handle();
+        setup.instance_descriptor.backends = Backends::DX12;
+        options.wgpu_setup = WgpuSetup::CreateNew(setup);
     }
     options
+}
+
+/// Whether main should run the app again with eframe's default backends. That is only useful
+/// when the DX12-only setup failed before the app started, so nothing was shown or done yet.
+pub fn retry_with_default_backends(
+    dx12_only: bool,
+    app_started: bool,
+    result: &eframe::Result,
+) -> bool {
+    dx12_only && !app_started && matches!(result, Err(eframe::Error::Wgpu(_)))
 }
 
 #[cfg(test)]
@@ -104,9 +118,47 @@ mod tests {
         assert_eq!(builder.inner_size, Some(egui::vec2(640.0, 400.0)));
     }
 
+    fn no_surface_formats() -> eframe::Result {
+        Err(eframe::Error::Wgpu(
+            eframe::egui_wgpu::WgpuError::NoSurfaceFormatsAvailable,
+        ))
+    }
+
     #[test]
-    fn dx12_only_unless_the_user_chose_a_backend() {
-        assert_eq!(choose_backends(false), Some(Backends::DX12));
-        assert_eq!(choose_backends(true), None);
+    fn retries_with_default_backends_when_dx12_setup_fails_before_the_app_starts() {
+        assert!(retry_with_default_backends(
+            true,
+            false,
+            &no_surface_formats()
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_once_the_app_has_started() {
+        assert!(!retry_with_default_backends(
+            true,
+            true,
+            &no_surface_formats()
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_when_already_using_default_backends() {
+        assert!(!retry_with_default_backends(
+            false,
+            false,
+            &no_surface_formats()
+        ));
+    }
+
+    #[test]
+    fn does_not_retry_on_success() {
+        assert!(!retry_with_default_backends(true, false, &Ok(())));
+    }
+
+    #[test]
+    fn does_not_retry_on_other_errors() {
+        let error = eframe::Error::AppCreation("x".into());
+        assert!(!retry_with_default_backends(true, false, &Err(error)));
     }
 }

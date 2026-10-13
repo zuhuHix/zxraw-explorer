@@ -57,8 +57,9 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
   maximized state is applied by `startup::maximize_hidden` while the window is DWM-cloaked,
   not by winit, which would flash a blank window on screen while maximizing it.
 * Graphics use wgpu on DX12 only, so the Vulkan and OpenGL drivers are not loaded at startup.
-  WARP (software) is DX12's fallback when the GPU driver lacks DX12. Setting `WGPU_BACKEND`
-  (`vulkan`, `gl`, `dx12`) restores eframe's own backend choice.
+  If the DX12 setup fails before the app starts, the window is created again with eframe's
+  default backends (Vulkan, DX12, OpenGL) and a warning is logged. Setting `WGPU_BACKEND`
+  (`vulkan`, `gl`, `dx12`) skips the DX12-only attempt and uses eframe's own backend choice.
 
 ## Data locations
 
