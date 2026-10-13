@@ -1,4 +1,4 @@
-#define AppVersion "0.2.1"
+#define AppVersion "0.3.0"
 #define PayloadDir "..\dist\ZXraw-Explorer-" + AppVersion + "-x64"
 ; Created by the running app (updater::APP_MUTEX in crates/forge-app/src/updater.rs).
 #define AppMutexName "ZXrawExplorerRunning"
