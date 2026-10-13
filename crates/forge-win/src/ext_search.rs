@@ -189,7 +189,8 @@ finally {
 }
 "#;
 
-const PROBE_SQL: &str = "SELECT TOP 1 System.ItemPathDisplay FROM SystemIndex";
+/// Selects both columns the script reads; a missing column makes ADO fail the probe.
+const PROBE_SQL: &str = "SELECT TOP 1 System.ItemPathDisplay, System.ItemType FROM SystemIndex";
 
 /// Builds the Windows Search SQL for a file-name search. `term` becomes a LIKE pattern
 /// `%term%`, with `%`, `_` and `[` escaped; `scope` becomes `AND SCOPE='file:<path>'`.
@@ -357,9 +358,34 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 }
 
 fn first_line(bytes: &[u8]) -> String {
-    let text = decode_output(bytes);
+    let text = clixml_errors(&decode_output(bytes));
     let line = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no details");
     line.chars().take(300).collect()
+}
+
+/// PowerShell started with redirected output writes its errors as CLIXML
+/// (`#< CLIXML` then `<S S="Error">text_x000D__x000A_</S>` records). Returns the error text
+/// of those records joined into lines, or `text` unchanged when it is not CLIXML.
+pub fn clixml_errors(text: &str) -> String {
+    let Some(body) = text.trim_start().strip_prefix("#< CLIXML") else {
+        return text.to_string();
+    };
+    let mut out = String::new();
+    for record in body.split(r#"<S S="Error">"#).skip(1) {
+        let value = record.split("</S>").next().unwrap_or("");
+        out.push_str(
+            &value
+                .replace("_x000D_", "")
+                .replace("_x000A_", "
+")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&apos;", "'")
+                .replace("&amp;", "&"),
+        );
+    }
+    out
 }
 
 fn exit_text(code: Option<i32>) -> String {
@@ -431,6 +457,17 @@ fn run(_exe: &Path, _args: &[OsString], _env: &[(&str, &str)]) -> Result<Capture
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clixml_error_records_become_plain_lines() {
+        let raw = "#< CLIXML
+<Objs Version=\"1.1.0.1\"><S S=\"Error\">Exception calling &quot;Execute&quot;_x000D__x000A_</S><S S=\"Error\">At line:1_x000D__x000A_</S></Objs>";
+        assert_eq!(super::clixml_errors(raw), "Exception calling \"Execute\"
+At line:1
+");
+        assert_eq!(super::first_line(raw.as_bytes()), "Exception calling \"Execute\"");
+        assert_eq!(super::clixml_errors("plain error"), "plain error");
+    }
+
     use super::*;
 
     #[test]
