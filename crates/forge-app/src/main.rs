@@ -36,6 +36,7 @@ mod settings;
 mod settings_ui;
 mod sidebar;
 mod similar;
+mod startup;
 // The automation hook exists only in debug builds or with the `automation` feature;
 // release builds get an inert stub with the same surface.
 #[cfg(any(debug_assertions, feature = "automation"))]
@@ -191,6 +192,9 @@ fn main() -> eframe::Result {
         }
         viewport = viewport.with_active(false).with_taskbar(false);
     }
+    // A saved maximized state is applied after the window is created, not by winit, so the
+    // hidden window never flashes on screen (see `startup`).
+    let maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let options = eframe::NativeOptions {
         viewport,
         // eframe stores viewport geometry separately from ZXraw's own settings. Keep it in
@@ -200,11 +204,30 @@ fn main() -> eframe::Result {
                 || std::env::var_os("ZXRAW_PROFILE_DIR").is_some()))
         .then(|| paths.data.join("eframe.ron")),
         persist_window: !hidden,
+        // Strips `maximized` from the builder so winit does not maximize the hidden window.
+        // See `startup::defer_maximized`.
+        window_builder: Some(Box::new({
+            let maximize = maximize.clone();
+            move |builder| {
+                let (builder, maximized) = startup::defer_maximized(builder);
+                maximize.store(maximized, std::sync::atomic::Ordering::Relaxed);
+                builder
+            }
+        })),
+        // Narrows the graphics backends to DX12 when possible, to skip loading the other
+        // drivers at startup. See `startup::wgpu_options`.
+        wgpu_options: startup::wgpu_options(),
         ..Default::default()
     };
     eframe::run_native(
         "ZXraw Explorer",
         options,
-        Box::new(move |cc| Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))),
+        Box::new(move |cc| {
+            // Maximizes the hidden window while it is cloaked. See `startup::maximize_hidden`.
+            if maximize.load(std::sync::atomic::Ordering::Relaxed) {
+                startup::maximize_hidden(cc);
+            }
+            Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))
+        }),
     )
 }
