@@ -1,5 +1,20 @@
 # Testing and benchmarks
 
+## Running tests
+
+- While iterating, run `scripts/test-affected.ps1` (PowerShell 5.1). It diffs against the
+  merge-base with `origin/main`, plus uncommitted and untracked files, then runs the unit tests of
+  the changed crates and the crates that depend on them, and only the e2e areas the change
+  reaches. The plan is printed first. `-DryRun` prints the plan without running anything,
+  `-Base <ref>` compares against another ref, and `-All` runs the whole workspace.
+- Run the full `cargo test --workspace` only before a merge or a release.
+- E2E runs up to `ZXRAW_E2E_JOBS` app windows at once (default `min(3, cores / 2)`, at least 1).
+  `ZXRAW_E2E_JOBS=1` restores one at a time. Timing tests (`perf::` and
+  `browser::two_thousand_small_images_record_grouping_frame_times`) always run alone.
+- To run one area, name it after `--`: `cargo test -p forge-app --test e2e -- library::`.
+  Several areas can be listed. The areas are browser, core, ingest, library, media, perf,
+  related, system, tools and viewer.
+
 ## Workspace checks
 
 Use the Windows MSVC toolchain. From the repository root:
@@ -196,13 +211,13 @@ touched.
 ```powershell
 $env:CARGO_TARGET_DIR = 'target/fr-e2e'
 $env:CARGO_PROFILE_DEV_DEBUG = '0'   # each debug target is ~6 GB with debug info
-cargo test -p forge-app --test e2e -- --test-threads=1
-cargo test -p forge-app --test e2e -- --test-threads=1 tools::   # one area
+cargo test -p forge-app --test e2e                  # all areas, ZXRAW_E2E_JOBS runs at once
+cargo test -p forge-app --test e2e -- tools::       # one area
 cargo test -p forge-app --bin zxraw
 ```
 
-Each run opens a real window, so run the tests one at a time (a static lock enforces this too).
-A run must finish within 75 s (`RunOpts::limit` raises it); the script has its own limit, 60 s by
+Each run opens a real window on a private desktop. Up to `ZXRAW_E2E_JOBS` runs go at once (see
+Running tests), and the timing tests run alone. A run must finish within 75 s (`RunOpts::limit` raises it); the script has its own limit, 60 s by
 default and changed with `limit <seconds>`.
 
 ### Isolation and seams
