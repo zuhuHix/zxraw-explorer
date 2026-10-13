@@ -13,10 +13,9 @@ use crate::settings::Accent;
 
 /// The default accent (Blue). Prefer [`accent`], which follows the user's choice and keeps
 /// its contrast on the light theme.
-pub const ACCENT: Color32 = Color32::from_rgb(77, 144, 254);
+pub const ACCENT: Color32 = Color32::from_rgb(72, 118, 176);
 
-/// Accent presets offered in Settings › Appearance, in swatch order. Keep in step with
-/// `ACCENTS` in `packaging/generate_icon.py`, which tints the app icon tiles.
+/// Accent presets offered in Settings › Appearance, in swatch order.
 pub const ACCENTS: [(Accent, &str); 7] = [
     (Accent::Blue, "Blue"),
     (Accent::Purple, "Purple"),

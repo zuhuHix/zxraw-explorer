@@ -7,11 +7,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use egui::{Color32, RichText};
+use egui::{Color32, KeyboardShortcut, Modifiers, RichText};
 use forge_db::{Db, ExclusionKind, Exclusions, IndexRoot};
 
 use crate::app::ZxrawApp;
-use crate::commands::Cmd;
+use crate::commands::{Cmd, set_binding, shortcut_text};
 use crate::settings::{ExternalTool, Settings, ThemeChoice, ViewMode};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -147,6 +147,12 @@ enum SettingsIntent {
     InstallUpdate,
 }
 
+struct ShortcutConflict {
+    cmd: Cmd,
+    text: String,
+    other: Cmd,
+}
+
 pub struct SettingsUi {
     pub open: bool,
     /// Which apps open photos; shared with the first-run welcome.
@@ -176,6 +182,12 @@ pub struct SettingsUi {
     exclusion_value: String,
     integrity_checking: bool,
     integrity_result: Option<Result<Vec<String>, String>>,
+    /// Command whose shortcut is being recorded ("Change" was clicked). While set, the
+    /// app's own key handling is suspended so the key press cannot run a command.
+    pub capture: Option<Cmd>,
+    /// A recorded shortcut that another command already uses, awaiting the user's choice.
+    shortcut_conflict: Option<ShortcutConflict>,
+    shortcut_filter: String,
     tx: Sender<SettingsMessage>,
     rx: Receiver<SettingsMessage>,
 }
@@ -211,6 +223,9 @@ impl Default for SettingsUi {
             exclusion_value: String::new(),
             integrity_checking: false,
             integrity_result: None,
+            capture: None,
+            shortcut_conflict: None,
+            shortcut_filter: String::new(),
             tx,
             rx,
         }
@@ -436,13 +451,16 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                         updates_page(ui, settings, &updates, &mut intents)
                                     }
                                     SettingsPage::Privacy => privacy_page(ui),
-                                    SettingsPage::Shortcuts => shortcuts_page(ui, ctx),
+                                    SettingsPage::Shortcuts => shortcuts_page(ui, settings, state),
                                 }
                             });
                         });
                 });
             });
         state.open = open;
+        if !state.open {
+            state.capture = None;
+        }
     }
 
     if old_hidden != app.settings.show_hidden || old_system != app.settings.show_system {
@@ -499,27 +517,24 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
     );
     ui.add_space(14.0);
     ui.label("App icon");
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (choice, label) in crate::app_icon::ALL {
-            let preview = crate::app_icon::preview(ui.ctx(), choice, settings.accent);
-            let image = egui::Image::new(&preview).fit_to_exact_size(egui::vec2(48.0, 48.0));
-            if ui
-                .add(
-                    egui::Button::image_and_text(image, label)
-                        .selected(settings.app_icon == choice),
-                )
-                .clicked()
-            {
+            let preview = crate::app_icon::preview(ui.ctx(), choice);
+            let image = egui::Image::new(&preview).fit_to_exact_size(egui::vec2(40.0, 40.0));
+            let response = ui
+                .add(egui::Button::image(image).selected(settings.app_icon == choice))
+                .on_hover_text(label);
+            if response.clicked() {
                 settings.app_icon = choice;
             }
         }
     });
     ui.label(
         RichText::new(
-            "Used for the window, the taskbar and your ZXraw Explorer shortcuts. A pinned \
-             taskbar icon may only change after you sign out or restart Explorer.",
+            "ℹ The window and its taskbar button change right away. Windows caches pinned \
+             taskbar and Start menu icons, so those may keep the old icon until you sign out \
+             or restart your PC.",
         )
-        .weak()
         .small(),
     );
 }
@@ -1363,27 +1378,166 @@ fn privacy_page(ui: &mut egui::Ui) {
     });
 }
 
-fn shortcuts_page(ui: &mut egui::Ui, ctx: &egui::Context) {
+fn shortcuts_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut SettingsUi) {
     page_heading(
         ui,
         "Keyboard shortcuts",
-        "The shortcuts available in the current build.",
+        "Click Change, then press the new keys. Esc cancels. Changes apply immediately.",
     );
-    ui.add_space(8.0);
+    let warn = ui.visuals().warn_fg_color;
+
+    // The key press that ends a capture. Escape cancels; anything else is the new shortcut.
+    if let Some(cmd) = state.capture {
+        match record_shortcut(ui.ctx()) {
+            None => {}
+            Some(None) => state.capture = None,
+            Some(Some(text)) => {
+                state.capture = None;
+                state.shortcut_conflict = None;
+                match cmd.conflicting(&settings.keybindings, &text) {
+                    Some(other) => {
+                        state.shortcut_conflict = Some(ShortcutConflict { cmd, text, other });
+                    }
+                    None => set_binding(&mut settings.keybindings, cmd, Some(text)),
+                }
+            }
+        }
+    }
+
+    if let Some(conflict) = state.shortcut_conflict.take() {
+        let mut keep = true;
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                warn,
+                format!("{} is already used by \"{}\".", conflict.text, conflict.other.label()),
+            );
+            if ui
+                .button(format!("Unassign it from \"{}\" and use it here", conflict.other.label()))
+                .clicked()
+            {
+                set_binding(&mut settings.keybindings, conflict.other, None);
+                set_binding(&mut settings.keybindings, conflict.cmd, Some(conflict.text.clone()));
+                keep = false;
+            }
+            if ui.button("Cancel").clicked() {
+                keep = false;
+            }
+        });
+        if keep {
+            state.shortcut_conflict = Some(conflict);
+        }
+        ui.add_space(4.0);
+    }
+
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.shortcut_filter)
+                .hint_text("Search commands…")
+                .desired_width(260.0),
+        );
+        let any_custom = !settings.keybindings.is_empty();
+        if ui
+            .add_enabled(any_custom, egui::Button::new("Reset all"))
+            .on_hover_text("Restore every default shortcut")
+            .clicked()
+        {
+            settings.keybindings.clear();
+            state.shortcut_conflict = None;
+        }
+    });
+    ui.add_space(6.0);
+
+    let filter = state.shortcut_filter.trim().to_lowercase();
     egui::Grid::new("settings-shortcuts")
-        .num_columns(2)
+        .num_columns(5)
         .striped(true)
+        .spacing([12.0, 6.0])
         .show(ui, |ui| {
             ui.strong("Command");
             ui.strong("Shortcut");
+            ui.label("");
+            ui.label("");
+            ui.label("");
             ui.end_row();
-            for cmd in Cmd::ALL {
+            for &cmd in Cmd::ALL {
+                let text = cmd.binding_text(&settings.keybindings);
+                if !filter.is_empty()
+                    && !cmd.label().to_lowercase().contains(&filter)
+                    && !text.to_lowercase().contains(&filter)
+                {
+                    continue;
+                }
+                let capturing = state.capture == Some(cmd);
                 ui.label(cmd.label());
-                let text = cmd.shortcut_text(ctx);
-                ui.label(if text.is_empty() { "—" } else { &text });
+                if capturing {
+                    ui.label(RichText::new("Press keys… Esc to cancel").italics().color(warn));
+                } else if text.is_empty() {
+                    ui.label(RichText::new("—").weak());
+                } else {
+                    ui.label(RichText::new(&text).monospace());
+                }
+                if capturing {
+                    if ui.small_button("Cancel").clicked() {
+                        state.capture = None;
+                    }
+                } else if ui.small_button("Change").clicked() {
+                    state.capture = Some(cmd);
+                    state.shortcut_conflict = None;
+                }
+                let clear = ui.add_enabled(
+                    !capturing && !text.is_empty(),
+                    egui::Button::new("Clear").small(),
+                );
+                if clear.on_hover_text("Leave this command without a shortcut").clicked() {
+                    set_binding(&mut settings.keybindings, cmd, None);
+                }
+                let customised = settings.keybindings.contains_key(cmd.id());
+                if ui
+                    .add_enabled(!capturing && customised, egui::Button::new("Reset").small())
+                    .on_hover_text("Restore the default shortcut")
+                    .clicked()
+                {
+                    settings.keybindings.remove(cmd.id());
+                }
                 ui.end_row();
             }
         });
+}
+
+/// Takes the next key press from this frame's input and removes it, so no other handler
+/// sees it. `Some(None)` is Escape (cancel); `Some(Some(text))` is the recorded shortcut.
+/// egui reports Ctrl+C/X/V as clipboard events rather than key presses, so those are
+/// mapped back to keys here.
+fn record_shortcut(ctx: &egui::Context) -> Option<Option<String>> {
+    ctx.input_mut(|i| {
+        let pos = i.events.iter().position(|e| {
+            matches!(
+                e,
+                egui::Event::Key { pressed: true, repeat: false, .. }
+                    | egui::Event::Copy
+                    | egui::Event::Cut
+                    | egui::Event::Paste(_)
+            )
+        })?;
+        let event = i.events.remove(pos);
+        let shift = i.modifiers.shift;
+        let clipboard = |key| {
+            let m = Modifiers { shift, ..Modifiers::COMMAND };
+            Some(Some(shortcut_text(&KeyboardShortcut::new(m, key))))
+        };
+        let result = match event {
+            egui::Event::Key { key: egui::Key::Escape, .. } => Some(None),
+            egui::Event::Key { key, modifiers, .. } => {
+                Some(Some(shortcut_text(&KeyboardShortcut::new(modifiers, key))))
+            }
+            egui::Event::Copy => clipboard(egui::Key::C),
+            egui::Event::Cut => clipboard(egui::Key::X),
+            _ => clipboard(egui::Key::V),
+        };
+        // The companion clipboard event of the same press must not be recorded next frame.
+        i.events.retain(|e| !matches!(e, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)));
+        result
+    })
 }
 
 fn show_cache_confirmation(app: &mut ZxrawApp, ctx: &egui::Context) {

@@ -241,8 +241,12 @@ pub fn run(app: &mut ZxrawApp, action: Action) {
     app.ops.settings_ui.default_app.invalidate();
 }
 
+/// Applies the selected defaults. Windows 10/11 blocks programmatic `UserChoice` writes, so some
+/// photo types not being accepted is expected: they are counted for a neutral notice, and the
+/// raw per-type detail goes to the log only.
 fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
     let mut errors = Vec::new();
+    let mut needs_windows = 0;
     if photos {
         let registered = std::env::current_exe()
             .map_err(|error| error.to_string())
@@ -258,10 +262,13 @@ fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
                         report.succeeded()
                     );
                 }
-                Ok(report) => errors.push(format!(
-                    "Some photo types need Windows Settings: {}",
-                    report.failure_summary()
-                )),
+                Ok(report) => {
+                    needs_windows = report.failed().count();
+                    tracing::warn!(
+                        "Windows did not accept {needs_windows} photo type defaults: {}",
+                        report.failure_summary()
+                    );
+                }
                 Err(error) => errors.push(format!("Could not set photo defaults: {error}")),
             },
             Err(error) => errors.push(format!("Could not register photo types: {error}")),
@@ -273,8 +280,8 @@ fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
                 Err(error) => errors.push(format!("Could not remove photo registration: {error}")),
             },
             Ok(report) => errors.push(format!(
-                "Some photo apps could not be restored; registration was kept: {}",
-                report.failure_summary()
+                "Some photo apps could not be restored; registration was kept ({} types)",
+                report.failed().count()
             )),
             Err(error) => errors.push(format!("Could not restore photo apps: {error}")),
         }
@@ -293,11 +300,32 @@ fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
         errors.push(format!("Could not restore folder opening: {error}"));
     }
 
-    if errors.is_empty() {
-        app.toast("ZXraw Explorer default updated");
+    if !errors.is_empty() {
+        tracing::warn!("default app update failed: {}", errors.join("; "));
+        app.toast_err(brief_error(&errors));
+    } else if needs_windows > 0 {
+        app.toast(format!(
+            "Windows needs you to confirm {needs_windows} photo types in Settings. Use \"Open Windows Settings\" below."
+        ));
     } else {
-        app.toast_err(errors.join(". "));
+        app.toast("ZXraw Explorer default updated");
     }
+}
+
+/// One short line for the user; the full text is in the log.
+fn brief_error(errors: &[String]) -> String {
+    let first = errors
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Unknown error");
+    let mut text: String = first.chars().take(140).collect();
+    if first.chars().count() > 140 {
+        text.push('…');
+    }
+    if errors.len() > 1 {
+        text.push_str(&format!(" (+{} more, see log)", errors.len() - 1));
+    }
+    text
 }
 
 fn restore_previous_apps(app: &mut ZxrawApp) {
@@ -308,10 +336,13 @@ fn restore_previous_apps(app: &mut ZxrawApp) {
                 errors.push(format!("Could not remove photo registration: {error}"));
             }
         }
-        Ok(report) => errors.push(format!(
-            "Some photo apps could not be restored; registration was kept: {}",
-            report.failure_summary()
-        )),
+        Ok(report) => {
+            tracing::warn!("could not restore photo apps: {}", report.failure_summary());
+            errors.push(format!(
+                "Some photo apps could not be restored; registration was kept ({} types)",
+                report.failed().count()
+            ));
+        }
         Err(error) => errors.push(format!("Could not restore photo apps: {error}")),
     }
     if let Err(error) = forge_win::unregister_default_folder_handler() {
@@ -320,7 +351,8 @@ fn restore_previous_apps(app: &mut ZxrawApp) {
     if errors.is_empty() {
         app.toast("Previous photo apps and folder settings restored");
     } else {
-        app.toast_err(errors.join(". "));
+        tracing::warn!("restore previous apps failed: {}", errors.join("; "));
+        app.toast_err(brief_error(&errors));
     }
 }
 

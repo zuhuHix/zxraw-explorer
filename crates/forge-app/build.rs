@@ -9,9 +9,10 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo sets OUT_DIR"));
-    // One icon per logo shape and accent colour, in the order `generate_icon.py` lists them:
-    // icon 1 (the square logo on blue) is the file's own icon; the app points its shortcuts
-    // at the others to follow Settings > Appearance (see `app_icon::resource_index`).
+    // One icon per app icon colour, in the order `assets/icons/icons.txt` lists them (written
+    // by `generate_icon.py`): icon 1 (Graphite, the default) is the file's own icon; the app
+    // points its shortcuts at the others to follow Settings > App icon (see
+    // `app_icon::resource_index`).
     let manifest =
         fs::read_to_string("../../assets/icons/icons.txt").expect("read assets/icons/icons.txt");
     let icons: String = manifest

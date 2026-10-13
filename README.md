@@ -40,6 +40,8 @@ Explorer is a file manager designed around that workflow:
 | Filters like `ext:cr3 rating:>=4 lens:35mm` | limited | ✅ |
 | Duplicate finder, folder compare, folder size analysis | — | ✅ |
 | Command palette for every action | — | ✅ |
+| Rebind any keyboard shortcut | — | ✅ |
+| Collections (manual and smart) that never move your files | — | ✅ |
 | Accounts, telemetry, cloud | built in | **none** |
 
 ---
@@ -156,6 +158,19 @@ Explorer is a file manager designed around that workflow:
   <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/palette.jpg"><img src="docs/images/screens/palette.jpg" width="80%" alt="Command palette filtered to rating commands"></a>
   <br><sub>Every action is in the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>), with its shortcut.</sub>
 </p>
+
+### Make it yours
+
+- **Settings are one click away.** The ⚙ button in the top bar (or <kbd>Ctrl</kbd>+<kbd>,</kbd>) opens them.
+- **Your own shortcuts.** Settings › Keyboard shortcuts lists every command. Click *Change*, press
+  the keys you want, and it applies immediately. Clashes are flagged, with an offer to move the
+  shortcut over. Each command can be reset, or all at once.
+- **Collections without the guesswork.** *New collection…* asks what you want (empty, from the
+  current selection, or a smart collection that fills itself from a search), explains how
+  collections work, and previews what's inside before you open it.
+- **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
+  files each get their own icon, alongside the photo, video and audio ones.
+- **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
 
 <sub>Screenshots are of the real app. The sample photos in them were generated for this page.</sub>
 

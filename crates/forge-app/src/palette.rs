@@ -46,7 +46,7 @@ pub fn fuzzy_score(hay: &str, needle: &str) -> Option<i32> {
 
 impl Palette {
     /// Returns the chosen command, if any. Sets `open = false` when dismissed.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<Cmd> {
+    pub fn show(&mut self, ctx: &egui::Context, keys: &crate::commands::Keybindings) -> Option<Cmd> {
         if !self.focused_once {
             self.open = true;
         }
@@ -111,7 +111,7 @@ impl Palette {
                             if r.clicked() {
                                 chosen = Some(*c);
                             }
-                            ui.label(RichText::new(c.shortcut_text(ui.ctx())).weak().small());
+                            ui.label(RichText::new(c.binding_text(keys)).weak().small());
                         });
                     }
                 });

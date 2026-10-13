@@ -206,7 +206,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `failed_export_keeps_existing_destination_intact`. Relink preview counts exact prefixes only
   (`relink_preview_counts_exact_prefix_and_not_siblings`).
 * 🟡 Library and collection browser, editing, and saved-search management UI —
-  `forge-app/src/collections_ui.rs` (reorder, picker filtering). User interaction is not automated.
+  `forge-app/src/collections_ui.rs` (reorder, picker filtering), with a "How collections work"
+  explainer, a guided *New collection…* window (empty / from selection / smart) and a detail
+  pane with counts, file preview and actions. User interaction is not automated.
 
 ## Archives and extra tools
 
@@ -243,15 +245,25 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 
 * 🟡 egui desktop shell, list/grid modes, keyboard commands, themes, preview pane — source is
   present and commands are driven by the e2e scripts; visual review is not complete.
-* ✅ App icon choice (Settings › Appearance: Square or Round) — `forge-app/src/app_icon.rs`.
-  The transparent logo sits on a tile in the accent colour; every shape × accent is embedded
-  in `zxraw.exe` (square on blue is the file icon). The choice switches the window/taskbar
+* ✅ App icon colour (Settings › Appearance: ten colours, Graphite by default; independent of the UI accent) — `forge-app/src/app_icon.rs`.
+  The freestanding folder-camera mark is drawn per colour by `packaging/draw_logo.py`, with a
+  simplified mark at 16–24 px; every colour is embedded in `zxraw.exe` (Graphite is the file
+  icon). Old "Square"/"Round" settings load as Graphite. The choice switches the window/taskbar
   icon live and repoints the user's own shortcuts to the app (Start menu, desktop, pinned
   taskbar) — `forge-win/src/shell.rs::shortcut_icons_change_only_for_shortcuts_to_the_app`,
   `app_icon::tests::exe_icon_resources_match_the_window_icons`.
   Pinned taskbar icons can lag until Explorer restarts.
+* ✅ Customisable keyboard shortcuts (Settings › Keyboard shortcuts): search, record a new
+  combination, clear, reset one or all; conflicts offer to move the binding. Overrides are
+  stored by stable command id and used for matching and every displayed hint (menus, palette,
+  tooltips) — `forge-app/src/commands.rs` (`parse_shortcut`/`shortcut_text` tests).
+* ✅ Settings button (⚙) in the top bar, alongside the palette button and <kbd>Ctrl</kbd>+<kbd>,</kbd>.
+* ✅ Per-type file icons for code, documents, spreadsheets, executables, archives and config
+  files — `views::plain_kind_tests`.
+* ✅ "Make ZXraw Explorer my default" reports types Windows wants confirmed as a short notice
+  (details go to the log) instead of a raw error list — `forge-app/src/default_app.rs`.
 * ✅ Accent colour (Settings › Appearance: Blue, Purple, Pink, Red, Orange, Green, Teal) drives
-  selection, focus rings, links, tab/sidebar indicators, progress bars and the icon tile; the
+  selection, focus rings, links, tab/sidebar indicators, progress bars; the
   neutral surfaces are faintly tinted towards it — `forge-app/src/theme.rs`.
 * ✅ Colour contrast meets WCAG AA for selected rows, accent text and links, and focus rings, for
   every accent in both themes — `forge-app/src/theme.rs` (`selected_row_text_meets_wcag_aa`,
