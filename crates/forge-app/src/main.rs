@@ -19,6 +19,7 @@ mod fonts;
 mod gps_ui;
 mod ingest_ui;
 mod library;
+mod media_durations;
 mod media_meta;
 mod meta_edit;
 mod meta_export;

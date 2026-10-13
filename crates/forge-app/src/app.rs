@@ -92,11 +92,14 @@ pub struct ZxrawApp {
 #[derive(Default)]
 struct SelectionSummary {
     listing: Option<u64>,
-    /// Visible entry path → size.
-    index: std::collections::HashMap<PathBuf, u64>,
+    /// Visible entry path → size, modification time, and whether it's a video or audio file.
+    index: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, bool)>,
     selection: Option<(usize, u64)>,
     count: usize,
     size: u64,
+    /// Selected video and audio files, for the running-time total.
+    media: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    durations: crate::media_durations::MediaDurations,
 }
 
 impl SelectionSummary {
@@ -106,7 +109,15 @@ impl SelectionSummary {
             self.index = p
                 .visible
                 .iter()
-                .map(|&i| (p.entries[i].path.clone(), p.entries[i].size))
+                .map(|&i| {
+                    let e = &p.entries[i];
+                    let media = !e.is_dir()
+                        && matches!(
+                            forge_core::model::media_kind_for_ext(&e.ext),
+                            forge_core::model::MediaKind::Video | forge_core::model::MediaKind::Audio
+                        );
+                    (e.path.clone(), (e.size, e.modified, media))
+                })
                 .collect();
             self.listing = Some(listing);
             self.selection = None;
@@ -128,12 +139,17 @@ impl SelectionSummary {
         if self.selection != Some(selection) {
             let mut count = 0;
             let mut size = 0;
+            self.media.clear();
             for path in &p.selected {
-                if let Some(&bytes) = self.index.get(path) {
+                if let Some(&(bytes, modified, media)) = self.index.get(path) {
                     count += 1;
                     size += bytes;
+                    if media {
+                        self.media.push((path.clone(), modified));
+                    }
                 }
             }
+            self.media.sort();
             (self.count, self.size) = (count, size);
             self.selection = Some(selection);
         }
@@ -825,6 +841,14 @@ impl ZxrawApp {
                 let (sel, size) = summary.get(p);
                 if sel > 0 {
                     s += &format!("   ·   {sel} selected ({})", format_size(size));
+                    if !summary.media.is_empty() {
+                        let total = summary.durations.total(
+                            &summary.media,
+                            self.settings.ffmpeg_dir.as_deref(),
+                            ui.ctx(),
+                        );
+                        s += &crate::media_durations::status_text(&total);
+                    }
                 }
             }
             ui.label(s);
@@ -1263,6 +1287,25 @@ mod selection_summary_tests {
         let second = summary.get(&p);
         assert_eq!(first, (300, (0..300).sum()));
         assert_eq!(second, (300, (300..600).sum()));
+    }
+
+    #[test]
+    fn collects_selected_video_and_audio_files_for_the_duration_total() {
+        let mut p = pane(&[("a.txt", 10), ("clip.mp4", 20), ("song.mp3", 30)]);
+        for e in &mut p.entries {
+            e.ext = e.name.rsplit('.').next().unwrap().into();
+        }
+        p.rebuild_visible();
+        let mut summary = SelectionSummary::default();
+        p.selected.insert(p.path.join("a.txt"));
+        p.selected.insert(p.path.join("clip.mp4"));
+        p.selected.insert(p.path.join("song.mp3"));
+        assert_eq!(summary.get(&p), (3, 60));
+        let names: Vec<_> = summary.media.iter().map(|(path, _)| path.file_name().unwrap()).collect();
+        assert_eq!(names, ["clip.mp4", "song.mp3"]);
+        p.selected.remove(&p.path.join("clip.mp4"));
+        summary.get(&p);
+        assert_eq!(summary.media.len(), 1);
     }
 
     #[test]
