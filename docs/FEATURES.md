@@ -96,7 +96,26 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `cancel_scan`). Not benchmarked.
 * ✅ Compare folders (engine) — `forge-core/src/compare.rs` (`compare_and_update_never_deletes`,
   `mirror_makes_identical`, `non_mirror_plan_with_deletes_is_refused`).
-* 🟡 Compare folders in the UI — no interaction path is automated.
+* ✅ Two-way folder sync (engine) — `forge-core/src/compare.rs`: copies each side's new files
+  and the newer copy of changed files in both directions and never deletes. Tests cover both
+  directions, newer-wins on each side, same-time conflicts skipped without overwriting, type
+  mismatches skipped, and a stale preview (source or destination changed) refused.
+* 🟡 Compare and sync folders in the UI — mode picker (Update / Mirror / Two-way) with a dry-run
+  preview of every action and its direction; *Sync folders…* opens it on the two panes. E2e
+  `two_way_copies_each_sides_only_file_to_the_other_side` drives a two-way sync through the
+  testhook; the rest of the window is not automated.
+* 🟡 Batch export / convert — `forge-app/src/batch_export.rs`: JPEG, PNG, TIFF and lossless WebP,
+  never-upscale resize, JPEG quality, naming template (`{name}`, `{n:3}`, `{w}`, `{h}`, `{ext}`),
+  RAW via the embedded preview, EXIF orientation applied, no-replace publishing. Unit tests cover
+  the template, sanitising, fit maths, in-batch de-duplication, a real resize-to-JPEG export with
+  a failing file, PNG/WebP output, and that an existing destination is never overwritten. The
+  window itself is not automated.
+* 🟡 Batch metadata editor — `forge-app/src/meta_edit.rs` with `forge-media/src/xmp_write.rs`:
+  title (`dc:title`), caption (`dc:description`), creator (`dc:creator`), copyright (`dc:rights`)
+  and keywords for many files, with a current → new preview. Writes XMP sidecars only; originals
+  are never modified. Seven new writer tests (set/read back, remove, escaping and Unicode, other
+  languages and unrelated content kept, unchanged updates write nothing) plus form-logic tests.
+  Not checked against Lightroom or Bridge reading the new fields.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).
@@ -191,6 +210,11 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   (`smart_collections_and_saved_searches`, `import_reports_smart_collection_query_conflict_without_replacing`).
   The management UI is 🟡 (see Library and collections).
 
+* 🟡 Everything and Windows Search name-search backends — `forge-win/src/ext_search.rs` and the
+  selector in the search window. Queries are passed as arguments or an environment variable,
+  never spliced into a command line; SQL literal and LIKE escaping are unit-tested, including
+  injection attempts. Everything (`es.exe`) was not installed here, so it has not been run live.
+
 ## Library and collections
 
 * ✅ Store index roots, offline rows, ratings, tags, collections, and saved searches in the local
@@ -228,6 +252,14 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * 🟡 Archive, split/join, and contact-sheet UI workflows — `forge-app/src/extra_tools_ui.rs`.
   The engine is tested; the dialogs and progress display are not automated.
 * ⬜ 7z and RAR archives — not implemented.
+
+## Status bar
+
+* ✅ Selection summary: count and total size of the listed, selected entries
+  (`forge-app/src/app.rs::selection_summary_tests`), and the total running time of selected
+  video and audio files, probed with `ffprobe` in the background and cached by path and
+  modification time (`forge-app/src/media_durations.rs`; tests cover totals, the 500-file probe
+  cap and the partial / unknown wording). Not run live here because FFmpeg is not installed.
 
 ## Performance
 

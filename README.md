@@ -186,6 +186,25 @@ Explorer is a file manager designed around that workflow:
 
 ---
 
+### Batch work on a selection
+
+Every one of these is in the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>) and can be
+given its own shortcut.
+
+- **Export / convert images.** Turn a selection into JPEG, PNG, TIFF or WebP, shrink to a long
+  edge or a box (never enlarged), pick the JPEG quality and name the files with a template such
+  as `{name}_{n:3}`. RAW files are exported from their embedded preview. Existing files are never
+  overwritten.
+- **Edit metadata.** Set the title, caption, creator, copyright and keywords on many files at
+  once, with a before/after preview. Changes go to XMP sidecars; your originals are not touched.
+- **Sync folders.** Compare two folders and preview exactly what will be copied before anything
+  happens. *Update* copies newer files one way, *Mirror* makes the right side identical, and
+  *Two-way* copies each side's new and newer files to the other without deleting anything.
+- **Fast name search.** The search window can also ask Everything or the Windows Search index,
+  when they are available, instead of the app's own library index.
+- **Selection summary.** The status bar shows how many items are selected, their total size and
+  the total running time of selected videos and audio.
+
 ## Import from a card, safely
 
 <p align="center">

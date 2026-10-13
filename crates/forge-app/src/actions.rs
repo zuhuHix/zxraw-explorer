@@ -470,6 +470,9 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::LocateProxies => crate::video_ui::locate_proxies(app),
         Cmd::SelectOriginals => crate::export_assoc::select_originals(app),
         Cmd::SelectExports => crate::export_assoc::select_exports(app),
+        Cmd::BatchExport => crate::batch_export::open(app),
+        Cmd::EditMetadata => crate::meta_edit::open(app),
+        Cmd::SyncFolders => crate::tools_ui::open_sync(app),
         Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {
             use crate::tools_ui::Tool;
             let tool = match cmd {
@@ -797,6 +800,8 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::video_ui::window(app, ui.ctx());
     crate::extra_tools_ui::window(app, ui.ctx());
     crate::meta_export::window(app, ui.ctx());
+    crate::batch_export::window(app, ui.ctx());
+    crate::meta_edit::window(app, ui.ctx());
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }

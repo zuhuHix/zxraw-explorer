@@ -558,6 +558,14 @@ pub(crate) fn automation_duplicates_recycle(app: &mut ZxrawApp) -> Result<(), St
     Ok(())
 }
 
+/// `Cmd::SyncFolders`: opens folder compare with the active pane on the left and the other
+/// pane (when dual-pane) on the right.
+pub fn open_sync(app: &mut ZxrawApp) {
+    let dir = app.pane().path.clone();
+    let other = app.tab().other().map(|p| p.path.clone());
+    app.ops.tools.open(Tool::CompareFolders, dir, Vec::new(), other);
+}
+
 pub(crate) fn automation_open_compare(app: &mut ZxrawApp, left: PathBuf) {
     app.ops
         .tools
@@ -658,6 +666,14 @@ pub(crate) fn automation_compare_report(
 }
 
 pub(crate) fn automation_compare_build_update(app: &mut ZxrawApp) -> Result<SyncPlan, String> {
+    automation_compare_build_plan(app, SyncMode::Update)
+}
+
+pub(crate) fn automation_compare_build_two_way(app: &mut ZxrawApp) -> Result<SyncPlan, String> {
+    automation_compare_build_plan(app, SyncMode::TwoWay)
+}
+
+fn automation_compare_build_plan(app: &mut ZxrawApp, mode: SyncMode) -> Result<SyncPlan, String> {
     let Some(window) = app
         .ops
         .tools
@@ -679,13 +695,21 @@ pub(crate) fn automation_compare_build_update(app: &mut ZxrawApp) -> Result<Sync
         .report
         .as_ref()
         .ok_or("comparison has not completed")?;
-    state.sync_mode = SyncMode::Update;
-    let plan = compare::plan_sync(report, &state.left, right, SyncMode::Update);
+    state.sync_mode = mode;
+    let plan = compare::plan_sync(report, &state.left, right, mode);
     state.plan = Some(plan.clone());
     Ok(plan)
 }
 
 pub(crate) fn automation_compare_execute_update(app: &mut ZxrawApp) -> Result<(), String> {
+    automation_compare_execute_plan(app, SyncMode::Update)
+}
+
+pub(crate) fn automation_compare_execute_two_way(app: &mut ZxrawApp) -> Result<(), String> {
+    automation_compare_execute_plan(app, SyncMode::TwoWay)
+}
+
+fn automation_compare_execute_plan(app: &mut ZxrawApp, mode: SyncMode) -> Result<(), String> {
     let jobs = app.ops.jobs.clone();
     let event_tx = app.ops.tx.clone();
     let app_ctx = app.ops.ctx.clone();
@@ -702,8 +726,8 @@ pub(crate) fn automation_compare_execute_update(app: &mut ZxrawApp) -> Result<()
     let ToolState::Compare(state) = &window.state else {
         unreachable!();
     };
-    if state.sync_mode != SyncMode::Update {
-        return Err("sync mode is not Update".into());
+    if state.sync_mode != mode {
+        return Err(format!("sync mode is not {mode:?}"));
     }
     let plan = state.plan.clone().ok_or("build a sync preview first")?;
     launch_action(
@@ -1106,6 +1130,11 @@ fn launch_action(
                     plan.left.display(),
                     plan.right.display()
                 ),
+                SyncMode::TwoWay => format!(
+                    "Syncing {} and {} both ways",
+                    plan.left.display(),
+                    plan.right.display()
+                ),
             };
             let result_tx = result_tx.clone();
             let ctx = ctx.clone();
@@ -1123,6 +1152,9 @@ fn launch_action(
                 );
                 let mut changed = HashSet::new();
                 changed.insert(plan.right.clone());
+                if plan.mode == compare::SyncMode::TwoWay {
+                    changed.insert(plan.left.clone());
+                }
                 for path in &report.done {
                     if let Some(parent) = path.parent() {
                         changed.insert(parent.to_path_buf());
@@ -2419,12 +2451,20 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
             SyncMode::Mirror,
             "Mirror left → right",
         );
+        ui.radio_value(&mut state.sync_mode, SyncMode::TwoWay, "Two-way");
         if old_mode != state.sync_mode {
             state.plan = None;
             state.confirming_mirror = false;
         }
         build_preview = ui.button("Build preview").clicked();
     });
+    for help in [
+        "Update: copies new and left-newer files; never deletes or overwrites a newer right file.",
+        "Mirror: makes right identical to left; right-only items go to the Recycle Bin after confirmation.",
+        "Two-way: copies missing items both ways and the newer file over the older; same-time conflicts are skipped; never deletes.",
+    ] {
+        ui.label(RichText::new(help).weak());
+    }
     // The preview is fingerprinted off the UI thread; `ToolPayload::SyncPlan` stores it.
     if build_preview && let Some(right) = &state.right {
         return Some(UiAction::Start(DeferredAction::BuildSyncPlan {
@@ -2435,20 +2475,38 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
         }));
     }
     if let Some(plan) = &state.plan {
+        let copies_to_left = plan
+            .actions
+            .iter()
+            .filter(|action| matches!(action, SyncAction::Copy { to_left: true, .. }))
+            .count();
         let copies = plan
             .actions
             .iter()
             .filter(|action| matches!(action, SyncAction::Copy { .. }))
+            .count()
+            - copies_to_left;
+        let dirs_to_left = plan
+            .actions
+            .iter()
+            .filter(|action| matches!(action, SyncAction::CreateDir { to_left: true, .. }))
             .count();
         let dirs = plan
             .actions
             .iter()
             .filter(|action| matches!(action, SyncAction::CreateDir { .. }))
-            .count();
+            .count()
+            - dirs_to_left;
         let deletes = plan.deletes();
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!("{copies} file copy/update(s)"));
-            ui.label(format!("{dirs} folder(s) to create"));
+            ui.label(format!(
+                "→ right: {copies} file copy/update(s), {dirs} folder(s)"
+            ));
+            if plan.mode == SyncMode::TwoWay {
+                ui.label(format!(
+                    "← left: {copies_to_left} file copy/update(s), {dirs_to_left} folder(s)"
+                ));
+            }
             ui.label(format!("{} to copy", format_size(plan.bytes_to_copy)));
             if !plan.skipped.is_empty() {
                 ui.label(format!("{} skipped", plan.skipped.len()));
@@ -2466,19 +2524,27 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
             .show(ui, |ui| {
                 for action in &plan.actions {
                     match action {
-                        SyncAction::CreateDir { rel } => {
-                            ui.label(format!("CREATE FOLDER  {}", plan.right.join(rel).display()))
+                        SyncAction::CreateDir { rel, to_left } => {
+                            let (arrow, root) = sync_destination(plan, *to_left);
+                            ui.label(format!(
+                                "{arrow}  CREATE FOLDER  {}",
+                                root.join(rel).display()
+                            ))
                         }
                         SyncAction::Copy {
                             rel,
                             overwrite,
                             bytes,
-                        } => ui.label(format!(
-                            "{}  {}  ({})",
-                            if *overwrite { "UPDATE" } else { "COPY" },
-                            plan.right.join(rel).display(),
-                            format_size(*bytes)
-                        )),
+                            to_left,
+                        } => {
+                            let (arrow, root) = sync_destination(plan, *to_left);
+                            ui.label(format!(
+                                "{arrow}  {}  {}  ({})",
+                                if *overwrite { "UPDATE" } else { "COPY" },
+                                root.join(rel).display(),
+                                format_size(*bytes)
+                            ))
+                        }
                         SyncAction::Delete { rel, is_dir, .. } => ui.colored_label(
                             ui.visuals().error_fg_color,
                             format!(
@@ -2543,6 +2609,15 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
         }
     }
     None
+}
+
+/// Arrow and destination root for an action that writes to the right or the left side.
+fn sync_destination(plan: &SyncPlan, to_left: bool) -> (&'static str, &Path) {
+    if to_left {
+        ("← left", plan.left.as_path())
+    } else {
+        ("→ right", plan.right.as_path())
+    }
 }
 
 fn compare_filter_matches(filter: CompareFilter, state: &EntryState) -> bool {

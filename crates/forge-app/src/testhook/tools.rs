@@ -21,6 +21,11 @@
 //!   not copy this relative path.
 //! - `compare assert-skipped <rel>`: the preview skips this relative path with a reason.
 //! - `compare execute-update`: run the previewed Update (fails unless the mode is Update).
+//! - `compare plan-two-way`: build the Two-way preview (copies missing items both ways and the
+//!   newer file over the older; never deletes). The `assert-plan`, `assert-copy`, and
+//!   `assert-skipped` verbs rebuild the Update preview, so check a Two-way preview before them.
+//! - `compare execute-two-way`: run the previewed Two-way sync (fails unless the mode is
+//!   Two-way).
 //! - `compare wait-sync [secs]`: wait for the sync job's result (default 30 s).
 //! - `compare assert-sync <key=value>…`: result counts. Keys: `done`, `failed`, `skipped`.
 //!
@@ -299,6 +304,14 @@ fn compare_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
         "execute-update" => {
             no_args(rest)?;
             tools_ui::automation_compare_execute_update(app).map(|()| Flow::Done)
+        }
+        "plan-two-way" => {
+            no_args(rest)?;
+            tools_ui::automation_compare_build_two_way(app).map(|_| Flow::Done)
+        }
+        "execute-two-way" => {
+            no_args(rest)?;
+            tools_ui::automation_compare_execute_two_way(app).map(|()| Flow::Done)
         }
         "wait-sync" => {
             let timeout = timeout_arg(rest)?;

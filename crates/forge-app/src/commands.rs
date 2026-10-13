@@ -92,6 +92,9 @@ pub enum Cmd {
     LocateProxies,
     SelectOriginals,
     SelectExports,
+    BatchExport,
+    EditMetadata,
+    SyncFolders,
     DownloadFfmpeg,
     CheckForUpdates,
 }
@@ -183,6 +186,9 @@ impl Cmd {
         Cmd::LocateProxies,
         Cmd::SelectOriginals,
         Cmd::SelectExports,
+        Cmd::BatchExport,
+        Cmd::EditMetadata,
+        Cmd::SyncFolders,
         Cmd::DownloadFfmpeg,
         Cmd::CheckForUpdates,
     ];
@@ -276,6 +282,9 @@ impl Cmd {
             Self::LocateProxies => "LocateProxies",
             Self::SelectOriginals => "SelectOriginals",
             Self::SelectExports => "SelectExports",
+            Self::BatchExport => "BatchExport",
+            Self::EditMetadata => "EditMetadata",
+            Self::SyncFolders => "SyncFolders",
             Self::DownloadFfmpeg => "DownloadFfmpeg",
             Self::CheckForUpdates => "CheckForUpdates",
         }
@@ -369,6 +378,9 @@ impl Cmd {
             LocateProxies => "Locate video proxies…",
             SelectOriginals => "Select originals of exports",
             SelectExports => "Select exports of originals",
+            BatchExport => "Export / convert images…",
+            EditMetadata => "Edit metadata (XMP)…",
+            SyncFolders => "Sync folders…",
             DownloadFfmpeg => "Download FFmpeg (video tools)…",
             CheckForUpdates => "Check for updates",
         }
