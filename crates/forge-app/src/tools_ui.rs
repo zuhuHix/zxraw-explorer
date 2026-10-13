@@ -558,6 +558,14 @@ pub(crate) fn automation_duplicates_recycle(app: &mut ZxrawApp) -> Result<(), St
     Ok(())
 }
 
+/// `Cmd::SyncFolders`: opens folder compare with the active pane on the left and the other
+/// pane (when dual-pane) on the right.
+pub fn open_sync(app: &mut ZxrawApp) {
+    let dir = app.pane().path.clone();
+    let other = app.tab().other().map(|p| p.path.clone());
+    app.ops.tools.open(Tool::CompareFolders, dir, Vec::new(), other);
+}
+
 pub(crate) fn automation_open_compare(app: &mut ZxrawApp, left: PathBuf) {
     app.ops
         .tools

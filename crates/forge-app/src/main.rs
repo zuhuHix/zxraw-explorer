@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod app_icon;
+mod batch_export;
 mod batch_rename;
 mod breadcrumb;
 mod collections_ui;
@@ -19,6 +20,7 @@ mod gps_ui;
 mod ingest_ui;
 mod library;
 mod media_meta;
+mod meta_edit;
 mod meta_export;
 mod modal;
 mod notices;
