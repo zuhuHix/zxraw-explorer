@@ -192,42 +192,62 @@ fn main() -> eframe::Result {
         }
         viewport = viewport.with_active(false).with_taskbar(false);
     }
-    // A saved maximized state is applied after the window is created, not by winit, so the
-    // hidden window never flashes on screen (see `startup`).
-    let maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let options = eframe::NativeOptions {
-        viewport,
-        // eframe stores viewport geometry separately from ZXraw's own settings. Keep it in
-        // the same throwaway profile when UI automation or an explicit profile is active.
-        persistence_path: (cfg!(any(debug_assertions, feature = "automation"))
-            && (testhook::env_requests_automation()
-                || std::env::var_os("ZXRAW_PROFILE_DIR").is_some()))
-        .then(|| paths.data.join("eframe.ron")),
-        persist_window: !hidden,
-        // Strips `maximized` from the builder so winit does not maximize the hidden window.
-        // See `startup::defer_maximized`.
-        window_builder: Some(Box::new({
-            let maximize = maximize.clone();
-            move |builder| {
-                let (builder, maximized) = startup::defer_maximized(builder);
-                maximize.store(maximized, std::sync::atomic::Ordering::Relaxed);
-                builder
-            }
-        })),
-        // Narrows the graphics backends to DX12 when possible, to skip loading the other
-        // drivers at startup. See `startup::wgpu_options`.
-        wgpu_options: startup::wgpu_options(),
-        ..Default::default()
+    // eframe stores viewport geometry separately from ZXraw's own settings. Keep it in the same
+    // throwaway profile when UI automation or an explicit profile is active.
+    let persistence_path = (cfg!(any(debug_assertions, feature = "automation"))
+        && (testhook::env_requests_automation()
+            || std::env::var_os("ZXRAW_PROFILE_DIR").is_some()))
+    .then(|| paths.data.join("eframe.ron"));
+    // Taken when the app is created, so a retry can tell whether the app started.
+    let app_args = std::rc::Rc::new(std::cell::RefCell::new(Some((paths, pending_crash))));
+    let run = |dx12_only: bool| {
+        // A saved maximized state is applied after the window is created, not by winit, so the
+        // hidden window never flashes on screen (see `startup`). Fresh for each attempt.
+        let maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = eframe::NativeOptions {
+            viewport: viewport.clone(),
+            persistence_path: persistence_path.clone(),
+            persist_window: !hidden,
+            // Strips `maximized` from the builder so winit does not maximize the hidden window.
+            // See `startup::defer_maximized`.
+            window_builder: Some(Box::new({
+                let maximize = maximize.clone();
+                move |builder| {
+                    let (builder, maximized) = startup::defer_maximized(builder);
+                    maximize.store(maximized, std::sync::atomic::Ordering::Relaxed);
+                    builder
+                }
+            })),
+            // DX12 alone skips loading the other drivers at startup. See `startup::wgpu_options`.
+            wgpu_options: startup::wgpu_options(dx12_only),
+            ..Default::default()
+        };
+        let app_args = app_args.clone();
+        eframe::run_native(
+            "ZXraw Explorer",
+            options,
+            Box::new(move |cc| {
+                // Maximizes the hidden window while it is cloaked. See `startup::maximize_hidden`.
+                if maximize.load(std::sync::atomic::Ordering::Relaxed) {
+                    startup::maximize_hidden(cc);
+                }
+                let (paths, pending_crash) = app_args
+                    .borrow_mut()
+                    .take()
+                    .expect("the app is created once per run");
+                Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))
+            }),
+        )
     };
-    eframe::run_native(
-        "ZXraw Explorer",
-        options,
-        Box::new(move |cc| {
-            // Maximizes the hidden window while it is cloaked. See `startup::maximize_hidden`.
-            if maximize.load(std::sync::atomic::Ordering::Relaxed) {
-                startup::maximize_hidden(cc);
-            }
-            Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))
-        }),
-    )
+    let dx12_only = startup::dx12_only_by_default();
+    let result = run(dx12_only);
+    if startup::retry_with_default_backends(dx12_only, app_args.borrow().is_none(), &result) {
+        if let Err(error) = &result {
+            tracing::warn!(
+                "DX12 graphics setup failed ({error}); retrying with the default graphics backends"
+            );
+        }
+        return run(false);
+    }
+    result
 }
