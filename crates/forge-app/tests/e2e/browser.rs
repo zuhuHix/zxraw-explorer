@@ -199,6 +199,8 @@ fn corrupt_jpeg_in_burst_does_not_break_grouping_or_crash() {
 
 #[test]
 fn two_thousand_small_images_record_grouping_frame_times() {
+    // Frame timings: runs alone, with no other app window running.
+    let _alone = exclusive();
     let (_temp, work, profile, root) = fixture();
     let source = root.join("many-images");
     fs::create_dir_all(&source).unwrap();

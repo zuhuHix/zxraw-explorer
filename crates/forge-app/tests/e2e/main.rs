@@ -8,10 +8,16 @@
 //! show native file dialogs (answers come from `dialog` steps) and recycle into a sandbox
 //! folder inside the profile, never the real Recycle Bin.
 //!
-//! The app opens a real window (on a private, invisible desktop, ignoring real input, so the
-//! PC stays usable; set `ZXRAW_SHOW_WINDOW=1` to watch), so these tests run one at a time (a
-//! static lock enforces it; `--test-threads=1` is still recommended). Areas live in their own
-//! modules; run one with e.g. `cargo test -p forge-app --test e2e viewer:: -- --test-threads=1`.
+//! Each app window opens on its own private, invisible desktop (named after the test
+//! process), ignores real input, and uses its own profile, temp folders and ephemeral ports,
+//! so runs are isolated from each other. Up to N app runs execute at once, where N is
+//! `ZXRAW_E2E_JOBS` (default: `min(3, available_parallelism / 2)`, at least 1; `1` restores
+//! the old one-at-a-time behaviour). A counting gate ([`run_app_with`]) enforces the limit.
+//! Tests whose numbers depend on the machine being otherwise idle (frame timings in `perf`
+//! and the grouping frame-time test in `browser`) call [`exclusive`] first, which waits for
+//! every permit, so they run alone. `ZXRAW_SHOW_WINDOW=1` shows a window to watch it (use
+//! `ZXRAW_E2E_JOBS=1` with that). Areas live in their own modules; run one with e.g.
+//! `cargo test -p forge-app --test e2e viewer::`.
 
 #![allow(dead_code)]
 
@@ -26,17 +32,96 @@ mod system;
 mod tools;
 mod viewer;
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Default hard limit for one app run. Most scripts finish in a few seconds.
 pub const RUN_LIMIT: Duration = Duration::from_secs(75);
 
-static WINDOW: Mutex<()> = Mutex::new(());
+/// Counting gate for app runs: `free` permits are available out of `total`.
+struct Gate {
+    free: Mutex<usize>,
+    changed: Condvar,
+    total: usize,
+}
+
+static GATE: OnceLock<Gate> = OnceLock::new();
+
+thread_local! {
+    /// Set on a test thread that holds [`exclusive`], whose app runs must not take a permit
+    /// again (it already holds all of them).
+    static EXCLUSIVE: Cell<bool> = Cell::new(false);
+}
+
+/// Number of app runs allowed at once: `ZXRAW_E2E_JOBS`, else `min(3, cores / 2)`, at least 1.
+pub fn e2e_jobs() -> usize {
+    let default = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).min(3))
+        .unwrap_or(1)
+        .max(1);
+    std::env::var("ZXRAW_E2E_JOBS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(default)
+}
+
+fn gate() -> &'static Gate {
+    GATE.get_or_init(|| {
+        let total = e2e_jobs();
+        Gate {
+            free: Mutex::new(total),
+            changed: Condvar::new(),
+            total,
+        }
+    })
+}
+
+/// Permits taken from the gate; they are returned on drop.
+struct Permit(usize);
+
+fn acquire(n: usize) -> Permit {
+    let g = gate();
+    let mut free = g.free.lock().unwrap_or_else(|p| p.into_inner());
+    while *free < n {
+        free = g.changed.wait(free).unwrap_or_else(|p| p.into_inner());
+    }
+    *free -= n;
+    Permit(n)
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let g = gate();
+        let mut free = g.free.lock().unwrap_or_else(|p| p.into_inner());
+        *free += self.0;
+        g.changed.notify_all();
+    }
+}
+
+/// Held by a test that must run alone (see [`exclusive`]).
+pub struct Exclusive {
+    _permit: Permit,
+}
+
+impl Drop for Exclusive {
+    fn drop(&mut self) {
+        EXCLUSIVE.with(|c| c.set(false));
+    }
+}
+
+/// Waits until no other app run is in progress and keeps new ones out until the returned
+/// guard is dropped. Use it first in any test whose assertions or reports depend on timing.
+pub fn exclusive() -> Exclusive {
+    let permit = acquire(gate().total);
+    EXCLUSIVE.with(|c| c.set(true));
+    Exclusive { _permit: permit }
+}
 
 pub struct Outcome {
     pub status: ExitStatus,
@@ -72,9 +157,8 @@ pub fn run_app(work: &Path, profile: &Path, script: &str) -> Outcome {
 }
 
 pub fn run_app_with(work: &Path, profile: &Path, script: &str, opts: &RunOpts) -> Outcome {
-    let _window = WINDOW
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A test that holds `exclusive()` already has every permit.
+    let _permit = (!EXCLUSIVE.with(|c| c.get())).then(|| acquire(1));
     let limit = opts.limit.unwrap_or(RUN_LIMIT);
     fs::create_dir_all(work).unwrap();
     let script_path = work.join("steps.txt");

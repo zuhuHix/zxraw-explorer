@@ -60,6 +60,8 @@ fn p95(report: &serde_json::Value, series: &str) -> f64 {
 
 #[test]
 fn fifty_thousand_files_scroll_without_long_frames() {
+    // Frame timings: runs alone, with no other app window running.
+    let _alone = exclusive();
     let sandbox = tempfile::tempdir().unwrap();
     let folder = sandbox.path().join("flat50k");
     let profile = sandbox.path().join("profile");
@@ -192,6 +194,8 @@ fn make_burst_folder(dir: &Path) -> String {
 
 #[test]
 fn five_thousand_burst_photos_keep_frames_short_while_grouping_and_scrolling() {
+    // Frame timings: runs alone, with no other app window running.
+    let _alone = exclusive();
     let sandbox = tempfile::tempdir().unwrap();
     let folder = sandbox.path().join("bursts5k");
     let profile = sandbox.path().join("profile");
