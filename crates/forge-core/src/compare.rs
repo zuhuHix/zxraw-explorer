@@ -236,17 +236,27 @@ pub enum SyncMode {
     /// Make the right side identical to the left: copies, overwrites any difference and
     /// **deletes** right-only items.
     Mirror,
+    /// Copy each side's missing files and folders to the other side, and the newer copy of a
+    /// file over the older one. Same-time, different-content files are skipped as conflicts.
+    /// Never deletes.
+    TwoWay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SyncAction {
     CreateDir {
         rel: PathBuf,
+        /// Create on the left side instead of the right (TwoWay plans only).
+        #[serde(default)]
+        to_left: bool,
     },
     Copy {
         rel: PathBuf,
         overwrite: bool,
         bytes: u64,
+        /// Copy right → left instead of left → right (TwoWay plans only).
+        #[serde(default)]
+        to_left: bool,
     },
     /// Only produced in Mirror mode. Folders are removed from their snapshot-listed entries.
     Delete {
@@ -287,7 +297,8 @@ pub struct SyncSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncExpectation {
     pub rel: PathBuf,
-    pub left: SideInfo,
+    /// State of the left side when planned (`None`: the action expects it to be absent).
+    pub left: Option<SideInfo>,
     pub right: Option<SideInfo>,
     pub left_fingerprint: Option<ContentFingerprint>,
     pub right_fingerprint: Option<ContentFingerprint>,
@@ -343,44 +354,98 @@ fn plan_sync_inner(
         .filter_map(|entry| entry.right.map(|side| (entry.rel.as_path(), side)))
         .collect();
     right_sides.sort_by(|a, b| a.0.cmp(b.0));
+    let two_way = mode == SyncMode::TwoWay;
     let mut bytes = 0;
-    let mut copy =
-        |entry: &CompareEntry, overwrite: bool, size: u64, copies: &mut Vec<SyncAction>| {
-            if let Some(left_side) = entry.left {
-                let left_fingerprint =
-                    fingerprint_for_side(&left.join(&entry.rel), left_side, Coverage::Sampled, ctx);
-                let right_side = entry
-                    .right
-                    .filter(|side| overwrite && side.kind == NodeKind::File);
-                // An overwritten destination is hashed in full: a sample could miss an edit.
-                let right_fingerprint = right_side.and_then(|side| {
-                    fingerprint_for_side(&right.join(&entry.rel), side, Coverage::Full, ctx)
-                });
-                expected.push(SyncExpectation {
-                    rel: entry.rel.clone(),
-                    left: left_side,
-                    right: right_side,
-                    left_fingerprint,
-                    right_fingerprint,
-                });
-            }
-            bytes += size;
-            copies.push(SyncAction::Copy {
-                rel: entry.rel.clone(),
-                overwrite,
-                bytes: size,
-            });
+    // `to_left` copies read the right side and write the left side; otherwise the reverse.
+    let mut copy = |entry: &CompareEntry,
+                    overwrite: bool,
+                    size: u64,
+                    to_left: bool,
+                    copies: &mut Vec<SyncAction>| {
+        let (source_root, source_side, dest_root, dest_side) = if to_left {
+            (right, entry.right, left, entry.left)
+        } else {
+            (left, entry.left, right, entry.right)
         };
+        if let Some(source_side) = source_side {
+            let source_fingerprint = fingerprint_for_side(
+                &source_root.join(&entry.rel),
+                source_side,
+                Coverage::Sampled,
+                ctx,
+            );
+            let dest_side = dest_side.filter(|side| overwrite && side.kind == NodeKind::File);
+            // An overwritten destination is hashed in full: a sample could miss an edit.
+            let dest_fingerprint = dest_side.and_then(|side| {
+                fingerprint_for_side(&dest_root.join(&entry.rel), side, Coverage::Full, ctx)
+            });
+            let (left_side, left_fingerprint, right_side, right_fingerprint) = if to_left {
+                (
+                    dest_side,
+                    dest_fingerprint,
+                    Some(source_side),
+                    source_fingerprint,
+                )
+            } else {
+                (
+                    Some(source_side),
+                    source_fingerprint,
+                    dest_side,
+                    dest_fingerprint,
+                )
+            };
+            expected.push(SyncExpectation {
+                rel: entry.rel.clone(),
+                left: left_side,
+                right: right_side,
+                left_fingerprint,
+                right_fingerprint,
+            });
+        }
+        bytes += size;
+        copies.push(SyncAction::Copy {
+            rel: entry.rel.clone(),
+            overwrite,
+            bytes: size,
+            to_left,
+        });
+    };
+    // Folders that are files or folders on only one side (TwoWay): nothing is copied into them.
+    let mut mismatched_dirs: HashSet<&Path> = HashSet::new();
     for e in &report.entries {
         check_cancel(ctx)?;
         let rel = e.rel.as_path();
         let lk = e.left.map(|i| i.kind);
+        if two_way
+            && matches!(e.state, EntryState::LeftOnly | EntryState::RightOnly)
+            && rel
+                .ancestors()
+                .skip(1)
+                .any(|dir| mismatched_dirs.contains(dir))
+        {
+            skipped.push(OpIssue::new(
+                rel,
+                "a parent folder is a different item type on each side",
+            ));
+            continue;
+        }
         match &e.state {
             EntryState::Same => {}
             EntryState::Error(msg) => skipped.push(OpIssue::new(rel, msg.clone())),
             EntryState::LeftOnly => match lk {
-                Some(NodeKind::Dir) => mkdirs.push(SyncAction::CreateDir { rel: rel.into() }),
-                Some(NodeKind::File) => copy(e, false, e.left.unwrap().size, &mut copies),
+                Some(NodeKind::Dir) => mkdirs.push(SyncAction::CreateDir {
+                    rel: rel.into(),
+                    to_left: false,
+                }),
+                Some(NodeKind::File) => copy(e, false, e.left.unwrap().size, false, &mut copies),
+                _ => skipped.push(OpIssue::new(rel, "links are not synced")),
+            },
+            EntryState::RightOnly if two_way => match e.right.map(|i| i.kind) {
+                Some(NodeKind::Dir) => mkdirs.push(SyncAction::CreateDir {
+                    rel: rel.into(),
+                    to_left: true,
+                }),
+                Some(NodeKind::File) => copy(e, false, e.right.unwrap().size, true, &mut copies),
                 _ => skipped.push(OpIssue::new(rel, "links are not synced")),
             },
             EntryState::RightOnly => {
@@ -416,11 +481,15 @@ fn plan_sync_inner(
                         expected: deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?,
                     });
                     if lk == Some(NodeKind::Dir) {
-                        mkdirs.push(SyncAction::CreateDir { rel: rel.into() });
+                        mkdirs.push(SyncAction::CreateDir {
+                            rel: rel.into(),
+                            to_left: false,
+                        });
                     } else {
-                        copy(e, false, e.left.unwrap().size, &mut copies);
+                        copy(e, false, e.left.unwrap().size, false, &mut copies);
                     }
                 } else {
+                    mismatched_dirs.insert(rel);
                     skipped.push(OpIssue::new(rel, "different item types on each side"));
                 }
             }
@@ -430,13 +499,26 @@ fn plan_sync_inner(
                     continue;
                 }
                 let size = e.left.unwrap().size;
-                let left_newer = time_cmp(
+                let order = time_cmp(
                     e.left.and_then(|i| i.modified),
                     e.right.and_then(|i| i.modified),
                     Duration::from_secs(2),
-                ) == std::cmp::Ordering::Greater;
-                if mirror || *reason == DiffReason::LeftNewer || left_newer {
-                    copy(e, true, size, &mut copies);
+                );
+                if two_way {
+                    match order {
+                        std::cmp::Ordering::Greater => copy(e, true, size, false, &mut copies),
+                        std::cmp::Ordering::Less => {
+                            let right_size = e.right.unwrap().size;
+                            copy(e, true, right_size, true, &mut copies)
+                        }
+                        std::cmp::Ordering::Equal => skipped
+                            .push(OpIssue::new(rel, "conflict: same time, different content")),
+                    }
+                } else if mirror
+                    || *reason == DiffReason::LeftNewer
+                    || order == std::cmp::Ordering::Greater
+                {
+                    copy(e, true, size, false, &mut copies);
                 } else {
                     skipped.push(OpIssue::new(
                         rel,
@@ -1044,8 +1126,9 @@ pub fn execute_sync(
                     );
                 }
             }
-            SyncAction::CreateDir { rel } => {
-                let p = plan.right.join(rel);
+            SyncAction::CreateDir { rel, to_left } => {
+                let root = if *to_left { &plan.left } else { &plan.right };
+                let p = root.join(rel);
                 if let Err(e) = fs::create_dir_all(&p) {
                     fail(&mut report, &p, e.to_string());
                 }
@@ -1054,29 +1137,30 @@ pub fn execute_sync(
                 rel,
                 overwrite,
                 bytes,
+                to_left,
             } => {
-                let src = plan.left.join(rel);
-                let dest = plan.right.join(rel);
+                let (src_root, dest_root) = if *to_left {
+                    (&plan.right, &plan.left)
+                } else {
+                    (&plan.left, &plan.right)
+                };
+                let src = src_root.join(rel);
+                let dest = dest_root.join(rel);
                 let expected = expected_by_rel.get(rel.as_path());
+                // Expectations are stored per side; pick the source's and destination's.
+                let (source_expect, source_fp, dest_expect, dest_fp) = match expected {
+                    Some(s) if *to_left => {
+                        (s.right, s.right_fingerprint, s.left, s.left_fingerprint)
+                    }
+                    Some(s) => (s.left, s.left_fingerprint, s.right, s.right_fingerprint),
+                    None => (None, None, None, None),
+                };
                 // The destination is always checked in full: it is what a copy may overwrite.
-                let source_unchanged = expected.is_some_and(|snapshot| {
-                    matches_snapshot(
-                        &src,
-                        Some(snapshot.left),
-                        snapshot.left_fingerprint,
-                        Coverage::Sampled,
-                        ctx,
-                    )
+                let source_unchanged = source_expect.is_some_and(|side| {
+                    matches_snapshot(&src, Some(side), source_fp, Coverage::Sampled, ctx)
                 });
-                let destination_unchanged = expected.is_some_and(|snapshot| {
-                    matches_snapshot(
-                        &dest,
-                        snapshot.right,
-                        snapshot.right_fingerprint,
-                        Coverage::Full,
-                        ctx,
-                    )
-                });
+                let destination_unchanged = expected.is_some()
+                    && matches_snapshot(&dest, dest_expect, dest_fp, Coverage::Full, ctx);
                 if !source_unchanged || !destination_unchanged {
                     if ctx.cancel.check().is_err() {
                         report.cancelled = true;
@@ -1101,17 +1185,16 @@ pub fn execute_sync(
                 // Checked again once the copy is written and verified, right before it is
                 // published: a long copy leaves time for someone to edit the destination.
                 let destination_still_unchanged = || {
-                    expected.is_some_and(|snapshot| {
-                        matches_snapshot(
-                            &dest,
-                            snapshot.right,
-                            snapshot.right_fingerprint,
-                            Coverage::Full,
-                            ctx,
-                        )
-                    })
+                    expected.is_some()
+                        && matches_snapshot(&dest, dest_expect, dest_fp, Coverage::Full, ctx)
                 };
-                match ops::copy_file_atomic_guarded(&src, &dest, opts, ctx, &destination_still_unchanged) {
+                match ops::copy_file_atomic_guarded(
+                    &src,
+                    &dest,
+                    opts,
+                    ctx,
+                    &destination_still_unchanged,
+                ) {
                     Ok(out) => {
                         report.bytes += out.bytes;
                         report.done.push(dest);
@@ -1565,7 +1648,7 @@ mod tests {
             let rel = PathBuf::from(format!("file-{index:05}.bin"));
             expected.push(SyncExpectation {
                 rel: rel.clone(),
-                left: side,
+                left: Some(side),
                 right: None,
                 left_fingerprint: fingerprint,
                 right_fingerprint: None,
@@ -1574,6 +1657,7 @@ mod tests {
                 rel,
                 overwrite: false,
                 bytes: 1,
+                to_left: false,
             });
         }
         let plan = SyncPlan {
@@ -1597,5 +1681,182 @@ mod tests {
             elapsed < Duration::from_secs(30),
             "50,000 indexed lookups took {elapsed:?}"
         );
+    }
+
+    fn two_way_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let l = d.path().join("L");
+        let r = d.path().join("R");
+        fs::create_dir_all(&l).unwrap();
+        fs::create_dir_all(&r).unwrap();
+        (d, l, r)
+    }
+
+    /// Plans a TwoWay sync; the returned cancel token and progress back the execution context.
+    fn two_way_plan(
+        l: &Path,
+        r: &Path,
+        opts: &CompareOptions,
+    ) -> (SyncPlan, CancelToken, Progress) {
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(l, r, opts, &ctx).unwrap();
+        (plan_sync(&report, l, r, SyncMode::TwoWay), cancel, progress)
+    }
+
+    fn run_two_way(l: &Path, r: &Path, opts: &CompareOptions) -> (SyncPlan, OpReport) {
+        let (plan, cancel, progress) = two_way_plan(l, r, opts);
+        let ctx = JobCtx::new(&cancel, &progress);
+        let result = execute_sync(&plan, true, None, &ctx);
+        (plan, result)
+    }
+
+    #[test]
+    fn two_way_copies_missing_items_in_both_directions() {
+        let (_d, l, r) = two_way_fixture();
+        fs::write(l.join("a.txt"), b"from left").unwrap();
+        fs::create_dir_all(l.join("ldir")).unwrap();
+        fs::write(l.join("ldir/x.txt"), b"left nested").unwrap();
+        fs::write(r.join("b.txt"), b"from right").unwrap();
+        fs::create_dir_all(r.join("rdir/deeper")).unwrap();
+        fs::write(r.join("rdir/deeper/y.txt"), b"right nested").unwrap();
+
+        let (plan, result) = run_two_way(&l, &r, &CompareOptions::default());
+
+        assert_eq!(plan.deletes(), 0);
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert_eq!(fs::read(r.join("a.txt")).unwrap(), b"from left");
+        assert_eq!(fs::read(l.join("b.txt")).unwrap(), b"from right");
+        assert_eq!(fs::read(r.join("ldir/x.txt")).unwrap(), b"left nested");
+        assert_eq!(
+            fs::read(l.join("rdir/deeper/y.txt")).unwrap(),
+            b"right nested"
+        );
+    }
+
+    #[test]
+    fn two_way_newer_file_wins_on_each_side() {
+        let (_d, l, r) = two_way_fixture();
+        fs::write(l.join("left-newer.txt"), b"L new").unwrap();
+        fs::write(r.join("left-newer.txt"), b"R old").unwrap();
+        set_mtime(&l.join("left-newer.txt"), 1_600_000_000);
+        set_mtime(&r.join("left-newer.txt"), 1_500_000_000);
+        fs::write(l.join("right-newer.txt"), b"L old").unwrap();
+        fs::write(r.join("right-newer.txt"), b"R new").unwrap();
+        set_mtime(&l.join("right-newer.txt"), 1_500_000_000);
+        set_mtime(&r.join("right-newer.txt"), 1_600_000_000);
+
+        let (plan, result) = run_two_way(&l, &r, &CompareOptions::default());
+
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Copy { rel, overwrite: true, to_left: false, .. }
+                if rel.as_path() == Path::new("left-newer.txt")
+        )));
+        assert!(plan.actions.iter().any(|action| matches!(
+            action,
+            SyncAction::Copy { rel, overwrite: true, to_left: true, .. }
+                if rel.as_path() == Path::new("right-newer.txt")
+        )));
+        assert_eq!(fs::read(r.join("left-newer.txt")).unwrap(), b"L new");
+        assert_eq!(fs::read(l.join("left-newer.txt")).unwrap(), b"L new");
+        assert_eq!(fs::read(l.join("right-newer.txt")).unwrap(), b"R new");
+        assert_eq!(fs::read(r.join("right-newer.txt")).unwrap(), b"R new");
+    }
+
+    #[test]
+    fn two_way_skips_same_time_different_content_and_overwrites_nothing() {
+        let (_d, l, r) = two_way_fixture();
+        fs::write(l.join("clash.txt"), b"aaaa").unwrap();
+        fs::write(r.join("clash.txt"), b"bbbb").unwrap();
+        set_mtime(&l.join("clash.txt"), 1_500_000_000);
+        set_mtime(&r.join("clash.txt"), 1_500_000_000);
+        let opts = CompareOptions {
+            use_hash: true,
+            ..Default::default()
+        };
+
+        let (plan, result) = run_two_way(&l, &r, &opts);
+
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.skipped.iter().any(|issue| {
+            issue.path == PathBuf::from("clash.txt")
+                && issue.reason == "conflict: same time, different content"
+        }));
+        assert_eq!(fs::read(l.join("clash.txt")).unwrap(), b"aaaa");
+        assert_eq!(fs::read(r.join("clash.txt")).unwrap(), b"bbbb");
+    }
+
+    #[test]
+    fn two_way_never_deletes_and_skips_type_mismatches() {
+        let (_d, l, r) = two_way_fixture();
+        fs::write(l.join("clash"), b"file on left").unwrap();
+        fs::create_dir_all(r.join("clash")).unwrap();
+        fs::write(r.join("clash/inside.txt"), b"folder on right").unwrap();
+        fs::write(r.join("only-right.txt"), b"R").unwrap();
+
+        let (plan, result) = run_two_way(&l, &r, &CompareOptions::default());
+
+        assert_eq!(plan.deletes(), 0);
+        assert!(result.failed.is_empty(), "{result:?}");
+        assert!(plan.skipped.iter().any(|issue| {
+            issue.path == PathBuf::from("clash")
+                && issue.reason == "different item types on each side"
+        }));
+        assert!(plan.skipped.iter().any(|issue| {
+            issue.path == PathBuf::from("clash/inside.txt")
+                && issue.reason == "a parent folder is a different item type on each side"
+        }));
+        assert_eq!(fs::read(l.join("clash")).unwrap(), b"file on left");
+        assert_eq!(
+            fs::read(r.join("clash/inside.txt")).unwrap(),
+            b"folder on right"
+        );
+        assert_eq!(fs::read(l.join("only-right.txt")).unwrap(), b"R");
+    }
+
+    #[test]
+    fn two_way_refuses_a_side_changed_after_the_preview() {
+        for change_destination in [true, false] {
+            let (_d, l, r) = two_way_fixture();
+            fs::write(l.join("doc.txt"), b"old text").unwrap();
+            fs::write(r.join("doc.txt"), b"new text").unwrap();
+            set_mtime(&l.join("doc.txt"), 1_500_000_000);
+            set_mtime(&r.join("doc.txt"), 1_600_000_000);
+            let (plan, cancel, progress) = two_way_plan(&l, &r, &CompareOptions::default());
+            assert_eq!(plan.actions.len(), 1, "{:?}", plan.actions);
+
+            // The newer right file would overwrite the left one (the destination). Edit either
+            // side keeping size and timestamp: only the content fingerprint can notice.
+            let changed = if change_destination {
+                l.join("doc.txt")
+            } else {
+                r.join("doc.txt")
+            };
+            let original_mtime = fs::metadata(&changed).unwrap().modified().unwrap();
+            fs::write(&changed, b"EDITED!!").unwrap();
+            File::options()
+                .write(true)
+                .open(&changed)
+                .unwrap()
+                .set_modified(original_mtime)
+                .unwrap();
+            let before = fs::read(&changed).unwrap();
+
+            let ctx = JobCtx::new(&cancel, &progress);
+            let result = execute_sync(&plan, true, None, &ctx);
+
+            assert_eq!(fs::read(&changed).unwrap(), before);
+            assert!(
+                result
+                    .failed
+                    .iter()
+                    .any(|issue| issue.reason.contains("changed since preview")),
+                "{result:?}"
+            );
+        }
     }
 }
