@@ -29,6 +29,8 @@ pub struct CollectionsUi {
     catalog_loading: bool,
     detail: Option<Detail>,
     detail_requested: bool,
+    /// (old, new) name of the saved search whose rename is in flight; applied to `detail` on success.
+    pending_rename: Option<(String, String)>,
     rows: Vec<FileRecord>,
     rows_loading: bool,
     rows_error: Option<String>,
@@ -121,6 +123,7 @@ impl Default for CollectionsUi {
             catalog_loading: false,
             detail: None,
             detail_requested: false,
+            pending_rename: None,
             rows: Vec::new(),
             rows_loading: false,
             rows_error: None,
@@ -561,6 +564,7 @@ fn poll_messages(app: &mut ZxrawApp) {
                     close_delete,
                 } => {
                     state.operation_pending = false;
+                    let renamed = state.pending_rename.take();
                     if refresh_catalog {
                         state.catalog_loaded = false;
                     }
@@ -569,6 +573,9 @@ fn poll_messages(app: &mut ZxrawApp) {
                     }
                     match result {
                         Ok(text) => {
+                            if let Some(detail) = renamed_detail(state.detail.as_ref(), renamed.as_ref()) {
+                                set_detail(state, detail);
+                            }
                             state.feedback = Some((text.clone(), false));
                             toasts.push((text, false));
                             if close_edit {
@@ -1949,9 +1956,28 @@ pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: 
     }
 }
 
+/// The detail to show once the saved search `renamed.0` has been renamed to `renamed.1`:
+/// the same query under the new name, so Rename and Delete target the search that exists.
+fn renamed_detail(detail: Option<&Detail>, renamed: Option<&(String, String)>) -> Option<Detail> {
+    let (old, new) = renamed?;
+    match detail? {
+        Detail::SavedSearch { name, query } if name == old => Some(Detail::SavedSearch {
+            name: new.clone(),
+            query: query.clone(),
+        }),
+        _ => None,
+    }
+}
+
 fn start_save_edit(app: &mut ZxrawApp, ctx: &egui::Context, form: EditDialog) {
     let EditDialog { kind, name, query } = form;
     let name = name.trim().to_string();
+    // Only when the operation will actually start, so a stale entry never reaches another one.
+    if let EditKind::RenameSavedSearch(saved) = &kind {
+        if app.ops.library.db.is_some() && !app.ops.collections_ui.operation_pending {
+            app.ops.collections_ui.pending_rename = Some((saved.name.clone(), name.clone()));
+        }
+    }
     start_operation(app, ctx, OperationFlags::EDIT, move |db| match kind {
         EditKind::CreateManual { add_files } => {
             let id = db
@@ -2262,5 +2288,42 @@ mod tests {
 
         assert!(destination.is_dir());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn renaming_the_shown_saved_search_moves_the_detail_to_the_new_name() {
+        let shown = Detail::SavedSearch {
+            name: "Old".into(),
+            query: "rating:5".into(),
+        };
+        let renamed = ("Old".to_string(), "New".to_string());
+        assert_eq!(
+            renamed_detail(Some(&shown), Some(&renamed)),
+            Some(Detail::SavedSearch {
+                name: "New".into(),
+                query: "rating:5".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn rename_leaves_other_details_alone() {
+        let other = Detail::SavedSearch {
+            name: "Other".into(),
+            query: "tag:x".into(),
+        };
+        let renamed = ("Old".to_string(), "New".to_string());
+        assert_eq!(renamed_detail(Some(&other), Some(&renamed)), None);
+        assert_eq!(renamed_detail(None, Some(&renamed)), None);
+        let collection = Detail::Collection {
+            id: 1,
+            kind: CollectionKind::Manual,
+        };
+        assert_eq!(renamed_detail(Some(&collection), Some(&renamed)), None);
+        let shown = Detail::SavedSearch {
+            name: "Old".into(),
+            query: String::new(),
+        };
+        assert_eq!(renamed_detail(Some(&shown), None), None);
     }
 }

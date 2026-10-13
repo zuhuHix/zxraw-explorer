@@ -1506,38 +1506,64 @@ fn shortcuts_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut Settin
 
 /// Takes the next key press from this frame's input and removes it, so no other handler
 /// sees it. `Some(None)` is Escape (cancel); `Some(Some(text))` is the recorded shortcut.
-/// egui reports Ctrl+C/X/V as clipboard events rather than key presses, so those are
-/// mapped back to keys here.
 fn record_shortcut(ctx: &egui::Context) -> Option<Option<String>> {
-    ctx.input_mut(|i| {
-        let pos = i.events.iter().position(|e| {
-            matches!(
-                e,
-                egui::Event::Key { pressed: true, repeat: false, .. }
-                    | egui::Event::Copy
-                    | egui::Event::Cut
-                    | egui::Event::Paste(_)
-            )
-        })?;
-        let event = i.events.remove(pos);
-        let shift = i.modifiers.shift;
-        let clipboard = |key| {
-            let m = Modifiers { shift, ..Modifiers::COMMAND };
+    ctx.input_mut(|i| take_shortcut(&mut i.events, i.modifiers))
+}
+
+/// The event handling behind [`record_shortcut`]. egui reports Ctrl+C/X/V as clipboard
+/// events rather than key presses, so those are mapped back to keys. Clipboard events carry
+/// no modifiers, so the frame's modifier state supplies them (Alt and Shift included).
+fn take_shortcut(events: &mut Vec<egui::Event>, modifiers: Modifiers) -> Option<Option<String>> {
+    let pos = events.iter().position(|e| {
+        matches!(
+            e,
+            egui::Event::Key { pressed: true, repeat: false, .. }
+                | egui::Event::Copy
+                | egui::Event::Cut
+                | egui::Event::Paste(_)
+        )
+    })?;
+    let event = events.remove(pos);
+    let clip_key = match &event {
+        egui::Event::Copy => Some(egui::Key::C),
+        egui::Event::Cut => Some(egui::Key::X),
+        egui::Event::Paste(_) => Some(egui::Key::V),
+        _ => None,
+    };
+    let result = match &event {
+        egui::Event::Key { key: egui::Key::Escape, .. } => Some(None),
+        egui::Event::Key { key, modifiers, .. } => {
+            Some(Some(shortcut_text(&KeyboardShortcut::new(*modifiers, *key))))
+        }
+        _ => {
+            // `command` is Ctrl on Windows; setting it keeps the recorded text on "Ctrl+".
+            let m = Modifiers { command: true, ..modifiers };
+            let key = clip_key.unwrap_or(egui::Key::V);
             Some(Some(shortcut_text(&KeyboardShortcut::new(m, key))))
-        };
-        let result = match event {
-            egui::Event::Key { key: egui::Key::Escape, .. } => Some(None),
-            egui::Event::Key { key, modifiers, .. } => {
-                Some(Some(shortcut_text(&KeyboardShortcut::new(modifiers, key))))
-            }
-            egui::Event::Copy => clipboard(egui::Key::C),
-            egui::Event::Cut => clipboard(egui::Key::X),
-            _ => clipboard(egui::Key::V),
-        };
-        // The companion clipboard event of the same press must not be recorded next frame.
-        i.events.retain(|e| !matches!(e, egui::Event::Copy | egui::Event::Cut | egui::Event::Paste(_)));
-        result
-    })
+        }
+    };
+    // egui may report one Ctrl+C/X/V press twice (a key press and a clipboard event). Drop
+    // only that one companion so it is not recorded next frame; other presses stay queued.
+    let same_chord = |m: &Modifiers| m.command && m.alt == modifiers.alt && m.shift == modifiers.shift;
+    let companion = match (&event, clip_key) {
+        (_, Some(k)) => events.iter().position(|e| {
+            matches!(e, egui::Event::Key { key, pressed: true, modifiers: m, .. }
+                if *key == k && same_chord(m))
+        }),
+        (egui::Event::Key { key, modifiers: m, .. }, None) if same_chord(m) => {
+            events.iter().position(|e| match e {
+                egui::Event::Copy => *key == egui::Key::C,
+                egui::Event::Cut => *key == egui::Key::X,
+                egui::Event::Paste(_) => *key == egui::Key::V,
+                _ => false,
+            })
+        }
+        _ => None,
+    };
+    if let Some(i) = companion {
+        events.remove(i);
+    }
+    result
 }
 
 fn show_cache_confirmation(app: &mut ZxrawApp, ctx: &egui::Context) {
@@ -2602,5 +2628,74 @@ mod tests {
             blender_tool.map(|tool| tool.exe.as_path()),
             Some(blender.as_path())
         );
+    }
+}
+
+#[cfg(test)]
+mod shortcut_capture_tests {
+    use super::*;
+
+    fn key(key: egui::Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn clipboard_event_keeps_alt_and_shift() {
+        let held = Modifiers { alt: true, ..Modifiers::COMMAND };
+        let mut events = vec![egui::Event::Copy];
+        assert_eq!(take_shortcut(&mut events, held), Some(Some("Ctrl+Alt+C".into())));
+        assert!(events.is_empty());
+
+        let mut events = vec![egui::Event::Cut];
+        let held = Modifiers { shift: true, ..Modifiers::COMMAND };
+        assert_eq!(take_shortcut(&mut events, held), Some(Some("Ctrl+Shift+X".into())));
+    }
+
+    #[test]
+    fn paste_without_modifiers_is_ctrl_v() {
+        let mut events = vec![egui::Event::Paste("text".into())];
+        assert_eq!(take_shortcut(&mut events, Modifiers::COMMAND), Some(Some("Ctrl+V".into())));
+    }
+
+    #[test]
+    fn clipboard_press_is_recorded_once_with_its_key_event() {
+        let held = Modifiers { alt: true, ..Modifiers::COMMAND };
+        let mut events = vec![egui::Event::Copy, key(egui::Key::C, held)];
+        assert_eq!(take_shortcut(&mut events, held), Some(Some("Ctrl+Alt+C".into())));
+        assert!(events.is_empty(), "companion key press left behind: {events:?}");
+
+        let mut events = vec![key(egui::Key::C, Modifiers::COMMAND), egui::Event::Copy];
+        assert_eq!(take_shortcut(&mut events, Modifiers::COMMAND), Some(Some("Ctrl+C".into())));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn only_the_companion_is_dropped_and_other_chords_stay_queued() {
+        let shifted = Modifiers { shift: true, ..Modifiers::COMMAND };
+        let mut events = vec![
+            egui::Event::Copy,
+            key(egui::Key::C, Modifiers::COMMAND),
+            key(egui::Key::C, shifted),
+            egui::Event::Cut,
+        ];
+        assert_eq!(take_shortcut(&mut events, Modifiers::COMMAND), Some(Some("Ctrl+C".into())));
+        assert_eq!(events, vec![key(egui::Key::C, shifted), egui::Event::Cut]);
+    }
+
+    #[test]
+    fn key_press_and_escape_are_recorded_as_before() {
+        let mut events = vec![key(egui::Key::Escape, Modifiers::NONE)];
+        assert_eq!(take_shortcut(&mut events, Modifiers::NONE), Some(None));
+
+        let held = Modifiers { alt: true, ..Modifiers::COMMAND };
+        let mut events = vec![key(egui::Key::Delete, held)];
+        assert_eq!(take_shortcut(&mut events, held), Some(Some("Ctrl+Alt+Delete".into())));
+    }
+
+    #[test]
+    fn no_input_records_nothing() {
+        let mut events = vec![egui::Event::PointerMoved(egui::Pos2::ZERO)];
+        assert_eq!(take_shortcut(&mut events, Modifiers::NONE), None);
+        assert_eq!(events.len(), 1);
     }
 }

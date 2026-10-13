@@ -545,10 +545,15 @@ pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
     if t.is_empty() {
         return Err("empty shortcut".into());
     }
-    // "+" is itself a key, so "Ctrl++" and "+" need special handling before splitting.
+    // "+" is itself a key, so "Ctrl++" and "+" need special handling before splitting. The
+    // separator before a trailing "+" key is the last '+' of "++", so anything left over
+    // ("Ctrl+++") is a surplus delimiter.
     let (head, key_tok) = if t == "+" {
         (None, "+")
     } else if let Some(h) = t.strip_suffix("++") {
+        if h.ends_with('+') {
+            return Err(format!("surplus `+` in `{text}`"));
+        }
         (Some(h), "+")
     } else {
         match t.rsplit_once('+') {
@@ -565,7 +570,6 @@ pub fn parse_shortcut(text: &str) -> Result<KeyboardShortcut, String> {
     let mut mods = Modifiers::NONE;
     let mut seen = [false; 3];
     if let Some(head) = head {
-        let head = head.strip_suffix('+').unwrap_or(head);
         for part in head.split('+') {
             let (idx, flag, name) = match part.trim().to_ascii_lowercase().as_str() {
                 "ctrl" | "control" => (0, Modifiers::COMMAND, "Ctrl"),
@@ -610,13 +614,18 @@ mod tests {
         assert_eq!(p("F5"), KeyboardShortcut::new(Modifiers::NONE, Key::F5));
         assert_eq!(p("Ctrl+Plus"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus));
         assert_eq!(p("Ctrl++"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Plus));
+        assert_eq!(p("Ctrl+Shift++"), KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Plus));
+        assert_eq!(p("+"), KeyboardShortcut::new(Modifiers::NONE, Key::Plus));
         assert_eq!(p("Ctrl+1"), KeyboardShortcut::new(Modifiers::COMMAND, Key::Num1));
         assert_eq!(p("  Ctrl + Shift + Delete "), KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Delete));
     }
 
     #[test]
     fn rejects_invalid_input() {
-        for bad in ["", "   ", "Ctrl+", "Ctrl+Shift", "Ctrl+Nope", "Hyper+P", "Ctrl+Ctrl+P", "Ctrl++Shift+P", "Ctrl+ +P"] {
+        for bad in [
+            "", "   ", "Ctrl+", "Ctrl+Shift", "Ctrl+Nope", "Hyper+P", "Ctrl+Ctrl+P", "Ctrl++Shift+P", "Ctrl+ +P",
+            "++", "+++", "Ctrl+++", "Ctrl+Shift+++", "Ctrl+Plus+",
+        ] {
             assert!(parse_shortcut(bad).is_err(), "`{bad}` should be rejected");
         }
     }

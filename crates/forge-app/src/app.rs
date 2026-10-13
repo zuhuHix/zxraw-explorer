@@ -80,6 +80,8 @@ pub struct ZxrawApp {
     applied_theme: Option<(bool, settings::Accent, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
     applied_icon: settings::AppIcon,
+    /// Whether the restored window size has been checked (see [`window_size_fix`]).
+    window_size_checked: bool,
     type_ahead: (String, Instant),
     last_session_save: Instant,
     selection_summary: SelectionSummary,
@@ -180,6 +182,7 @@ impl ZxrawApp {
             focus_filter: false,
             applied_theme: None,
             applied_icon: settings.app_icon,
+            window_size_checked: false,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
@@ -986,6 +989,22 @@ impl eframe::App for ZxrawApp {
             theme::apply(&ctx, dark, self.settings.accent, self.settings.ui_scale);
             self.applied_theme = Some(look);
         }
+        if !self.window_size_checked {
+            let viewport = ctx.input(|i| i.viewport().clone());
+            if self.testhook.active() || viewport.minimized == Some(true) {
+                self.window_size_checked = true;
+            } else if let (Some(inner), Some(monitor)) = (viewport.inner_rect, viewport.monitor_size) {
+                self.window_size_checked = true;
+                if let Some(size) = window_size_fix(inner.size(), monitor) {
+                    tracing::info!("restored window was {:?}; resizing to {size:?}", inner.size());
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+                        ((monitor - size) / 2.0).to_pos2(),
+                    ));
+                }
+            }
+        }
         let icon = self.settings.app_icon;
         if self.applied_icon != icon {
             self.applied_icon = icon;
@@ -1318,5 +1337,33 @@ mod selection_summary_tests {
         p.rebuild_visible();
         p.selected.insert(p.path.join("a.txt"));
         assert_eq!(summary.get(&p), (2, 40));
+    }
+}
+
+/// The window size to switch to when the size restored from the last session is too small to
+/// use (it can come back tiny after closing while minimised, or after a DPI change), or `None`
+/// to keep it. The default is 1360x840, shrunk to fit 90% of the monitor.
+fn window_size_fix(inner: egui::Vec2, monitor: egui::Vec2) -> Option<egui::Vec2> {
+    let fit = (monitor * 0.9).min(egui::vec2(1360.0, 840.0));
+    let usable = egui::vec2(900.0, 560.0).min(fit);
+    (inner.x < usable.x || inner.y < usable.y).then_some(fit)
+}
+
+#[cfg(test)]
+mod window_size_tests {
+    use super::window_size_fix;
+    use egui::vec2;
+
+    #[test]
+    fn tiny_restored_windows_are_enlarged_to_fit_the_monitor() {
+        let monitor = vec2(1920.0, 1080.0);
+        assert_eq!(window_size_fix(vec2(320.0, 200.0), monitor), Some(vec2(1360.0, 840.0)));
+        assert_eq!(window_size_fix(vec2(1200.0, 400.0), monitor), Some(vec2(1360.0, 840.0)));
+        assert_eq!(window_size_fix(vec2(1000.0, 700.0), monitor), None);
+        // A small screen gets a window that fits it, and is not "fixed" again every launch.
+        let small = vec2(1024.0, 600.0);
+        let fixed = window_size_fix(vec2(300.0, 200.0), small).unwrap();
+        assert_eq!(fixed, vec2(921.6, 540.0));
+        assert_eq!(window_size_fix(fixed, small), None);
     }
 }

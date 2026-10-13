@@ -4,7 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use forge_core::listing::SortSpec;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeChoice {
@@ -12,6 +13,17 @@ pub enum ThemeChoice {
     Dark,
     Light,
     System,
+}
+
+/// Deserializes a setting that falls back to its default when the stored value is not one this
+/// version knows (e.g. written by a newer version), instead of failing the whole settings file.
+fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// The colour of the app icon's folder-camera mark (see `app_icon`). Independent of the UI
@@ -70,7 +82,9 @@ pub struct ExternalTool {
 pub struct Settings {
     pub theme: ThemeChoice,
     pub ui_scale: f32,
+    #[serde(deserialize_with = "lenient")]
     pub app_icon: AppIcon,
+    #[serde(deserialize_with = "lenient")]
     pub accent: Accent,
     pub show_hidden: bool,
     pub show_system: bool,
@@ -244,5 +258,27 @@ mod tests {
         assert_eq!(settings.app_icon, AppIcon::Graphite);
         let settings: Settings = serde_json::from_str(r#"{"app_icon":"Steel"}"#).unwrap();
         assert_eq!(settings.app_icon, AppIcon::Steel);
+    }
+
+    #[test]
+    fn unknown_app_icon_or_accent_keeps_the_rest_of_the_settings() {
+        let json = r#"{
+            "app_icon": "Holographic",
+            "accent": "Chartreuse",
+            "bookmarks": ["C:\\Photos"],
+            "keybindings": {"NewTab": "Ctrl+Shift+T"}
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.app_icon, AppIcon::Graphite);
+        assert_eq!(settings.accent, Accent::Blue);
+        assert_eq!(settings.bookmarks, vec![PathBuf::from(r"C:\Photos")]);
+        assert_eq!(settings.keybindings.get("NewTab"), Some(&Some("Ctrl+Shift+T".to_string())));
+    }
+
+    #[test]
+    fn non_string_app_icon_falls_back_to_default() {
+        let settings: Settings = serde_json::from_str(r#"{"app_icon": 7, "accent": null}"#).unwrap();
+        assert_eq!(settings.app_icon, AppIcon::Graphite);
+        assert_eq!(settings.accent, Accent::Blue);
     }
 }

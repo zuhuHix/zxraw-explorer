@@ -279,10 +279,13 @@ fn apply_selected(app: &mut ZxrawApp, photos: bool, folders: bool) {
                 Ok(()) => app.toast("Previous photo apps restored"),
                 Err(error) => errors.push(format!("Could not remove photo registration: {error}")),
             },
-            Ok(report) => errors.push(format!(
-                "Some photo apps could not be restored; registration was kept ({} types)",
-                report.failed().count()
-            )),
+            Ok(report) => {
+                tracing::warn!("could not restore photo apps: {}", report.failure_summary());
+                errors.push(format!(
+                    "Some photo apps could not be restored; registration was kept ({} types)",
+                    report.failed().count()
+                ));
+            }
             Err(error) => errors.push(format!("Could not restore photo apps: {error}")),
         }
     }
