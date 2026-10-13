@@ -1152,6 +1152,9 @@ fn launch_action(
                 );
                 let mut changed = HashSet::new();
                 changed.insert(plan.right.clone());
+                if plan.mode == compare::SyncMode::TwoWay {
+                    changed.insert(plan.left.clone());
+                }
                 for path in &report.done {
                     if let Some(parent) = path.parent() {
                         changed.insert(parent.to_path_buf());

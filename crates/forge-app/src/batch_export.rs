@@ -444,9 +444,14 @@ fn preview_names(
     let mut names = Vec::new();
     let mut conflicts = 0;
     for (index, source) in sources.iter().take(PREVIEW_ROWS).enumerate() {
-        let dims = *cache
-            .entry(source.clone())
-            .or_insert_with(|| image::image_dimensions(source).ok());
+        // Reading a header is only worth it when the template shows the size.
+        let dims = if options.template.contains("{w") || options.template.contains("{h") {
+            *cache
+                .entry(source.clone())
+                .or_insert_with(|| image::image_dimensions(source).ok())
+        } else {
+            None
+        };
         let out_dims = dims.map(|(w, h)| fit_size(w, h, options.resize));
         let raw = build_name(
             &options.template,

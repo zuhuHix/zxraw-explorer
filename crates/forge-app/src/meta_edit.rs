@@ -139,11 +139,24 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
     let (targets, skipped) = selected_targets(app);
     let key: Vec<PathBuf> = targets.iter().take(PREVIEW_LIMIT).cloned().collect();
-    if ui_state().lock().snapshot_key != key {
-        let snapshots: Vec<Snapshot> = key.iter().map(|path| snapshot(path)).collect();
+    {
+        // Sidecars are read on a worker thread so a slow share never stalls the UI; a result
+        // for a selection that has changed in the meantime is dropped.
         let mut state = ui_state().lock();
-        state.snapshots = snapshots;
-        state.snapshot_key = key;
+        if state.snapshot_key != key {
+            state.snapshots.clear();
+            state.snapshot_key = key.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let snapshots: Vec<Snapshot> = key.iter().map(|path| snapshot(path)).collect();
+                let mut state = ui_state().lock();
+                if state.snapshot_key == key {
+                    state.snapshots = snapshots;
+                }
+                drop(state);
+                ctx.request_repaint();
+            });
+        }
     }
 
     let mut start = false;

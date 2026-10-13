@@ -339,6 +339,20 @@ fn plan_sync_inner(
     mode: SyncMode,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<SyncPlan> {
+    if roots_overlap(left, right) {
+        return Ok(SyncPlan {
+            left: left.to_path_buf(),
+            right: right.to_path_buf(),
+            mode,
+            actions: Vec::new(),
+            bytes_to_copy: 0,
+            skipped: vec![OpIssue::new(
+                right,
+                "the two folders are the same or one is inside the other; nothing will be synced",
+            )],
+            expected: Vec::new(),
+        });
+    }
     let mirror = mode == SyncMode::Mirror;
     let mut deletes: Vec<SyncAction> = Vec::new();
     let mut mkdirs = Vec::new();
@@ -817,6 +831,37 @@ fn matches_delete_snapshot(
     true
 }
 
+/// True when the two roots are the same folder or one lies inside the other. Syncing such a
+/// pair would copy a folder into itself (and Mirror could recycle files of the source). Real
+/// paths are compared when both resolve, so a junction or a differently spelled path is caught.
+fn roots_overlap(left: &Path, right: &Path) -> bool {
+    let (left, right) = match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(l), Ok(r)) => (l, r),
+        _ => (left.to_path_buf(), right.to_path_buf()),
+    };
+    crate::paths::is_within(&left, &right) || crate::paths::is_within(&right, &left)
+}
+
+/// Like [`path_is_within_real_directories`] for a path that may not exist yet: every
+/// component of `rel` that already exists under `root` must be a real folder (not a link,
+/// junction or file); missing trailing components are allowed.
+fn existing_ancestors_are_real_directories(root: &Path, rel: &Path) -> bool {
+    let mut path = root.to_path_buf();
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if sync_node_kind(&metadata) == NodeKind::Dir => {}
+        _ => return false,
+    }
+    for component in rel.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if sync_node_kind(&metadata) == NodeKind::Dir => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn path_is_within_real_directories(root: &Path, parent_rel: &Path) -> bool {
     let mut path = root.to_path_buf();
     let Ok(root_metadata) = fs::symlink_metadata(&path) else {
@@ -1129,7 +1174,13 @@ pub fn execute_sync(
             SyncAction::CreateDir { rel, to_left } => {
                 let root = if *to_left { &plan.left } else { &plan.right };
                 let p = root.join(rel);
-                if let Err(e) = fs::create_dir_all(&p) {
+                if !existing_ancestors_are_real_directories(root, rel) {
+                    fail(
+                        &mut report,
+                        &p,
+                        "folder path changed to a link or file since preview; rerun compare".into(),
+                    );
+                } else if let Err(e) = fs::create_dir_all(&p) {
                     fail(&mut report, &p, e.to_string());
                 }
             }
@@ -1159,7 +1210,13 @@ pub fn execute_sync(
                 let source_unchanged = source_expect.is_some_and(|side| {
                     matches_snapshot(&src, Some(side), source_fp, Coverage::Sampled, ctx)
                 });
+                // A folder on the way to the destination must still be a real folder: a junction
+                // swapped in after the preview would publish the copy outside the sync root.
                 let destination_unchanged = expected.is_some()
+                    && path_is_within_real_directories(
+                        dest_root,
+                        rel.parent().unwrap_or(Path::new("")),
+                    )
                     && matches_snapshot(&dest, dest_expect, dest_fp, Coverage::Full, ctx);
                 if !source_unchanged || !destination_unchanged {
                     if ctx.cancel.check().is_err() {
@@ -1615,10 +1672,11 @@ mod tests {
                 .collect(),
             errors: Vec::new(),
         };
-        let root = Path::new("does-not-exist");
+        // Two distinct roots: the same folder on both sides is refused as an overlap.
+        let (left, right) = (Path::new("does-not-exist-l"), Path::new("does-not-exist-r"));
 
         let started = std::time::Instant::now();
-        let plan = plan_sync(&report, root, root, SyncMode::Mirror);
+        let plan = plan_sync(&report, left, right, SyncMode::Mirror);
         let elapsed = started.elapsed();
 
         assert_eq!(plan.deletes(), COUNT);
@@ -1710,6 +1768,50 @@ mod tests {
         let ctx = JobCtx::new(&cancel, &progress);
         let result = execute_sync(&plan, true, None, &ctx);
         (plan, result)
+    }
+
+    #[test]
+    fn overlapping_roots_produce_an_empty_plan_in_every_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let outer = d.path().join("Photos");
+        let inner = outer.join("Backup");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(outer.join("a.jpg"), b"a").unwrap();
+        for (left, right) in [(&outer, &inner), (&inner, &outer), (&outer, &outer)] {
+            let (cancel, progress) = (CancelToken::new(), Progress::default());
+            let ctx = JobCtx::new(&cancel, &progress);
+            let report = compare_dirs(left, right, &CompareOptions::default(), &ctx).unwrap();
+            for mode in [SyncMode::Update, SyncMode::Mirror, SyncMode::TwoWay] {
+                let plan = plan_sync(&report, left, right, mode);
+                assert!(plan.actions.is_empty(), "{mode:?} {left:?} -> {right:?}");
+                assert_eq!(plan.skipped.len(), 1);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_swapped_in_after_the_preview_is_not_written_through() {
+        let (d, l, r) = two_way_fixture();
+        fs::create_dir_all(l.join("sub")).unwrap();
+        fs::create_dir_all(r.join("sub")).unwrap();
+        fs::write(r.join("sub/new.txt"), b"right").unwrap();
+        let (plan, cancel, progress) = two_way_plan(&l, &r, &CompareOptions::default());
+        assert!(plan.actions.iter().any(|a| matches!(a, SyncAction::Copy { to_left: true, .. })));
+        // Replace L/sub with a junction to a folder outside the sync root.
+        let outside = d.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::remove_dir(l.join("sub")).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(l.join("sub"))
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "{status:?}");
+        let result = execute_sync(&plan, true, None, &JobCtx::new(&cancel, &progress));
+        assert!(!outside.join("new.txt").exists(), "copy went through the junction");
+        assert_eq!(result.failed.len(), 1, "{result:?}");
     }
 
     #[test]
