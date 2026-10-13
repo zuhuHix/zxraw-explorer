@@ -130,7 +130,7 @@ Explorer is a file manager designed around that workflow:
   <tr>
     <td>
       <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/import.jpg"><img src="docs/images/screens/import.jpg" alt="Media ingest window planning a verified copy from a camera card into dated folders"></a>
-      <b>Plan the import before it copies.</b> The card on <code>X:</code> is mapped into dated
+      <b>Plan the import before it copies.</b> The card is mapped into dated
       folders under <code>P:\Photos</code>, every file is verified after copying, and the
       source is never modified.
     </td>
@@ -171,6 +171,16 @@ Explorer is a file manager designed around that workflow:
 - **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
   files each get their own icon, alongside the photo, video and audio ones.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
+
+<p align="center">
+  <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/collections.jpg"><img src="docs/images/screens/collections.jpg" width="80%" alt="Collections window with a Lisbon portfolio collection and the New collection dialog open"></a>
+  <br><sub>Collections group files without moving them. Start one from the current selection.</sub>
+</p>
+
+<p align="center">
+  <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/file-icons.jpg"><img src="docs/images/screens/file-icons.jpg" width="80%" alt="Details view of a project folder with a different icon for each file type"></a>
+  <br><sub>Code, documents, spreadsheets, programs and archives each get their own icon.</sub>
+</p>
 
 <sub>Screenshots are of the real app. The sample photos in them were generated for this page.</sub>
 
