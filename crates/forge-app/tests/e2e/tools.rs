@@ -323,6 +323,57 @@ fn update_copies_only_newer_and_missing_files_and_never_deletes() {
 }
 
 #[test]
+fn two_way_copies_each_sides_only_file_to_the_other_side() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let left = sandbox.path().join("left");
+    let right = sandbox.path().join("right");
+    fs::create_dir_all(&left).unwrap();
+    fs::create_dir_all(&right).unwrap();
+    write_file(&left.join("a.txt"), b"alpha from the left");
+    write_file(&right.join("b.txt"), b"beta from the right");
+    let script = format!(
+        "ui tools compare open {left}\n\
+         ui tools compare set-right {right}\n\
+         ui tools compare start\n\
+         ui tools compare wait 30\n\
+         ui tools compare plan-two-way\n\
+         ui tools compare execute-two-way\n\
+         ui tools compare wait-sync 30\n\
+         ui tools compare assert-sync done=2 failed=0\n\
+         wait-jobs 20\n\
+         exit\n",
+        left = shown(&left),
+        right = shown(&right),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        fs::read(right.join("a.txt")).unwrap(),
+        b"alpha from the left"
+    );
+    assert_eq!(
+        fs::read(left.join("a.txt")).unwrap(),
+        b"alpha from the left"
+    );
+    assert_eq!(
+        fs::read(left.join("b.txt")).unwrap(),
+        b"beta from the right"
+    );
+    assert_eq!(
+        fs::read(right.join("b.txt")).unwrap(),
+        b"beta from the right"
+    );
+    assert!(
+        !recycle_sandbox(&profile).exists(),
+        "Two-way never deletes, so nothing reaches the sandbox"
+    );
+}
+
+#[test]
 fn update_refuses_a_left_file_changed_after_the_preview() {
     let sandbox = tempfile::tempdir().unwrap();
     let profile = sandbox.path().join("profile");
