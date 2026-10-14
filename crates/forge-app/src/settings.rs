@@ -380,8 +380,8 @@ mod tests {
     #[test]
     fn bookmarks_migrate_into_pins_once_after_existing_pins() {
         let json = r#"{
-            "bookmarks": ["C:\Photos", "D:\Card"],
-            "pins": [{"path": "D:\Card", "label": "SD", "file": false}]
+            "bookmarks": ["C:\\Photos", "D:\\Card"],
+            "pins": [{"path": "D:\\Card", "label": "SD", "file": false}]
         }"#;
         let mut settings: Settings = serde_json::from_str(json).unwrap();
         settings.migrate();
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn old_session_tabs_load_without_sort_or_right_view() {
-        let json = r#"{"tabs":[{"left":"C:\A","right":"C:\B","view":"Grid"}],"active_tab":0}"#;
+        let json = r#"{"tabs":[{"left":"C:\\A","right":"C:\\B","view":"Grid"}],"active_tab":0}"#;
         let session: Session = serde_json::from_str(json).unwrap();
         let tab = &session.tabs[0];
         assert_eq!(tab.right.as_deref(), Some(Path::new(r"C:\B")));
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn a_pin_with_missing_fields_still_loads() {
         let settings: Settings =
-            serde_json::from_str(r#"{"pins":[{"path":"C:\X"},{"label":"no path"}]}"#).unwrap();
+            serde_json::from_str(r#"{"pins":[{"path":"C:\\X"},{"label":"no path"}]}"#).unwrap();
         assert_eq!(settings.pins[0], Pin { path: PathBuf::from(r"C:\X"), label: None, file: false });
         assert_eq!(settings.pins.len(), 2);
     }
