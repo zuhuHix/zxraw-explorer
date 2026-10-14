@@ -588,6 +588,108 @@ pub(crate) fn section(ui: &mut Ui, title: &str) {
     );
 }
 
+
+/// The name shown for a pin: its label, else the file or folder name, else the full path.
+pub(crate) fn pin_label(pin: &Pin) -> String {
+    if let Some(label) = pin
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        return label.to_string();
+    }
+    pin.path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pin.path.to_string_lossy().into_owned())
+}
+
+/// Last known existence status of a pinned path (`Unknown` until its first check).
+pub(crate) fn pin_status(app: &ZxrawApp, path: &Path) -> PinStatus {
+    app.sidebar.pins.status(path)
+}
+
+/// What a click on pin `index` does. A missing target is not opened; the user is told instead.
+pub(crate) fn activate_pin(app: &mut ZxrawApp, index: usize) {
+    let Some(pin) = app.settings.pins.get(index).cloned() else {
+        return;
+    };
+    if pin_status(app, &pin.path) == PinStatus::Missing {
+        app.toast(format!("{} is not available", pin_label(&pin)));
+        return;
+    }
+    if pin.file {
+        crate::actions::open_file(app, &pin.path);
+    } else {
+        app.navigate(pin.path);
+    }
+}
+
+/// Whether `path` is a file, decided from the listed entries of both panes. Only paths that
+/// are not listed touch the disk.
+fn is_file_path(app: &ZxrawApp, path: &Path) -> bool {
+    let tab = app.tab();
+    let listed = std::iter::once(tab.focused())
+        .chain(tab.other())
+        .flat_map(|pane| pane.entries.iter())
+        .find(|e| e.path.as_path() == path);
+    match listed {
+        Some(entry) => entry.kind == EntryKind::File,
+        None => !path.is_dir(),
+    }
+}
+
+/// Files or folders released on the Quick access section.
+fn pin_dropped(app: &mut ZxrawApp, paths: Vec<PathBuf>) {
+    let items: Vec<(PathBuf, bool)> = paths
+        .into_iter()
+        .map(|p| {
+            let file = is_file_path(app, &p);
+            (p, file)
+        })
+        .collect();
+    pin_paths(app, items);
+}
+
+/// Pins paths to Quick access; `true` marks a file. Already pinned paths are skipped.
+pub fn pin_paths(app: &mut ZxrawApp, paths: Vec<(PathBuf, bool)>) {
+    if paths.is_empty() {
+        return;
+    }
+    if add_pins(&mut app.settings.pins, paths) > 0 {
+        app.toast("Pinned to Quick access");
+    } else {
+        app.toast("Already in Quick access");
+    }
+}
+
+/// `PinToQuickAccess`: pins the selected entries, or the current folder if none.
+pub fn pin_selection(app: &mut ZxrawApp) {
+    let pane = app.pane();
+    let targets = pane.action_targets();
+    let items: Vec<(PathBuf, bool)> = if targets.is_empty() {
+        vec![(pane.path.clone(), false)]
+    } else {
+        targets
+            .into_iter()
+            .map(|p| {
+                let file = is_file_path(app, &p);
+                (p, file)
+            })
+            .collect()
+    };
+    pin_paths(app, items);
+}
+
+/// Applies an accepted `RenamePin` prompt. Blank text clears the label.
+pub fn accept_label(app: &mut ZxrawApp, p: Prompt) -> Option<Modal> {
+    if let PromptKind::RenamePin { path } = &p.kind {
+        set_label(&mut app.settings.pins, path, &p.text);
+    }
+    None
+}
+
 #[cfg(test)]
 mod card_tests {
     use super::*;
@@ -708,105 +810,4 @@ mod card_tests {
         watch.dismiss(&e.root);
         assert_eq!(roots(&watch.prompts), vec![f.root]);
     }
-}
-
-/// The name shown for a pin: its label, else the file or folder name, else the full path.
-pub(crate) fn pin_label(pin: &Pin) -> String {
-    if let Some(label) = pin
-        .label
-        .as_deref()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-    {
-        return label.to_string();
-    }
-    pin.path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| pin.path.to_string_lossy().into_owned())
-}
-
-/// Last known existence status of a pinned path (`Unknown` until its first check).
-pub(crate) fn pin_status(app: &ZxrawApp, path: &Path) -> PinStatus {
-    app.sidebar.pins.status(path)
-}
-
-/// What a click on pin `index` does. A missing target is not opened; the user is told instead.
-pub(crate) fn activate_pin(app: &mut ZxrawApp, index: usize) {
-    let Some(pin) = app.settings.pins.get(index).cloned() else {
-        return;
-    };
-    if pin_status(app, &pin.path) == PinStatus::Missing {
-        app.toast(format!("{} is not available", pin_label(&pin)));
-        return;
-    }
-    if pin.file {
-        crate::actions::open_file(app, &pin.path);
-    } else {
-        app.navigate(pin.path);
-    }
-}
-
-/// Whether `path` is a file, decided from the listed entries of both panes. Only paths that
-/// are not listed touch the disk.
-fn is_file_path(app: &ZxrawApp, path: &Path) -> bool {
-    let tab = app.tab();
-    let listed = std::iter::once(tab.focused())
-        .chain(tab.other())
-        .flat_map(|pane| pane.entries.iter())
-        .find(|e| e.path.as_path() == path);
-    match listed {
-        Some(entry) => entry.kind == EntryKind::File,
-        None => !path.is_dir(),
-    }
-}
-
-/// Files or folders released on the Quick access section.
-fn pin_dropped(app: &mut ZxrawApp, paths: Vec<PathBuf>) {
-    let items: Vec<(PathBuf, bool)> = paths
-        .into_iter()
-        .map(|p| {
-            let file = is_file_path(app, &p);
-            (p, file)
-        })
-        .collect();
-    pin_paths(app, items);
-}
-
-/// Pins paths to Quick access; `true` marks a file. Already pinned paths are skipped.
-pub fn pin_paths(app: &mut ZxrawApp, paths: Vec<(PathBuf, bool)>) {
-    if paths.is_empty() {
-        return;
-    }
-    if add_pins(&mut app.settings.pins, paths) > 0 {
-        app.toast("Pinned to Quick access");
-    } else {
-        app.toast("Already in Quick access");
-    }
-}
-
-/// `PinToQuickAccess`: pins the selected entries, or the current folder if none.
-pub fn pin_selection(app: &mut ZxrawApp) {
-    let pane = app.pane();
-    let targets = pane.action_targets();
-    let items: Vec<(PathBuf, bool)> = if targets.is_empty() {
-        vec![(pane.path.clone(), false)]
-    } else {
-        targets
-            .into_iter()
-            .map(|p| {
-                let file = is_file_path(app, &p);
-                (p, file)
-            })
-            .collect()
-    };
-    pin_paths(app, items);
-}
-
-/// Applies an accepted `RenamePin` prompt. Blank text clears the label.
-pub fn accept_label(app: &mut ZxrawApp, p: Prompt) -> Option<Modal> {
-    if let PromptKind::RenamePin { path } = &p.kind {
-        set_label(&mut app.settings.pins, path, &p.text);
-    }
-    None
 }
