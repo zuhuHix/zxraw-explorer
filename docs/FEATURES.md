@@ -178,6 +178,23 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   preview of every action and its direction; *Sync folders…* opens it on the two panes. E2e
   `two_way_copies_each_sides_only_file_to_the_other_side` drives a two-way sync through the
   testhook; the rest of the window is not automated.
+* 🟡 Verify backup (compare by content) — `forge-core/src/backup_verify.rs` classifies files as
+  match, missing, differs, only in the backup, moved (by BLAKE3, optional) and not checked
+  (online-only cloud files are never read). Quick mode trusts equal size and date and hashes
+  only on a mismatch; *Full verify* hashes every pair. Unit tests cover the classification,
+  quick versus full, moved-file detection with a same-size decoy, placeholders, cancellation,
+  case-insensitive matching and the CSV/text export. The window is in `forge-app/src/tools_ui.rs`
+  (*Verify backup…*, or the button in *Compare folders*); e2e `tools::` scenarios drive it.
+* 🟡 Find and replace in files — `forge-core/src/text_replace.rs` with the preview window in
+  `forge-app/src/replace_ui.rs`. Literal or regex search, match case, whole word, include and
+  exclude patterns, recursion. Skips binary files (NUL bytes or known RAW/image/video/archive
+  extensions), files above a size limit (16 MiB by default), read-only files and online-only
+  cloud files. UTF-8 (with or without BOM) and UTF-16 LE/BE are kept, as are CRLF/LF/mixed line
+  endings. Each file is written to a temporary file and swapped in with `ReplaceFileW`, which
+  keeps its creation time and attributes; a file edited after the preview is left alone. The
+  originals are backed up in the profile, and *Undo* restores them only if the file is still as
+  the replace left it. Unit tests cover every encoding, line endings, binary skipping, regex and
+  whole word, the atomic write and undo; e2e `tools::` scenarios drive the window.
 * 🟡 Batch export / convert — `forge-app/src/batch_export.rs`: JPEG, PNG, TIFF and lossless WebP,
   never-upscale resize, JPEG quality, naming template (`{name}`, `{n:3}`, `{w}`, `{h}`, `{ext}`),
   RAW via the embedded preview, EXIF orientation applied, no-replace publishing. Unit tests cover

@@ -57,6 +57,44 @@
 //! - `external delete <path>`: remove a file, or a folder with everything in it.
 //! - `external append <path> | <text>`: append text, changing the file size.
 //!
+//! Cloud placeholders:
+//! - `simulate-online-only <path>`: mark the file as an online-only cloud file for this process,
+//!   so find-and-replace and the backup check skip it the way they skip real placeholders.
+//!
+//! Find and replace (`… | …` separates paths; `replace set` takes the rest of the line as the
+//! value):
+//! - `replace open <path> [| <path>…]`: open the window on these files or folders.
+//! - `replace set <key> <value>`: set one form field. Keys: `find`, `replace`, `regex`, `case`,
+//!   `whole-word`, `recursive` (on/off), `include`, `exclude`, `max-mib`.
+//! - `replace preview`: start the preview; `replace wait-preview [secs]` waits for it (default
+//!   30 s).
+//! - `replace assert-preview <key=value>…`: counts of the preview. Keys: `files`, `matches`,
+//!   `skipped`.
+//! - `replace assert-skipped <file name> <reason>`: the preview skips that file. Reasons:
+//!   `binary-extension`, `binary`, `too-large`, `online-only`, `read-only`, `changed`.
+//! - `replace untick <file name>`: leave a previewed file out of the replace.
+//! - `replace run`: start the replace of the ticked files; `replace wait-apply [secs]` waits for
+//!   it (default 30 s).
+//! - `replace assert-apply <key=value>…`: counts of the replace. Keys: `files` (undo records),
+//!   `replacements`, `skipped`, `failed`.
+//! - `replace undo`: the window's "Undo replace" action; follow it with `wait-jobs`.
+//!
+//! Backup check (the Verify backup window, one folder per verb):
+//! - `verify open <original>`: open the check for this folder.
+//! - `verify set-backup <backup>`: choose the backup folder.
+//! - `verify options full=on|off moves=on|off`: both settings are required. Full hashes every
+//!   pair of equal size; moves finds renamed files by hash.
+//! - `verify start`: run the check; `verify cancel` cancels a running check.
+//! - `verify wait [secs]`: wait for the report (default 30 s); fails if the check ended with an
+//!   error.
+//! - `verify wait-cancelled [secs]`: wait for the check to end, and succeed only if it ended
+//!   cancelled.
+//! - `verify assert <key=value>…`: counts of the report. Keys: `match`, `missing`, `differs`,
+//!   `extra`, `moved`, `not-checked`, `errors`.
+//! - `verify assert-status <rel path> <status>`: one entry's status label (`match`, `missing`,
+//!   `differs`, `extra`, `moved`, `not-checked`, `error`).
+//! - `verify export <path> csv|text`: write the report to a new file; follow with `assert-contains`.
+//!
 //! Every verb fails with a message on bad arguments, and waiting verbs fail after their
 //! timeout with the reason they were still waiting.
 
@@ -66,8 +104,10 @@ use std::time::Duration;
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
-use crate::{extra_tools_ui, tools_ui};
+use crate::{extra_tools_ui, replace_ui, tools_ui};
+use forge_core::backup_verify::BackupReport;
 use forge_core::compare::{EntryState, SyncAction};
+use forge_core::text_replace::{ApplyReport, ScanReport, SkipReason};
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 const WAIT_MAX: u64 = 300;
@@ -85,6 +125,13 @@ pub(super) fn step(
     match verb {
         "duplicates" => duplicates_step(app, args, st),
         "compare" => compare_step(app, args, st),
+        "replace" => replace_step(app, args, st),
+        "verify" => verify_step(app, args, st),
+        "simulate-online-only" => {
+            // Only inside the sandbox; the path is matched exactly by the engines.
+            forge_core::cloud::simulate_online_only(inside(one_path(args)?)?);
+            Ok(Flow::Done)
+        }
         "external" => external_step(args),
         "wait-listing" => wait_listing(app, args, st),
         "wait-entry-size" => wait_entry_size(app, args, st),
@@ -98,8 +145,7 @@ pub(super) fn step(
                 .trim()
                 .parse()
                 .map_err(|_| "part size must be a number of bytes")?;
-            extra_tools_ui::automation_split(app, inside(file)?, bytes)
-                .map(|()| Flow::Done)
+            extra_tools_ui::automation_split(app, inside(file)?, bytes).map(|()| Flow::Done)
         }
         "join" => {
             extra_tools_ui::automation_join(app, inside(one_path(args)?)?);
@@ -135,7 +181,10 @@ fn click_button(
             None => format!("tool button {label:?} is not visible"),
         };
         if st.data.is_none() {
-            if st.started.is_some_and(|started| started.elapsed() > BUTTON_WAIT) {
+            if st
+                .started
+                .is_some_and(|started| started.elapsed() > BUTTON_WAIT)
+            {
                 return Err(format!("{reason} after {} s", BUTTON_WAIT.as_secs()));
             }
             return Ok(Flow::Wait(reason));
@@ -340,6 +389,275 @@ fn compare_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
             Ok(Flow::Done)
         }
         _ => Err(format!("unknown `ui tools compare` verb `{sub}`")),
+    }
+}
+
+fn replace_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
+    let (sub, rest) = split_verb(args);
+    match sub {
+        "open" => {
+            let roots = rest
+                .split(" | ")
+                .map(|path| one_path(path).and_then(inside))
+                .collect::<Result<Vec<_>, _>>()?;
+            replace_ui::automation_open(app, roots);
+            Ok(Flow::Done)
+        }
+        "set" => {
+            let (key, value) = split_verb(rest);
+            replace_ui::automation_set(app, key, value).map(|()| Flow::Done)
+        }
+        "preview" => {
+            no_args(rest)?;
+            replace_ui::automation_preview(app).map(|()| Flow::Done)
+        }
+        "wait-preview" => {
+            let timeout = timeout_arg(rest)?;
+            match replace_ui::automation_preview_result(app) {
+                Some(Ok(_)) => Ok(Flow::Done),
+                Some(Err(error)) => Err(format!("preview failed: {error}")),
+                None => wait_or_fail(st, timeout, "the preview is still running"),
+            }
+        }
+        "assert-preview" => {
+            let counts = key_counts(rest)?;
+            let report = finished_preview(app)?;
+            for (key, expected) in counts {
+                let found = match key {
+                    "files" => report.files.len(),
+                    "matches" => report.total_matches(),
+                    "skipped" => report.skipped.len(),
+                    _ => return Err(format!("unknown preview count `{key}`")),
+                };
+                if found != expected {
+                    return Err(format!(
+                        "expected {expected} `{key}` in the preview, found {found}"
+                    ));
+                }
+            }
+            Ok(Flow::Done)
+        }
+        "assert-skipped" => {
+            let (name, reason) = split_verb(rest);
+            if name.is_empty() || reason.is_empty() {
+                return Err("expected `<file name> <reason>`".into());
+            }
+            let report = finished_preview(app)?;
+            match report
+                .skipped
+                .iter()
+                .find(|(path, _)| path.file_name().and_then(|n| n.to_str()) == Some(name))
+            {
+                Some((_, found)) if skip_key(found) == reason => Ok(Flow::Done),
+                Some((_, found)) => Err(format!(
+                    "{name} is skipped as `{}`, expected `{reason}`",
+                    skip_key(found)
+                )),
+                None => Err(format!("the preview does not skip {name}")),
+            }
+        }
+        "untick" => {
+            let name = one_path(rest)?;
+            replace_ui::automation_untick(app, name).map(|()| Flow::Done)
+        }
+        "run" => {
+            no_args(rest)?;
+            replace_ui::automation_replace(app).map(|()| Flow::Done)
+        }
+        "wait-apply" => {
+            let timeout = timeout_arg(rest)?;
+            match replace_ui::automation_apply_result(app) {
+                Some(Ok(_)) => Ok(Flow::Done),
+                Some(Err(error)) => Err(format!("replace failed: {error}")),
+                None => wait_or_fail(st, timeout, "the replace is still running"),
+            }
+        }
+        "assert-apply" => {
+            let counts = key_counts(rest)?;
+            let report = finished_apply(app)?;
+            for (key, expected) in counts {
+                let found = match key {
+                    "files" => report.undo.len(),
+                    "replacements" => report.replacements(),
+                    "skipped" => report.skipped.len(),
+                    "failed" => report.failed.len(),
+                    _ => return Err(format!("unknown replace count `{key}`")),
+                };
+                if found != expected {
+                    return Err(format!(
+                        "expected {expected} `{key}` in the replace, found {found}"
+                    ));
+                }
+            }
+            Ok(Flow::Done)
+        }
+        "undo" => {
+            no_args(rest)?;
+            replace_ui::automation_undo(app).map(|()| Flow::Done)
+        }
+        _ => Err(format!("unknown `ui tools replace` verb `{sub}`")),
+    }
+}
+
+/// The finished preview, or an error saying what to wait for.
+fn finished_preview(app: &mut ZxrawApp) -> Result<ScanReport, String> {
+    match replace_ui::automation_preview_result(app) {
+        Some(Ok(report)) => Ok(report),
+        Some(Err(error)) => Err(format!("preview failed: {error}")),
+        None => Err("the preview has not completed (use `replace wait-preview`)".into()),
+    }
+}
+
+/// The finished replace, or an error saying what to wait for.
+fn finished_apply(app: &mut ZxrawApp) -> Result<ApplyReport, String> {
+    match replace_ui::automation_apply_result(app) {
+        Some(Ok(report)) => Ok(report),
+        Some(Err(error)) => Err(format!("replace failed: {error}")),
+        None => Err("the replace has not completed (use `replace wait-apply`)".into()),
+    }
+}
+
+/// The script name of a skip reason, as used by `replace assert-skipped`.
+fn skip_key(reason: &SkipReason) -> &'static str {
+    match reason {
+        SkipReason::BinaryExtension => "binary-extension",
+        SkipReason::Binary => "binary",
+        SkipReason::TooLarge(_) => "too-large",
+        SkipReason::OnlineOnly => "online-only",
+        SkipReason::ReadOnly => "read-only",
+        SkipReason::Changed => "changed",
+        SkipReason::Unreadable(_) => "unreadable",
+    }
+}
+
+fn verify_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
+    let (sub, rest) = split_verb(args);
+    match sub {
+        "open" => {
+            tools_ui::automation_open_verify(app, inside(one_path(rest)?)?);
+            Ok(Flow::Done)
+        }
+        "set-backup" => tools_ui::automation_verify_set_backup(app, inside(one_path(rest)?)?)
+            .map(|()| Flow::Done),
+        "options" => {
+            let mut full = None;
+            let mut moves = None;
+            for pair in rest.split_whitespace() {
+                let (key, value) = pair
+                    .split_once('=')
+                    .ok_or_else(|| format!("expected `key=on|off`, found `{pair}`"))?;
+                let on = match value {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("`{pair}`: expected on or off")),
+                };
+                match key {
+                    "full" => full = Some(on),
+                    "moves" => moves = Some(on),
+                    _ => return Err(format!("unknown verify option `{key}`")),
+                }
+            }
+            let (Some(full), Some(moves)) = (full, moves) else {
+                return Err("expected both `full=on|off` and `moves=on|off`".into());
+            };
+            tools_ui::automation_verify_set_options(app, full, moves).map(|()| Flow::Done)
+        }
+        "start" => {
+            no_args(rest)?;
+            tools_ui::automation_verify_start(app).map(|()| Flow::Done)
+        }
+        "cancel" => {
+            no_args(rest)?;
+            tools_ui::automation_verify_cancel(app).map(|()| Flow::Done)
+        }
+        "wait" => {
+            let timeout = timeout_arg(rest)?;
+            match tools_ui::automation_verify_report(app) {
+                Some(Ok(_)) => Ok(Flow::Done),
+                Some(Err(error)) => Err(format!("backup check failed: {error}")),
+                None => wait_or_fail(st, timeout, "the backup check is still running"),
+            }
+        }
+        "wait-cancelled" => {
+            let timeout = timeout_arg(rest)?;
+            match tools_ui::automation_verify_report(app) {
+                Some(Err(error)) if error.contains("cancel") => Ok(Flow::Done),
+                Some(Err(error)) => Err(format!(
+                    "the backup check ended with an error, not a cancel: {error}"
+                )),
+                Some(Ok(_)) => Err("the backup check finished without being cancelled".into()),
+                None => wait_or_fail(st, timeout, "the backup check is still running"),
+            }
+        }
+        "assert" => {
+            let counts = key_counts(rest)?;
+            let report = finished_verify(app)?;
+            let totals = report.counts();
+            for (key, expected) in counts {
+                let found = match key {
+                    "match" => totals.matched,
+                    "missing" => totals.missing,
+                    "differs" => totals.differs,
+                    "extra" => totals.extra,
+                    "moved" => totals.moved,
+                    "not-checked" => totals.not_checked,
+                    "errors" => totals.errors,
+                    _ => return Err(format!("unknown verify count `{key}`")),
+                };
+                if found != expected {
+                    return Err(format!(
+                        "expected {expected} `{key}` in the backup check, found {found}"
+                    ));
+                }
+            }
+            Ok(Flow::Done)
+        }
+        "assert-status" => {
+            let (rel, label) = split_verb(rest);
+            if rel.is_empty() || label.is_empty() {
+                return Err("expected `<rel path> <status>`".into());
+            }
+            let want = if label == "not-checked" {
+                "not checked"
+            } else {
+                label
+            };
+            let report = finished_verify(app)?;
+            let entry = report
+                .entries
+                .iter()
+                .find(|entry| entry.rel == Path::new(rel))
+                .ok_or_else(|| format!("the backup check has no entry for {rel}"))?;
+            let found = entry.status.label();
+            if found == want {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("{rel} is `{found}`, expected `{want}`"))
+            }
+        }
+        "export" => {
+            // `verify export <path> csv|text`; the path comes first so it may hold no spaces.
+            let (path, format) = rest
+                .rsplit_once(char::is_whitespace)
+                .ok_or("expected `<path> csv|text`")?;
+            let csv = match format.trim() {
+                "csv" => true,
+                "text" => false,
+                other => return Err(format!("expected csv or text, found `{other}`")),
+            };
+            let path = entry_inside(one_path(path)?)?;
+            tools_ui::automation_verify_export(app, path, csv).map(|()| Flow::Done)
+        }
+        _ => Err(format!("unknown `ui tools verify` verb `{sub}`")),
+    }
+}
+
+/// The finished backup check report, or an error saying what to wait for.
+fn finished_verify(app: &mut ZxrawApp) -> Result<BackupReport, String> {
+    match tools_ui::automation_verify_report(app) {
+        Some(Ok(report)) => Ok(report),
+        Some(Err(error)) => Err(format!("backup check failed: {error}")),
+        None => Err("the backup check has not completed (use `verify wait`)".into()),
     }
 }
 
