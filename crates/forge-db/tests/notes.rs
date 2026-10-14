@@ -272,3 +272,39 @@ fn relink_many_applies_a_case_only_rename() {
     assert_eq!(rec.name, "IMG.jpg");
     assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("keep"));
 }
+
+#[test]
+fn relink_many_never_touches_a_real_path_that_looks_like_a_staging_name() {
+    let db = Db::open_in_memory().unwrap();
+    // A real file named like a plausible staging name must survive a batch rename untouched.
+    let decoy = add(&db, r"D:\.zxraw-relink-1-0");
+    db.set_notes(&[decoy], Some("decoy")).unwrap();
+    let a = add(&db, r"D:\Shoot\a.jpg");
+    let b = add(&db, r"D:\Shoot\b.jpg");
+    db.set_notes(&[a], Some("A")).unwrap();
+    db.relink_many(&[
+        (PathBuf::from(r"D:\Shoot\a.jpg"), PathBuf::from(r"D:\Shoot\b.jpg")),
+        (PathBuf::from(r"D:\Shoot\b.jpg"), PathBuf::from(r"D:\Shoot\a.jpg")),
+    ])
+    .unwrap();
+    assert_eq!(db.annotation(decoy).unwrap().notes.as_deref(), Some("decoy"));
+    assert_eq!(
+        db.file(decoy).unwrap().unwrap().path,
+        PathBuf::from(r"D:\.zxraw-relink-1-0")
+    );
+    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("A"));
+    assert_eq!(db.annotation(b).unwrap().notes, None);
+}
+
+#[test]
+fn non_ascii_notes_round_trip_and_are_searchable() {
+    let db = Db::open_in_memory().unwrap();
+    let id = add(&db, r"D:\Shoot\portrait.jpg");
+    let note = "Café crème à Zürich — 🎉 Ünïcode ✓ 東京";
+    db.set_notes(&[id], Some(note)).unwrap();
+    assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some(note));
+    for q in ["note:zürich", "note:ZÜRICH", "café", "🎉", "東京", "note:crème"] {
+        assert_eq!(names(&db, q), set(&["portrait.jpg"]), "{q}");
+    }
+    assert!(names(&db, "note:zurich").is_empty(), "accents are not folded");
+}

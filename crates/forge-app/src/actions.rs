@@ -512,7 +512,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                         .cloned()
                         .collect(),
                 };
-                app.ops.library.follow_moves(undone);
+                follow_moves(app, undone);
                 let dirs: std::collections::BTreeSet<PathBuf> = pairs
                     .iter()
                     .filter_map(|(_, o)| o.parent().map(Path::to_path_buf))
@@ -746,17 +746,24 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             Event::UpdateDownloaded(result) => crate::updater::downloaded(app, result),
             Event::Undo(u) => {
                 if let UndoEntry::Ops(records) = &u {
-                    app.ops.library.follow_moves(undo_record_moves(records));
+                    follow_moves(app, undo_record_moves(records));
                 }
                 app.ops.undo.push(u);
                 if app.ops.undo.len() > 50 {
                     app.ops.undo.remove(0);
                 }
             }
-            Event::FilesMoved(pairs) => app.ops.library.follow_moves(pairs),
+            Event::FilesMoved(pairs) => follow_moves(app, pairs),
         }
     }
     changed
+}
+
+/// ZXraw moved or renamed files (`from` -> `to`): the note being edited and the library rows
+/// (notes, ratings, tags) follow them.
+pub fn follow_moves(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
+    app.ops.tags_ui.follow_moves(&pairs);
+    app.ops.library.follow_moves(pairs);
 }
 
 /// The `(from, to)` moves recorded by an operation's undo records (renames and moves).
@@ -844,7 +851,8 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
             crate::batch_rename::BrOutcome::Closed => {}
             crate::batch_rename::BrOutcome::Applied { dirs, report, undo } => {
                 // Undo pairs are (current, original): the files now sit at `current`.
-                app.ops.library.follow_moves(
+                follow_moves(
+                    app,
                     undo.iter()
                         .map(|(current, original)| (original.clone(), current.clone()))
                         .collect(),
@@ -911,7 +919,7 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                         std::fs::rename(path, &target)
                     };
                     if res.is_ok() {
-                        app.ops.library.follow_moves(vec![(path.clone(), target.clone())]);
+                        follow_moves(app, vec![(path.clone(), target.clone())]);
                         app.ops
                             .undo
                             .push(UndoEntry::Rename(vec![(target.clone(), path.clone())]));

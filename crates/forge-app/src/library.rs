@@ -26,6 +26,7 @@ pub enum LibMsg {
         result: Result<Vec<FileRecord>, String>,
     },
     Error(String),
+    Info(String),
 }
 
 struct AnnotationWrite {
@@ -83,6 +84,8 @@ pub struct Library {
     pub search: SearchState,
     /// Set once interrupted index passes have been looked at for this session.
     pub resume_checked: bool,
+    /// Notes not confirmed by the database at exit, replayed when the library next opens.
+    notes_recovery: PathBuf,
 }
 
 #[derive(Default)]
@@ -120,10 +123,26 @@ impl Library {
         let (tx, rx) = unbounded();
         let t = tx.clone();
         let c = ctx.clone();
+        let notes_recovery = note_recovery_path(&path);
+        let recovery = notes_recovery.clone();
         std::thread::spawn(move || {
             let r = Db::open(&path);
             let msg = match r {
                 Ok(db) => {
+                    match replay_note_recovery(&db, &recovery) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            let _ = t.send(LibMsg::Info(format!(
+                                "Saved {n} note(s) left unsaved when ZXraw last closed"
+                            )));
+                        }
+                        Err(error) => {
+                            let _ = t.send(LibMsg::Error(format!(
+                                "Notes left unsaved when ZXraw last closed could not be saved yet                                  (kept in {}): {error}",
+                                recovery.display()
+                            )));
+                        }
+                    }
                     let recovered = db
                         .recovered_corrupt_file()
                         .map(|p: &Path| format!("The library database was damaged and has been reset. The old file was kept as {}", p.display()));
@@ -150,7 +169,13 @@ impl Library {
             xmp_sync: false,
             search: SearchState::default(),
             resume_checked: false,
+            notes_recovery,
         }
+    }
+
+    /// Where notes not confirmed at exit are kept until the next start.
+    pub fn notes_recovery_path(&self) -> &Path {
+        &self.notes_recovery
     }
 
     /// Drain messages; returns user-facing notices (toasts).
@@ -214,6 +239,7 @@ impl Library {
                     }
                 }
                 LibMsg::Error(e) => notices.push(Err(e)),
+                LibMsg::Info(message) => notices.push(Ok(message)),
             }
         }
         notices
@@ -725,6 +751,78 @@ fn authoritative_annotations(
         .collect()
 }
 
+/// One note waiting in the recovery file: `note: None` clears the file's note.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingNote {
+    pub path: PathBuf,
+    pub note: Option<String>,
+}
+
+fn note_recovery_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("pending-notes.json")
+}
+
+fn read_note_recovery(file: &Path) -> std::io::Result<Vec<PendingNote>> {
+    let bytes = std::fs::read(file)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Adds `notes` to the recovery file (a later note for the same path replaces an earlier one).
+/// Written to a temp file first and renamed, so a crash never leaves half a file.
+pub fn write_note_recovery(file: &Path, notes: &[PendingNote]) -> std::io::Result<()> {
+    let mut all = match read_note_recovery(file) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!("ignoring an unreadable note recovery file: {e}");
+            Vec::new()
+        }
+    };
+    for note in notes {
+        all.retain(|n| !forge_core::paths::paths_equal(&n.path, &note.path));
+        all.push(note.clone());
+    }
+    let json = serde_json::to_vec_pretty(&all)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, file)
+}
+
+/// Saves the notes of the recovery file into the library and removes the file. Notes of files
+/// that no longer exist are dropped. On a database error the file is kept for the next start.
+/// Returns the number of notes saved.
+pub fn replay_note_recovery(db: &Db, file: &Path) -> Result<usize, String> {
+    let notes = match read_note_recovery(file) {
+        Ok(notes) => notes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut saved = 0;
+    for pending in &notes {
+        let Ok(entry) = forge_core::listing::entry_for_path(&pending.path) else {
+            tracing::warn!(path = %pending.path.display(), "dropping a recovered note: the file is gone");
+            continue;
+        };
+        db.upsert_entries(&[entry]).map_err(|e| e.to_string())?;
+        let Some(id) = db.file_id(&pending.path).map_err(|e| e.to_string())? else {
+            continue;
+        };
+        db.set_notes(&[id], pending.note.as_deref())
+            .map_err(|e| e.to_string())?;
+        saved += 1;
+    }
+    std::fs::remove_file(file).map_err(|e| e.to_string())?;
+    Ok(saved)
+}
+
 /// Whether a note exists for the badge: blank notes do not count.
 fn has_note(notes: Option<&str>) -> bool {
     notes.is_some_and(|n| !n.trim().is_empty())
@@ -749,7 +847,7 @@ fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
 }
 
 /// Where `path` goes under a set of moves made together, if any of them covers it.
-fn moved_by(path: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+pub(crate) fn moved_by(path: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
     pairs.iter().find_map(|(old, new)| moved_path(path, old, new))
 }
 
@@ -831,7 +929,7 @@ fn sync_sidecars(
         .collect();
     let first = failures.first()?;
     Some(format!(
-        "XMP sidecar sync failed for {} of {} file(s); the photos were not modified. First error: {first}",
+        "XMP sidecar not updated for {} of {} file(s); the change is saved in the library only and the photos were not modified. First error: {first}",
         failures.len(),
         targets.len()
     ))
@@ -1051,6 +1149,31 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
     }
 }
 
+/// A library with a writer thread on `db`, for tests here and in other modules.
+#[cfg(test)]
+pub(crate) fn test_library(db: Arc<Db>) -> Library {
+    let (tx, rx) = unbounded();
+    let writer = Some(spawn_writer(db.clone(), tx.clone()));
+    Library {
+        db: Some(db),
+        open_error: None,
+        tx,
+        rx,
+        ctx: egui::Context::default(),
+        annotations: HashMap::new(),
+        loaded_dirs: HashSet::new(),
+        locally_edited: HashSet::new(),
+        annotation_versions: HashMap::new(),
+        next_annotation_version: 0,
+        queued: Vec::new(),
+        writer,
+        xmp_sync: false,
+        search: SearchState::default(),
+        resume_checked: false,
+        notes_recovery: std::env::temp_dir().join("zxraw-test-pending-notes.json"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1107,25 +1230,7 @@ mod tests {
     }
 
     fn library_with_test_writer(db: Arc<Db>) -> Library {
-        let (tx, rx) = unbounded();
-        let writer = Some(spawn_writer(db.clone(), tx.clone()));
-        Library {
-            db: Some(db),
-            open_error: None,
-            tx,
-            rx,
-            ctx: egui::Context::default(),
-            annotations: HashMap::new(),
-            loaded_dirs: HashSet::new(),
-            locally_edited: HashSet::new(),
-            annotation_versions: HashMap::new(),
-            next_annotation_version: 0,
-            queued: Vec::new(),
-            writer,
-            xmp_sync: false,
-            search: SearchState::default(),
-            resume_checked: false,
-        }
+        super::test_library(db)
     }
 
     #[test]
@@ -1218,6 +1323,31 @@ mod tests {
         });
         assert!(msg.is_none());
         assert_eq!(written, vec![PathBuf::from("local.jpg")]);
+    }
+
+    #[test]
+    fn a_utf16_sidecar_is_reported_as_kept_in_the_library_only() {
+        let root = temp_root("utf16-sidecar");
+        let photo = root.join("a.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let side = forge_media::xmp_write::sidecar_path_for(&photo);
+        let xml = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about=""/></rdf:RDF></x:xmpmeta>"#;
+        let bytes: Vec<u8> = [
+            vec![0xFF, 0xFE],
+            xml.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+        ]
+        .concat();
+        std::fs::write(&side, &bytes).unwrap();
+        let update = SidecarUpdate {
+            note: Some(Some("Café 🎉".into())),
+            ..Default::default()
+        };
+        let msg = sync_sidecars(true, &[photo], &update, |_| false, update_sidecar)
+            .expect("the UTF-16 sidecar is reported");
+        assert!(msg.contains("sidecar is UTF-16"), "{msg}");
+        assert!(msg.contains("saved in the library only"), "{msg}");
+        assert_eq!(std::fs::read(&side).unwrap(), bytes);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1414,6 +1544,29 @@ mod tests {
         assert!(has_note(Some("client proof")));
         assert!(!has_note(Some("  \t ")));
         assert!(!has_note(None));
+    }
+
+    #[test]
+    fn recovered_notes_are_replayed_once_at_the_next_start() {
+        let root = temp_root("note-recovery");
+        let (photo, gone) = (root.join("a.jpg"), root.join("gone.jpg"));
+        std::fs::write(&photo, b"photo").unwrap();
+        let file = root.join("pending-notes.json");
+        let note = |path: &Path, text: &str| PendingNote {
+            path: path.to_path_buf(),
+            note: Some(text.into()),
+        };
+        write_note_recovery(&file, &[note(&photo, "first"), note(&gone, "lost")]).unwrap();
+        // A later note for the same file replaces the earlier one.
+        write_note_recovery(&file, &[note(&photo, "Zürich 🎉 final")]).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(replay_note_recovery(&db, &file), Ok(1));
+        let id = db.file_id(&photo).unwrap().unwrap();
+        assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("Zürich 🎉 final"));
+        assert!(!file.exists(), "the recovery file is removed once replayed");
+        assert_eq!(replay_note_recovery(&db, &file), Ok(0));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

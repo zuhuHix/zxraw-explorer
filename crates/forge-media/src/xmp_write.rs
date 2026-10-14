@@ -464,7 +464,7 @@ fn decode_for_write(bytes: &[u8], path: &Path) -> Result<String> {
     }
     if bytes.starts_with(&[0xFE, 0xFF]) || bytes.starts_with(&[0xFF, 0xFE]) {
         return Err(MediaError::Unsupported(format!(
-            "unsupported encoding: UTF-16 XMP at {}; left untouched",
+            "{}: sidecar is UTF-16, which ZXraw does not rewrite (unsupported encoding); left untouched",
             path.display()
         )));
     }
@@ -3143,6 +3143,28 @@ mod tests {
         assert_eq!(fields.description, None);
         let text = std::fs::read_to_string(dir.path().join("IMG_13.xmp")).unwrap();
         assert!(text.contains("xmlns:xmpDM=\"http://ns.adobe.com/xmp/1.0/DynamicMedia/\""));
+    }
+
+    #[test]
+    fn non_ascii_note_round_trips_and_keeps_the_caption() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("intl.jpg");
+        write_file(dir.path(), "intl.xmp", LR_ATTRS);
+        let caption_before = read_sidecar_fields(&img).description;
+        let note = "Café crème à Zürich — 🎉 Ünïcode ✓ 東京";
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some(note.into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(fields.note.as_deref(), Some(note));
+        assert_eq!(fields.description, caption_before);
+        let text = std::fs::read_to_string(dir.path().join("intl.xmp")).unwrap();
+        assert!(text.contains(note), "written as UTF-8 text, not escaped");
     }
 
     #[test]

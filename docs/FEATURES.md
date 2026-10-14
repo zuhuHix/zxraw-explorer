@@ -166,7 +166,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `library.rs::tag_rename_then_annotation_add_share_writer_order`.
 * 🟡 Notes on files — the preview panel's *Note* box (`tags_ui.rs`) saves 800 ms after the last
   keystroke, on focus loss, on a selection change, when the panel closes, and at exit (the
-  library writer is flushed). It shows *Unsaved changes*, *Saving…*, *Saved ✓* only once the
+  library writer is flushed for up to 7 s; a note still unconfirmed goes to `pending-notes.json`
+  and is saved at the next start). A note being edited follows its file when ZXraw renames or
+  moves it before the autosave. It shows *Unsaved changes*, *Saving…*, *Saved ✓* only once the
   database confirms the write, or *Not saved* with the error (`tags_ui.rs` tests cover the
   status, the confirmation and the autosave timer). Notes live in the library
   database for any file type (`annotations.notes`; migration 2 clears blank notes and indexes
