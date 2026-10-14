@@ -4,7 +4,7 @@
 //! taller than the image), it sits in one of nine anchor positions inset by `margin_pct`
 //! percent of the image's short edge, and it is blended with `opacity`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
@@ -140,6 +140,36 @@ pub fn placement(
 const REFERENCE_PX: f32 = 100.0;
 /// Windows fonts to try, in order, from `%WINDIR%\Fonts`.
 const FONT_FILES: [&str; 4] = ["segoeuib.ttf", "segoeui.ttf", "arialbd.ttf", "arial.ttf"];
+/// Logos are kept at most this long on their long edge; larger ones are downscaled once
+/// when the watermark is prepared.
+const MAX_LOGO_EDGE: u32 = 4096;
+/// Decode budget for a logo file, so a huge image fails instead of exhausting memory.
+const LOGO_MAX_DIMENSION: u32 = 16_384;
+const LOGO_MAX_ALLOC: u64 = 512 * 1024 * 1024;
+
+/// Decodes a logo under strict limits and shrinks it to [`MAX_LOGO_EDGE`].
+fn load_logo(path: &Path) -> Result<RgbaImage, String> {
+    let fail = |error: &dyn std::fmt::Display| {
+        format!("Could not open watermark image {}: {error}", path.display())
+    };
+    let mut reader = image::ImageReader::open(path)
+        .map_err(|e| fail(&e))?
+        .with_guessed_format()
+        .map_err(|e| fail(&e))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(LOGO_MAX_DIMENSION);
+    limits.max_image_height = Some(LOGO_MAX_DIMENSION);
+    limits.max_alloc = Some(LOGO_MAX_ALLOC);
+    reader.limits(limits);
+    let logo = reader.decode().map_err(|e| fail(&e))?;
+    let logo = if logo.width().max(logo.height()) > MAX_LOGO_EDGE {
+        logo.thumbnail(MAX_LOGO_EDGE, MAX_LOGO_EDGE)
+    } else {
+        logo
+    };
+    Ok(logo.to_rgba8())
+}
+
 /// Font file bytes, read once for the whole process.
 static FONT_BYTES: OnceLock<Option<Vec<u8>>> = OnceLock::new();
 
@@ -208,11 +238,7 @@ impl PreparedWatermark {
                 }
             }
             WatermarkSource::Image { path } => {
-                let logo = image::open(path)
-                    .map_err(|e| {
-                        format!("Could not open watermark image {}: {e}", path.display())
-                    })?
-                    .to_rgba8();
+                let logo = load_logo(path)?;
                 if logo.width() == 0 || logo.height() == 0 {
                     return Err(format!("Watermark image {} is empty.", path.display()));
                 }
@@ -661,6 +687,28 @@ mod tests {
             }
             other => panic!("expected RGBA8, got {:?}", other.color()),
         }
+    }
+
+    #[test]
+    fn large_logos_are_downscaled_and_bad_files_fail_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wide = dir.path().join("wide.png");
+        RgbaImage::from_pixel(5000, 20, Rgba([255, 0, 0, 255]))
+            .save(&wide)
+            .expect("write logo");
+        let prepared = PreparedWatermark::prepare(&logo_watermark(wide, Anchor::Center, 1.0))
+            .expect("prepare");
+        match &prepared.mark {
+            Mark::Logo(logo) => assert_eq!(logo.width(), MAX_LOGO_EDGE),
+            Mark::Text { .. } => panic!("expected a logo"),
+        }
+
+        let broken = dir.path().join("broken.png");
+        std::fs::write(&broken, b"not a png").expect("write");
+        let error = PreparedWatermark::prepare(&logo_watermark(broken, Anchor::Center, 1.0))
+            .err()
+            .expect("a broken logo is an error");
+        assert!(error.contains("broken.png"), "{error}");
     }
 
     #[test]
