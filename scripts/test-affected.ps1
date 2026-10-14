@@ -102,6 +102,7 @@ $E2EMap = @(
     @('crates/forge-app/src/sidebar.rs', 'sidebar'),
     @('crates/forge-app/src/sidebar/*', 'sidebar'),
     @('crates/forge-app/src/layouts.rs', 'sidebar'),
+    @('crates/forge-app/src/path_probe.rs', 'sidebar'),
     @('crates/forge-app/src/similar.rs', 'browser'),
     @('crates/forge-app/src/platform.rs', 'browser'),
     # thumbnails and previews are used by the grid everywhere
