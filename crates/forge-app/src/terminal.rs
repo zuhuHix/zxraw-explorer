@@ -137,9 +137,11 @@ impl Installed {
     }
 }
 
-/// Whether `p` exists. Uses `symlink_metadata` so that app execution aliases count.
+/// Whether `p` is an absolute path that exists. Uses `symlink_metadata` so that app execution
+/// aliases count. A relative path would resolve against a working directory, which could be a
+/// browsed folder, so it never counts.
 fn present(p: &Path) -> bool {
-    std::fs::symlink_metadata(p).is_ok()
+    p.is_absolute() && std::fs::symlink_metadata(p).is_ok()
 }
 
 /// The non-empty entries of `PATH`, with surrounding quotes removed.
@@ -157,6 +159,8 @@ fn path_dirs(env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
                 d
             }
         })
+        // Relative entries (".", "bin") would resolve against a working directory.
+        .filter(|d| d.is_absolute())
         .collect()
 }
 
@@ -758,6 +762,17 @@ mod tests {
         assert_eq!(found.pwsh, Some(pwsh));
         assert_eq!(found.powershell, Some(ps));
         assert_eq!(found.cmd, Some(cmd));
+    }
+
+    #[test]
+    fn relative_path_entries_are_ignored() {
+        // "." or "bin" would find a program in whatever folder is current, e.g. a browsed one.
+        let env = |k: &str| (k == "PATH").then(|| OsString::from(r".;bin;;C:\Tools;.\x"));
+        assert_eq!(path_dirs(&env), vec![PathBuf::from(r"C:\Tools")]);
+        assert!(
+            !present(Path::new("Cargo.toml")),
+            "relative paths never count as found"
+        );
     }
 
     #[test]

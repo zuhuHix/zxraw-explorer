@@ -194,9 +194,10 @@ Explorer is a file manager designed around that workflow:
   PowerShell, otherwise cmd; Settings › Browsing picks a specific one. An *as administrator*
   variant is on the folder background menu.
 - **Git at a glance.** In a folder inside a Git repository, changed files get a small badge
-  (modified, new, conflict), ignored files are dimmed and the status bar shows the branch. It
-  runs `git status` in the background with a time limit, so huge repositories are simply skipped.
-  Turn it off in Settings › Browsing.
+  (modified, new, conflict), ignored files are dimmed and the status bar shows the branch. The
+  status is read in the background by the app itself, without running Git or anything a
+  repository's settings name, so opening a downloaded project is safe. Huge repositories are
+  skipped. Turn it off in Settings › Browsing.
 
 <p align="center">
   <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/collections.jpg"><img src="docs/images/screens/collections.jpg" width="80%" alt="Collections window with a Lisbon portfolio collection and the New collection dialog open"></a>
