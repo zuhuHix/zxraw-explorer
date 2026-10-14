@@ -675,19 +675,24 @@ impl ZxrawApp {
                     }
                 }
                 Key::Enter => self.open_cursor(),
-                Key::Backspace => self.pane_mut().up(),
-                Key::Escape => {
-                    let p = self.pane_mut();
-                    if !p.filter_text.is_empty() {
-                        p.set_filter(String::new());
-                    } else {
-                        p.clear_selection();
+                Key::Backspace => {
+                    let filtering = *self.settings.list_typing == crate::settings::ListTyping::Filter;
+                    if !(filtering && self.pane_mut().filter_backspace()) {
+                        self.pane_mut().up();
                     }
                 }
+                Key::Escape => self.pane_mut().escape(),
                 _ => {}
             }
         }
-        // Type-ahead find.
+        // Type-to-filter, or type-ahead find.
+        if *self.settings.list_typing == crate::settings::ListTyping::Filter {
+            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !text.is_empty() && !m.command {
+                self.pane_mut().type_filter(&text);
+            }
+            return;
+        }
         let text: String = text.chars().filter(|c| !c.is_control() && *c != ' ').collect();
         if !text.is_empty() && !m.command {
             let (buf, at) = &mut self.type_ahead;
@@ -882,6 +887,25 @@ impl ZxrawApp {
                 }
             }
             ui.label(s);
+            let mut end_sticky = false;
+            if !p.filter_text.is_empty() {
+                ui.add_space(8.0);
+                let text = RichText::new(format!("🔍 Filtered: “{}”", p.filter_text.trim()))
+                    .color(theme::accent(ui.ctx()));
+                ui.label(text).on_hover_text("Only names matching the filter are listed. Esc clears it.");
+            }
+            if p.sticky {
+                ui.add_space(8.0);
+                let text = RichText::new("📌 Sticky selection").color(theme::accent(ui.ctx()));
+                end_sticky = ui
+                    .selectable_label(true, text)
+                    .on_hover_text(crate::commands::tooltip(
+                        "A click adds or removes an item. Esc or this button turns it off",
+                        Cmd::ToggleStickySelection,
+                        &self.settings.keybindings,
+                    ))
+                    .clicked();
+            }
             match &p.load {
                 LoadState::Loading { since } if since.elapsed() > Duration::from_millis(200) => {
                     ui.spinner();
@@ -897,6 +921,9 @@ impl ZxrawApp {
                     ui.label(RichText::new(format!("⚠ {e}")).color(ui.visuals().error_fg_color));
                 }
                 _ => {}
+            }
+            if end_sticky {
+                self.pane_mut().sticky = false;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 crate::actions::status_widgets(self, ui);
@@ -980,6 +1007,10 @@ impl eframe::App for ZxrawApp {
             ctx,
             &self.settings.keybindings,
             self.ops.settings_ui.capture.is_some(),
+        );
+        crate::pane::publish_typing_filters(
+            ctx,
+            *self.settings.list_typing == crate::settings::ListTyping::Filter,
         );
         let mut changed = false;
         for t in &mut self.tabs {

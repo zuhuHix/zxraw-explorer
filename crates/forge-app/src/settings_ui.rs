@@ -614,6 +614,25 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 ui.selectable_value(&mut *settings.default_view, ViewMode::Grid, "Thumbnail grid");
             });
     });
+    ui.horizontal(|ui| {
+        use crate::settings::ListTyping;
+        ui.label("Typing in the file list");
+        egui::ComboBox::from_id_salt("settings-list-typing")
+            .selected_text(match *settings.list_typing {
+                ListTyping::Jump => "Jump to name",
+                ListTyping::Filter => "Filter the list",
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut *settings.list_typing, ListTyping::Jump, "Jump to name");
+                ui.selectable_value(&mut *settings.list_typing, ListTyping::Filter, "Filter the list");
+            });
+    });
+    ui.label(
+        RichText::new(
+            "Filter the list: typed letters go into the filter box so only matching names              stay. Backspace removes a letter, Esc clears the filter.",
+        )
+        .weak(),
+    );
 }
 
 fn performance_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut SettingsUi) {

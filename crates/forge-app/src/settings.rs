@@ -113,6 +113,16 @@ pub enum ViewMode {
     Grid,
 }
 
+/// What typing a name in the file list does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ListTyping {
+    /// Jump to the next name that starts with the typed text.
+    #[default]
+    Jump,
+    /// Add the typed text to the folder filter, so only matching names stay listed.
+    Filter,
+}
+
 /// An external program the user can send files to ("Open in Lightroom", "Resolve"…).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalTool {
@@ -175,6 +185,8 @@ pub struct Settings {
     /// Reopen the previous session's tabs at startup (the behaviour before this was a
     /// setting, so it defaults to on).
     pub restore_session: bool,
+    /// What typing in the file list does: jump to a name (default) or filter the list.
+    pub list_typing: Lenient<ListTyping>,
     /// Settings this version doesn't know (written by a newer one), kept so saving doesn't
     /// drop them.
     #[serde(flatten)]
@@ -214,6 +226,7 @@ impl Default for Settings {
             pins: Vec::new(),
             layouts: Vec::new(),
             restore_session: true,
+            list_typing: ListTyping::Jump.into(),
             extra: Extra::new(),
         }
     }

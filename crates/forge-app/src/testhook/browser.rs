@@ -12,6 +12,10 @@
 //! - `expand <anchor>` / `collapse <anchor>`: change a stack's display state.
 //! - `assert-expanded <anchor>` / `assert-collapsed <anchor>`: verify that display state.
 //! - `select-group <anchor>`: select every listed file represented by the group.
+//! - `assert-visible <name1>, <name2>`: assert the focused pane shows exactly these names, in
+//!   this order (after the filter and hidden-file rules).
+//! - `assert-filter [text]`: assert the focused pane's filter text (empty when omitted).
+//! - `assert-sticky on|off`: assert whether sticky selection is on in the focused pane.
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
@@ -132,6 +136,45 @@ pub(super) fn step(
             pane.anchor = pane.cursor;
             pane.scroll_to_cursor = pane.cursor.is_some();
             Ok(Flow::Done)
+        }
+        "assert-visible" => {
+            let expected: Vec<&str> = args
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .collect();
+            let pane = app.pane();
+            let shown: Vec<&str> = pane
+                .visible
+                .iter()
+                .map(|&index| pane.entries[index].name.as_str())
+                .collect();
+            if shown == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("the list shows {shown:?}, expected {expected:?}"))
+            }
+        }
+        "assert-filter" => {
+            let filter = &app.pane().filter_text;
+            if filter == args.trim() {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("the filter is `{filter}`, expected `{}`", args.trim()))
+            }
+        }
+        "assert-sticky" => {
+            let expected = match args.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err("expected `on` or `off`".into()),
+            };
+            let sticky = app.pane().sticky;
+            if sticky == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("sticky selection is {}", if sticky { "on" } else { "off" }))
+            }
         }
         other => Err(format!("unknown `ui browser` verb `{other}`")),
     }

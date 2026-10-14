@@ -55,6 +55,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * 🟡 Browse a 50,000-file folder in the desktop UI — the screenshot hook loaded the folder and
   captured a frame in an earlier run (not repeated for `dfd43d9`); see [BENCHMARKS.md](BENCHMARKS.md).
   Frame pacing and interactive responsiveness are not measured.
+* ✅ Type to filter (Settings › Browsing › *Typing in the file list*: *Jump to name*, the
+  default, or *Filter the list*). In filter mode typed letters go into the folder filter, so the
+  same query syntax applies; Backspace removes a letter, Esc clears it, and the status bar shows
+  the active filter — `pane.rs` (`typing_extends_the_filter_and_backspace_and_escape_undo_it`,
+  `typed_query_syntax_uses_the_same_filter_machinery`), e2e
+  `typing_filters_the_list_when_the_setting_says_so`, `typing_jumps_to_a_name_by_default`.
+* ✅ Sticky selection (*Sticky selection*, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd>): a plain
+  click adds or removes an item, as Ctrl+click does; the status bar shows 📌 while it is on, and
+  Esc, the indicator or the command turns it off, keeping the picks — `pane.rs`
+  (`sticky_selection_makes_a_plain_click_toggle`, `escape_clears_filter_then_sticky_then_selection`),
+  e2e `sticky_selection_toggles_items_with_plain_clicks`.
 * ✅ Folder auto-refresh on new files — `forge-app/src/watcher.rs::detects_new_file_after_debounce`
   (watcher wired in `main.rs` and `actions.rs`). The rendered list refresh is not driven by a test.
 
