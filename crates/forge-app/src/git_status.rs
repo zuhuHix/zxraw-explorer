@@ -18,8 +18,6 @@ use gix::status::plumbing::index_as_worktree::EntryStatus;
 use gix::status::plumbing::index_as_worktree::traits::{CompareBlobs, ReadData, SubmoduleStatus};
 use gix::status::plumbing::index_as_worktree_with_renames::{Entry, VisitEntry};
 
-/// Most changed, new or ignored entries collected; a repository with more is skipped.
-const MAX_ENTRIES: usize = 50_000;
 /// Longest a status walk may take before it is stopped.
 const TIMEOUT: Duration = Duration::from_secs(4);
 /// Age after which a cached status is refetched while its folder is shown.
@@ -481,69 +479,145 @@ fn worker(requests: Receiver<Request>, replies: Sender<Reply>, ctx: egui::Contex
     }
 }
 
+/// What one status read may cost before the repository is skipped for the session.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Wall time for the whole read, from before the repository is opened.
+    time: Duration,
+    /// Size of `.git/index` on disk, checked before it is loaded.
+    index_bytes: u64,
+    /// Entries in the index (each is compared with its file).
+    index_entries: usize,
+    /// Folders and files the directory walk looks at, emitted or not.
+    visited: usize,
+}
+
+const LIMITS: Limits = Limits {
+    time: TIMEOUT,
+    index_bytes: 64 * 1024 * 1024,
+    index_entries: 100_000,
+    visited: 50_000,
+};
+
 /// Reads the status of the repository at `root` with `gix`, in this process.
+fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
+    read_status_with(root, LIMITS)
+}
+
+/// [`read_status`] with explicit limits.
 ///
 /// No external program ever runs: gix implements no fsmonitor, configuration is loaded in
 /// isolation (the repository's own config only, never `git` itself, system or user config),
 /// and file contents are never read, so no filter driver from `.gitattributes` can start. A
 /// tracked file whose size or time differs from the index counts as modified.
-fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
-    if !forge_core::cloud::background_read_allowed(root) {
+///
+/// Refused without reading anything: a repository inside a cloud sync root (the walk would
+/// read `.gitignore` files that may be online-only), a `.git` file pointing at a network
+/// path, and a repository whose config moves its work tree (`core.worktree`) away from `root`.
+fn read_status_with(root: &Path, limits: Limits) -> Result<RepoStatus, Failure> {
+    // The budget covers everything from here on, including opening and loading the index.
+    let deadline = Instant::now() + limits.time;
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let (done, finished) = crossbeam_channel::bounded::<()>(0);
+    let flag = Arc::clone(&interrupt);
+    let time = limits.time;
+    thread::spawn(move || {
+        if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = finished.recv_timeout(time) {
+            flag.store(true, Ordering::SeqCst);
+        }
+    });
+    let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
+    let result = read_within(root, limits, &interrupt, deadline);
+    drop(done);
+    match result {
+        _ if over() => Err(Failure::TooBig),
+        result => result,
+    }
+}
+
+fn read_within(
+    root: &Path,
+    limits: Limits,
+    interrupt: &AtomicBool,
+    deadline: Instant,
+) -> Result<RepoStatus, Failure> {
+    // The timer thread raises `interrupt` (which gix polls); the clock check makes the
+    // deadline exact between steps.
+    let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
+    let err = |e: &dyn std::fmt::Display| Failure::Error(e.to_string());
+    if forge_core::cloud::in_cloud_sync_root(root) {
         return Err(Failure::Unsafe);
     }
-    let err = |e: &dyn std::fmt::Display| Failure::Error(e.to_string());
+    if git_file_points_to_network(root) {
+        return Err(Failure::Unsafe);
+    }
     let repo = gix::open_opts(root, gix::open::Options::isolated().strict_config(false))
         .map_err(|e| err(&e))?;
+    // `core.worktree` in the repository's own config could point the walk anywhere.
+    let same_tree = match (repo.workdir(), std::fs::canonicalize(root)) {
+        (Some(workdir), Ok(root)) => std::fs::canonicalize(workdir).is_ok_and(|w| w == root),
+        _ => false,
+    };
+    if !same_tree {
+        return Err(Failure::Unsafe);
+    }
     let branch = repo
         .head_name()
         .ok()
         .flatten()
         .map(|name| name.shorten().to_string());
+    let index_file = repo.index_path();
+    if std::fs::metadata(&index_file).is_ok_and(|m| m.len() > limits.index_bytes) {
+        return Err(Failure::TooBig);
+    }
     let index = repo.index_or_empty().map_err(|e| err(&e))?;
+    if index.entries().len() > limits.index_entries || over() {
+        return Err(Failure::TooBig);
+    }
 
-    // Stop a walk that takes too long; the timer is released as soon as the walk returns.
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let (done, finished) = crossbeam_channel::bounded::<()>(0);
-    let flag = Arc::clone(&interrupt);
-    thread::spawn(move || {
-        if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = finished.recv_timeout(TIMEOUT) {
-            flag.store(true, Ordering::SeqCst);
-        }
-    });
+    let mut status = RepoStatus::new(root.to_path_buf(), branch);
 
-    let mut collect = Collect {
-        status: RepoStatus::new(root.to_path_buf(), branch),
-        count: 0,
-        interrupt: Arc::clone(&interrupt),
-    };
-    let dirwalk = repo
-        .dirwalk_options()
-        .map_err(|e| err(&e))?
-        .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory)
-        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory));
-    let walked = repo.index_worktree_status(
+    // Tracked files: stat data against the index.
+    repo.index_worktree_status(
         &index,
         None::<&str>,
-        &mut collect,
+        &mut Tracked(&mut status),
         StatOnly,
         NoSubmodules,
         &mut gix::progress::Discard,
-        &interrupt,
+        interrupt,
         gix::status::index_worktree::Options {
             sorting: None,
-            dirwalk_options: Some(dirwalk),
+            dirwalk_options: None,
             rewrites: None,
             thread_limit: Some(1),
         },
-    );
-    drop(done);
-    if interrupt.load(Ordering::SeqCst) {
+    )
+    .map_err(|e| err(&e))?;
+    if over() {
+        return Err(Failure::TooBig);
+    }
+
+    // Untracked and ignored entries. Untracked files are emitted one by one so every one
+    // counts towards the limit; ignored folders are reported whole, as git does.
+    let options = repo
+        .dirwalk_options()
+        .map_err(|e| err(&e))?
+        .emit_untracked(gix::dir::walk::EmissionMode::Matching)
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory));
+    let mut walk = Walk {
+        status: &mut status,
+        visited: 0,
+        max: limits.visited,
+        too_many: false,
+    };
+    let walked = repo.dirwalk(&index, None::<&str>, interrupt, options, &mut walk);
+    if walk.too_many || over() {
         return Err(Failure::TooBig);
     }
     walked.map_err(|e| err(&e))?;
 
     // Staged changes: the index against HEAD's tree. Compares object ids only.
-    let status = &mut collect.status;
     match repo.head_tree_id() {
         Ok(tree) => {
             repo.tree_index_status(
@@ -552,6 +626,9 @@ fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
                 None,
                 gix::status::tree_index::TrackRenames::Disabled,
                 |change, _, _| {
+                    if over() {
+                        return Ok(std::ops::ControlFlow::Break(()));
+                    }
                     use gix::diff::index::ChangeRef;
                     let (location, badge) = match &change {
                         ChangeRef::Addition { location, .. } => (location, GitBadge::Added),
@@ -568,11 +645,35 @@ fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
         // Unborn branch: everything in the index is new.
         Err(_) => {
             for entry in index.entries() {
+                if over() {
+                    break;
+                }
                 status.add_staged(&entry.path(&index).to_string(), GitBadge::Added);
             }
         }
     }
-    Ok(collect.status)
+    if over() {
+        return Err(Failure::TooBig);
+    }
+    Ok(status)
+}
+
+/// Does `root/.git` name a git directory on a network path (`gitdir: \\server\...`)? Opening it
+/// would contact that server just because a folder was listed.
+fn git_file_points_to_network(root: &Path) -> bool {
+    let dot_git = root.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
+    // A real `.git` file is one short line; anything large is not one.
+    if std::fs::metadata(&dot_git).map_or(true, |m| m.len() > 4096) {
+        return true;
+    }
+    let Ok(text) = std::fs::read_to_string(&dot_git) else {
+        return true;
+    };
+    let target = text.trim().strip_prefix("gitdir:").unwrap_or("").trim();
+    target.starts_with(r"\\") || target.starts_with("//")
 }
 
 /// Compares tracked files by their index stat data only. Never reading a file is what keeps
@@ -608,48 +709,82 @@ impl SubmoduleStatus for NoSubmodules {
     }
 }
 
-/// Turns gix status entries into badges, stopping the walk past [`MAX_ENTRIES`].
-struct Collect {
-    status: RepoStatus,
-    count: usize,
-    interrupt: Arc<AtomicBool>,
-}
+/// Badges for tracked files that differ from the index.
+struct Tracked<'s>(&'s mut RepoStatus);
 
-impl<'index> VisitEntry<'index> for Collect {
+impl<'index> VisitEntry<'index> for Tracked<'_> {
     type ContentChange = ();
     type SubmoduleStatus = ();
 
     fn visit_entry(&mut self, entry: Entry<'index, (), ()>) {
-        let (path, badge) = match entry {
-            Entry::Modification {
-                rela_path, status, ..
-            } => {
-                let badge = match status {
-                    EntryStatus::Conflict { .. } => GitBadge::Conflicted,
-                    EntryStatus::IntentToAdd => GitBadge::Added,
-                    EntryStatus::NeedsUpdate(_) => return,
-                    EntryStatus::Change(_) => GitBadge::Modified,
-                };
-                (rela_path.to_string(), badge)
-            }
-            Entry::DirectoryContents { entry, .. } => {
-                let badge = match entry.status {
-                    gix::dir::entry::Status::Untracked => GitBadge::Added,
-                    gix::dir::entry::Status::Ignored(_) => GitBadge::Ignored,
-                    _ => return,
-                };
-                let dir = matches!(entry.disk_kind, Some(gix::dir::entry::Kind::Directory));
-                let slash = if dir { "/" } else { "" };
-                (format!("{}{slash}", entry.rela_path), badge)
-            }
-            Entry::Rewrite { .. } => return,
-        };
-        self.count += 1;
-        if self.count > MAX_ENTRIES {
-            self.interrupt.store(true, Ordering::SeqCst);
-            return;
+        if let Entry::Modification {
+            rela_path, status, ..
+        } = entry
+        {
+            let badge = match status {
+                EntryStatus::Conflict { .. } => GitBadge::Conflicted,
+                EntryStatus::IntentToAdd => GitBadge::Added,
+                EntryStatus::NeedsUpdate(_) => return,
+                EntryStatus::Change(_) => GitBadge::Modified,
+            };
+            self.0.add(&rela_path.to_string(), badge);
         }
-        self.status.add(&path, badge);
+    }
+}
+
+/// Collects untracked and ignored entries, stopping once `max` folders and files were seen.
+struct Walk<'s> {
+    status: &'s mut RepoStatus,
+    visited: usize,
+    max: usize,
+    too_many: bool,
+}
+
+impl Walk<'_> {
+    fn count(&mut self) -> bool {
+        self.visited += 1;
+        if self.visited > self.max {
+            self.too_many = true;
+        }
+        !self.too_many
+    }
+}
+
+impl gix::dir::walk::Delegate for Walk<'_> {
+    fn emit(
+        &mut self,
+        entry: gix::dir::EntryRef<'_>,
+        _collapsed_directory_status: Option<gix::dir::entry::Status>,
+    ) -> gix::dir::walk::Action {
+        if !self.count() {
+            return std::ops::ControlFlow::Break(());
+        }
+        let badge = match entry.status {
+            gix::dir::entry::Status::Untracked => GitBadge::Added,
+            gix::dir::entry::Status::Ignored(_) => GitBadge::Ignored,
+            _ => return std::ops::ControlFlow::Continue(()),
+        };
+        let dir = matches!(entry.disk_kind, Some(gix::dir::entry::Kind::Directory));
+        let slash = if dir { "/" } else { "" };
+        self.status
+            .add(&format!("{}{slash}", entry.rela_path), badge);
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn can_recurse(
+        &mut self,
+        entry: gix::dir::EntryRef<'_>,
+        for_deletion: Option<gix::dir::walk::ForDeletionMode>,
+        worktree_root_is_repository: bool,
+    ) -> bool {
+        // Every folder considered counts, whether or not it is entered or emitted.
+        self.count()
+            && entry.status.can_recurse(
+                entry.disk_kind,
+                entry.pathspec_match,
+                for_deletion,
+                worktree_root_is_repository,
+            )
     }
 }
 
@@ -907,6 +1042,53 @@ mod tests {
         assert_eq!(
             status.badge(&root.join("a.txt"), false),
             Some(GitBadge::Modified)
+        );
+    }
+
+    #[test]
+    fn a_config_that_moves_the_work_tree_is_refused() {
+        let Some(tmp) = fixture_repo() else { return };
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("secret.txt"), "s").unwrap();
+        let target = elsewhere.path().to_string_lossy().replace('\\', "/");
+        assert!(git(tmp.path(), &["config", "core.worktree", &target]));
+        assert_eq!(read_status(tmp.path()).unwrap_err(), Failure::Unsafe);
+    }
+
+    #[test]
+    fn a_git_file_pointing_at_a_network_path_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dot_git = tmp.path().join(".git");
+        std::fs::write(&dot_git, "gitdir: \\\\server\\share\\repo.git\n").unwrap();
+        assert!(git_file_points_to_network(tmp.path()));
+        assert_eq!(read_status(tmp.path()).unwrap_err(), Failure::Unsafe);
+        std::fs::write(&dot_git, "gitdir: C:/code/main/.git/worktrees/x\n").unwrap();
+        assert!(!git_file_points_to_network(tmp.path()));
+    }
+
+    #[test]
+    fn every_part_of_the_scan_is_bounded() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let many = root.join("many");
+        std::fs::create_dir_all(&many).unwrap();
+        for i in 0..20 {
+            std::fs::write(many.join(format!("{i}.txt")), "x").unwrap();
+        }
+        assert!(read_status_with(root, LIMITS).is_ok());
+        let small = |f: fn(&mut Limits)| {
+            let mut limits = LIMITS;
+            f(&mut limits);
+            read_status_with(root, limits)
+        };
+        // The fixture's index has three entries.
+        assert_eq!(small(|l| l.index_entries = 2).unwrap_err(), Failure::TooBig);
+        assert_eq!(small(|l| l.index_bytes = 10).unwrap_err(), Failure::TooBig);
+        // A single untracked folder is reported as one entry, but all its files are visited.
+        assert_eq!(small(|l| l.visited = 10).unwrap_err(), Failure::TooBig);
+        assert_eq!(
+            small(|l| l.time = Duration::ZERO).unwrap_err(),
+            Failure::TooBig
         );
     }
 }

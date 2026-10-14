@@ -32,7 +32,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   administrator or on a network (UNC) path; choose PowerShell instead. Git badges compare file
   size and time with the index and never read contents, so a file rewritten with identical
   contents, or one changed within the same second as the last commit, can show as modified.
-  Repositories that take over 4 s or have over 50,000 changed or untracked entries show no badges.
+  Repositories that take over 4 s, have an index over 100,000 entries or need over 50,000
+  folders and files walked show no badges, and neither does any repository inside OneDrive or
+  another cloud-synced folder (its `.gitignore` files could be online-only).
 * Files and folders can be dropped into the app. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another

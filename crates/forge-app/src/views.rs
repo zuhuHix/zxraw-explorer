@@ -2148,7 +2148,8 @@ pub fn grid(
                         p.circle_filled(corner, 11.0, Color32::from_black_alpha(150));
                         draw_cloud_badge(&p, corner, 13.0, ONLINE_ONLY_COLOR);
                     }
-                    if let Some(git) = thumbs.git_badge(&entry.path, entry.kind == EntryKind::Dir) {
+                    let git = thumbs.git_badge(&entry.path, entry.kind == EntryKind::Dir);
+                    if let Some(git) = git {
                         // Left of the cloud badge when both are shown.
                         let inset = if entry.online_only { 24.0 } else { 3.0 };
                         let at = pos2(badge_rect.right() - inset, badge_rect.bottom() - 10.0);
@@ -2212,6 +2213,8 @@ pub fn grid(
                     );
                     let label_color = if selected {
                         ui.visuals().strong_text_color()
+                    } else if git == Some(crate::git_status::GitBadge::Ignored) {
+                        ui.visuals().weak_text_color()
                     } else {
                         ui.visuals().text_color()
                     };
