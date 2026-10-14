@@ -20,6 +20,7 @@ mod ffmpeg_setup;
 mod fonts;
 mod gps_ui;
 mod ingest_ui;
+mod layouts;
 mod library;
 mod media_durations;
 mod media_meta;

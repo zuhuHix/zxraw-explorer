@@ -28,6 +28,7 @@ mod library;
 mod media;
 mod perf;
 mod related;
+mod sidebar;
 mod system;
 mod tools;
 mod viewer;

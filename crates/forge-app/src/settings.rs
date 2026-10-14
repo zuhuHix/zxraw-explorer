@@ -122,6 +122,13 @@ pub struct Settings {
     /// Where the search window looks: "index" (the library index, default), "everything"
     /// (voidtools Everything) or "windows" (Windows Search). Unknown values mean "index".
     pub search_backend: String,
+    /// Files and folders pinned to the sidebar's Quick access section, in display order.
+    pub pins: Vec<Pin>,
+    /// Saved tab layouts ("Save layout…"), in the order they were saved.
+    pub layouts: Vec<Layout>,
+    /// Reopen the previous session's tabs at startup (the behaviour before this was a
+    /// setting, so it defaults to on).
+    pub restore_session: bool,
 }
 
 impl Default for Settings {
@@ -154,16 +161,61 @@ impl Default for Settings {
             skipped_update: None,
             keybindings: Default::default(),
             search_backend: "index".into(),
+            pins: Vec::new(),
+            layouts: Vec::new(),
+            restore_session: true,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+impl Settings {
+    /// Upgrades a settings file written by an older version. Folder bookmarks became Quick
+    /// access pins: they are moved over once, after any pins that already exist.
+    pub fn migrate(&mut self) {
+        for path in std::mem::take(&mut self.bookmarks) {
+            if !self.pins.iter().any(|p| p.path == path) {
+                self.pins.push(Pin {
+                    path,
+                    label: None,
+                    file: false,
+                });
+            }
+        }
+    }
+}
+
+/// A file or folder pinned to the sidebar's Quick access section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Pin {
+    pub path: PathBuf,
+    /// Shown instead of the file or folder name when set.
+    pub label: Option<String>,
+    /// Pinned as a file: a click opens it with its default app instead of navigating.
+    pub file: bool,
+}
+
+/// A saved set of tabs, restored by "Load layout".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Layout {
+    pub name: String,
+    pub tabs: Vec<TabSession>,
+    pub active_tab: usize,
+}
+
+/// One tab of a session or a saved layout. The split is on when `right` is set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TabSession {
     pub left: PathBuf,
     pub right: Option<PathBuf>,
     pub view: ViewMode,
+    /// Absent in files from before layouts: the default sort applies.
+    pub sort: Option<SortSpec>,
+    /// The right pane's view and sort, when they differ from the left pane's.
+    pub right_view: Option<ViewMode>,
+    pub right_sort: Option<SortSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -286,6 +338,79 @@ mod tests {
         assert!(settings.verify_copies);
         let settings: Settings = serde_json::from_str(r#"{"transfer_queue": false}"#).unwrap();
         assert!(!settings.transfer_queue);
+    }
+
+    #[test]
+    fn pins_layouts_and_restore_flag_round_trip() {
+        let mut settings = Settings {
+            restore_session: false,
+            ..Default::default()
+        };
+        settings.pins = vec![
+            Pin { path: PathBuf::from(r"C:\Shoots"), label: None, file: false },
+            Pin { path: PathBuf::from(r"C:\Shoots\cover.cr3"), label: Some("Cover".into()), file: true },
+        ];
+        settings.layouts = vec![Layout {
+            name: "Culling".into(),
+            tabs: vec![TabSession {
+                left: PathBuf::from(r"C:\Shoots"),
+                right: Some(PathBuf::from(r"D:\Backup")),
+                view: ViewMode::Grid,
+                sort: Some(SortSpec { descending: true, ..Default::default() }),
+                right_view: Some(ViewMode::Details),
+                right_sort: None,
+            }],
+            active_tab: 0,
+        }];
+        let json = serde_json::to_string(&settings).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.pins, settings.pins);
+        assert_eq!(back.layouts, settings.layouts);
+        assert!(!back.restore_session);
+    }
+
+    #[test]
+    fn old_settings_without_pins_or_layouts_load_with_defaults() {
+        let settings: Settings = serde_json::from_str(r#"{"theme":"Light","show_hidden":true}"#).unwrap();
+        assert!(settings.pins.is_empty());
+        assert!(settings.layouts.is_empty());
+        assert!(settings.restore_session, "session restore stays on for existing users");
+    }
+
+    #[test]
+    fn bookmarks_migrate_into_pins_once_after_existing_pins() {
+        let json = r#"{
+            "bookmarks": ["C:\Photos", "D:\Card"],
+            "pins": [{"path": "D:\Card", "label": "SD", "file": false}]
+        }"#;
+        let mut settings: Settings = serde_json::from_str(json).unwrap();
+        settings.migrate();
+        let paths: Vec<_> = settings.pins.iter().map(|p| p.path.clone()).collect();
+        assert_eq!(paths, vec![PathBuf::from(r"D:\Card"), PathBuf::from(r"C:\Photos")]);
+        assert_eq!(settings.pins[0].label.as_deref(), Some("SD"));
+        assert!(!settings.pins[1].file);
+        assert!(settings.bookmarks.is_empty());
+        let before = settings.pins.clone();
+        settings.migrate();
+        assert_eq!(settings.pins, before);
+    }
+
+    #[test]
+    fn old_session_tabs_load_without_sort_or_right_view() {
+        let json = r#"{"tabs":[{"left":"C:\A","right":"C:\B","view":"Grid"}],"active_tab":0}"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        let tab = &session.tabs[0];
+        assert_eq!(tab.right.as_deref(), Some(Path::new(r"C:\B")));
+        assert_eq!(tab.view, ViewMode::Grid);
+        assert_eq!((tab.sort, tab.right_view, tab.right_sort), (None, None, None));
+    }
+
+    #[test]
+    fn a_pin_with_missing_fields_still_loads() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"pins":[{"path":"C:\X"},{"label":"no path"}]}"#).unwrap();
+        assert_eq!(settings.pins[0], Pin { path: PathBuf::from(r"C:\X"), label: None, file: false });
+        assert_eq!(settings.pins.len(), 2);
     }
 
     #[test]

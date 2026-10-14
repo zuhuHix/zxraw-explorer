@@ -44,6 +44,7 @@ mod library;
 mod media;
 mod perf;
 mod related;
+mod sidebar;
 mod system;
 mod tools;
 mod viewer;
@@ -281,7 +282,7 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// assert-notice <kind>       crash | welcome | none: which startup notices are open
 /// dismiss-notices            close the startup notices as the user would
 /// ui <area> <verb> [args]    area-specific verbs: viewer, ingest, library, tools, perf,
-///                            browser, media, related, system
+///                            browser, media, related, sidebar, system
 ///                            (documented in the area modules under `testhook/`)
 /// ```
 #[derive(Debug, Clone)]
@@ -363,6 +364,7 @@ enum Area {
     Browser,
     Media,
     Related,
+    Sidebar,
     System,
 }
 
@@ -849,6 +851,7 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
                 "browser" => Area::Browser,
                 "media" => Area::Media,
                 "related" => Area::Related,
+                "sidebar" => Area::Sidebar,
                 "system" => Area::System,
                 other => return Err(format!("unknown area `{other}`")),
             };
@@ -1689,6 +1692,7 @@ fn exec(
             Area::Browser => browser::step(app, ctx, verb, args, st),
             Area::Media => media::step(app, ctx, verb, args, st),
             Area::Related => related::step(app, ctx, verb, args, st),
+            Area::Sidebar => sidebar::step(app, ctx, verb, args, st),
             Area::System => system::step(app, ctx, verb, args, st),
         },
     }

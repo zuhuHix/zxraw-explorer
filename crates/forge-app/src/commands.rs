@@ -98,6 +98,10 @@ pub enum Cmd {
     SyncFolders,
     DownloadFfmpeg,
     CheckForUpdates,
+    PinToQuickAccess,
+    SaveLayout,
+    LoadLayout,
+    ManageLayouts,
 }
 
 impl Cmd {
@@ -193,6 +197,10 @@ impl Cmd {
         Cmd::SyncFolders,
         Cmd::DownloadFfmpeg,
         Cmd::CheckForUpdates,
+        Cmd::PinToQuickAccess,
+        Cmd::SaveLayout,
+        Cmd::LoadLayout,
+        Cmd::ManageLayouts,
     ];
 
     /// Stable identifier used as the key in `Settings::keybindings`. Never rename one: it's
@@ -290,6 +298,10 @@ impl Cmd {
             Self::SyncFolders => "SyncFolders",
             Self::DownloadFfmpeg => "DownloadFfmpeg",
             Self::CheckForUpdates => "CheckForUpdates",
+            Self::PinToQuickAccess => "PinToQuickAccess",
+            Self::SaveLayout => "SaveLayout",
+            Self::LoadLayout => "LoadLayout",
+            Self::ManageLayouts => "ManageLayouts",
         }
     }
 
@@ -335,7 +347,7 @@ impl Cmd {
             ThumbsBigger => "Larger thumbnails",
             ThumbsSmaller => "Smaller thumbnails",
             CommandPalette => "Command palette",
-            BookmarkFolder => "Bookmark this folder",
+            BookmarkFolder => "Pin this folder to Quick access",
             ShowJobs => "Show operations",
             Settings => "Settings",
             Search => "Search index…",
@@ -387,6 +399,10 @@ impl Cmd {
             SyncFolders => "Sync folders…",
             DownloadFfmpeg => "Download FFmpeg (video tools)…",
             CheckForUpdates => "Check for updates",
+            PinToQuickAccess => "Pin to Quick access",
+            SaveLayout => "Save layout…",
+            LoadLayout => "Load layout…",
+            ManageLayouts => "Manage layouts…",
         }
     }
 
