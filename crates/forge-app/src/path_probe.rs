@@ -157,10 +157,10 @@ impl Batch {
     ) -> Self {
         let mut state = HashMap::new();
         for (path, network) in paths {
-            if !state.contains_key(&path) {
+            state.entry(path).or_insert_with_key(|path| {
                 client.submit(path.clone(), network);
-                state.insert(path, State::Queued);
-            }
+                State::Queued
+            });
         }
         Self {
             client,
@@ -176,10 +176,10 @@ impl Batch {
                 Event::Started(path) => (path, State::Running),
                 Event::Done(path, found) => (path, State::Done(found)),
             };
-            if let Some(state) = self.state.get_mut(&path) {
-                if !matches!(state, State::Done(_)) {
-                    *state = next;
-                }
+            if let Some(state) = self.state.get_mut(&path)
+                && !matches!(state, State::Done(_))
+            {
+                *state = next;
             }
         }
         self.state.values().all(|s| matches!(s, State::Done(_))) || now >= self.deadline
