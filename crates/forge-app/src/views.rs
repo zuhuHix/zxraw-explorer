@@ -691,10 +691,14 @@ fn remember_cursor_accessible_focus(ui: &Ui, view_id: egui::Id, response: &egui:
 }
 
 fn view_owns_focus(ui: &Ui, view_id: egui::Id) -> bool {
-    let focus = ui.memory(|memory| memory.focused());
-    let owner = ui
-        .ctx()
-        .data(|data| data.get_temp::<egui::Id>(view_id.with("cursor-accessible-focus")));
+    list_has_focus(ui.ctx(), view_id)
+}
+
+/// Whether a row or tile of the file list `view_id` has keyboard focus (its key handler then
+/// takes the keys; see `ZxrawApp::handle_keys`).
+pub fn list_has_focus(ctx: &egui::Context, view_id: egui::Id) -> bool {
+    let focus = ctx.memory(|memory| memory.focused());
+    let owner = ctx.data(|data| data.get_temp::<egui::Id>(view_id.with("cursor-accessible-focus")));
     focus.is_some() && focus == owner
 }
 
@@ -862,6 +866,25 @@ fn handle_focused_view_keys(
             .collect::<String>();
         (modifiers, keys, text)
     });
+    if !modifiers.alt
+        && keys.iter().any(|key| {
+            matches!(
+                key,
+                egui::Key::ArrowUp
+                    | egui::Key::ArrowDown
+                    | egui::Key::ArrowLeft
+                    | egui::Key::ArrowRight
+                    | egui::Key::PageUp
+                    | egui::Key::PageDown
+                    | egui::Key::Home
+                    | egui::Key::End
+            )
+        })
+    {
+        // The cursor moves and focus follows it; egui must not also move focus out of the
+        // list (at the first row, Up would land on a toolbar button).
+        ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+    }
     if !modifiers.alt {
         for key in keys {
             match key {
@@ -877,15 +900,12 @@ fn handle_focused_view_keys(
                 egui::Key::ArrowLeft if columns > 1 => {
                     pane.move_cursor(-1, modifiers.shift, modifiers.command)
                 }
-                // Details view: Right/Left open and close folders in place. egui would also
-                // move keyboard focus out of the list with a bare arrow; cancel that.
+                // Details view: Right/Left open and close folders in place.
                 egui::Key::ArrowRight if !modifiers.shift && !modifiers.command => {
                     pane.tree_right();
-                    ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
                 }
                 egui::Key::ArrowLeft if !modifiers.shift && !modifiers.command => {
                     pane.tree_left();
-                    ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
                 }
                 egui::Key::PageDown => pane.move_cursor(20, modifiers.shift, modifiers.command),
                 egui::Key::PageUp => pane.move_cursor(-20, modifiers.shift, modifiers.command),
@@ -1863,6 +1883,7 @@ pub fn grid(
         let response = ui
             .selectable_label(pane.similar.enabled(), "Group bursts & similar")
             .on_hover_text("Group images within 2 seconds or with a dHash distance of 6 or less.");
+        crate::testhook::note_control_rect(ui, "group-similar", response.rect);
         if response.clicked() {
             pane.similar.toggle();
         }

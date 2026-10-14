@@ -586,7 +586,19 @@ impl ZxrawApp {
         {
             return;
         }
-        let text_focus = ctx.memory(|m| m.focused().is_some());
+        // Who has keyboard focus decides who gets the keys:
+        // - a text field (filter, address, a prompt): it does, apart from a few safe commands;
+        // - a row or tile of a file list: that view's own key handler (`views.rs`);
+        // - any other widget (a toolbar or sidebar button that was clicked) or nothing: the
+        //   file list. A clicked button keeps egui focus, and egui would otherwise move that
+        //   focus between buttons with the arrow keys instead of moving the file cursor.
+        let focused = ctx.memory(|m| m.focused());
+        let list_focus = [false, true]
+            .into_iter()
+            .any(|right| views::list_has_focus(ctx, egui::Id::new(("pane", self.active, right))));
+        let text_focus = ctx.text_edit_focused() || list_focus;
+        // A focused button still answers Tab, Enter and Space itself (keyboard access).
+        let widget_focus = focused.is_some() && !text_focus;
         let mut cmds = Vec::new();
         let overrides = &self.settings.keybindings;
         ctx.input_mut(|i| {
@@ -595,6 +607,9 @@ impl ZxrawApp {
                     // While typing, keys belong to the text field: only commands that cannot
                     // touch files or the selection are allowed through.
                     if text_focus && !allowed_while_typing(c) {
+                        continue;
+                    }
+                    if widget_focus && is_widget_key(&sc) {
                         continue;
                     }
                     if consume_exact(i, &sc) {
@@ -636,7 +651,7 @@ impl ZxrawApp {
         } else {
             1
         };
-        let (m, keys, text) = ctx.input(|i| {
+        let (m, keys, text) = ctx.input_mut(|i| {
             let keys: Vec<Key> = [
                 Key::ArrowUp,
                 Key::ArrowDown,
@@ -652,8 +667,14 @@ impl ZxrawApp {
                 Key::Escape,
             ]
             .into_iter()
+            .filter(|k| !(widget_focus && matches!(k, Key::Enter | Key::Space)))
             .filter(|k| i.key_pressed(*k))
             .collect();
+            // Taken here, so no widget acts on the same press.
+            let modifiers = i.modifiers;
+            for k in &keys {
+                i.consume_key(modifiers, *k);
+            }
             let text: String = i
                 .events
                 .iter()
@@ -666,6 +687,16 @@ impl ZxrawApp {
         });
         if m.alt {
             return;
+        }
+        if keys.iter().any(|k| is_navigation_key(*k)) {
+            // The file cursor moves; egui must not also move focus to a neighbouring widget,
+            // and a clicked button gives focus back so the list's rows can take it.
+            ctx.memory_mut(|mem| {
+                mem.move_focus(egui::FocusDirection::None);
+                if let Some(id) = focused.filter(|_| widget_focus) {
+                    mem.surrender_focus(id);
+                }
+            });
         }
         let page = 20;
         for k in keys {
@@ -1223,6 +1254,28 @@ impl ZxrawApp {
 /// Commands that stay active while a text field has keyboard focus. Everything else
 /// (ratings, delete, copy/paste of files, selection) would act on the file list behind the
 /// field the user is typing in.
+/// Keys that move the file cursor.
+fn is_navigation_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::ArrowUp
+            | Key::ArrowDown
+            | Key::ArrowLeft
+            | Key::ArrowRight
+            | Key::PageUp
+            | Key::PageDown
+            | Key::Home
+            | Key::End
+    )
+}
+
+/// A shortcut a focused button handles itself: Tab and Shift+Tab move focus, Enter and Space
+/// press the button.
+fn is_widget_key(sc: &egui::KeyboardShortcut) -> bool {
+    let plain = sc.modifiers.is_none() || sc.modifiers == egui::Modifiers::SHIFT;
+    plain && matches!(sc.logical_key, Key::Tab | Key::Enter | Key::Space)
+}
+
 fn allowed_while_typing(c: Cmd) -> bool {
     matches!(
         c,

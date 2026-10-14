@@ -19,6 +19,9 @@
 //! - `click-arrow <name>`: real pointer click on a folder's disclosure arrow (details view).
 //!   Waits until the arrow is on screen.
 //! - `assert-no-dialog`: no dialog (prompt, confirmation, report) is open.
+//! - `click-control <name>`: real pointer click on a named control (`group-similar`: the grid's
+//!   "Group bursts & similar" toggle). Waits until it is on screen.
+//! - `assert-grouping on|off`: whether burst grouping is on in the focused pane.
 //! - `assert-cursor <name>`: the focused pane's cursor is on this entry.
 //! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
 //! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
@@ -201,6 +204,35 @@ pub(super) fn step(
                 .downcast_ref::<egui::Pos2>()
                 .unwrap();
             super::pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
+        }
+        "click-control" => {
+            if st.data.is_none() {
+                let name = args.trim();
+                let Some(rect) = super::drawn_rect(ctx, super::control_rect_id(name)) else {
+                    return Ok(Flow::Wait(format!("the control `{name}` is not on screen")));
+                };
+                st.data = Some(Box::new(rect.center()));
+            }
+            let pos = *st
+                .data
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<egui::Pos2>()
+                .unwrap();
+            super::pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
+        }
+        "assert-grouping" => {
+            let expected = match args.trim() {
+                "on" => true,
+                "off" => false,
+                _ => return Err("expected `on` or `off`".into()),
+            };
+            let on = app.pane().similar.enabled();
+            if on == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("grouping is {}", if on { "on" } else { "off" }))
+            }
         }
         "assert-cursor" => {
             let name = args.trim();

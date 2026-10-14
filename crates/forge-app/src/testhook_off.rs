@@ -32,6 +32,9 @@ pub fn tick(_app: &mut crate::app::ZxrawApp, _ctx: &egui::Context) {}
 pub(crate) fn note_entry_rect(_ui: &egui::Ui, _path: &std::path::Path, _rect: egui::Rect) {}
 
 #[inline(always)]
+pub(crate) fn note_control_rect(_ui: &egui::Ui, _name: &str, _rect: egui::Rect) {}
+
+#[inline(always)]
 pub(crate) fn note_arrow_rect(_ui: &egui::Ui, _path: &std::path::Path, _rect: egui::Rect) {}
 
 #[inline(always)]

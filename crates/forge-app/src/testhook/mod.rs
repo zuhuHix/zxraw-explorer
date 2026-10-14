@@ -1094,6 +1094,15 @@ pub(crate) fn note_arrow_rect(ui: &egui::Ui, path: &Path, rect: egui::Rect) {
     note_rect(ui, arrow_rect_id(path), rect);
 }
 
+/// Records where a named control (a toggle or button) was drawn, for `ui browser click-control`.
+pub(crate) fn note_control_rect(ui: &egui::Ui, name: &str, rect: egui::Rect) {
+    note_rect(ui, control_rect_id(name), rect);
+}
+
+fn control_rect_id(name: &str) -> egui::Id {
+    egui::Id::new(("testhook-control-rect", name))
+}
+
 fn arrow_rect_id(path: &Path) -> egui::Id {
     egui::Id::new(("testhook-arrow-rect", path))
 }

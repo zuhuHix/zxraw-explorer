@@ -94,6 +94,11 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   click, Right/Left, select-all across levels, filter, Recycle a nested file, double-click a
   nested folder, expanded state remembered after navigating back, a file created outside the app
   in a nested open folder appears).
+* ✅ Arrow keys, Page Up/Down, Home and End always move the file cursor unless a text field has
+  focus, including after a toolbar or sidebar button was clicked, at the edges of the grid and
+  the first row of the list, and with the preview panel open; egui no longer moves focus between
+  buttons with them. A focused button still answers Tab, Enter and Space — e2e
+  `arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked`.
 * ✅ Folder auto-refresh on new files — `forge-app/src/watcher.rs::detects_new_file_after_debounce`
   (watcher wired in `main.rs` and `actions.rs`). The rendered list refresh is not driven by a test.
 
