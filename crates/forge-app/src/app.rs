@@ -267,25 +267,18 @@ impl ZxrawApp {
         Self::home()
     }
 
-    fn new_pane(&self, path: PathBuf, view: ViewMode) -> Pane {
+    pub(crate) fn new_pane(&self, path: PathBuf, view: ViewMode) -> Pane {
         let mut p = Pane::new(path, self.settings.default_sort, view);
         p.show_hidden = self.settings.show_hidden;
         p.show_system = self.settings.show_system;
         p
     }
 
-    /// Builds a tab from a saved session or layout. Folders that no longer exist (or are
-    /// offline) open `fallback` instead and are returned as missing.
-    pub(crate) fn tab_from_session(&self, t: &TabSession, fallback: &Path) -> (Tab, Vec<PathBuf>) {
-        let mut missing = Vec::new();
-        let mut pane = |path: &PathBuf, view: ViewMode, sort: Option<forge_core::listing::SortSpec>| {
-            let path = if path.is_dir() {
-                path.clone()
-            } else {
-                missing.push(path.clone());
-                fallback.to_path_buf()
-            };
-            let mut p = self.new_pane(path, view);
+    /// Builds a tab from a saved session or layout. Never touches the disk: listings load in
+    /// the background, and the caller checks which folders still exist (see `layouts`).
+    pub(crate) fn tab_from_session(&self, t: &TabSession) -> Tab {
+        let pane = |path: &PathBuf, view: ViewMode, sort: Option<forge_core::listing::SortSpec>| {
+            let mut p = self.new_pane(path.clone(), view);
             if let Some(sort) = sort {
                 p.sort = sort;
             }
@@ -295,19 +288,18 @@ impl ZxrawApp {
         let right = t.right.as_ref().map(|r| {
             pane(r, t.right_view.unwrap_or(t.view), t.right_sort.or(t.sort))
         });
-        let tab = Tab {
+        Tab {
             left,
             right,
             focus: Side::Left,
-        };
-        (tab, missing)
+        }
     }
 
     fn restore_session(&mut self, s: Session) {
-        // Restore folders that still exist; fall back to home for vanished/offline ones.
-        let home = self.start_folder();
+        // The tabs open at once; folders that have vanished or are offline are switched to the
+        // start folder when the background check answers (see `layouts::tick`).
         for t in &s.tabs {
-            let (tab, _) = self.tab_from_session(t, &home);
+            let tab = self.tab_from_session(t);
             self.tabs.push(tab);
         }
         if self.tabs.is_empty() {
@@ -321,6 +313,7 @@ impl ZxrawApp {
         } else {
             self.show_sidebar = s.show_sidebar;
             self.show_preview = s.show_preview;
+            crate::layouts::check_restored(self);
         }
         self.active = s.active_tab.min(self.tabs.len() - 1);
     }
@@ -331,6 +324,7 @@ impl ZxrawApp {
                 .tabs
                 .iter()
                 .map(|t| TabSession {
+                    extra: Default::default(),
                     left: t.left.path.clone(),
                     right: t.right.as_ref().map(|r| r.path.clone()),
                     view: t.left.view,
@@ -996,6 +990,7 @@ impl eframe::App for ZxrawApp {
         }
         changed |= crate::actions::poll(self);
         crate::updater::tick(self);
+        crate::layouts::tick(self, ctx);
         if !self.pane().is_loading()
             && let Some(photo) = self.launch_photo.take()
         {

@@ -20,8 +20,8 @@
 //! Saved layouts:
 //! - `layouts [name, name…]`: fail unless the saved layouts have exactly these names, in order.
 //!   With no arguments it checks that there are none.
-//! - `load-layout <name>`: open the layout as "Load layout" does; fails if there is no such
-//!   layout (a layout whose folders are missing is reported by its toast instead).
+//! - `load-layout <name>`: open the layout as "Load layout" does and wait until its folder
+//!   checks have answered; fails if there is no such layout (a layout whose folders are missing is reported by its toast instead).
 //!
 //! Focused tab checks:
 //! - `assert-split on|off`: whether the active tab shows two panes.
@@ -163,10 +163,17 @@ pub(super) fn step(
         }
         "load-layout" => {
             let name = one(args)?;
-            if crate::layouts::load_by_name(app, name) {
-                Ok(Flow::Done)
+            // The layout opens once its folder checks answer; wait for that.
+            if st.phase == 0 {
+                if !crate::layouts::load_by_name(app, name) {
+                    return Err(format!("no saved layout named `{name}`"));
+                }
+                st.phase = 1;
+            }
+            if crate::layouts::is_loading(app) {
+                Ok(Flow::Wait(format!("layout `{name}` is still loading")))
             } else {
-                Err(format!("no saved layout named `{name}`"))
+                Ok(Flow::Done)
             }
         }
         "assert-split" => {
