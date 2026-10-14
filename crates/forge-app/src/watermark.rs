@@ -228,8 +228,9 @@ impl PreparedWatermark {
         })
     }
 
-    /// Renders the mark at its final pixel size for an `img_w` x `img_h` target.
-    fn render(&self, img_w: u32, img_h: u32) -> RgbaImage {
+    /// Renders the mark at its final pixel size for an `img_w` x `img_h` target. Fails
+    /// instead of aborting when the mark's buffers cannot be allocated.
+    fn render(&self, img_w: u32, img_h: u32) -> Result<RgbaImage, String> {
         match &self.mark {
             Mark::Text {
                 font,
@@ -237,63 +238,182 @@ impl PreparedWatermark {
                 ref_w,
                 ref_h,
             } => {
-                let (target_w, _) = mark_size(img_w, img_h, *ref_w, *ref_h, self.size_pct);
+                let (target_w, target_h) = mark_size(img_w, img_h, *ref_w, *ref_h, self.size_pct);
                 let px = REFERENCE_PX * target_w as f32 / *ref_w as f32;
-                text_mark(&rasterize(font, text, px), px)
+                // Coverage (f32) plus the RGBA mark, with room for glyph overhang and shadow.
+                let pad = (px / 10.0).ceil() as u64 + 2;
+                ensure_alloc((u64::from(target_w) + pad) * (u64::from(target_h) + pad) * 8)?;
+                Ok(text_mark(&rasterize(font, text, px), px))
             }
             Mark::Logo(logo) => {
                 let (w, h) = mark_size(img_w, img_h, logo.width(), logo.height(), self.size_pct);
                 if (w, h) == logo.dimensions() {
-                    logo.clone()
+                    ensure_alloc(u64::from(w) * u64::from(h) * 4)?;
+                    Ok(logo.clone())
                 } else {
-                    image::imageops::resize(logo, w, h, FilterType::Lanczos3)
+                    // Lanczos keeps a float copy of the intermediate pass as well.
+                    ensure_alloc(u64::from(w) * u64::from(logo.height().max(h)) * 16)?;
+                    Ok(image::imageops::resize(logo, w, h, FilterType::Lanczos3))
                 }
             }
         }
     }
 
-    /// Stamps the mark onto `image` in place.
+    /// Stamps the mark onto `image` in place. A mark that cannot be rendered is skipped.
     pub fn apply_rgba(&self, image: &mut RgbaImage) {
         let (img_w, img_h) = image.dimensions();
+        let _ = self.blend(&mut **image, img_w, img_h, 4);
+    }
+
+    /// Stamps the mark onto `image`, blending into its own pixel buffer: only the mark's
+    /// rectangle is touched and no full-size copy is made. The pixel format is unchanged
+    /// except for exotic formats, which become 8-bit RGB(A). Fails when memory runs out.
+    pub fn apply(&self, mut image: DynamicImage) -> Result<DynamicImage, String> {
+        let (img_w, img_h) = (image.width(), image.height());
+        match &mut image {
+            DynamicImage::ImageLuma8(buf) => self.blend(&mut **buf, img_w, img_h, 1)?,
+            DynamicImage::ImageLumaA8(buf) => self.blend(&mut **buf, img_w, img_h, 2)?,
+            DynamicImage::ImageRgb8(buf) => self.blend(&mut **buf, img_w, img_h, 3)?,
+            DynamicImage::ImageRgba8(buf) => self.blend(&mut **buf, img_w, img_h, 4)?,
+            DynamicImage::ImageLuma16(buf) => self.blend(&mut **buf, img_w, img_h, 1)?,
+            DynamicImage::ImageLumaA16(buf) => self.blend(&mut **buf, img_w, img_h, 2)?,
+            DynamicImage::ImageRgb16(buf) => self.blend(&mut **buf, img_w, img_h, 3)?,
+            DynamicImage::ImageRgba16(buf) => self.blend(&mut **buf, img_w, img_h, 4)?,
+            DynamicImage::ImageRgb32F(buf) => self.blend(&mut **buf, img_w, img_h, 3)?,
+            DynamicImage::ImageRgba32F(buf) => self.blend(&mut **buf, img_w, img_h, 4)?,
+            _ => {
+                let channels = if image.color().has_alpha() { 4 } else { 3 };
+                ensure_alloc(u64::from(img_w) * u64::from(img_h) * channels)?;
+                let mut converted = if channels == 4 {
+                    DynamicImage::ImageRgba8(image.to_rgba8())
+                } else {
+                    DynamicImage::ImageRgb8(image.to_rgb8())
+                };
+                drop(image);
+                return match &mut converted {
+                    DynamicImage::ImageRgba8(buf) => self
+                        .blend(&mut **buf, img_w, img_h, 4)
+                        .map(|()| converted),
+                    DynamicImage::ImageRgb8(buf) => self
+                        .blend(&mut **buf, img_w, img_h, 3)
+                        .map(|()| converted),
+                    _ => Ok(converted),
+                };
+            }
+        }
+        Ok(image)
+    }
+
+    /// Source-over blend of the mark into a row-major buffer of `channels` channels per
+    /// pixel (1 = grey, 2 = grey + alpha, 3 = RGB, 4 = RGBA).
+    fn blend<T: Channel>(
+        &self,
+        data: &mut [T],
+        img_w: u32,
+        img_h: u32,
+        channels: usize,
+    ) -> Result<(), String> {
         if img_w == 0 || img_h == 0 || self.opacity.is_nan() {
-            return;
+            return Ok(());
         }
         let opacity = self.opacity.clamp(0.0, 1.0);
         if opacity <= 0.0 {
-            return;
+            return Ok(());
         }
-        let mark = self.render(img_w, img_h);
+        let mark = self.render(img_w, img_h)?;
         let (mark_w, mark_h) = mark.dimensions();
         let (x0, y0) = placement(img_w, img_h, mark_w, mark_h, self.anchor, self.margin_pct);
-
+        let has_alpha = channels == 2 || channels == 4;
+        let colour_channels = if channels >= 3 { 3 } else { 1 };
         for my in 0..mark_h {
+            let y = y0 + i64::from(my);
+            if y < 0 || y >= i64::from(img_h) {
+                continue;
+            }
             for mx in 0..mark_w {
-                let (x, y) = (x0 + i64::from(mx), y0 + i64::from(my));
-                if x < 0 || y < 0 || x >= i64::from(img_w) || y >= i64::from(img_h) {
+                let x = x0 + i64::from(mx);
+                if x < 0 || x >= i64::from(img_w) {
                     continue;
                 }
                 let src = mark.get_pixel(mx, my);
                 let alpha = f32::from(src[3]) / 255.0 * opacity;
-                over(
-                    image.get_pixel_mut(x as u32, y as u32),
-                    [src[0], src[1], src[2]],
-                    alpha,
-                );
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let start = (y as usize * img_w as usize + x as usize) * channels;
+                let Some(pixel) = data.get_mut(start..start + channels) else {
+                    continue;
+                };
+                let colour = [src[0], src[1], src[2]].map(|c| f32::from(c) / 255.0);
+                let source: [f32; 3] = if colour_channels == 1 {
+                    let grey = 0.2126 * colour[0] + 0.7152 * colour[1] + 0.0722 * colour[2];
+                    [grey; 3]
+                } else {
+                    colour
+                };
+                let dst_alpha = if has_alpha {
+                    pixel[channels - 1].to_unit()
+                } else {
+                    1.0
+                };
+                let out_alpha = alpha + dst_alpha * (1.0 - alpha);
+                if out_alpha <= 0.0 {
+                    continue;
+                }
+                for (channel, s) in pixel[..colour_channels].iter_mut().zip(source) {
+                    let d = channel.to_unit();
+                    *channel = T::from_unit((s * alpha + d * dst_alpha * (1.0 - alpha)) / out_alpha);
+                }
+                if has_alpha {
+                    pixel[channels - 1] = T::from_unit(out_alpha);
+                }
             }
         }
+        Ok(())
     }
+}
 
-    /// Stamps the mark onto `image`. An image without alpha stays without alpha.
-    pub fn apply(&self, image: DynamicImage) -> DynamicImage {
-        let has_alpha = image.color().has_alpha();
-        let mut rgba = image.to_rgba8();
-        self.apply_rgba(&mut rgba);
-        if has_alpha {
-            DynamicImage::ImageRgba8(rgba)
-        } else {
-            DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba).into_rgb8())
-        }
+/// A pixel channel the mark can be blended into, as a 0.0–1.0 value.
+trait Channel: Copy {
+    fn to_unit(self) -> f32;
+    fn from_unit(value: f32) -> Self;
+}
+
+impl Channel for u8 {
+    fn to_unit(self) -> f32 {
+        f32::from(self) / 255.0
     }
+    fn from_unit(value: f32) -> Self {
+        (value * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+}
+
+impl Channel for u16 {
+    fn to_unit(self) -> f32 {
+        f32::from(self) / 65535.0
+    }
+    fn from_unit(value: f32) -> Self {
+        (value * 65535.0).round().clamp(0.0, 65535.0) as u16
+    }
+}
+
+impl Channel for f32 {
+    fn to_unit(self) -> f32 {
+        self
+    }
+    fn from_unit(value: f32) -> Self {
+        value
+    }
+}
+
+/// Checks that `bytes` can be allocated right now, so a huge mark fails for one file
+/// instead of aborting the process.
+fn ensure_alloc(bytes: u64) -> Result<(), String> {
+    let mut probe: Vec<u8> = Vec::new();
+    usize::try_from(bytes)
+        .ok()
+        .and_then(|bytes| probe.try_reserve_exact(bytes).ok())
+        .ok_or_else(|| "not enough memory for the watermark".to_string())
 }
 
 /// Source-over blend of a straight-alpha colour onto a straight-alpha pixel.
@@ -494,7 +614,7 @@ mod tests {
             .expect("prepare");
 
         // 20% of 200 = 40px logo at BottomRight with a 3px margin: rect x 157..197, y 57..97.
-        let out = prepared.apply(solid_rgb(200, 100));
+        let out = prepared.apply(solid_rgb(200, 100)).unwrap();
         let out = match out {
             DynamicImage::ImageRgb8(img) => img,
             other => panic!("expected RGB output, got {:?}", other.color()),
@@ -504,6 +624,43 @@ mod tests {
         assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0], "outside the mark");
         assert_eq!(out.get_pixel(156, 60).0, [0, 0, 0], "just left of the mark");
         assert_eq!(out.get_pixel(170, 97).0, [0, 0, 0], "just below the mark");
+    }
+
+    #[test]
+    fn deep_grey_and_alpha_images_keep_their_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_logo(dir.path());
+        let prepared = PreparedWatermark::prepare(&logo_watermark(path, Anchor::BottomRight, 1.0))
+            .expect("prepare");
+
+        let rgb16 = image::ImageBuffer::from_pixel(200, 100, image::Rgb([0u16, 0, 0]));
+        match prepared.apply(DynamicImage::ImageRgb16(rgb16)).unwrap() {
+            DynamicImage::ImageRgb16(img) => {
+                assert_eq!(img.get_pixel(160, 60).0, [65535, 0, 0]);
+                assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0]);
+            }
+            other => panic!("expected RGB16, got {:?}", other.color()),
+        }
+
+        let grey = image::GrayImage::from_pixel(200, 100, image::Luma([0]));
+        match prepared.apply(DynamicImage::ImageLuma8(grey)).unwrap() {
+            // Pure red as grey (Rec. 709 luma).
+            DynamicImage::ImageLuma8(img) => {
+                assert_eq!(img.get_pixel(160, 60).0, [54]);
+                assert_eq!(img.get_pixel(190, 60).0, [0]);
+            }
+            other => panic!("expected Luma8, got {:?}", other.color()),
+        }
+
+        // A fully transparent pixel under the opaque mark becomes the mark colour, opaque.
+        let clear = RgbaImage::from_pixel(200, 100, Rgba([0, 0, 0, 0]));
+        match prepared.apply(DynamicImage::ImageRgba8(clear)).unwrap() {
+            DynamicImage::ImageRgba8(img) => {
+                assert_eq!(img.get_pixel(160, 60).0, [255, 0, 0, 255]);
+                assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 0]);
+            }
+            other => panic!("expected RGBA8, got {:?}", other.color()),
+        }
     }
 
     #[test]
@@ -546,7 +703,7 @@ mod tests {
                 return;
             }
         };
-        let out = prepared.apply(solid_rgb(400, 200)).into_rgb8();
+        let out = prepared.apply(solid_rgb(400, 200)).unwrap().into_rgb8();
         let mut changed = 0;
         for (x, y, px) in out.enumerate_pixels() {
             if px.0 != [0, 0, 0] {

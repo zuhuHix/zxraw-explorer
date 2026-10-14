@@ -275,6 +275,85 @@ mod tests {
         assert!(exif_for_export(&path, MetadataPolicy::Clean).is_none());
     }
 
+    /// A big-endian EXIF block laid out the way cameras write it, assembled by hand: IFD0
+    /// holds Make and the pointers to an Exif sub-IFD (ExposureTime, FNumber) and a GPS
+    /// sub-IFD (GPSLatitudeRef, GPSLatitude).
+    fn camera_style_exif() -> Vec<u8> {
+        fn entry(out: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: [u8; 4]) {
+            out.extend(tag.to_be_bytes());
+            out.extend(kind.to_be_bytes());
+            out.extend(count.to_be_bytes());
+            out.extend(value);
+        }
+        fn rational(out: &mut Vec<u8>, num: u32, denom: u32) {
+            out.extend(num.to_be_bytes());
+            out.extend(denom.to_be_bytes());
+        }
+        const ASCII: u16 = 2;
+        const LONG: u16 = 4;
+        const RATIONAL: u16 = 5;
+        // Offsets: IFD0 at 8 (42 bytes) + "TestCam\0" = 58; Exif IFD at 58 (30 bytes) + two
+        // rationals = 104; GPS IFD at 104 (30 bytes) + three rationals = 158.
+        let (make_at, exif_at, exposure_at, fnumber_at) = (50u32, 58u32, 88u32, 96u32);
+        let (gps_at, latitude_at) = (104u32, 134u32);
+
+        let mut out = b"MM\0\x2a".to_vec();
+        out.extend(8u32.to_be_bytes());
+        out.extend(3u16.to_be_bytes());
+        entry(&mut out, 0x010f, ASCII, 8, make_at.to_be_bytes());
+        entry(&mut out, 0x8769, LONG, 1, exif_at.to_be_bytes());
+        entry(&mut out, 0x8825, LONG, 1, gps_at.to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.extend(b"TestCam\0");
+        assert_eq!(out.len(), exif_at as usize);
+
+        out.extend(2u16.to_be_bytes());
+        entry(&mut out, 0x829a, RATIONAL, 1, exposure_at.to_be_bytes());
+        entry(&mut out, 0x829d, RATIONAL, 1, fnumber_at.to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        rational(&mut out, 1, 125);
+        rational(&mut out, 28, 10);
+        assert_eq!(out.len(), gps_at as usize);
+
+        out.extend(2u16.to_be_bytes());
+        entry(&mut out, 0x0001, ASCII, 2, *b"N\0\0\0");
+        entry(&mut out, 0x0002, RATIONAL, 3, latitude_at.to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        rational(&mut out, 48, 1);
+        rational(&mut out, 51, 1);
+        rational(&mut out, 30, 1);
+        out
+    }
+
+    #[test]
+    fn sub_ifd_fields_of_a_real_jpeg_follow_the_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("camera.jpg");
+        write_jpeg(&src, Some(camera_style_exif()));
+
+        // kamadak reports Exif and GPS sub-IFD fields of the main image as `In::PRIMARY`
+        // (`ifd_num` is the image index), which is what `keep` relies on.
+        let source = Reader::new()
+            .read_from_container(&mut BufReader::new(File::open(&src).unwrap()))
+            .unwrap();
+        for tag in [Tag::ExposureTime, Tag::FNumber, Tag::GPSLatitude] {
+            assert_eq!(source.fields().find(|f| f.tag == tag).unwrap().ifd_num, In::PRIMARY);
+        }
+
+        let all = read_back(exif_for_export(&src, MetadataPolicy::All).unwrap());
+        assert!(all.get_field(Tag::GPSLatitude, In::PRIMARY).is_some());
+        assert!(all.get_field(Tag::GPSLatitudeRef, In::PRIMARY).is_some());
+        assert!(all.get_field(Tag::ExposureTime, In::PRIMARY).is_some());
+        assert!(all.get_field(Tag::FNumber, In::PRIMARY).is_some());
+        assert_eq!(ascii_of(&all, Tag::Make).unwrap(), b"TestCam");
+
+        let clean = read_back(exif_for_export(&src, MetadataPolicy::Clean).unwrap());
+        assert!(!has_gps(&clean));
+        assert!(clean.get_field(Tag::ExposureTime, In::PRIMARY).is_some());
+        assert!(clean.get_field(Tag::FNumber, In::PRIMARY).is_some());
+        assert_eq!(ascii_of(&clean, Tag::Make).unwrap(), b"TestCam");
+    }
+
     #[test]
     fn clean_bytes_survive_the_jpeg_encoder() {
         let dir = tempfile::tempdir().unwrap();
