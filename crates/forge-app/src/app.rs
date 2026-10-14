@@ -862,7 +862,9 @@ impl ZxrawApp {
                     self.pane_mut().set_filter(filter);
                 }
                 if fr.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
-                    self.pane_mut().set_filter(String::new());
+                    // Same order as Esc in the list: the filter, then sticky selection, then
+                    // the selection. The field gives up focus either way.
+                    self.pane_mut().escape();
                     fr.surrender_focus();
                 }
                 // Address / breadcrumb takes the rest.

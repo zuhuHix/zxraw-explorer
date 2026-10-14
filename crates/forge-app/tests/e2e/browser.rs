@@ -375,7 +375,10 @@ fn sticky_selection_toggles_items_with_plain_clicks() {
          click-entry b.txt\nassert-selection b.txt\n\
          # The command toggles it too.\n\
          cmd ToggleStickySelection\nclick-entry a.txt\nassert-selection a.txt, b.txt\n\
-         cmd ToggleStickySelection\nui browser assert-sticky off\nexit\n",
+         cmd ToggleStickySelection\nui browser assert-sticky off\n\
+         # Esc in the empty filter box ends sticky selection too, keeping the picks.\n\
+         cmd ToggleStickySelection\ncmd FocusFilter\nwait-frames 2\nkey Escape\n\
+         ui browser assert-sticky off\nassert-selection a.txt, b.txt\nexit\n",
         work = shown(&work),
         shot = shown(&shot),
     );

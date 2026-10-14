@@ -1070,8 +1070,9 @@ impl Pane {
     }
 
     /// Change the tree's shape, then rebuild the rows. `change` may remove entries, which
-    /// invalidates row indices, so the cursor and anchor are carried over by path (to the
-    /// nearest listed folder above them when their item is gone).
+    /// invalidates row indices, so the cursor and anchor are carried over by path. When its
+    /// item is gone, the cursor moves to the nearest listed folder above it and the anchor
+    /// is cleared.
     fn reshape(&mut self, change: impl FnOnce(&mut Self)) {
         let path_at = |pane: &Self, vis: Option<usize>| {
             vis.and_then(|v| pane.entry_at(v)).map(|e| e.path.clone())
@@ -1088,7 +1089,9 @@ impl Pane {
             self.rebuild_visible();
         }
         self.cursor = cursor.and_then(|p| self.row_of_nearest(&p));
-        self.anchor = anchor.and_then(|p| self.row_of_nearest(&p));
+        // Only the cursor falls back to a parent folder: an anchor moved there would make a
+        // later Shift-click select the folder (and a Delete take all of it).
+        self.anchor = anchor.and_then(|p| self.row_of(&p));
     }
 
     /// Row of `path`, or of its nearest listed parent folder.
@@ -1412,6 +1415,34 @@ mod tests {
         pane.escape();
         assert_eq!(visible_names(&pane).len(), 2);
         assert_eq!(pane.cursor, Some(0), "the cursor is set again, on the first item");
+    }
+
+    #[test]
+    fn showing_hidden_files_keeps_the_cursor_and_anchor_on_their_items() {
+        let (_folder, mut pane) = listed(&["a-hidden.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        pane.entries[0].hidden = true;
+        pane.rebuild_visible();
+        assert_eq!(visible_names(&pane), ["b.jpg", "c.jpg", "d.jpg"]);
+        pane.click(1, false, false); // anchor on c.jpg
+        pane.cursor = Some(2); // cursor on d.jpg
+
+        // The hidden file sorts before both, so every row index shifts by one.
+        pane.show_hidden = true;
+        pane.rebuild_visible();
+        assert_eq!(visible_names(&pane), ["a-hidden.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("d.jpg"));
+        assert_eq!(pane.entry_at(pane.anchor.unwrap()).map(|e| e.name.as_str()), Some("c.jpg"));
+
+        pane.show_hidden = false;
+        pane.rebuild_visible();
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("d.jpg"));
+        assert_eq!(pane.entry_at(pane.anchor.unwrap()).map(|e| e.name.as_str()), Some("c.jpg"));
+
+        // Sorting the other way moves the rows too.
+        pane.set_sort(SortKey::Name);
+        assert_eq!(visible_names(&pane), ["d.jpg", "c.jpg", "b.jpg"]);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("d.jpg"));
+        assert_eq!(pane.entry_at(pane.anchor.unwrap()).map(|e| e.name.as_str()), Some("c.jpg"));
     }
 
     #[test]
@@ -1833,6 +1864,25 @@ mod tests {
         // Its item filtered out: the anchor is dropped instead of pointing at another row.
         pane.set_filter("a1".into());
         assert_eq!(pane.anchor, None);
+    }
+
+    #[test]
+    fn collapsing_a_folder_clears_an_anchor_inside_it_but_moves_the_cursor_up() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "a1.txt"), false, false);
+
+        pane.set_expanded(&a, false);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+        assert_eq!(pane.anchor, None, "the anchor is not moved to the folder");
+
+        // A Shift-click now selects from the clicked row only, never the folder.
+        pane.click(row_of(&pane, "b.txt"), false, true);
+        let picked: Vec<&str> = pane.selected_entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(picked, ["b.txt"]);
     }
 
     #[test]
