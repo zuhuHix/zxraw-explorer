@@ -195,6 +195,13 @@ given its own shortcut.
   edge or a box (never enlarged), pick the JPEG quality and name the files with a template such
   as `{name}_{n:3}`. RAW files are exported from their embedded preview. Existing files are never
   overwritten.
+- **Deliver to client.** <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>E</kbd>, or *Deliver to client…* and
+  *Deliver with ▸* in the file menu, opens the export with a saved preset such as "Client web
+  (2048px JPEG 85, watermark, zip)". Presets hold the format, size, naming, a text or PNG
+  watermark (position, size, opacity, with a live preview), "only picks" or "rating ≥ N", and
+  whether to write loose files or one `.zip`. By default GPS, serial numbers and other private
+  data are stripped while the camera details and copyright are kept. Three presets are built in;
+  you can save, duplicate, rename and delete your own.
 - **Edit metadata.** Set the title, caption, creator, copyright and keywords on many files at
   once, with a before/after preview. Changes go to XMP sidecars; your originals are not touched.
 - **Sync folders.** Compare two folders and preview exactly what will be copied before anything

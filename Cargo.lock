@@ -1406,6 +1406,7 @@ dependencies = [
  "forge-media",
  "forge-win",
  "image",
+ "kamadak-exif",
  "lru",
  "notify",
  "parking_lot",

@@ -112,6 +112,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   the template, sanitising, fit maths, in-batch de-duplication, a real resize-to-JPEG export with
   a failing file, PNG/WebP output, and that an existing destination is never overwritten. The
   window itself is not automated.
+* 🟡 Delivery presets ("Deliver to client") — `forge-app/src/delivery_presets.rs`,
+  `watermark.rs`, `delivery_meta.rs`, driven through `batch_export.rs`: named presets in
+  `delivery_presets.json` (three built-ins; save, save as new, duplicate, rename, delete, restore
+  built-ins), text or PNG watermark with nine anchors, size, opacity and margin plus a live
+  preview, "only picks" / "rating ≥ N" filtering from library annotations, loose files or one zip
+  written under a temporary name and renamed, and EXIF policy (none / clean: no GPS, serials,
+  owner or maker notes but copyright kept / all). `Cmd::Deliver` (Ctrl+Shift+E) uses the
+  last-used preset; the file context menu has *Deliver with ▸ preset*. Unit tests cover the
+  preset round-trip and editing, watermark placement and blending, the zip output (including
+  cancel and no-replace), GPS/serial stripping with copyright kept in a real exported JPEG, and
+  the rating/pick filter. The window and the context menu are not automated.
 * 🟡 Batch metadata editor — `forge-app/src/meta_edit.rs` with `forge-media/src/xmp_write.rs`:
   title (`dc:title`), caption (`dc:description`), creator (`dc:creator`), copyright (`dc:rights`)
   and keywords for many files, with a current → new preview. Writes XMP sidecars only; originals

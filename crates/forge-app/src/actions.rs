@@ -471,6 +471,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::SelectOriginals => crate::export_assoc::select_originals(app),
         Cmd::SelectExports => crate::export_assoc::select_exports(app),
         Cmd::BatchExport => crate::batch_export::open(app),
+        Cmd::Deliver => crate::batch_export::deliver(app),
         Cmd::EditMetadata => crate::meta_edit::open(app),
         Cmd::SyncFolders => crate::tools_ui::open_sync(app),
         Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {

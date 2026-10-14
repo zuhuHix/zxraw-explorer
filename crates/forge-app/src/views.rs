@@ -204,6 +204,7 @@ const CONTEXT_FILE: &[Option<Cmd>] = &[
     None,
     Some(Cmd::ChecksumFiles),
     Some(Cmd::CompareImages),
+    Some(Cmd::Deliver),
     Some(Cmd::Properties),
 ];
 
@@ -236,6 +237,10 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], out: &mut Vec<ViewEvent>) {
                     .clicked()
                 {
                     out.push(ViewEvent::Command(*c));
+                    ui.close();
+                }
+                if *c == Cmd::Deliver && crate::batch_export::deliver_menu(ui) {
+                    out.push(ViewEvent::Command(Cmd::Deliver));
                     ui.close();
                 }
             }
