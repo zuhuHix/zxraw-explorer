@@ -480,11 +480,14 @@ pub fn plan_ingest(
                     chosen = Some((cand, status));
                 }
                 Ok(md) if node_kind(&md) == NodeKind::File && md.len() == size => {
+                    // Hashing an online-only source or destination would download it: its
+                    // content is unknown, so it is not a known duplicate.
+                    if !cloud::background_read_allowed(&src)
+                        || !cloud::background_read_allowed(&cand)
+                    {
+                        continue;
+                    }
                     if source_hash.is_none() {
-                        // Hashing an online-only source would download it: not a known duplicate.
-                        if !cloud::background_read_allowed(&src) {
-                            continue;
-                        }
                         match hashing::hash_file(&src, ctx.cancel, Some(ctx.progress)) {
                             Ok(h) => source_hash = Some(h),
                             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -1318,6 +1321,39 @@ mod tests {
                 .iter()
                 .any(|u| u.path.ends_with("IMG_0001.XMP"))
         );
+    }
+
+    #[test]
+    fn online_only_destination_copy_is_not_hashed_or_matched() {
+        let c = card();
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let spec = IngestSpec {
+            folder_template: "{project}".into(),
+            file_template: "{orig_name}".into(),
+            project: "P".into(),
+            write_manifest: false,
+            ..IngestSpec::new(vec![c.card.clone()], c.dest.clone())
+        };
+        let first = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        let r1 = execute_ingest(&first, &ctx).unwrap();
+        assert!(r1.is_complete(), "{r1:?}");
+        let source = c.card.join("DCIM/100CANON/IMG_0001.CR3");
+        let copy = first
+            .items
+            .iter()
+            .find(|i| i.source == source)
+            .unwrap()
+            .dest
+            .clone();
+        // The earlier import's copy is now online-only: its content is unknown.
+        cloud::simulate_online_only(&copy);
+        let plan = plan_ingest(&spec, &NoMetadata, &ctx).unwrap();
+        cloud::clear_simulated_online_only(&copy);
+        let item = plan.items.iter().find(|i| i.source == source).unwrap();
+        assert_ne!(item.status, IngestStatus::AlreadyImported);
+        assert_ne!(item.dest, copy);
+        assert_eq!(plan.count(IngestStatus::AlreadyImported), 2);
     }
 
     #[test]

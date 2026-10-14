@@ -61,7 +61,14 @@ pub enum EntryState {
     TypeMismatch,
     /// Could not be compared (hash failed).
     Error(String),
+    /// Content unknown: a side is an online-only cloud file, and reading it would download it.
+    /// Neither equal nor different; sync leaves it alone.
+    NotCompared(String),
 }
+
+/// Why an online-only entry was not compared or synced (shown in the preview).
+pub const ONLINE_ONLY_NOT_COMPARED: &str =
+    "online-only: content not compared (download it to compare or sync)";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompareEntry {
@@ -205,10 +212,13 @@ fn compare_files(
     if li.size != ri.size {
         return Ok(EntryState::Different(DiffReason::Size));
     }
-    // Online-only placeholders are never read in the background: compare them by size/date.
-    let readable = cloud::background_read_allowed(&left.join(rel))
-        && cloud::background_read_allowed(&right.join(rel));
-    if opts.use_hash && readable {
+    if opts.use_hash {
+        // Online-only placeholders are never read in the background: content stays unknown.
+        if !cloud::background_read_allowed(&left.join(rel))
+            || !cloud::background_read_allowed(&right.join(rel))
+        {
+            return Ok(EntryState::NotCompared(ONLINE_ONLY_NOT_COMPARED.into()));
+        }
         let h = |p: PathBuf| hashing::hash_file(&p, ctx.cancel, Some(ctx.progress));
         return Ok(match (h(left.join(rel)), h(right.join(rel))) {
             (Ok(a), Ok(b)) if a == b => EntryState::Same,
@@ -374,6 +384,8 @@ fn plan_sync_inner(
     right_sides.sort_by(|a, b| a.0.cmp(b.0));
     let two_way = mode == SyncMode::TwoWay;
     let mut bytes = 0;
+    // Copies whose snapshot would have to read an online-only file are left out.
+    let mut online_skipped = Vec::new();
     // `to_left` copies read the right side and write the left side; otherwise the reverse.
     let mut copy = |entry: &CompareEntry,
                     overwrite: bool,
@@ -385,6 +397,13 @@ fn plan_sync_inner(
         } else {
             (left, entry.left, right, entry.right)
         };
+        let dest_overwritten = dest_side.filter(|side| overwrite && side.kind == NodeKind::File);
+        if source_side.is_some_and(|side| online_only(&source_root.join(&entry.rel), side))
+            || dest_overwritten.is_some_and(|side| online_only(&dest_root.join(&entry.rel), side))
+        {
+            online_skipped.push(OpIssue::new(&entry.rel, ONLINE_ONLY_NOT_COMPARED));
+            return;
+        }
         if let Some(source_side) = source_side {
             let source_fingerprint = fingerprint_for_side(
                 &source_root.join(&entry.rel),
@@ -392,7 +411,7 @@ fn plan_sync_inner(
                 Coverage::Sampled,
                 ctx,
             );
-            let dest_side = dest_side.filter(|side| overwrite && side.kind == NodeKind::File);
+            let dest_side = dest_overwritten;
             // An overwritten destination is hashed in full: a sample could miss an edit.
             let dest_fingerprint = dest_side.and_then(|side| {
                 fingerprint_for_side(&dest_root.join(&entry.rel), side, Coverage::Full, ctx)
@@ -449,7 +468,9 @@ fn plan_sync_inner(
         }
         match &e.state {
             EntryState::Same => {}
-            EntryState::Error(msg) => skipped.push(OpIssue::new(rel, msg.clone())),
+            EntryState::Error(msg) | EntryState::NotCompared(msg) => {
+                skipped.push(OpIssue::new(rel, msg.clone()))
+            }
             EntryState::LeftOnly => match lk {
                 Some(NodeKind::Dir) => mkdirs.push(SyncAction::CreateDir {
                     rel: rel.into(),
@@ -477,26 +498,38 @@ fn plan_sync_inner(
                         continue; // removed with its parent
                     }
                     let is_dir = e.right.is_some_and(|i| i.kind == NodeKind::Dir);
+                    let Some(expected) = deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?
+                    else {
+                        // Its local contents are still deleted one by one below.
+                        skipped.push(OpIssue::new(rel, ONLINE_ONLY_NOT_COMPARED));
+                        continue;
+                    };
                     if is_dir {
                         deleted_dirs.insert(rel);
                     }
                     deletes.push(SyncAction::Delete {
                         rel: rel.into(),
                         is_dir,
-                        expected: deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?,
+                        expected,
                     });
                 }
             }
             EntryState::TypeMismatch => {
                 if mirror && matches!(lk, Some(NodeKind::Dir | NodeKind::File)) {
                     let is_dir = e.right.is_some_and(|i| i.kind == NodeKind::Dir);
+                    let Some(expected) = deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?
+                    else {
+                        mismatched_dirs.insert(rel);
+                        skipped.push(OpIssue::new(rel, ONLINE_ONLY_NOT_COMPARED));
+                        continue;
+                    };
                     if is_dir {
                         deleted_dirs.insert(rel);
                     }
                     deletes.push(SyncAction::Delete {
                         rel: rel.into(),
                         is_dir,
-                        expected: deletion_snapshot(&right_sides, right, rel, is_dir, ctx)?,
+                        expected,
                     });
                     if lk == Some(NodeKind::Dir) {
                         mkdirs.push(SyncAction::CreateDir {
@@ -546,6 +579,7 @@ fn plan_sync_inner(
             }
         }
     }
+    skipped.extend(online_skipped);
     let mut actions = deletes;
     actions.extend(mkdirs);
     actions.extend(copies);
@@ -568,6 +602,14 @@ fn check_cancel(ctx: Option<&JobCtx<'_>>) -> Result<()> {
     }
 }
 
+/// A file whose data is not on this PC: snapshotting it for sync would download it. A file
+/// that has since disappeared is not online-only; the snapshot check handles it.
+fn online_only(path: &Path, side: SideInfo) -> bool {
+    side.kind == NodeKind::File
+        && !cloud::background_read_allowed(path)
+        && fs::symlink_metadata(path).is_ok()
+}
+
 fn fingerprint_for_side(
     path: &Path,
     side: SideInfo,
@@ -580,14 +622,15 @@ fn fingerprint_for_side(
 }
 
 /// Snapshot of `rel` and, for a folder, of every right-side descendant. `right_sides` must be
-/// sorted by path (see [`plan_sync_inner`]).
+/// sorted by path (see [`plan_sync_inner`]). `None` when any file in it is online-only:
+/// its content cannot be snapshotted without downloading it.
 fn deletion_snapshot(
     right_sides: &[(&Path, SideInfo)],
     right: &Path,
     rel: &Path,
     is_dir: bool,
     ctx: Option<&JobCtx<'_>>,
-) -> Result<Vec<SyncSnapshot>> {
+) -> Result<Option<Vec<SyncSnapshot>>> {
     let belongs = |path: &Path| {
         if is_dir {
             path.starts_with(rel)
@@ -602,6 +645,9 @@ fn deletion_snapshot(
         .take_while(|&&(path, _)| belongs(path))
     {
         check_cancel(ctx)?;
+        if online_only(&right.join(path), side) {
+            return Ok(None);
+        }
         snapshots.push(SyncSnapshot {
             rel: path.to_path_buf(),
             side: SideInfo {
@@ -613,7 +659,7 @@ fn deletion_snapshot(
             fingerprint: fingerprint_for_side(&right.join(path), side, Coverage::Sampled, ctx),
         });
     }
-    Ok(snapshots)
+    Ok(Some(snapshots))
 }
 
 /// Deleter used for Mirror deletions. The app passes a Recycle Bin implementation from
@@ -1334,7 +1380,78 @@ mod tests {
         cloud::simulate_online_only(l.join("cloud.txt"));
         let cloud_rep = compare_dirs(&l, &r, &opts, &ctx).unwrap();
         cloud::clear_simulated_online_only(&l.join("cloud.txt"));
-        assert_eq!(state(cloud_rep), EntryState::Same);
+        assert_eq!(
+            state(cloud_rep),
+            EntryState::NotCompared(ONLINE_ONLY_NOT_COMPARED.into())
+        );
+    }
+
+    #[test]
+    fn mirror_preview_never_reads_online_only_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (l, r) = (temp.path().join("L"), temp.path().join("R"));
+        fs::create_dir_all(l.join("dir")).unwrap();
+        fs::create_dir_all(r.join("gone")).unwrap();
+        // New on the left, online-only: copying it needs a source snapshot.
+        fs::write(l.join("new-cloud.bin"), b"new").unwrap();
+        fs::write(l.join("new-local.bin"), b"new").unwrap();
+        // Different by date; the right copy, which would be overwritten, is online-only.
+        fs::write(l.join("changed.bin"), b"left").unwrap();
+        fs::write(r.join("changed.bin"), b"rite").unwrap();
+        set_mtime(&l.join("changed.bin"), 1_600_000_000);
+        set_mtime(&r.join("changed.bin"), 1_500_000_000);
+        // Right-only, so Mirror deletes them; one folder holds an online-only file.
+        fs::write(r.join("gone/cloud.bin"), b"x").unwrap();
+        fs::write(r.join("gone/local.bin"), b"x").unwrap();
+        fs::write(r.join("stale-local.bin"), b"x").unwrap();
+        let cloud = [
+            l.join("new-cloud.bin"),
+            r.join("changed.bin"),
+            r.join("gone/cloud.bin"),
+        ];
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let report = compare_dirs(&l, &r, &CompareOptions::default(), &ctx).unwrap();
+        for path in &cloud {
+            cloud::simulate_online_only(path);
+        }
+        let plan = plan_sync_with_ctx(&report, &l, &r, SyncMode::Mirror, &ctx).unwrap();
+        for path in &cloud {
+            cloud::clear_simulated_online_only(path);
+        }
+        let skipped: HashSet<PathBuf> = plan
+            .skipped
+            .iter()
+            .filter(|issue| issue.reason == ONLINE_ONLY_NOT_COMPARED)
+            .map(|issue| issue.path.clone())
+            .collect();
+        // The folder is kept for its online-only file, which is also listed on its own.
+        let expect = [
+            PathBuf::from("new-cloud.bin"),
+            PathBuf::from("changed.bin"),
+            PathBuf::from("gone"),
+            Path::new("gone").join("cloud.bin"),
+        ];
+        assert_eq!(skipped, expect.into_iter().collect::<HashSet<_>>());
+        let planned: Vec<String> = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                SyncAction::Copy { rel, .. } => format!("copy {}", rel.display()),
+                SyncAction::Delete { rel, .. } => format!("delete {}", rel.display()),
+                SyncAction::CreateDir { rel, .. } => format!("mkdir {}", rel.display()),
+            })
+            .collect();
+        for action in ["copy new-local.bin", "delete stale-local.bin"] {
+            assert!(planned.contains(&action.to_string()), "{planned:?}");
+        }
+        // The online-only file keeps its folder; its local neighbour is still removed.
+        let local = Path::new("gone").join("local.bin");
+        let local = format!("delete {}", local.display());
+        assert!(planned.contains(&local), "{planned:?}");
+        let touched = |a: &String| a.contains("cloud") || a.contains("changed");
+        assert!(!planned.iter().any(touched), "{planned:?}");
     }
 
     fn set_mtime(p: &Path, secs: u64) {

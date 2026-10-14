@@ -1817,6 +1817,8 @@ fn still_matches(
     }
     match hash {
         None => size == 0,
+        // An online-only copy cannot be verified without downloading it: not a match.
+        Some(_) if !forge_core::cloud::background_read_allowed(path) => false,
         Some(h) => forge_core::hashing::hash_file(path, cancel, None).is_ok_and(|d| d == h),
     }
 }
@@ -2368,6 +2370,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
     let different =
         report.count(|s| matches!(s, EntryState::Different(_) | EntryState::TypeMismatch));
     let same = report.count(|s| matches!(s, EntryState::Same));
+    let not_compared = report.count(|s| matches!(s, EntryState::NotCompared(_)));
     let errors = report.count(|s| matches!(s, EntryState::Error(_))) + report.errors.len();
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(format!("{} entries", report.entries.len())).strong());
@@ -2375,6 +2378,9 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
         ui.label(format!("{right_only} right-only"));
         ui.label(format!("{different} different"));
         ui.label(format!("{same} same"));
+        if not_compared > 0 {
+            ui.label(format!("{not_compared} online-only, not compared"));
+        }
         if errors > 0 {
             ui.colored_label(ui.visuals().error_fg_color, format!("{errors} errors"));
         }
@@ -2629,7 +2635,9 @@ fn compare_filter_matches(filter: CompareFilter, state: &EntryState) -> bool {
             matches!(state, EntryState::Different(_) | EntryState::TypeMismatch)
         }
         CompareFilter::Same => matches!(state, EntryState::Same),
-        CompareFilter::Errors => matches!(state, EntryState::Error(_)),
+        CompareFilter::Errors => {
+            matches!(state, EntryState::Error(_) | EntryState::NotCompared(_))
+        }
     }
 }
 
@@ -2644,6 +2652,10 @@ fn entry_state_label(state: &EntryState, ui: &egui::Ui) -> (String, Color32) {
         ),
         EntryState::TypeMismatch => ("TYPE MISMATCH".into(), ui.visuals().error_fg_color),
         EntryState::Error(message) => (format!("ERROR · {message}"), ui.visuals().error_fg_color),
+        EntryState::NotCompared(message) => (
+            format!("NOT COMPARED · {message}"),
+            ui.visuals().weak_text_color(),
+        ),
     }
 }
 
@@ -2764,6 +2776,13 @@ mod tests {
         std::fs::write(&c, b"SAME CONTENT").unwrap();
         let (ok, skipped) = verify_recycle(std::slice::from_ref(&check), &cancel);
         assert_eq!(ok, vec![b.clone()]);
+        assert_eq!(skipped.len(), 1);
+
+        // A kept copy that became online-only cannot be verified without downloading it.
+        forge_core::cloud::simulate_online_only(&a);
+        let (ok, skipped) = verify_recycle(std::slice::from_ref(&check), &cancel);
+        forge_core::cloud::clear_simulated_online_only(&a);
+        assert!(ok.is_empty());
         assert_eq!(skipped.len(), 1);
 
         // The kept copy deleted in Explorer: nothing in the group may be removed.

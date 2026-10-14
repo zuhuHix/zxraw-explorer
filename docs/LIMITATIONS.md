@@ -63,8 +63,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   placeholder folder fetches names and sizes from the cloud, not file contents. Skipping them
   would hide whole OneDrive trees.
 * The copy/move download warning walks selected folders only up to an entry and time limit.
-  Past that limit it gives a general warning instead of an exact count. Folder sync in Folder
-  compare still reads online-only files when it compares content.
+  Past that limit it gives a general warning instead of an exact count. That walk runs off the
+  UI thread; a "Checking for online-only files" dialog appears if it takes longer than 150 ms.
+* Folder compare (with content hashing) and its sync preview mark online-only files "not
+  compared" and leave them out of the sync. Download them first to compare or sync them.
 * Background reads check the attributes, then open the file normally. A file that becomes
   online-only between the check and the open is still downloaded. Windows has no documented
   way to open a Cloud Files placeholder for reading without downloading it.

@@ -344,8 +344,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Cloud placeholders are never downloaded by background work. OneDrive, Dropbox and Google
   Drive files that are only online (`RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE` in the
   listing attributes) get a cloud badge instead of a thumbnail. Thumbnails, preview-pane EXIF and
-  text, video durations, library metadata extraction, duplicate and similar-photo scans, folder
-  compare hashing, and viewer prefetching all skip them through one check,
+  text, the video panel, video durations, library metadata extraction, XMP sidecars, duplicate and
+  similar-photo scans, folder compare and its sync preview, the ingest preview, and viewer
+  prefetching all skip them through one check,
   `forge_core::cloud::background_read_allowed`. Opening a file still downloads it. A copy (or a
   move to another drive) of 10 or more online-only files, or 1 GB or more, asks first and gives
   the count and size. Tests: `forge-core/src/cloud.rs`, `duplicates.rs::online_only_files_are_never_compared`,

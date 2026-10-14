@@ -457,6 +457,7 @@ fn entry_key(state: &EntryState) -> &'static str {
         EntryState::Different(_) => "different",
         EntryState::TypeMismatch => "type-mismatch",
         EntryState::Error(_) => "error",
+        EntryState::NotCompared(_) => "not-compared",
     }
 }
 
