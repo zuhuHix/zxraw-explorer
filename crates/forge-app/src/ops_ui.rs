@@ -1,6 +1,7 @@
 //! Copy/move/delete jobs, the interactive conflict dialog and the operations panel.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, bounded};
@@ -25,6 +26,10 @@ const CLOUD_WARN_BYTES: u64 = 1 << 30;
 /// and marks its totals as a lower bound.
 const CLOUD_WALK_MAX_ENTRIES: usize = 20_000;
 const CLOUD_WALK_TIME_LIMIT: Duration = Duration::from_millis(300);
+/// A scan that finishes this quickly needs no "Checking" dialog (local folders, nearly always).
+const CLOUD_CHECK_GRACE: Duration = Duration::from_millis(150);
+/// Ids for online-only checks, so a result is matched to the dialog that asked for it.
+static NEXT_CLOUD_CHECK: AtomicU64 = AtomicU64::new(1);
 
 /// A conflict waiting for the user, with the channel the job thread is blocked on.
 pub struct ConflictQuestion {
@@ -43,6 +48,10 @@ struct ClipboardMoveCompletion {
 /// Start a copy or move of `sources` into `dest` as a background job, after asking first
 /// when it would download online-only files.
 pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
+    if scan_needed(&sources, &dest, kind) {
+        ask_after_cloud_check(app, sources.clone(), sources, dest, kind, None);
+        return;
+    }
     if let Some(body) = cloud_warning_for(&sources, &dest, kind) {
         let pending = ConfirmKind::DownloadCloudFiles {
             sources,
@@ -126,6 +135,17 @@ fn clipboard_move(
     if sources.is_empty() {
         return false;
     }
+    if check_cloud && scan_needed(&sources, &dest, OpKind::Move) {
+        ask_after_cloud_check(
+            app,
+            sources,
+            clipboard_sources,
+            dest,
+            OpKind::Move,
+            Some((generation, expected_sequence)),
+        );
+        return true;
+    }
     if check_cloud && let Some(body) = cloud_warning_for(&sources, &dest, OpKind::Move) {
         let pending = ConfirmKind::DownloadCloudFiles {
             sources: clipboard_sources,
@@ -161,6 +181,153 @@ fn ask_cloud_download(app: &mut ZxrawApp, body: String, kind: OpKind, pending: C
         confirm_label: format!("Download and {verb}"),
         danger: false,
     }));
+}
+
+/// Shows the "Checking" dialog while the online-only scan runs on a background thread.
+/// Cancel drops the dialog, which discards the result. Continue anyway starts the transfer.
+fn ask_after_cloud_check(
+    app: &mut ZxrawApp,
+    scan_sources: Vec<PathBuf>,
+    sources: Vec<PathBuf>,
+    dest: PathBuf,
+    kind: OpKind,
+    clipboard: Option<(Option<u64>, Option<u32>)>,
+) {
+    let id = NEXT_CLOUD_CHECK.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = bounded(1);
+    let ctx = app.ops.ctx.clone();
+    let scan_dest = dest.clone();
+    std::thread::spawn(move || {
+        let warning = cloud_warning_for(&scan_sources, &scan_dest, kind);
+        let _ = tx.send((id, warning));
+        ctx.request_repaint();
+    });
+    // Bounded wait: a slow enumeration on cloud or network storage gets the dialog instead.
+    if let Ok((finished, warning)) = rx.recv_timeout(CLOUD_CHECK_GRACE) {
+        match cloud_check_action(Some(id), finished, warning) {
+            CloudCheckAction::Warn(body) => {
+                let pending = ConfirmKind::DownloadCloudFiles {
+                    sources,
+                    dest,
+                    kind,
+                    clipboard,
+                };
+                ask_cloud_download(app, body, kind, pending);
+            }
+            CloudCheckAction::Start => start_pending_transfer(app, sources, dest, kind, clipboard),
+            CloudCheckAction::Ignore => {}
+        }
+        return;
+    }
+    app.ops.modal = Some(Modal::Confirm(Confirm {
+        kind: ConfirmKind::CheckingCloudFiles {
+            id,
+            result: rx,
+            sources,
+            dest,
+            kind,
+            clipboard,
+        },
+        title: "Checking for online-only files…".into(),
+        body: "Looking for files that would be downloaded from the cloud.".into(),
+        confirm_label: "Continue anyway".into(),
+        danger: false,
+    }));
+}
+
+/// Applies a finished online-only check to the dialog that is waiting for it.
+pub fn poll_cloud_check(app: &mut ZxrawApp) {
+    let Some(Modal::Confirm(Confirm {
+        kind: ConfirmKind::CheckingCloudFiles { id, result, .. },
+        ..
+    })) = &app.ops.modal
+    else {
+        return;
+    };
+    let Ok((finished, warning)) = result.try_recv() else {
+        return;
+    };
+    let action = cloud_check_action(Some(*id), finished, warning);
+    if action == CloudCheckAction::Ignore {
+        return;
+    }
+    let Some(Modal::Confirm(Confirm {
+        kind:
+            ConfirmKind::CheckingCloudFiles {
+                sources,
+                dest,
+                kind,
+                clipboard,
+                ..
+            },
+        ..
+    })) = app.ops.modal.take()
+    else {
+        return;
+    };
+    match action {
+        CloudCheckAction::Warn(body) => {
+            let pending = ConfirmKind::DownloadCloudFiles {
+                sources,
+                dest,
+                kind,
+                clipboard,
+            };
+            ask_cloud_download(app, body, kind, pending);
+        }
+        CloudCheckAction::Start => start_pending_transfer(app, sources, dest, kind, clipboard),
+        CloudCheckAction::Ignore => {}
+    }
+}
+
+/// Starts a transfer the user has already checked or accepted, without asking again.
+pub fn start_pending_transfer(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    dest: PathBuf,
+    kind: OpKind,
+    clipboard: Option<(Option<u64>, Option<u32>)>,
+) {
+    match clipboard {
+        None => start_transfer_confirmed(app, sources, dest, kind),
+        Some((generation, expected_sequence)) => {
+            if !start_clipboard_move_confirmed(app, sources, dest, generation, expected_sequence) {
+                app.toast("Nothing to move: the items are already in this folder");
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CloudCheckAction {
+    Start,
+    Warn(String),
+    /// The result is not for the awaited check.
+    Ignore,
+}
+
+/// Pure decision for a finished online-only check: `awaited` is the id of the check the
+/// dialog shows, `finished` the id the result carries. A mismatch means the result is stale.
+fn cloud_check_action(
+    awaited: Option<u64>,
+    finished: u64,
+    warning: Option<String>,
+) -> CloudCheckAction {
+    if awaited != Some(finished) {
+        return CloudCheckAction::Ignore;
+    }
+    warning.map_or(CloudCheckAction::Start, CloudCheckAction::Warn)
+}
+
+/// Does the transfer need the folder walk? Top-level files are checked synchronously, and a
+/// move within one volume is a rename that downloads nothing.
+fn scan_needed(sources: &[PathBuf], dest: &Path, kind: OpKind) -> bool {
+    if kind == OpKind::Move && sources.iter().all(|path| same_volume(path, dest)) {
+        return false;
+    }
+    sources
+        .iter()
+        .any(|path| std::fs::symlink_metadata(path).is_ok_and(|md| md.is_dir()))
 }
 
 /// The confirmation text when a transfer of `sources` to `dest` would download online-only
@@ -904,6 +1071,50 @@ mod cloud_warning_tests {
             cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.truncated),
             None
         );
+    }
+
+    #[test]
+    fn cloud_check_result_is_applied_only_to_its_own_check() {
+        assert_eq!(
+            cloud_check_action(Some(3), 3, None),
+            CloudCheckAction::Start
+        );
+        assert_eq!(
+            cloud_check_action(Some(3), 3, Some("warn".into())),
+            CloudCheckAction::Warn("warn".into())
+        );
+        // A result for an earlier check, or for a dialog already cancelled or continued.
+        assert_eq!(
+            cloud_check_action(Some(3), 2, Some("warn".into())),
+            CloudCheckAction::Ignore
+        );
+        assert_eq!(cloud_check_action(None, 3, None), CloudCheckAction::Ignore);
+    }
+
+    #[test]
+    fn folders_need_the_async_scan_but_top_level_files_do_not() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("file.bin");
+        let folder = dir.path().join("folder");
+        std::fs::write(&file, b"abc").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        assert!(!scan_needed(
+            std::slice::from_ref(&file),
+            &elsewhere,
+            OpKind::Copy
+        ));
+        assert!(scan_needed(
+            std::slice::from_ref(&folder),
+            &elsewhere,
+            OpKind::Copy
+        ));
+        // A folder moved within its volume is a rename: no scan at all.
+        assert!(!scan_needed(
+            std::slice::from_ref(&folder),
+            &elsewhere,
+            OpKind::Move
+        ));
     }
 
     #[test]

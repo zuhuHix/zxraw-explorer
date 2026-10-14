@@ -802,6 +802,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::meta_export::window(app, ui.ctx());
     crate::batch_export::window(app, ui.ctx());
     crate::meta_edit::window(app, ui.ctx());
+    crate::ops_ui::poll_cloud_check(app);
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {
         return;
     }
@@ -914,6 +915,13 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                         app.toast("Nothing to move: the items are already in this folder");
                     }
                 }
+                ConfirmKind::CheckingCloudFiles {
+                    sources,
+                    dest,
+                    kind,
+                    clipboard,
+                    ..
+                } => crate::ops_ui::start_pending_transfer(app, sources, dest, kind, clipboard),
             }
             None
         }

@@ -54,6 +54,16 @@ pub enum ConfirmKind {
         kind: OpKind,
         clipboard: Option<(Option<u64>, Option<u32>)>,
     },
+    /// The online-only check of a copy or move runs on a background thread. `result` carries
+    /// the check's id and warning. Accept starts the transfer without waiting for it.
+    CheckingCloudFiles {
+        id: u64,
+        result: crossbeam_channel::Receiver<(u64, Option<String>)>,
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        kind: OpKind,
+        clipboard: Option<(Option<u64>, Option<u32>)>,
+    },
 }
 
 pub struct Confirm {

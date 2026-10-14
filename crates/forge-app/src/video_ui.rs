@@ -295,6 +295,8 @@ where
 
 /// State for preview extraction. GPU textures and frame data are cached by file path,
 /// modification time, and requested time; only the selected file's work is allowed to run.
+const ONLINE_ONLY_VIDEO: &str = "Online-only file: open it to download it from the cloud.";
+
 pub struct VideoUi {
     tx: Sender<VideoMessage>,
     rx: Receiver<VideoMessage>,
@@ -450,6 +452,15 @@ impl VideoUi {
         .collect();
         if !missing.is_empty() {
             self.missing_tools = Some(missing.join(" and "));
+        }
+        // Selecting is not opening: probing or extracting frames would download an online-only
+        // clip. The flags also stop hover and scrub frames for this selection.
+        if !forge_core::cloud::background_read_allowed(&media.path) {
+            self.ffmpeg_available = false;
+            self.ffprobe_available = false;
+            self.probe_error = Some(ONLINE_ONLY_VIDEO.into());
+            self.strip_error = Some(ONLINE_ONLY_VIDEO.into());
+            return;
         }
 
         if let Some(result) = self.probe_cache.get(&media).cloned() {
@@ -1614,6 +1625,12 @@ fn start_estimate(
             let mut durations_s = Vec::with_capacity(sources.len());
             let mut duration_errors = Vec::with_capacity(sources.len());
             for path in &sources {
+                // The estimate is a preview: an online-only clip is not downloaded to probe it.
+                if !forge_core::cloud::background_read_allowed(path) {
+                    durations_s.push(None);
+                    duration_errors.push(Some("online-only, not probed".to_string()));
+                    continue;
+                }
                 match ff.probe(path) {
                     Ok(meta) => {
                         let duration = meta.duration_s.filter(|d| d.is_finite() && *d > 0.0);
