@@ -191,8 +191,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Metadata and XMP sync
 
-* XMP sidecar sync is opt-in. When it is enabled, only ratings, labels, and keywords are written.
-  Picks and notes stay in the app library (`library.rs`) and are not written to sidecars.
+* XMP sidecar sync is opt-in. When it is enabled, ratings, labels, keywords, and (for photos and
+  RAW files only) notes are written. Notes go to `xmpDM:logComment`, chosen so the caption in
+  `dc:description` is never overwritten; Lightroom does not display that field. Picks stay in the
+  app library (`library.rs`). Notes already present in a sidecar are not read back into the library.
+* Notes and ratings follow renames and moves made inside ZXraw. A file renamed or moved by another
+  program keeps its note on the old path until it is relinked (Collections › Relink).
 * The sidecar writer is tested for lossless merges, namespaces, and same-process serialisation,
   but it has not been tested with Lightroom, Capture One, or darktable.
 * A small cross-process race window remains. Updates within ZXraw are serialised. Another process

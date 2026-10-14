@@ -103,12 +103,14 @@ pub struct FileRecord {
     pub rating: u8,
     pub label: Option<ColorLabel>,
     pub pick: PickState,
+    /// The file has a non-empty note in `annotations.notes`.
+    pub has_notes: bool,
 }
 
 /// Columns matching [`FileRecord::from_row`]; aliases `f` = files, `a` = annotations.
 pub(crate) const RECORD_COLS: &str = "f.id, f.volume_id, f.path, f.parent_path, f.name, f.ext, \
     f.size, f.mtime, f.ctime, f.kind, f.media_kind, f.indexed_at, f.present, f.partial_hash, \
-    f.full_hash, COALESCE(a.rating, 0), a.label, COALESCE(a.pick, 0)";
+    f.full_hash, COALESCE(a.rating, 0), a.label, COALESCE(a.pick, 0),     COALESCE(a.notes, '') <> ''";
 
 impl FileRecord {
     pub(crate) fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
@@ -133,6 +135,7 @@ impl FileRecord {
                 .get::<_, Option<String>>(16)?
                 .and_then(|s| ColorLabel::parse(&s)),
             pick: PickState::from_i64(r.get(17)?),
+            has_notes: r.get::<_, i64>(18)? != 0,
         })
     }
 }

@@ -807,3 +807,35 @@ fn unterminated_quote_in_a_search_is_reported_not_crashed() {
         &script,
     ));
 }
+
+#[test]
+fn note_follows_a_file_renamed_in_the_app() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("shoot");
+    photos(&dir, &["a.jpg"]);
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        "navigate {dir}\n\
+         select a.jpg\n\
+         ui library note Client proof\n\
+         cmd Rename\n\
+         type renamed.jpg\n\
+         accept\n\
+         assert-exists {renamed}\n\
+         ui library assert-note {renamed} | Client proof\n\
+         exit\n",
+        dir = shown(&dir),
+        renamed = shown(&dir.join("renamed.jpg")),
+    );
+    expect_ok(&run_app(sandbox.path(), &profile, &script));
+
+    let db = library(&profile);
+    let id = db
+        .file_id(&dir.join("renamed.jpg"))
+        .unwrap()
+        .expect("the renamed file keeps its library row");
+    assert_eq!(
+        db.annotation(id).unwrap().notes.as_deref(),
+        Some("Client proof")
+    );
+}

@@ -71,6 +71,7 @@ fn simulate_external_edit(_path: &Path) {}
 const XMP_NS: &str = "http://ns.adobe.com/xap/1.0/";
 const DC_NS: &str = "http://purl.org/dc/elements/1.1/";
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const XMP_DM_NS: &str = "http://ns.adobe.com/xmp/1.0/DynamicMedia/";
 /// Sidecars are normally a few KB; anything this large is refused rather than rewritten.
 const MAX_SIDECAR_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CHANGE_RETRIES: usize = 3;
@@ -105,6 +106,9 @@ pub struct SidecarUpdate {
     pub creator: Option<Option<String>>,
     /// `dc:rights` (copyright), same semantics as `title`.
     pub rights: Option<Option<String>>,
+    /// The ZXraw per-file note, written to `xmpDM:logComment` (simple text) so it never
+    /// touches the caption in `dc:description`. `Some(None)` or a blank value removes it.
+    pub note: Option<Option<String>>,
 }
 
 impl SidecarUpdate {
@@ -116,6 +120,7 @@ impl SidecarUpdate {
             && self.description.is_none()
             && self.creator.is_none()
             && self.rights.is_none()
+            && self.note.is_none()
             && self.add_keywords.iter().all(|k| k.trim().is_empty())
             && self.remove_keywords.iter().all(|k| k.trim().is_empty())
     }
@@ -141,6 +146,8 @@ pub struct SidecarFields {
     pub description: Option<String>,
     pub creator: Vec<String>,
     pub rights: Option<String>,
+    /// The ZXraw per-file note (`xmpDM:logComment`); blank reads as `None`.
+    pub note: Option<String>,
 }
 
 /// Reads the title, caption, creator and copyright of the image's sidecar. Never fails: a
@@ -169,6 +176,9 @@ pub fn read_sidecar_fields(image: &Path) -> SidecarFields {
         .flatten();
     out.rights = read_alt(&doc, &text, description, "rights").ok().flatten();
     out.creator = read_seq(&doc, &text, description, "creator").unwrap_or_default();
+    out.note = simple_values(&doc, &text, description, XMP_DM_NS, "logComment")
+        .ok()
+        .and_then(|values| values.into_iter().find_map(non_blank));
     out.sidecar = Some(path);
     out
 }
@@ -567,6 +577,23 @@ fn apply_update(text: &str, image_path: &Path, update: &SidecarUpdate) -> Result
         Some(None) => remove_simple(&doc, text, description, XMP_NS, "Label", &mut edits)?,
         None => {}
     }
+    match text_edit(&update.note) {
+        Some(Some(note)) => set_simple(
+            &doc,
+            text,
+            description,
+            PropertyName {
+                namespace: XMP_DM_NS,
+                local: "logComment",
+                preferred_prefix: "xmpDM",
+            },
+            &note,
+            &mut namespaces,
+            &mut edits,
+        )?,
+        Some(None) => remove_simple(&doc, text, description, XMP_DM_NS, "logComment", &mut edits)?,
+        None => {}
+    }
     let text_fields = TextFields::from_update(update);
     for (local, requested) in text_fields.alternatives() {
         match requested {
@@ -654,6 +681,20 @@ fn verify(
             None if values.is_empty() => {}
             _ => return Err(corrupt("merged XMP label did not verify; left untouched")),
         }
+    }
+    match text_edit(&update.note) {
+        Some(Some(expected)) => {
+            let values = simple_values(&after_doc, out, after_desc, XMP_DM_NS, "logComment")?;
+            if values.is_empty() || values.iter().any(|value| *value != expected) {
+                return Err(corrupt("merged XMP note did not verify; left untouched"));
+            }
+        }
+        Some(None) => {
+            if !simple_values(&after_doc, out, after_desc, XMP_DM_NS, "logComment")?.is_empty() {
+                return Err(corrupt("merged XMP note was not removed; left untouched"));
+            }
+        }
+        None => {}
     }
     let text_fields = TextFields::from_update(update);
     for (local, requested) in text_fields.alternatives() {
@@ -1047,10 +1088,7 @@ fn set_simple(
         .filter(|attr| doc.attr_is(description, attr, property.namespace, property.local))
     {
         found = true;
-        edits.push(Edit::replace(
-            attr.value.clone(),
-            escape(value).into_owned(),
-        ));
+        edits.push(Edit::replace(attr.value.clone(), escape_simple(value)));
     }
     for child in doc.children(description) {
         if doc.element_is(child, property.namespace, property.local) {
@@ -1059,13 +1097,13 @@ fn set_simple(
             if node.empty {
                 edits.push(Edit::replace(
                     node.start..node.end,
-                    format!("<{}>{}</{}>", node.name, escape(value), node.name),
+                    format!("<{}>{}</{}>", node.name, escape_simple(value), node.name),
                 ));
             } else {
                 simple_content(text, node)?;
                 edits.push(Edit::replace(
                     node.tag_end..node.close,
-                    escape(value).into_owned(),
+                    escape_simple(value),
                 ));
             }
         }
@@ -1080,10 +1118,23 @@ fn set_simple(
         let name = qualified_name(&prefix, property.local);
         edits.push(Edit::insert(
             doc.nodes[description].name_end,
-            format!(" {name}=\"{}\"", escape(value)),
+            format!(" {name}=\"{}\"", escape_simple(value)),
         ));
     }
     Ok(())
+}
+
+/// Escapes a simple property value for an attribute or element. Line breaks and tabs become
+/// character references: a raw newline or tab in an attribute value is read back as a space.
+fn escape_simple(value: &str) -> String {
+    let escaped = escape(value);
+    if !escaped.contains(['\n', '\r', '\t']) {
+        return escaped.into_owned();
+    }
+    escaped
+        .replace('\r', "&#xD;")
+        .replace('\n', "&#xA;")
+        .replace('\t', "&#x9;")
 }
 
 /// Removes a namespace-resolved simple property on the selected image description.
@@ -2808,5 +2859,251 @@ mod tests {
             vec![s("Ana"), s("Bruno")]
         );
         assert!(split_creators(" ; ").is_empty());
+    }
+
+    /// Caption, title, keywords, rights, creator, rating and label; no xmpDM namespace.
+    const CAPTIONED: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:dc="http://purl.org/dc/elements/1.1/"
+    xmp:Rating="4">
+   <xmp:Label>Green</xmp:Label>
+   <dc:title><rdf:Alt><rdf:li xml:lang="x-default">Sunset &amp; sea</rdf:li></rdf:Alt></dc:title>
+   <dc:description><rdf:Alt><rdf:li xml:lang="x-default">Caption  with   spaces</rdf:li></rdf:Alt></dc:description>
+   <dc:subject><rdf:Bag><rdf:li>beach</rdf:li><rdf:li>dog</rdf:li></rdf:Bag></dc:subject>
+   <dc:rights><rdf:Alt><rdf:li xml:lang="x-default">(c) Ana</rdf:li></rdf:Alt></dc:rights>
+   <dc:creator><rdf:Seq><rdf:li>Ana</rdf:li></rdf:Seq></dc:creator>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    const CAPTION_XML: &str = r#"<dc:description><rdf:Alt><rdf:li xml:lang="x-default">Caption  with   spaces</rdf:li></rdf:Alt></dc:description>"#;
+
+    /// Attribute-form note on the description, with the xmpDM namespace already declared.
+    const NOTE_ATTR: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/"
+    xmp:Rating="2" xmpDM:logComment="old note">
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    /// Element-form note with the xmpDM namespace already declared.
+    const NOTE_ELEMENTS: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+ <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+  <rdf:Description rdf:about=""
+    xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+    xmlns:xmpDM="http://ns.adobe.com/xmp/1.0/DynamicMedia/"
+    xmp:Rating="2">
+   <xmpDM:logComment>old note</xmpDM:logComment>
+  </rdf:Description>
+ </rdf:RDF>
+</x:xmpmeta>
+"#;
+
+    #[test]
+    fn note_is_added_and_caption_title_keywords_rating_label_stay_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("IMG_7.CR3");
+        let side = write_file(dir.path(), "IMG_7.xmp", CAPTIONED);
+        let before = read_sidecar_fields(&img);
+        assert_eq!(before.note, None);
+        assert_eq!(before.description.as_deref(), Some("Caption  with   spaces"));
+
+        let outcome = update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some("A note".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, SidecarOutcome::Updated(_)));
+
+        let after = read_sidecar_fields(&img);
+        assert_eq!(after.note.as_deref(), Some("A note"));
+        assert_eq!(after.title, before.title);
+        assert_eq!(after.description, before.description);
+        assert_eq!(after.creator, before.creator);
+        assert_eq!(after.rights, before.rights);
+
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert!(text.contains(CAPTION_XML), "caption must be byte-identical");
+        assert!(text.contains("<dc:subject><rdf:Bag><rdf:li>beach</rdf:li><rdf:li>dog</rdf:li></rdf:Bag></dc:subject>"));
+        assert!(text.contains("<xmp:Label>Green</xmp:Label>"));
+        assert!(text.contains("xmp:Rating=\"4\""));
+        assert!(text.contains("xmlns:xmpDM=\"http://ns.adobe.com/xmp/1.0/DynamicMedia/\""));
+        assert!(text.contains("xmpDM:logComment=\"A note\""));
+    }
+
+    #[test]
+    fn note_never_lands_in_caption_and_caption_update_keeps_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("IMG_10.CR3");
+        let side = write_file(dir.path(), "IMG_10.xmp", LR_ELEMENTS);
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some("only a note".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert!(!text.contains("dc:description"));
+        assert_eq!(read_sidecar_fields(&img).description, None);
+        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("only a note"));
+
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                description: Some(Some("A caption".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(fields.description.as_deref(), Some("A caption"));
+        assert_eq!(fields.note.as_deref(), Some("only a note"));
+    }
+
+    #[test]
+    fn note_replace_and_remove_in_element_and_attribute_forms() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let img = dir.path().join("IMG_11.CR3");
+        let side = write_file(dir.path(), "IMG_11.xmp", NOTE_ATTR);
+        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("old note"));
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some("new note".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("new note"));
+        assert!(!std::fs::read_to_string(&side).unwrap().contains("old note"));
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(None),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_fields(&img).note, None);
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert!(!text.contains("logComment"));
+        assert!(text.contains("xmp:Rating=\"2\""));
+
+        let img2 = dir.path().join("IMG_12.CR3");
+        let side2 = write_file(dir.path(), "IMG_12.xmp", NOTE_ELEMENTS);
+        assert_eq!(read_sidecar_fields(&img2).note.as_deref(), Some("old note"));
+        update_sidecar(
+            &img2,
+            &SidecarUpdate {
+                note: Some(Some("new note".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        let text2 = std::fs::read_to_string(&side2).unwrap();
+        assert!(text2.contains("<xmpDM:logComment>new note</xmpDM:logComment>"));
+        assert!(text2.contains("xmp:Rating=\"2\""));
+        update_sidecar(
+            &img2,
+            &SidecarUpdate {
+                note: Some(Some("   ".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_fields(&img2).note, None);
+        assert!(!std::fs::read_to_string(&side2).unwrap().contains("logComment"));
+    }
+
+    #[test]
+    fn note_only_creates_a_new_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("IMG_13.CR3");
+        let outcome = update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some("fresh".into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, SidecarOutcome::Created(_)));
+        let fields = read_sidecar_fields(&img);
+        assert_eq!(fields.note.as_deref(), Some("fresh"));
+        assert_eq!(fields.description, None);
+        let text = std::fs::read_to_string(dir.path().join("IMG_13.xmp")).unwrap();
+        assert!(text.contains("xmlns:xmpDM=\"http://ns.adobe.com/xmp/1.0/DynamicMedia/\""));
+    }
+
+    #[test]
+    fn multi_line_and_special_note_round_trips_in_every_form() {
+        let note = "line one\nline two & <three> \"q\"";
+        let dir = tempfile::tempdir().unwrap();
+
+        let img = dir.path().join("IMG_14.CR3");
+        let side = write_file(dir.path(), "IMG_14.xmp", NOTE_ELEMENTS);
+        update_sidecar(
+            &img,
+            &SidecarUpdate {
+                note: Some(Some(note.into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some(note));
+        let text = std::fs::read_to_string(&side).unwrap();
+        assert!(text.contains("<xmpDM:logComment>line one&#xA;line two &amp; &lt;three&gt; &quot;q&quot;</xmpDM:logComment>"));
+
+        let img2 = dir.path().join("IMG_15.CR3");
+        let side2 = write_file(dir.path(), "IMG_15.xmp", NOTE_ATTR);
+        update_sidecar(
+            &img2,
+            &SidecarUpdate {
+                note: Some(Some(note.into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        let text2 = std::fs::read_to_string(&side2).unwrap();
+        assert!(text2.contains("&#xA;"), "newline must be a character reference");
+        assert_eq!(read_sidecar_fields(&img2).note.as_deref(), Some(note));
+
+        let img3 = dir.path().join("IMG_16.CR3");
+        update_sidecar(
+            &img3,
+            &SidecarUpdate {
+                note: Some(Some(note.into())),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(read_sidecar_fields(&img3).note.as_deref(), Some(note));
+    }
+
+    #[test]
+    fn note_only_update_is_not_empty() {
+        assert!(!SidecarUpdate {
+            note: Some(Some("x".into())),
+            ..Default::default()
+        }
+        .is_empty());
+        assert!(!SidecarUpdate {
+            note: Some(None),
+            ..Default::default()
+        }
+        .is_empty());
     }
 }

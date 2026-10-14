@@ -42,11 +42,45 @@ struct Selected {
     files: Option<Vec<(PathBuf, Annotation)>>,
 }
 
-/// Notes for the single selected file. Saved on Enter or when the field loses focus.
+/// A note is saved once its text has been unchanged for this long.
+const NOTE_AUTOSAVE_AFTER: Duration = Duration::from_millis(800);
+/// The note box grows with its text up to this many rows, then scrolls.
+const NOTE_MAX_ROWS: f32 = 8.0;
+
+/// Notes for the single selected file. Saved after a pause in typing, when the field loses
+/// focus, and when the selection moves to another file.
 struct NotesDraft {
     path: PathBuf,
     text: String,
     saved: String,
+    /// When the text last changed while it differed from `saved`. Cleared by a save.
+    changed_at: Option<Instant>,
+}
+
+/// What the note's status line says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteStatus {
+    Unsaved,
+    Saved,
+    Empty,
+}
+
+fn note_status(draft: &NotesDraft) -> NoteStatus {
+    if draft.text != draft.saved {
+        NoteStatus::Unsaved
+    } else if draft.text.trim().is_empty() {
+        NoteStatus::Empty
+    } else {
+        NoteStatus::Saved
+    }
+}
+
+/// True when the text differs from what is saved and has been left alone for the autosave pause.
+fn autosave_due(draft: &NotesDraft, now: Instant) -> bool {
+    draft.text != draft.saved
+        && draft
+            .changed_at
+            .is_some_and(|at| now.saturating_duration_since(at) >= NOTE_AUTOSAVE_AFTER)
 }
 
 struct Renaming {
@@ -388,6 +422,7 @@ impl TagsUi {
             path,
             saved: text.clone(),
             text,
+            changed_at: None,
         });
     }
 
@@ -401,6 +436,7 @@ impl TagsUi {
         let path = draft.path.clone();
         let trimmed = draft.text.trim().to_string();
         draft.saved = draft.text.clone();
+        draft.changed_at = None;
         let notes = (!trimmed.is_empty()).then_some(trimmed);
         if let Some((_, annotation)) = self
             .cache
@@ -669,28 +705,73 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
     }
 
     ui.add_space(4.0);
-    ui.label(RichText::new("Notes").weak());
     if n == 1 {
-        let lost_focus = match st.notes.as_mut() {
-            Some(draft) => ui
-                .add(
-                    egui::TextEdit::singleline(&mut draft.text)
-                        .hint_text("Saved on Enter or when you leave the field")
-                        .desired_width(f32::INFINITY),
-                )
-                .lost_focus(),
+        let now = Instant::now();
+        let status = st.notes.as_ref().map_or(NoteStatus::Empty, note_status);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Note").weak());
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| match status {
+                    NoteStatus::Unsaved => {
+                        ui.label(
+                            RichText::new("Unsaved changes").color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                    NoteStatus::Saved => {
+                        ui.label(RichText::new("Saved ✓").weak());
+                    }
+                    NoteStatus::Empty => {}
+                },
+            );
+        });
+        let mut lost_focus = false;
+        match st.notes.as_mut() {
+            Some(draft) => {
+                let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                let max_height = row_height * NOTE_MAX_ROWS + 8.0;
+                egui::ScrollArea::vertical()
+                    .id_salt("note-text")
+                    .max_height(max_height)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let response = ui.add(
+                            egui::TextEdit::multiline(&mut draft.text)
+                                .hint_text("Add a note — saved automatically")
+                                .desired_rows(3)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if response.changed() {
+                            draft.changed_at = Some(now);
+                        }
+                        lost_focus = response.lost_focus();
+                    });
+            }
             None => {
                 ui.add_enabled(
                     false,
-                    egui::TextEdit::singleline(&mut String::new()).hint_text("Loading…"),
+                    egui::TextEdit::multiline(&mut String::new())
+                        .hint_text("Loading…")
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY),
                 );
-                false
             }
-        };
-        if lost_focus {
+        }
+        let due = st.notes.as_ref().is_some_and(|d| autosave_due(d, now));
+        if lost_focus || due {
             st.save_notes(library, &ctx);
+        } else if let Some(draft) = st
+            .notes
+            .as_ref()
+            .filter(|d| note_status(d) == NoteStatus::Unsaved)
+            && let Some(at) = draft.changed_at
+        {
+            // Wake up when the pause ends, so the save happens without more input.
+            let left = NOTE_AUTOSAVE_AFTER.saturating_sub(now.saturating_duration_since(at));
+            ctx.request_repaint_after(left);
         }
     } else {
+        ui.label(RichText::new("Note").weak());
         ui.label(
             RichText::new("Select one file to edit its notes.")
                 .weak()
@@ -959,6 +1040,61 @@ mod tests {
             files[0].1.tags,
             vec!["alpha".to_string(), "keep".to_string(), "zeta".to_string()]
         );
+    }
+
+    fn draft(text: &str, saved: &str, changed_at: Option<Instant>) -> NotesDraft {
+        NotesDraft {
+            path: PathBuf::from("a.jpg"),
+            text: text.into(),
+            saved: saved.into(),
+            changed_at,
+        }
+    }
+
+    #[test]
+    fn note_status_tracks_unsaved_saved_and_empty() {
+        assert_eq!(note_status(&draft("x", "", None)), NoteStatus::Unsaved);
+        assert_eq!(note_status(&draft("", "x", None)), NoteStatus::Unsaved);
+        assert_eq!(note_status(&draft("x", "x", None)), NoteStatus::Saved);
+        assert_eq!(note_status(&draft("", "", None)), NoteStatus::Empty);
+        // Whitespace-only text is in sync with a saved blank note, so it shows nothing.
+        assert_eq!(note_status(&draft("  ", "  ", None)), NoteStatus::Empty);
+    }
+
+    #[test]
+    fn autosave_waits_for_the_pause_then_fires() {
+        let t0 = Instant::now();
+        let d = draft("hello", "", Some(t0));
+        assert!(!autosave_due(&d, t0));
+        assert!(!autosave_due(&d, t0 + Duration::from_millis(799)));
+        assert!(autosave_due(&d, t0 + NOTE_AUTOSAVE_AFTER));
+        assert!(autosave_due(&d, t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn autosave_is_not_due_when_text_matches_saved() {
+        let t0 = Instant::now();
+        let synced = draft("hello", "hello", Some(t0));
+        assert!(!autosave_due(&synced, t0 + Duration::from_secs(5)));
+        let no_edit_yet = draft("hello", "", None);
+        assert!(!autosave_due(&no_edit_yet, t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn autosave_is_due_again_after_a_further_edit() {
+        let t0 = Instant::now();
+        // First edit, saved after the pause.
+        let mut d = draft("a", "", Some(t0));
+        assert!(autosave_due(&d, t0 + NOTE_AUTOSAVE_AFTER));
+        d.saved = d.text.clone();
+        d.changed_at = None;
+        assert!(!autosave_due(&d, t0 + Duration::from_secs(10)));
+        // A later edit restarts the pause.
+        let t1 = t0 + Duration::from_secs(10);
+        d.text.push('b');
+        d.changed_at = Some(t1);
+        assert!(!autosave_due(&d, t1 + Duration::from_millis(100)));
+        assert!(autosave_due(&d, t1 + NOTE_AUTOSAVE_AFTER));
     }
 
     #[test]
