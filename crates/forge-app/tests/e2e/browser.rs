@@ -382,3 +382,46 @@ fn sticky_selection_toggles_items_with_plain_clicks() {
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn folders_open_in_place_with_arrows_and_clicks() {
+    let (temp, work, profile) = list_fixture(&[
+        "Shoot/img_02.txt",
+        "Shoot/img_01.txt",
+        "Shoot/Selects/best.txt",
+        "notes.txt",
+    ]);
+    let shot = shots_dir().join("folders-open-in-place.png");
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         # A click on the arrow opens the folder in place, lazily.\n\
+         ui browser click-arrow Shoot\nwait-entry img_01.txt\nwait-frames 3\n\
+         ui browser assert-visible Shoot, Selects, img_01.txt, img_02.txt, notes.txt\n\
+         ui browser assert-depths Shoot=0, Selects=1, img_01.txt=1, notes.txt=0\n\
+         # Right opens a folder under the cursor; Left goes to its parent, then closes it.\n\
+         click-entry Selects\nkey ArrowRight\nwait-entry best.txt\nwait-frames 3\n\
+         ui browser assert-depths best.txt=2\nscreenshot {shot}\n\
+         click-entry best.txt\nkey ArrowLeft\nassert-selection Selects\n\
+         key ArrowLeft\nui browser assert-collapsed-folder Selects\n\
+         # Focus stays in the list: Left again goes from Selects to its folder.\n\
+         key ArrowLeft\nassert-selection Shoot\n\
+         # Multi-select across levels.\n\
+         click-entry img_02.txt\nkey ctrl+A\nassert-selected 5\n\
+         # The filter applies to nested items, and keeps the folders that lead to a match.\n\
+         cmd FocusFilter\nwait-frames 2\ntext img_01\nwait-frames 2\n\
+         ui browser assert-visible Shoot, img_01.txt\nkey Escape\nwait-frames 2\n\
+         ui browser assert-visible Shoot, Selects, img_01.txt, img_02.txt, notes.txt\n\
+         # Delete a nested file: the open folder follows the change.\n\
+         click-entry img_02.txt\nkey Delete\nwait-jobs 20\nwait-no-entry img_02.txt\n\
+         assert-missing {img02}\nassert-path {work}\n\
+         # Double-clicking a nested folder opens it as the current folder.\n\
+         # (Let the refresh that follows the delete finish: steps pause while a pane loads.)\n\
+         wait-frames 60\ndouble-click-entry Selects\nwait-entry best.txt\nassert-path {selects}\n\
+         navigate {work}\nwait-entry img_01.txt\nui browser assert-expanded-folder Shoot\nexit\n",
+        work = shown(&work),
+        shot = shown(&shot),
+        img02 = shown(&work.join("Shoot").join("img_02.txt")),        selects = shown(&work.join("Shoot").join("Selects")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}

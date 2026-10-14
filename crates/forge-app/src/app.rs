@@ -285,9 +285,13 @@ impl ZxrawApp {
             p
         };
         let left = pane(&t.left, *t.view, *t.sort);
-        let right = t.right.as_ref().map(|r| {
+        let mut right = t.right.as_ref().map(|r| {
             pane(r, t.right_view.unwrap_or(*t.view), t.right_sort.or(*t.sort))
         });
+        let mut left = left;
+        for pane in std::iter::once(&mut left).chain(right.as_mut()) {
+            pane.expanded.extend(t.expanded.iter().cloned());
+        }
         Tab {
             left,
             right,
@@ -331,6 +335,12 @@ impl ZxrawApp {
                     sort: Some(t.left.sort).into(),
                     right_view: t.right.as_ref().map(|r| r.view).into(),
                     right_sort: t.right.as_ref().map(|r| r.sort).into(),
+                    expanded: std::iter::once(&t.left)
+                        .chain(t.right.as_ref())
+                        .flat_map(|p| p.expanded.iter().cloned())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
                 })
                 .collect(),
             active_tab: self.active,
@@ -413,12 +423,12 @@ impl ZxrawApp {
         // Exports may have appeared or gone; their associations are re-scanned on demand.
         crate::export_assoc::invalidate_cache();
         for t in &mut self.tabs {
-            if t.left.path == dir {
-                t.left.refresh();
-            }
-            if let Some(r) = &mut t.right {
-                if r.path == dir {
-                    r.refresh();
+            for pane in std::iter::once(&mut t.left).chain(t.right.as_mut()) {
+                if pane.path == dir {
+                    pane.refresh();
+                } else if pane.shows_children_of(dir) {
+                    // A folder opened in place.
+                    pane.reload_children(dir);
                 }
             }
         }
@@ -665,6 +675,12 @@ impl ZxrawApp {
                 Key::ArrowUp => pane.move_cursor(-grid_cols, m.shift, m.command),
                 Key::ArrowRight if grid_cols > 1 => pane.move_cursor(1, m.shift, m.command),
                 Key::ArrowLeft if grid_cols > 1 => pane.move_cursor(-1, m.shift, m.command),
+                Key::ArrowRight if !m.shift && !m.command => {
+                    pane.tree_right();
+                }
+                Key::ArrowLeft if !m.shift && !m.command => {
+                    pane.tree_left();
+                }
                 Key::PageDown => pane.move_cursor(page, m.shift, m.command),
                 Key::PageUp => pane.move_cursor(-page, m.shift, m.command),
                 Key::Home => pane.move_cursor(-(1 << 30), m.shift, m.command),

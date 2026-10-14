@@ -311,6 +311,7 @@ pub fn plan(layout: &Layout, exists: impl Fn(&Path) -> bool) -> Plan {
                 sort: t.right_sort.or(*t.sort).into(),
                 right_view: None.into(),
                 right_sort: None.into(),
+                expanded: t.expanded.clone(),
             }),
             _ => None,
         };
@@ -694,6 +695,7 @@ mod tests {
                 sort: Some(sort).into(),
                 right_view: None.into(),
                 right_sort: None.into(),
+                expanded: Vec::new(),
             }]
         );
         assert_eq!(p.missing, vec![PathBuf::from("A")]);

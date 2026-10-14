@@ -1,11 +1,15 @@
 //! A browsing pane: current folder, history, streaming listing, filter, sort, selection.
+//!
+//! In details view, folders can be opened in place: an expanded folder's children are
+//! listed (streamed, like the folder itself) into the same `entries`, and `visible` holds
+//! the flattened tree, each level sorted, with `depth` giving the indent of every row.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, unbounded};
-use forge_core::FileEntry;
+use crossbeam_channel::{Receiver, Sender, unbounded};
+use forge_core::{EntryKind, FileEntry};
 use forge_core::listing::{self, SortKey, SortSpec};
 use forge_core::query::Query;
 use forge_jobs::CancelToken;
@@ -19,6 +23,17 @@ enum ListMsg {
     Failed(String),
 }
 
+/// Listing of a folder opened in place. Its messages carry `id`, so a superseded listing
+/// (collapsed, refreshed or reopened since) is ignored.
+struct ChildLoad {
+    id: u64,
+    cancel: CancelToken,
+    loading: bool,
+    /// A re-listing of an already listed folder collects here and replaces the old rows
+    /// when complete, so a change inside an open folder does not make its rows flicker.
+    staged: Option<Vec<FileEntry>>,
+}
+
 pub enum LoadState {
     Loading { since: Instant },
     Ready { errors: usize },
@@ -29,10 +44,25 @@ pub struct Pane {
     pub path: PathBuf,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
-    /// All entries of the folder, sorted by `sort`.
+    /// All entries of the folder, sorted by `sort`, together with the entries of the folders
+    /// opened in place (details view). Use `visible` for display order.
     pub entries: Vec<FileEntry>,
     /// Indices into `entries` that pass the filter/hidden rules, in display order.
     pub visible: Vec<usize>,
+    /// Tree depth of each `visible` row; empty when no folder is open (all rows at depth 0).
+    pub depth: Vec<u16>,
+    /// Folders opened in place, by path. Remembered for the tab across navigation; only
+    /// the ones listed in the current folder (and inside open folders) are shown open.
+    pub expanded: HashSet<PathBuf>,
+    /// Listings of the open folders whose children are in `entries`.
+    children: HashMap<PathBuf, ChildLoad>,
+    child_tx: Sender<(u64, PathBuf, ListMsg)>,
+    child_rx: Receiver<(u64, PathBuf, ListMsg)>,
+    next_child_id: u64,
+    /// While a refresh lists the folder again, its entries collect here (see `load_path`).
+    staged: Option<Vec<FileEntry>>,
+    /// The view `poll` last saw: leaving details view closes the tree, returning reopens it.
+    tree_view: ViewMode,
     pub sort: SortSpec,
     pub view: ViewMode,
     pub filter_text: String,
@@ -52,7 +82,7 @@ pub struct Pane {
     /// Name to select once loading finishes (e.g. the folder we navigated up from).
     pending_select: Option<String>,
     /// Like `pending_select`, but only moves the cursor (refresh keeps the selection).
-    pending_select_keep: Option<String>,
+    pending_select_keep: Option<PathBuf>,
     pub editing_path: Option<String>,
     pub show_hidden: bool,
     pub show_system: bool,
@@ -85,12 +115,21 @@ fn next_listing_rev() -> u64 {
 
 impl Pane {
     pub fn new(path: PathBuf, sort: SortSpec, view: ViewMode) -> Self {
+        let (child_tx, child_rx) = unbounded();
         let mut p = Self {
             path: PathBuf::new(),
             back: Vec::new(),
             forward: Vec::new(),
             entries: Vec::new(),
             visible: Vec::new(),
+            depth: Vec::new(),
+            expanded: HashSet::new(),
+            children: HashMap::new(),
+            child_tx,
+            child_rx,
+            next_child_id: 1,
+            tree_view: view,
+            staged: None,
             sort,
             view,
             filter_text: String::new(),
@@ -183,7 +222,7 @@ impl Pane {
         let keep: Vec<PathBuf> = self.selected.iter().cloned().collect();
         let cursor = self
             .cursor_entry()
-            .map(|e| e.name.clone())
+            .map(|e| e.path.clone())
             .or_else(|| self.pending_select_keep.clone());
         let p = self.path.clone();
         self.load_path(p);
@@ -211,12 +250,28 @@ impl Pane {
         } else {
             self.similar.on_navigation();
         }
+        if path == self.path && !path.as_os_str().is_empty() {
+            // Refresh: the rows, selection and cursor stay while the folder (and every
+            // folder open in place) is listed again; complete listings replace the rows.
+            self.staged = Some(Vec::new());
+            let open: Vec<PathBuf> = self.children.keys().cloned().collect();
+            for dir in open {
+                self.start_listing(dir, true);
+            }
+        } else {
+            self.staged = None;
+            for load in self.children.values() {
+                load.cancel.cancel();
+            }
+            self.children.clear();
+            self.entries.clear();
+            self.visible.clear();
+            self.depth.clear();
+            self.selected.clear();
+            self.cursor = None;
+            self.anchor = None;
+        }
         self.path = path.clone();
-        self.entries.clear();
-        self.visible.clear();
-        self.selected.clear();
-        self.cursor = None;
-        self.anchor = None;
         self.pending_select = None;
         self.pending_select_keep = None;
         self.load = LoadState::Loading {
@@ -243,13 +298,36 @@ impl Pane {
 
     /// Drain listing messages. Returns true if anything changed (caller repaints).
     pub fn poll(&mut self) -> bool {
-        let Some(rx) = &self.rx else { return false };
-        let mut changed = false;
+        let mut changed = self.sync_tree_view();
+        changed |= self.poll_children();
+        let Some(rx) = &self.rx else {
+            if self.dirty_sort
+                && (!self.children_loading() || self.last_sort.elapsed().as_millis() >= 150)
+            {
+                self.resort();
+            }
+            return changed;
+        };
         let mut finished = None;
+        let mut open = Vec::new();
         // Bound the work per frame so a giant folder can't stall a frame.
         for _ in 0..64 {
             match rx.try_recv() {
+                Ok(ListMsg::Batch(b)) if self.staged.is_some() => {
+                    self.staged.as_mut().unwrap().extend(b);
+                }
                 Ok(ListMsg::Batch(b)) => {
+                    if self.view == ViewMode::Details && !self.expanded.is_empty() {
+                        open.extend(
+                            b.iter()
+                                .filter(|e| {
+                                    e.kind == EntryKind::Dir
+                                        && self.expanded.contains(&e.path)
+                                        && !self.children.contains_key(&e.path)
+                                })
+                                .map(|e| e.path.clone()),
+                        );
+                    }
                     self.entries.extend(b);
                     // Field-level update: `rx` is still borrowed from `self`.
                     self.listing_rev = next_listing_rev();
@@ -267,20 +345,34 @@ impl Pane {
                 Err(_) => break,
             }
         }
+        for dir in open {
+            self.start_child_load(dir);
+        }
         if let Some(state) = finished {
+            if let Some(fresh) = self.staged.take() {
+                // A refresh finished (a failed one leaves nothing listed, as before).
+                let fresh = if matches!(state, LoadState::Failed(_)) { Vec::new() } else { fresh };
+                let dir = self.path.clone();
+                self.reshape(|pane| pane.swap_children(&dir, fresh));
+            }
             self.load = state;
             self.rx = None;
             self.dirty_sort = true;
             changed = true;
             // `refresh` keeps the old selection; forget paths that are no longer listed.
+            // Items inside open folders may still be on their way.
             if !self.selected.is_empty() {
                 let listed: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
-                self.selected.retain(|p| listed.contains(p.as_path()));
+                let expanded = &self.expanded;
+                self.selected.retain(|p| {
+                    listed.contains(p.as_path()) || p.parent().is_some_and(|d| expanded.contains(d))
+                });
             }
         }
         if self.dirty_sort {
             // While streaming, re-sort at most every ~150ms; always sort when done.
-            let due = !self.is_loading() || self.last_sort.elapsed().as_millis() >= 150;
+            let due = (!self.is_loading() && !self.children_loading())
+                || self.last_sort.elapsed().as_millis() >= 150;
             if due {
                 self.resort();
             }
@@ -289,11 +381,10 @@ impl Pane {
             if let Some(name) = self.pending_select.take() {
                 self.select_name(&name);
             }
-            if let Some(name) = self.pending_select_keep.take() {
-                self.cursor = self
-                    .visible
-                    .iter()
-                    .position(|&i| self.entries[i].name.eq_ignore_ascii_case(&name));
+            // By path: names repeat across open folders. An item inside an open folder
+            // that is still listing falls back to the folder.
+            if let Some(path) = self.pending_select_keep.take() {
+                self.cursor = self.row_of_nearest(&path);
             }
         }
         changed
@@ -352,19 +443,28 @@ impl Pane {
     pub fn rebuild_visible(&mut self) {
         self.listing_changed();
         let plain = self.filter_text.trim().to_lowercase();
-        self.visible = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| (self.show_hidden || !e.hidden) && (self.show_system || !e.system))
-            .filter(|(_, e)| match (&self.filter_query, &self.filter_error) {
-                (Some(q), _) => q.matches_entry(e),
-                // Unparseable query: fall back to plain substring so typing never "breaks".
-                (None, Some(_)) => e.name.to_lowercase().contains(&plain),
-                (None, None) => true,
-            })
-            .map(|(i, _)| i)
-            .collect();
+        let shown = |e: &FileEntry| (self.show_hidden || !e.hidden) && (self.show_system || !e.system);
+        let matches = |e: &FileEntry| match (&self.filter_query, &self.filter_error) {
+            (Some(q), _) => q.matches_entry(e),
+            // Unparseable query: fall back to plain substring so typing never "breaks".
+            (None, Some(_)) => e.name.to_lowercase().contains(&plain),
+            (None, None) => true,
+        };
+        if self.children.is_empty() {
+            self.visible = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| shown(e) && matches(e))
+                .map(|(i, _)| i)
+                .collect();
+            self.depth = Vec::new();
+        } else {
+            let (visible, depth) =
+                flatten_tree(&self.entries, &self.path, &self.expanded, shown, matches);
+            self.visible = visible;
+            self.depth = depth;
+        }
         if let Some(c) = self.cursor {
             if c >= self.visible.len() {
                 self.cursor = self.visible.len().checked_sub(1);
@@ -409,11 +509,15 @@ impl Pane {
     }
 
     pub fn select_name(&mut self, name: &str) {
-        if let Some(v) = self
-            .visible
-            .iter()
-            .position(|&i| self.entries[i].name.eq_ignore_ascii_case(name))
-        {
+        // Names repeat across open folders: the item under the cursor wins.
+        let at_cursor = self
+            .cursor
+            .filter(|_| self.cursor_entry().is_some_and(|e| e.name.eq_ignore_ascii_case(name)));
+        if let Some(v) = at_cursor.or_else(|| {
+            self.visible
+                .iter()
+                .position(|&i| self.entries[i].name.eq_ignore_ascii_case(name))
+        }) {
             self.click(v, false, false);
             self.scroll_to_cursor = true;
         }
@@ -581,6 +685,309 @@ impl Pane {
         self.click(vis, ctrl || self.sticky, shift);
     }
 
+    // -----------------------------------------------------------------------
+    // Folders opened in place
+    // -----------------------------------------------------------------------
+
+    /// Tree depth of a visible row (0 for the folder's own entries).
+    pub fn depth_at(&self, vis: usize) -> usize {
+        self.depth.get(vis).copied().unwrap_or(0) as usize
+    }
+
+    /// Whether `entry` can be opened in place: a real folder, in details view. Links are
+    /// left out so a junction loop cannot open forever.
+    pub fn can_expand(&self, entry: &FileEntry) -> bool {
+        self.view == ViewMode::Details && entry.kind == EntryKind::Dir
+    }
+
+    pub fn is_expanded(&self, path: &Path) -> bool {
+        self.view == ViewMode::Details && self.expanded.contains(path)
+    }
+
+    /// The open folder's listing is still streaming in.
+    pub fn is_child_loading(&self, path: &Path) -> bool {
+        self.children.get(path).is_some_and(|c| c.loading && c.staged.is_none())
+    }
+
+    fn children_loading(&self) -> bool {
+        self.children.values().any(|c| c.loading)
+    }
+
+    /// Open or close a listed folder in place. Closing forgets the items listed below it
+    /// (and drops them from the selection); folders open inside it stay remembered.
+    pub fn set_expanded(&mut self, path: &Path, open: bool) {
+        if open {
+            let listed = self
+                .entries
+                .iter()
+                .any(|e| e.path == path && self.can_expand(e));
+            if !listed || self.children.contains_key(path) {
+                return;
+            }
+            self.expanded.insert(path.to_path_buf());
+            self.reshape(|pane| pane.start_child_load(path.to_path_buf()));
+        } else if self.expanded.remove(path) {
+            // A cursor inside the folder moves to the folder.
+            self.reshape(|pane| pane.drop_children(path, true));
+            self.scroll_to_cursor = true;
+        }
+    }
+
+    pub fn toggle_expanded_at(&mut self, vis: usize) {
+        if let Some(e) = self.entry_at(vis).filter(|e| self.can_expand(e)) {
+            let path = e.path.clone();
+            let open = !self.expanded.contains(&path);
+            self.set_expanded(&path, open);
+        }
+    }
+
+    /// Right arrow in details view: open the folder under the cursor, or step into it when
+    /// it is already open. Returns false when the key has nothing to do.
+    pub fn tree_right(&mut self) -> bool {
+        let Some(cur) = self.cursor else { return false };
+        let Some(e) = self.entry_at(cur).filter(|e| self.can_expand(e)) else {
+            return false;
+        };
+        let path = e.path.clone();
+        if !self.children.contains_key(&path) {
+            self.set_expanded(&path, true);
+        } else if cur + 1 < self.visible.len() && self.depth_at(cur + 1) > self.depth_at(cur) {
+            self.click(cur + 1, false, false);
+            self.scroll_to_cursor = true;
+        }
+        true
+    }
+
+    /// Left arrow in details view: close the open folder under the cursor, or go to the
+    /// folder that contains the item.
+    pub fn tree_left(&mut self) -> bool {
+        let Some(cur) = self.cursor else { return false };
+        let Some(e) = self.entry_at(cur) else { return false };
+        let path = e.path.clone();
+        if self.can_expand(e) && self.children.contains_key(&path) {
+            self.set_expanded(&path, false);
+            return true;
+        }
+        if self.depth_at(cur) == 0 {
+            return false;
+        }
+        let parent = path.parent().map(Path::to_path_buf);
+        if let Some(v) = self
+            .visible
+            .iter()
+            .position(|&i| Some(&self.entries[i].path) == parent.as_ref())
+        {
+            self.click(v, false, false);
+            self.scroll_to_cursor = true;
+        }
+        true
+    }
+
+    /// Whether `dir` is an open folder whose items this pane lists.
+    pub fn shows_children_of(&self, dir: &Path) -> bool {
+        self.children.contains_key(dir)
+    }
+
+    /// Re-list an open folder (its contents changed). Selected items inside are kept when
+    /// they are listed again.
+    pub fn reload_children(&mut self, dir: &Path) {
+        if !self.children.contains_key(dir) {
+            return;
+        }
+        self.start_listing(dir.to_path_buf(), true);
+    }
+
+    fn start_child_load(&mut self, dir: PathBuf) {
+        self.start_listing(dir, false);
+    }
+
+    /// Replace the rows listed below `dir` with a complete new listing of it. Rows of
+    /// subfolders that are gone go too; open subfolders that remain keep theirs.
+    fn swap_children(&mut self, dir: &Path, fresh: Vec<FileEntry>) {
+        let listed: HashSet<&Path> = fresh.iter().map(|e| e.path.as_path()).collect();
+        let gone: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.path.parent() == Some(dir) && !listed.contains(e.path.as_path()))
+            .map(|e| e.path.clone())
+            .collect();
+        drop(listed);
+        for path in &gone {
+            self.drop_children(path, true);
+            self.selected.remove(path);
+        }
+        let open: Vec<PathBuf> = fresh
+            .iter()
+            .filter(|e| {
+                e.kind == EntryKind::Dir
+                    && self.expanded.contains(&e.path)
+                    && !self.children.contains_key(&e.path)
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        self.entries.retain(|e| e.path.parent() != Some(dir));
+        self.entries.extend(fresh);
+        self.dirty_sort = true;
+        for path in open {
+            self.start_child_load(path);
+        }
+    }
+
+    fn start_listing(&mut self, dir: PathBuf, replace: bool) {
+        if let Some(old) = self.children.remove(&dir) {
+            old.cancel.cancel();
+        }
+        let id = self.next_child_id;
+        self.next_child_id += 1;
+        let cancel = CancelToken::new();
+        let tx = self.child_tx.clone();
+        let (thread_cancel, thread_dir) = (cancel.clone(), dir.clone());
+        let spawned = std::thread::Builder::new()
+            .name("list-subdir".into())
+            .spawn(move || {
+                let r = listing::list_dir_streaming(&thread_dir, 2048, &thread_cancel, |b| {
+                    let _ = tx.send((id, thread_dir.clone(), ListMsg::Batch(b)));
+                });
+                let msg = match r {
+                    Ok(errors) => ListMsg::Done { errors },
+                    Err(e) => ListMsg::Failed(e.to_string()),
+                };
+                let _ = tx.send((id, thread_dir, msg));
+            });
+        let loading = spawned.is_ok();
+        let staged = replace.then(Vec::new);
+        self.children.insert(dir, ChildLoad { id, cancel, loading, staged });
+    }
+
+    /// Remove everything listed below `dir` and cancel those listings.
+    fn drop_children(&mut self, dir: &Path, deselect: bool) {
+        let inside = |p: &Path| p != dir && p.starts_with(dir);
+        self.children.retain(|path, load| {
+            let keep = !path.starts_with(dir);
+            if !keep {
+                load.cancel.cancel();
+            }
+            keep
+        });
+        self.entries.retain(|e| !inside(&e.path));
+        if deselect {
+            self.selected.retain(|p| !inside(p));
+        }
+    }
+
+    /// Drain the open folders' listings (bounded per frame, like the main listing).
+    fn poll_children(&mut self) -> bool {
+        let mut changed = false;
+        let mut open = Vec::new();
+        let mut swaps = Vec::new();
+        for _ in 0..64 {
+            let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
+            let Some(load) = self.children.get_mut(&dir).filter(|l| l.id == id) else {
+                continue;
+            };
+            match msg {
+                ListMsg::Batch(b) if load.staged.is_some() => {
+                    load.staged.as_mut().unwrap().extend(b);
+                    continue;
+                }
+                ListMsg::Done { .. } if load.staged.is_some() => {
+                    load.loading = false;
+                    swaps.push((dir, load.staged.take().unwrap()));
+                    continue;
+                }
+                ListMsg::Failed(_) if load.staged.is_some() => {
+                    // Keep the rows that were listed; the folder may be back next time.
+                    load.loading = false;
+                    load.staged = None;
+                    continue;
+                }
+                ListMsg::Batch(b) => {
+                    if self.view == ViewMode::Details {
+                        open.extend(
+                            b.iter()
+                                .filter(|e| e.kind == EntryKind::Dir && self.expanded.contains(&e.path))
+                                .map(|e| e.path.clone()),
+                        );
+                    }
+                    self.entries.extend(b);
+                }
+                ListMsg::Done { .. } | ListMsg::Failed(_) => load.loading = false,
+            }
+            self.dirty_sort = true;
+            changed = true;
+        }
+        for dir in open {
+            self.start_child_load(dir);
+        }
+        if !swaps.is_empty() {
+            self.reshape(|pane| {
+                for (dir, fresh) in swaps {
+                    pane.swap_children(&dir, fresh);
+                }
+            });
+            changed = true;
+        }
+        changed
+    }
+
+    /// Leaving details view closes the tree (the open folders stay remembered); coming back
+    /// lists them again.
+    fn sync_tree_view(&mut self) -> bool {
+        if self.view == self.tree_view {
+            return false;
+        }
+        self.tree_view = self.view;
+        self.reshape(|pane| {
+            if pane.view != ViewMode::Details {
+                let open: Vec<PathBuf> = pane.children.keys().cloned().collect();
+                for dir in open {
+                    pane.drop_children(&dir, true);
+                }
+            } else {
+                let open: Vec<PathBuf> = pane
+                    .entries
+                    .iter()
+                    .filter(|e| e.kind == EntryKind::Dir && pane.expanded.contains(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                for dir in open {
+                    pane.start_child_load(dir);
+                }
+            }
+        });
+        true
+    }
+
+    /// Change the tree's shape, then rebuild the rows. `change` may remove entries, which
+    /// invalidates row indices, so the cursor and anchor are carried over by path (to the
+    /// nearest listed folder above them when their item is gone).
+    fn reshape(&mut self, change: impl FnOnce(&mut Self)) {
+        let path_at = |pane: &Self, vis: Option<usize>| {
+            vis.and_then(|v| pane.entry_at(v)).map(|e| e.path.clone())
+        };
+        let cursor = path_at(self, self.cursor);
+        let anchor = path_at(self, self.anchor);
+        change(self);
+        self.cursor = None;
+        self.anchor = None;
+        self.visible.clear();
+        if self.dirty_sort {
+            self.resort();
+        } else {
+            self.rebuild_visible();
+        }
+        self.cursor = cursor.and_then(|p| self.row_of_nearest(&p));
+        self.anchor = anchor.and_then(|p| self.row_of_nearest(&p));
+    }
+
+    /// Row of `path`, or of its nearest listed parent folder.
+    fn row_of_nearest(&self, path: &Path) -> Option<usize> {
+        path.ancestors()
+            .take_while(|p| *p != self.path)
+            .find_map(|p| self.visible.iter().position(|&i| self.entries[i].path == p))
+    }
+
+
     /// Jump to the next entry whose name starts with the typed prefix (type-ahead find).
     pub fn type_ahead(&mut self, prefix: &str) {
         let p = prefix.to_lowercase();
@@ -604,7 +1011,84 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         self.cancel.cancel();
+        for load in self.children.values() {
+            load.cancel.cancel();
+        }
     }
+}
+
+/// Display order of a folder with some subfolders opened in place: each level in `entries`
+/// order (already sorted), every expanded folder followed by its children, one level deeper.
+/// `shown` applies the hidden/system rules (a hidden folder hides its children too);
+/// `matches` is the filter. A folder that does not match stays listed while one of its
+/// descendants does, so a match is never shown without the folders that lead to it.
+/// Returns the indices into `entries` and the depth of each.
+pub(crate) fn flatten_tree(
+    entries: &[FileEntry],
+    root: &Path,
+    expanded: &HashSet<PathBuf>,
+    shown: impl Fn(&FileEntry) -> bool,
+    matches: impl Fn(&FileEntry) -> bool,
+) -> (Vec<usize>, Vec<u16>) {
+    let mut by_parent: HashMap<&Path, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if let Some(parent) = e.path.parent() {
+            by_parent.entry(parent).or_default().push(i);
+        }
+    }
+    let mut out = (Vec::new(), Vec::new());
+    // Explicit stack instead of recursion: (parent, depth, next child position, row of the
+    // folder whose children these are, or None for the root).
+    struct Level<'a> {
+        children: &'a [usize],
+        next: usize,
+        depth: u16,
+        /// Row of the folder that owns this level and whether it matched the filter.
+        owner: Option<(usize, bool)>,
+    }
+    let empty: Vec<usize> = Vec::new();
+    let mut stack = vec![Level {
+        children: by_parent.get(root).unwrap_or(&empty),
+        next: 0,
+        depth: 0,
+        owner: None,
+    }];
+    while let Some(level) = stack.last_mut() {
+        let Some(&i) = level.children.get(level.next) else {
+            let done = stack.pop().unwrap();
+            if let Some((row, matched)) = done.owner {
+                // A folder that does not match is kept only when something below it is.
+                if !matched && out.0.len() == row + 1 {
+                    out.0.pop();
+                    out.1.pop();
+                }
+            }
+            continue;
+        };
+        level.next += 1;
+        let depth = level.depth;
+        let e = &entries[i];
+        if !shown(e) {
+            continue;
+        }
+        let matched = matches(e);
+        let opens = e.kind == EntryKind::Dir && expanded.contains(&e.path);
+        if opens {
+            let row = out.0.len();
+            out.0.push(i);
+            out.1.push(depth);
+            stack.push(Level {
+                children: by_parent.get(e.path.as_path()).unwrap_or(&empty),
+                next: 0,
+                depth: depth + 1,
+                owner: Some((row, matched)),
+            });
+        } else if matched {
+            out.0.push(i);
+            out.1.push(depth);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -864,5 +1348,340 @@ mod tests {
         assert_eq!(pane.selected.len(), 2, "and keeps what was picked");
         pane.escape();
         assert!(pane.selected.is_empty());
+    }
+
+    fn fake_entry(root: &Path, rel: &str, kind: EntryKind) -> FileEntry {
+        let path = root.join(rel);
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        FileEntry {
+            path,
+            name,
+            kind,
+            size: 1,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            ext: "".into(),
+        }
+    }
+
+    fn open_set(paths: &[PathBuf]) -> HashSet<PathBuf> {
+        paths.iter().cloned().collect()
+    }
+
+    #[test]
+    fn flatten_tree_lists_open_folders_depth_first() {
+        let root = Path::new(r"C:\root");
+        let entries = vec![
+            fake_entry(root, "a", EntryKind::Dir),
+            fake_entry(root, "a/x.txt", EntryKind::File),
+            fake_entry(root, "a/sub", EntryKind::Dir),
+            fake_entry(root, "a/sub/deep.txt", EntryKind::File),
+            fake_entry(root, "b.txt", EntryKind::File),
+            fake_entry(root, "c", EntryKind::Dir),
+            fake_entry(root, "c/k.txt", EntryKind::File),
+        ];
+        // `sub` is not open, so `deep.txt` stays out.
+        let expanded = open_set(&[root.join("a"), root.join("c")]);
+        let (rows, depth) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |_: &FileEntry| true,
+            |_: &FileEntry| true,
+        );
+        assert_eq!(rows, vec![0, 1, 2, 4, 5, 6]);
+        assert_eq!(depth, vec![0, 1, 1, 0, 0, 1]);
+
+        let closed = open_set(&[]);
+        let (rows, depth) = flatten_tree(
+            &entries,
+            root,
+            &closed,
+            |_: &FileEntry| true,
+            |_: &FileEntry| true,
+        );
+        assert_eq!(rows, vec![0, 4, 5]);
+        assert_eq!(depth, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn flatten_tree_hides_the_children_of_a_hidden_folder() {
+        let root = Path::new(r"C:\root");
+        let entries = vec![
+            fake_entry(root, "a", EntryKind::Dir),
+            fake_entry(root, "a/x.txt", EntryKind::File),
+            fake_entry(root, "b.txt", EntryKind::File),
+        ];
+        let expanded = open_set(&[root.join("a")]);
+        let (rows, depth) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |_: &FileEntry| true,
+            |_: &FileEntry| true,
+        );
+        assert_eq!(rows, vec![0, 1, 2]);
+        assert_eq!(depth, vec![0, 1, 0]);
+
+        let (rows, _) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |e: &FileEntry| e.name != "a",
+            |_: &FileEntry| true,
+        );
+        assert_eq!(rows, vec![2], "the open folder is hidden, so its children are too");
+    }
+
+    #[test]
+    fn flatten_tree_filter_keeps_folders_that_lead_to_a_match() {
+        let root = Path::new(r"C:\root");
+        let entries = vec![
+            fake_entry(root, "a", EntryKind::Dir),
+            fake_entry(root, "a/x.txt", EntryKind::File),
+            fake_entry(root, "a/sub", EntryKind::Dir),
+            fake_entry(root, "a/sub/deep.txt", EntryKind::File),
+            fake_entry(root, "b.txt", EntryKind::File),
+            fake_entry(root, "c", EntryKind::Dir),
+            fake_entry(root, "c/y.txt", EntryKind::File),
+        ];
+        let expanded = open_set(&[root.join("a"), root.join("a").join("sub"), root.join("c")]);
+
+        // `a` and `sub` do not match, but `deep.txt` below them does. `c` has no match at all.
+        let (rows, depth) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |_: &FileEntry| true,
+            |e: &FileEntry| e.name == "deep.txt",
+        );
+        assert_eq!(rows, vec![0, 2, 3]);
+        assert_eq!(depth, vec![0, 1, 2]);
+
+        // A matching child under a matching folder stays, with the sibling that does not match dropped.
+        let (rows, depth) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |_: &FileEntry| true,
+            |e: &FileEntry| e.name == "a" || e.name == "x.txt",
+        );
+        assert_eq!(rows, vec![0, 1]);
+        assert_eq!(depth, vec![0, 1]);
+
+        // A matching folder stays even when nothing below it matches.
+        let (rows, _) = flatten_tree(
+            &entries,
+            root,
+            &expanded,
+            |_: &FileEntry| true,
+            |e: &FileEntry| e.name == "a",
+        );
+        assert_eq!(rows, vec![0]);
+    }
+
+    /// Waits until the pane's main listing and every open folder's listing have finished,
+    /// then takes the final poll so the rows are rebuilt.
+    fn settle(pane: &mut Pane) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            pane.poll();
+            let busy = pane.is_loading() || pane.expanded.iter().any(|p| pane.is_child_loading(p));
+            if !busy {
+                break;
+            }
+            assert!(Instant::now() < deadline, "folder listing timed out");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        pane.poll();
+    }
+
+    /// `root` holds `a/` (with `a1.txt` and `sub/deep.txt`) and `b.txt`.
+    fn tree_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a").join("sub")).unwrap();
+        std::fs::write(root.join("a").join("a1.txt"), b"a1").unwrap();
+        std::fs::write(root.join("a").join("sub").join("deep.txt"), b"deep").unwrap();
+        std::fs::write(root.join("b.txt"), b"b").unwrap();
+        (dir, root)
+    }
+
+    fn open_tree_pane(root: &Path) -> Pane {
+        let mut pane = Pane::new(root.to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        pane
+    }
+
+    fn row_of(pane: &Pane, name: &str) -> usize {
+        pane.visible
+            .iter()
+            .position(|&i| pane.entries[i].name == name)
+            .unwrap_or_else(|| panic!("{name} is not listed"))
+    }
+
+    #[test]
+    fn expanded_folders_list_their_children_in_place() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let sub = a.join("sub");
+        let mut pane = open_tree_pane(&root);
+
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "sub", "a1.txt", "b.txt"]);
+        assert_eq!(pane.depth, vec![0u16, 1, 1, 0]);
+
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "sub", "deep.txt", "a1.txt", "b.txt"]);
+        assert_eq!(pane.depth, vec![0u16, 1, 2, 1, 0]);
+
+        pane.set_expanded(&a, false);
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "b.txt"]);
+        assert!(pane.expanded.contains(&sub), "the nested folder stays remembered");
+        assert!(!pane.expanded.contains(&a));
+    }
+
+    #[test]
+    fn arrow_keys_open_step_into_and_close_folders() {
+        let (_dir, root) = tree_fixture();
+        let mut pane = open_tree_pane(&root);
+
+        pane.select_name("a");
+        assert!(pane.tree_right(), "right arrow opens the folder under the cursor");
+        settle(&mut pane);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+
+        assert!(pane.tree_right(), "right arrow on an open folder steps into it");
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("sub"));
+
+        assert!(pane.tree_left(), "left arrow on a closed nested item goes to its folder");
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+
+        assert!(pane.tree_left(), "left arrow on an open folder closes it");
+        assert!(!pane.expanded.contains(&root.join("a")));
+        assert_eq!(visible_names(&pane), ["a", "b.txt"]);
+    }
+
+    #[test]
+    fn selection_reaches_nested_items_and_collapsing_drops_them() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+
+        let nested = row_of(&pane, "a1.txt");
+        pane.click(nested, false, false);
+        let other = row_of(&pane, "b.txt");
+        pane.click(other, true, false);
+        let picked: Vec<&str> = pane
+            .selected_entries()
+            .into_iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(picked, ["a1.txt", "b.txt"]);
+
+        pane.set_expanded(&a, false);
+        assert_eq!(pane.selected.len(), 1, "the collapsed folder's item leaves the selection");
+        assert!(pane.selected.contains(&root.join("b.txt")));
+    }
+
+    #[test]
+    fn filter_applies_to_nested_items() {
+        let (_dir, root) = tree_fixture();
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&root.join("a"), true);
+        settle(&mut pane);
+
+        pane.set_filter("a1".into());
+        assert_eq!(visible_names(&pane), ["a", "a1.txt"]);
+    }
+
+    #[test]
+    fn leaving_details_view_closes_the_tree_and_returning_reopens_it() {
+        let (_dir, root) = tree_fixture();
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&root.join("a"), true);
+        settle(&mut pane);
+
+        pane.view = ViewMode::Grid;
+        pane.poll();
+        assert_eq!(visible_names(&pane), ["a", "b.txt"], "only the top level is shown");
+        assert!(pane.depth.is_empty());
+
+        pane.view = ViewMode::Details;
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "sub", "a1.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn reloading_an_open_folder_keeps_its_rows_until_the_new_listing_is_in() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        let a1 = row_of(&pane, "a1.txt");
+        pane.click(a1, false, false);
+
+        std::fs::write(a.join("a2.txt"), b"a2").unwrap();
+        std::fs::remove_dir_all(a.join("sub")).unwrap();
+        pane.reload_children(&a);
+        assert_eq!(
+            visible_names(&pane),
+            ["a", "sub", "a1.txt", "b.txt"],
+            "the old rows stay while the folder is listed again"
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while visible_names(&pane) != ["a", "a1.txt", "a2.txt", "b.txt"] {
+            pane.poll();
+            assert!(Instant::now() < deadline, "reload timed out: {:?}", visible_names(&pane));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(pane.depth, vec![0u16, 1, 1, 0]);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a1.txt"));
+        assert!(pane.selected.contains(&a.join("a1.txt")), "the selection survives");
+    }
+
+    #[test]
+    fn refresh_keeps_nested_rows_and_forgets_an_open_folder_that_is_gone() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+
+        pane.refresh();
+        assert!(
+            pane.entries.iter().any(|e| e.name == "a1.txt"),
+            "nested rows are not thrown away by a refresh"
+        );
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "sub", "a1.txt", "b.txt"]);
+
+        std::fs::remove_dir_all(&a).unwrap();
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["b.txt"]);
+        assert!(!pane.entries.iter().any(|e| e.name == "a1.txt"));
+        assert!(!pane.shows_children_of(&a));
+    }
+
+    #[test]
+    fn refresh_keeps_the_open_folders() {
+        let (_dir, root) = tree_fixture();
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&root.join("a"), true);
+        settle(&mut pane);
+
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["a", "sub", "a1.txt", "b.txt"]);
     }
 }

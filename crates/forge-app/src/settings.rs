@@ -283,6 +283,8 @@ pub struct TabSession {
     /// The right pane's view and sort, when they differ from the left pane's.
     pub right_view: Lenient<Option<ViewMode>>,
     pub right_sort: Lenient<Option<SortSpec>>,
+    /// Folders opened in place in this tab's details view.
+    pub expanded: Vec<PathBuf>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -428,6 +430,7 @@ mod tests {
                 sort: Some(SortSpec { descending: true, ..Default::default() }).into(),
                 right_view: Some(ViewMode::Details).into(),
                 right_sort: None.into(),
+                expanded: Vec::new(),
                 extra: Default::default(),
             }],
             active_tab: 0,

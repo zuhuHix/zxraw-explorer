@@ -291,6 +291,9 @@ fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
     }
 }
 
+/// Width of one tree level in details view, and of a folder's disclosure arrow.
+const TREE_INDENT: f32 = 16.0;
+
 fn row_click(resp: &egui::Response, pane: &mut Pane, vis: usize, out: &mut Vec<ViewEvent>) {
     let m = resp.ctx.input(|i| i.modifiers);
     if resp.clicked() {
@@ -876,6 +879,16 @@ fn handle_focused_view_keys(
                 egui::Key::ArrowLeft if columns > 1 => {
                     pane.move_cursor(-1, modifiers.shift, modifiers.command)
                 }
+                // Details view: Right/Left open and close folders in place. egui would also
+                // move keyboard focus out of the list with a bare arrow; cancel that.
+                egui::Key::ArrowRight if !modifiers.shift && !modifiers.command => {
+                    pane.tree_right();
+                    ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                }
+                egui::Key::ArrowLeft if !modifiers.shift && !modifiers.command => {
+                    pane.tree_left();
+                    ui.memory_mut(|memory| memory.move_focus(egui::FocusDirection::None));
+                }
                 egui::Key::PageDown => pane.move_cursor(20, modifiers.shift, modifiers.command),
                 egui::Key::PageUp => pane.move_cursor(-20, modifiers.shift, modifiers.command),
                 egui::Key::Home => pane.move_cursor(-(1 << 30), modifiers.shift, modifiers.command),
@@ -1280,6 +1293,8 @@ pub fn details(
         Sense::click_and_drag(),
     );
     crate::testhook::note_view_rect(ui, background.rect);
+    // A click on a folder's disclosure arrow, applied after the rows are drawn.
+    let mut toggle_folder = None;
     let sa = scroll.show_rows(ui, row_h, n, |ui, range| {
         for vis in range {
             let Some(&entry_index) = pane.visible.get(vis) else {
@@ -1335,14 +1350,40 @@ pub fn details(
             let cy = rect.center().y;
             let mut col_x = rect.left();
             let name_column = columns[0];
+            // Folders open in place: each level is indented, and folders get an arrow.
+            let indent = TREE_INDENT * pane.depth_at(vis) as f32;
+            let expandable = pane.can_expand(entry);
+            let expanded = expandable && pane.is_expanded(&entry.path);
+            let arrow_rect = Rect::from_min_size(
+                pos2(col_x + 4.0 + indent, rect.top()),
+                vec2(TREE_INDENT, row_h),
+            );
+            if expandable {
+                let arrow = if !expanded {
+                    "\u{23F5}"
+                } else if pane.is_child_loading(&entry.path) {
+                    "\u{2026}"
+                } else {
+                    "\u{23F7}"
+                };
+                let hovered = response.hover_pos().is_some_and(|p| arrow_rect.contains(p));
+                let color = if selected || hovered {
+                    text_color
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                painter.text(arrow_rect.center(), Align2::CENTER_CENTER, arrow, small.clone(), color);
+                crate::testhook::note_arrow_rect(ui, &entry.path, arrow_rect.intersect(rect));
+            }
+            let tree_left = col_x + 4.0 + indent + TREE_INDENT - 8.0;
             painter.text(
-                pos2(col_x + 8.0, cy),
+                pos2(tree_left + 8.0, cy),
                 Align2::LEFT_CENTER,
                 icon_for(entry),
                 font.clone(),
                 icon_color(entry),
             );
-            let mut name_left = col_x + 30.0;
+            let mut name_left = tree_left + 30.0;
             if let Some(label_color) = annotation
                 .and_then(|value| value.label)
                 .and_then(|index| theme::LABEL_COLORS.get(index as usize))
@@ -1444,6 +1485,11 @@ pub fn details(
                 Some(&description),
                 Some(selected),
             );
+            if expandable {
+                response
+                    .ctx
+                    .accesskit_node_builder(response.id, |node| node.set_expanded(expanded));
+            }
             let should_follow_cursor = focused && pane.cursor == Some(vis);
             let focused_id = ui.memory(|memory| memory.focused());
             let cursor_owner = ui
@@ -1464,8 +1510,20 @@ pub fn details(
                 response
             };
             let entry_clone = entry.clone();
-            begin_drag(&response, pane, &entry_clone);
-            row_click(&response, pane, vis, &mut out);
+            let on_arrow = expandable
+                && response
+                    .interact_pointer_pos()
+                    .is_some_and(|p| arrow_rect.contains(p));
+            if on_arrow {
+                if response.clicked() {
+                    response.request_focus();
+                    toggle_folder = Some(vis);
+                    out.push(ViewEvent::Focus);
+                }
+            } else {
+                begin_drag(&response, pane, &entry_clone);
+                row_click(&response, pane, vis, &mut out);
+            }
             if response.clicked() || response.secondary_clicked() {
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(id.with("accessible-focus"), response.id);
@@ -1478,6 +1536,9 @@ pub fn details(
         }
     });
     ui.spacing_mut().item_spacing = previous_spacing;
+    if let Some(vis) = toggle_folder {
+        pane.toggle_expanded_at(vis);
+    }
     ui.ctx()
         .data_mut(|data| data.insert_temp(id.with("off"), sa.state.offset.y));
     ui.ctx()
