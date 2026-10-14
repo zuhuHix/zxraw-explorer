@@ -486,12 +486,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 Cmd::ChecksumFiles => Tool::Checksums,
                 _ => Tool::CompareFolders,
             };
-            let sel: Vec<PathBuf> = app
-                .pane()
-                .selected_entries()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect();
+            let sel: Vec<PathBuf> = app.pane().selected_roots();
             let other = app.tab().other().map(|p| p.path.clone());
             app.ops.tools.open(tool, dir, sel, other);
         }
@@ -652,7 +647,20 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             Err(e) => app.toast_err(e),
         }
     }
-    app.ops.watcher.sync(&folders);
+    // Folders opened in place are watched too (non-recursively, like the panes' folders),
+    // and stop being watched when they are closed.
+    let watched: Vec<PathBuf> = app
+        .tabs
+        .get(app.active)
+        .map(|t| {
+            std::iter::once(&t.left)
+                .chain(t.right.as_ref())
+                .flat_map(|p| p.open_folders().map(Path::to_path_buf))
+                .collect()
+        })
+        .unwrap_or_default();
+    let watched: Vec<PathBuf> = folders.iter().cloned().chain(watched).collect();
+    app.ops.watcher.sync(&watched);
     let tabs = &app.tabs;
     let due = app.ops.watcher.due(|d| {
         tabs.iter()

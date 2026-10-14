@@ -417,7 +417,12 @@ fn folders_open_in_place_with_arrows_and_clicks() {
          # Double-clicking a nested folder opens it as the current folder.\n\
          # (Let the refresh that follows the delete finish: steps pause while a pane loads.)\n\
          wait-frames 60\ndouble-click-entry Selects\nwait-entry best.txt\nassert-path {selects}\n\
-         navigate {work}\nwait-entry img_01.txt\nui browser assert-expanded-folder Shoot\nexit\n",
+         navigate {work}\nwait-entry img_01.txt\nui browser assert-expanded-folder Shoot\n\
+         # A change inside a nested open folder shows up: open folders are watched too.\n\
+         ui browser click-arrow Selects\nwait-entry best.txt\n\
+         ui tools external create {late}\nwait-entry late.txt | 15\n\
+         ui browser assert-depths late.txt=2\nexit\n",
+        late = shown(&work.join("Shoot").join("Selects").join("late.txt")),
         work = shown(&work),
         shot = shown(&shot),
         img02 = shown(&work.join("Shoot").join("img_02.txt")),        selects = shown(&work.join("Shoot").join("Selects")),

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use forge_core::{EntryKind, FileEntry};
 use forge_core::listing::{self, SortKey, SortSpec};
 use forge_core::query::Query;
@@ -32,6 +32,76 @@ struct ChildLoad {
     /// A re-listing of an already listed folder collects here and replaces the old rows
     /// when complete, so a change inside an open folder does not make its rows flicker.
     staged: Option<Vec<FileEntry>>,
+    /// Why the folder could not be listed (shown on its row).
+    error: Option<String>,
+}
+
+/// Folders opened in place are listed by a small shared pool of workers, so opening many
+/// folders never starts one thread each.
+const SUBDIR_WORKERS: usize = 4;
+/// Listing messages a pane may have waiting; a worker waits when its pane is this far behind.
+const SUBDIR_BACKLOG: usize = 64;
+
+type ChildMsg = (u64, PathBuf, ListMsg);
+
+struct ListJob {
+    id: u64,
+    dir: PathBuf,
+    cancel: CancelToken,
+    tx: Sender<ChildMsg>,
+}
+
+/// Queue of the shared listing workers (started on first use).
+fn subdir_queue() -> &'static Sender<ListJob> {
+    static QUEUE: std::sync::OnceLock<Sender<ListJob>> = std::sync::OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = unbounded::<ListJob>();
+        for n in 0..SUBDIR_WORKERS {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("list-subdir-{n}"))
+                .spawn(move || {
+                    for job in rx {
+                        // A folder closed (or relisted) while its job waited is skipped.
+                        if job.cancel.is_cancelled() {
+                            continue;
+                        }
+                        let r = listing::list_dir_streaming(&job.dir, 2048, &job.cancel, |b| {
+                            let _ = job.tx.send((job.id, job.dir.clone(), ListMsg::Batch(b)));
+                        });
+                        if job.cancel.is_cancelled() {
+                            continue;
+                        }
+                        let msg = match r {
+                            Ok(errors) => ListMsg::Done { errors },
+                            Err(e) => ListMsg::Failed(e.to_string()),
+                        };
+                        let _ = job.tx.send((job.id, job.dir, msg));
+                    }
+                });
+        }
+        tx
+    })
+}
+
+/// `paths` without the ones inside another of them: a selected folder already covers its
+/// contents, so an operation must not get both (a copy would duplicate the child, a move or
+/// delete would fail on it). Compared per component, ignoring case, as Windows does, so
+/// `C:\a\b` covers `C:\a\b\c` but not `C:\a\bc`.
+pub fn without_covered(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    fn key(path: &Path) -> Vec<String> {
+        path.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    }
+    let all: HashSet<Vec<String>> = paths.iter().map(|p| key(p)).collect();
+    paths
+        .into_iter()
+        .filter(|p| {
+            let k = key(p);
+            !(1..k.len()).any(|n| all.contains(&k[..n]))
+        })
+        .collect()
 }
 
 pub enum LoadState {
@@ -56,8 +126,8 @@ pub struct Pane {
     pub expanded: HashSet<PathBuf>,
     /// Listings of the open folders whose children are in `entries`.
     children: HashMap<PathBuf, ChildLoad>,
-    child_tx: Sender<(u64, PathBuf, ListMsg)>,
-    child_rx: Receiver<(u64, PathBuf, ListMsg)>,
+    child_tx: Sender<ChildMsg>,
+    child_rx: Receiver<ChildMsg>,
     next_child_id: u64,
     /// While a refresh lists the folder again, its entries collect here (see `load_path`).
     staged: Option<Vec<FileEntry>>,
@@ -115,7 +185,7 @@ fn next_listing_rev() -> u64 {
 
 impl Pane {
     pub fn new(path: PathBuf, sort: SortSpec, view: ViewMode) -> Self {
-        let (child_tx, child_rx) = unbounded();
+        let (child_tx, child_rx) = bounded(SUBDIR_BACKLOG);
         let mut p = Self {
             path: PathBuf::new(),
             back: Vec::new(),
@@ -392,14 +462,22 @@ impl Pane {
 
     pub fn resort(&mut self) {
         let cursor_path = self.cursor_entry().map(|e| e.path.clone());
+        let anchor_path = self.anchor.and_then(|a| self.entry_at(a)).map(|e| e.path.clone());
         listing::sort_entries(&mut self.entries, self.sort);
+        // Row indices are stale until `visible` is rebuilt; nothing may read them.
+        self.visible.clear();
         self.listing_changed();
         self.dirty_sort = false;
         self.last_sort = Instant::now();
         self.rebuild_visible();
         if let Some(p) = cursor_path {
-            self.cursor = self.visible.iter().position(|&i| self.entries[i].path == p);
+            self.cursor = self.row_of(&p);
         }
+        self.anchor = anchor_path.and_then(|p| self.row_of(&p));
+    }
+
+    fn row_of(&self, path: &Path) -> Option<usize> {
+        self.visible.iter().position(|&i| self.entries[i].path == path)
     }
 
     pub fn set_sort(&mut self, key: SortKey) {
@@ -440,7 +518,20 @@ impl Pane {
         self.anchor = row_of(self, anchor);
     }
 
+    /// Recompute the rows. The cursor and the Shift-select anchor stay on their items (by
+    /// path) while those are listed; a cursor whose item went away is clamped, an anchor is
+    /// dropped. Callers that changed `entries` must clear `visible` first.
     pub fn rebuild_visible(&mut self) {
+        let cursor_path = self.cursor_entry().map(|e| e.path.clone());
+        let anchor_path = self.anchor.and_then(|a| self.entry_at(a)).map(|e| e.path.clone());
+        self.rebuild_rows();
+        if let Some(row) = cursor_path.and_then(|p| self.row_of(&p)) {
+            self.cursor = Some(row);
+        }
+        self.anchor = anchor_path.and_then(|p| self.row_of(&p));
+    }
+
+    fn rebuild_rows(&mut self) {
         self.listing_changed();
         let plain = self.filter_text.trim().to_lowercase();
         let shown = |e: &FileEntry| (self.show_hidden || !e.hidden) && (self.show_system || !e.system);
@@ -473,7 +564,7 @@ impl Pane {
     }
 
     pub fn entry_at(&self, vis: usize) -> Option<&FileEntry> {
-        self.visible.get(vis).map(|&i| &self.entries[i])
+        self.visible.get(vis).and_then(|&i| self.entries.get(i))
     }
 
     pub fn cursor_entry(&self) -> Option<&FileEntry> {
@@ -492,13 +583,16 @@ impl Pane {
             .collect()
     }
 
+    /// Selected paths in display order, without the items inside a selected folder.
+    pub fn selected_roots(&self) -> Vec<PathBuf> {
+        without_covered(self.selected_entries().iter().map(|e| e.path.clone()).collect())
+    }
+
     /// Selected paths, or the cursor item if nothing is selected.
+    /// What an operation acts on: the selected paths (a folder covers the selected items
+    /// inside it, see [`without_covered`]), or the cursor item if nothing is selected.
     pub fn action_targets(&self) -> Vec<PathBuf> {
-        let sel: Vec<PathBuf> = self
-            .selected_entries()
-            .iter()
-            .map(|e| e.path.clone())
-            .collect();
+        let sel = self.selected_roots();
         if sel.is_empty() {
             self.cursor_entry()
                 .map(|e| vec![e.path.clone()])
@@ -713,6 +807,21 @@ impl Pane {
         self.children.values().any(|c| c.loading)
     }
 
+    /// Listing the folder or a folder opened in place (the app keeps repainting).
+    pub fn is_busy(&self) -> bool {
+        self.is_loading() || self.children_loading()
+    }
+
+    /// Why an open folder could not be listed.
+    pub fn child_error(&self, path: &Path) -> Option<&str> {
+        self.children.get(path).and_then(|c| c.error.as_deref())
+    }
+
+    /// Folders whose items are listed (the open folders), for the folder watcher.
+    pub fn open_folders(&self) -> impl Iterator<Item = &Path> {
+        self.children.keys().map(PathBuf::as_path)
+    }
+
     /// Open or close a listed folder in place. Closing forgets the items listed below it
     /// (and drops them from the selection); folders open inside it stay remembered.
     pub fn set_expanded(&mut self, path: &Path, open: bool) {
@@ -840,23 +949,16 @@ impl Pane {
         let id = self.next_child_id;
         self.next_child_id += 1;
         let cancel = CancelToken::new();
-        let tx = self.child_tx.clone();
-        let (thread_cancel, thread_dir) = (cancel.clone(), dir.clone());
-        let spawned = std::thread::Builder::new()
-            .name("list-subdir".into())
-            .spawn(move || {
-                let r = listing::list_dir_streaming(&thread_dir, 2048, &thread_cancel, |b| {
-                    let _ = tx.send((id, thread_dir.clone(), ListMsg::Batch(b)));
-                });
-                let msg = match r {
-                    Ok(errors) => ListMsg::Done { errors },
-                    Err(e) => ListMsg::Failed(e.to_string()),
-                };
-                let _ = tx.send((id, thread_dir, msg));
-            });
-        let loading = spawned.is_ok();
+        let job = ListJob {
+            id,
+            dir: dir.clone(),
+            cancel: cancel.clone(),
+            tx: self.child_tx.clone(),
+        };
+        let loading = subdir_queue().send(job).is_ok();
         let staged = replace.then(Vec::new);
-        self.children.insert(dir, ChildLoad { id, cancel, loading, staged });
+        let error = (!loading).then(|| "the folder could not be listed".to_string());
+        self.children.insert(dir, ChildLoad { id, cancel, loading, staged, error });
     }
 
     /// Remove everything listed below `dir` and cancel those listings.
@@ -895,10 +997,12 @@ impl Pane {
                     swaps.push((dir, load.staged.take().unwrap()));
                     continue;
                 }
-                ListMsg::Failed(_) if load.staged.is_some() => {
+                ListMsg::Failed(e) if load.staged.is_some() => {
                     // Keep the rows that were listed; the folder may be back next time.
                     load.loading = false;
                     load.staged = None;
+                    load.error = Some(e);
+                    changed = true;
                     continue;
                 }
                 ListMsg::Batch(b) => {
@@ -911,7 +1015,14 @@ impl Pane {
                     }
                     self.entries.extend(b);
                 }
-                ListMsg::Done { .. } | ListMsg::Failed(_) => load.loading = false,
+                ListMsg::Done { .. } => {
+                    load.loading = false;
+                    load.error = None;
+                }
+                ListMsg::Failed(e) => {
+                    load.loading = false;
+                    load.error = Some(e);
+                }
             }
             self.dirty_sort = true;
             changed = true;
@@ -1671,6 +1782,90 @@ mod tests {
         assert_eq!(visible_names(&pane), ["b.txt"]);
         assert!(!pane.entries.iter().any(|e| e.name == "a1.txt"));
         assert!(!pane.shows_children_of(&a));
+    }
+
+    #[test]
+    fn a_selected_folder_covers_the_selected_items_inside_it() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_covered(paths(&[
+                r"C:\a\b",
+                r"C:\A\B\c.txt",
+                r"C:\a\bc",
+                r"C:\a\b\sub\deep.txt",
+                r"C:\x.txt",
+            ])),
+            paths(&[r"C:\a\b", r"C:\a\bc", r"C:\x.txt"]),
+            "per component and ignoring case; order kept"
+        );
+
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "a"), false, false);
+        pane.click(row_of(&pane, "a1.txt"), true, false);
+        pane.click(row_of(&pane, "b.txt"), true, false);
+        assert_eq!(pane.selected.len(), 3);
+        assert_eq!(pane.action_targets(), vec![a, root.join("b.txt")]);
+    }
+
+    #[test]
+    fn the_shift_select_anchor_stays_on_its_item_when_rows_move() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.click(row_of(&pane, "b.txt"), false, false);
+
+        // Rows streamed in above the anchor.
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        assert_eq!(pane.anchor, Some(row_of(&pane, "b.txt")));
+        pane.click(row_of(&pane, "a1.txt"), false, true);
+        let picked: Vec<&str> = pane.selected_entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(picked, ["a1.txt", "b.txt"], "the range runs from the anchor's item");
+
+        // A re-sort moves the rows.
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.set_sort(SortKey::Name);
+        assert_eq!(pane.anchor, Some(row_of(&pane, "b.txt")));
+        // Its item filtered out: the anchor is dropped instead of pointing at another row.
+        pane.set_filter("a1".into());
+        assert_eq!(pane.anchor, None);
+    }
+
+    #[test]
+    fn an_open_folder_that_cannot_be_listed_reports_why() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        std::fs::remove_dir_all(&a).unwrap();
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        assert!(pane.child_error(&a).is_some(), "the folder row shows the error");
+        assert!(!pane.is_busy());
+    }
+
+    #[test]
+    fn many_open_folders_share_the_listing_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        for n in 0..12 {
+            let sub = root.join(format!("f{n:02}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("x.txt"), b"x").unwrap();
+        }
+        let mut pane = open_tree_pane(&root);
+        for n in 0..12 {
+            pane.set_expanded(&root.join(format!("f{n:02}")), true);
+        }
+        settle(&mut pane);
+        assert_eq!(pane.visible.len(), 24, "every folder and its file");
+        assert!(pane.depth.iter().filter(|&&d| d == 1).count() == 12);
+        // Closing a folder before its job ran drops the job.
+        pane.set_expanded(&root.join("f00"), false);
+        assert!(!pane.shows_children_of(&root.join("f00")));
     }
 
     #[test]
