@@ -633,6 +633,24 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
         )
         .weak(),
     );
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.label("Terminal for \"Open terminal here\"");
+        egui::ComboBox::from_id_salt("settings-terminal")
+            .selected_text(settings.terminal.label())
+            .show_ui(ui, |ui| {
+                for choice in crate::terminal::TerminalChoice::ALL {
+                    ui.selectable_value(&mut *settings.terminal, choice, choice.label());
+                }
+            });
+    });
+    ui.checkbox(&mut settings.git_badges, "Show Git status badges and branch");
+    ui.label(
+        RichText::new(
+            "In folders inside a Git repository, mark modified, new, ignored and conflicted              files. Needs Git installed; very large repositories are skipped.",
+        )
+        .weak(),
+    );
 }
 
 fn performance_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut SettingsUi) {

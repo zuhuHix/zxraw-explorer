@@ -201,6 +201,26 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   are never modified. Seven new writer tests (set/read back, remove, escaping and Unicode, other
   languages and unrelated content kept, unchanged updates write nothing) plus form-logic tests.
   Not checked against Lightroom or Bridge reading the new fields.
+* 🟡 Open terminal here — `forge-app/src/terminal.rs`, command `OpenTerminal` (Ctrl+Alt+T) and
+  `OpenTerminalAdmin`, on the folder and folder-background context menus. Auto picks Windows
+  Terminal, then PowerShell 7, Windows PowerShell, cmd (PowerShell first for UNC folders);
+  Settings › Browsing chooses one. Launched through `ShellExecuteW` (`forge-win` `launch_console`)
+  with a built argument string, never a shell string: Windows Terminal gets `-d` with `;` escaped
+  as `\;`, PowerShell gets an `-EncodedCommand` `Set-Location -LiteralPath`, cmd gets only a
+  working directory (or `pushd` for UNC). Unit tests (`terminal::tests`) round-trip every
+  terminal's arguments through a CommandLineToArgvW parser for folders with spaces, `&`, `%`,
+  `^`, `'`, `;`, Unicode, UNC and `\\?\` prefixes; e2e
+  `folder_context_menu_opens_a_terminal_in_that_folder` right-clicks a folder and clicks the menu
+  item (automated runs record the launch instead of opening a window). Windows Terminal's `\;`
+  handling was checked by hand once; the administrator variant was not run.
+* 🟡 Git status badges — `forge-app/src/git_status.rs`: modified, new (added or untracked),
+  ignored (dimmed) and conflicted entries, rolled up to folders, and the branch in the status
+  bar. `git status --porcelain=v2 -z` runs on one background thread with a 4 s and 8 MB limit
+  (a repository over either is skipped for the session), without optional locks, cached per
+  repository and refreshed when the folder watcher fires or after 15 s. Needs `git.exe` on
+  PATH or in Program Files. Unit tests cover porcelain parsing (renames, conflicts, untracked and
+  ignored folders, detached HEAD), roll-up, repo-root detection and one real `git init`
+  repository. Badge drawing is not covered by a test.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).

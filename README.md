@@ -189,6 +189,14 @@ Explorer is a file manager designed around that workflow:
   badge, notes follow files that ZXraw renames or moves, and search finds them (plain text,
   `note:proof`, `has:notes`). With XMP sync on, photo notes are also written to the sidecar as
   `xmpDM:logComment`, so your caption is never touched.
+- **Open a terminal here.** Right-click a folder or the empty part of a listing, or press
+  <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd>. It uses Windows Terminal when installed, otherwise
+  PowerShell, otherwise cmd; Settings › Browsing picks a specific one. An *as administrator*
+  variant is on the folder background menu.
+- **Git at a glance.** In a folder inside a Git repository, changed files get a small badge
+  (modified, new, conflict), ignored files are dimmed and the status bar shows the branch. It
+  runs `git status` in the background with a time limit, so huge repositories are simply skipped.
+  Turn it off in Settings › Browsing.
 
 <p align="center">
   <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/collections.jpg"><img src="docs/images/screens/collections.jpg" width="80%" alt="Collections window with a Lisbon portfolio collection and the New collection dialog open"></a>

@@ -9,6 +9,9 @@
 //!   (the check runs a few seconds after startup; needs `ZXRAW_UPDATE_API`).
 //! - `update-now`: press the notice's "Update now".
 //! - `assert-no-update`: require that no update notice is showing.
+//! - `click-menu <label>`: real click on the open context menu's item `label`.
+//! - `wait-terminal <folder> [| seconds]`: wait until "Open terminal here" has (in automated
+//!   runs, only recorded) a terminal launch for `folder`.
 //!
 //! Copy and move queue (the transfer queue; "waiting" means queued, not running):
 //! - `pause-queue` / `resume-queue`: hold or release the queue. Waiting transfers stay queued
@@ -160,6 +163,39 @@ pub(super) fn step(
             None => Ok(Flow::Done),
             Some(update) => Err(format!("an update notice offers {}", update.version)),
         },
+        "click-menu" => {
+            let label = args.trim();
+            if label.is_empty() {
+                return Err("`click-menu` needs a menu item label".into());
+            }
+            if st.data.is_none() {
+                let Some(rect) = super::drawn_rect(ctx, super::menu_rect_id(label)) else {
+                    if elapsed(st) >= WAIT_LIMIT {
+                        return Err(format!("menu item `{label}` is not shown"));
+                    }
+                    return Ok(Flow::Wait(format!("waiting for menu item `{label}`")));
+                };
+                st.data = Some(Box::new(rect.center()));
+            }
+            let pos = *st
+                .data
+                .as_ref()
+                .and_then(|d| d.downcast_ref::<egui::Pos2>())
+                .ok_or("click-menu lost its position")?;
+            super::pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
+        }
+        "wait-terminal" => {
+            let (folder, timeout) = filename_and_timeout(args)?;
+            let want = Path::new(folder);
+            match crate::terminal::recorded() {
+                Some(l) if l.cwd.as_os_str().eq_ignore_ascii_case(want.as_os_str()) => Ok(Flow::Done),
+                last if elapsed(st) >= timeout => Err(format!(
+                    "no terminal was launched in `{folder}` (last: {:?})",
+                    last.map(|l| l.cwd)
+                )),
+                _ => Ok(Flow::Wait(format!("waiting for a terminal in `{folder}`"))),
+            }
+        }
         _ => Err(format!("unknown `ui system` verb `{verb}`")),
     }
 }

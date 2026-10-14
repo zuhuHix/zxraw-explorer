@@ -187,6 +187,10 @@ pub struct Settings {
     pub restore_session: bool,
     /// What typing in the file list does: jump to a name (default) or filter the list.
     pub list_typing: Lenient<ListTyping>,
+    /// The terminal "Open terminal here" starts (see `terminal`).
+    pub terminal: Lenient<crate::terminal::TerminalChoice>,
+    /// Show Git status badges and the branch for folders inside a Git repository.
+    pub git_badges: bool,
     /// Settings this version doesn't know (written by a newer one), kept so saving doesn't
     /// drop them.
     #[serde(flatten)]
@@ -227,6 +231,8 @@ impl Default for Settings {
             layouts: Vec::new(),
             restore_session: true,
             list_typing: ListTyping::Jump.into(),
+            terminal: Default::default(),
+            git_badges: true,
             extra: Extra::new(),
         }
     }

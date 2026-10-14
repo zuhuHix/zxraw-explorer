@@ -138,12 +138,14 @@ pub struct Actions {
     pub tags_ui: crate::tags_ui::TagsUi,
     pub ffmpeg_setup: crate::ffmpeg_setup::FfmpegSetup,
     pub updater: crate::updater::Updater,
+    pub git: crate::git_status::GitStatus,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
 pub struct GridProvider<'a> {
     thumbs: &'a mut crate::thumbs::ThumbManager,
     annotations: &'a std::collections::HashMap<PathBuf, crate::views::Annotation>,
+    git: &'a crate::git_status::GitStatus,
 }
 
 impl ThumbProvider for GridProvider<'_> {
@@ -160,6 +162,9 @@ impl ThumbProvider for GridProvider<'_> {
             .get(path)
             .copied()
             .filter(|a| *a != Default::default())
+    }
+    fn git_badge(&self, path: &Path, is_dir: bool) -> Option<crate::git_status::GitBadge> {
+        self.git.badge(path, is_dir)
     }
 }
 
@@ -189,6 +194,7 @@ impl Actions {
             tags_ui: Default::default(),
             ffmpeg_setup: Default::default(),
             updater: Default::default(),
+            git: crate::git_status::GitStatus::new(ctx.clone()),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -220,6 +226,7 @@ impl Actions {
         GridProvider {
             thumbs: &mut self.thumbs,
             annotations: &self.library.annotations,
+            git: &self.git,
         }
     }
 }
@@ -330,6 +337,21 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 app.ops
                     .spawn_shell("Open with", move || forge_win::open_with_dialog(&p));
             }
+        }
+        Cmd::OpenTerminal | Cmd::OpenTerminalAdmin => {
+            // A folder the command was invoked on, otherwise the folder shown.
+            let target = app.pane().action_targets().into_iter().next();
+            let choice = *app.settings.terminal;
+            let elevated = cmd == Cmd::OpenTerminalAdmin;
+            let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+            // Off the UI thread: probing the folder and starting the shell can block.
+            std::thread::spawn(move || {
+                let folder = target.filter(|t| t.is_dir()).unwrap_or(dir);
+                if let Err(e) = crate::terminal::open(choice, &folder, elevated) {
+                    let _ = tx.send(Event::Error(format!("Open terminal failed: {e}")));
+                    ctx.request_repaint();
+                }
+            });
         }
         Cmd::RevealInExplorer => {
             let p = app
@@ -702,11 +724,15 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             .map(|p| p.entries.len())
             .unwrap_or(0)
     });
+    app.ops.git.set_enabled(app.settings.git_badges);
+    app.ops.git.track(&folders);
+    let git_changed = app.ops.git.poll();
     for d in &due {
+        app.ops.git.invalidate(d);
         app.ops.thumbs.invalidate_dir(d);
         app.refresh_all_showing(d);
     }
-    let mut changed = app.ops.thumbs.begin_frame(folders) || !due.is_empty();
+    let mut changed = app.ops.thumbs.begin_frame(folders) || !due.is_empty() || git_changed;
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     // A finished "Select originals/exports" match (computed off the UI thread).
     changed |= crate::export_assoc::poll(app);

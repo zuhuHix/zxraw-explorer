@@ -103,6 +103,8 @@ pub enum Cmd {
     LoadLayout,
     ManageLayouts,
     ToggleStickySelection,
+    OpenTerminal,
+    OpenTerminalAdmin,
 }
 
 impl Cmd {
@@ -203,6 +205,8 @@ impl Cmd {
         Cmd::LoadLayout,
         Cmd::ManageLayouts,
         Cmd::ToggleStickySelection,
+        Cmd::OpenTerminal,
+        Cmd::OpenTerminalAdmin,
     ];
 
     /// Stable identifier used as the key in `Settings::keybindings`. Never rename one: it's
@@ -305,6 +309,8 @@ impl Cmd {
             Self::LoadLayout => "LoadLayout",
             Self::ManageLayouts => "ManageLayouts",
             Self::ToggleStickySelection => "ToggleStickySelection",
+            Self::OpenTerminal => "OpenTerminal",
+            Self::OpenTerminalAdmin => "OpenTerminalAdmin",
         }
     }
 
@@ -407,6 +413,8 @@ impl Cmd {
             LoadLayout => "Load layout…",
             ManageLayouts => "Manage layouts…",
             ToggleStickySelection => "Sticky selection (click adds or removes)",
+            OpenTerminal => "Open terminal here",
+            OpenTerminalAdmin => "Open terminal here as administrator",
         }
     }
 
@@ -414,6 +422,7 @@ impl Cmd {
         use Cmd::*;
         let c = Modifiers::COMMAND;
         let cs = Modifiers::COMMAND | Modifiers::SHIFT;
+        let ca = Modifiers::COMMAND | Modifiers::ALT;
         let a = Modifiers::ALT;
         let s = Modifiers::SHIFT;
         let n = Modifiers::NONE;
@@ -476,6 +485,7 @@ impl Cmd {
             MarkReject => k(c, Key::Delete),
             Unflag => k(c, Key::U),
             ToggleStickySelection => k(cs, Key::S),
+            OpenTerminal => k(ca, Key::T),
             _ => None,
         }
     }

@@ -331,3 +331,27 @@ fn update_with_a_tampered_installer_is_refused() {
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
+
+#[test]
+fn folder_context_menu_opens_a_terminal_in_that_folder() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let media = sandbox.path().join("media");
+    let profile = sandbox.path().join("profile");
+    // Characters cmd, PowerShell and Windows Terminal each treat specially.
+    let folder = media.join("Shoot & 100% ^ it's ;x");
+    std::fs::create_dir_all(&folder).unwrap();
+
+    // Automated runs only record the launch, so no terminal window opens.
+    let script = format!(
+        "dismiss-notices\nnavigate {}\nwait-entry Shoot & 100% ^ it's ;x\n\
+         right-click-entry Shoot & 100% ^ it's ;x\n\
+         ui system click-menu Open terminal here\n\
+         ui system wait-terminal {} | 20\n\
+         assert-no-error-toast\nexit\n",
+        shown(&media),
+        shown(&folder),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
