@@ -33,8 +33,11 @@ use crate::delivery_presets::{
 use crate::watermark::{Anchor, PreparedWatermark, Watermark, WatermarkSource};
 
 const PREVIEW_ROWS: usize = 20;
-/// Long edge of the watermark preview image.
+/// Long edge of the watermark preview as shown in the window.
 const WATERMARK_PREVIEW_EDGE: u32 = 360;
+/// Long edge of the image the preview is built from (sharp on high-DPI screens, cheap
+/// to decode).
+const PREVIEW_SOURCE_EDGE: u32 = 1280;
 static BATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,20 +165,10 @@ struct BatchUi {
     /// Preset requested from the "Deliver with" menu, applied by [`deliver`].
     pending_preset: Option<String>,
     prepared: Option<(Watermark, Result<Arc<PreparedWatermark>, String>)>,
-    preview: Option<WatermarkPreview>,
+    preview: WatermarkPreview,
     run: Option<BatchRun>,
     /// Header dimensions of previewed sources (None = unreadable, e.g. RAW).
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
-}
-
-/// Downscaled copy of one source with the current watermark applied.
-struct WatermarkPreview {
-    source: PathBuf,
-    /// `None` when the source cannot be decoded.
-    base: Option<image::RgbaImage>,
-    /// Watermark the texture was made with (`None` = no watermark).
-    shown: Option<Option<Watermark>>,
-    texture: Option<egui::TextureHandle>,
 }
 
 impl Default for BatchUi {
@@ -204,7 +197,7 @@ impl Default for BatchUi {
             preset_name: String::new(),
             pending_preset: None,
             prepared: None,
-            preview: None,
+            preview: WatermarkPreview::default(),
             run: None,
             dims_cache: HashMap::new(),
         }
@@ -691,54 +684,130 @@ fn watermark_section(ui: &mut egui::Ui, state: &mut BatchUi) {
     });
 }
 
-/// Shows `source` downscaled with the current watermark.
+/// What a preview image shows: one source with one watermark setting.
+#[derive(Clone, PartialEq)]
+struct PreviewKey {
+    source: PathBuf,
+    /// `None` = no watermark.
+    watermark: Option<Watermark>,
+}
+
+/// A preview built on a worker thread.
+struct PreviewResult {
+    key: PreviewKey,
+    /// The downscaled source, kept so the next watermark change does not decode again.
+    /// `None` when the source cannot be decoded.
+    base: Option<Arc<image::RgbaImage>>,
+    image: Option<image::RgbaImage>,
+}
+
+/// Downscaled copy of the first source with the current watermark applied. Decoding and
+/// compositing run on a worker thread; at most one request is in flight.
+#[derive(Default)]
+struct WatermarkPreview {
+    /// Key of the texture on screen.
+    shown: Option<PreviewKey>,
+    texture: Option<egui::TextureHandle>,
+    /// Last decoded source and its downscaled pixels.
+    base: Option<(PathBuf, Option<Arc<image::RgbaImage>>)>,
+    pending: Option<(PreviewKey, crossbeam_channel::Receiver<PreviewResult>)>,
+}
+
+/// The downscaled source for the preview, from the thumbnail pipeline: RAW files use
+/// their embedded preview, JPEGs a large enough EXIF thumbnail, everything else a decode
+/// under the usual pixel and allocation limits. Orientation is applied.
+fn preview_base(source: &Path) -> Option<image::RgbaImage> {
+    let limits = forge_media::thumbs::DecodeLimits::default();
+    forge_media::thumbs::generate_thumbnail(source, PREVIEW_SOURCE_EDGE, &limits, None, 0, None)
+        .ok()?
+        .to_rgba_image()
+}
+
+/// Shows `source` downscaled with the current watermark, with a spinner while it loads.
 fn watermark_preview(ui: &mut egui::Ui, state: &mut BatchUi, source: &Path) {
-    if state
-        .preview
-        .as_ref()
-        .is_none_or(|preview| preview.source != source)
-    {
-        let base = load_source(source).ok().map(|image| {
-            image
-                .thumbnail(WATERMARK_PREVIEW_EDGE, WATERMARK_PREVIEW_EDGE)
-                .to_rgba8()
-        });
-        state.preview = Some(WatermarkPreview {
-            source: source.to_path_buf(),
-            base,
-            shown: None,
-            texture: None,
-        });
-    }
+    let wanted = PreviewKey {
+        source: source.to_path_buf(),
+        watermark: state.watermark_on.then(|| state.watermark.clone()),
+    };
     let watermark = prepared_watermark(state);
-    let wanted = state.watermark_on.then(|| state.watermark.clone());
-    let Some(preview) = state.preview.as_mut() else {
-        return;
-    };
-    let Some(base) = &preview.base else {
-        ui.label(egui::RichText::new("No preview: this image cannot be decoded.").weak());
-        return;
-    };
-    if preview.shown.as_ref() != Some(&wanted) || preview.texture.is_none() {
-        let mut image = base.clone();
-        if let Ok(Some(prepared)) = &watermark {
-            prepared.apply_rgba(&mut image);
+    let preview = &mut state.preview;
+
+    if let Some((_, receiver)) = &preview.pending {
+        match receiver.try_recv() {
+            Ok(result) => {
+                preview.pending = None;
+                preview.base = Some((result.key.source.clone(), result.base));
+                // A result for an older file or watermark is dropped, not shown.
+                if result.key == wanted {
+                    preview.texture = result.image.map(|image| {
+                        let size = [image.width() as usize, image.height() as usize];
+                        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+                        ui.ctx().load_texture(
+                            "batch-export-watermark-preview",
+                            pixels,
+                            egui::TextureOptions::LINEAR,
+                        )
+                    });
+                    preview.shown = Some(result.key);
+                }
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) => preview.pending = None,
         }
-        let size = [image.width() as usize, image.height() as usize];
-        let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
-        preview.texture = Some(ui.ctx().load_texture(
-            "batch-export-watermark-preview",
-            pixels,
-            egui::TextureOptions::LINEAR,
-        ));
-        preview.shown = Some(wanted);
     }
-    if let Some(texture) = &preview.texture {
+
+    if preview.shown.as_ref() != Some(&wanted) && preview.pending.is_none() {
+        let base = preview
+            .base
+            .as_ref()
+            .filter(|(path, _)| *path == wanted.source)
+            .map(|(_, base)| base.clone());
+        let mark = watermark.as_ref().ok().cloned().flatten();
+        let key = wanted.clone();
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        let ctx = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let base = base.unwrap_or_else(|| preview_base(&key.source).map(Arc::new));
+            let image = base.as_ref().map(|base| {
+                let mut image = image::RgbaImage::clone(base);
+                if let Some(mark) = &mark
+                    && key.watermark.is_some()
+                {
+                    mark.apply_rgba(&mut image);
+                }
+                image
+            });
+            // The receiver is gone when a newer request replaced this one.
+            if sender.send(PreviewResult { key, base, image }).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        preview.pending = Some((wanted.clone(), receiver));
+    }
+
+    ui.horizontal(|ui| {
         ui.label(format!(
             "Preview: {}",
             source.file_name().unwrap_or_default().to_string_lossy()
         ));
-        ui.image((texture.id(), texture.size_vec2()));
+        if preview.pending.is_some() {
+            ui.spinner();
+        }
+    });
+    let showing_source = preview
+        .shown
+        .as_ref()
+        .is_some_and(|shown| shown.source == source);
+    match &preview.texture {
+        Some(texture) if showing_source => {
+            let size = texture.size_vec2();
+            let scale = (WATERMARK_PREVIEW_EDGE as f32 / size.x.max(size.y)).min(1.0);
+            ui.image((texture.id(), size * scale));
+        }
+        _ if showing_source && preview.pending.is_none() => {
+            ui.label(egui::RichText::new("No preview: this image cannot be decoded.").weak());
+        }
+        _ => {}
     }
     if let Err(error) = watermark {
         ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1180,7 +1249,7 @@ fn render_one(
     let image = load_source(source)?;
     let mut image = resize_to(image, options.resize);
     if let Some(watermark) = &options.watermark {
-        image = watermark.apply(image);
+        image = watermark.apply(image)?;
     }
     let dims = image.dimensions();
     let raw = build_name(
