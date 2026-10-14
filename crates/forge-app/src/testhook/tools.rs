@@ -72,7 +72,7 @@
 //!   `skipped`.
 //! - `replace assert-skipped <file name> <reason>`: the preview skips that file. Reasons:
 //!   `binary-extension`, `unknown-type`, `binary`, `too-large`, `online-only`, `read-only`,
-//!   `changed`, `path-changed`, `unreadable`.
+//!   `changed`, `path-changed`, `hard-linked`, `unreadable`.
 //! - `replace untick <file name>`: leave a previewed file out of the replace.
 //! - `replace run`: start the replace of the ticked files; `replace wait-apply [secs]` waits for
 //!   it (default 30 s).
@@ -529,6 +529,7 @@ fn skip_key(reason: &SkipReason) -> &'static str {
         SkipReason::ReadOnly => "read-only",
         SkipReason::Changed => "changed",
         SkipReason::PathChanged => "path-changed",
+        SkipReason::HardLinked => "hard-linked",
         SkipReason::Unreadable(_) => "unreadable",
     }
 }

@@ -21,7 +21,6 @@ use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
 
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
@@ -39,6 +38,9 @@ pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Matching lines stored per file in a [`FilePreview`]. The counts stay exact past this.
 pub const MAX_PREVIEW_LINES: usize = 200;
+/// Preview lines stored across all files of one scan. Later files still count their matches,
+/// but store no preview lines once this is reached.
+pub const MAX_PREVIEW_TOTAL_LINES: usize = 20_000;
 
 /// Longest line shown in a [`LineMatch`]; longer lines are cut to a window around the match.
 const DISPLAY_MAX: usize = 400;
@@ -454,6 +456,8 @@ pub enum SkipReason {
     Changed,
     /// A folder in its path was replaced by a link, or the file moved.
     PathChanged,
+    /// The file has more than one hard link; replacing it would split the links.
+    HardLinked,
     /// Could not be read; the message says why.
     Unreadable(String),
 }
@@ -475,6 +479,7 @@ impl SkipReason {
             Self::PathChanged => {
                 "A folder in its path was replaced by a link, or the file moved; not changed".into()
             }
+            Self::HardLinked => "Hard-linked file, not changed".into(),
             Self::Unreadable(msg) => format!("Could not be read: {msg}"),
         }
     }
@@ -500,6 +505,9 @@ impl ScanReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplaceUndo {
     pub path: PathBuf,
+    /// Canonical root and the path under it, re-validated before the file is restored.
+    pub root: PathBuf,
+    pub rel: PathBuf,
     /// Copy of the original bytes.
     pub backup: PathBuf,
     /// Identity of the bytes written by the replace.
@@ -559,11 +567,12 @@ fn scan_with(
         skipped: col.skipped,
         ..Default::default()
     };
+    let mut budget = MAX_PREVIEW_TOTAL_LINES;
     for cand in &col.out {
         ctx.cancel.check()?;
         ctx.progress.set_current(cand.path.display().to_string());
         report.files_scanned += 1;
-        scan_file(cand, &re, spec, opts, ctx, source, &mut report);
+        scan_file(cand, &re, spec, opts, ctx, source, &mut budget, &mut report);
         ctx.progress.add_items(1);
     }
     Ok(report)
@@ -730,6 +739,7 @@ fn scan_file(
     opts: &ScanOptions,
     ctx: &JobCtx<'_>,
     source: &dyn AttributeSource,
+    budget: &mut usize,
     report: &mut ScanReport,
 ) {
     let path = cand.path.as_path();
@@ -766,6 +776,15 @@ fn scan_file(
     if md.len() > opts.max_file_size {
         return skip(report, path, SkipReason::TooLarge(md.len()));
     }
+    match handle_stamp(&file) {
+        Ok(st) if st.links > 1 => return skip(report, path, SkipReason::HardLinked),
+        Ok(_) => {}
+        Err(e) => {
+            ctx.progress.add_error();
+            let msg = CoreError::io(path, e).to_string();
+            return skip(report, path, SkipReason::Unreadable(msg));
+        }
+    }
     let bytes = match read_bounded(&mut file, opts.max_file_size) {
         Ok(Some(bytes)) => bytes,
         // The file grew after the metadata was read: at least one byte over the limit.
@@ -779,10 +798,12 @@ fn scan_file(
     let Some(decoded) = decode(&bytes) else {
         return skip(report, path, SkipReason::Binary);
     };
-    let (matches, match_count, lines_with_matches) = find_matches(&decoded.text, re, spec);
+    let limit = MAX_PREVIEW_LINES.min(*budget);
+    let (matches, match_count, lines_with_matches) = find_matches(&decoded.text, re, spec, limit);
     if match_count == 0 {
         return;
     }
+    *budget -= matches.len();
     if md.permissions().readonly() {
         return skip(report, path, SkipReason::ReadOnly);
     }
@@ -882,9 +903,14 @@ struct LineGroup {
     hits: Vec<(Range<usize>, String)>,
 }
 
-/// Group the matches of `text` by line. Returns the first [`MAX_PREVIEW_LINES`] lines with a
-/// match, the total match count and the total number of lines with a match.
-fn find_matches(text: &str, re: &Regex, spec: &SearchSpec) -> (Vec<LineMatch>, usize, usize) {
+/// Group the matches of `text` by line. Returns the first `limit` lines with a match, the total
+/// match count and the total number of lines with a match.
+fn find_matches(
+    text: &str,
+    re: &Regex,
+    spec: &SearchSpec,
+    limit: usize,
+) -> (Vec<LineMatch>, usize, usize) {
     let mut groups: Vec<LineGroup> = Vec::new();
     let mut lines = LineCursor::new(text);
     let mut count = 0;
@@ -911,7 +937,7 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec) -> (Vec<LineMatch>, u
         }
         last_line = Some(line_start);
         lines_total += 1;
-        if groups.len() < MAX_PREVIEW_LINES {
+        if groups.len() < limit {
             groups.push(LineGroup {
                 line_no,
                 line_start,
@@ -1094,18 +1120,75 @@ struct Step<'a> {
     before_publish: &'a dyn Fn(&Path),
 }
 
-/// Size and modification time: what a concurrent writer changes.
+/// What a concurrent writer or a swapped file changes: size, last-write time and file identity
+/// (volume serial and file index), plus the hard-link count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stamp {
     len: u64,
-    modified: Option<SystemTime>,
+    modified: u64,
+    volume: u32,
+    index: u64,
+    links: u32,
 }
 
-fn stamp(md: &fs::Metadata) -> Stamp {
-    Stamp {
+/// The [`Stamp`] of an open file, from `GetFileInformationByHandle`.
+#[cfg(windows)]
+fn handle_stamp(file: &File) -> io::Result<Stamp> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is owned by `file`, which outlives the call; `info` is a valid out
+    // pointer.
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+        .map_err(io::Error::other)?;
+    let join = |hi: u32, lo: u32| (u64::from(hi) << 32) | u64::from(lo);
+    Ok(Stamp {
+        len: join(info.nFileSizeHigh, info.nFileSizeLow),
+        modified: join(
+            info.ftLastWriteTime.dwHighDateTime,
+            info.ftLastWriteTime.dwLowDateTime,
+        ),
+        volume: info.dwVolumeSerialNumber,
+        index: join(info.nFileIndexHigh, info.nFileIndexLow),
+        links: info.nNumberOfLinks,
+    })
+}
+
+#[cfg(not(windows))]
+fn handle_stamp(file: &File) -> io::Result<Stamp> {
+    use std::os::unix::fs::MetadataExt;
+    let md = file.metadata()?;
+    Ok(Stamp {
         len: md.len(),
-        modified: md.modified().ok(),
-    }
+        modified: (md.mtime() as u64) << 32 ^ md.mtime_nsec() as u64,
+        volume: md.dev() as u32,
+        index: md.ino(),
+        links: md.nlink() as u32,
+    })
+}
+
+/// The [`Stamp`] of `path`, opened for attributes only and sharing everything, so no other
+/// program is disturbed. A link at `path` is not followed.
+fn path_stamp(path: &Path) -> io::Result<Stamp> {
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES.0)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)?
+    };
+    #[cfg(not(windows))]
+    let file = File::open(path)?;
+    handle_stamp(&file)
 }
 
 /// True when `file.root.join(&file.rel)` is still the previewed file: every folder on the way is
@@ -1113,8 +1196,13 @@ fn stamp(md: &fs::Metadata) -> Stamp {
 /// file still canonicalize to where they did at scan time. Cloud placeholders are not links, so
 /// they pass.
 fn location_intact(file: &FilePreview) -> bool {
+    location_intact_at(&file.root, &file.rel)
+}
+
+/// [`location_intact`] for a canonical `root` and the path `rel` under it.
+fn location_intact_at(root: &Path, rel: &Path) -> bool {
     let mut names = Vec::new();
-    for component in file.rel.components() {
+    for component in rel.components() {
         match component {
             Component::Normal(name) => names.push(name),
             _ => return false,
@@ -1123,7 +1211,7 @@ fn location_intact(file: &FilePreview) -> bool {
     let Some(last) = names.len().checked_sub(1) else {
         return false;
     };
-    let mut cur = file.root.clone();
+    let mut cur = root.to_path_buf();
     for (i, name) in names.iter().enumerate() {
         cur.push(name);
         let Ok(md) = fs::symlink_metadata(&cur) else {
@@ -1137,11 +1225,11 @@ fn location_intact(file: &FilePreview) -> bool {
             return false;
         }
     }
-    match canonical_path(&file.root) {
-        Ok(root) if root == file.root => {}
+    match canonical_path(root) {
+        Ok(now) if now == root => {}
         _ => return false,
     }
-    canonical_path(&cur).is_ok_and(|now| now.starts_with(&file.root))
+    canonical_path(&cur).is_ok_and(|now| now.starts_with(root))
 }
 
 /// Opens `path` for reading and replacing. On Windows the handle shares read and delete only,
@@ -1163,9 +1251,10 @@ fn open_locked(path: &Path) -> io::Result<File> {
     }
 }
 
-/// Replace in one file. Order: location, cloud gate, locked open, bounded read, fingerprint,
-/// replacement in memory, backup written from the bytes read, then [`publish_replacement`].
-/// A stop (changed, moved, cancelled, failed) after the backup was written removes the backup.
+/// Replace in one file. Order: cloud gate, location, locked open, hard-link check, bounded
+/// read, fingerprint, replacement in memory, backup written from the bytes read, then
+/// [`publish`]. A stop (changed, moved, cancelled, failed) after the backup was written
+/// removes the backup.
 fn replace_one(file: &FilePreview, index: usize, step: &Step<'_>) -> Result<Outcome> {
     let target = file.root.join(&file.rel);
     if !background_read_allowed(&target) {
@@ -1178,6 +1267,10 @@ fn replace_one(file: &FilePreview, index: usize, step: &Step<'_>) -> Result<Outc
     let md = handle.metadata().map_err(|e| CoreError::io(&target, e))?;
     if md.permissions().readonly() {
         return Ok(Outcome::Skipped(SkipReason::ReadOnly));
+    }
+    let before = handle_stamp(&handle).map_err(|e| CoreError::io(&target, e))?;
+    if before.links > 1 {
+        return Ok(Outcome::Skipped(SkipReason::HardLinked));
     }
     let original = match read_bounded(&mut handle, file.max_file_size) {
         Ok(Some(bytes)) => bytes,
@@ -1204,16 +1297,32 @@ fn replace_one(file: &FilePreview, index: usize, step: &Step<'_>) -> Result<Outc
         .backup_dir
         .join(format!("{index:05}-{}", file_name_of(&target)));
     write_new_file(&backup, &original).map_err(|e| CoreError::io(&backup, e))?;
-    match publish_replacement(file, &target, handle, &new_bytes, step) {
-        Ok(None) => Ok(Outcome::Replaced(ReplaceUndo {
+    let checks = || {
+        if !location_intact(file) {
+            return Some(Outcome::Skipped(SkipReason::PathChanged));
+        }
+        (step.before_publish)(&target);
+        if step.ctx.cancel.is_cancelled() {
+            return Some(Outcome::Cancelled);
+        }
+        None
+    };
+    match publish(&target, handle, &before, &new_bytes, checks) {
+        Ok(Published::Done) => Ok(Outcome::Replaced(ReplaceUndo {
             path: target,
+            root: file.root.clone(),
+            rel: file.rel.clone(),
             backup,
             written: fingerprint(&new_bytes),
             replacements: count,
         })),
-        Ok(Some(stop)) => {
+        Ok(Published::Stopped(stop)) => {
             let _ = fs::remove_file(&backup);
             Ok(stop)
+        }
+        Ok(Published::Changed) => {
+            let _ = fs::remove_file(&backup);
+            Ok(Outcome::Skipped(SkipReason::Changed))
         }
         Err(e) => {
             let _ = fs::remove_file(&backup);
@@ -1222,26 +1331,31 @@ fn replace_one(file: &FilePreview, index: usize, step: &Step<'_>) -> Result<Outc
     }
 }
 
-/// Write `new_bytes` to a temp file and publish it over `target`. `handle` is the locked
-/// handle the bytes were read through. Returns `None` when published, or the outcome that
-/// stopped it (the temp file is removed in that case).
+enum Published {
+    Done,
+    /// `checks` stopped it.
+    Stopped(Outcome),
+    /// The file's stamp changed after it was read.
+    Changed,
+}
+
+/// Write `new_bytes` to a temp file in the target's folder and publish it over `target` with
+/// `ReplaceFileW`. `handle` is the deny-write handle the current bytes were read through and
+/// `before` its stamp. The temp file is removed whenever nothing is published.
 ///
-/// The handle is closed only just before the replace, since ReplaceFileW cannot run while it
-/// is open. The size and modification time are compared with the handle's stamp after it is
-/// closed, and again right before the replace. A writer that gets in between that last
-/// comparison and ReplaceFileW (a window of microseconds) is not caught; the backup still holds
-/// the bytes that were replaced.
-fn publish_replacement(
-    file: &FilePreview,
+/// Order: write and flush the temp file while `handle` still blocks other writers, close
+/// `handle` (ReplaceFileW cannot run while it is open), run `checks` (location and junction
+/// validation, cancellation), then compare the size, last-write time and file ID with `before`
+/// as the very last step before ReplaceFileW. Protection against a concurrent edit is
+/// best-effort: a writer that gets in during the microseconds between that comparison and
+/// ReplaceFileW is not detected (its edit is replaced; the backup holds the bytes we read).
+fn publish(
     target: &Path,
     handle: File,
+    before: &Stamp,
     new_bytes: &[u8],
-    step: &Step<'_>,
-) -> Result<Option<Outcome>> {
-    let md = handle.metadata().map_err(|e| CoreError::io(target, e))?;
-    let perms = md.permissions();
-    let before = stamp(&md);
-
+    checks: impl FnOnce() -> Option<Outcome>,
+) -> Result<Published> {
     let (temp, mut temp_file) = create_temp(target)?;
     let written = temp_file
         .write_all(new_bytes)
@@ -1251,14 +1365,17 @@ fn publish_replacement(
         let _ = fs::remove_file(&temp);
         return Err(CoreError::io(target, e));
     }
-
     drop(handle);
-    if let Some(stop) = last_checks(file, target, &before, step) {
+    if let Some(stop) = checks() {
         let _ = fs::remove_file(&temp);
-        return Ok(Some(stop));
+        return Ok(Published::Stopped(stop));
     }
-    match replace_into_place(&temp, target, perms) {
-        Ok(()) => Ok(None),
+    if !path_stamp(target).is_ok_and(|now| now == *before) {
+        let _ = fs::remove_file(&temp);
+        return Ok(Published::Changed);
+    }
+    match replace_into_place(&temp, target) {
+        Ok(()) => Ok(Published::Done),
         Err(e) => {
             let _ = fs::remove_file(&temp);
             Err(CoreError::io(target, e))
@@ -1266,33 +1383,15 @@ fn publish_replacement(
     }
 }
 
-/// The checks right before publishing: the stamp is unchanged, the location is still intact,
-/// the test hook has run, and the job is not cancelled. Returns the outcome that stops the
-/// replace, if any.
-fn last_checks(
-    file: &FilePreview,
-    target: &Path,
-    before: &Stamp,
-    step: &Step<'_>,
-) -> Option<Outcome> {
-    match fs::metadata(target) {
-        Ok(now) if stamp(&now) == *before => {}
-        _ => return Some(Outcome::Skipped(SkipReason::Changed)),
-    }
-    if !location_intact(file) {
-        return Some(Outcome::Skipped(SkipReason::PathChanged));
-    }
-    (step.before_publish)(target);
-    if step.ctx.cancel.is_cancelled() {
-        return Some(Outcome::Cancelled);
-    }
-    None
-}
-
+/// Create `path` and write `bytes` to it; a partly written file is removed on failure.
 fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = File::create_new(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    drop(f);
+    if written.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1320,10 +1419,13 @@ fn create_temp(path: &Path) -> Result<(PathBuf, File)> {
     )))
 }
 
+/// Swap `tmp` in for `path` with `ReplaceFileW`, which keeps the original's creation time,
+/// attributes, ACLs and alternate streams. No merge errors are ignored and there is no
+/// fallback: if they cannot be kept, the call fails and the original stays untouched.
 #[cfg(windows)]
-fn replace_into_place(tmp: &Path, path: &Path, perms: fs::Permissions) -> io::Result<()> {
+fn replace_into_place(tmp: &Path, path: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Storage::FileSystem::{REPLACEFILE_IGNORE_MERGE_ERRORS, ReplaceFileW};
+    use windows::Win32::Storage::FileSystem::{REPLACE_FILE_FLAGS, ReplaceFileW};
     use windows::core::PCWSTR;
 
     let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
@@ -1331,84 +1433,71 @@ fn replace_into_place(tmp: &Path, path: &Path, perms: fs::Permissions) -> io::Re
     let source = wide(tmp);
     // SAFETY: both strings are NUL-terminated and outlive the call. The backup, exclude and
     // reserved arguments are null, which the API accepts.
-    let done = unsafe {
+    unsafe {
         ReplaceFileW(
             PCWSTR(target.as_ptr()),
             PCWSTR(source.as_ptr()),
             PCWSTR::null(),
-            REPLACEFILE_IGNORE_MERGE_ERRORS,
+            REPLACE_FILE_FLAGS(0),
             None,
             None,
         )
-    };
-    match done {
-        Ok(()) => Ok(()),
-        // ReplaceFileW keeps creation time, attributes, ACLs and streams; if it fails (for
-        // example on a filesystem without support), a plain rename still replaces the data.
-        Err(_) => rename_over(tmp, path, perms),
     }
+    .map_err(io::Error::other)
 }
 
 #[cfg(not(windows))]
-fn replace_into_place(tmp: &Path, path: &Path, perms: fs::Permissions) -> io::Result<()> {
-    rename_over(tmp, path, perms)
-}
-
-fn rename_over(tmp: &Path, path: &Path, perms: fs::Permissions) -> io::Result<()> {
-    fs::set_permissions(tmp, perms)?;
+fn replace_into_place(tmp: &Path, path: &Path) -> io::Result<()> {
+    fs::set_permissions(tmp, fs::metadata(path)?.permissions())?;
     fs::rename(tmp, path)
 }
 
-/// Undo one replace. Refused if the file changed since the replace; otherwise the backup
-/// bytes are published over it the same way as a replace (locked read, fingerprint, temp file,
-/// stamp check, replace) and the backup is deleted.
+/// Undo one replace. Refused if the file moved, a folder on its path became a link, or it
+/// changed since the replace; otherwise the backup bytes are published over it the same way
+/// as a replace (validation, locked read, fingerprint, temp file, stamp check last) and the
+/// backup is deleted.
 pub fn undo(rec: &ReplaceUndo) -> Result<()> {
-    if !background_read_allowed(&rec.path) {
-        return Err(CoreError::Invalid(format!(
-            "{}: is an online-only file",
-            rec.path.display()
-        )));
+    undo_with_hook(rec, &|_| {})
+}
+
+/// [`undo`] with a hook that runs just before the final checks. For tests.
+fn undo_with_hook(rec: &ReplaceUndo, before_publish: &dyn Fn(&Path)) -> Result<()> {
+    let target = rec.root.join(&rec.rel);
+    let refused = |why: &str| CoreError::Invalid(format!("{}: {why}", target.display()));
+    if !background_read_allowed(&target) {
+        return Err(refused("is an online-only file"));
     }
-    let modified_err = || {
-        CoreError::Invalid(format!(
-            "{} has been modified since the replace",
-            rec.path.display()
-        ))
-    };
-    let mut handle = open_locked(&rec.path).map_err(|e| CoreError::io(&rec.path, e))?;
+    if !location_intact_at(&rec.root, &rec.rel) {
+        return Err(refused("moved, or a folder on its path is now a link"));
+    }
+    let modified = || refused("has been modified since the replace");
+    let mut handle = open_locked(&target).map_err(|e| CoreError::io(&target, e))?;
+    let before = handle_stamp(&handle).map_err(|e| CoreError::io(&target, e))?;
+    if before.links > 1 {
+        return Err(refused("is hard-linked"));
+    }
     let current = match read_bounded(&mut handle, rec.written.size) {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return Err(modified_err()),
-        Err(e) => return Err(CoreError::io(&rec.path, e)),
+        Ok(None) => return Err(modified()),
+        Err(e) => return Err(CoreError::io(&target, e)),
     };
     if fingerprint(&current) != rec.written {
-        return Err(modified_err());
+        return Err(modified());
     }
     let original = fs::read(&rec.backup).map_err(|e| CoreError::io(&rec.backup, e))?;
-    let md = handle.metadata().map_err(|e| CoreError::io(&rec.path, e))?;
-    let perms = md.permissions();
-    let before = stamp(&md);
-
-    let (temp, mut temp_file) = create_temp(&rec.path)?;
-    let written = temp_file
-        .write_all(&original)
-        .and_then(|()| temp_file.sync_all());
-    drop(temp_file);
-    if let Err(e) = written {
-        let _ = fs::remove_file(&temp);
-        return Err(CoreError::io(&rec.path, e));
-    }
-    drop(handle);
-    match fs::metadata(&rec.path) {
-        Ok(now) if stamp(&now) == before => {}
-        _ => {
-            let _ = fs::remove_file(&temp);
-            return Err(modified_err());
+    let checks = || {
+        if !location_intact_at(&rec.root, &rec.rel) {
+            return Some(Outcome::Skipped(SkipReason::PathChanged));
         }
-    }
-    if let Err(e) = replace_into_place(&temp, &rec.path, perms) {
-        let _ = fs::remove_file(&temp);
-        return Err(CoreError::io(&rec.path, e));
+        before_publish(&target);
+        None
+    };
+    match publish(&target, handle, &before, &original, checks)? {
+        Published::Done => {}
+        Published::Stopped(_) => {
+            return Err(refused("moved, or a folder on its path is now a link"));
+        }
+        Published::Changed => return Err(modified()),
     }
     fs::remove_file(&rec.backup).map_err(|e| CoreError::io(&rec.backup, e))?;
     Ok(())
@@ -2002,5 +2091,180 @@ mod tests {
 
         // Remove the junction itself; its target is untouched.
         fs::remove_dir(&sub).unwrap();
+    }
+
+    fn temp_files_in(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count()
+    }
+
+    #[test]
+    fn hard_linked_files_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("linked.txt");
+        fs::write(&linked, b"foo linked").unwrap();
+        fs::hard_link(&linked, dir.path().join("twin.txt")).unwrap();
+        let s = spec("foo", "bar");
+        let report = run_scan(dir.path(), &s, &ScanOptions::default());
+        assert_eq!(
+            skip_reason(&report, "linked.txt"),
+            Some(&SkipReason::HardLinked)
+        );
+        assert!(report.files.is_empty());
+
+        // A link made after the preview is caught by apply.
+        let single = dir.path().join("single.txt");
+        fs::write(&single, b"foo single").unwrap();
+        let report = run_scan(&single, &s, &ScanOptions::default());
+        assert_eq!(report.files.len(), 1);
+        fs::hard_link(&single, dir.path().join("late-twin.txt")).unwrap();
+        let applied = run_apply(&report.files, &s, backups.path());
+        assert!(matches!(
+            applied.skipped.as_slice(),
+            [(_, SkipReason::HardLinked)]
+        ));
+        assert_eq!(fs::read(&single).unwrap(), b"foo single");
+        assert_eq!(fs::read(&linked).unwrap(), b"foo linked");
+    }
+
+    #[test]
+    fn an_edit_at_the_last_moment_is_caught_by_the_final_stamp_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        fs::write(&file, b"foo text").unwrap();
+        let s = spec("foo", "bar");
+        let files = run_scan(dir.path(), &s, &ScanOptions::default()).files;
+        let cancel = CancelToken::new();
+        let progress = Progress::new();
+        let ctx = JobCtx::new(&cancel, &progress);
+        // The hook runs after the path checks and before the stamp check.
+        let hook = |path: &Path| {
+            let mut f = OpenOptions::new().append(true).open(path).unwrap();
+            f.write_all(b" edited").unwrap();
+        };
+        let report = apply_with_hook(&files, &s, backups.path(), &ctx, &hook).unwrap();
+        assert!(matches!(
+            report.skipped.as_slice(),
+            [(_, SkipReason::Changed)]
+        ));
+        assert_eq!(fs::read(&file).unwrap(), b"foo text edited");
+        assert_eq!(temp_files_in(dir.path()), 0);
+        assert!(fs::read_dir(backups.path()).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_replace_reports_the_file_and_leaves_it_untouched() {
+        use std::cell::RefCell;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        fs::write(&file, b"foo text").unwrap();
+        let s = spec("foo", "bar");
+        let files = run_scan(dir.path(), &s, &ScanOptions::default()).files;
+        let cancel = CancelToken::new();
+        let progress = Progress::new();
+        let ctx = JobCtx::new(&cancel, &progress);
+        // A handle without delete sharing makes ReplaceFileW fail; there is no rename fallback.
+        let held = RefCell::new(None);
+        let hook = |path: &Path| {
+            let f = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
+                .open(path)
+                .unwrap();
+            *held.borrow_mut() = Some(f);
+        };
+        let report = apply_with_hook(&files, &s, backups.path(), &ctx, &hook).unwrap();
+        drop(held.borrow_mut().take());
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.undo.is_empty());
+        assert_eq!(fs::read(&file).unwrap(), b"foo text");
+        assert_eq!(temp_files_in(dir.path()), 0);
+        assert!(fs::read_dir(backups.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn undo_refuses_an_edit_at_the_last_moment() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = dir.path().join("doc.txt");
+        fs::write(&file, b"foo text").unwrap();
+        let s = spec("foo", "bar");
+        let files = run_scan(dir.path(), &s, &ScanOptions::default()).files;
+        let applied = run_apply(&files, &s, backups.path());
+        let rec = &applied.undo[0];
+        let hook = |path: &Path| {
+            let mut f = OpenOptions::new().append(true).open(path).unwrap();
+            f.write_all(b" edited").unwrap();
+        };
+        assert!(undo_with_hook(rec, &hook).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"bar text edited");
+        assert!(
+            rec.backup.exists(),
+            "the backup is kept when undo is refused"
+        );
+        assert_eq!(temp_files_in(dir.path()), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn undo_refuses_when_a_folder_became_a_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("doc.txt"), b"foo inside").unwrap();
+        let s = spec("foo", "bar");
+        let files = run_scan(dir.path(), &s, &ScanOptions::default()).files;
+        let applied = run_apply(&files, &s, backups.path());
+        assert_eq!(applied.undo.len(), 1);
+
+        // Put the replaced bytes outside and point `sub` at them through a junction.
+        let victim = outside.path().join("doc.txt");
+        fs::write(&victim, b"bar inside").unwrap();
+        fs::remove_dir_all(&sub).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&sub)
+            .arg(outside.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+
+        assert!(undo(&applied.undo[0]).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"bar inside");
+        fs::remove_dir(&sub).unwrap();
+    }
+
+    #[test]
+    fn preview_lines_share_one_budget_across_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let per_file = MAX_PREVIEW_LINES;
+        let files = MAX_PREVIEW_TOTAL_LINES / per_file + 3;
+        let body = "foo\n".repeat(per_file);
+        for i in 0..files {
+            fs::write(dir.path().join(format!("f{i:04}.txt")), &body).unwrap();
+        }
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &ScanOptions::default());
+        assert_eq!(report.files.len(), files);
+        let stored: usize = report.files.iter().map(|f| f.matches.len()).sum();
+        assert_eq!(stored, MAX_PREVIEW_TOTAL_LINES);
+        assert!(report.files.iter().all(|f| f.match_count == per_file));
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|f| f.lines_with_matches == per_file)
+        );
     }
 }
