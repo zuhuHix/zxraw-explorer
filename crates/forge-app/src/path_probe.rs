@@ -1,76 +1,143 @@
 //! Existence checks off the UI thread. A check on an unreachable network share can block in
-//! the OS for a long time, so checks run on a small fixed pool of workers: a dead share ties
-//! up at most that many threads, and the UI thread never waits on the disk.
+//! the OS for a long time, so every check in the process goes through one service with a fixed
+//! number of workers in two lanes: network paths can tie up only the network lane, and local
+//! paths never queue behind them. The workers live for the whole process, so repeated layout
+//! loads or pin checks never pile up threads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-/// What a check found: `None` when the path could not be read, else whether it is a folder.
+/// What a finished check found: `None` when the path could not be read, else whether it is a
+/// folder.
 pub type Found = Option<bool>;
+
+/// Progress of one submitted check, reported to the client that submitted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// A worker picked the check up (until then it is only queued).
+    Started(PathBuf),
+    Done(PathBuf, Found),
+}
 
 fn check(path: &Path) -> Found {
     std::fs::metadata(path).ok().map(|m| m.is_dir())
 }
 
-/// A queue of existence checks served by a fixed number of worker threads. Dropping the
-/// probe lets idle workers exit; a worker blocked in a check exits once the check returns.
-pub struct Probe {
-    jobs: Sender<PathBuf>,
-    results: Receiver<(PathBuf, Found)>,
+/// True for UNC paths and paths on a mapped network drive (`network_roots`).
+pub fn is_network(path: &Path, network_roots: &[PathBuf]) -> bool {
+    let text = path.to_string_lossy().to_lowercase();
+    text.starts_with(r"\\")
+        || network_roots
+            .iter()
+            .any(|root| text.starts_with(&root.to_string_lossy().to_lowercase()))
 }
 
-impl Probe {
-    pub fn new(workers: usize, repaint: Option<egui::Context>) -> Self {
-        Self::with_check(workers, repaint, check)
+struct Job {
+    path: PathBuf,
+    reply: Sender<Event>,
+    repaint: Option<egui::Context>,
+}
+
+/// The worker lanes. [`Service::global`] is the one the app uses.
+pub struct Service {
+    local: Sender<Job>,
+    network: Sender<Job>,
+}
+
+const LOCAL_WORKERS: usize = 2;
+const NETWORK_WORKERS: usize = 3;
+
+impl Service {
+    pub fn global() -> &'static Service {
+        static SERVICE: OnceLock<Service> = OnceLock::new();
+        SERVICE.get_or_init(|| Service::new(LOCAL_WORKERS, NETWORK_WORKERS, check))
     }
 
-    fn with_check(
-        workers: usize,
-        repaint: Option<egui::Context>,
-        check: fn(&Path) -> Found,
-    ) -> Self {
-        let (jobs, job_rx) = unbounded::<PathBuf>();
-        let (result_tx, results) = unbounded();
-        for _ in 0..workers.max(1) {
-            let job_rx = job_rx.clone();
-            let result_tx = result_tx.clone();
-            let repaint = repaint.clone();
-            let _ = std::thread::Builder::new()
-                .name("path-probe".into())
-                .spawn(move || {
-                    for path in job_rx {
-                        let found = check(&path);
-                        if result_tx.send((path, found)).is_err() {
-                            break;
-                        }
-                        if let Some(ctx) = &repaint {
-                            ctx.request_repaint();
-                        }
-                    }
-                });
+    fn new(local: usize, network: usize, check: fn(&Path) -> Found) -> Self {
+        Self {
+            local: lane("probe-local", local, check),
+            network: lane("probe-network", network, check),
         }
-        Self { jobs, results }
-    }
-
-    pub fn submit(&self, path: PathBuf) {
-        let _ = self.jobs.send(path);
-    }
-
-    pub fn try_recv(&self) -> Option<(PathBuf, Found)> {
-        self.results.try_recv().ok()
     }
 }
 
-/// A one-off batch of checks (the folders of a layout or a restored session) with a
-/// deadline: a path with no answer by then counts as unreachable.
+fn lane(name: &str, workers: usize, check: fn(&Path) -> Found) -> Sender<Job> {
+    let (jobs, job_rx) = unbounded::<Job>();
+    for _ in 0..workers.max(1) {
+        let job_rx = job_rx.clone();
+        let _ = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                for job in job_rx {
+                    let _ = job.reply.send(Event::Started(job.path.clone()));
+                    let found = check(&job.path);
+                    let _ = job.reply.send(Event::Done(job.path, found));
+                    if let Some(ctx) = &job.repaint {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+    }
+    jobs
+}
+
+/// One user of the service (the pin watcher, a layout load). Results come back only to the
+/// client that asked; dropping it simply discards later results.
+pub struct Client {
+    local: Sender<Job>,
+    network: Sender<Job>,
+    reply: Sender<Event>,
+    events: Receiver<Event>,
+    repaint: Option<egui::Context>,
+}
+
+impl Client {
+    pub fn new(repaint: Option<egui::Context>) -> Self {
+        Self::on(Service::global(), repaint)
+    }
+
+    fn on(service: &Service, repaint: Option<egui::Context>) -> Self {
+        let (reply, events) = unbounded();
+        Self {
+            local: service.local.clone(),
+            network: service.network.clone(),
+            reply,
+            events,
+            repaint,
+        }
+    }
+
+    pub fn submit(&self, path: PathBuf, network: bool) {
+        let lane = if network { &self.network } else { &self.local };
+        let _ = lane.send(Job {
+            path,
+            reply: self.reply.clone(),
+            repaint: self.repaint.clone(),
+        });
+    }
+
+    pub fn try_recv(&self) -> Option<Event> {
+        self.events.try_recv().ok()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+    Queued,
+    Running,
+    Done(Found),
+}
+
+/// A one-off batch of checks (the folders of a layout or a restored session) with a deadline.
+/// Only a finished negative check makes a path missing; a path still queued or running at the
+/// deadline is unknown, and callers open it anyway so its tab can show its own error.
 pub struct Batch {
-    probe: Probe,
-    /// `None` until the path's check answers.
-    found: HashMap<PathBuf, Option<Found>>,
-    waiting: usize,
+    client: Client,
+    state: HashMap<PathBuf, State>,
     deadline: Instant,
 }
 
@@ -78,53 +145,57 @@ pub struct Batch {
 pub const BATCH_LIMIT: Duration = Duration::from_secs(8);
 
 impl Batch {
-    pub fn start(paths: impl IntoIterator<Item = PathBuf>, repaint: Option<egui::Context>) -> Self {
-        Self::start_with(Probe::new(3, repaint), paths, Instant::now() + BATCH_LIMIT)
+    /// `paths` pairs each path with whether it is on the network.
+    pub fn start(paths: impl IntoIterator<Item = (PathBuf, bool)>, repaint: Option<egui::Context>) -> Self {
+        Self::start_with(Client::new(repaint), paths, Instant::now() + BATCH_LIMIT)
     }
 
-    fn start_with(probe: Probe, paths: impl IntoIterator<Item = PathBuf>, deadline: Instant) -> Self {
-        let mut found = HashMap::new();
-        for path in paths {
-            if !found.contains_key(&path) {
-                probe.submit(path.clone());
-                found.insert(path, None);
+    fn start_with(
+        client: Client,
+        paths: impl IntoIterator<Item = (PathBuf, bool)>,
+        deadline: Instant,
+    ) -> Self {
+        let mut state = HashMap::new();
+        for (path, network) in paths {
+            if !state.contains_key(&path) {
+                client.submit(path.clone(), network);
+                state.insert(path, State::Queued);
             }
         }
         Self {
-            probe,
-            waiting: found.len(),
-            found,
+            client,
+            state,
             deadline,
         }
     }
 
-    /// Takes in finished checks. True once every path has an answer or the deadline passed.
+    /// Takes in progress. True once every check has finished or the deadline passed.
     pub fn poll(&mut self, now: Instant) -> bool {
-        while let Some((path, found)) = self.probe.try_recv() {
-            if let Some(slot @ None) = self.found.get_mut(&path) {
-                *slot = Some(found);
-                self.waiting -= 1;
+        while let Some(event) = self.client.try_recv() {
+            let (path, next) = match event {
+                Event::Started(path) => (path, State::Running),
+                Event::Done(path, found) => (path, State::Done(found)),
+            };
+            if let Some(state) = self.state.get_mut(&path) {
+                if !matches!(state, State::Done(_)) {
+                    *state = next;
+                }
             }
         }
-        self.waiting == 0 || now >= self.deadline
+        self.state.values().all(|s| matches!(s, State::Done(_))) || now >= self.deadline
     }
 
-    /// Whether `path` was found to be a folder. Unanswered paths are not.
-    pub fn is_dir(&self, path: &Path) -> bool {
-        self.found.get(path).copied().flatten().flatten() == Some(true)
+    /// The check finished and found no folder at `path`.
+    pub fn is_missing(&self, path: &Path) -> bool {
+        matches!(self.state.get(path), Some(State::Done(found)) if *found != Some(true))
     }
 
-    /// Whether `path` is one of the batch's paths.
-    pub fn knows(&self, path: &Path) -> bool {
-        self.found.contains_key(path)
-    }
-
-    /// Paths whose check had not answered when the batch ended (usually offline shares).
-    pub fn unanswered(&self) -> Vec<PathBuf> {
+    /// Paths whose check had not finished when the batch ended (usually offline shares).
+    pub fn unchecked(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self
-            .found
+            .state
             .iter()
-            .filter(|(_, f)| f.is_none())
+            .filter(|(_, s)| !matches!(s, State::Done(_)))
             .map(|(p, _)| p.clone())
             .collect();
         out.sort();
@@ -137,66 +208,120 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Paths under `\\hung` block for a minute, like an offline share; others answer at once
+    /// (`missing` in the name means not found).
+    fn fake_check(path: &Path) -> Found {
+        let text = path.to_string_lossy();
+        if text.starts_with(r"\\hung") {
+            std::thread::sleep(Duration::from_secs(60));
+            return None;
+        }
+        (!text.contains("missing")).then_some(true)
+    }
+
+    fn wait_for(client: &Client, want: impl Fn(&Event) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            match client.try_recv() {
+                Some(event) if want(&event) => return true,
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn local_checks_are_not_stuck_behind_hung_network_checks() {
+        let service = Service::new(1, 2, fake_check);
+        let client = Client::on(&service, None);
+        for i in 0..5 {
+            client.submit(PathBuf::from(format!(r"\\hung\share{i}")), true);
+        }
+        client.submit(PathBuf::from(r"C:\photos"), false);
+        assert!(wait_for(&client, |e| *e == Event::Done(PathBuf::from(r"C:\photos"), Some(true))));
+    }
+
     static RUNNING: AtomicUsize = AtomicUsize::new(0);
     static PEAK: AtomicUsize = AtomicUsize::new(0);
 
-    fn slow_check(_: &Path) -> Found {
+    fn counting_check(_: &Path) -> Found {
         let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
         PEAK.fetch_max(now, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(20));
         RUNNING.fetch_sub(1, Ordering::SeqCst);
         Some(true)
     }
 
     #[test]
-    fn many_checks_never_run_on_more_threads_than_the_pool() {
-        let probe = Probe::with_check(2, None, slow_check);
+    fn many_checks_never_run_on_more_threads_than_the_lane() {
+        let service = Service::new(1, 2, counting_check);
+        let client = Client::on(&service, None);
         for i in 0..12 {
-            probe.submit(PathBuf::from(format!(r"\\offline\share{i}")));
+            client.submit(PathBuf::from(format!(r"\\nas\share{i}")), true);
         }
-        let mut got = 0;
+        let mut done = 0;
         let until = Instant::now() + Duration::from_secs(10);
-        while got < 12 && Instant::now() < until {
-            if probe.try_recv().is_some() {
-                got += 1;
-            } else {
-                std::thread::sleep(Duration::from_millis(5));
+        while done < 12 && Instant::now() < until {
+            match client.try_recv() {
+                Some(Event::Done(..)) => done += 1,
+                Some(_) => {}
+                None => std::thread::sleep(Duration::from_millis(5)),
             }
         }
-        assert_eq!(got, 12);
+        assert_eq!(done, 12);
         assert!(PEAK.load(Ordering::SeqCst) <= 2, "peak {}", PEAK.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn batch_reports_folders_files_and_missing_paths() {
+    fn batch_reports_folders_files_and_missing_paths_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         std::fs::write(&file, b"x").unwrap();
         let gone = dir.path().join("gone");
-        let mut batch = Batch::start([dir.path().to_path_buf(), file.clone(), gone.clone()], None);
+        let paths = [dir.path().to_path_buf(), file.clone(), gone.clone()].map(|p| (p, false));
+        let mut batch = Batch::start(paths, None);
         let until = Instant::now() + Duration::from_secs(10);
         while !batch.poll(Instant::now()) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(batch.is_dir(dir.path()));
-        assert!(!batch.is_dir(&file));
-        assert!(!batch.is_dir(&gone));
-        assert!(batch.unanswered().is_empty());
-    }
-
-    fn never(_: &Path) -> Found {
-        std::thread::sleep(Duration::from_secs(3600));
-        None
+        assert!(!batch.is_missing(dir.path()));
+        assert!(batch.is_missing(&file), "a file is not a folder");
+        assert!(batch.is_missing(&gone));
+        assert!(batch.unchecked().is_empty());
     }
 
     #[test]
-    fn a_hung_check_ends_the_batch_at_its_deadline() {
-        let now = Instant::now();
-        let probe = Probe::with_check(1, None, never);
-        let mut batch = Batch::start_with(probe, [PathBuf::from(r"\\dead\share")], now + Duration::from_millis(50));
-        assert!(!batch.poll(now));
-        assert!(batch.poll(now + Duration::from_millis(60)));
-        assert!(!batch.is_dir(Path::new(r"\\dead\share")));
-        assert_eq!(batch.unanswered(), vec![PathBuf::from(r"\\dead\share")]);
+    fn at_the_deadline_unfinished_checks_are_unknown_not_missing() {
+        // One network worker: the first hung path runs, the second only ever queues.
+        let service = Service::new(1, 1, fake_check);
+        let start = Instant::now();
+        let paths = [
+            (PathBuf::from(r"\\hung\a"), true),
+            (PathBuf::from(r"\\hung\b"), true),
+            (PathBuf::from(r"C:\missing"), false),
+            (PathBuf::from(r"C:\here"), false),
+        ];
+        let mut batch =
+            Batch::start_with(Client::on(&service, None), paths, start + Duration::from_millis(300));
+        while !batch.poll(Instant::now()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(batch.is_missing(Path::new(r"C:\missing")));
+        assert!(!batch.is_missing(Path::new(r"C:\here")));
+        assert!(!batch.is_missing(Path::new(r"\\hung\a")));
+        assert!(!batch.is_missing(Path::new(r"\\hung\b")));
+        assert_eq!(
+            batch.unchecked(),
+            vec![PathBuf::from(r"\\hung\a"), PathBuf::from(r"\\hung\b")]
+        );
+    }
+
+    #[test]
+    fn network_paths_are_recognised() {
+        let roots = vec![PathBuf::from(r"Z:\")];
+        assert!(is_network(Path::new(r"\\server\share"), &[]));
+        assert!(is_network(Path::new(r"z:\docs"), &roots));
+        assert!(!is_network(Path::new(r"C:\docs"), &roots));
     }
 }

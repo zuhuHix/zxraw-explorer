@@ -1,6 +1,6 @@
 //! Quick access pins: list edits (add, reorder, rename, remove) and the background check that
-//! tells whether a pinned file or folder still exists. The checks run on short-lived worker
-//! threads; the scheduling bookkeeping takes explicit times so it can be tested without them.
+//! tells whether a pinned file or folder still exists. The checks run on the shared probe
+//! service; the scheduling bookkeeping takes explicit times so it can be tested without it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use forge_core::paths::paths_equal;
 
-use crate::path_probe::Probe;
+use crate::path_probe::{Client, Event, is_network};
 use crate::settings::Pin;
 
 /// How often a local pinned path is checked.
@@ -24,7 +24,11 @@ pub enum PinStatus {
     #[default]
     Unknown,
     Present,
+    /// The check finished and found nothing there.
     Missing,
+    /// The check did not answer in time (usually an offline share). Shown greyed out, but a
+    /// click still tries to open it.
+    Unreachable,
 }
 
 /// Drag payload of a pin row: the index of the pin being moved.
@@ -79,12 +83,7 @@ pub fn set_label(pins: &mut [Pin], path: &Path, text: &str) -> bool {
 /// How long to wait between checks of `path`: network paths (UNC, or under a network drive
 /// root) get the longer interval.
 pub fn check_interval(path: &Path, network_roots: &[PathBuf]) -> Duration {
-    let text = path.to_string_lossy().to_lowercase();
-    let is_unc = text.starts_with(r"\\");
-    let on_network_drive = network_roots
-        .iter()
-        .any(|root| text.starts_with(&root.to_string_lossy().to_lowercase()));
-    if is_unc || on_network_drive {
+    if is_network(path, network_roots) {
         NETWORK_INTERVAL
     } else {
         LOCAL_INTERVAL
@@ -95,27 +94,33 @@ pub fn check_interval(path: &Path, network_roots: &[PathBuf]) -> Duration {
 struct Slot {
     status: PinStatus,
     last_checked: Option<Instant>,
-    /// A check was started and its result has not arrived yet. Never cleared by timeout, so a
-    /// hung check blocks further checks of that path instead of piling up threads.
-    in_flight: bool,
+    /// Submitted and waiting for a worker. At most one queued check per path, so a dead share
+    /// can't grow the queue.
+    queued: bool,
+    /// When a worker picked the check up; `None` once it answered.
+    running_since: Option<Instant>,
     pinned: bool,
 }
 
+impl Slot {
+    fn timed_out(&self, now: Instant) -> bool {
+        self.running_since
+            .is_some_and(|started| now.saturating_duration_since(started) >= CHECK_TIMEOUT)
+    }
+}
+
 /// Keeps the existence status of pinned paths up to date without touching the disk on the UI
-/// thread. Checks queue on a small worker pool (see `path_probe`), so pins on dead network
-/// shares can't pile up blocked threads.
+/// thread. Checks go through the shared probe service (see `path_probe`), whose local and
+/// network lanes keep local pins answering while a network share hangs.
 #[derive(Default)]
 pub struct PinWatch {
     slots: HashMap<PathBuf, Slot>,
-    /// Started on the first tick that has something to check.
-    probe: Option<Probe>,
+    /// Connected on the first tick that has something to check.
+    probe: Option<Client>,
 }
 
-/// Workers checking pins. A check stuck on an offline share holds one of them.
-const PROBE_WORKERS: usize = 3;
-
-/// A check that has not answered by then shows its pin as unavailable. The check itself keeps
-/// its worker until the OS gives up, and the path is not queued again meanwhile.
+/// A check that has been running this long shows its pin as unreachable, and the pin is
+/// checked again at its next interval.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl PinWatch {
@@ -130,12 +135,16 @@ impl PinWatch {
         let now = Instant::now();
         for path in self.due(now, network_roots) {
             self.start(&path, now);
+            let network = is_network(&path, network_roots);
             self.probe
-                .get_or_insert_with(|| Probe::new(PROBE_WORKERS, Some(ctx.clone())))
-                .submit(path);
+                .get_or_insert_with(|| Client::new(Some(ctx.clone())))
+                .submit(path, network);
         }
-        while let Some((path, found)) = self.probe.as_ref().and_then(Probe::try_recv) {
-            self.finish(&path, found.is_some());
+        while let Some(event) = self.probe.as_ref().and_then(Client::try_recv) {
+            match event {
+                Event::Started(path) => self.started(&path, now),
+                Event::Done(path, found) => self.finish(&path, found.is_some()),
+            }
         }
         self.expire(now);
         if !self.slots.is_empty() {
@@ -145,7 +154,7 @@ impl PinWatch {
     }
 
     /// Follows the pin list: every pinned path gets a slot. Slots of unpinned paths are dropped,
-    /// except while a check for them is still running (its result is then ignored).
+    /// except while a check for them is still pending (its result is then ignored).
     fn sync(&mut self, pins: &[Pin]) {
         for slot in self.slots.values_mut() {
             slot.pinned = false;
@@ -153,10 +162,12 @@ impl PinWatch {
         for pin in pins {
             self.slots.entry(pin.path.clone()).or_default().pinned = true;
         }
-        self.slots.retain(|_, slot| slot.pinned || slot.in_flight);
+        self.slots
+            .retain(|_, slot| slot.pinned || slot.queued || slot.running_since.is_some());
     }
 
-    /// Pinned paths that have no check in flight and whose interval has passed. Sorted, so the
+    /// Pinned paths whose interval has passed and that have no check queued or running (a
+    /// running check that timed out does not hold the pin back: it is retried). Sorted, so the
     /// order is stable.
     fn due(&self, now: Instant, network_roots: &[PathBuf]) -> Vec<PathBuf> {
         let mut due: Vec<PathBuf> = self
@@ -164,7 +175,8 @@ impl PinWatch {
             .iter()
             .filter(|(path, slot)| {
                 slot.pinned
-                    && !slot.in_flight
+                    && !slot.queued
+                    && (slot.running_since.is_none() || slot.timed_out(now))
                     && slot.last_checked.is_none_or(|checked| {
                         now.saturating_duration_since(checked) >= check_interval(path, network_roots)
                     })
@@ -175,22 +187,28 @@ impl PinWatch {
         due
     }
 
-    /// Marks a check of `path` as started at `now`.
+    /// Marks a check of `path` as submitted at `now`.
     fn start(&mut self, path: &Path, now: Instant) {
         if let Some(slot) = self.slots.get_mut(path) {
-            slot.in_flight = true;
+            slot.queued = true;
             slot.last_checked = Some(now);
         }
     }
 
-    /// Pins whose check has run longer than [`CHECK_TIMEOUT`] show as missing.
+    /// A worker picked up the check of `path`; its timeout counts from here.
+    fn started(&mut self, path: &Path, now: Instant) {
+        if let Some(slot) = self.slots.get_mut(path) {
+            slot.queued = false;
+            slot.running_since = Some(now);
+        }
+    }
+
+    /// Pins whose check has run longer than [`CHECK_TIMEOUT`] show as unreachable. Queued
+    /// checks never time out: they have not touched the disk yet.
     fn expire(&mut self, now: Instant) {
         for slot in self.slots.values_mut() {
-            let overdue = slot
-                .last_checked
-                .is_some_and(|started| now.saturating_duration_since(started) >= CHECK_TIMEOUT);
-            if slot.pinned && slot.in_flight && overdue {
-                slot.status = PinStatus::Missing;
+            if slot.pinned && slot.timed_out(now) {
+                slot.status = PinStatus::Unreachable;
             }
         }
     }
@@ -200,7 +218,8 @@ impl PinWatch {
         let Some(slot) = self.slots.get_mut(path) else {
             return;
         };
-        slot.in_flight = false;
+        slot.queued = false;
+        slot.running_since = None;
         if slot.pinned {
             slot.status = if present {
                 PinStatus::Present
@@ -424,18 +443,41 @@ mod tests {
     }
 
     #[test]
-    fn a_check_that_never_answers_shows_missing_after_the_timeout() {
+    fn a_running_check_that_never_answers_shows_unreachable_and_is_retried() {
         let mut watch = PinWatch::default();
         let path = PathBuf::from(r"\\offline\share");
         let pins = vec![Pin { path: path.clone(), ..Default::default() }];
         let t0 = Instant::now();
         watch.sync(&pins);
         watch.start(&path, t0);
+        watch.started(&path, t0);
         watch.expire(t0 + CHECK_TIMEOUT / 2);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
-        watch.expire(t0 + CHECK_TIMEOUT);
-        assert_eq!(watch.status(&path), PinStatus::Missing);
-        assert!(watch.due(t0 + CHECK_TIMEOUT * 10, &[]).is_empty(), "still in flight");
+        let t1 = t0 + CHECK_TIMEOUT;
+        watch.expire(t1);
+        assert_eq!(watch.status(&path), PinStatus::Unreachable);
+        // Retried at its next interval, even though the first check still holds a worker.
+        assert_eq!(watch.due(t0 + NETWORK_INTERVAL, &[]), vec![path.clone()]);
+        watch.start(&path, t0 + NETWORK_INTERVAL);
+        assert!(watch.due(t0 + NETWORK_INTERVAL * 3, &[]).is_empty(), "one queued retry at most");
+        watch.finish(&path, true);
+        assert_eq!(watch.status(&path), PinStatus::Present);
+    }
+
+    #[test]
+    fn a_queued_check_never_times_out() {
+        let mut watch = PinWatch::default();
+        let path = PathBuf::from(r"C:\photos");
+        watch.sync(&pins_of(&[r"C:\photos"]));
+        let t0 = Instant::now();
+        watch.start(&path, t0);
+        watch.expire(t0 + CHECK_TIMEOUT * 10);
+        assert_eq!(watch.status(&path), PinStatus::Unknown);
+        // Once a worker runs it, the timeout counts from then.
+        let t1 = t0 + CHECK_TIMEOUT * 10;
+        watch.started(&path, t1);
+        watch.expire(t1 + CHECK_TIMEOUT / 2);
+        assert_eq!(watch.status(&path), PinStatus::Unknown);
         watch.finish(&path, true);
         assert_eq!(watch.status(&path), PinStatus::Present);
     }

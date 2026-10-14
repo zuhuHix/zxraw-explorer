@@ -311,9 +311,10 @@ fn pins_list(app: &mut ZxrawApp, ui: &mut Ui) {
     let current = app.pane().path.clone();
     let mut edit = None;
     for (i, pin) in pins.iter().enumerate() {
-        let missing = pin_status(app, &pin.path) == PinStatus::Missing;
+        let status = pin_status(app, &pin.path);
+        let missing = status == PinStatus::Missing;
         let is_current = !pin.file && paths_equal(&current, &pin.path);
-        let r = pin_row(ui, i, pin, missing, is_current);
+        let r = pin_row(ui, i, pin, status, is_current);
 
         if r.clicked() {
             activate_pin(app, i);
@@ -399,7 +400,8 @@ fn pins_list(app: &mut ZxrawApp, ui: &mut Ui) {
 }
 
 /// One pin row: a drag source for reordering, drawn muted when its target is missing.
-fn pin_row(ui: &mut Ui, index: usize, pin: &Pin, missing: bool, current: bool) -> egui::Response {
+fn pin_row(ui: &mut Ui, index: usize, pin: &Pin, status: PinStatus, current: bool) -> egui::Response {
+    let missing = matches!(status, PinStatus::Missing | PinStatus::Unreachable);
     let icon = if pin.file { "📄" } else { "🔖" };
     let text = RichText::new(format!("{icon}  {}", pin_label(pin)));
     let text = if missing {
@@ -426,10 +428,10 @@ fn pin_row(ui: &mut Ui, index: usize, pin: &Pin, missing: bool, current: bool) -
     if current {
         theme::paint_indicator(ui, r.rect, true);
     }
-    let tip = if missing {
-        format!("Not found: {}", pin.path.display())
-    } else {
-        pin.path.to_string_lossy().into_owned()
+    let tip = match status {
+        PinStatus::Missing => format!("Not found: {}", pin.path.display()),
+        PinStatus::Unreachable => format!("Not responding: {}", pin.path.display()),
+        _ => pin.path.to_string_lossy().into_owned(),
     };
     r.on_hover_text(tip)
 }

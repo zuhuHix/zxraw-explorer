@@ -28,12 +28,53 @@ pub struct LayoutsUi {
 struct Loading {
     layout: Layout,
     check: Batch,
+    /// The open tabs when loading started. If the user changes them meanwhile, the load is
+    /// cancelled rather than overwriting their work.
+    started_from: Workspace,
 }
 
-/// Every folder a set of tabs opens.
-fn tab_paths(tabs: &[TabSession]) -> Vec<PathBuf> {
+/// The open tabs (folders, views, sorting) and which one is active.
+type Workspace = (Vec<TabSession>, usize);
+
+fn workspace(app: &ZxrawApp) -> Workspace {
+    (app.session().tabs, app.active)
+}
+
+/// What a pending load does this frame.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadStep {
+    Wait,
+    Apply,
+    Cancel,
+}
+
+fn load_step(started_from: &Workspace, current: &Workspace, checks_done: bool) -> LoadStep {
+    if started_from != current {
+        LoadStep::Cancel
+    } else if checks_done {
+        LoadStep::Apply
+    } else {
+        LoadStep::Wait
+    }
+}
+
+/// Every folder a set of tabs opens, paired with whether it is on the network (so the probe
+/// can keep local checks out of the network lane).
+fn probe_paths(app: &ZxrawApp, tabs: &[TabSession]) -> Vec<(PathBuf, bool)> {
+    let network_roots: Vec<PathBuf> = app
+        .sidebar
+        .drives
+        .lock()
+        .iter()
+        .filter(|d| d.kind == "Network")
+        .map(|d| d.root.clone())
+        .collect();
     tabs.iter()
         .flat_map(|t| std::iter::once(t.left.clone()).chain(t.right.clone()))
+        .map(|p| {
+            let network = crate::path_probe::is_network(&p, &network_roots);
+            (p, network)
+        })
         .collect()
 }
 
@@ -303,10 +344,11 @@ pub fn load_by_name(app: &mut ZxrawApp, name: &str) -> bool {
 /// Starts loading `layout`: its folders are checked off the UI thread (an offline share can
 /// take the OS a long time to give up on), and [`tick`] opens it when they have answered.
 fn open_layout(app: &mut ZxrawApp, layout: &Layout) {
-    let check = Batch::start(tab_paths(&layout.tabs), None);
+    let check = Batch::start(probe_paths(app, &layout.tabs), None);
     app.layouts.loading = Some(Loading {
         layout: layout.clone(),
         check,
+        started_from: workspace(app),
     });
 }
 
@@ -319,19 +361,30 @@ pub fn is_loading(app: &ZxrawApp) -> bool {
 /// Checks the folders of the tabs restored from the last session; see [`tick`].
 pub fn check_restored(app: &mut ZxrawApp) {
     let tabs = app.session().tabs;
-    app.layouts.restored = Some(Batch::start(tab_paths(&tabs), None));
+    app.layouts.restored = Some(Batch::start(probe_paths(app, &tabs), None));
 }
 
 /// Applies finished folder checks. Called every frame from `logic`.
 pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let now = Instant::now();
     let mut pending = false;
-    if let Some(loading) = &mut app.layouts.loading {
-        if loading.check.poll(now) {
-            let loading = app.layouts.loading.take().expect("checked above");
-            finish_load(app, &loading.layout, &loading.check);
-        } else {
-            pending = true;
+    if app.layouts.loading.is_some() {
+        let current = workspace(app);
+        let loading = app.layouts.loading.as_mut().expect("checked above");
+        let done = loading.check.poll(now);
+        match load_step(&loading.started_from, &current, done) {
+            LoadStep::Wait => pending = true,
+            LoadStep::Apply => {
+                let loading = app.layouts.loading.take().expect("checked above");
+                finish_load(app, &loading.layout, &loading.check);
+            }
+            LoadStep::Cancel => {
+                let loading = app.layouts.loading.take().expect("checked above");
+                app.toast(format!(
+                    "Stopped loading layout “{}”: the tabs were changed",
+                    loading.layout.name
+                ));
+            }
         }
     }
     if let Some(check) = &mut app.layouts.restored {
@@ -347,33 +400,44 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 }
 
-/// Replaces the open tabs with the ones of `layout` whose folders were found. If none
-/// survive, the current tabs stay. Missing and unreachable folders are reported.
+/// Replaces the open tabs with the ones of `layout` whose folders exist. Only a finished
+/// negative check counts as missing: a folder whose check did not answer in time (usually an
+/// offline share) opens anyway and its tab shows its own error. If no tab survives, the
+/// current tabs stay.
 fn finish_load(app: &mut ZxrawApp, layout: &Layout, check: &Batch) {
-    let plan = plan(layout, |p| check.is_dir(p));
-    let unreachable = check.unanswered();
-    let (offline, missing): (Vec<PathBuf>, Vec<PathBuf>) =
-        plan.missing.iter().cloned().partition(|p| unreachable.contains(p));
+    let plan = plan(layout, |p| !check.is_missing(p));
+    let slow: Vec<PathBuf> = check
+        .unchecked()
+        .into_iter()
+        .filter(|p| plan.tabs.iter().any(|t| &t.left == p || t.right.as_ref() == Some(p)))
+        .collect();
     if plan.tabs.is_empty() {
         app.toast_err(format!(
-            "Layout “{}”: none of its folders were found{}",
-            layout.name,
-            if offline.is_empty() { String::new() } else { format!(" ({} not reachable)", offline.len()) }
+            "Layout “{}”: none of its folders were found",
+            layout.name
         ));
         return;
     }
     app.tabs = plan.tabs.iter().map(|t| app.tab_from_session(t)).collect();
     app.active = plan.active.min(app.tabs.len() - 1);
-    if plan.missing.is_empty() {
+    if plan.missing.is_empty() && slow.is_empty() {
         app.toast(format!("Layout “{}” loaded", layout.name));
         return;
     }
     let mut parts = Vec::new();
-    if !missing.is_empty() {
-        parts.push(format!("{} folder(s) not found: {}", missing.len(), path_list(&missing)));
+    if !plan.missing.is_empty() {
+        parts.push(format!(
+            "{} folder(s) not found: {}",
+            plan.missing.len(),
+            path_list(&plan.missing)
+        ));
     }
-    if !offline.is_empty() {
-        parts.push(format!("{} not reachable: {}", offline.len(), path_list(&offline)));
+    if !slow.is_empty() {
+        parts.push(format!(
+            "{} not responding yet, opened anyway: {}",
+            slow.len(),
+            path_list(&slow)
+        ));
     }
     app.toast_err(format!("Layout “{}”: {}", layout.name, parts.join("; ")));
 }
@@ -384,14 +448,15 @@ fn path_list(paths: &[PathBuf]) -> String {
     format!("{}{more}", shown.join(", "))
 }
 
-/// Restored panes whose folder has vanished or is offline switch to the start folder, unless
-/// the user has already navigated away.
+/// Restored panes whose folder was found to be gone switch to the start folder, unless the user
+/// has already navigated away. A folder whose check did not answer (an offline share) stays,
+/// and its pane shows its own error.
 fn fix_restored(app: &mut ZxrawApp, check: &Batch) {
     let fallback = app.start_folder();
     let mut stale = Vec::new();
     for (t, tab) in app.tabs.iter().enumerate() {
         for (right, pane) in std::iter::once((false, &tab.left)).chain(tab.right.iter().map(|r| (true, r))) {
-            if !pane.can_back() && !check.is_dir(&pane.path) && check.knows(&pane.path) {
+            if !pane.can_back() && check.is_missing(&pane.path) {
                 stale.push((t, right));
             }
         }
@@ -722,5 +787,19 @@ mod tests {
         assert_eq!(l.tabs[0].sort, None);
         assert_eq!(l.tabs[0].right_view, None);
         assert_eq!(l.tabs[0].right_sort, None);
+    }
+
+    #[test]
+    fn a_pending_load_is_cancelled_when_the_tabs_change() {
+        let before: Workspace = (vec![tab("C:/a", None)], 0);
+        assert_eq!(load_step(&before, &before.clone(), false), LoadStep::Wait);
+        assert_eq!(load_step(&before, &before.clone(), true), LoadStep::Apply);
+        let navigated: Workspace = (vec![tab("C:/b", None)], 0);
+        assert_eq!(load_step(&before, &navigated, false), LoadStep::Cancel);
+        assert_eq!(load_step(&before, &navigated, true), LoadStep::Cancel);
+        let new_tab: Workspace = (vec![tab("C:/a", None), tab("C:/a", None)], 1);
+        assert_eq!(load_step(&before, &new_tab, true), LoadStep::Cancel);
+        let split: Workspace = (vec![tab("C:/a", Some("C:/b"))], 0);
+        assert_eq!(load_step(&before, &split, true), LoadStep::Cancel);
     }
 }
