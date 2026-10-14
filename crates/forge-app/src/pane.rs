@@ -423,7 +423,7 @@ impl Pane {
                 // A refresh finished (a failed one leaves nothing listed, as before).
                 let fresh = if matches!(state, LoadState::Failed(_)) { Vec::new() } else { fresh };
                 let dir = self.path.clone();
-                self.reshape(|pane| pane.swap_children(&dir, fresh));
+                self.reshape(false, |pane| pane.swap_children(&dir, fresh));
             }
             self.load = state;
             self.rx = None;
@@ -451,10 +451,9 @@ impl Pane {
             if let Some(name) = self.pending_select.take() {
                 self.select_name(&name);
             }
-            // By path: names repeat across open folders. An item inside an open folder
-            // that is still listing falls back to the folder.
+            // By path: names repeat across open folders. An item that is gone leaves no cursor.
             if let Some(path) = self.pending_select_keep.take() {
-                self.cursor = self.row_of_nearest(&path);
+                self.cursor = self.row_of(&path);
             }
         }
         changed
@@ -519,14 +518,16 @@ impl Pane {
     }
 
     /// Recompute the rows. The cursor and the Shift-select anchor stay on their items (by
-    /// path) while those are listed; a cursor whose item went away is clamped, an anchor is
-    /// dropped. Callers that changed `entries` must clear `visible` first.
+    /// path) while those are listed, and are cleared when their item is no longer shown.
+    /// Callers that changed `entries` must clear `visible` first.
     pub fn rebuild_visible(&mut self) {
         let cursor_path = self.cursor_entry().map(|e| e.path.clone());
         let anchor_path = self.anchor.and_then(|a| self.entry_at(a)).map(|e| e.path.clone());
         self.rebuild_rows();
-        if let Some(row) = cursor_path.and_then(|p| self.row_of(&p)) {
-            self.cursor = Some(row);
+        // An item that is no longer shown (hidden, filtered out) takes the cursor with it:
+        // left on its old row, the cursor would point at another file.
+        if let Some(p) = cursor_path {
+            self.cursor = self.row_of(&p);
         }
         self.anchor = anchor_path.and_then(|p| self.row_of(&p));
     }
@@ -591,9 +592,14 @@ impl Pane {
     /// Selected paths, or the cursor item if nothing is selected.
     /// What an operation acts on: the selected paths (a folder covers the selected items
     /// inside it, see [`without_covered`]), or the cursor item if nothing is selected.
+    ///
+    /// A selection that is entirely hidden (hidden files turned off, filtered out, inside a
+    /// closed folder) targets nothing: the cursor is not used in its place.
     pub fn action_targets(&self) -> Vec<PathBuf> {
         let sel = self.selected_roots();
-        if sel.is_empty() {
+        if sel.is_empty() && !self.selected.is_empty() {
+            Vec::new()
+        } else if sel.is_empty() {
             self.cursor_entry()
                 .map(|e| vec![e.path.clone()])
                 .unwrap_or_default()
@@ -834,10 +840,10 @@ impl Pane {
                 return;
             }
             self.expanded.insert(path.to_path_buf());
-            self.reshape(|pane| pane.start_child_load(path.to_path_buf()));
+            self.reshape(false, |pane| pane.start_child_load(path.to_path_buf()));
         } else if self.expanded.remove(path) {
             // A cursor inside the folder moves to the folder.
-            self.reshape(|pane| pane.drop_children(path, true));
+            self.reshape(true, |pane| pane.drop_children(path, true));
             self.scroll_to_cursor = true;
         }
     }
@@ -1031,7 +1037,7 @@ impl Pane {
             self.start_child_load(dir);
         }
         if !swaps.is_empty() {
-            self.reshape(|pane| {
+            self.reshape(false, |pane| {
                 for (dir, fresh) in swaps {
                     pane.swap_children(&dir, fresh);
                 }
@@ -1048,7 +1054,8 @@ impl Pane {
             return false;
         }
         self.tree_view = self.view;
-        self.reshape(|pane| {
+        // Leaving details view closes every open folder: like closing one.
+        self.reshape(true, |pane| {
             if pane.view != ViewMode::Details {
                 let open: Vec<PathBuf> = pane.children.keys().cloned().collect();
                 for dir in open {
@@ -1071,9 +1078,10 @@ impl Pane {
 
     /// Change the tree's shape, then rebuild the rows. `change` may remove entries, which
     /// invalidates row indices, so the cursor and anchor are carried over by path. When its
-    /// item is gone, the cursor moves to the nearest listed folder above it and the anchor
-    /// is cleared.
-    fn reshape(&mut self, change: impl FnOnce(&mut Self)) {
+    /// item is gone the anchor is cleared, and so is the cursor, unless the user closed the
+    /// folder it was in (`closing`): then it moves to that folder. A cursor left on some
+    /// other row would make Delete act on an item the user never chose.
+    fn reshape(&mut self, closing: bool, change: impl FnOnce(&mut Self)) {
         let path_at = |pane: &Self, vis: Option<usize>| {
             vis.and_then(|v| pane.entry_at(v)).map(|e| e.path.clone())
         };
@@ -1088,7 +1096,9 @@ impl Pane {
         } else {
             self.rebuild_visible();
         }
-        self.cursor = cursor.and_then(|p| self.row_of_nearest(&p));
+        self.cursor = cursor.and_then(|p| {
+            if closing { self.row_of_nearest(&p) } else { self.row_of(&p) }
+        });
         // Only the cursor falls back to a parent folder: an anchor moved there would make a
         // later Shift-click select the folder (and a Delete take all of it).
         self.anchor = anchor.and_then(|p| self.row_of(&p));
@@ -1443,6 +1453,52 @@ mod tests {
         assert_eq!(visible_names(&pane), ["d.jpg", "c.jpg", "b.jpg"]);
         assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("d.jpg"));
         assert_eq!(pane.entry_at(pane.anchor.unwrap()).map(|e| e.name.as_str()), Some("c.jpg"));
+    }
+
+    #[test]
+    fn hiding_the_selected_cursor_item_leaves_nothing_to_act_on() {
+        let (_folder, mut pane) = listed(&["a-secret.jpg", "b.jpg", "c.jpg"]);
+        pane.entries[0].hidden = true;
+        pane.show_hidden = true;
+        pane.rebuild_visible();
+        pane.click(0, false, false);
+        assert_eq!(pane.action_targets(), vec![pane.entries[0].path.clone()]);
+
+        pane.show_hidden = false;
+        pane.rebuild_visible();
+        assert_eq!(pane.cursor, None, "the cursor does not move to b.jpg");
+        assert!(pane.action_targets().is_empty(), "Delete must not hit another file");
+        assert!(pane.selected.contains(&pane.entries[0].path), "the hidden pick is kept");
+
+        // Shown again, the selection is the target again.
+        pane.show_hidden = true;
+        pane.rebuild_visible();
+        assert_eq!(pane.action_targets(), vec![pane.entries[0].path.clone()]);
+    }
+
+    #[test]
+    fn filtering_away_the_selection_leaves_nothing_to_act_on() {
+        let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg", "cherry.jpg"]);
+        pane.click(2, false, false);
+        pane.type_filter("berr");
+        assert_eq!(visible_names(&pane), ["berry.jpg"]);
+        assert!(pane.action_targets().is_empty(), "the selection is filtered out");
+        pane.escape();
+        assert_eq!(pane.action_targets(), vec![pane.entries[2].path.clone()]);
+    }
+
+    #[test]
+    fn targets_are_the_visible_selection_or_the_cursor() {
+        let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg", "cherry.jpg"]);
+        pane.click(0, false, false);
+        pane.click(2, true, false);
+        assert_eq!(
+            pane.action_targets(),
+            vec![pane.entries[0].path.clone(), pane.entries[2].path.clone()]
+        );
+        pane.clear_selection();
+        pane.cursor = Some(1);
+        assert_eq!(pane.action_targets(), vec![pane.entries[1].path.clone()]);
     }
 
     #[test]
