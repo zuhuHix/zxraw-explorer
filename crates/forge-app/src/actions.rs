@@ -466,6 +466,10 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::SplitFile => crate::extra_tools_ui::split_file(app),
         Cmd::JoinFiles => crate::extra_tools_ui::join_files(app),
         Cmd::GroupSimilar => crate::similar::toggle(app),
+        Cmd::ToggleStickySelection => {
+            let pane = app.pane_mut();
+            pane.sticky = !pane.sticky;
+        }
         Cmd::ExportMetadata => crate::meta_export::open(app),
         Cmd::LocateProxies => crate::video_ui::locate_proxies(app),
         Cmd::SelectOriginals => crate::export_assoc::select_originals(app),

@@ -102,6 +102,7 @@ pub enum Cmd {
     SaveLayout,
     LoadLayout,
     ManageLayouts,
+    ToggleStickySelection,
 }
 
 impl Cmd {
@@ -201,6 +202,7 @@ impl Cmd {
         Cmd::SaveLayout,
         Cmd::LoadLayout,
         Cmd::ManageLayouts,
+        Cmd::ToggleStickySelection,
     ];
 
     /// Stable identifier used as the key in `Settings::keybindings`. Never rename one: it's
@@ -302,6 +304,7 @@ impl Cmd {
             Self::SaveLayout => "SaveLayout",
             Self::LoadLayout => "LoadLayout",
             Self::ManageLayouts => "ManageLayouts",
+            Self::ToggleStickySelection => "ToggleStickySelection",
         }
     }
 
@@ -403,6 +406,7 @@ impl Cmd {
             SaveLayout => "Save layout…",
             LoadLayout => "Load layout…",
             ManageLayouts => "Manage layouts…",
+            ToggleStickySelection => "Sticky selection (click adds or removes)",
         }
     }
 
@@ -471,6 +475,7 @@ impl Cmd {
             MarkPick => k(c, Key::P),
             MarkReject => k(c, Key::Delete),
             Unflag => k(c, Key::U),
+            ToggleStickySelection => k(cs, Key::S),
             _ => None,
         }
     }

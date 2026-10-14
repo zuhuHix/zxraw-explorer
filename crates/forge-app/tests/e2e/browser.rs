@@ -308,3 +308,77 @@ fn hidden_burst_member_is_not_selected_or_copied_with_its_stack() {
     );
     println!("hidden-member stack screenshot: {}", stack_shot.display());
 }
+
+fn list_fixture(names: &[&str]) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    for name in names {
+        write_file(&work.join(name), b"x");
+    }
+    let profile = temp.path().join("profile");
+    (temp, work, profile)
+}
+
+#[test]
+fn typing_filters_the_list_when_the_setting_says_so() {
+    let (temp, work, profile) = list_fixture(&["beach 01.txt", "beach 02.txt", "city.txt"]);
+    write_file(
+        &profile.join("config").join("settings.json"),
+        br#"{ "list_typing": "Filter" }"#,
+    );
+    let shot = shots_dir().join("type-to-filter.png");
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         # Nothing focused: the app's global key handler takes the text.\n\
+         text cit\nui browser assert-filter cit\nui browser assert-visible city.txt\n\
+         key Escape\nui browser assert-filter\n\
+         # A focused row: the list view's own key handler takes it.\n\
+         click-entry city.txt\ntext beach 0\nwait-frames 2\nscreenshot {shot}\n\
+         ui browser assert-filter beach 0\n\
+         ui browser assert-visible beach 01.txt, beach 02.txt\n\
+         key Backspace\nkey Backspace\nui browser assert-filter beach\nassert-path {work}\n\
+         key Escape\nui browser assert-visible beach 01.txt, beach 02.txt, city.txt\n\
+         # With no filter left, Backspace goes up a folder as usual.\n\
+         click-entry city.txt\nkey Backspace\nassert-path {root}\nexit\n",
+        work = shown(&work),
+        root = shown(temp.path()),
+        shot = shown(&shot),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn typing_jumps_to_a_name_by_default() {
+    let (temp, work, profile) = list_fixture(&["beach.txt", "city.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         text ci\nassert-selection city.txt\nui browser assert-filter\n\
+         ui browser assert-visible beach.txt, city.txt\nexit\n",
+        work = shown(&work),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn sticky_selection_toggles_items_with_plain_clicks() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt"]);
+    let shot = shots_dir().join("sticky-selection.png");
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         key ctrl+shift+S\nui browser assert-sticky on\n\
+         click-entry a.txt\nclick-entry b.txt\nclick-entry c.txt\nassert-selected 3\n\
+         click-entry b.txt\nassert-selection a.txt, c.txt\nwait-frames 2\nscreenshot {shot}\n\
+         # Esc ends sticky selection and keeps the picks; a plain click replaces them again.\n\
+         key Escape\nui browser assert-sticky off\nassert-selection a.txt, c.txt\n\
+         click-entry b.txt\nassert-selection b.txt\n\
+         # The command toggles it too.\n\
+         cmd ToggleStickySelection\nclick-entry a.txt\nassert-selection a.txt, b.txt\n\
+         cmd ToggleStickySelection\nui browser assert-sticky off\nexit\n",
+        work = shown(&work),
+        shot = shown(&shot),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}

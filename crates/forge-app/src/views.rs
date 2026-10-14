@@ -295,7 +295,7 @@ fn row_click(resp: &egui::Response, pane: &mut Pane, vis: usize, out: &mut Vec<V
     let m = resp.ctx.input(|i| i.modifiers);
     if resp.clicked() {
         resp.request_focus();
-        pane.click(vis, m.command, m.shift);
+        pane.pointer_click(vis, m.command, m.shift);
         out.push(ViewEvent::Focus);
     }
     if resp.secondary_clicked() {
@@ -890,17 +890,23 @@ fn handle_focused_view_keys(
                         out.push(ViewEvent::Activate(cursor));
                     }
                 }
-                egui::Key::Backspace => out.push(ViewEvent::Command(Cmd::Up)),
-                egui::Key::Escape => {
-                    if !pane.filter_text.is_empty() {
-                        pane.set_filter(String::new());
-                    } else {
-                        pane.clear_selection();
+                egui::Key::Backspace => {
+                    let filtering = crate::pane::typing_filters(ui.ctx());
+                    if !(filtering && pane.filter_backspace()) {
+                        out.push(ViewEvent::Command(Cmd::Up));
                     }
                 }
+                egui::Key::Escape => pane.escape(),
                 _ => {}
             }
         }
+    }
+    if crate::pane::typing_filters(ui.ctx()) {
+        let text: String = text.chars().filter(|character| !character.is_control()).collect();
+        if !text.is_empty() && !modifiers.command {
+            pane.type_filter(&text);
+        }
+        return;
     }
     let text: String = text
         .chars()
@@ -1754,7 +1760,8 @@ fn group_row_click(
     let modifiers = resp.ctx.input(|input| input.modifiers);
     if resp.clicked() {
         resp.request_focus();
-        pane.click_group(cursor_vis, members, modifiers.command, modifiers.shift);
+        let ctrl = modifiers.command || pane.sticky;
+        pane.click_group(cursor_vis, members, ctrl, modifiers.shift);
         out.push(ViewEvent::Focus);
     }
     if resp.secondary_clicked() {

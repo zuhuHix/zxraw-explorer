@@ -174,6 +174,12 @@ Explorer is a file manager designed around that workflow:
   away from the sidebar's Layouts section.
 - **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
   files each get their own icon, alongside the photo, video and audio ones.
+- **Type to filter.** Settings › Browsing › *Typing in the file list* can switch typing from
+  jumping to a name to filtering the list: type a few letters and only matching names stay.
+  <kbd>Esc</kbd> clears the filter.
+- **Sticky selection.** <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> makes every click add or remove
+  an item, so picking scattered files needs no <kbd>Ctrl</kbd>. The status bar shows 📌 while it is
+  on; <kbd>Esc</kbd> turns it off.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
 
 <p align="center">

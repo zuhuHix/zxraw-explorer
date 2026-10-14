@@ -60,6 +60,20 @@ pub struct Pane {
     pub similar: crate::similar::Grouping,
     /// Changes whenever `entries` or `visible` change (see [`Pane::listing_rev`]).
     listing_rev: u64,
+    /// Sticky selection: a plain click toggles an item in or out of the selection, as
+    /// Ctrl+click does (`Cmd::ToggleStickySelection`; Esc turns it off).
+    pub sticky: bool,
+}
+
+/// Whether typing in the file list filters it (Settings › Browsing). The app publishes the
+/// setting each frame so the list views, which only see a pane, can read it.
+pub fn publish_typing_filters(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("zxraw-typing-filters"), on));
+}
+
+pub fn typing_filters(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::new("zxraw-typing-filters")))
+        .unwrap_or(false)
 }
 
 /// Source of listing revisions, shared by all panes so two panes never report the same one.
@@ -98,6 +112,7 @@ impl Pane {
             show_system: false,
             similar: crate::similar::Grouping::default(),
             listing_rev: 0,
+            sticky: false,
         };
         p.load_path(path);
         p
@@ -507,6 +522,56 @@ impl Pane {
         self.scroll_to_cursor = true;
     }
 
+    /// Type-to-filter: typed characters extend the filter, so only matching names stay
+    /// listed. The cursor lands on the first match when it was not on a listed item.
+    pub fn type_filter(&mut self, text: &str) {
+        // A leading space would only make the filter look empty; spaces inside names count.
+        let text = if self.filter_text.is_empty() { text.trim_start() } else { text };
+        if text.is_empty() {
+            return;
+        }
+        let cursor_path = self.cursor_entry().map(|e| e.path.clone());
+        let mut filter = self.filter_text.clone();
+        filter.push_str(text);
+        self.set_filter(filter);
+        // Keep the cursor on its item while it still matches, otherwise go to the first match.
+        self.cursor = cursor_path
+            .and_then(|p| self.visible.iter().position(|&i| self.entries[i].path == p))
+            .or(if self.visible.is_empty() { None } else { Some(0) });
+        self.scroll_to_cursor = true;
+    }
+
+    /// Backspace in type-to-filter mode: removes the filter's last character. Returns false
+    /// when there is no filter, so Backspace keeps its usual meaning (up one folder).
+    pub fn filter_backspace(&mut self) -> bool {
+        if self.filter_text.is_empty() {
+            return false;
+        }
+        let mut filter = self.filter_text.clone();
+        filter.pop();
+        self.set_filter(filter);
+        self.scroll_to_cursor = true;
+        true
+    }
+
+    /// Esc in the file list undoes one thing at a time: the filter, then sticky selection,
+    /// then the selection.
+    pub fn escape(&mut self) {
+        if !self.filter_text.is_empty() {
+            self.set_filter(String::new());
+            self.scroll_to_cursor = true;
+        } else if self.sticky {
+            self.sticky = false;
+        } else {
+            self.clear_selection();
+        }
+    }
+
+    /// A mouse click on a row or tile: sticky selection turns a plain click into Ctrl+click.
+    pub fn pointer_click(&mut self, vis: usize, ctrl: bool, shift: bool) {
+        self.click(vis, ctrl || self.sticky, shift);
+    }
+
     /// Jump to the next entry whose name starts with the typed prefix (type-ahead find).
     pub fn type_ahead(&mut self, prefix: &str) {
         let p = prefix.to_lowercase();
@@ -642,5 +707,114 @@ mod tests {
 
         let members = vec![hidden.clone(), shown.clone()];
         assert_eq!(pane.visible_group_paths(&members), vec![shown]);
+    }
+    fn listed(names: &[&str]) -> (tempfile::TempDir, Pane) {
+        let folder = tempfile::tempdir().unwrap();
+        let mut pane = Pane::new(
+            folder.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Details,
+        );
+        pane.entries = names
+            .iter()
+            .map(|name| FileEntry {
+                path: folder.path().join(name),
+                name: (*name).into(),
+                kind: EntryKind::File,
+                size: 1,
+                modified: None,
+                created: None,
+                hidden: false,
+                readonly: false,
+                system: false,
+                ext: "jpg".into(),
+            })
+            .collect();
+        pane.rebuild_visible();
+        (folder, pane)
+    }
+
+    fn visible_names(pane: &Pane) -> Vec<&str> {
+        pane.visible.iter().map(|&i| pane.entries[i].name.as_str()).collect()
+    }
+
+    #[test]
+    fn typing_extends_the_filter_and_backspace_and_escape_undo_it() {
+        let (_folder, mut pane) = listed(&["beach 01.jpg", "beach 02.jpg", "city.jpg"]);
+        pane.type_filter(" ");
+        assert!(pane.filter_text.is_empty(), "a leading space is not a filter");
+        pane.type_filter("bea");
+        pane.type_filter("ch 0");
+        assert_eq!(pane.filter_text, "beach 0");
+        assert_eq!(visible_names(&pane), ["beach 01.jpg", "beach 02.jpg"]);
+        assert_eq!(pane.cursor, Some(0), "the cursor lands on the first match");
+        assert!(pane.selected.is_empty(), "filtering never selects");
+
+        pane.cursor = Some(1);
+        pane.type_filter("2");
+        assert_eq!(visible_names(&pane), ["beach 02.jpg"]);
+        assert_eq!(pane.cursor, Some(0), "the cursor stays on its item");
+        pane.cursor = Some(0);
+        pane.filter_backspace();
+        pane.cursor = Some(1);
+        pane.type_filter("1");
+        assert_eq!(pane.cursor, Some(0), "a filtered-out cursor moves to the first match");
+        pane.filter_backspace();
+        pane.type_filter("2");
+        assert!(pane.filter_backspace());
+        assert_eq!(pane.filter_text, "beach 0");
+        assert_eq!(visible_names(&pane).len(), 2);
+
+        pane.escape();
+        assert!(pane.filter_text.is_empty());
+        assert_eq!(visible_names(&pane).len(), 3);
+        assert!(!pane.filter_backspace(), "no filter: Backspace goes up a folder instead");
+    }
+
+    #[test]
+    fn typed_query_syntax_uses_the_same_filter_machinery() {
+        let (_folder, mut pane) = listed(&["a.jpg", "b.cr3", "c.cr3"]);
+        pane.entries[1].ext = "cr3".into();
+        pane.entries[2].ext = "cr3".into();
+        pane.type_filter("ext:cr3");
+        assert_eq!(visible_names(&pane), ["b.cr3", "c.cr3"]);
+    }
+
+    #[test]
+    fn sticky_selection_makes_a_plain_click_toggle() {
+        let (_folder, mut pane) = listed(&["1.jpg", "2.jpg", "3.jpg"]);
+        pane.pointer_click(0, false, false);
+        pane.pointer_click(1, false, false);
+        assert_eq!(pane.selected.len(), 1, "without sticky a click replaces the selection");
+
+        pane.sticky = true;
+        pane.pointer_click(0, false, false);
+        pane.pointer_click(2, false, false);
+        assert_eq!(pane.selected.len(), 3);
+        pane.pointer_click(1, false, false);
+        assert_eq!(pane.selected.len(), 2, "a second click takes the item out again");
+        assert!(!pane.selected.contains(&pane.entries[1].path));
+
+        // Keyboard movement still moves a single selection: sticky is for the pointer.
+        pane.move_cursor(1, false, false);
+        assert_eq!(pane.selected.len(), 1);
+    }
+
+    #[test]
+    fn escape_clears_filter_then_sticky_then_selection() {
+        let (_folder, mut pane) = listed(&["1.jpg", "2.jpg"]);
+        pane.sticky = true;
+        pane.pointer_click(0, false, false);
+        pane.pointer_click(1, false, false);
+        pane.type_filter("1");
+
+        pane.escape();
+        assert!(pane.filter_text.is_empty());
+        assert!(pane.sticky);
+        pane.escape();
+        assert!(!pane.sticky, "the second Esc ends sticky selection");
+        assert_eq!(pane.selected.len(), 2, "and keeps what was picked");
+        pane.escape();
+        assert!(pane.selected.is_empty());
     }
 }
