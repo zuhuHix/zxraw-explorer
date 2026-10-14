@@ -246,12 +246,19 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   bar. Read in-process with `gix` on one background thread; no external program ever runs (no
   `git.exe`, no fsmonitor, no filter drivers: file contents are never read, a tracked file whose
   stat data differs from the index counts as modified). Config is the repository's own only.
-  A 4 s and 50,000-entry limit skips a repository for the session; results are cached per
-  repository and refreshed when the folder watcher fires or after 15 s, and an online-only
-  cloud folder is never read. Unit tests cover lookup and roll-up, repo-root detection, a real
-  repository (modified, staged, untracked, ignored) and `repository_config_cannot_run_programs`
-  (a repository whose `core.fsmonitor` and filter drivers point at a marker-writing script; the
-  marker is never created). Badge drawing is not covered by a test.
+  One budget covers the whole read, from opening the repository: 4 s, a 64 MB / 100,000-entry
+  index and 50,000 folders and files visited by the walk (each file of an untracked folder
+  counts); a repository over any of them is skipped for the session. Refused without being
+  read: a repository inside a cloud sync root (`forge_core::cloud::in_cloud_sync_root`: a
+  Cloud Files reparse tag or online-only attribute on the folder or any ancestor, fail closed),
+  a `.git` file pointing at a network path, and a config whose `core.worktree` moves the work
+  tree away from the folder. Results are cached per repository and refreshed when the folder
+  watcher fires or after 15 s. Unit tests cover lookup and roll-up, repo-root detection, a real
+  repository (modified, staged, untracked, ignored), `repository_config_cannot_run_programs`
+  (`core.fsmonitor` and filter drivers point at a marker-writing script; the marker is never
+  created), `a_config_that_moves_the_work_tree_is_refused`,
+  `a_git_file_pointing_at_a_network_path_is_refused` and `every_part_of_the_scan_is_bounded`
+  (each limit injected small). Badge drawing is not covered by a test.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).

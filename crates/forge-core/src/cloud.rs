@@ -73,8 +73,16 @@ pub trait AttributeSource {
 pub struct FsAttributes;
 
 impl AttributeSource for FsAttributes {
-    #[cfg(windows)]
     fn attributes(&self, path: &Path) -> Option<u32> {
+        find_data(path).map(|(attributes, _)| attributes)
+    }
+}
+
+/// `(attributes, reparse tag)` from the find data of `path`; the tag is 0 unless the entry is
+/// a reparse point. Never opens the file.
+#[cfg(windows)]
+fn find_data(path: &Path) -> Option<(u32, u32)> {
+    {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Storage::FileSystem::{
             FIND_FIRST_EX_FLAGS, FindClose, FindExInfoBasic, FindExSearchNameMatch,
@@ -105,13 +113,46 @@ impl AttributeSource for FsAttributes {
         .ok()?;
         // SAFETY: `handle` came from a successful FindFirstFileExW and is closed once.
         let _ = unsafe { FindClose(handle) };
-        Some(data.dwFileAttributes)
+        let tag = if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            data.dwReserved0
+        } else {
+            0
+        };
+        Some((data.dwFileAttributes, tag))
     }
-    #[cfg(not(windows))]
-    fn attributes(&self, _path: &Path) -> Option<u32> {
-        // No cloud placeholders outside Windows.
-        Some(0)
-    }
+}
+
+#[cfg(not(windows))]
+fn find_data(_path: &Path) -> Option<(u32, u32)> {
+    // No cloud placeholders outside Windows.
+    Some((0, 0))
+}
+
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Is `tag` one of the Cloud Files reparse tags (`IO_REPARSE_TAG_CLOUD` to `_CLOUD_F`)?
+pub fn is_cloud_reparse_tag(tag: u32) -> bool {
+    tag & 0xFFFF_0FFF == 0x9000_001A
+}
+
+/// Is `dir` inside a cloud sync root (OneDrive, Dropbox, Google Drive "files on demand")?
+///
+/// True when `dir` or any ancestor is a Cloud Files placeholder (cloud reparse tag) or
+/// online-only, and true when such an attribute cannot be read (fail closed). Drive and share
+/// roots are not checked. For background work that would read many files below `dir` without
+/// asking about each one, such as a repository scan.
+pub fn in_cloud_sync_root(dir: &Path) -> bool {
+    in_cloud_sync_root_with(dir, &find_data)
+}
+
+/// [`in_cloud_sync_root`] with an injectable `(attributes, reparse tag)` source.
+pub fn in_cloud_sync_root_with(dir: &Path, find: &dyn Fn(&Path) -> Option<(u32, u32)>) -> bool {
+    dir.ancestors().filter(|a| a.parent().is_some()).any(|a| {
+        is_simulated(a)
+            || find(a).is_none_or(|(attributes, tag)| {
+                is_online_only_attrs(attributes) || is_cloud_reparse_tag(tag)
+            })
+    })
 }
 
 /// May background work (thumbnails, metadata, hashing, scans) read the data of `path`?
@@ -248,5 +289,49 @@ mod tests {
         assert!(!background_read_allowed_entry(&entry));
         clear_simulated_online_only(&f);
         assert!(background_read_allowed(&f));
+    }
+
+    #[test]
+    fn sync_root_check_looks_at_every_ancestor() {
+        let cloud = |p: &Path| {
+            let s = p.to_string_lossy().to_lowercase();
+            Some(if s == r"c:\users\me\onedrive" {
+                (0x10 | 0x400, 0x9000_701A)
+            } else {
+                (0x10, 0)
+            })
+        };
+        assert!(in_cloud_sync_root_with(
+            Path::new(r"C:\Users\me\OneDrive\code\repo"),
+            &cloud
+        ));
+        assert!(in_cloud_sync_root_with(
+            Path::new(r"C:\Users\me\OneDrive"),
+            &cloud
+        ));
+        assert!(!in_cloud_sync_root_with(
+            Path::new(r"C:\Users\me\code\repo"),
+            &cloud
+        ));
+        // A junction is a reparse point too, but not a cloud one.
+        let junction = |_: &Path| Some((0x10 | 0x400, 0xA000_0003));
+        assert!(!in_cloud_sync_root_with(Path::new(r"C:\j\repo"), &junction));
+        let recall = |p: &Path| {
+            Some((
+                if p.ends_with("repo") {
+                    0x10 | 0x0040_0000
+                } else {
+                    0x10
+                },
+                0,
+            ))
+        };
+        assert!(in_cloud_sync_root_with(Path::new(r"C:\x\repo"), &recall));
+        assert!(
+            in_cloud_sync_root_with(Path::new(r"C:\x\repo"), &|_| None),
+            "fails closed"
+        );
+        assert!(is_cloud_reparse_tag(0x9000_001A) && is_cloud_reparse_tag(0x9000_F01A));
+        assert!(!is_cloud_reparse_tag(0xA000_000C));
     }
 }

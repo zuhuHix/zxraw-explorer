@@ -647,7 +647,9 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(&mut settings.git_badges, "Show Git status badges and branch");
     ui.label(
         RichText::new(
-            "In folders inside a Git repository, mark modified, new, ignored and conflicted              files. Needs Git installed; very large repositories are skipped.",
+            "In folders inside a Git repository, mark modified, new, ignored and conflicted \
+             files. Git does not need to be installed; very large repositories and folders \
+             synced by OneDrive or other cloud storage are skipped.",
         )
         .weak(),
     );
