@@ -525,10 +525,10 @@ mod tests {
             .map(PathBuf::from)
             .collect();
         let annotations: HashMap<PathBuf, Annotation> = HashMap::from([
-            (paths[0].clone(), Annotation { rating: 5, label: None, pick: 1 }),
-            (paths[1].clone(), Annotation { rating: 3, label: Some(2), pick: 0 }),
-            (paths[2].clone(), Annotation { rating: 0, label: None, pick: -1 }),
-            (paths[3].clone(), Annotation { rating: 4, label: None, pick: 1 }),
+            (paths[0].clone(), Annotation { rating: 5, label: None, pick: 1, has_note: false }),
+            (paths[1].clone(), Annotation { rating: 3, label: Some(2), pick: 0, has_note: false }),
+            (paths[2].clone(), Annotation { rating: 0, label: None, pick: -1, has_note: false }),
+            (paths[3].clone(), Annotation { rating: 4, label: None, pick: 1, has_note: false }),
             // e.jpg is unannotated.
         ]);
         let run = |filter| filter_sources(&paths, filter, |p| annotations.get(p).copied());

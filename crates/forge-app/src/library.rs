@@ -37,6 +37,8 @@ struct AnnotationWrite {
     /// Each file's entry as read when the change was requested. The writer thread may run
     /// after the file was renamed, so it must not re-read the path itself.
     entries: HashMap<PathBuf, forge_core::FileEntry>,
+    /// Told whether the database write succeeded (sidecar sync is reported separately).
+    ack: Option<Sender<Result<(), String>>>,
 }
 
 enum LibraryWrite {
@@ -54,6 +56,8 @@ enum LibraryWrite {
     Relink {
         pairs: Vec<(PathBuf, PathBuf)>,
     },
+    /// Answered once every write queued before it has been applied.
+    Flush(Sender<()>),
 }
 
 pub struct Library {
@@ -251,6 +255,38 @@ impl Library {
     /// Apply an annotation change to files (optimistically updates the local cache, then
     /// persists in the background). Files are added to the database if not indexed yet.
     pub fn annotate(&mut self, paths: Vec<PathBuf>, change: AnnotationChange) {
+        self.annotate_with(paths, change, None);
+    }
+
+    /// [`Library::annotate`], and the returned channel answers once the database write has
+    /// succeeded or failed. It disconnects without an answer when the write is never made
+    /// (the library database is unavailable).
+    pub fn annotate_confirmed(
+        &mut self,
+        paths: Vec<PathBuf>,
+        change: AnnotationChange,
+    ) -> Receiver<Result<(), String>> {
+        let (ack, result) = bounded(1);
+        self.annotate_with(paths, change, Some(ack));
+        result
+    }
+
+    /// Waits up to `timeout` until every write queued so far has reached the database (used
+    /// at exit). Returns false on timeout or when there is no writer.
+    pub fn flush(&self, timeout: std::time::Duration) -> bool {
+        let Some(writer) = &self.writer else {
+            return false;
+        };
+        let (done, wait) = bounded(1);
+        writer.send(LibraryWrite::Flush(done)).is_ok() && wait.recv_timeout(timeout).is_ok()
+    }
+
+    fn annotate_with(
+        &mut self,
+        paths: Vec<PathBuf>,
+        change: AnnotationChange,
+        ack: Option<Sender<Result<(), String>>>,
+    ) {
         self.next_annotation_version = self.next_annotation_version.wrapping_add(1).max(1);
         let version = self.next_annotation_version;
         let mut versions = HashMap::new();
@@ -295,6 +331,7 @@ impl Library {
             versions,
             xmp_sync: self.xmp_sync,
             entries,
+            ack,
         };
         if self.db.is_none() {
             if self.open_error.is_some() {
@@ -319,11 +356,9 @@ impl Library {
         if pairs.is_empty() {
             return;
         }
-        for (old, new) in &pairs {
-            rekey_map(&mut self.annotations, old, new);
-            rekey_set(&mut self.locally_edited, old, new);
-            rekey_map(&mut self.annotation_versions, old, new);
-        }
+        rekey_map(&mut self.annotations, &pairs);
+        rekey_set(&mut self.locally_edited, &pairs);
+        rekey_map(&mut self.annotation_versions, &pairs);
         let write = LibraryWrite::Relink { pairs };
         if self.db.is_some() {
             self.persist(write);
@@ -713,12 +748,19 @@ fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     Some(parts.fold(new.to_path_buf(), |acc, part| acc.join(part)))
 }
 
-/// Re-keys every entry of `map` under `old` to the matching path under `new`. Moved entries
-/// replace whatever was keyed at their destination, as the database merge does.
-fn rekey_map<V>(map: &mut HashMap<PathBuf, V>, old: &Path, new: &Path) {
+/// Where `path` goes under a set of moves made together, if any of them covers it.
+fn moved_by(path: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
+    pairs.iter().find_map(|(old, new)| moved_path(path, old, new))
+}
+
+/// Re-keys every entry of `map` that sits under one of the moved paths. All moves are applied
+/// as one set (every entry is taken out before any is put back), so a swap or a cycle of
+/// renames keeps each value with its file. Moved entries replace whatever was keyed at their
+/// destination, as the database merge does.
+fn rekey_map<V>(map: &mut HashMap<PathBuf, V>, pairs: &[(PathBuf, PathBuf)]) {
     let moves: Vec<(PathBuf, PathBuf)> = map
         .keys()
-        .filter_map(|key| moved_path(key, old, new).map(|to| (key.clone(), to)))
+        .filter_map(|key| moved_by(key, pairs).map(|to| (key.clone(), to)))
         .collect();
     let taken: Vec<(PathBuf, V)> = moves
         .into_iter()
@@ -728,15 +770,15 @@ fn rekey_map<V>(map: &mut HashMap<PathBuf, V>, old: &Path, new: &Path) {
 }
 
 /// The set counterpart of [`rekey_map`].
-fn rekey_set(set: &mut HashSet<PathBuf>, old: &Path, new: &Path) {
+fn rekey_set(set: &mut HashSet<PathBuf>, pairs: &[(PathBuf, PathBuf)]) {
     let moves: Vec<(PathBuf, PathBuf)> = set
         .iter()
-        .filter_map(|key| moved_path(key, old, new).map(|to| (key.clone(), to)))
+        .filter_map(|key| moved_by(key, pairs).map(|to| (key.clone(), to)))
         .collect();
-    for (from, to) in moves {
-        set.remove(&from);
-        set.insert(to);
+    for (from, _) in &moves {
+        set.remove(from);
     }
+    set.extend(moves.into_iter().map(|(_, to)| to));
 }
 
 /// The XMP-visible part of an annotation change. Picks stay in the app library. Notes are
@@ -769,13 +811,20 @@ fn sync_sidecars(
     enabled: bool,
     paths: &[PathBuf],
     update: &SidecarUpdate,
+    skip: impl Fn(&Path) -> bool,
     mut write: impl FnMut(&Path, &SidecarUpdate) -> forge_media::Result<SidecarOutcome>,
 ) -> Option<String> {
     if !enabled || update.is_empty() {
         return None;
     }
     // Cloud placeholders are skipped, not failed: reading them would download the file.
-    let targets: Vec<&PathBuf> = paths.iter().filter(|p| !cloud_placeholder(p)).collect();
+    let (skipped, targets): (Vec<&PathBuf>, Vec<&PathBuf>) = paths.iter().partition(|p| skip(p));
+    if !skipped.is_empty() {
+        tracing::info!(
+            count = skipped.len(),
+            "XMP sidecar sync skipped online-only or unreadable files"
+        );
+    }
     let failures: Vec<String> = targets
         .iter()
         .filter_map(|p| write(p.as_path(), update).err().map(|e| e.to_string()))
@@ -789,33 +838,23 @@ fn sync_sidecars(
 }
 
 /// Whether a sidecar write must be skipped for `image`: the photo itself, or its existing
-/// sidecar, is an online-only cloud placeholder. A missing sidecar is never a placeholder.
+/// sidecar, is an online-only cloud placeholder. Fails closed: when the attributes of either
+/// cannot be read, the write is skipped. A sidecar that does not exist yet is not checked.
 fn cloud_placeholder(image: &Path) -> bool {
-    is_online_only(image) || is_online_only(&forge_media::xmp_write::sidecar_path_for(image))
+    cloud_placeholder_with(image, &forge_core::cloud::FsAttributes)
 }
 
-/// Whether the file is an online-only cloud placeholder (OneDrive and similar), whose bytes
-/// live in the cloud. Reading such a file would download it, so ZXraw never reads one.
-// TODO: PR #10's `forge_core::cloud` will replace this check.
-#[cfg(windows)]
-pub fn is_online_only(path: &Path) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    std::fs::symlink_metadata(path).is_ok_and(|m| online_only_attrs(m.file_attributes()))
-}
-
-#[cfg(not(windows))]
-pub fn is_online_only(_path: &Path) -> bool {
-    false
-}
-
-/// The file attribute bits that mark an online-only placeholder: `FILE_ATTRIBUTE_OFFLINE`,
-/// `FILE_ATTRIBUTE_RECALL_ON_OPEN` and `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn online_only_attrs(attrs: u32) -> bool {
-    const OFFLINE: u32 = 0x1000;
-    const RECALL_ON_OPEN: u32 = 0x40000;
-    const RECALL_ON_DATA_ACCESS: u32 = 0x400000;
-    (attrs & (OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS)) != 0
+fn cloud_placeholder_with(image: &Path, source: &dyn forge_core::cloud::AttributeSource) -> bool {
+    use forge_core::cloud::background_read_allowed_with;
+    if !background_read_allowed_with(image, source) {
+        return true;
+    }
+    let sidecar = forge_media::xmp_write::sidecar_path_for(image);
+    match std::fs::symlink_metadata(&sidecar) {
+        Ok(_) => !background_read_allowed_with(&sidecar, source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 /// Whether a file gets the note in its sidecar (`xmpDM:logComment`): photos only.
@@ -844,14 +883,16 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<LibraryWrite> {
                         let result = db.delete_tag(&name).map_err(|e| e.to_string());
                         let _ = reply.send(result);
                     }
+                    LibraryWrite::Flush(done) => {
+                        let _ = done.send(());
+                    }
                     LibraryWrite::Relink { pairs } => {
-                        for (old, new) in pairs {
-                            if let Err(error) = db.relink(&old, &new, None) {
-                                let _ = tx.send(LibMsg::Error(format!(
-                                    "Could not update the library for {} after it was moved: {error}",
-                                    new.display()
-                                )));
-                            }
+                        // One set in one transaction: swaps and cycles stay correct.
+                        if let Err(error) = db.relink_many(&pairs) {
+                            let _ = tx.send(LibMsg::Error(format!(
+                                "Could not update the library after {} item(s) were moved or renamed: {error}",
+                                pairs.len()
+                            )));
                         }
                     }
                 }
@@ -868,8 +909,12 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
         versions,
         xmp_sync,
         entries: captured,
+        mut ack,
     } = write;
     if paths.is_empty() {
+        if let Some(ack) = ack {
+            let _ = ack.send(Ok(()));
+        }
         return;
     }
 
@@ -959,6 +1004,9 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
         if let Some(error) = db_failure {
             details.push(error);
         }
+        if let Some(ack) = ack.take() {
+            let _ = ack.send(Err(details.join("; ")));
+        }
         let _ = tx.send(LibMsg::Error(format!(
             "Some annotations were not saved: {}",
             details.join("; ")
@@ -978,6 +1026,10 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
         }
     }
 
+    if let Some(ack) = ack {
+        let _ = ack.send(Ok(()));
+    }
+
     // Photos get the note as well; other files get only the XMP-visible fields. Each group
     // is its own update, so a note-only change never touches a non-photo's sidecar.
     let (photos, others): (Vec<PathBuf>, Vec<PathBuf>) = saved_paths
@@ -989,8 +1041,8 @@ fn persist_annotation(db: &Db, tx: &Sender<LibMsg>, write: AnnotationWrite) {
         ..base.clone()
     };
     for msg in [
-        sync_sidecars(xmp_sync, &photos, &photo_update, update_sidecar),
-        sync_sidecars(xmp_sync, &others, &base, update_sidecar),
+        sync_sidecars(xmp_sync, &photos, &photo_update, cloud_placeholder, update_sidecar),
+        sync_sidecars(xmp_sync, &others, &base, cloud_placeholder, update_sidecar),
     ]
     .into_iter()
     .flatten()
@@ -1137,19 +1189,35 @@ mod tests {
             ..Default::default()
         };
         let mut calls = 0;
-        let off = sync_sidecars(false, &paths, &update, |p, _| {
+        let off = sync_sidecars(false, &paths, &update, |_| false, |p, _| {
             calls += 1;
             Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
         });
         assert_eq!(calls, 0);
         assert!(off.is_none());
 
-        let on = sync_sidecars(true, &paths, &update, |p, _| {
+        let on = sync_sidecars(true, &paths, &update, |_| false, |p, _| {
             calls += 1;
             Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
         });
         assert_eq!(calls, 2);
         assert!(on.is_none());
+    }
+
+    #[test]
+    fn skipped_files_are_never_written_or_counted_as_failures() {
+        let paths = vec![PathBuf::from("cloud.jpg"), PathBuf::from("local.jpg")];
+        let update = SidecarUpdate {
+            rating: Some(2),
+            ..Default::default()
+        };
+        let mut written = Vec::new();
+        let msg = sync_sidecars(true, &paths, &update, |p| p.ends_with("cloud.jpg"), |p, _| {
+            written.push(p.to_path_buf());
+            Ok(SidecarOutcome::Unchanged(p.to_path_buf()))
+        });
+        assert!(msg.is_none());
+        assert_eq!(written, vec![PathBuf::from("local.jpg")]);
     }
 
     #[test]
@@ -1159,7 +1227,7 @@ mod tests {
             add_keywords: vec!["k".into()],
             ..Default::default()
         };
-        let msg = sync_sidecars(true, &paths, &update, |p, _| {
+        let msg = sync_sidecars(true, &paths, &update, |_| false, |p, _| {
             if p.ends_with("b.jpg") {
                 Err(MediaError::Unsupported("read-only".into()))
             } else {
@@ -1349,6 +1417,79 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_annotation_answers_after_the_database_write() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let root = temp_root("confirmed-note");
+        let photo = root.join("a.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let mut library = library_with_test_writer(db.clone());
+        let note = |text: &str| AnnotationChange {
+            notes: Some(Some(text.into())),
+            ..Default::default()
+        };
+        let answer = library.annotate_confirmed(vec![photo.clone()], note("client proof"));
+        assert_eq!(
+            answer.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Ok(())
+        );
+        let id = db.file_id(&photo).unwrap().unwrap();
+        assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("client proof"));
+
+        let missing = root.join("gone.jpg");
+        let answer = library.annotate_confirmed(vec![missing], note("lost"));
+        assert!(
+            answer
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        assert!(library.flush(std::time::Duration::from_secs(5)));
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn swapped_names_keep_their_notes_in_memory_and_in_the_database() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let root = temp_root("swap-notes");
+        let (a, b) = (root.join("a.jpg"), root.join("b.jpg"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        index(&db, &[&a, &b]);
+        let mut library = library_with_test_writer(db.clone());
+        for (path, text, rating) in [(&a, "note of a", 5), (&b, "note of b", 1)] {
+            library.annotate(
+                vec![path.clone()],
+                AnnotationChange {
+                    rating: Some(rating),
+                    notes: Some(Some(text.into())),
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(library.flush(std::time::Duration::from_secs(5)));
+
+        // Swap the files on disk, as a batch rename would, then follow both renames at once.
+        let tmp = root.join("swap.tmp");
+        std::fs::rename(&a, &tmp).unwrap();
+        std::fs::rename(&b, &a).unwrap();
+        std::fs::rename(&tmp, &b).unwrap();
+        library.follow_moves(vec![(a.clone(), b.clone()), (b.clone(), a.clone())]);
+        assert!(library.flush(std::time::Duration::from_secs(5)));
+
+        assert_eq!(library.annotations[&b].rating, 5);
+        assert_eq!(library.annotations[&a].rating, 1);
+        let note_at = |p: &Path| {
+            let id = db.file_id(p).unwrap().unwrap();
+            db.annotation(id).unwrap().notes
+        };
+        assert_eq!(note_at(&b).as_deref(), Some("note of a"));
+        assert_eq!(note_at(&a).as_deref(), Some("note of b"));
+        drop(library);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn moved_path_matches_whole_components_case_insensitively() {
         let old = Path::new(r"C:\Shoot");
         let new = Path::new(r"D:\Archive\Shoot");
@@ -1481,13 +1622,29 @@ mod tests {
     }
 
     #[test]
-    fn online_only_bits_mark_cloud_placeholders() {
-        assert!(!online_only_attrs(0));
-        // Archive, normal and read-only attributes are ordinary local files.
-        assert!(!online_only_attrs(0x20 | 0x80 | 0x1 | 0x800));
-        assert!(online_only_attrs(0x1000), "FILE_ATTRIBUTE_OFFLINE");
-        assert!(online_only_attrs(0x40000), "FILE_ATTRIBUTE_RECALL_ON_OPEN");
-        assert!(online_only_attrs(0x400000), "FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS");
-        assert!(online_only_attrs(0x20 | 0x1000));
+    fn sidecar_writes_fail_closed_for_cloud_placeholders() {
+        struct Attrs(Option<u32>, Option<u32>);
+        impl forge_core::cloud::AttributeSource for Attrs {
+            fn attributes(&self, path: &Path) -> Option<u32> {
+                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xmp")) {
+                    self.1
+                } else {
+                    self.0
+                }
+            }
+        }
+        let root = temp_root("cloud-sidecar");
+        let photo = root.join("a.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        // No sidecar yet: only the photo is checked.
+        assert!(!cloud_placeholder_with(&photo, &Attrs(Some(0x20), None)));
+        assert!(cloud_placeholder_with(&photo, &Attrs(Some(0x400000), None)));
+        // Unreadable attributes fail closed.
+        assert!(cloud_placeholder_with(&photo, &Attrs(None, None)));
+        std::fs::write(forge_media::xmp_write::sidecar_path_for(&photo), b"<x/>").unwrap();
+        assert!(!cloud_placeholder_with(&photo, &Attrs(Some(0x20), Some(0x20))));
+        assert!(cloud_placeholder_with(&photo, &Attrs(Some(0x20), Some(0x1000))));
+        assert!(cloud_placeholder_with(&photo, &Attrs(Some(0x20), None)));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

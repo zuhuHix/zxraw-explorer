@@ -165,17 +165,23 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   suggestion ranking, excluded tags, mixed tags for selections, comma splitting) and
   `library.rs::tag_rename_then_annotation_add_share_writer_order`.
 * 🟡 Notes on files — the preview panel's *Note* box (`tags_ui.rs`) saves 800 ms after the last
-  keystroke, on focus loss and on a selection change, and shows *Unsaved changes* / *Saved ✓*
-  (`tags_ui.rs` tests cover the status and the autosave timer). Notes live in the library
+  keystroke, on focus loss, on a selection change, when the panel closes, and at exit (the
+  library writer is flushed). It shows *Unsaved changes*, *Saving…*, *Saved ✓* only once the
+  database confirms the write, or *Not saved* with the error (`tags_ui.rs` tests cover the
+  status, the confirmation and the autosave timer). Notes live in the library
   database for any file type (`annotations.notes`; migration 2 clears blank notes and indexes
   files that have one, tested by opening a version-1 database in `forge-db/tests/notes.rs`).
   Items with a note show a ✎ badge in the grid and details views. Plain-text search also matches
   notes; `note:`/`notes:`, `has:notes` and `missing:notes` filter on them (`forge-db/tests/notes.rs`).
   Notes, ratings and tags follow files that ZXraw renames or moves (rename, batch rename, same- and
-  cross-volume moves, and undo) through `Db::relink` on the library writer (`library.rs` tests).
+  cross-volume moves, and undo). Each set of moves is applied in one transaction by
+  `Db::relink_many`, which parks every source under a temporary path first, so swaps and cycles
+  keep each note on its file (`forge-db/tests/notes.rs`, `library.rs` tests).
   With XMP sync on, photo and RAW notes are written to `xmpDM:logComment`, never to the caption
-  in `dc:description` (`xmp_write.rs` and `library.rs` tests); online-only cloud placeholders are
-  skipped. Not verified in Lightroom/Bridge, and a note found in a sidecar is not imported.
+  in `dc:description` (`xmp_write.rs` and `library.rs` tests). Sidecar writes skip online-only
+  cloud placeholders and fail closed when the attributes cannot be read. A sidecar is replaced
+  only if it still holds the bytes the merge was based on, checked while holding a handle that
+  blocks other writers; otherwise it is re-read and merged again, or a conflict is reported. Not verified in Lightroom/Bridge, and a note found in a sidecar is not imported.
 * 🟡 Culling and compare viewer, zoom/pan, and filmstrip — `forge-app/src/viewer/` (`cull`, `zoom`,
   `cache`, `loader`, `decode`, `meta`). Unit tests cover culling logic, zoom math, cache budget,
   and corrupt input; no visual interaction is certified.

@@ -48,26 +48,43 @@ const NOTE_AUTOSAVE_AFTER: Duration = Duration::from_millis(800);
 const NOTE_MAX_ROWS: f32 = 8.0;
 
 /// Notes for the single selected file. Saved after a pause in typing, when the field loses
-/// focus, and when the selection moves to another file.
+/// focus, when the selection moves to another file, when the panel is closed, and at exit.
 struct NotesDraft {
     path: PathBuf,
     text: String,
+    /// The text the database has confirmed.
     saved: String,
     /// When the text last changed while it differed from `saved`. Cleared by a save.
     changed_at: Option<Instant>,
+    /// A save sent to the library writer and not answered yet.
+    saving: Option<PendingSave>,
+    /// Why the last save failed. Cleared by the next edit or save.
+    error: Option<String>,
+}
+
+struct PendingSave {
+    text: String,
+    result: crossbeam_channel::Receiver<Result<(), String>>,
 }
 
 /// What the note's status line says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NoteStatus {
     Unsaved,
+    Saving,
     Saved,
+    Failed(String),
     Empty,
 }
 
 fn note_status(draft: &NotesDraft) -> NoteStatus {
-    if draft.text != draft.saved {
-        NoteStatus::Unsaved
+    if draft.saving.is_some() {
+        NoteStatus::Saving
+    } else if draft.text != draft.saved {
+        match &draft.error {
+            Some(error) => NoteStatus::Failed(error.clone()),
+            None => NoteStatus::Unsaved,
+        }
     } else if draft.text.trim().is_empty() {
         NoteStatus::Empty
     } else {
@@ -75,9 +92,17 @@ fn note_status(draft: &NotesDraft) -> NoteStatus {
     }
 }
 
-/// True when the text differs from what is saved and has been left alone for the autosave pause.
+/// True when the text needs saving: it differs from what is confirmed and from any save in
+/// flight.
+fn note_dirty(draft: &NotesDraft) -> bool {
+    draft.text != draft.saved && draft.saving.as_ref().is_none_or(|p| p.text != draft.text)
+}
+
+/// True when the text needs saving and has been left alone for the autosave pause. After a
+/// failed save, autosave waits for the next edit (focus loss still retries).
 fn autosave_due(draft: &NotesDraft, now: Instant) -> bool {
-    draft.text != draft.saved
+    note_dirty(draft)
+        && draft.error.is_none()
         && draft
             .changed_at
             .is_some_and(|at| now.saturating_duration_since(at) >= NOTE_AUTOSAVE_AFTER)
@@ -125,6 +150,9 @@ pub struct TagsUi {
     input: String,
     highlight: Option<usize>,
     notes: Option<NotesDraft>,
+    /// The frame the panel was last drawn in. A note left behind when the panel stops being
+    /// drawn is saved by [`tick`].
+    panel_frame: u64,
     manage: ManageState,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -145,6 +173,7 @@ impl Default for TagsUi {
             input: String::new(),
             highlight: None,
             notes: None,
+            panel_frame: 0,
             manage: ManageState::default(),
             tx,
             rx,
@@ -421,20 +450,51 @@ impl TagsUi {
             saved: text.clone(),
             text,
             changed_at: None,
+            saving: None,
+            error: None,
         });
+    }
+
+    /// Picks up the answer to a save in flight: `saved` moves only once the database
+    /// confirms the write.
+    fn poll_note_save(&mut self, ctx: &egui::Context) {
+        let Some(draft) = self.notes.as_mut() else {
+            return;
+        };
+        let Some(pending) = draft.saving.as_ref() else {
+            return;
+        };
+        match pending.result.try_recv() {
+            Ok(Ok(())) => {
+                draft.saved = pending.text.clone();
+                draft.saving = None;
+            }
+            Ok(Err(error)) => {
+                draft.error = Some(error);
+                draft.saving = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                draft.error = Some("the library database is not available".into());
+                draft.saving = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        }
     }
 
     fn save_notes(&mut self, library: &mut Library, ctx: &egui::Context) {
         let Some(draft) = self.notes.as_mut() else {
             return;
         };
-        if draft.text == draft.saved {
+        if !note_dirty(draft) {
             return;
         }
         let path = draft.path.clone();
         let trimmed = draft.text.trim().to_string();
-        draft.saved = draft.text.clone();
+        let text = draft.text.clone();
         draft.changed_at = None;
+        draft.error = None;
         let notes = (!trimmed.is_empty()).then_some(trimmed);
         if let Some((_, annotation)) = self
             .cache
@@ -444,14 +504,18 @@ impl TagsUi {
         {
             annotation.notes = notes.clone();
         }
-        library.annotate(
+        let result = library.annotate_confirmed(
             vec![path],
             AnnotationChange {
                 notes: Some(notes),
                 ..Default::default()
             },
         );
+        if let Some(draft) = self.notes.as_mut() {
+            draft.saving = Some(PendingSave { text, result });
+        }
         self.edited(ctx);
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 
     fn change_tags(
@@ -528,6 +592,27 @@ impl TagsUi {
 }
 
 /// Drawn in the preview panel below the file info for any file.
+/// Runs every frame, drawn or not: picks up save answers, and saves a note left unsaved when
+/// the panel stopped being drawn (closed, collapsed, or another view took its place).
+pub fn tick(app: &mut ZxrawApp) {
+    let ctx = app.ops.ctx.clone();
+    let st = &mut app.ops.tags_ui;
+    st.poll_note_save(&ctx);
+    let hidden = ctx.cumulative_frame_nr() > st.panel_frame + 1;
+    if hidden && st.notes.as_ref().is_some_and(note_dirty) {
+        st.save_notes(&mut app.ops.library, &ctx);
+    }
+}
+
+/// At exit: saves an unsaved note and waits briefly for the library writer to apply it.
+pub fn flush_for_exit(app: &mut ZxrawApp) {
+    let ctx = app.ops.ctx.clone();
+    app.ops.tags_ui.save_notes(&mut app.ops.library, &ctx);
+    if !app.ops.library.flush(Duration::from_secs(3)) {
+        tracing::warn!("the library writer did not finish before exit");
+    }
+}
+
 pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
     let ctx = ui.ctx().clone();
     let selection = selection_paths(app.pane(), &entry.path);
@@ -535,6 +620,8 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
     let library = &mut app.ops.library;
     let st = &mut app.ops.tags_ui;
     st.poll();
+    st.poll_note_save(&ctx);
+    st.panel_frame = ctx.cumulative_frame_nr();
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Tags & notes").strong());
@@ -716,8 +803,18 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
                             RichText::new("Unsaved changes").color(ui.visuals().warn_fg_color),
                         );
                     }
+                    NoteStatus::Saving => {
+                        ui.label(RichText::new("Saving…").weak());
+                    }
                     NoteStatus::Saved => {
                         ui.label(RichText::new("Saved ✓").weak());
+                    }
+                    NoteStatus::Failed(error) => {
+                        ui.label(RichText::new("Not saved").color(ui.visuals().error_fg_color))
+                            .on_hover_text(format!(
+                                "The note could not be saved: {error}
+Edit it or leave the field to try again."
+                            ));
                     }
                     NoteStatus::Empty => {}
                 },
@@ -741,6 +838,7 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
                         );
                         if response.changed() {
                             draft.changed_at = Some(now);
+                            draft.error = None;
                         }
                         lost_focus = response.lost_focus();
                     });
@@ -761,7 +859,7 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
         } else if let Some(draft) = st
             .notes
             .as_ref()
-            .filter(|d| note_status(d) == NoteStatus::Unsaved)
+            .filter(|d| note_dirty(d) && d.error.is_none())
             && let Some(at) = draft.changed_at
         {
             // Wake up when the pause ends, so the save happens without more input.
@@ -1046,7 +1144,91 @@ mod tests {
             text: text.into(),
             saved: saved.into(),
             changed_at,
+            saving: None,
+            error: None,
         }
+    }
+
+    fn pending(text: &str) -> (PendingSave, crossbeam_channel::Sender<Result<(), String>>) {
+        let (tx, result) = crossbeam_channel::bounded(1);
+        (
+            PendingSave {
+                text: text.into(),
+                result,
+            },
+            tx,
+        )
+    }
+
+    #[test]
+    fn saved_is_shown_only_after_the_database_confirms() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let (save, answer) = pending("client proof");
+        st.notes = Some(NotesDraft {
+            saving: Some(save),
+            ..draft("client proof", "", None)
+        });
+        assert_eq!(note_status(st.notes.as_ref().unwrap()), NoteStatus::Saving);
+        st.poll_note_save(&ctx);
+        assert_eq!(note_status(st.notes.as_ref().unwrap()), NoteStatus::Saving);
+        answer.send(Ok(())).unwrap();
+        st.poll_note_save(&ctx);
+        let d = st.notes.as_ref().unwrap();
+        assert_eq!(d.saved, "client proof");
+        assert_eq!(note_status(d), NoteStatus::Saved);
+    }
+
+    #[test]
+    fn a_failed_save_shows_the_error_and_waits_for_the_next_edit() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let t0 = Instant::now();
+        let (save, answer) = pending("x");
+        st.notes = Some(NotesDraft {
+            saving: Some(save),
+            ..draft("x", "", Some(t0))
+        });
+        answer.send(Err("disk full".into())).unwrap();
+        st.poll_note_save(&ctx);
+        let d = st.notes.as_mut().unwrap();
+        assert_eq!(d.saved, "");
+        assert_eq!(note_status(d), NoteStatus::Failed("disk full".into()));
+        assert!(!autosave_due(d, t0 + Duration::from_secs(5)));
+        // An edit clears the error and autosave resumes after the pause.
+        d.error = None;
+        d.changed_at = Some(t0);
+        assert!(autosave_due(d, t0 + NOTE_AUTOSAVE_AFTER));
+    }
+
+    #[test]
+    fn a_dropped_save_reports_the_library_unavailable() {
+        let mut st = TagsUi::default();
+        let (save, answer) = pending("x");
+        drop(answer);
+        st.notes = Some(NotesDraft {
+            saving: Some(save),
+            ..draft("x", "", None)
+        });
+        st.poll_note_save(&egui::Context::default());
+        assert!(matches!(
+            note_status(st.notes.as_ref().unwrap()),
+            NoteStatus::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn autosave_skips_text_already_being_saved() {
+        let t0 = Instant::now();
+        let (save, _answer) = pending("abc");
+        let mut d = NotesDraft {
+            saving: Some(save),
+            ..draft("abc", "", Some(t0))
+        };
+        assert!(!autosave_due(&d, t0 + Duration::from_secs(5)));
+        // Typing during the save makes the newer text due on its own.
+        d.text.push('d');
+        assert!(autosave_due(&d, t0 + Duration::from_secs(5)));
     }
 
     #[test]

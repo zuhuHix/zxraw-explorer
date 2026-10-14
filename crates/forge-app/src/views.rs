@@ -2351,6 +2351,7 @@ mod accessibility_tests {
             readonly: false,
             system: false,
             ext: "jpg".into(),
+            online_only: false,
         };
         let with_note = Annotation {
             has_note: true,
