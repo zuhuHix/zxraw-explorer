@@ -959,3 +959,390 @@ fn join_never_replaces_an_existing_output_file() {
         "join must not replace an existing file"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Find and replace
+// ---------------------------------------------------------------------------
+
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// UTF-16 LE text with its byte-order mark, as Notepad saves "Unicode" files.
+fn utf16_le_bom(text: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE];
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+/// Every file below `root`, in any subfolder.
+fn files_below(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(root).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(files_below(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
+fn find_replace_preview_then_replace_keeps_encodings_and_line_endings() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    let profile = sandbox.path().join("profile");
+    let photo = [b"cat".as_slice(), &noise(4096, 41)].concat();
+    let nul = b"cat\0 text\n".to_vec();
+    // 1.1 MiB: over the 1 MiB limit the script sets.
+    let big = "cat line\n".repeat(130_000).into_bytes();
+    write_file(&root.join("a.txt"), b"cat and cat\nthe end\n");
+    write_file(
+        &root.join("b.txt"),
+        &[UTF8_BOM, b"a cat\r\nsecond line\r\n"].concat(),
+    );
+    write_file(&root.join("c.txt"), &utf16_le_bom("cat here\r\nsecond\r\n"));
+    write_file(&root.join("photo.cr3"), &photo);
+    write_file(&root.join("nul.txt"), &nul);
+    write_file(&root.join("big.log"), &big);
+    write_file(&root.join("sub").join("d.md"), b"cat in a subfolder\n");
+    let script = format!(
+        "ui tools replace open {root}\n\
+         ui tools replace set find cat\n\
+         ui tools replace set replace dog\n\
+         ui tools replace set whole-word on\n\
+         ui tools replace set max-mib 1\n\
+         ui tools replace preview\n\
+         ui tools replace wait-preview 30\n\
+         ui tools replace assert-preview files=4 matches=5 skipped=3\n\
+         ui tools replace assert-skipped photo.cr3 binary-extension\n\
+         ui tools replace assert-skipped nul.txt binary\n\
+         ui tools replace assert-skipped big.log too-large\n\
+         ui tools replace untick d.md\n\
+         ui tools replace run\n\
+         ui tools replace wait-apply 30\n\
+         ui tools replace assert-apply files=3 replacements=4 skipped=0 failed=0\n\
+         wait-jobs 20\n\
+         exit\n",
+        root = shown(&root),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        fs::read(root.join("a.txt")).unwrap(),
+        b"dog and dog\nthe end\n"
+    );
+    assert_eq!(
+        fs::read(root.join("b.txt")).unwrap(),
+        [UTF8_BOM, b"a dog\r\nsecond line\r\n"].concat(),
+        "UTF-8 BOM and CRLF are kept"
+    );
+    assert_eq!(
+        fs::read(root.join("c.txt")).unwrap(),
+        utf16_le_bom("dog here\r\nsecond\r\n"),
+        "UTF-16 LE with BOM and CRLF are kept"
+    );
+    assert_eq!(
+        fs::read(root.join("sub").join("d.md")).unwrap(),
+        b"cat in a subfolder\n",
+        "an unticked file is not changed"
+    );
+    assert_eq!(fs::read(root.join("photo.cr3")).unwrap(), photo);
+    assert_eq!(fs::read(root.join("nul.txt")).unwrap(), nul);
+    assert_eq!(fs::read(root.join("big.log")).unwrap(), big);
+    let leftovers: Vec<PathBuf> = files_below(&root)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
+}
+
+#[test]
+fn find_replace_undo_restores_the_original_bytes() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("ranges");
+    let profile = sandbox.path().join("profile");
+    let ranges = b"10-20\n30-45\nno numbers here\n".to_vec();
+    let crlf = [UTF8_BOM, b"1-2\r\n3-4\r\n"].concat();
+    write_file(&root.join("ranges.txt"), &ranges);
+    write_file(&root.join("crlf.txt"), &crlf);
+    write_file(&root.join("external.txt"), b"5-6\n");
+    let script = format!(
+        "ui tools replace open {root}\n\
+         ui tools replace set find (\\d+)-(\\d+)\n\
+         ui tools replace set replace $2-$1\n\
+         ui tools replace set regex on\n\
+         ui tools replace preview\n\
+         ui tools replace wait-preview 30\n\
+         ui tools replace assert-preview files=3 matches=5 skipped=0\n\
+         ui tools replace run\n\
+         ui tools replace wait-apply 30\n\
+         ui tools replace assert-apply files=3 replacements=5 skipped=0 failed=0\n\
+         ui tools external append {external} | late edit\n\
+         ui tools replace undo\n\
+         wait-jobs 20\n\
+         exit\n",
+        root = shown(&root),
+        external = shown(&root.join("external.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(fs::read(root.join("ranges.txt")).unwrap(), ranges);
+    assert_eq!(fs::read(root.join("crlf.txt")).unwrap(), crlf);
+    assert_eq!(
+        fs::read(root.join("external.txt")).unwrap(),
+        b"6-5\nlate edit",
+        "a file edited after the replace is not restored by undo"
+    );
+}
+
+#[test]
+fn find_replace_through_the_window_buttons() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("notes");
+    let profile = sandbox.path().join("profile");
+    let file = root.join("a.txt");
+    write_file(&file, b"hello world\nhello again\n");
+    let script = format!(
+        "navigate {root}\n\
+         cmd FindReplace\n\
+         ui tools replace set find hello\n\
+         ui tools replace set replace bye\n\
+         ui tools click-button replace:Preview\n\
+         ui tools replace wait-preview 30\n\
+         ui tools click-button replace:Replace\n\
+         ui tools replace wait-apply 30\n\
+         wait-jobs 20\n\
+         screenshot {shot}\n\
+         assert-contains {file} | bye world\n\
+         assert-contains {file} | bye again\n\
+         exit\n",
+        root = shown(&root),
+        file = shown(&file),
+        shot = shown(&shot("find-replace-buttons.png")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(fs::read(&file).unwrap(), b"bye world\nbye again\n");
+}
+
+#[test]
+fn find_replace_skips_online_only_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("cloud");
+    let profile = sandbox.path().join("profile");
+    let local = root.join("local.txt");
+    let cloud = root.join("cloud.txt");
+    write_file(&local, b"cat\n");
+    write_file(&cloud, b"cat in the cloud\n");
+    let script = format!(
+        "ui tools simulate-online-only {cloud}\n\
+         ui tools replace open {root}\n\
+         ui tools replace set find cat\n\
+         ui tools replace set replace dog\n\
+         ui tools replace preview\n\
+         ui tools replace wait-preview 30\n\
+         ui tools replace assert-skipped cloud.txt online-only\n\
+         ui tools replace assert-preview files=1 matches=1 skipped=1\n\
+         ui tools replace run\n\
+         ui tools replace wait-apply 30\n\
+         ui tools replace assert-apply files=1 replacements=1 skipped=0 failed=0\n\
+         wait-jobs 20\n\
+         exit\n",
+        cloud = shown(&cloud),
+        root = shown(&root),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(fs::read(&local).unwrap(), b"dog\n");
+    assert_eq!(
+        fs::read(&cloud).unwrap(),
+        b"cat in the cloud\n",
+        "an online-only file is never read, so never changed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Backup check
+// ---------------------------------------------------------------------------
+
+/// Original and backup folders covering every status: same, changed with the same size and
+/// date, missing, extra, a renamed file (moved), and an online-only file. Returns both roots.
+/// The root holds no subfolders, so the counts stay flat.
+fn backup_fixture(root: &Path) -> (PathBuf, PathBuf) {
+    let original = root.join("original");
+    let backup = root.join("backup");
+    let base = SystemTime::now() - Duration::from_secs(86_400);
+    write_file(&original.join("same.txt"), b"same bytes");
+    write_file(&backup.join("same.txt"), b"same bytes");
+    write_file(&original.join("changed.bin"), &noise(4096, 41));
+    write_file(&backup.join("changed.bin"), &noise(4096, 42));
+    for path in [
+        original.join("same.txt"),
+        backup.join("same.txt"),
+        original.join("changed.bin"),
+        backup.join("changed.bin"),
+    ] {
+        set_modified(&path, base);
+    }
+    write_file(&original.join("missing.txt"), b"only in the original");
+    write_file(
+        &backup.join("extra.txt"),
+        b"only in the backup, longer name",
+    );
+    write_file(&original.join("old-name.bin"), &noise(8192, 51));
+    write_file(&backup.join("new-name.bin"), &noise(8192, 51));
+    write_file(&original.join("cloud.txt"), b"online-only in the original");
+    write_file(&backup.join("cloud.txt"), b"online-only in the original");
+    (original, backup)
+}
+
+#[test]
+fn verify_backup_reports_missing_differs_extra_and_moved() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let (original, backup) = backup_fixture(sandbox.path());
+    let csv = sandbox.path().join("report.csv");
+    let script = format!(
+        "ui tools simulate-online-only {cloud}\n\
+         ui tools verify open {original}\n\
+         ui tools verify set-backup {backup}\n\
+         ui tools verify options full=on moves=on\n\
+         ui tools verify start\n\
+         ui tools verify wait 60\n\
+         ui tools verify assert match=1 missing=1 differs=1 extra=1 moved=1 not-checked=1 errors=0\n\
+         ui tools verify assert-status same.txt match\n\
+         ui tools verify assert-status changed.bin differs\n\
+         ui tools verify assert-status missing.txt missing\n\
+         ui tools verify assert-status old-name.bin moved\n\
+         ui tools verify assert-status cloud.txt not-checked\n\
+         ui tools verify export {csv} csv\n\
+         assert-exists {csv}\n\
+         assert-contains {csv} | missing\n\
+         assert-contains {csv} | missing.txt\n\
+         assert-contains {csv} | new-name.bin\n\
+         exit\n",
+        cloud = shown(&original.join("cloud.txt")),
+        original = shown(&original),
+        backup = shown(&backup),
+        csv = shown(&csv),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        fs::read(original.join("changed.bin")).unwrap(),
+        noise(4096, 41),
+        "the check only reads"
+    );
+    assert!(csv.exists());
+}
+
+#[test]
+fn verify_backup_quick_mode_trusts_size_and_date() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let original = sandbox.path().join("original");
+    let backup = sandbox.path().join("backup");
+    let base = SystemTime::now() - Duration::from_secs(86_400);
+    write_file(&original.join("same.txt"), b"same bytes");
+    write_file(&backup.join("same.txt"), b"same bytes");
+    write_file(&original.join("changed.bin"), &noise(4096, 41));
+    write_file(&backup.join("changed.bin"), &noise(4096, 42));
+    for path in [
+        original.join("same.txt"),
+        backup.join("same.txt"),
+        original.join("changed.bin"),
+        backup.join("changed.bin"),
+    ] {
+        set_modified(&path, base);
+    }
+    // Both runs use the same windows: the second changes the mode, not the folders.
+    let script = format!(
+        "ui tools verify open {original}\n\
+         ui tools verify set-backup {backup}\n\
+         ui tools verify options full=off moves=off\n\
+         ui tools verify start\n\
+         ui tools verify wait 60\n\
+         ui tools verify assert match=2 differs=0 errors=0\n\
+         ui tools verify options full=on moves=off\n\
+         ui tools verify start\n\
+         ui tools verify wait 60\n\
+         ui tools verify assert match=1 differs=1 errors=0\n\
+         ui tools verify assert-status changed.bin differs\n\
+         exit\n",
+        original = shown(&original),
+        backup = shown(&backup),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn verify_backup_can_be_cancelled() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let original = sandbox.path().join("original");
+    let backup = sandbox.path().join("backup");
+    // 24 pairs of 8 MiB, 384 MB in all: enough work to be cancelled mid-run, within the size
+    // budget. The bytes are shared, so each copy is identical and every pair is hashed.
+    let block = noise(8 * 1024 * 1024, 61);
+    for index in 0..24 {
+        write_file(&original.join(format!("photo-{index:02}.raw")), &block);
+        write_file(&backup.join(format!("photo-{index:02}.raw")), &block);
+    }
+    // Cancel right after the start: the check is still hashing, and the next step runs one
+    // frame later. A sleep would let the check finish first.
+    let script = format!(
+        "limit 120\n\
+         ui tools verify open {original}\n\
+         ui tools verify set-backup {backup}\n\
+         ui tools verify options full=on moves=off\n\
+         ui tools verify start\n\
+         ui tools verify cancel\n\
+         ui tools verify wait-cancelled 60\n\
+         exit\n",
+        original = shown(&original),
+        backup = shown(&backup),
+    );
+
+    let outcome = run_app_with(
+        sandbox.path(),
+        &profile,
+        &script,
+        &RunOpts {
+            limit: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+    );
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        fs::read(original.join("photo-00.raw")).unwrap(),
+        block,
+        "a cancelled check changes nothing"
+    );
+}

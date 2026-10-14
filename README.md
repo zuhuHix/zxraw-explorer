@@ -225,6 +225,15 @@ given its own shortcut.
 - **Sync folders.** Compare two folders and preview exactly what will be copied before anything
   happens. *Update* copies newer files one way, *Mirror* makes the right side identical, and
   *Two-way* copies each side's new and newer files to the other without deleting anything.
+- **Verify a backup.** Check a backup folder against the original by content (BLAKE3): files
+  missing from the backup, copies that differ, files only in the backup and, optionally, files
+  that were moved or renamed. A quick mode trusts matching size and date; *Full verify* reads
+  every file. Online-only cloud files are reported as not checked instead of being downloaded.
+  The report can be saved as CSV or text.
+- **Find and replace in files.** Search the folder or the selection for text or a regular
+  expression and review every match, old and new side by side, before anything changes. Untick
+  the files you want left alone. Binary, RAW, image, video and archive files are never touched,
+  the encoding and line endings are kept, and <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes the replace.
 - **Fast name search.** The search window can also ask Everything or the Windows Search index,
   when they are available, instead of the app's own library index.
 - **Selection summary.** The status bar shows how many items are selected, their total size and

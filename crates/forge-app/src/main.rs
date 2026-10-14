@@ -34,6 +34,7 @@ mod path_probe;
 mod palette;
 mod platform;
 mod preview;
+mod replace_ui;
 mod search_ui;
 mod tags_ui;
 mod watermark;

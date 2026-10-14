@@ -1,4 +1,5 @@
-//! Power-user tool windows: folder size, duplicates, checksums and folder compare.
+//! Power-user tool windows: folder size, duplicates, checksums, folder compare and the
+//! backup check (compare a backup with its original by content).
 //!
 //! The engine work stays in `forge-core`; every long operation is registered with the
 //! Operations panel and reports back to its own window over a channel.
@@ -9,9 +10,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
 use egui::{Align2, Color32, FontId, Rect, RichText, Sense, Stroke, Vec2, pos2, vec2};
+use forge_core::backup_verify::{
+    BackupReport, VerifyMode, VerifyOptions, VerifyStatus, verify_backup,
+};
 use forge_core::compare::{self, CompareReport, EntryState, SyncAction, SyncMode, SyncPlan};
 use forge_core::disk_usage::{self, UsageReport};
 use forge_core::duplicates::{self, DupOptions, DupReport, DuplicateGroup};
+use forge_core::error::CoreError;
 use forge_core::hashing::{self, ManifestEntry, VerifyReport};
 use forge_core::model::format_size;
 use forge_core::ops::{JobCtx, OpReport};
@@ -30,6 +35,7 @@ pub enum Tool {
     Duplicates,
     Checksums,
     CompareFolders,
+    VerifyBackup,
 }
 
 #[derive(Default)]
@@ -88,8 +94,23 @@ impl ToolsState {
                 last_sync: None,
                 confirming_mirror: false,
             }),
+            Tool::VerifyBackup => ToolState::Verify(VerifyState {
+                original: dir,
+                backup: other_dir,
+                full: false,
+                detect_moves: false,
+                report: None,
+                filter: VerifyFilter::Problems,
+                last_export: None,
+                export_error: None,
+            }),
         };
-        let start_initial = !matches!(&state, ToolState::Compare(c) if c.right.is_none());
+        // Compare and the backup check need their second folder before they can start.
+        let start_initial = match &state {
+            ToolState::Compare(c) => c.right.is_some(),
+            ToolState::Verify(v) => v.backup.is_some(),
+            _ => true,
+        };
         self.windows.push(ToolWindow {
             id: self.next_id,
             open: true,
@@ -121,6 +142,7 @@ enum ToolState {
     Duplicates(DuplicatesState),
     Checksums(ChecksumsState),
     Compare(CompareState),
+    Verify(VerifyState),
 }
 
 struct FolderState {
@@ -182,6 +204,44 @@ enum CompareFilter {
     Errors,
 }
 
+struct VerifyState {
+    original: PathBuf,
+    backup: Option<PathBuf>,
+    /// "Full verify": hash every pair with equal sizes, whatever the timestamps say.
+    full: bool,
+    detect_moves: bool,
+    report: Option<BackupReport>,
+    filter: VerifyFilter,
+    last_export: Option<PathBuf>,
+    export_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerifyFilter {
+    /// Everything except matches. The default.
+    Problems,
+    All,
+    Missing,
+    Differs,
+    Extra,
+    Moved,
+    NotChecked,
+    Errors,
+    Matches,
+}
+
+const VERIFY_FILTERS: [(&str, VerifyFilter); 9] = [
+    ("Problems", VerifyFilter::Problems),
+    ("All", VerifyFilter::All),
+    ("Missing", VerifyFilter::Missing),
+    ("Differs", VerifyFilter::Differs),
+    ("Only in backup", VerifyFilter::Extra),
+    ("Moved", VerifyFilter::Moved),
+    ("Not checked", VerifyFilter::NotChecked),
+    ("Errors", VerifyFilter::Errors),
+    ("Matches", VerifyFilter::Matches),
+];
+
 struct ToolEnvelope {
     generation: u64,
     payload: ToolPayload,
@@ -197,11 +257,17 @@ enum ToolPayload {
     SyncPlan(Result<SyncPlan, String>),
     Recycled(Result<(), String>),
     Synced(OpReport),
+    BackupVerified(Result<BackupReport, String>),
 }
 
 enum UiAction {
     Navigate(PathBuf),
     Start(DeferredAction),
+    /// Open the backup check for the folders of a folder compare.
+    OpenVerify {
+        original: PathBuf,
+        backup: PathBuf,
+    },
 }
 
 enum DeferredAction {
@@ -225,6 +291,11 @@ enum DeferredAction {
         right: PathBuf,
         use_hash: bool,
     },
+    VerifyBackup {
+        original: PathBuf,
+        backup: PathBuf,
+        options: VerifyOptions,
+    },
     BuildSyncPlan {
         report: CompareReport,
         left: PathBuf,
@@ -247,6 +318,7 @@ impl ToolWindow {
             ToolState::Duplicates(_) => "Find duplicates",
             ToolState::Checksums(_) => "Checksums",
             ToolState::Compare(_) => "Compare folders",
+            ToolState::Verify(_) => "Verify backup",
         }
     }
 
@@ -347,6 +419,15 @@ impl ToolWindow {
                     }
                     Err(error) => self.notice = Some(error),
                 },
+                ToolPayload::BackupVerified(result) => match result {
+                    Ok(report) => {
+                        if let ToolState::Verify(state) = &mut self.state {
+                            state.report = Some(report);
+                        }
+                        self.notice = None;
+                    }
+                    Err(error) => self.notice = Some(error),
+                },
                 ToolPayload::Synced(report) => {
                     self.notice = Some(if report.failed.is_empty() {
                         format!(
@@ -400,7 +481,30 @@ impl ToolWindow {
                         use_hash: state.use_hash,
                     })
             }
+            ToolState::Verify(state) => {
+                state
+                    .backup
+                    .as_ref()
+                    .map(|backup| DeferredAction::VerifyBackup {
+                        original: state.original.clone(),
+                        backup: backup.clone(),
+                        options: verify_options(state),
+                    })
+            }
         }
+    }
+}
+
+/// Settings for a backup check from the window's controls.
+fn verify_options(state: &VerifyState) -> VerifyOptions {
+    VerifyOptions {
+        mode: if state.full {
+            VerifyMode::Full
+        } else {
+            VerifyMode::Quick
+        },
+        detect_moves: state.detect_moves,
+        ..Default::default()
     }
 }
 
@@ -415,9 +519,11 @@ pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
 
         let mut navigate = None;
         let mut deferred = None;
+        let mut verify = None;
         match ui_action {
             Some(UiAction::Navigate(path)) => navigate = Some(path),
             Some(UiAction::Start(action)) => deferred = Some(action),
+            Some(UiAction::OpenVerify { original, backup }) => verify = Some((original, backup)),
             None => {}
         }
         if deferred.is_none() {
@@ -427,6 +533,11 @@ pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
         }
         if let Some(path) = navigate {
             app.navigate(path);
+        }
+        if let Some((original, backup)) = verify {
+            app.ops
+                .tools
+                .open(Tool::VerifyBackup, original, Vec::new(), Some(backup));
         }
         if let Some(action) = deferred {
             let jobs = &app.ops.jobs;
@@ -563,7 +674,19 @@ pub(crate) fn automation_duplicates_recycle(app: &mut ZxrawApp) -> Result<(), St
 pub fn open_sync(app: &mut ZxrawApp) {
     let dir = app.pane().path.clone();
     let other = app.tab().other().map(|p| p.path.clone());
-    app.ops.tools.open(Tool::CompareFolders, dir, Vec::new(), other);
+    app.ops
+        .tools
+        .open(Tool::CompareFolders, dir, Vec::new(), other);
+}
+
+/// `Cmd::VerifyBackup`: the focused pane is the original, the other pane (when dual-pane)
+/// is the backup.
+pub fn open_verify_backup(app: &mut ZxrawApp) {
+    let dir = app.pane().path.clone();
+    let other = app.tab().other().map(|p| p.path.clone());
+    app.ops
+        .tools
+        .open(Tool::VerifyBackup, dir, Vec::new(), other);
 }
 
 pub(crate) fn automation_open_compare(app: &mut ZxrawApp, left: PathBuf) {
@@ -755,6 +878,125 @@ pub(crate) fn automation_compare_sync_result(app: &mut ZxrawApp) -> Option<OpRep
     state.last_sync.clone()
 }
 
+#[allow(dead_code)] // used by the automation functions below
+fn find_verify_window(app: &mut ZxrawApp) -> Option<&mut ToolWindow> {
+    app.ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Verify(_)))
+}
+
+pub(crate) fn automation_open_verify(app: &mut ZxrawApp, original: PathBuf) {
+    app.ops
+        .tools
+        .open(Tool::VerifyBackup, original, Vec::new(), None);
+}
+
+pub(crate) fn automation_verify_set_backup(
+    app: &mut ZxrawApp,
+    backup: PathBuf,
+) -> Result<(), String> {
+    let Some(window) = find_verify_window(app) else {
+        return Err("verify backup is not open".into());
+    };
+    let ToolState::Verify(state) = &mut window.state else {
+        unreachable!();
+    };
+    state.backup = Some(backup);
+    state.report = None;
+    Ok(())
+}
+
+pub(crate) fn automation_verify_set_options(
+    app: &mut ZxrawApp,
+    full: bool,
+    detect_moves: bool,
+) -> Result<(), String> {
+    let Some(window) = find_verify_window(app) else {
+        return Err("verify backup is not open".into());
+    };
+    let ToolState::Verify(state) = &mut window.state else {
+        unreachable!();
+    };
+    state.full = full;
+    state.detect_moves = detect_moves;
+    Ok(())
+}
+
+pub(crate) fn automation_verify_start(app: &mut ZxrawApp) -> Result<(), String> {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let Some(window) = find_verify_window(app) else {
+        return Err("verify backup is not open".into());
+    };
+    let ToolState::Verify(state) = &mut window.state else {
+        unreachable!();
+    };
+    let backup = state
+        .backup
+        .clone()
+        .ok_or("choose the backup folder before verifying")?;
+    let action = DeferredAction::VerifyBackup {
+        original: state.original.clone(),
+        backup,
+        options: verify_options(state),
+    };
+    state.report = None;
+    launch_action(&jobs, &event_tx, &app_ctx, window, action);
+    Ok(())
+}
+
+/// Cancels the running backup check. The job then reports "Backup check cancelled".
+pub(crate) fn automation_verify_cancel(app: &mut ZxrawApp) -> Result<(), String> {
+    let Some(window) = find_verify_window(app) else {
+        return Err("verify backup is not open".into());
+    };
+    let Some(job) = window.job.as_ref().filter(|job| !job.state().is_finished()) else {
+        return Err("no backup check is running".into());
+    };
+    job.cancel.cancel();
+    Ok(())
+}
+
+pub(crate) fn automation_verify_report(
+    app: &mut ZxrawApp,
+) -> Option<std::result::Result<BackupReport, String>> {
+    let window = find_verify_window(app)?;
+    window.poll_messages();
+    let ToolState::Verify(state) = &window.state else {
+        unreachable!();
+    };
+    if let Some(report) = &state.report {
+        Some(Ok(report.clone()))
+    } else if window
+        .job
+        .as_ref()
+        .is_none_or(|job| job.state().is_finished())
+        && let Some(notice) = &window.notice
+    {
+        Some(Err(notice.clone()))
+    } else {
+        None
+    }
+}
+
+pub(crate) fn automation_verify_export(
+    app: &mut ZxrawApp,
+    path: PathBuf,
+    csv: bool,
+) -> Result<(), String> {
+    let Some(window) = find_verify_window(app) else {
+        return Err("verify backup is not open".into());
+    };
+    let ToolState::Verify(state) = &mut window.state else {
+        unreachable!();
+    };
+    export_verify_report(state, &path, csv)
+}
+
 fn render_window(window: &mut ToolWindow, ctx: &egui::Context) -> Option<UiAction> {
     let mut action = None;
     let title = window.title();
@@ -766,6 +1008,7 @@ fn render_window(window: &mut ToolWindow, ctx: &egui::Context) -> Option<UiActio
         ToolState::Duplicates(_) => [900.0, 700.0],
         ToolState::Checksums(_) => [900.0, 700.0],
         ToolState::Compare(_) => [960.0, 720.0],
+        ToolState::Verify(_) => [960.0, 720.0],
     };
     egui::Window::new(title)
         .id(egui::Id::new(("tool-window", window.id)))
@@ -835,6 +1078,7 @@ fn render_body(window: &mut ToolWindow, ui: &mut egui::Ui) -> Option<UiAction> {
         ToolState::Duplicates(state) => render_duplicates(window.id, state, ui),
         ToolState::Checksums(state) => render_checksums(window.id, state, ui),
         ToolState::Compare(state) => render_compare(window.id, state, ui),
+        ToolState::Verify(state) => render_verify(window.id, state, ui),
     }
 }
 
@@ -1052,6 +1296,42 @@ fn launch_action(
                 err.map_or(Ok(()), Err)
             });
             ("sync-preview", title, handle)
+        }
+        DeferredAction::VerifyBackup {
+            original,
+            backup,
+            options,
+        } => {
+            let title = format!(
+                "Verifying backup {} against {}",
+                backup.display(),
+                original.display()
+            );
+            let result_tx = result_tx.clone();
+            let ctx = ctx.clone();
+            let handle = jobs.spawn("verify-backup", title.clone(), move |job| {
+                let result =
+                    match verify_backup(&original, &backup, &options, &JobCtx::from_job(job)) {
+                        Ok(report) => {
+                            for entry in &report.entries {
+                                if matches!(entry.status, VerifyStatus::Error(_)) {
+                                    job.progress.add_error();
+                                }
+                            }
+                            Ok(report)
+                        }
+                        Err(CoreError::Cancelled) => Err("Backup check cancelled".to_owned()),
+                        Err(error) => Err(error.to_string()),
+                    };
+                let err = result.as_ref().err().cloned();
+                let _ = result_tx.send(ToolEnvelope {
+                    generation,
+                    payload: ToolPayload::BackupVerified(result),
+                });
+                ctx.request_repaint();
+                err.map_or(Ok(()), Err)
+            });
+            ("verify-backup", title, handle)
         }
         DeferredAction::RecycleDuplicates {
             targets,
@@ -2309,6 +2589,7 @@ fn manifest_for_selection(
 fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Option<UiAction> {
     let mut picked_right = None;
     let mut compare_now = false;
+    let mut verify_now = false;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Left").strong());
         ui.label(state.left.display().to_string());
@@ -2326,7 +2607,21 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
         if state.right.is_some() && ui.button("Compare / refresh").clicked() {
             compare_now = true;
         }
+        if state.right.is_some()
+            && ui
+                .small_button("Verify backup by content…")
+                .on_hover_text("Check that the right folder is a complete backup of the left")
+                .clicked()
+        {
+            verify_now = true;
+        }
     });
+    if verify_now && let Some(backup) = &state.right {
+        return Some(UiAction::OpenVerify {
+            original: state.left.clone(),
+            backup: backup.clone(),
+        });
+    }
     if let Some(right) = picked_right {
         state.right = Some(right.clone());
         state.report = None;
@@ -2659,9 +2954,341 @@ fn entry_state_label(state: &EntryState, ui: &egui::Ui) -> (String, Color32) {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Backup check
+// -----------------------------------------------------------------------------
+
+fn render_verify(id: u64, state: &mut VerifyState, ui: &mut egui::Ui) -> Option<UiAction> {
+    let mut picked_original = None;
+    let mut picked_backup = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Original").strong());
+        ui.label(state.original.display().to_string());
+        if ui.button("Choose original folder…").clicked() {
+            picked_original = crate::dialogs::pick_folder(rfd::FileDialog::new());
+        }
+        ui.separator();
+        ui.label(RichText::new("Backup").strong());
+        if let Some(backup) = &state.backup {
+            ui.label(backup.display().to_string());
+        } else {
+            ui.label(RichText::new("Choose a folder").weak());
+        }
+        if ui.button("Choose backup folder…").clicked() {
+            picked_backup = crate::dialogs::pick_folder(rfd::FileDialog::new());
+        }
+    });
+    if let Some(path) = picked_original {
+        state.original = path;
+        state.report = None;
+    }
+    if let Some(path) = picked_backup {
+        state.backup = Some(path);
+        state.report = None;
+    }
+
+    ui.checkbox(&mut state.full, "Full verify (hash every file)");
+    ui.label(
+        RichText::new(
+            "Quick (unchecked): sizes and dates are compared first, and a file is hashed only when its date differs.",
+        )
+        .weak(),
+    );
+    ui.checkbox(
+        &mut state.detect_moves,
+        "Find moved or renamed files by content",
+    );
+    let start = ui
+        .horizontal(|ui| {
+            let verify = ui.add_enabled(state.backup.is_some(), egui::Button::new("Verify"));
+            register_click_target(ui.ctx(), "verify:Verify", &verify);
+            verify.clicked()
+        })
+        .inner;
+    if start && let Some(backup) = state.backup.clone() {
+        state.report = None;
+        state.last_export = None;
+        state.export_error = None;
+        return Some(UiAction::Start(DeferredAction::VerifyBackup {
+            original: state.original.clone(),
+            backup,
+            options: verify_options(state),
+        }));
+    }
+    if let Some(path) = &state.last_export {
+        ui.label(RichText::new(format!("Report saved to {}", path.display())).weak());
+    }
+    if let Some(error) = &state.export_error {
+        ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+    }
+
+    let Some(report) = state.report.as_ref() else {
+        ui.add_space(8.0);
+        ui.label(RichText::new("Results appear here. The check runs as a cancellable job.").weak());
+        return None;
+    };
+    ui.separator();
+    let error_color = ui.visuals().error_fg_color;
+    let counts = report.counts();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("{} matched", counts.matched)).strong());
+        for (count, text, problem) in [
+            (counts.missing, "missing from the backup", true),
+            (counts.differs, "differ", true),
+            (counts.extra, "only in the backup", false),
+            (counts.moved, "moved or renamed", false),
+            (counts.not_checked, "not checked", false),
+            (counts.errors, "errors", true),
+        ] {
+            let text = format!("{count} {text}");
+            if problem && count > 0 {
+                ui.colored_label(error_color, text);
+            } else {
+                ui.label(text);
+            }
+        }
+    });
+    if report.is_ok() {
+        ui.label(
+            RichText::new("Backup verified: no problems found.")
+                .strong()
+                .color(Color32::from_rgb(76, 185, 112)),
+        );
+    } else {
+        ui.label(RichText::new("Problems found").strong().color(error_color));
+    }
+
+    let mut export: Option<(PathBuf, bool)> = None;
+    ui.horizontal(|ui| {
+        if ui.button("Export CSV…").clicked()
+            && let Some(path) = crate::dialogs::save_file(
+                rfd::FileDialog::new()
+                    .set_file_name("backup-check.csv")
+                    .add_filter("CSV", &["csv"]),
+            )
+        {
+            export = Some((path, true));
+        }
+        if ui.button("Export text…").clicked()
+            && let Some(path) = crate::dialogs::save_file(
+                rfd::FileDialog::new()
+                    .set_file_name("backup-check.txt")
+                    .add_filter("Text", &["txt"]),
+            )
+        {
+            export = Some((path, false));
+        }
+    });
+
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Show").weak());
+        for (label, filter) in VERIFY_FILTERS {
+            if ui.selectable_label(state.filter == filter, label).clicked() {
+                state.filter = filter;
+            }
+        }
+    });
+    let filter = state.filter;
+    let indices: Vec<usize> = report
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| verify_filter_matches(filter, &entry.status))
+        .map(|(index, _)| index)
+        .collect();
+    egui::ScrollArea::vertical()
+        .id_salt(("verify-entries", id))
+        .max_height(340.0)
+        .show_rows(ui, 24.0, indices.len(), |ui, range| {
+            for row in range {
+                let entry = &report.entries[indices[row]];
+                ui.horizontal(|ui| {
+                    ui.colored_label(verify_status_color(&entry.status, ui), entry.status.label());
+                    ui.label(forge_core::paths::to_slash(&entry.rel));
+                    match &entry.status {
+                        VerifyStatus::Moved { backup_rel } => {
+                            ui.label(
+                                RichText::new(format!(
+                                    "→ {}",
+                                    forge_core::paths::to_slash(backup_rel)
+                                ))
+                                .weak(),
+                            );
+                        }
+                        VerifyStatus::NotChecked(reason) | VerifyStatus::Error(reason) => {
+                            ui.label(RichText::new(reason).weak());
+                        }
+                        _ => {}
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!(
+                            "{}  |  {}",
+                            size_label(entry.original_size),
+                            size_label(entry.backup_size)
+                        ));
+                    });
+                });
+            }
+        });
+
+    if let Some((path, csv)) = export {
+        // The report is no longer used here; the save only updates the export status.
+        let _ = export_verify_report(state, &path, csv);
+    }
+    None
+}
+
+/// Does `filter` show an entry with `status`?
+fn verify_filter_matches(filter: VerifyFilter, status: &VerifyStatus) -> bool {
+    match filter {
+        VerifyFilter::Problems => !matches!(status, VerifyStatus::Match),
+        VerifyFilter::All => true,
+        VerifyFilter::Missing => matches!(status, VerifyStatus::Missing),
+        VerifyFilter::Differs => matches!(status, VerifyStatus::Differs),
+        VerifyFilter::Extra => matches!(status, VerifyStatus::Extra),
+        VerifyFilter::Moved => matches!(status, VerifyStatus::Moved { .. }),
+        VerifyFilter::NotChecked => matches!(status, VerifyStatus::NotChecked(_)),
+        VerifyFilter::Errors => matches!(status, VerifyStatus::Error(_)),
+        VerifyFilter::Matches => matches!(status, VerifyStatus::Match),
+    }
+}
+
+fn verify_status_color(status: &VerifyStatus, ui: &egui::Ui) -> Color32 {
+    match status {
+        VerifyStatus::Match => Color32::from_rgb(87, 177, 112),
+        VerifyStatus::Missing | VerifyStatus::Differs | VerifyStatus::Error(_) => {
+            ui.visuals().error_fg_color
+        }
+        VerifyStatus::Extra => Color32::from_rgb(223, 164, 75),
+        VerifyStatus::Moved { .. } => Color32::from_rgb(86, 165, 230),
+        VerifyStatus::NotChecked(_) => theme::muted(ui),
+    }
+}
+
+fn size_label(size: Option<u64>) -> String {
+    size.map_or_else(|| "—".to_string(), format_size)
+}
+
+/// Save the report as CSV or text. Failures are kept in the window for display.
+fn export_verify_report(state: &mut VerifyState, path: &Path, csv: bool) -> Result<(), String> {
+    let report = state
+        .report
+        .as_ref()
+        .ok_or("the backup check has not completed")?;
+    let text = if csv {
+        report.to_csv()
+    } else {
+        report.to_text()
+    };
+    match write_report_file(path, &text) {
+        Ok(()) => {
+            state.last_export = Some(path.to_path_buf());
+            state.export_error = None;
+            Ok(())
+        }
+        Err(error) => {
+            let message = format!("Could not save the report to {}: {error}", path.display());
+            state.last_export = None;
+            state.export_error = Some(message.clone());
+            Err(message)
+        }
+    }
+}
+
+/// Write `text` to `path` through a temporary file in the same folder, so a failed export
+/// never leaves a partial report under the chosen name.
+fn write_report_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "report path has no file name",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(
+        ".{}.zxraw-tmp-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_filter_chips_show_their_statuses() {
+        let all = [
+            VerifyStatus::Match,
+            VerifyStatus::Missing,
+            VerifyStatus::Differs,
+            VerifyStatus::Extra,
+            VerifyStatus::Moved {
+                backup_rel: PathBuf::from("b.bin"),
+            },
+            VerifyStatus::NotChecked("link".into()),
+            VerifyStatus::Error("denied".into()),
+        ];
+        let shown = |filter| {
+            all.iter()
+                .filter(|status| verify_filter_matches(filter, status))
+                .count()
+        };
+        assert_eq!(shown(VerifyFilter::Problems), 6);
+        assert_eq!(shown(VerifyFilter::All), 7);
+        assert_eq!(shown(VerifyFilter::Matches), 1);
+        for (filter, index) in [
+            (VerifyFilter::Missing, 1),
+            (VerifyFilter::Differs, 2),
+            (VerifyFilter::Extra, 3),
+            (VerifyFilter::Moved, 4),
+            (VerifyFilter::NotChecked, 5),
+            (VerifyFilter::Errors, 6),
+        ] {
+            let hits: Vec<usize> = all
+                .iter()
+                .enumerate()
+                .filter(|(_, status)| verify_filter_matches(filter, status))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(hits, vec![index], "{filter:?}");
+        }
+        assert_eq!(VERIFY_FILTERS[0].1, VerifyFilter::Problems);
+    }
+
+    #[test]
+    fn report_file_is_written_whole_and_never_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("backup-check.csv");
+        write_report_file(&target, "status,path\r\nmatch,a\r\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "status,path\r\nmatch,a\r\n"
+        );
+        write_report_file(&target, "replaced").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "replaced");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        let missing_folder = dir.path().join("no-such-folder").join("report.txt");
+        assert!(write_report_file(&missing_folder, "text").is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn squarified_treemap_tiles_area_without_overlap_and_preserves_proportions() {

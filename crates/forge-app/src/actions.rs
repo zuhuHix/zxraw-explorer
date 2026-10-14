@@ -65,6 +65,8 @@ pub enum UndoEntry {
     Rename(Vec<(PathBuf, PathBuf)>),
     /// Records from the ops engine (moves on the same volume, created items, new copies).
     Ops(Vec<forge_core::ops::UndoRecord>),
+    /// Find and replace: each file is restored from its backup if it is unchanged since.
+    TextReplace(Vec<forge_core::text_replace::ReplaceUndo>),
 }
 
 /// In-app clipboard for files (Ctrl+C / Ctrl+X then Ctrl+V).
@@ -500,6 +502,8 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Deliver => crate::batch_export::deliver(app),
         Cmd::EditMetadata => crate::meta_edit::open(app),
         Cmd::SyncFolders => crate::tools_ui::open_sync(app),
+        Cmd::FindReplace => crate::replace_ui::open(app),
+        Cmd::VerifyBackup => crate::tools_ui::open_verify_backup(app),
         Cmd::FolderSize | Cmd::FindDuplicates | Cmd::ChecksumFiles | Cmd::CompareFolders => {
             use crate::tools_ui::Tool;
             let tool = match cmd {
@@ -519,6 +523,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
+            Some(UndoEntry::TextReplace(records)) => crate::replace_ui::undo(app, records),
             Some(UndoEntry::Rename(pairs)) => {
                 let r = forge_core::rename::undo(&pairs);
                 // Only the pairs that really moved back: a partial undo follows just those.
@@ -871,6 +876,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::extra_tools_ui::window(app, ui.ctx());
     crate::meta_export::window(app, ui.ctx());
     crate::batch_export::window(app, ui.ctx());
+    crate::replace_ui::window(app, ui.ctx());
     crate::meta_edit::window(app, ui.ctx());
     crate::ops_ui::poll_cloud_check(app);
     if crate::ops_ui::conflict_dialog(app, ui.ctx()) {

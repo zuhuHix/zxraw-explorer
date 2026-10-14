@@ -4,13 +4,15 @@
 //! * `model`, `listing`, `paths`, `error` — shared types & directory enumeration
 //! * `ops` — copy/move/delete/create with conflict policies and verification
 //! * `rename` — batch rename templates with preview
-//! * `hashing`, `duplicates`, `disk_usage`, `compare` — power-user analysis
+//! * `hashing`, `duplicates`, `disk_usage`, `compare`, `backup_verify` — power-user analysis
+//! * `text_replace` — find and replace text in files (preview, atomic write, undo)
 //! * `query` — search query language (parsed to an AST consumed by `forge-db`)
 //! * `ingest` — media import planning & verified copy
 //! * `archive` — safe archive browsing/extraction helpers
 //! * `cloud` — cloud placeholder detection: may background work read a file?
 
 pub mod archive;
+pub mod backup_verify;
 pub mod cloud;
 pub mod compare;
 pub mod disk_usage;
@@ -26,6 +28,7 @@ pub mod paths;
 pub mod query;
 pub mod rename;
 pub mod split;
+pub mod text_replace;
 
 pub use error::{CoreError, Result};
 pub use model::{EntryKind, FileEntry, MediaKind};
