@@ -125,6 +125,13 @@ fn start_transfer_with(
         .transfers()
         .set_serial(app.settings.transfer_queue);
     let disks = transfer_disks(&sources, &dest);
+    // A move deletes its sources, so it must act on the items the user picked: what is
+    // at a source path when the job starts must still be the same item.
+    let identities: Vec<Option<SourceIdentity>> = if kind == OpKind::Move {
+        sources.iter().map(|s| source_identity(s)).collect()
+    } else {
+        Vec::new()
+    };
     // Taken by whichever runs: the job, or the callback for a job cancelled while queued.
     let completion = std::sync::Arc::new(parking_lot::Mutex::new(completion));
     let unstarted = {
@@ -148,8 +155,21 @@ fn start_transfer_with(
     let job_body = move |job: &JobHandle| {
         let completion = completion.lock().take();
         // A queued job starts later: anything that vanished meanwhile is skipped, not
-        // failed. Conflicts are looked at only now, when the job runs.
-        let (sources, vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
+        // failed, and a moved source replaced by another item is left alone. Conflicts
+        // are looked at only now, when the job runs.
+        let mut changed = Vec::new();
+        let sources: Vec<PathBuf> = sources
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, source)| match identities.get(i) {
+                Some(Some(then)) if source_identity(&source).is_some_and(|now| now != *then) => {
+                    changed.push(source);
+                    None
+                }
+                _ => Some(source),
+            })
+            .collect();
+        let (sources, mut vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
             .into_iter()
             .partition(|s| forge_core::paths::exists_no_follow(s));
         let opts = OpOptions {
@@ -158,7 +178,18 @@ fn start_transfer_with(
             force_copy_for_move,
         };
         let plan = match ops::plan(kind, &sources, &dest, opts, &job.cancel) {
-            Ok(plan) => plan,
+            Ok(mut plan) => {
+                // A source that vanished after the check above is not a failure either.
+                plan.issues.retain(|issue| {
+                    let gone = sources.contains(&issue.path)
+                        && !forge_core::paths::exists_no_follow(&issue.path);
+                    if gone {
+                        vanished.push(issue.path.clone());
+                    }
+                    !gone
+                });
+                plan
+            }
             Err(e) => {
                 let _ = tx.send(Event::Error(e.to_string()));
                 if let Some(completion) = completion {
@@ -206,6 +237,11 @@ fn start_transfer_with(
                 .skipped
                 .push(ops::OpIssue::new(path, "no longer exists"));
         }
+        for path in changed {
+            report
+                .skipped
+                .push(ops::OpIssue::new(path, "changed while queued, not moved"));
+        }
         let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
         finish_report(
             job,
@@ -231,6 +267,36 @@ fn start_transfer_with(
     app.ops
         .jobs
         .spawn_queued("transfer", title, disks, job_body, unstarted);
+}
+
+/// What a source path pointed at when a move was queued.
+#[derive(PartialEq)]
+enum SourceIdentity {
+    /// Volume serial and file index (Windows file ID).
+    Id {
+        kind: std::fs::FileType,
+        id: (u32, u64),
+    },
+    /// Fallback when the file ID cannot be read.
+    Meta {
+        kind: std::fs::FileType,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+    },
+}
+
+/// `None` if nothing is at `path`. Does not follow a link at the end.
+fn source_identity(path: &Path) -> Option<SourceIdentity> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    let kind = md.file_type();
+    Some(match forge_win::file_id(path) {
+        Ok(id) => SourceIdentity::Id { kind, id },
+        Err(_) => SourceIdentity::Meta {
+            kind,
+            len: md.len(),
+            modified: md.modified().ok(),
+        },
+    })
 }
 
 /// Physical disks a transfer reads and writes, or `None` if any of them is unknown
@@ -669,7 +735,9 @@ fn job_row(
                         action = Some(QueueAction::Up);
                     }
                 } else if state != JobState::Queued {
-                    let paused = state == JobState::Paused;
+                    // The user's own pause; a job held only by the paused queue offers
+                    // "Pause" and resumes with the queue.
+                    let paused = j.cancel.is_paused_itself();
                     if ui
                         .small_button(if paused { "Resume" } else { "Pause" })
                         .clicked()
