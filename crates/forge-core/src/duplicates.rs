@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cloud::{background_read_allowed, is_online_only_metadata};
 use crate::error::{CoreError, Result};
 use crate::hashing::{self, Digest};
 use crate::ops::{JobCtx, NodeKind, OpIssue, WalkItem, node_kind, walk_tree};
@@ -67,6 +68,9 @@ pub struct DupReport {
     /// comparison]. The byte-comparison slot stays zero unless `byte_compare` is set.
     pub stage_times: [Duration; 4],
     pub links_skipped: u64,
+    /// Cloud placeholders whose data is not on this PC: never read, so never compared.
+    #[serde(default)]
+    pub skipped_online_only: u64,
     pub errors: Vec<OpIssue>,
 }
 
@@ -89,12 +93,14 @@ fn dedupe_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     keep
 }
 
-/// Collect regular files under `roots` (a root may also be a single file).
+/// Collect regular files under `roots` (a root may also be a single file). Online-only cloud
+/// placeholders are counted in `online_only` and not passed on: reading them would download.
 fn collect_files(
     roots: &[PathBuf],
     ctx: &JobCtx<'_>,
     errors: &mut Vec<OpIssue>,
     links: &mut u64,
+    online_only: &mut u64,
     mut f: impl FnMut(PathBuf, u64),
 ) -> Result<()> {
     for root in dedupe_roots(roots) {
@@ -106,12 +112,17 @@ fn collect_files(
             }
         };
         match node_kind(&md) {
+            NodeKind::File if is_online_only_metadata(&root, &md) => *online_only += 1,
             NodeKind::File => f(root, md.len()),
             NodeKind::Link => *links += 1,
             NodeKind::Dir => walk_tree(&root, ctx.cancel, |item| match item {
                 WalkItem::Entry(e) if e.is_file() => {
                     ctx.progress.add_items(1);
-                    f(e.path.clone(), e.size)
+                    if background_read_allowed(&e.path) {
+                        f(e.path.clone(), e.size)
+                    } else {
+                        *online_only += 1;
+                    }
                 }
                 WalkItem::Entry(e) if e.is_link() => *links += 1,
                 WalkItem::Entry(_) => {}
@@ -135,20 +146,29 @@ pub fn find_duplicates(
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut errors = Vec::new();
     let mut links = 0;
+    let mut online_only = 0;
     let stage_start = Instant::now();
     ctx.progress.set_current("scanning");
-    collect_files(roots, ctx, &mut errors, &mut links, |path, size| {
-        report.files_scanned += 1;
-        let wanted = if size == 0 {
-            opts.include_empty
-        } else {
-            size >= opts.min_size
-        };
-        if wanted && seen.insert(path.clone()) {
-            by_size.entry(size).or_default().push(path);
-        }
-    })?;
+    collect_files(
+        roots,
+        ctx,
+        &mut errors,
+        &mut links,
+        &mut online_only,
+        |path, size| {
+            report.files_scanned += 1;
+            let wanted = if size == 0 {
+                opts.include_empty
+            } else {
+                size >= opts.min_size
+            };
+            if wanted && seen.insert(path.clone()) {
+                by_size.entry(size).or_default().push(path);
+            }
+        },
+    )?;
     report.links_skipped = links;
+    report.skipped_online_only = online_only;
     by_size.retain(|_, v| v.len() > 1);
     report.stage_candidates[0] = by_size.values().map(|v| v.len() as u64).sum();
     report.stage_times[0] = stage_start.elapsed();
@@ -469,6 +489,30 @@ mod tests {
             &JobCtx::new(&cancel, &progress),
         );
         assert!(matches!(r, Err(CoreError::Cancelled)));
+    }
+
+    #[test]
+    fn online_only_files_are_never_compared() {
+        use crate::cloud::{clear_simulated_online_only, simulate_online_only};
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        fs::write(r.join("a.bin"), b"same content").unwrap();
+        fs::write(r.join("b.bin"), b"same content").unwrap();
+        let cloud = r.join("b.bin");
+        simulate_online_only(&cloud);
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let rep = find_duplicates(
+            &[r.to_path_buf()],
+            &DupOptions::default(),
+            &JobCtx::new(&cancel, &progress),
+        )
+        .unwrap();
+        clear_simulated_online_only(&cloud);
+        assert!(rep.groups.is_empty(), "{:?}", rep.groups);
+        assert_eq!(rep.skipped_online_only, 1);
+        assert_eq!(rep.files_scanned, 1);
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
     }
 
     #[test]

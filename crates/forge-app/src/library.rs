@@ -512,6 +512,11 @@ pub fn extract_metadata(db: &Db, job: &JobHandle) {
             if job.cancel.check().is_err() {
                 return;
             }
+            // Left without metadata: it is read once the file is downloaded (or never, if not).
+            if !forge_core::cloud::background_read_allowed(&r.path) {
+                job.progress.add_items(1);
+                continue;
+            }
             match r.media_kind {
                 forge_core::MediaKind::Video => {
                     let m = ff
@@ -1059,6 +1064,37 @@ mod tests {
         }));
         assert_eq!(library.annotations[&path].rating, 0);
         assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn metadata_extraction_skips_online_only_photos() {
+        let photo: &[u8] = include_bytes!("../../../docs/images/privacy.jpg");
+        let root = std::env::temp_dir().join(format!(
+            "zxraw-meta-online-only-{}-{}",
+            std::process::id(),
+            forge_db::latest_version()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let local = root.join("local.jpg");
+        let cloud = root.join("cloud.jpg");
+        std::fs::write(&local, photo).unwrap();
+        std::fs::write(&cloud, photo).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let root_id = db.add_index_root(&root).unwrap();
+        forge_db::Indexer::new(&db).index_root(root_id).unwrap();
+        forge_core::cloud::simulate_online_only(&cloud);
+
+        let job = forge_jobs::JobRegistry::new().spawn("test", "test", |_| Ok(()));
+        extract_metadata(&db, &job);
+        forge_core::cloud::clear_simulated_online_only(&cloud);
+
+        let pending = db.files_needing_meta_after(0, 100, false).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].path, cloud);
+        let local_id = db.file_id(&local).unwrap().unwrap();
+        assert!(db.image_meta(local_id).unwrap().is_some());
+        assert!(db.image_meta(pending[0].id).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

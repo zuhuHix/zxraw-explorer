@@ -503,6 +503,9 @@ impl Inner {
             self.mem.lock().insert(key, img.clone());
             return Ok(img);
         }
+        if !forge_core::cloud::background_read_allowed(&req.path) {
+            return Err(MediaError::OnlineOnly);
+        }
         token.check()?;
         let img = generate_thumbnail(
             &req.path,

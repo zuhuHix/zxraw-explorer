@@ -897,6 +897,24 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                 ConfirmKind::Recycle(t) => recycle(app, t),
                 ConfirmKind::DeletePermanently(t) => delete_permanently(app, t),
                 ConfirmKind::DownloadFfmpeg => crate::ffmpeg_setup::start(app),
+                ConfirmKind::DownloadCloudFiles {
+                    sources,
+                    dest,
+                    kind,
+                    clipboard: None,
+                } => crate::ops_ui::start_transfer_confirmed(app, sources, dest, kind),
+                ConfirmKind::DownloadCloudFiles {
+                    sources,
+                    dest,
+                    clipboard: Some((generation, sequence)),
+                    ..
+                } => {
+                    if !crate::ops_ui::start_clipboard_move_confirmed(
+                        app, sources, dest, generation, sequence,
+                    ) {
+                        app.toast("Nothing to move: the items are already in this folder");
+                    }
+                }
             }
             None
         }

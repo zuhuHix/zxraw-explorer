@@ -25,6 +25,11 @@ pub struct MetaLoader {
 
 impl MetaLoader {
     pub fn get(&mut self, e: &FileEntry, ctx: &egui::Context) -> Option<Result<MediaMeta, String>> {
+        if !forge_core::cloud::background_read_allowed_entry(e) {
+            return Some(Err(
+                "Online-only file: open it to download it from the cloud.".into(),
+            ));
+        }
         if let Some((p, r)) = &*self.slot.lock() {
             if *p == e.path {
                 return Some(r.clone());

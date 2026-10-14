@@ -2558,6 +2558,7 @@ fn scan_clip_label(path: &Path, cancel: &CancelToken) -> Option<String> {
             hidden: false,
             readonly: metadata.permissions().readonly(),
             system: false,
+            online_only: false,
             ext,
         });
     }
@@ -3234,6 +3235,7 @@ mod tests {
             hidden: false,
             readonly: false,
             system: false,
+            online_only: false,
             ext,
         }
     }

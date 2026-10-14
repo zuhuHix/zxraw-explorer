@@ -720,6 +720,9 @@ fn register_accessible_node(
 
 fn entry_accessibility_description(entry: &FileEntry, annotation: Option<Annotation>) -> String {
     let mut parts = vec![format!("Type: {}", type_label(entry))];
+    if entry.online_only {
+        parts.push("Online-only".into());
+    }
     if entry.kind == EntryKind::File {
         parts.push(format!("Size: {}", format_size(entry.size)));
     }
@@ -1339,6 +1342,14 @@ pub fn details(
             {
                 painter.circle_filled(pos2(name_left + 4.0, cy), 4.0, *label_color);
                 name_left += 13.0;
+            }
+            if entry.online_only {
+                let center = pos2(name_left + 6.0, cy);
+                draw_cloud_badge(&painter, center, 12.0, ONLINE_ONLY_COLOR);
+                let hit = Rect::from_center_size(center, vec2(14.0, row_h));
+                ui.interact(hit, ui.id().with(("cloud", &entry.path)), Sense::hover())
+                    .on_hover_text(ONLINE_ONLY_HINT);
+                name_left += 16.0;
             }
             let name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
             let name_rect =
@@ -2005,6 +2016,11 @@ pub fn grid(
                     if let Some(a) = annotation {
                         draw_annotation(&p, badge_rect, a);
                     }
+                    if entry.online_only {
+                        let corner = badge_rect.right_bottom() - vec2(10.0, 10.0);
+                        p.circle_filled(corner, 11.0, Color32::from_black_alpha(150));
+                        draw_cloud_badge(&p, corner, 13.0, ONLINE_ONLY_COLOR);
+                    }
                     let badge_clicked = if let Some(badge) = &item.badge {
                         let label = badge.count.to_string();
                         let badge_size =
@@ -2103,7 +2119,12 @@ pub fn grid(
                     }
                     remember_accessible_focus(ui, id, &resp);
                     remember_cursor_accessible_focus(ui, id, &resp);
-                    let resp = resp.on_hover_text_at_pointer(entry.name.clone());
+                    let tip = if entry.online_only {
+                        format!("{}\n{ONLINE_ONLY_HINT}", entry.name)
+                    } else {
+                        entry.name.clone()
+                    };
+                    let resp = resp.on_hover_text_at_pointer(tip);
                     if let Some(members) = &item.members {
                         if resp.drag_started() {
                             resp.dnd_set_drag_payload(DragPaths(members.clone()));
@@ -2214,6 +2235,23 @@ fn pane_grid_columns_store(ui: &Ui, id: egui::Id, per_row: usize) {
 pub fn grid_columns(ctx: &egui::Context, id: egui::Id) -> usize {
     ctx.data(|d| d.get_temp::<usize>(id.with("per_row")))
         .unwrap_or(1)
+}
+
+/// Muted blue-grey for the online-only cloud marker.
+const ONLINE_ONLY_COLOR: Color32 = Color32::from_rgb(120, 150, 180);
+const ONLINE_ONLY_HINT: &str =
+    "Online-only: stored in the cloud. Opening or copying it downloads it.";
+
+/// A small cloud (three bumps on a rounded base) centred on `c`, `s` pixels wide.
+pub fn draw_cloud_badge(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32) {
+    p.circle_filled(c + vec2(-0.22 * s, 0.08 * s), 0.22 * s, color);
+    p.circle_filled(c + vec2(0.04 * s, -0.08 * s), 0.3 * s, color);
+    p.circle_filled(c + vec2(0.26 * s, 0.08 * s), 0.2 * s, color);
+    p.rect_filled(
+        Rect::from_min_max(c + vec2(-0.42 * s, 0.08 * s), c + vec2(0.46 * s, 0.3 * s)),
+        0.11 * s,
+        color,
+    );
 }
 
 pub fn draw_annotation(p: &egui::Painter, img_rect: Rect, a: Annotation) {
@@ -2333,6 +2371,7 @@ mod accessibility_tests {
                 hidden: false,
                 readonly: false,
                 system: false,
+                online_only: false,
                 ext: "png".into(),
             },
             FileEntry {
@@ -2345,6 +2384,7 @@ mod accessibility_tests {
                 hidden: false,
                 readonly: false,
                 system: false,
+                online_only: false,
                 ext: "txt".into(),
             },
         ];
@@ -2419,6 +2459,7 @@ mod accessibility_tests {
             hidden: false,
             readonly: false,
             system: false,
+            online_only: false,
             ext: "jpg".into(),
         };
         let second = FileEntry {
@@ -2600,6 +2641,7 @@ mod grouped_grid_tests {
             hidden,
             readonly: false,
             system: false,
+            online_only: false,
             ext: "jpg".into(),
         }
     }
@@ -2710,5 +2752,32 @@ mod plain_kind_tests {
         assert_eq!(plain_kind("LICENSE", ""), PlainKind::Text);
         assert_eq!(plain_kind("archive.bin", "bin"), PlainKind::Other);
         assert_eq!(plain_kind("Makefile", ""), PlainKind::Other);
+    }
+}
+
+#[cfg(test)]
+mod online_only_tests {
+    use super::{EntryKind, FileEntry, entry_accessibility_description};
+
+    fn file(online_only: bool) -> FileEntry {
+        FileEntry {
+            path: "C:/cloud/clip.mp4".into(),
+            name: "clip.mp4".into(),
+            kind: EntryKind::File,
+            size: 1 << 30,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            online_only,
+            ext: "mp4".into(),
+        }
+    }
+
+    #[test]
+    fn online_only_entries_are_described_for_screen_readers() {
+        assert!(entry_accessibility_description(&file(true), None).contains("Online-only"));
+        assert!(!entry_accessibility_description(&file(false), None).contains("Online-only"));
     }
 }

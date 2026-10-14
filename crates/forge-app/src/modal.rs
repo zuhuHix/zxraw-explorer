@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use egui::{Key, RichText};
+use forge_core::ops::OpKind;
 
 pub enum Modal {
     /// Single-line text prompt (new folder, rename).
@@ -45,6 +46,14 @@ pub enum ConfirmKind {
     Recycle(Vec<PathBuf>),
     /// Download and install FFmpeg (see `ffmpeg_setup`).
     DownloadFfmpeg,
+    /// A copy or move that would first download online-only files; Accept resumes it.
+    /// `clipboard` is `(generation, expected_sequence)` for a clipboard move.
+    DownloadCloudFiles {
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        kind: OpKind,
+        clipboard: Option<(Option<u64>, Option<u32>)>,
+    },
 }
 
 pub struct Confirm {

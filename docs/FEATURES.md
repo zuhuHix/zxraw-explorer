@@ -341,6 +341,19 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Links and reparse points are not followed by recursive operations — `forge-core/src/ops.rs`
   (`links_are_not_followed`, `links_are_not_followed_windows`), `listing.rs::junctions_are_links`,
   `forge-db/tests/indexer.rs::junctions_are_recorded_but_not_followed`.
+* ✅ Cloud placeholders are never downloaded by background work. OneDrive, Dropbox and Google
+  Drive files that are only online (`RECALL_ON_DATA_ACCESS`, `RECALL_ON_OPEN` or `OFFLINE` in the
+  listing attributes) get a cloud badge instead of a thumbnail. Thumbnails, preview-pane EXIF and
+  text, video durations, library metadata extraction, duplicate and similar-photo scans, folder
+  compare hashing, and viewer prefetching all skip them through one check,
+  `forge_core::cloud::background_read_allowed`. Opening a file still downloads it. A copy (or a
+  move to another drive) of 10 or more online-only files, or 1 GB or more, asks first and gives
+  the count and size. Tests: `forge-core/src/cloud.rs`, `duplicates.rs::online_only_files_are_never_compared`,
+  `compare.rs::online_only_files_are_not_hashed_by_folder_compare`,
+  `forge-media/tests/media.rs::background_thumbnails_never_read_online_only_files`,
+  `forge-app` `library::tests::metadata_extraction_skips_online_only_photos` and
+  `ops_ui::cloud_warning_tests`. Real placeholders cannot be created in tests, so they are
+  simulated; the badge has not been checked against a live OneDrive folder.
 * ✅ Copies stage to a temporary name and are cleaned up on cancel — `ops.rs::cancel_mid_copy_leaves_no_partial_files`.
 * ✅ ZIP extraction rejects unsafe paths before writing — `archive.rs::zip_slip_is_rejected_before_writing`.
 * ✅ SQLite migrations, WAL and integrity, and corrupt-database recovery — `forge-db/src/lib.rs`

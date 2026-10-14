@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cloud;
 use crate::error::{CoreError, Result};
 use crate::hashing;
 use crate::ops::{self, CopyFileOptions, JobCtx, NodeKind, OpIssue, OpReport, WalkItem, walk_tree};
@@ -204,7 +205,10 @@ fn compare_files(
     if li.size != ri.size {
         return Ok(EntryState::Different(DiffReason::Size));
     }
-    if opts.use_hash {
+    // Online-only placeholders are never read in the background: compare them by size/date.
+    let readable = cloud::background_read_allowed(&left.join(rel))
+        && cloud::background_read_allowed(&right.join(rel));
+    if opts.use_hash && readable {
         let h = |p: PathBuf| hashing::hash_file(&p, ctx.cancel, Some(ctx.progress));
         return Ok(match (h(left.join(rel)), h(right.join(rel))) {
             (Ok(a), Ok(b)) if a == b => EntryState::Same,
@@ -1307,6 +1311,31 @@ mod tests {
     use super::*;
     use forge_jobs::{CancelToken, Progress};
     use std::fs::File;
+
+    #[test]
+    fn online_only_files_are_not_hashed_by_folder_compare() {
+        let (_d, l, r) = setup();
+        fs::write(l.join("cloud.txt"), b"aaaa").unwrap();
+        fs::write(r.join("cloud.txt"), b"bbbb").unwrap();
+        set_mtime(&l.join("cloud.txt"), 1_500_000_000);
+        set_mtime(&r.join("cloud.txt"), 1_500_000_000);
+        let opts = CompareOptions {
+            use_hash: true,
+            ..Default::default()
+        };
+        let state = |rep: CompareReport| rep.entries[0].state.clone();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let ctx = JobCtx::new(&cancel, &progress);
+
+        let local = compare_dirs(&l, &r, &opts, &ctx).unwrap();
+        assert_eq!(state(local), EntryState::Different(DiffReason::Content));
+
+        cloud::simulate_online_only(l.join("cloud.txt"));
+        let cloud_rep = compare_dirs(&l, &r, &opts, &ctx).unwrap();
+        cloud::clear_simulated_online_only(&l.join("cloud.txt"));
+        assert_eq!(state(cloud_rep), EntryState::Same);
+    }
 
     fn set_mtime(p: &Path, secs: u64) {
         File::options()

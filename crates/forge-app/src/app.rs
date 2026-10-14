@@ -1256,6 +1256,7 @@ mod selection_summary_tests {
             hidden: false,
             readonly: false,
             system: false,
+            online_only: false,
             ext: "txt".into(),
         }
     }

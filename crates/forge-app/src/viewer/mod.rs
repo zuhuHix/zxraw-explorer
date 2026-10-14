@@ -141,6 +141,8 @@ pub struct Viewer {
     toast: Option<(String, Instant)>,
     close: bool,
     input_blocked: bool,
+    /// Items found to be online-only cloud files (checked lazily, attributes only).
+    online_only: std::collections::HashMap<usize, bool>,
 }
 
 impl Viewer {
@@ -197,6 +199,7 @@ impl Viewer {
             toast: None,
             close: false,
             input_blocked: false,
+            online_only: std::collections::HashMap::new(),
         };
         if mode == ViewerMode::Compare {
             v.init_compare(None);
@@ -699,7 +702,7 @@ impl Viewer {
                 let q = if d > 0 { pl + d } else { p + d };
                 if q >= 0 && (q as usize) < self.visible.len() {
                     let i = self.visible[q as usize];
-                    if !current.contains(&i) {
+                    if !current.contains(&i) && self.prefetch_allowed(i) {
                         req.push(((i, Level::Screen), Priority::Low));
                     }
                 }
@@ -707,11 +710,23 @@ impl Viewer {
         }
         // Filmstrip thumbnails in view.
         for p in self.strip_range.clone() {
-            if let Some(&i) = self.visible.get(p) {
+            if let Some(&i) = self.visible.get(p)
+                && self.prefetch_allowed(i)
+            {
                 req.push(((i, Level::Small), Priority::Normal));
             }
         }
         self.loader.update(&req);
+    }
+
+    /// Neighbours and filmstrip thumbnails are prefetched only for files on this PC: an
+    /// online-only cloud file downloads only when the user moves to it.
+    fn prefetch_allowed(&mut self, i: usize) -> bool {
+        let items = &self.items;
+        !*self
+            .online_only
+            .entry(i)
+            .or_insert_with(|| !forge_core::cloud::background_read_allowed(&items[i]))
     }
 }
 

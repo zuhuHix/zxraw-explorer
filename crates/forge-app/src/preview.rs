@@ -51,7 +51,13 @@ impl TextPreview {
     }
 }
 
+/// Online-only files are not read: that would download them.
+const ONLINE_ONLY_MESSAGE: &str = "Online-only file: open it to download it from the cloud.";
+
 fn read_text_head(p: &Path, max: usize) -> Result<String, String> {
+    if !forge_core::cloud::background_read_allowed(p) {
+        return Err(ONLINE_ONLY_MESSAGE.into());
+    }
     let f = std::fs::File::open(p).map_err(|e| e.to_string())?;
     let mut buf = Vec::with_capacity(max);
     f.take(max as u64)
@@ -129,4 +135,20 @@ pub fn is_media(e: &FileEntry) -> bool {
             e.media_kind(),
             MediaKind::Image | MediaKind::Raw | MediaKind::Video
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_preview_does_not_read_online_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "hello").unwrap();
+        forge_core::cloud::simulate_online_only(&path);
+        assert_eq!(read_text_head(&path, 1024), Err(ONLINE_ONLY_MESSAGE.into()));
+        forge_core::cloud::clear_simulated_online_only(&path);
+        assert_eq!(read_text_head(&path, 1024), Ok("hello".into()));
+    }
 }

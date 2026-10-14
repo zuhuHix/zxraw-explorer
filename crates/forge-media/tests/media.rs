@@ -867,3 +867,28 @@ fn tiff_tag_700_and_cr3_xmp_box() {
     let m = read_image_metadata(&p).unwrap();
     assert_eq!(m.xmp.and_then(|x| x.rating), Some(4));
 }
+
+#[test]
+fn background_thumbnails_never_read_online_only_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(dir.path(), "cloud.jpg", &jpeg(800, 600, 4));
+    let md = std::fs::metadata(&p).unwrap();
+    let req = || ThumbRequest::new(&p, 128).stat(md.modified().ok(), md.len());
+
+    forge_core::cloud::simulate_online_only(&p);
+    let s = service(None, 2);
+    assert_eq!(s.request(req()), RequestStatus::Queued);
+    let r = recv(&s);
+    assert!(
+        matches!(r.image, Err(MediaError::OnlineOnly)),
+        "{:?}",
+        r.image
+    );
+    assert_eq!(s.stats().generated, 0);
+
+    forge_core::cloud::clear_simulated_online_only(&p);
+    assert_eq!(s.request(req()), RequestStatus::Queued);
+    let img = recv(&s).image.unwrap();
+    assert_eq!((img.width, img.height), (128, 96));
+    assert_eq!(s.stats().generated, 1);
+}

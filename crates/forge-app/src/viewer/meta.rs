@@ -77,6 +77,15 @@ fn read_summary_stoppable(
     read_summary_inner(path, probe_video, ff, || stop.load(Ordering::Acquire))
 }
 
+/// What the sequential scan records for an online-only file: listing data only.
+fn online_only_summary(path: &std::path::Path) -> MetaSummary {
+    MetaSummary {
+        is_video: is_video(path),
+        file_size: std::fs::symlink_metadata(path).ok().map(|m| m.len()),
+        ..Default::default()
+    }
+}
+
 fn read_summary_inner(
     path: &std::path::Path,
     probe_video: bool,
@@ -327,6 +336,10 @@ fn scan(
         // Check before every metadata operation. An individual filesystem call remains
         // synchronous and cannot be interrupted once the OS blocks inside it.
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !full && !forge_core::cloud::background_read_allowed(p) {
+                // Online-only cloud file: only the image being viewed may download it.
+                return Some(online_only_summary(p));
+            }
             read_summary_stoppable(p, full, &ff, &stop)
         }))
         .unwrap_or_else(|_| {
