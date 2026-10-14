@@ -136,6 +136,8 @@ impl TestHook {
             || hook.select.is_some();
         hook.hidden = hook.automated && hide_window();
         RECORD_RECTS.store(hook.automated, std::sync::atomic::Ordering::Relaxed);
+        // Automated runs never open real terminal windows; scripts check the recorded launch.
+        crate::terminal::set_record_only(hook.automated);
         hook
     }
 
@@ -1110,6 +1112,15 @@ fn arrow_rect_id(path: &Path) -> egui::Id {
 /// Records the file list's area (where a click on empty space lands).
 pub(crate) fn note_view_rect(ui: &egui::Ui, rect: egui::Rect) {
     note_rect(ui, view_rect_id(), rect);
+}
+
+fn menu_rect_id(label: &str) -> egui::Id {
+    egui::Id::new(("testhook-menu-rect", label))
+}
+
+/// Records where a context-menu item was drawn, so `ui system click-menu` can click it.
+pub(crate) fn note_menu_rect(ui: &egui::Ui, label: &str, rect: egui::Rect) {
+    note_rect(ui, menu_rect_id(label), rect);
 }
 
 /// A rect recorded during the last couple of frames, so a row that scrolled away or

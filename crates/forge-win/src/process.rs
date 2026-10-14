@@ -69,6 +69,67 @@ pub fn hold_named_mutex(_name: &str) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
+/// Starts a console program in its own new console window through ShellExecuteW, so it gets a
+/// real console (std::process with null stdio would make a shell exit at once). `params` is the
+/// raw parameter string (already quoted by the caller). `elevated` uses the "runas" verb (UAC
+/// prompt). The process is detached.
+#[cfg(windows)]
+pub fn launch_console(exe: &Path, params: &str, cwd: Option<&Path>, elevated: bool) -> Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let _com = crate::shell::com::ComGuard::apartment_threaded()?;
+    let verb = crate::to_wide(if elevated { "runas" } else { "open" });
+    let file = crate::to_wide(exe);
+    let params = (!params.is_empty()).then(|| crate::to_wide(params));
+    let dir = cwd.map(crate::to_wide);
+    let params_ptr = params
+        .as_ref()
+        .map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr()));
+    let dir_ptr = dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
+    // ShellExecuteW returns a value greater than 32 on success, otherwise an SE_ERR code.
+    let rc = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(file.as_ptr()),
+            params_ptr,
+            dir_ptr,
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = rc.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else if elevated {
+        Err(WinError::Api {
+            op: "ShellExecuteW",
+            code: code as u32,
+            message: format!(
+                "the administrator prompt was declined or failed ({})",
+                exe.display()
+            ),
+        })
+    } else {
+        Err(WinError::Api {
+            op: "ShellExecuteW",
+            code: code as u32,
+            message: format!("could not start {}", exe.display()),
+        })
+    }
+}
+
+#[cfg(not(windows))]
+pub fn launch_console(
+    _exe: &Path,
+    _params: &str,
+    _cwd: Option<&Path>,
+    _elevated: bool,
+) -> Result<()> {
+    Err(WinError::Unsupported)
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;

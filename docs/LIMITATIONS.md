@@ -28,6 +28,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Windows shell and file exchange
 
+* "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
+  administrator or on a network (UNC) path; choose PowerShell instead. Git badges need Git for
+  Windows installed and are skipped for repositories whose `git status` takes over 4 s or prints
+  over 8 MB.
 * Files and folders can be dropped into the app. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another

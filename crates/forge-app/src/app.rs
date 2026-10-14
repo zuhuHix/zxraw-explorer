@@ -978,6 +978,9 @@ impl ZxrawApp {
                 }
                 _ => {}
             }
+            if let Some(branch) = self.ops.git.repo_for(&p.path).and_then(|r| r.branch.as_deref()) {
+                ui.label(RichText::new(format!("   ·   Git: {branch}")).color(theme::muted(ui)));
+            }
             if end_sticky {
                 self.pane_mut().sticky = false;
             }

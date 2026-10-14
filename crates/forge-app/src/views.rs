@@ -42,6 +42,10 @@ pub trait ThumbProvider {
     fn annotation(&self, _path: &Path) -> Option<Annotation> {
         None
     }
+    /// Optional Git status badge of an entry (see `git_status`).
+    fn git_badge(&self, _path: &Path, _is_dir: bool) -> Option<crate::git_status::GitBadge> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -193,6 +197,7 @@ const CONTEXT_FILE: &[Option<Cmd>] = &[
     Some(Cmd::OpenIn),
     Some(Cmd::RevealInExplorer),
     Some(Cmd::PinToQuickAccess),
+    Some(Cmd::OpenTerminal),
     None,
     Some(Cmd::Cut),
     Some(Cmd::Copy),
@@ -224,6 +229,8 @@ const CONTEXT_BACKGROUND: &[Option<Cmd>] = &[
     Some(Cmd::FindDuplicates),
     Some(Cmd::BookmarkFolder),
     Some(Cmd::RevealInExplorer),
+    Some(Cmd::OpenTerminal),
+    Some(Cmd::OpenTerminalAdmin),
 ];
 
 fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], out: &mut Vec<ViewEvent>) {
@@ -235,10 +242,9 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], out: &mut Vec<ViewEvent>) {
             }
             Some(c) => {
                 let sc = c.binding_text(&overrides);
-                if ui
-                    .add(egui::Button::new(c.label()).shortcut_text(sc))
-                    .clicked()
-                {
+                let button = ui.add(egui::Button::new(c.label()).shortcut_text(sc));
+                crate::testhook::note_menu_rect(ui, c.label(), button.rect);
+                if button.clicked() {
                     out.push(ViewEvent::Command(*c));
                     ui.close();
                 }
@@ -1357,9 +1363,10 @@ pub fn details(
                     egui::StrokeKind::Inside,
                 );
             }
+            let git = thumbs.git_badge(&entry.path, entry.kind == EntryKind::Dir);
             let text_color = if selected {
                 ui.visuals().selection.stroke.color
-            } else if entry.hidden {
+            } else if entry.hidden || git == Some(crate::git_status::GitBadge::Ignored) {
                 ui.visuals().weak_text_color()
             } else {
                 ui.visuals().text_color()
@@ -1428,7 +1435,11 @@ pub fn details(
                 );
                 name_left += 14.0;
             }
-            let name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
+            let mut name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
+            if let Some(badge) = git.filter(|_| name_width > 40.0) {
+                let right = pos2(col_x + name_column.width - 8.0, cy);
+                name_width -= crate::git_status::paint_badge(&painter, right, badge) + 4.0;
+            }
             let name_rect =
                 Rect::from_min_size(pos2(name_left, rect.top()), vec2(name_width, row_h));
             let child_error = if expanded { pane.child_error(&entry.path) } else { None };
@@ -2136,6 +2147,12 @@ pub fn grid(
                         let corner = badge_rect.right_bottom() - vec2(10.0, 10.0);
                         p.circle_filled(corner, 11.0, Color32::from_black_alpha(150));
                         draw_cloud_badge(&p, corner, 13.0, ONLINE_ONLY_COLOR);
+                    }
+                    if let Some(git) = thumbs.git_badge(&entry.path, entry.kind == EntryKind::Dir) {
+                        // Left of the cloud badge when both are shown.
+                        let inset = if entry.online_only { 24.0 } else { 3.0 };
+                        let at = pos2(badge_rect.right() - inset, badge_rect.bottom() - 10.0);
+                        crate::git_status::paint_badge(&p, at, git);
                     }
                     let badge_clicked = if let Some(badge) = &item.badge {
                         let label = badge.count.to_string();
