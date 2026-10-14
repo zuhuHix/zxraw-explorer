@@ -486,3 +486,31 @@ fn rename_with_the_selection_filtered_out_renames_nothing() {
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked() {
+    let (temp, work, profile) =
+        list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd TogglePreview\ncmd ViewGrid\nwait-frames 5\n\
+         click-entry a.txt\nui browser assert-cursor a.txt\n\
+         # Clicking the toggle leaves egui focus on it; the arrows must still move the cursor.\n\
+         ui browser click-control group-similar\nui browser assert-grouping on\n\
+         key ArrowRight\nui browser assert-cursor b.txt\n\
+         # Down from the only row stops on the last tile instead of leaving the grid.\n\
+         key ArrowDown\nui browser assert-cursor f.txt\n\
+         key ArrowRight\nui browser assert-cursor f.txt\n\
+         key Home\nkey ArrowLeft\nui browser assert-cursor a.txt\n\
+         ui browser assert-grouping on\n\
+         # Details view: Up on the first row must not send focus to the toolbar.\n\
+         cmd ViewDetails\nwait-frames 3\nclick-entry a.txt\n\
+         key ArrowUp\nui browser assert-cursor a.txt\n\
+         key ArrowDown\nui browser assert-cursor b.txt\n\
+         key ArrowDown\nui browser assert-cursor c.txt\n\
+         key End\nkey ArrowDown\nui browser assert-cursor f.txt\n\
+         key ArrowUp\nui browser assert-cursor e.txt\nexit\n",
+        work = shown(&work),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
