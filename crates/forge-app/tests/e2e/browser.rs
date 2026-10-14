@@ -433,3 +433,29 @@ fn folders_open_in_place_with_arrows_and_clicks() {
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn delete_with_the_selection_filtered_out_touches_no_file() {
+    let (temp, work, profile) = list_fixture(&["apple.txt", "berry.txt", "cherry.txt"]);
+    write_file(
+        &profile.join("config").join("settings.json"),
+        br#"{ "list_typing": "Filter" }"#,
+    );
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         # Select cherry, then type a filter that hides it (the cursor lands on berry).\n\
+         click-entry cherry.txt\ntext berr\nui browser assert-visible berry.txt\n\
+         key Delete\nwait-frames 10\nwait-jobs 10\n\
+         assert-exists {apple}\nassert-exists {berry}\nassert-exists {cherry}\n\
+         # With the filter cleared, the selection is the target again.\n\
+         key Escape\nui browser assert-visible apple.txt, berry.txt, cherry.txt\n\
+         assert-selection cherry.txt\nkey Delete\nwait-jobs 20\nwait-no-entry cherry.txt\n\
+         assert-missing {cherry}\nassert-exists {berry}\nexit\n",
+        work = shown(&work),
+        apple = shown(&work.join("apple.txt")),
+        berry = shown(&work.join("berry.txt")),
+        cherry = shown(&work.join("cherry.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
