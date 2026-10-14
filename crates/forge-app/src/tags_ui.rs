@@ -211,12 +211,14 @@ fn apply_tag_change(files: &mut [(PathBuf, Annotation)], add: &[String], remove:
     }
 }
 
-/// The paths tag edits apply to: the explicit selection, or the cursor file if nothing is selected.
+/// The paths tag edits apply to: the selected items the list shows, or the file the panel
+/// shows (the cursor) when none is. Hidden or filtered-out picks are never edited unseen.
 fn selection_paths(pane: &Pane, cursor: &Path) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = if pane.selected.is_empty() {
+    let shown: Vec<PathBuf> = pane.selected_entries().iter().map(|e| e.path.clone()).collect();
+    let mut paths: Vec<PathBuf> = if shown.is_empty() {
         vec![cursor.to_path_buf()]
     } else {
-        pane.selected.iter().cloned().collect()
+        shown
     };
     paths.sort();
     paths

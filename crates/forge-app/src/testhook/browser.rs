@@ -18,6 +18,8 @@
 //! - `assert-sticky on|off`: assert whether sticky selection is on in the focused pane.
 //! - `click-arrow <name>`: real pointer click on a folder's disclosure arrow (details view).
 //!   Waits until the arrow is on screen.
+//! - `assert-no-dialog`: no dialog (prompt, confirmation, report) is open.
+//! - `assert-cursor <name>`: the focused pane's cursor is on this entry.
 //! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
 //! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
 //!   folder is open in place.
@@ -199,6 +201,26 @@ pub(super) fn step(
                 .downcast_ref::<egui::Pos2>()
                 .unwrap();
             super::pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
+        }
+        "assert-cursor" => {
+            let name = args.trim();
+            match app.pane().cursor_entry() {
+                Some(e) if e.name.eq_ignore_ascii_case(name) => Ok(Flow::Done),
+                Some(e) => Err(format!("the cursor is on `{}`, expected `{name}`", e.name)),
+                None => Err(format!("there is no cursor, expected `{name}`")),
+            }
+        }
+        "assert-no-dialog" => {
+            no_args(args, "assert-no-dialog")?;
+            if app.ops.modal.is_none() {
+                Ok(Flow::Done)
+            } else {
+                let what = match &app.ops.modal {
+                    Some(crate::modal::Modal::Prompt(p)) => format!("a prompt with `{}`", p.text),
+                    _ => "a dialog".to_string(),
+                };
+                Err(format!("{what} is open"))
+            }
         }
         "assert-depths" => {
             let pane = app.pane();

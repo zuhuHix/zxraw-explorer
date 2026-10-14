@@ -491,8 +491,10 @@ impl Pane {
     }
 
     /// Change the filter. The cursor and the range anchor stay on their items (row indices
-    /// change when the list narrows or widens); a cursor whose item is filtered out moves to
-    /// the first listed item. The selection is a set of paths, so it never goes stale.
+    /// change when the list narrows or widens); when their item is filtered out they are
+    /// cleared, never moved to another file (an action would then hit a file the user did not
+    /// choose). The next arrow key starts from the first row. The selection is a set of paths,
+    /// so it never goes stale.
     pub fn set_filter(&mut self, text: String) {
         let path_at = |pane: &Self, vis: Option<usize>| {
             vis.and_then(|v| pane.entry_at(v)).map(|e| e.path.clone())
@@ -513,7 +515,7 @@ impl Pane {
         let row_of = |pane: &Self, path: Option<PathBuf>| {
             path.and_then(|p| pane.visible.iter().position(|&i| pane.entries[i].path == p))
         };
-        self.cursor = row_of(self, cursor).or(if self.visible.is_empty() { None } else { Some(0) });
+        self.cursor = row_of(self, cursor);
         self.anchor = row_of(self, anchor);
     }
 
@@ -606,6 +608,19 @@ impl Pane {
         } else {
             sel
         }
+    }
+
+    /// What F2 renames: one of the guarded [`Pane::action_targets`], the cursor item when it
+    /// is one of them, else the first. A selection that is entirely hidden renames nothing,
+    /// even when the cursor sits on another, visible file.
+    pub fn rename_target(&self) -> Option<&FileEntry> {
+        let targets = self.action_targets();
+        self.cursor_entry()
+            .filter(|e| targets.contains(&e.path))
+            .or_else(|| {
+                let first = targets.first()?;
+                self.entries.iter().find(|e| &e.path == first)
+            })
     }
 
     pub fn select_name(&mut self, name: &str) {
@@ -740,7 +755,7 @@ impl Pane {
     }
 
     /// Type-to-filter: typed characters extend the filter, so only matching names stay
-    /// listed. The cursor lands on the first match when it was not on a listed item.
+    /// listed. A cursor whose item is filtered out is cleared (see [`Pane::set_filter`]).
     pub fn type_filter(&mut self, text: &str) {
         // A leading space would only make the filter look empty; spaces inside names count.
         let text = if self.filter_text.is_empty() { text.trim_start() } else { text };
@@ -749,7 +764,7 @@ impl Pane {
         }
         let mut filter = self.filter_text.clone();
         filter.push_str(text);
-        // `set_filter` keeps the cursor on its item, or moves it to the first match.
+        // `set_filter` keeps the cursor on its item, or clears it.
         self.set_filter(filter);
         self.scroll_to_cursor = true;
     }
@@ -1365,7 +1380,7 @@ mod tests {
         pane.type_filter("ch 0");
         assert_eq!(pane.filter_text, "beach 0");
         assert_eq!(visible_names(&pane), ["beach 01.jpg", "beach 02.jpg"]);
-        assert_eq!(pane.cursor, Some(0), "the cursor lands on the first match");
+        assert_eq!(pane.cursor, None, "filtering never places the cursor");
         assert!(pane.selected.is_empty(), "filtering never selects");
 
         pane.cursor = Some(1);
@@ -1376,7 +1391,9 @@ mod tests {
         pane.filter_backspace();
         pane.cursor = Some(1);
         pane.type_filter("1");
-        assert_eq!(pane.cursor, Some(0), "a filtered-out cursor moves to the first match");
+        assert_eq!(pane.cursor, None, "a filtered-out cursor is cleared, not moved");
+        pane.move_cursor(1, false, false);
+        assert_eq!(pane.cursor, Some(0), "the next arrow starts from the first row");
         pane.filter_backspace();
         pane.type_filter("2");
         assert!(pane.filter_backspace());
@@ -1416,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_a_filter_with_no_matches_puts_the_cursor_on_the_first_item() {
+    fn a_cursor_filtered_away_stays_cleared_when_the_filter_is_cleared() {
         let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg"]);
         pane.cursor = Some(1);
         pane.type_filter("qqqq");
@@ -1424,7 +1441,8 @@ mod tests {
         assert_eq!(pane.cursor, None);
         pane.escape();
         assert_eq!(visible_names(&pane).len(), 2);
-        assert_eq!(pane.cursor, Some(0), "the cursor is set again, on the first item");
+        assert_eq!(pane.cursor, None, "no file becomes the cursor by itself");
+        assert!(pane.action_targets().is_empty());
     }
 
     #[test]
@@ -1485,6 +1503,24 @@ mod tests {
         assert!(pane.action_targets().is_empty(), "the selection is filtered out");
         pane.escape();
         assert_eq!(pane.action_targets(), vec![pane.entries[2].path.clone()]);
+    }
+
+    #[test]
+    fn rename_never_targets_a_file_the_user_did_not_pick() {
+        let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg", "cherry.jpg"]);
+        pane.click(2, false, false);
+        pane.type_filter("berr");
+        assert_eq!(pane.rename_target(), None, "the cursor was cleared with its item");
+        pane.cursor = Some(0); // berry, as Ctrl+arrow would leave it, unselected
+        assert_eq!(pane.rename_target(), None, "cherry is selected but hidden: rename nothing");
+
+        pane.escape();
+        assert_eq!(pane.rename_target().map(|e| e.name.as_str()), Some("cherry.jpg"));
+        pane.click(0, true, false); // apple joins; the cursor is on apple
+        assert_eq!(pane.rename_target().map(|e| e.name.as_str()), Some("apple.jpg"));
+        pane.clear_selection();
+        pane.cursor = Some(1);
+        assert_eq!(pane.rename_target().map(|e| e.name.as_str()), Some("berry.jpg"));
     }
 
     #[test]
