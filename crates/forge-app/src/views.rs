@@ -50,6 +50,8 @@ pub struct Annotation {
     pub label: Option<u8>,
     /// 1 = pick, -1 = reject, 0 = none
     pub pick: i8,
+    /// The file has a non-empty note (shown as a small note badge).
+    pub has_note: bool,
 }
 
 /// What a plain (non-media) file is, for its list/grid icon. Media kinds come from
@@ -747,6 +749,9 @@ fn entry_accessibility_description(entry: &FileEntry, annotation: Option<Annotat
             -1 => parts.push("Rejected".into()),
             _ => {}
         }
+        if annotation.has_note {
+            parts.push("Has a note".into());
+        }
     }
     parts.join(". ")
 }
@@ -1350,6 +1355,16 @@ pub fn details(
                 ui.interact(hit, ui.id().with(("cloud", &entry.path)), Sense::hover())
                     .on_hover_text(ONLINE_ONLY_HINT);
                 name_left += 16.0;
+            }
+            if annotation.is_some_and(|value| value.has_note) {
+                painter.text(
+                    pos2(name_left + 5.0, cy),
+                    Align2::CENTER_CENTER,
+                    NOTE_GLYPH,
+                    FontId::proportional(11.0),
+                    text_color,
+                );
+                name_left += 14.0;
             }
             let name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
             let name_rect =
@@ -2254,6 +2269,10 @@ pub fn draw_cloud_badge(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32
     );
 }
 
+/// Marks a file that has a note. U+270E is in Segoe UI Symbol, which `fonts::install` loads as a
+/// fallback (the same font as the pick and reject marks).
+const NOTE_GLYPH: &str = "✎";
+
 pub fn draw_annotation(p: &egui::Painter, img_rect: Rect, a: Annotation) {
     if a.rating > 0 {
         let stars: String = "★".repeat(a.rating as usize);
@@ -2269,6 +2288,17 @@ pub fn draw_annotation(p: &egui::Painter, img_rect: Rect, a: Annotation) {
         && let Some(c) = theme::LABEL_COLORS.get(l as usize)
     {
         p.circle_filled(img_rect.right_top() + vec2(-8.0, 8.0), 5.0, *c);
+    }
+    if a.has_note {
+        let center = img_rect.right_bottom() + vec2(-9.0, -9.0);
+        p.circle_filled(center, 9.0, Color32::from_black_alpha(160));
+        p.text(
+            center,
+            Align2::CENTER_CENTER,
+            NOTE_GLYPH,
+            FontId::proportional(12.0),
+            Color32::WHITE,
+        );
     }
     match a.pick {
         1 => {
@@ -2302,8 +2332,40 @@ mod accessibility_tests {
     use forge_core::listing::SortSpec;
     use forge_core::{FileEntry, model::EntryKind};
 
-    use super::{DetailsColumn, LoadState, ThumbProvider, details, grid, splitter_width_range};
+    use super::{
+        Annotation, DetailsColumn, LoadState, ThumbProvider, details,
+        entry_accessibility_description, grid, splitter_width_range,
+    };
     use crate::{pane::Pane, settings::ViewMode};
+
+    #[test]
+    fn note_badge_is_announced_in_the_accessible_description() {
+        let entry = FileEntry {
+            path: std::path::PathBuf::from("shot.jpg"),
+            name: "shot.jpg".into(),
+            kind: EntryKind::File,
+            size: 1,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            ext: "jpg".into(),
+        };
+        let with_note = Annotation {
+            has_note: true,
+            ..Default::default()
+        };
+        assert!(
+            entry_accessibility_description(&entry, Some(with_note)).ends_with("Has a note"),
+            "a file with a note is announced"
+        );
+        assert!(
+            !entry_accessibility_description(&entry, Some(Annotation::default())).contains("note"),
+            "a file without a note is not"
+        );
+        assert!(!entry_accessibility_description(&entry, None).contains("note"));
+    }
 
     struct NoThumbs;
 

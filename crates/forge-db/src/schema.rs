@@ -15,11 +15,18 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "initial schema",
-    sql: V1,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "initial schema",
+        sql: V1,
+    },
+    Migration {
+        version: 2,
+        description: "notes: clear blank notes, index files with notes",
+        sql: V2,
+    },
+];
 
 /// Highest schema version this build understands.
 pub fn latest_version() -> i64 {
@@ -209,6 +216,12 @@ CREATE TABLE settings (
 );
 "#;
 
+const V2: &str = r#"
+-- Blank notes were once stored as text; treat them as no note.
+UPDATE annotations SET notes = NULL WHERE notes IS NOT NULL AND trim(notes) = '';
+CREATE INDEX IF NOT EXISTS idx_annotations_notes ON annotations(file_id) WHERE notes IS NOT NULL;
+"#;
+
 /// Apply all pending migrations. Returns the versions applied by this call.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<Vec<i64>> {
     migrate_with(conn, MIGRATIONS)
@@ -257,4 +270,55 @@ pub(crate) fn current_version(conn: &Connection) -> Result<i64> {
         .optional()?
         .flatten()
         .unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_clears_blank_notes_and_indexes_notes_on_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forge.db");
+        {
+            let mut conn = Connection::open(&path).unwrap();
+            migrate_with(&mut conn, &MIGRATIONS[..1]).unwrap();
+            conn.execute_batch(
+                r"INSERT INTO volumes(id, root, last_seen) VALUES (1, 'D:\', 0);
+                 INSERT INTO files(id, volume_id, path, path_lc, parent_path, name, name_lc,
+                                   kind, media_kind, indexed_at)
+                 VALUES (1, 1, 'D:\a.jpg', 'd:\a.jpg', 'D:\', 'a.jpg', 'a.jpg', 'file', 'image', 0),
+                        (2, 1, 'D:\b.jpg', 'd:\b.jpg', 'D:\', 'b.jpg', 'b.jpg', 'file', 'image', 0);
+                 INSERT INTO annotations(file_id, notes, updated_at)
+                 VALUES (1, 'keep me', 0), (2, '   ', 0);",
+            )
+            .unwrap();
+            assert_eq!(current_version(&conn).unwrap(), 1);
+        }
+
+        let db = crate::Db::open(&path).unwrap();
+        assert_eq!(latest_version(), 2);
+        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.annotation(1).unwrap().notes.as_deref(), Some("keep me"));
+        assert_eq!(db.annotation(2).unwrap().notes, None);
+        let has_index: i64 = db
+            .with_conn(|c| {
+                Ok(c.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_annotations_notes'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(has_index, 1);
+        drop(db);
+
+        // Reopening applies nothing new.
+        let db = crate::Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        let mut conn = Connection::open(&path).unwrap();
+        assert!(migrate_with(&mut conn, MIGRATIONS).unwrap().is_empty());
+        assert_eq!(db.annotation(1).unwrap().notes.as_deref(), Some("keep me"));
+    }
 }

@@ -80,7 +80,7 @@ Explorer is a file manager designed around that workflow:
       <img src="docs/images/pillar-organize.jpg" width="120" alt=""><br>
       <b>Find anything</b><br>
       Tags, collections and smart collections, plus search across camera, lens, ISO, rating,
-      date and more. Ratings can also be written to XMP sidecars.
+      date and more. Ratings and notes can also be written to XMP sidecars.
     </td>
     <td align="center">
       <img src="docs/images/pillar-video.jpg" width="120" alt=""><br>
@@ -171,6 +171,11 @@ Explorer is a file manager designed around that workflow:
 - **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
   files each get their own icon, alongside the photo, video and audio ones.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
+- **Notes on any file.** Type a note in the preview panel's *Note* box. It saves on its own a
+  moment after you stop typing, and shows whether it is saved. Files with a note get a small ✎
+  badge, notes follow files that ZXraw renames or moves, and search finds them (plain text,
+  `note:proof`, `has:notes`). With XMP sync on, photo notes are also written to the sidecar as
+  `xmpDM:logComment`, so your caption is never touched.
 
 <p align="center">
   <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/collections.jpg"><img src="docs/images/screens/collections.jpg" width="80%" alt="Collections window with a Lisbon portfolio collection and the New collection dialog open"></a>

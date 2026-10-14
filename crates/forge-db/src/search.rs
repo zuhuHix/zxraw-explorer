@@ -180,7 +180,16 @@ impl Compiler {
     fn filter(&mut self, f: &Filter) -> (String, bool) {
         const TAKEN: &str = "COALESCE(im.taken_at, vm.recorded_at)";
         match f {
-            Filter::Text(t) | Filter::Path(t) => (self.contains("f.path_lc", t), false),
+            Filter::Path(t) => (self.contains("f.path_lc", t), false),
+            Filter::Text(t) => {
+                let needle = self.bind_s(t);
+                (
+                    format!(
+                        "(instr(f.path_lc, {needle}) > 0 OR instr(ulower(COALESCE(a.notes, '')), {needle}) > 0)"
+                    ),
+                    false,
+                )
+            }
             Filter::Name(t) => (self.contains("f.name_lc", t), false),
             Filter::Glob(g) => {
                 // SQLite GLOB: '*' and '?' as typed; '[' must be escaped as a class.

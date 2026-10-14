@@ -29,6 +29,9 @@ pub enum Event {
     },
     Conflict(crate::ops_ui::ConflictQuestion),
     Undo(UndoEntry),
+    /// Files or folders were moved (`from` -> `to`) outside an undo record, or an undo moved
+    /// them back: their library rows and notes follow.
+    FilesMoved(Vec<(PathBuf, PathBuf)>),
     /// Our Copy/Cut reached the Windows clipboard (`Ok(sequence)`) or failed.
     ClipboardPublished {
         generation: u64,
@@ -500,6 +503,16 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
             Some(UndoEntry::Rename(pairs)) => {
                 let r = forge_core::rename::undo(&pairs);
+                // Only the pairs that really moved back: a partial undo follows just those.
+                let undone: Vec<(PathBuf, PathBuf)> = match r.status {
+                    forge_core::rename::RenameStatus::Completed => pairs.clone(),
+                    _ => pairs
+                        .iter()
+                        .filter(|(current, original)| original.exists() && !current.exists())
+                        .cloned()
+                        .collect(),
+                };
+                app.ops.library.follow_moves(undone);
                 let dirs: std::collections::BTreeSet<PathBuf> = pairs
                     .iter()
                     .filter_map(|(_, o)| o.parent().map(Path::to_path_buf))
@@ -731,14 +744,30 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             Event::UpdateChecked(checked) => crate::updater::checked(app, checked),
             Event::UpdateDownloaded(result) => crate::updater::downloaded(app, result),
             Event::Undo(u) => {
+                if let UndoEntry::Ops(records) = &u {
+                    app.ops.library.follow_moves(undo_record_moves(records));
+                }
                 app.ops.undo.push(u);
                 if app.ops.undo.len() > 50 {
                     app.ops.undo.remove(0);
                 }
             }
+            Event::FilesMoved(pairs) => app.ops.library.follow_moves(pairs),
         }
     }
     changed
+}
+
+/// The `(from, to)` moves recorded by an operation's undo records (renames and moves).
+pub fn undo_record_moves(records: &[forge_core::ops::UndoRecord]) -> Vec<(PathBuf, PathBuf)> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            forge_core::ops::UndoRecord::Renamed { from, to }
+            | forge_core::ops::UndoRecord::Moved { from, to } => Some((from.clone(), to.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
@@ -812,6 +841,12 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
             crate::batch_rename::BrOutcome::Open => app.ops.batch_rename = Some(br),
             crate::batch_rename::BrOutcome::Closed => {}
             crate::batch_rename::BrOutcome::Applied { dirs, report, undo } => {
+                // Undo pairs are (current, original): the files now sit at `current`.
+                app.ops.library.follow_moves(
+                    undo.iter()
+                        .map(|(current, original)| (original.clone(), current.clone()))
+                        .collect(),
+                );
                 if !undo.is_empty() {
                     app.ops.undo.push(UndoEntry::Rename(undo));
                 }
@@ -874,6 +909,7 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                         std::fs::rename(path, &target)
                     };
                     if res.is_ok() {
+                        app.ops.library.follow_moves(vec![(path.clone(), target.clone())]);
                         app.ops
                             .undo
                             .push(UndoEntry::Rename(vec![(target.clone(), path.clone())]));

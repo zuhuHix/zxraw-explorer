@@ -640,6 +640,12 @@ fn start_transfer_with(
                 "could not verify it's the same item, not moved",
             ));
         }
+        if kind == OpKind::Move {
+            let moved = uncovered_moves(&sources, &dest, &report);
+            if !moved.is_empty() {
+                let _ = tx.send(Event::FilesMoved(moved));
+            }
+        }
         let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
         finish_report(
             job,
@@ -753,6 +759,30 @@ fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
     Some(disks)
 }
 
+/// The `(source, destination)` pairs of moved top-level items that have no undo record. A
+/// cross-volume move is a copy plus a delete and records no undo entry, so its pair is read
+/// from the report: the destination must be in `report.done` under the source's own name and
+/// the source must be gone. A keep-both copy (renamed on arrival) is not matched, so its
+/// library row stays at the old path.
+fn uncovered_moves(
+    sources: &[PathBuf],
+    dest: &Path,
+    report: &OpReport,
+) -> Vec<(PathBuf, PathBuf)> {
+    sources
+        .iter()
+        .filter_map(|src| {
+            let target = dest.join(src.file_name()?);
+            let covered = report
+                .undo
+                .iter()
+                .any(|u| matches!(u, ops::UndoRecord::Moved { from, .. } if from == src));
+            let moved = report.done.contains(&target) && !src.exists();
+            (moved && !covered).then(|| (src.clone(), target))
+        })
+        .collect()
+}
+
 fn finish_report(
     job: &JobHandle,
     report: &OpReport,
@@ -830,9 +860,19 @@ pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
         move |job| {
             let mut errors = Vec::new();
             for r in records.iter().rev() {
-                if let Err(e) = ops::undo(r) {
-                    errors.push(format!("{}: {e}", r.describe()));
-                    job.progress.add_error();
+                match ops::undo(r) {
+                    Ok(()) => {
+                        // The undo moved the item back: its library rows follow it.
+                        if let ops::UndoRecord::Renamed { from, to }
+                        | ops::UndoRecord::Moved { from, to } = r
+                        {
+                            let _ = tx.send(Event::FilesMoved(vec![(to.clone(), from.clone())]));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", r.describe()));
+                        job.progress.add_error();
+                    }
                 }
                 let touched: Vec<PathBuf> = match r {
                     ops::UndoRecord::Renamed { from, to } | ops::UndoRecord::Moved { from, to } => {
