@@ -322,7 +322,15 @@ impl Pane {
         self.resort();
     }
 
+    /// Change the filter. The cursor and the range anchor stay on their items (row indices
+    /// change when the list narrows or widens); a cursor whose item is filtered out moves to
+    /// the first listed item. The selection is a set of paths, so it never goes stale.
     pub fn set_filter(&mut self, text: String) {
+        let path_at = |pane: &Self, vis: Option<usize>| {
+            vis.and_then(|v| pane.entry_at(v)).map(|e| e.path.clone())
+        };
+        let cursor = path_at(self, self.cursor);
+        let anchor = path_at(self, self.anchor);
         self.filter_text = text;
         self.filter_error = None;
         self.filter_query = None;
@@ -334,6 +342,11 @@ impl Pane {
             }
         }
         self.rebuild_visible();
+        let row_of = |pane: &Self, path: Option<PathBuf>| {
+            path.and_then(|p| pane.visible.iter().position(|&i| pane.entries[i].path == p))
+        };
+        self.cursor = row_of(self, cursor).or(if self.visible.is_empty() { None } else { Some(0) });
+        self.anchor = row_of(self, anchor);
     }
 
     pub fn rebuild_visible(&mut self) {
@@ -530,14 +543,10 @@ impl Pane {
         if text.is_empty() {
             return;
         }
-        let cursor_path = self.cursor_entry().map(|e| e.path.clone());
         let mut filter = self.filter_text.clone();
         filter.push_str(text);
+        // `set_filter` keeps the cursor on its item, or moves it to the first match.
         self.set_filter(filter);
-        // Keep the cursor on its item while it still matches, otherwise go to the first match.
-        self.cursor = cursor_path
-            .and_then(|p| self.visible.iter().position(|&i| self.entries[i].path == p))
-            .or(if self.visible.is_empty() { None } else { Some(0) });
         self.scroll_to_cursor = true;
     }
 
@@ -769,6 +778,44 @@ mod tests {
         assert!(pane.filter_text.is_empty());
         assert_eq!(visible_names(&pane).len(), 3);
         assert!(!pane.filter_backspace(), "no filter: Backspace goes up a folder instead");
+    }
+
+    #[test]
+    fn widening_the_filter_keeps_the_cursor_and_anchor_on_their_items() {
+        let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg", "cherry.jpg"]);
+        pane.click(0, false, false); // anchor on apple.jpg
+        pane.cursor = Some(2); // cursor on cherry.jpg
+        pane.type_filter("cherr");
+        assert_eq!(visible_names(&pane), ["cherry.jpg"]);
+        assert_eq!(pane.cursor, Some(0));
+        assert_eq!(pane.anchor, None, "the anchor's item is filtered out");
+
+        assert!(pane.filter_backspace());
+        assert_eq!(
+            pane.cursor_entry().map(|e| e.name.as_str()),
+            Some("cherry.jpg"),
+            "Backspace keeps the cursor on cherry.jpg, not on whatever is now at its row"
+        );
+
+        pane.escape();
+        pane.click(2, false, false); // anchor and cursor on cherry.jpg
+        pane.type_filter("cherr");
+        pane.escape();
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("cherry.jpg"));
+        assert_eq!(pane.entry_at(pane.anchor.unwrap()).map(|e| e.name.as_str()), Some("cherry.jpg"));
+        assert!(pane.selected.contains(&pane.entries[2].path), "the selection is by path");
+    }
+
+    #[test]
+    fn clearing_a_filter_with_no_matches_puts_the_cursor_on_the_first_item() {
+        let (_folder, mut pane) = listed(&["apple.jpg", "berry.jpg"]);
+        pane.cursor = Some(1);
+        pane.type_filter("qqqq");
+        assert!(pane.visible.is_empty());
+        assert_eq!(pane.cursor, None);
+        pane.escape();
+        assert_eq!(visible_names(&pane).len(), 2);
+        assert_eq!(pane.cursor, Some(0), "the cursor is set again, on the first item");
     }
 
     #[test]
