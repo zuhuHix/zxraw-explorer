@@ -46,7 +46,7 @@ pub use file_types::{
     refresh_file_types_if_registered, register_file_types, unregister_file_types,
 };
 pub use files::{
-    hard_link_count, is_removable, physical_disks, set_attributes, volume_serial,
+    file_id, hard_link_count, is_removable, physical_disks, set_attributes, volume_serial,
 };
 pub use integration::{
     default_folder_handler_enabled, is_registered, refresh_default_folder_handler,

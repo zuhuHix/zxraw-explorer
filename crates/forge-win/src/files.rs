@@ -72,6 +72,21 @@ pub fn volume_serial(_path: &Path) -> Result<u32> {
     Err(WinError::Unsupported)
 }
 
+/// Identity of the file or folder at `path` (not following a link at the end): the
+/// volume serial and the file index. A file replaced by another of the same name gets a
+/// different identity; renaming within the volume keeps it.
+#[cfg(windows)]
+pub fn file_id(path: &Path) -> Result<(u32, u64)> {
+    let info = handle_info(path)?;
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((info.dwVolumeSerialNumber, index))
+}
+
+#[cfg(not(windows))]
+pub fn file_id(_path: &Path) -> Result<(u32, u64)> {
+    Err(WinError::Unsupported)
+}
+
 /// True if the volume holding `path` is removable (USB stick, SD card). UNC paths and
 /// anything without a drive letter return `false`.
 #[cfg(windows)]
@@ -294,5 +309,21 @@ mod tests {
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&b, b"x").unwrap();
         assert_eq!(volume_serial(&a).unwrap(), volume_serial(&b).unwrap());
+    }
+
+    #[test]
+    fn file_id_survives_a_rename_but_not_a_replacement() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        let first = file_id(&a).unwrap();
+        assert_eq!(file_id(&a).unwrap(), first);
+        std::fs::rename(&a, &b).unwrap();
+        assert_eq!(file_id(&b).unwrap(), first, "a rename keeps the identity");
+        // Keep `b` alive so the index cannot be reused by the new `a`.
+        std::fs::write(&a, b"x").unwrap();
+        assert_ne!(file_id(&a).unwrap(), first, "a new file has a new identity");
+        assert!(file_id(d.path()).is_ok(), "folders have an identity too");
     }
 }

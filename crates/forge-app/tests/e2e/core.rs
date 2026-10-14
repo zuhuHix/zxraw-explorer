@@ -233,6 +233,46 @@ fn queued_copy_skips_a_source_deleted_while_waiting() {
 }
 
 #[test]
+fn queued_move_leaves_a_source_replaced_while_waiting() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    write_file(&src.join("x.txt"), b"x is moved");
+    write_file(&src.join("y.txt"), b"the y the user picked");
+    fs::create_dir_all(&dst).unwrap();
+    let y = shown(&src.join("y.txt"));
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "ui system pause-queue",
+            "select x.txt, y.txt",
+            "cmd MoveToOtherPane",
+            // Another program replaces y.txt with a different file of the same name.
+            &format!("ui tools external delete {y}"),
+            &format!("ui tools external create {y}"),
+            "ui system resume-queue",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dst.join("x.txt")).unwrap(), b"x is moved");
+    assert!(!src.join("x.txt").exists());
+    assert!(
+        !dst.join("y.txt").exists(),
+        "a source replaced while queued must not be moved"
+    );
+    assert_eq!(
+        fs::metadata(src.join("y.txt")).unwrap().len(),
+        4096,
+        "the replacement stays where it is"
+    );
+}
+
+#[test]
 fn closing_with_queued_copies_warns() {
     let sandbox = tempfile::tempdir().unwrap();
     let src = sandbox.path().join("src");

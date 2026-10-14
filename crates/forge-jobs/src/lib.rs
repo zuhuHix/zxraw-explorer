@@ -29,6 +29,9 @@ pub struct CancelToken {
 struct CancelInner {
     cancelled: AtomicBool,
     paused: AtomicBool,
+    /// Set by [`TransferQueue::set_paused`]; kept apart from `paused` so resuming the
+    /// queue never resumes a job the user paused on its own.
+    queue_paused: AtomicBool,
     parent: Option<CancelToken>,
 }
 
@@ -71,9 +74,22 @@ impl CancelToken {
         self.inner.paused.store(paused, Ordering::Release);
     }
 
+    /// True if paused for any reason: by [`CancelToken::set_paused`], by the transfer
+    /// queue, or through the parent.
     pub fn is_paused(&self) -> bool {
         self.inner.paused.load(Ordering::Acquire)
+            || self.inner.queue_paused.load(Ordering::Acquire)
             || self.inner.parent.as_ref().is_some_and(|p| p.is_paused())
+    }
+
+    /// True only if this token itself was paused with [`CancelToken::set_paused`] (the
+    /// user's own pause), not by the queue or a parent.
+    pub fn is_paused_itself(&self) -> bool {
+        self.inner.paused.load(Ordering::Acquire)
+    }
+
+    fn set_queue_paused(&self, paused: bool) {
+        self.inner.queue_paused.store(paused, Ordering::Release);
     }
 
     /// Blocks while paused (polling), returns `Err(Cancelled)` if cancelled.
@@ -622,6 +638,8 @@ struct Running {
     id: JobId,
     disks: DiskSet,
     cancel: CancelToken,
+    /// Started with "start now": the queue's pause does not apply to it.
+    forced: bool,
 }
 
 struct Waiting {
@@ -718,6 +736,7 @@ impl TransferQueue {
                     id,
                     disks: w.disks,
                     cancel: cancel.clone(),
+                    forced: w.forced,
                 });
                 drop(st);
                 // Jobs behind this one may have waited only for it to leave the queue.
@@ -805,13 +824,14 @@ impl TransferQueue {
     }
 
     /// Pauses or resumes the whole queue: waiting transfers stay queued and running ones
-    /// pause (or resume) at their next safe point. A transfer started with "start now"
-    /// while the queue is paused runs until paused itself.
+    /// pause (or resume) at their next safe point. A running transfer runs only when the
+    /// user has not paused it on its own and the queue is not paused, unless it was
+    /// started with "start now", which the queue's pause never touches.
     pub fn set_paused(&self, paused: bool) {
         let mut st = self.inner.state.lock();
         st.paused = paused;
-        for r in &st.running {
-            r.cancel.set_paused(paused);
+        for r in st.running.iter().filter(|r| !r.forced) {
+            r.cancel.set_queue_paused(paused);
         }
         drop(st);
         self.inner.cv.notify_all();
@@ -1056,6 +1076,64 @@ mod tests {
         drop(gb);
         quiet(&reg);
         assert_eq!(*order.lock(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn resuming_the_queue_keeps_a_job_the_user_paused() {
+        let reg = JobRegistry::new();
+        reg.transfers().set_serial(false);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        wait_until("both run", || {
+            a.state() == JobState::Running && b.state() == JobState::Running
+        });
+        a.cancel.set_paused(true);
+        let q = reg.transfers();
+        q.set_paused(true);
+        assert_eq!(b.state(), JobState::Paused);
+        q.set_paused(false);
+        assert_eq!(b.state(), JobState::Running, "the queue's pause is lifted");
+        assert_eq!(a.state(), JobState::Paused, "the user's own pause stays");
+        assert!(a.cancel.is_paused_itself());
+        // The other way round: lifting the user's pause while the queue is paused
+        // leaves the job paused until the queue resumes.
+        q.set_paused(true);
+        a.cancel.set_paused(false);
+        assert_eq!(a.state(), JobState::Paused);
+        q.set_paused(false);
+        assert_eq!(a.state(), JobState::Running);
+        drop((ga, gb));
+        quiet(&reg);
+    }
+
+    #[test]
+    fn a_started_now_job_ignores_the_queue_pause() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        assert!(reg.transfers().start_now(b.id));
+        wait_until("b runs", || b.state() == JobState::Running);
+        reg.transfers().set_paused(true);
+        assert_eq!(a.state(), JobState::Paused);
+        assert_eq!(
+            b.state(),
+            JobState::Running,
+            "forced jobs ignore the queue pause"
+        );
+        b.cancel.set_paused(true);
+        assert_eq!(
+            b.state(),
+            JobState::Paused,
+            "but the user can still pause it"
+        );
+        reg.transfers().set_paused(false);
+        assert_eq!(b.state(), JobState::Paused);
+        b.cancel.set_paused(false);
+        drop((ga, gb));
+        quiet(&reg);
     }
 
     #[test]
