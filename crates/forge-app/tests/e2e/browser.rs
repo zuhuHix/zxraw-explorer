@@ -514,3 +514,45 @@ fn arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked() {
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn after_switching_panes_the_arrows_move_the_active_panes_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    for name in ["l1.txt", "l2.txt", "l3.txt"] {
+        write_file(&left.join(name), b"x");
+    }
+    for name in ["r1.txt", "r2.txt", "r3.txt"] {
+        write_file(&right.join(name), b"x");
+    }
+    let script = dual_pane_script(
+        &left,
+        &right,
+        &[
+            "cmd ViewDetails",
+            "wait-frames 5",
+            // A left row gets focus, then the right pane becomes active without a click (as
+            // a command does); the left row keeps egui focus.
+            "click-entry l1.txt",
+            "key ArrowDown",
+            "ui browser assert-cursor l2.txt",
+            "focus right",
+            "wait-frames 2",
+            "assert-path RIGHT",
+            "key Home",
+            "key ArrowDown",
+            "ui browser assert-cursor r2.txt",
+            "key ArrowDown",
+            "ui browser assert-cursor r3.txt",
+            // And back with Tab: the left pane's cursor is where it was and moves again.
+            "key Tab",
+            "wait-frames 2",
+            "key ArrowUp",
+            "ui browser assert-cursor l1.txt",
+        ],
+    )
+    .replace("assert-path RIGHT", &format!("assert-path {}", shown(&right)));
+    let outcome = run_app(temp.path(), &temp.path().join("profile"), &script);
+    expect_ok(&outcome);
+}
