@@ -155,20 +155,11 @@ fn start_transfer_with(
     let job_body = move |job: &JobHandle| {
         let completion = completion.lock().take();
         // A queued job starts later: anything that vanished meanwhile is skipped, not
-        // failed, and a moved source replaced by another item is left alone. Conflicts
-        // are looked at only now, when the job runs.
-        let mut changed = Vec::new();
-        let sources: Vec<PathBuf> = sources
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, source)| match identities.get(i) {
-                Some(Some(then)) if source_identity(&source).is_some_and(|now| now != *then) => {
-                    changed.push(source);
-                    None
-                }
-                _ => Some(source),
-            })
-            .collect();
+        // failed, and a moved source replaced by another item is left alone. A move fails
+        // closed: a source whose identity was not captured when queued is not moved
+        // either. Conflicts are looked at only now, when the job runs.
+        let (sources, changed, unverified) =
+            screen_queued_sources(sources, &identities, source_identity);
         let (sources, mut vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
             .into_iter()
             .partition(|s| forge_core::paths::exists_no_follow(s));
@@ -242,6 +233,12 @@ fn start_transfer_with(
                 .skipped
                 .push(ops::OpIssue::new(path, "changed while queued, not moved"));
         }
+        for path in unverified {
+            report.skipped.push(ops::OpIssue::new(
+                path,
+                "could not verify it's the same item, not moved",
+            ));
+        }
         let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
         finish_report(
             job,
@@ -283,6 +280,27 @@ enum SourceIdentity {
         len: u64,
         modified: Option<std::time::SystemTime>,
     },
+}
+
+/// Splits a queued job's sources into those to act on, those replaced since they were
+/// queued, and those with no identity recorded at queue time that exist now (a move fails
+/// closed on them). `identities` is empty for copies, which keep every source. Sources
+/// that are gone are kept here; the caller reports them as no longer existing.
+fn screen_queued_sources(
+    sources: Vec<PathBuf>,
+    identities: &[Option<SourceIdentity>],
+    current: impl Fn(&Path) -> Option<SourceIdentity>,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut keep, mut changed, mut unverified) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, source) in sources.into_iter().enumerate() {
+        let now = current(&source);
+        match (identities.get(i), now) {
+            (Some(Some(then)), Some(now)) if now != *then => changed.push(source),
+            (Some(None), Some(_)) => unverified.push(source),
+            _ => keep.push(source),
+        }
+    }
+    (keep, changed, unverified)
 }
 
 /// `None` if nothing is at `path`. Does not follow a link at the end.
@@ -809,4 +827,53 @@ fn job_row(
         });
     }
     action
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(len: u64) -> SourceIdentity {
+        let dir = tempfile::tempdir().unwrap();
+        SourceIdentity::Meta {
+            kind: std::fs::symlink_metadata(dir.path()).unwrap().file_type(),
+            len,
+            modified: None,
+        }
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn queued_move_screening_fails_closed() {
+        let sources = paths(&[
+            "same",
+            "replaced",
+            "no-baseline",
+            "no-baseline-gone",
+            "gone",
+        ]);
+        let identities = vec![Some(meta(1)), Some(meta(2)), None, None, Some(meta(5))];
+        let now = |p: &Path| match p.to_str().unwrap() {
+            "same" => Some(meta(1)),
+            "replaced" => Some(meta(99)),
+            "no-baseline" => Some(meta(3)),
+            _ => None,
+        };
+        let (keep, changed, unverified) = screen_queued_sources(sources, &identities, now);
+        // Gone sources stay in `keep`; the job reports them as no longer existing.
+        assert_eq!(keep, paths(&["same", "no-baseline-gone", "gone"]));
+        assert_eq!(changed, paths(&["replaced"]));
+        assert_eq!(unverified, paths(&["no-baseline"]));
+    }
+
+    #[test]
+    fn queued_copy_screening_keeps_every_source() {
+        let sources = paths(&["a", "b"]);
+        let (keep, changed, unverified) = screen_queued_sources(sources, &[], |_| Some(meta(1)));
+        assert_eq!(keep, paths(&["a", "b"]));
+        assert!(changed.is_empty() && unverified.is_empty());
+    }
 }
