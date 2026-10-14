@@ -247,7 +247,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             )));
         }
         Cmd::Rename => {
-            if let Some(e) = app.pane().cursor_entry().cloned() {
+            if let Some(e) = app.pane().rename_target().cloned() {
                 app.ops.modal = Some(Modal::Prompt(Prompt::new(
                     PromptKind::Rename {
                         path: e.path.clone(),

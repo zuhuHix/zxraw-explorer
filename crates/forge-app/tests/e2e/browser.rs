@@ -460,3 +460,29 @@ fn delete_with_the_selection_filtered_out_touches_no_file() {
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn rename_with_the_selection_filtered_out_renames_nothing() {
+    let (temp, work, profile) = list_fixture(&["apple.txt", "berry.txt", "cherry.txt"]);
+    write_file(
+        &profile.join("config").join("settings.json"),
+        br#"{ "list_typing": "Filter" }"#,
+    );
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         # Select cherry, then type a filter that hides it: F2 must not offer to rename berry.\n\
+         click-entry cherry.txt\ntext berr\nui browser assert-visible berry.txt\n\
+         key F2\nwait-frames 5\nui browser assert-no-dialog\n\
+         assert-exists {berry}\nassert-exists {cherry}\n\
+         # With the filter cleared, F2 renames the selected file.\n\
+         key Escape\nassert-selection cherry.txt\n\
+         key F2\ntype renamed.txt\naccept\nwait-exists {renamed}\n\
+         assert-missing {cherry}\nassert-exists {berry}\nexit\n",
+        work = shown(&work),
+        berry = shown(&work.join("berry.txt")),
+        cherry = shown(&work.join("cherry.txt")),
+        renamed = shown(&work.join("renamed.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
