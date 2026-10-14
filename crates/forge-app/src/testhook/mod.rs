@@ -1089,6 +1089,15 @@ pub(crate) fn note_entry_rect(ui: &egui::Ui, path: &Path, rect: egui::Rect) {
     note_rect(ui, entry_rect_id(path), rect);
 }
 
+/// Records where a folder's disclosure arrow was drawn (details view).
+pub(crate) fn note_arrow_rect(ui: &egui::Ui, path: &Path, rect: egui::Rect) {
+    note_rect(ui, arrow_rect_id(path), rect);
+}
+
+fn arrow_rect_id(path: &Path) -> egui::Id {
+    egui::Id::new(("testhook-arrow-rect", path))
+}
+
 /// Records the file list's area (where a click on empty space lands).
 pub(crate) fn note_view_rect(ui: &egui::Ui, rect: egui::Rect) {
     note_rect(ui, view_rect_id(), rect);

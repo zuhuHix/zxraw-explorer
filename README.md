@@ -180,6 +180,9 @@ Explorer is a file manager designed around that workflow:
 - **Sticky selection.** <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> makes every click add or remove
   an item, so picking scattered files needs no <kbd>Ctrl</kbd>. The status bar shows 📌 while it is
   on; <kbd>Esc</kbd> turns it off.
+- **Folders that open in place.** In details view, click the arrow beside a folder, or press
+  <kbd>→</kbd> / <kbd>←</kbd>, to open it right where it sits. Its contents appear underneath,
+  indented, and you can work with them as usual.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
 
 <p align="center">

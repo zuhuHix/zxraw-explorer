@@ -16,6 +16,11 @@
 //!   this order (after the filter and hidden-file rules).
 //! - `assert-filter [text]`: assert the focused pane's filter text (empty when omitted).
 //! - `assert-sticky on|off`: assert whether sticky selection is on in the focused pane.
+//! - `click-arrow <name>`: real pointer click on a folder's disclosure arrow (details view).
+//!   Waits until the arrow is on screen.
+//! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
+//! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
+//!   folder is open in place.
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
@@ -176,8 +181,74 @@ pub(super) fn step(
                 Err(format!("sticky selection is {}", if sticky { "on" } else { "off" }))
             }
         }
+        "click-arrow" => {
+            if st.data.is_none() {
+                let name = args.trim();
+                let Some(path) = entry_path(app, name) else {
+                    return Err(format!("`{name}` is not listed"));
+                };
+                let Some(rect) = super::drawn_rect(ctx, super::arrow_rect_id(&path)) else {
+                    return Ok(Flow::Wait(format!("the arrow of `{name}` is not on screen")));
+                };
+                st.data = Some(Box::new(rect.center()));
+            }
+            let pos = *st
+                .data
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<egui::Pos2>()
+                .unwrap();
+            super::pointer_clicks(app, st, pos, 1, egui::PointerButton::Primary)
+        }
+        "assert-depths" => {
+            let pane = app.pane();
+            for pair in args.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let Some((name, depth)) = pair.split_once('=') else {
+                    return Err(format!("expected `<name>=<depth>`, got `{pair}`"));
+                };
+                let (name, depth) = (name.trim(), depth.trim());
+                let depth: usize = depth
+                    .parse()
+                    .map_err(|_| format!("`{depth}` is not a depth"))?;
+                let Some(vis) = pane
+                    .visible
+                    .iter()
+                    .position(|&i| pane.entries[i].name.eq_ignore_ascii_case(name))
+                else {
+                    return Err(format!("`{name}` is not shown"));
+                };
+                if pane.depth_at(vis) != depth {
+                    return Err(format!(
+                        "`{name}` is at depth {}, expected {depth}",
+                        pane.depth_at(vis)
+                    ));
+                }
+            }
+            Ok(Flow::Done)
+        }
+        "assert-expanded-folder" | "assert-collapsed-folder" => {
+            let name = args.trim();
+            let Some(path) = entry_path(app, name) else {
+                return Err(format!("`{name}` is not listed"));
+            };
+            let expected = verb == "assert-expanded-folder";
+            let open = app.pane().is_expanded(&path);
+            if open == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("folder `{name}` open in place is {open}, expected {expected}"))
+            }
+        }
         other => Err(format!("unknown `ui browser` verb `{other}`")),
     }
+}
+
+fn entry_path(app: &ZxrawApp, name: &str) -> Option<PathBuf> {
+    app.pane()
+        .entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))
+        .map(|e| e.path.clone())
 }
 
 fn no_args(args: &str, verb: &str) -> Result<(), String> {

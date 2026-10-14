@@ -66,6 +66,28 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   Esc, the indicator or the command turns it off, keeping the picks — `pane.rs`
   (`sticky_selection_makes_a_plain_click_toggle`, `escape_clears_filter_then_sticky_then_selection`),
   e2e `sticky_selection_toggles_items_with_plain_clicks`.
+* ✅ Folders that open in place (details view): a folder shows a disclosure arrow; click it, or
+  press Right or Left, to open or close it (Right again steps into an open folder, Left on a
+  nested item goes to its folder). Children are listed lazily on a background thread and
+  streamed in batches, like the folder itself; each level is sorted on its own, and the filter
+  applies to nested items while keeping the folders that lead to a match. Selection, drag-out,
+  open, rename, delete and copy work on nested items (they are ordinary paths). Open folders are
+  remembered per tab, including across navigation and in the saved session. Leaving details view
+  closes the tree, and returning reopens it. Folders opened in place are not watched on their own:
+  an operation inside one reloads it, and the current folder's watcher and Refresh reload every open
+  folder. A refresh keeps the rows, selection and cursor until the new listing is complete, so the
+  tree does not flicker. Open folders are not followed through links (no junction loops) —
+  `pane.rs` (`flatten_tree_lists_open_folders_depth_first`,
+  `flatten_tree_hides_the_children_of_a_hidden_folder`,
+  `flatten_tree_filter_keeps_folders_that_lead_to_a_match`,
+  `expanded_folders_list_their_children_in_place`, `arrow_keys_open_step_into_and_close_folders`,
+  `selection_reaches_nested_items_and_collapsing_drops_them`, `filter_applies_to_nested_items`,
+  `leaving_details_view_closes_the_tree_and_returning_reopens_it`,
+  `reloading_an_open_folder_keeps_its_rows_until_the_new_listing_is_in`,
+  `refresh_keeps_nested_rows_and_forgets_an_open_folder_that_is_gone`,
+  `refresh_keeps_the_open_folders`), e2e `folders_open_in_place_with_arrows_and_clicks` (arrow
+  click, Right/Left, select-all across levels, filter, Recycle a nested file, double-click a
+  nested folder, expanded state remembered after navigating back).
 * ✅ Folder auto-refresh on new files — `forge-app/src/watcher.rs::detects_new_file_after_debounce`
   (watcher wired in `main.rs` and `actions.rs`). The rendered list refresh is not driven by a test.
 
