@@ -457,6 +457,29 @@ impl TagsUi {
         });
     }
 
+    /// Files ZXraw moved or renamed: the note being edited, and the selection it belongs to,
+    /// follow their file, so an edit not saved yet is saved at the new path.
+    pub fn follow_moves(&mut self, pairs: &[(PathBuf, PathBuf)]) {
+        use crate::library::moved_by;
+        if let Some(draft) = self.notes.as_mut()
+            && let Some(to) = moved_by(&draft.path, pairs)
+        {
+            draft.path = to;
+        }
+        if let Some(cache) = self.cache.as_mut() {
+            for path in cache.paths.iter_mut() {
+                if let Some(to) = moved_by(path, pairs) {
+                    *path = to;
+                }
+            }
+            for (path, _) in cache.files.iter_mut().flatten() {
+                if let Some(to) = moved_by(path, pairs) {
+                    *path = to;
+                }
+            }
+        }
+    }
+
     /// Picks up the answer to a save in flight: `saved` moves only once the database
     /// confirms the write.
     fn poll_note_save(&mut self, ctx: &egui::Context) {
@@ -606,13 +629,44 @@ pub fn tick(app: &mut ZxrawApp) {
     }
 }
 
-/// At exit: saves an unsaved note and waits briefly for the library writer to apply it.
-pub fn flush_for_exit(app: &mut ZxrawApp) {
+/// How long exit waits for the library writer: longer than the database's 5 s busy timeout,
+/// so a write that is waiting on a lock still gets its answer.
+const EXIT_FLUSH_WAIT: Duration = Duration::from_secs(7);
+
+/// Sends the note being edited to the library now (used before ZXraw moves files in a job, so
+/// the write is queued while the file is still at the path being edited).
+pub fn save_note_now(app: &mut ZxrawApp) {
     let ctx = app.ops.ctx.clone();
     app.ops.tags_ui.save_notes(&mut app.ops.library, &ctx);
-    if !app.ops.library.flush(Duration::from_secs(3)) {
+}
+
+/// At exit: saves an unsaved note and waits for the library writer to confirm it. A note the
+/// database has not confirmed by then is written to the recovery file and saved at the next
+/// start.
+pub fn flush_for_exit(app: &mut ZxrawApp) {
+    let ctx = app.ops.ctx.clone();
+    let st = &mut app.ops.tags_ui;
+    st.save_notes(&mut app.ops.library, &ctx);
+    if !app.ops.library.flush(EXIT_FLUSH_WAIT) {
         tracing::warn!("the library writer did not finish before exit");
     }
+    st.poll_note_save(&ctx);
+    let Some(pending) = st.notes.as_ref().and_then(unconfirmed_note) else {
+        return;
+    };
+    let file = app.ops.library.notes_recovery_path().to_path_buf();
+    match crate::library::write_note_recovery(&file, &[pending]) {
+        Ok(()) => tracing::warn!("an unsaved note was kept in {}", file.display()),
+        Err(e) => tracing::error!("could not keep an unsaved note in {}: {e}", file.display()),
+    }
+}
+
+/// The note to keep for the next start when the database has not confirmed the draft.
+fn unconfirmed_note(draft: &NotesDraft) -> Option<crate::library::PendingNote> {
+    (draft.text != draft.saved).then(|| crate::library::PendingNote {
+        path: draft.path.clone(),
+        note: Some(draft.text.trim().to_string()).filter(|n| !n.is_empty()),
+    })
 }
 
 pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
@@ -1160,6 +1214,74 @@ mod tests {
             },
             tx,
         )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("zxraw-tags-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_note_typed_then_renamed_at_once_lands_on_the_new_path() {
+        let db = std::sync::Arc::new(forge_db::Db::open_in_memory().unwrap());
+        let dir = temp_dir("rename-draft");
+        let (old, new) = (dir.join("a.jpg"), dir.join("final.jpg"));
+        std::fs::write(&old, b"photo").unwrap();
+        let mut library = crate::library::test_library(db.clone());
+        let ctx = egui::Context::default();
+        let mut st = TagsUi::default();
+        st.cache = Some(Selected {
+            paths: vec![old.clone()],
+            files: Some(vec![(old.clone(), Annotation::default())]),
+        });
+        // Typed, but the autosave pause has not passed yet.
+        st.notes = Some(NotesDraft {
+            path: old.clone(),
+            ..draft("Café proof 🎉", "", Some(Instant::now()))
+        });
+
+        // Renamed in the app right away: the rename and the follow happen in the same frame.
+        std::fs::rename(&old, &new).unwrap();
+        let pairs = vec![(old.clone(), new.clone())];
+        st.follow_moves(&pairs);
+        library.follow_moves(pairs);
+        assert_eq!(st.notes.as_ref().unwrap().path, new);
+
+        // The selection now shows the renamed file: the draft is kept, then saved.
+        st.sync_selection(std::slice::from_ref(&new));
+        st.sync_notes(&mut library, &ctx);
+        assert_eq!(st.notes.as_ref().unwrap().text, "Café proof 🎉");
+        st.save_notes(&mut library, &ctx);
+        assert!(library.flush(Duration::from_secs(5)));
+        st.poll_note_save(&ctx);
+        assert_eq!(note_status(st.notes.as_ref().unwrap()), NoteStatus::Saved);
+
+        let id = db.file_id(&new).unwrap().expect("a row at the new path");
+        assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("Café proof 🎉"));
+        assert!(db.file_id(&old).unwrap().is_none());
+        drop(library);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unconfirmed_note_is_kept_for_the_next_start() {
+        let (save, _answer) = pending("late note");
+        let d = NotesDraft {
+            saving: Some(save),
+            ..draft("late note", "", None)
+        };
+        assert_eq!(
+            unconfirmed_note(&d),
+            Some(crate::library::PendingNote {
+                path: PathBuf::from("a.jpg"),
+                note: Some("late note".into()),
+            })
+        );
+        assert_eq!(unconfirmed_note(&draft("same", "same", None)), None);
+        // A cleared note is kept as a clear.
+        assert_eq!(unconfirmed_note(&draft("  ", "old", None)).unwrap().note, None);
     }
 
     #[test]

@@ -680,7 +680,21 @@ impl Db {
                 if !root.ends_with(SEP) {
                     root.push(SEP);
                 }
-                let temp = PathBuf::from(format!("{root}.zxraw-relink-{nonce}-{i}"));
+                // `<` and `>` cannot appear in a Windows file name, so no real file can ever
+                // be indexed at this staging key.
+                let temp_s = format!("{root}<zxraw-relink-{nonce}-{i}>");
+                let (lo, hi) = subtree_bounds(&temp_s);
+                let taken: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 OR (path >= ?2 AND path < ?3))",
+                    params![temp_s, lo, hi],
+                    |r| r.get(0),
+                )?;
+                if taken {
+                    return Err(DbError::Invalid(format!(
+                        "relink staging key {temp_s} is already in use"
+                    )));
+                }
+                let temp = PathBuf::from(temp_s);
                 relink_tx(tx, old, &temp, None)?;
                 parked.push((temp, new));
             }

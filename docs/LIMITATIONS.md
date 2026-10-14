@@ -197,6 +197,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   app library (`library.rs`). Notes already present in a sidecar are not read back into the library.
 * Notes and ratings follow renames and moves made inside ZXraw. A file renamed or moved by another
   program keeps its note on the old path until it is relinked (Collections › Relink).
+* A file that appears at a path that previously held a different, externally moved file inherits
+  its note, tags and rating.
+* A sidecar saved as UTF-16 is never rewritten. The sync error says "sidecar is UTF-16", and the
+  note (or rating, label, keywords) is saved in the library only.
+* A note the database had not confirmed when ZXraw closed is kept in `pending-notes.json` in the
+  app data folder and saved to the library at the next start. That replay does not update the
+  XMP sidecar; the next edit of the note does.
 * The sidecar writer is tested for lossless merges, namespaces, and same-process serialisation,
   but it has not been tested with Lightroom, Capture One, or darktable.
 * Updates within ZXraw are serialised. Against other programs, the final compare and replace run

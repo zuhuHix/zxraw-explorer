@@ -501,6 +501,10 @@ fn start_transfer_with(
     if sources.is_empty() {
         return;
     }
+    if kind == OpKind::Move {
+        // Queue the note being edited while its file is still where it is being edited.
+        crate::tags_ui::save_note_now(app);
+    }
     let verify = app.settings.verify_copies;
     let verb = if kind == OpKind::Copy {
         "Copying"
@@ -852,6 +856,7 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
 }
 
 pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
+    crate::tags_ui::save_note_now(app);
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
     app.ops.jobs.spawn(
