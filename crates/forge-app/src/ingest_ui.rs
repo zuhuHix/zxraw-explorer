@@ -946,11 +946,15 @@ fn show_preview(ui: &mut Ui, state: &IngestState) {
     let new = plan.count(IngestStatus::New);
     let renamed = plan.count(IngestStatus::Renamed);
     let present = plan.count(IngestStatus::AlreadyImported);
+    let online_only = plan.online_only_count();
     let total_bytes: u64 = plan.items.iter().map(|item| item.size).sum();
     ui.horizontal_wrapped(|ui| {
         metric(ui, "New", new.to_string());
         metric(ui, "Renamed for conflicts", renamed.to_string());
         metric(ui, "Already imported", present.to_string());
+        if online_only > 0 {
+            metric(ui, "Online-only", online_only.to_string());
+        }
         metric(ui, "Problems", plan.errors.len().to_string());
         metric(
             ui,
@@ -1047,10 +1051,17 @@ fn show_preview(ui: &mut Ui, state: &IngestState) {
                         IngestStatus::Renamed => ("Renamed", Color32::from_rgb(225, 170, 65)),
                         IngestStatus::AlreadyImported => ("Present", crate::theme::muted(ui)),
                     };
+                    let status = if item.online_only {
+                        format!("{label} · online-only, will download on import")
+                    } else {
+                        label.to_string()
+                    };
                     ui.add_sized(
                         [widths[2], 24.0],
-                        egui::Label::new(RichText::new(label).small().color(color)),
-                    );
+                        egui::Label::new(RichText::new(status.as_str()).small().color(color))
+                            .truncate(),
+                    )
+                    .on_hover_text(status);
                 });
             }
         });

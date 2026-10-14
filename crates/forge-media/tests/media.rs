@@ -892,3 +892,24 @@ fn background_thumbnails_never_read_online_only_files() {
     assert_eq!((img.width, img.height), (128, 96));
     assert_eq!(s.stats().generated, 1);
 }
+
+#[test]
+fn background_metadata_skips_an_online_only_sidecar() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(dir.path(), "local.jpg", &jpeg(64, 64, 2));
+    let sidecar = dir.path().join("local.xmp");
+    std::fs::write(
+        &sidecar,
+        "<x:xmpmeta><rdf:Description xmp:Rating='5'/></x:xmpmeta>",
+    )
+    .unwrap();
+    forge_core::cloud::simulate_online_only(&sidecar);
+    let background = read_image_metadata(&p).unwrap();
+    // The explicit reader (metadata editing) still reads it.
+    let explicit = read_xmp_sidecar(&p).unwrap();
+    forge_core::cloud::clear_simulated_online_only(&sidecar);
+    assert!(background.xmp.is_none(), "{:?}", background.xmp);
+    assert_eq!(explicit.and_then(|x| x.rating), Some(5));
+    let x = read_image_metadata(&p).unwrap().xmp.unwrap();
+    assert_eq!(x.rating, Some(5));
+}

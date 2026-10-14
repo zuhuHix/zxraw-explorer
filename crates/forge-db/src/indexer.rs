@@ -415,6 +415,7 @@ impl<'a> Indexer<'a> {
                         if exclusions.excludes_folder(&path_str(&path).to_lowercase()) {
                             continue;
                         }
+                        // Cloud placeholder folders are listed: that fetches names, not contents.
                         stack.push(path.clone());
                     }
                     EntryKind::File | EntryKind::Link => {
