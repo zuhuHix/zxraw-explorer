@@ -715,21 +715,38 @@ struct WatermarkPreview {
 
 /// The downscaled source for the preview, from the thumbnail pipeline: RAW files use
 /// their embedded preview, JPEGs a large enough EXIF thumbnail, everything else a decode
-/// under the usual pixel and allocation limits. Orientation is applied.
+/// under limits stricter than the export's, so a huge PNG or TIFF gives no preview
+/// instead of a multi-gigabyte decode. Orientation is applied.
 fn preview_base(source: &Path) -> Option<image::RgbaImage> {
-    let limits = forge_media::thumbs::DecodeLimits::default();
+    let limits = forge_media::thumbs::DecodeLimits {
+        max_input_pixels: 50_000_000,
+        max_alloc_bytes: 512 * 1024 * 1024,
+    };
     forge_media::thumbs::generate_thumbnail(source, PREVIEW_SOURCE_EDGE, &limits, None, 0, None)
         .ok()?
         .to_rgba_image()
 }
 
 /// Shows `source` downscaled with the current watermark, with a spinner while it loads.
-fn watermark_preview(ui: &mut egui::Ui, state: &mut BatchUi, source: &Path) {
+/// `cached` is a thumbnail of `source` already in memory, used instead of decoding.
+fn watermark_preview(
+    ui: &mut egui::Ui,
+    state: &mut BatchUi,
+    source: &Path,
+    cached: Option<Arc<image::RgbaImage>>,
+) {
     let wanted = PreviewKey {
         source: source.to_path_buf(),
         watermark: state.watermark_on.then(|| state.watermark.clone()),
     };
     let watermark = prepared_watermark(state);
+    // A preview is only built once the watermark it shows has been prepared, so a stale or
+    // missing mark is never recorded as the preview of the current settings.
+    let mark_ready = !state.watermark_on
+        || state
+            .prepared
+            .as_ref()
+            .is_some_and(|(prepared, _)| *prepared == state.watermark);
     let preview = &mut state.preview;
 
     if let Some((_, receiver)) = &preview.pending {
@@ -756,12 +773,13 @@ fn watermark_preview(ui: &mut egui::Ui, state: &mut BatchUi, source: &Path) {
         }
     }
 
-    if preview.shown.as_ref() != Some(&wanted) && preview.pending.is_none() {
+    if preview.shown.as_ref() != Some(&wanted) && preview.pending.is_none() && mark_ready {
         let base = preview
             .base
             .as_ref()
             .filter(|(path, _)| *path == wanted.source)
-            .map(|(_, base)| base.clone());
+            .map(|(_, base)| base.clone())
+            .or_else(|| cached.map(Some));
         let mark = watermark.as_ref().ok().cloned().flatten();
         let key = wanted.clone();
         let (sender, receiver) = crossbeam_channel::bounded(1);
@@ -790,7 +808,7 @@ fn watermark_preview(ui: &mut egui::Ui, state: &mut BatchUi, source: &Path) {
             "Preview: {}",
             source.file_name().unwrap_or_default().to_string_lossy()
         ));
-        if preview.pending.is_some() {
+        if preview.pending.is_some() || !mark_ready {
             ui.spinner();
         }
     });
@@ -805,7 +823,7 @@ fn watermark_preview(ui: &mut egui::Ui, state: &mut BatchUi, source: &Path) {
             ui.image((texture.id(), size * scale));
         }
         _ if showing_source && preview.pending.is_none() => {
-            ui.label(egui::RichText::new("No preview: this image cannot be decoded.").weak());
+            ui.label(egui::RichText::new("Preview unavailable for this file.").weak());
         }
         _ => {}
     }
@@ -822,6 +840,21 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut BatchUi) {
     });
     let folder = folder_label(&app.pane().path);
     refresh_watermark(state);
+    // A thumbnail the grid already decoded spares the preview a decode of the source.
+    let cached_preview = sources
+        .first()
+        .filter(|first| {
+            state.watermark_on
+                && state
+                    .preview
+                    .base
+                    .as_ref()
+                    .is_none_or(|(path, _)| path != *first)
+        })
+        .and_then(|first| app.pane().entries.iter().find(|entry| entry.path == *first))
+        .and_then(|entry| app.ops.thumbs.largest_cached(entry))
+        .and_then(|thumb| thumb.to_rgba_image())
+        .map(Arc::new);
     let active = state
         .run
         .as_ref()
@@ -952,7 +985,7 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut BatchUi) {
             if state.watermark_on
                 && let Some(first) = sources.first()
             {
-                watermark_preview(ui, state, first);
+                watermark_preview(ui, state, first, cached_preview.clone());
             }
             ui.separator();
 

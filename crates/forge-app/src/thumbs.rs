@@ -41,6 +41,15 @@ pub struct ThumbManager {
 }
 
 impl ThumbManager {
+    /// The largest thumbnail of `entry` already decoded in memory, without any disk or
+    /// decode work.
+    pub fn largest_cached(&self, entry: &FileEntry) -> Option<Arc<ThumbImage>> {
+        BUCKETS
+            .iter()
+            .rev()
+            .find_map(|b| self.service.get_cached(&entry.path, *b, entry.modified, entry.size))
+    }
+
     pub fn new(cache_dir: PathBuf, mem_mb: u64, ffmpeg_dir: Option<&Path>) -> Self {
         let cfg = ThumbConfig {
             cache_dir: Some(cache_dir),
