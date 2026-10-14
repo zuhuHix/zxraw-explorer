@@ -55,7 +55,6 @@ impl GitBadge {
         }
     }
 
-
     /// Colour of the badge letter and, faded, its background.
     pub fn color(self) -> egui::Color32 {
         match self {
@@ -553,11 +552,23 @@ fn locate_git() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// Placeholder until the cloud-placeholder check lands on main.
-// Replaced by forge_core::cloud::background_read_allowed once the cloud-placeholder check is on main.
+/// May `git status` read the repository at `path` in the background? Not when the folder is a
+/// cloud placeholder whose data is not on this PC: git would download it.
+// TODO: use forge_core::cloud::background_read_allowed once the cloud-placeholder check (#10)
+// is on main; this reads the same attributes without opening the folder.
 fn background_read_allowed(path: &Path) -> bool {
-    let _ = path;
-    true
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
+        const ONLINE_ONLY: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
+        std::fs::symlink_metadata(path).map_or(true, |md| md.file_attributes() & ONLINE_ONLY == 0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// Runs `git status` in `root` and returns its raw porcelain v2 output.
@@ -700,14 +711,23 @@ mod tests {
             Some(GitBadge::Modified)
         );
         assert_eq!(status.badge(&p("added.rs"), false), Some(GitBadge::Added));
-        assert_eq!(status.badge(&p("renamed.rs"), false), Some(GitBadge::Modified));
+        assert_eq!(
+            status.badge(&p("renamed.rs"), false),
+            Some(GitBadge::Modified)
+        );
         // The original path of the rename is not an entry.
         assert_eq!(status.badge(&p("old name.rs"), false), None);
-        assert_eq!(status.badge(&p("conflict.rs"), false), Some(GitBadge::Conflicted));
+        assert_eq!(
+            status.badge(&p("conflict.rs"), false),
+            Some(GitBadge::Conflicted)
+        );
         assert_eq!(status.badge(&p("new dir"), true), Some(GitBadge::Added));
         assert_eq!(status.badge(&p("notes.txt"), false), Some(GitBadge::Added));
         assert_eq!(status.badge(&p("target"), true), Some(GitBadge::Ignored));
-        assert_eq!(status.badge(&p("debug.log"), false), Some(GitBadge::Ignored));
+        assert_eq!(
+            status.badge(&p("debug.log"), false),
+            Some(GitBadge::Ignored)
+        );
     }
 
     #[test]
@@ -754,7 +774,10 @@ mod tests {
         assert_eq!(status.badge(&p(".git"), true), None);
         assert_eq!(status.badge(&p(r".git\HEAD"), false), None);
         assert_eq!(status.badge(&PathBuf::from(r"D:\other\x.txt"), false), None);
-        assert_eq!(status.badge(&PathBuf::from(r"C:\repo-other\x.txt"), false), None);
+        assert_eq!(
+            status.badge(&PathBuf::from(r"C:\repo-other\x.txt"), false),
+            None
+        );
     }
 
     #[test]
@@ -764,7 +787,10 @@ mod tests {
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("a").join("b").join("c")).unwrap();
-        assert_eq!(find_repo_root(&root.join("a").join("b").join("c")), Some(root));
+        assert_eq!(
+            find_repo_root(&root.join("a").join("b").join("c")),
+            Some(root)
+        );
 
         // A `.git` file, as in worktrees and submodules, also counts.
         let worktree = tmp.path().join("worktree");
