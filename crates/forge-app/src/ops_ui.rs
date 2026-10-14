@@ -1,7 +1,7 @@
 //! Copy/move/delete jobs, the interactive conflict dialog and the operations panel.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, bounded};
 use egui::{RichText, Ui};
@@ -21,6 +21,10 @@ use crate::views;
 /// because reading them downloads everything from the cloud.
 const CLOUD_WARN_COUNT: usize = 10;
 const CLOUD_WARN_BYTES: u64 = 1 << 30;
+/// Limits on the metadata-only walk into selected folders. Hitting either one stops the walk
+/// and marks its totals as a lower bound.
+const CLOUD_WALK_MAX_ENTRIES: usize = 20_000;
+const CLOUD_WALK_TIME_LIMIT: Duration = Duration::from_millis(300);
 
 /// A conflict waiting for the user, with the channel the job thread is blocked on.
 pub struct ConflictQuestion {
@@ -163,26 +167,103 @@ fn ask_cloud_download(app: &mut ZxrawApp, body: String, kind: OpKind, pending: C
 /// files, or `None`.
 fn cloud_warning_for(sources: &[PathBuf], dest: &Path, kind: OpKind) -> Option<String> {
     let same = sources.iter().all(|path| same_volume(path, dest));
-    let (count, bytes) = online_only_totals(sources, dest, kind);
-    cloud_download_warning(count, bytes, kind, same)
+    if kind == OpKind::Move && same {
+        return None;
+    }
+    let scan = online_only_totals(sources, dest, kind);
+    cloud_download_warning(scan.count, scan.bytes, kind, same, scan.truncated)
 }
 
-/// Top-level online-only files that the transfer would read, and their logical size.
-/// Metadata only: placeholders report their full size without being opened. Folders are not
-/// walked (listing a cloud folder is too slow), so online-only files inside a folder are
-/// not counted.
-fn online_only_totals(sources: &[PathBuf], dest: &Path, kind: OpKind) -> (usize, u64) {
-    sources.iter().fold((0, 0), |(count, bytes), path| {
+/// Online-only files that the transfer would read, and their logical size. Metadata only:
+/// placeholders report their full size without being opened.
+#[derive(Debug, Default, PartialEq)]
+struct OnlineOnlyScan {
+    count: usize,
+    bytes: u64,
+    /// The folder walk stopped at its limits, so `count` and `bytes` are lower bounds.
+    truncated: bool,
+}
+
+fn online_only_totals(sources: &[PathBuf], dest: &Path, kind: OpKind) -> OnlineOnlyScan {
+    online_only_totals_with(
+        sources,
+        dest,
+        kind,
+        CLOUD_WALK_MAX_ENTRIES,
+        CLOUD_WALK_TIME_LIMIT,
+    )
+}
+
+/// [`online_only_totals`] with injectable walk limits.
+fn online_only_totals_with(
+    sources: &[PathBuf],
+    dest: &Path,
+    kind: OpKind,
+    max_entries: usize,
+    time_limit: Duration,
+) -> OnlineOnlyScan {
+    let deadline = Instant::now() + time_limit;
+    let mut scan = OnlineOnlyScan::default();
+    let mut visited = 0;
+    for path in sources {
         if kind == OpKind::Move && same_volume(path, dest) {
-            return (count, bytes);
+            continue;
         }
-        match std::fs::symlink_metadata(path) {
-            Ok(md) if md.is_file() && !forge_core::cloud::background_read_allowed(path) => {
-                (count + 1, bytes + md.len())
+        let Ok(md) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if md.is_file() {
+            if !forge_core::cloud::background_read_allowed(path) {
+                scan.count += 1;
+                scan.bytes += md.len();
             }
-            _ => (count, bytes),
+        } else if md.is_dir() {
+            walk_online_only(path, max_entries, deadline, &mut visited, &mut scan);
         }
-    })
+    }
+    scan
+}
+
+/// Walks the folder `root` and adds its online-only files to `scan`. Listing metadata only:
+/// `DirEntry::metadata` comes from the directory enumeration, so no file is opened. Symlinks
+/// and junctions are not followed. The walk stops, marking `scan.truncated`, when it has
+/// visited `max_entries` entries or passed `deadline`.
+fn walk_online_only(
+    root: &Path,
+    max_entries: usize,
+    deadline: Instant,
+    visited: &mut usize,
+    scan: &mut OnlineOnlyScan,
+) {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if *visited >= max_entries || Instant::now() >= deadline {
+                scan.truncated = true;
+                return;
+            }
+            *visited += 1;
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && let Ok(md) = entry.metadata()
+                && forge_core::cloud::is_online_only_metadata(&path, &md)
+            {
+                scan.count += 1;
+                scan.bytes += md.len();
+            }
+        }
+    }
 }
 
 /// Are both paths on the same drive (or share the same UNC share / root)?
@@ -197,27 +278,44 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 
 /// Pure decision: the body text of the download warning, or `None` when the transfer is
 /// cheap enough to start at once. A move within one volume is a rename and downloads nothing.
+///
+/// When the folder walk was `truncated` and it had already seen online-only files, the real
+/// total is unknown but not zero, so a generic warning is shown instead of silence. An
+/// online-only file seen before the cap proves the selection holds more of them. A walk that
+/// stopped before seeing any proves nothing, so it stays silent.
 fn cloud_download_warning(
     count: usize,
     bytes: u64,
     kind: OpKind,
     same_volume: bool,
+    truncated: bool,
 ) -> Option<String> {
     if kind == OpKind::Move && same_volume {
         return None;
     }
-    if count < CLOUD_WARN_COUNT && bytes < CLOUD_WARN_BYTES {
-        return None;
-    }
-    let (files, are, them) = if count == 1 {
-        ("1 file".to_owned(), "is", "it")
-    } else {
-        (format!("{count} files"), "are", "them")
-    };
     let verb = if kind == OpKind::Copy {
         "Copying"
     } else {
         "Moving"
+    };
+    if count < CLOUD_WARN_COUNT && bytes < CLOUD_WARN_BYTES {
+        if truncated && count > 0 {
+            return Some(format!(
+                "This folder may contain online-only files. {verb} downloads them from the cloud first."
+            ));
+        }
+        return None;
+    }
+    let (files, are, them) = if count == 1 && !truncated {
+        ("1 file".to_owned(), "is", "it")
+    } else {
+        (format!("{count} files"), "are", "them")
+    };
+    // A capped walk saw only part of the selection: the totals are lower bounds.
+    let files = if truncated {
+        format!("At least {files}")
+    } else {
+        files
     };
     Some(format!(
         "{files} ({}) {are} online-only. {verb} {them} downloads {them} from the cloud first.",
@@ -1020,26 +1118,30 @@ mod cloud_warning_tests {
 
     #[test]
     fn small_transfers_do_not_warn() {
-        assert_eq!(cloud_download_warning(0, 0, OpKind::Copy, false), None);
         assert_eq!(
-            cloud_download_warning(CLOUD_WARN_COUNT - 1, 1024, OpKind::Copy, false),
+            cloud_download_warning(0, 0, OpKind::Copy, false, false),
             None
         );
         assert_eq!(
-            cloud_download_warning(1, CLOUD_WARN_BYTES - 1, OpKind::Copy, false),
+            cloud_download_warning(CLOUD_WARN_COUNT - 1, 1024, OpKind::Copy, false, false),
+            None
+        );
+        assert_eq!(
+            cloud_download_warning(1, CLOUD_WARN_BYTES - 1, OpKind::Copy, false, false),
             None
         );
     }
 
     #[test]
     fn count_or_size_threshold_warns() {
-        let body = cloud_download_warning(CLOUD_WARN_COUNT, 3, OpKind::Copy, false).unwrap();
+        let body = cloud_download_warning(CLOUD_WARN_COUNT, 3, OpKind::Copy, false, false).unwrap();
         assert_eq!(
             body,
             "10 files (3 B) are online-only. Copying them downloads them from the cloud first."
         );
-        assert!(cloud_download_warning(1, CLOUD_WARN_BYTES, OpKind::Copy, false).is_some());
-        let single = cloud_download_warning(1, CLOUD_WARN_BYTES, OpKind::Move, false).unwrap();
+        assert!(cloud_download_warning(1, CLOUD_WARN_BYTES, OpKind::Copy, false, false).is_some());
+        let single =
+            cloud_download_warning(1, CLOUD_WARN_BYTES, OpKind::Move, false, false).unwrap();
         assert!(single.starts_with(&format!(
             "1 file ({}) is online-only. Moving it downloads it",
             format_size(CLOUD_WARN_BYTES)
@@ -1047,13 +1149,140 @@ mod cloud_warning_tests {
     }
 
     #[test]
+    fn capped_walk_totals_are_lower_bounds() {
+        let body = cloud_download_warning(CLOUD_WARN_COUNT, 3, OpKind::Copy, false, true).unwrap();
+        assert!(
+            body.starts_with("At least 10 files (3 B) are online-only."),
+            "{body}"
+        );
+    }
+
+    #[test]
     fn move_within_one_volume_never_warns() {
         assert_eq!(
-            cloud_download_warning(50, CLOUD_WARN_BYTES * 4, OpKind::Move, true),
+            cloud_download_warning(50, CLOUD_WARN_BYTES * 4, OpKind::Move, true, true),
             None
         );
-        assert!(cloud_download_warning(50, 0, OpKind::Move, false).is_some());
-        assert!(cloud_download_warning(50, 0, OpKind::Copy, true).is_some());
+        assert!(cloud_download_warning(50, 0, OpKind::Move, false, false).is_some());
+        assert!(cloud_download_warning(50, 0, OpKind::Copy, true, false).is_some());
+    }
+
+    #[test]
+    fn same_volume_move_skips_the_walk() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let mut placeholders = Vec::new();
+        for i in 0..CLOUD_WARN_COUNT {
+            let path = folder.join(format!("cloud{i}.bin"));
+            std::fs::write(&path, b"abc").unwrap();
+            forge_core::cloud::simulate_online_only(path.clone());
+            placeholders.push(path);
+        }
+        let dest = dir.path().join("dest");
+        let sources = std::slice::from_ref(&folder);
+        assert_eq!(cloud_warning_for(sources, &dest, OpKind::Move), None);
+        // The same folder copied would warn, so the Move result comes from the rule.
+        assert!(cloud_warning_for(sources, &dest, OpKind::Copy).is_some());
+        for path in &placeholders {
+            forge_core::cloud::clear_simulated_online_only(path);
+        }
+    }
+
+    #[test]
+    fn nested_online_only_files_are_counted() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let root = dir.path().join("root");
+        let deep = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir(root.join("a").join("empty")).unwrap();
+        let folders = [root.clone(), root.join("a"), root.join("a").join("b"), deep];
+        let mut placeholders = Vec::new();
+        for i in 0..10 {
+            let path = folders[i % folders.len()].join(format!("cloud{i}.bin"));
+            std::fs::write(&path, b"abc").unwrap();
+            forge_core::cloud::simulate_online_only(path.clone());
+            placeholders.push(path);
+        }
+        let local = root.join("local.bin");
+        std::fs::write(&local, b"hello").unwrap();
+
+        let elsewhere = dir.path().join("elsewhere");
+        let scan = online_only_totals(std::slice::from_ref(&root), &elsewhere, OpKind::Copy);
+        assert_eq!(
+            scan,
+            OnlineOnlyScan {
+                count: 10,
+                bytes: 30,
+                truncated: false,
+            }
+        );
+        let body = cloud_warning_for(std::slice::from_ref(&root), &elsewhere, OpKind::Copy)
+            .expect("ten online-only files warn");
+        assert!(body.starts_with("10 files (30 B) are online-only."));
+        for path in &placeholders {
+            forge_core::cloud::clear_simulated_online_only(path);
+        }
+    }
+
+    #[test]
+    fn entry_cap_with_online_only_file_gives_generic_warning() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let mut placeholders = Vec::new();
+        for i in 0..5 {
+            let path = root.join(format!("cloud{i}.bin"));
+            std::fs::write(&path, b"abc").unwrap();
+            forge_core::cloud::simulate_online_only(path.clone());
+            placeholders.push(path);
+        }
+        let elsewhere = dir.path().join("elsewhere");
+        // Every entry is online-only, so the first two visited are seen before the cap.
+        let scan = online_only_totals_with(
+            std::slice::from_ref(&root),
+            &elsewhere,
+            OpKind::Copy,
+            2,
+            Duration::from_secs(60),
+        );
+        assert!(scan.truncated);
+        assert_eq!(scan.count, 2);
+        let body =
+            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.truncated);
+        assert_eq!(
+            body.as_deref(),
+            Some(
+                "This folder may contain online-only files. Copying downloads them from the cloud first."
+            )
+        );
+        for path in &placeholders {
+            forge_core::cloud::clear_simulated_online_only(path);
+        }
+    }
+
+    #[test]
+    fn entry_cap_without_online_only_file_stays_silent() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        for i in 0..5 {
+            std::fs::write(root.join(format!("local{i}.bin")), b"abc").unwrap();
+        }
+        let elsewhere = dir.path().join("elsewhere");
+        let scan = online_only_totals_with(
+            std::slice::from_ref(&root),
+            &elsewhere,
+            OpKind::Copy,
+            2,
+            Duration::from_secs(60),
+        );
+        assert!(scan.truncated);
+        assert_eq!(scan.count, 0);
+        assert_eq!(
+            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.truncated),
+            None
+        );
     }
 
     #[test]
@@ -1063,28 +1292,36 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn totals_count_only_online_only_top_level_files() {
+    fn totals_count_online_only_files_at_top_level_and_under_folders() {
         let dir = tempfile::tempdir().expect("temp directory");
         let cloud = dir.path().join("cloud.bin");
         let local = dir.path().join("local.bin");
         let folder = dir.path().join("folder");
+        let nested = folder.join("nested.bin");
         std::fs::write(&cloud, b"abc").unwrap();
         std::fs::write(&local, b"hello").unwrap();
         std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&nested, b"xy").unwrap();
         forge_core::cloud::simulate_online_only(cloud.clone());
         forge_core::cloud::simulate_online_only(folder.clone());
+        forge_core::cloud::simulate_online_only(nested.clone());
         let sources = [cloud.clone(), local, folder.clone()];
         let elsewhere = dir.path().join("elsewhere");
         assert_eq!(
             online_only_totals(&sources, &elsewhere, OpKind::Copy),
-            (1, 3)
+            OnlineOnlyScan {
+                count: 2,
+                bytes: 5,
+                truncated: false,
+            }
         );
         // A move within the same volume is a rename: nothing is read.
         assert_eq!(
             online_only_totals(&sources, dir.path(), OpKind::Move),
-            (0, 0)
+            OnlineOnlyScan::default()
         );
         forge_core::cloud::clear_simulated_online_only(&cloud);
         forge_core::cloud::clear_simulated_online_only(&folder);
+        forge_core::cloud::clear_simulated_online_only(&nested);
     }
 }

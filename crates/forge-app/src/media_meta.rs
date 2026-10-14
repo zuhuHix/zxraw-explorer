@@ -16,6 +16,8 @@ pub enum MediaMeta {
 
 type MetaSlot = Arc<Mutex<Option<(PathBuf, Result<MediaMeta, String>)>>>;
 
+const ONLINE_ONLY: &str = "Online-only file: open it to download it from the cloud.";
+
 /// Holds the metadata of the most recently requested file.
 #[derive(Default)]
 pub struct MetaLoader {
@@ -26,9 +28,7 @@ pub struct MetaLoader {
 impl MetaLoader {
     pub fn get(&mut self, e: &FileEntry, ctx: &egui::Context) -> Option<Result<MediaMeta, String>> {
         if !forge_core::cloud::background_read_allowed_entry(e) {
-            return Some(Err(
-                "Online-only file: open it to download it from the cloud.".into(),
-            ));
+            return Some(Err(ONLINE_ONLY.into()));
         }
         if let Some((p, r)) = &*self.slot.lock() {
             if *p == e.path {
@@ -42,14 +42,19 @@ impl MetaLoader {
             let kind = e.media_kind();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let r = match kind {
-                    MediaKind::Video => forge_media::FfTools::global()
-                        .probe(&path)
-                        .map(|m| MediaMeta::Video(Box::new(m)))
-                        .map_err(|e| e.to_string()),
-                    _ => forge_media::read_image_metadata(&path)
-                        .map(|m| MediaMeta::Image(Box::new(m)))
-                        .map_err(|e| e.to_string()),
+                // The listing flag may be stale: re-check just before reading.
+                let r = if !forge_core::cloud::background_read_allowed(&path) {
+                    Err(ONLINE_ONLY.to_owned())
+                } else {
+                    match kind {
+                        MediaKind::Video => forge_media::FfTools::global()
+                            .probe(&path)
+                            .map(|m| MediaMeta::Video(Box::new(m)))
+                            .map_err(|e| e.to_string()),
+                        _ => forge_media::read_image_metadata(&path)
+                            .map(|m| MediaMeta::Image(Box::new(m)))
+                            .map_err(|e| e.to_string()),
+                    }
                 };
                 *slot.lock() = Some((path, r));
                 ctx.request_repaint();

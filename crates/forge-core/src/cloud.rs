@@ -7,7 +7,11 @@
 //! read the file: that download is the user's choice.
 //!
 //! Detection uses only the attributes Windows already has: the directory listing's find data
-//! or `GetFileAttributesW`. Neither opens the file, so neither triggers a download.
+//! or `FindFirstFileExW` on the exact path. Neither opens the file, so neither triggers a
+//! download. The path check fails closed: unreadable attributes count as online-only.
+//!
+//! Recall-marked *folders* are still listed by walkers (indexer, ops, scans): listing a
+//! placeholder folder fetches only names and sizes, never file contents.
 //!
 //! The check lives in one place so other policies (for example slow network shares) can be
 //! added to [`background_read_allowed`] later without touching the callers.
@@ -63,30 +67,58 @@ pub trait AttributeSource {
     fn attributes(&self, path: &Path) -> Option<u32>;
 }
 
-/// Reads attributes with `GetFileAttributesW`, which never opens the file.
+/// Reads the find data of `path` with `FindFirstFileExW` (`FindExInfoBasic`): the same
+/// attributes a directory listing reports, including `RECALL_ON_OPEN`, which
+/// `GetFileAttributesW` does not report. Never opens the file.
 pub struct FsAttributes;
 
 impl AttributeSource for FsAttributes {
     #[cfg(windows)]
     fn attributes(&self, path: &Path) -> Option<u32> {
         use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+        use windows::Win32::Storage::FileSystem::{
+            FIND_FIRST_EX_FLAGS, FindClose, FindExInfoBasic, FindExSearchNameMatch,
+            FindFirstFileExW, WIN32_FIND_DATAW,
+        };
         use windows::core::PCWSTR;
+        let path = crate::paths::to_extended_length(path);
+        let text = path.as_os_str().to_string_lossy();
+        let name_part = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        // Wildcards would match other names (Windows file names cannot contain them).
+        if name_part.is_empty() || name_part.contains(['*', '?']) {
+            return None;
+        }
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
-        let a = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
-        (a != INVALID_FILE_ATTRIBUTES).then_some(a)
+        let mut data = WIN32_FIND_DATAW::default();
+        // SAFETY: `wide` is NUL-terminated and `data` is a valid WIN32_FIND_DATAW; both
+        // outlive the call.
+        let handle = unsafe {
+            FindFirstFileExW(
+                PCWSTR(wide.as_ptr()),
+                FindExInfoBasic,
+                (&mut data as *mut WIN32_FIND_DATAW).cast(),
+                FindExSearchNameMatch,
+                None,
+                FIND_FIRST_EX_FLAGS(0),
+            )
+        }
+        .ok()?;
+        // SAFETY: `handle` came from a successful FindFirstFileExW and is closed once.
+        let _ = unsafe { FindClose(handle) };
+        Some(data.dwFileAttributes)
     }
     #[cfg(not(windows))]
     fn attributes(&self, _path: &Path) -> Option<u32> {
-        None
+        // No cloud placeholders outside Windows.
+        Some(0)
     }
 }
 
 /// May background work (thumbnails, metadata, hashing, scans) read the data of `path`?
 ///
-/// False for cloud placeholders whose data is not on this PC. Unreadable attributes count
-/// as allowed: the reader then fails on its own, exactly as before.
+/// False for cloud placeholders whose data is not on this PC, and false when the attributes
+/// cannot be read (fail closed). Call it at the worker boundary, just before opening the
+/// file: a listing flag can be stale by then.
 pub fn background_read_allowed(path: &Path) -> bool {
     background_read_allowed_with(path, &FsAttributes)
 }
@@ -96,10 +128,13 @@ pub fn background_read_allowed_with(path: &Path, source: &dyn AttributeSource) -
     if is_simulated(path) {
         return false;
     }
-    !source.attributes(path).is_some_and(is_online_only_attrs)
+    source
+        .attributes(path)
+        .is_some_and(|a| !is_online_only_attrs(a))
 }
 
-/// [`background_read_allowed`] for an entry from a listing, without another syscall.
+/// Pre-filter for an entry from a listing, without a syscall. Used for the badge and to avoid
+/// queueing work; the worker still calls [`background_read_allowed`] before reading.
 pub fn background_read_allowed_entry(entry: &FileEntry) -> bool {
     !entry.online_only && !is_simulated(&entry.path)
 }
@@ -175,7 +210,14 @@ mod tests {
         ]));
         assert!(background_read_allowed_with(&local, &fake));
         assert!(!background_read_allowed_with(&cloud, &fake));
-        assert!(background_read_allowed_with(&missing, &fake));
+        // Unknown attributes fail closed.
+        assert!(!background_read_allowed_with(&missing, &fake));
+        let on_open = PathBuf::from(r"C:\photos\open.cr3");
+        let fake = Fake(HashMap::from([(
+            on_open.clone(),
+            0x20 | FILE_ATTRIBUTE_RECALL_ON_OPEN,
+        )]));
+        assert!(!background_read_allowed_with(&on_open, &fake));
     }
 
     #[test]
@@ -184,9 +226,14 @@ mod tests {
         let f = dir.path().join("a.jpg");
         std::fs::write(&f, b"x").unwrap();
         assert!(background_read_allowed(&f));
-        assert!(background_read_allowed(
-            &dir.path().join("does-not-exist.jpg")
-        ));
+        // Missing files and wildcard patterns fail closed.
+        assert!(!background_read_allowed(&dir.path().join("missing.jpg")));
+        assert!(!background_read_allowed(&dir.path().join("a*.jpg")));
+        let long = dir.path().join("d".repeat(120)).join("e".repeat(120));
+        std::fs::create_dir_all(&long).unwrap();
+        let long_file = long.join("long-path-photo.jpg");
+        std::fs::write(&long_file, b"x").unwrap();
+        assert!(background_read_allowed(&long_file));
     }
 
     #[test]

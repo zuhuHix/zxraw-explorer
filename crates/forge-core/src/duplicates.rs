@@ -68,7 +68,8 @@ pub struct DupReport {
     /// comparison]. The byte-comparison slot stays zero unless `byte_compare` is set.
     pub stage_times: [Duration; 4],
     pub links_skipped: u64,
-    /// Cloud placeholders whose data is not on this PC: never read, so never compared.
+    /// Candidates never read because they are online-only cloud placeholders (or their
+    /// attributes could not be read). Files with no same-size peer are not checked.
     #[serde(default)]
     pub skipped_online_only: u64,
     pub errors: Vec<OpIssue>,
@@ -93,8 +94,9 @@ fn dedupe_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     keep
 }
 
-/// Collect regular files under `roots` (a root may also be a single file). Online-only cloud
-/// placeholders are counted in `online_only` and not passed on: reading them would download.
+/// Collect regular files under `roots` (a root may also be a single file). A root that is an
+/// online-only cloud placeholder is counted in `online_only` and not passed on. Files found by
+/// the walk are checked live just before they are hashed (see `find_duplicates`).
 fn collect_files(
     roots: &[PathBuf],
     ctx: &JobCtx<'_>,
@@ -118,11 +120,7 @@ fn collect_files(
             NodeKind::Dir => walk_tree(&root, ctx.cancel, |item| match item {
                 WalkItem::Entry(e) if e.is_file() => {
                     ctx.progress.add_items(1);
-                    if background_read_allowed(&e.path) {
-                        f(e.path.clone(), e.size)
-                    } else {
-                        *online_only += 1;
-                    }
+                    f(e.path.clone(), e.size)
                 }
                 WalkItem::Entry(e) if e.is_link() => *links += 1,
                 WalkItem::Entry(_) => {}
@@ -168,7 +166,6 @@ pub fn find_duplicates(
         },
     )?;
     report.links_skipped = links;
-    report.skipped_online_only = online_only;
     by_size.retain(|_, v| v.len() > 1);
     report.stage_candidates[0] = by_size.values().map(|v| v.len() as u64).sum();
     report.stage_times[0] = stage_start.elapsed();
@@ -196,12 +193,17 @@ pub fn find_duplicates(
         if ctx.cancel.is_cancelled() {
             return Err(CoreError::Cancelled);
         }
-        hashing::partial_hash(p)
+        // Checked live at the moment of reading: an online-only file would download.
+        if !background_read_allowed(p) {
+            return Ok(None);
+        }
+        hashing::partial_hash(p).map(Some)
     });
     ctx.cancel.check()?;
     for ((size, p), r) in items.into_iter().zip(hashed) {
         match r {
-            Ok(h) => by_partial.entry((size, h)).or_default().push(p),
+            Ok(Some(h)) => by_partial.entry((size, h)).or_default().push(p),
+            Ok(None) => online_only += 1,
             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
             Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
         }
@@ -225,11 +227,15 @@ pub fn find_duplicates(
         .collect();
     // Fewer threads here: these are full reads, and too many would thrash spinning disks.
     let hashed = par_map(&items, io_threads(4), |(_, p)| {
-        hashing::hash_file(p, ctx.cancel, Some(ctx.progress))
+        if !background_read_allowed(p) {
+            return Ok(None);
+        }
+        hashing::hash_file(p, ctx.cancel, Some(ctx.progress)).map(Some)
     });
     for ((size, p), r) in items.into_iter().zip(hashed) {
         match r {
-            Ok(h) => by_full.entry((size, h)).or_default().push(p),
+            Ok(Some(h)) => by_full.entry((size, h)).or_default().push(p),
+            Ok(None) => online_only += 1,
             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
             Err(e) => errors.push(OpIssue::new(&p, e.to_string())),
         }
@@ -262,6 +268,7 @@ pub fn find_duplicates(
             .then_with(|| a.files.cmp(&b.files))
     });
     report.stage_times[3] = stage_start.elapsed();
+    report.skipped_online_only = online_only;
     report.groups = groups;
     report.errors = errors;
     Ok(report)
@@ -511,7 +518,7 @@ mod tests {
         clear_simulated_online_only(&cloud);
         assert!(rep.groups.is_empty(), "{:?}", rep.groups);
         assert_eq!(rep.skipped_online_only, 1);
-        assert_eq!(rep.files_scanned, 1);
+        assert_eq!(rep.files_scanned, 2);
         assert!(rep.errors.is_empty(), "{:?}", rep.errors);
     }
 

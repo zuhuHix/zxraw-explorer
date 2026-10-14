@@ -28,6 +28,7 @@ use std::time::SystemTime;
 use chrono::{Datelike, NaiveDateTime, Timelike};
 use serde::{Deserialize, Serialize};
 
+use crate::cloud;
 use crate::error::{CoreError, Result};
 use crate::fault;
 use crate::hashing::{self, Digest, ManifestEntry};
@@ -114,6 +115,11 @@ pub struct IngestItem {
     pub status: IngestStatus,
     /// Known when computed during planning (for already-imported detection).
     pub source_hash: Option<Digest>,
+    /// Cloud placeholder whose data is not on this PC. Planning did not read it: the date falls
+    /// back to the modified time, and it is never matched as already imported. Import downloads
+    /// it like any other source.
+    #[serde(default)]
+    pub online_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +133,10 @@ pub struct IngestPlan {
 impl IngestPlan {
     pub fn count(&self, s: IngestStatus) -> usize {
         self.items.iter().filter(|i| i.status == s).count()
+    }
+
+    pub fn online_only_count(&self) -> usize {
+        self.items.iter().filter(|i| i.online_only).count()
     }
 }
 
@@ -395,16 +405,22 @@ pub fn plan_ingest(
     if let Some(exts) = &exts {
         files.retain(|(p, _, _)| exts.contains(&crate::model::ext_of(p)));
     }
-    // Capture info + chronological order (stable for {seq}).
-    let mut staged: Vec<(PathBuf, u64, NaiveDateTime, Option<String>)> = files
+    // Capture info + chronological order (stable for {seq}). Reading metadata from an
+    // online-only placeholder would download it, so it keeps the modified-time date.
+    let mut staged: Vec<(PathBuf, u64, NaiveDateTime, Option<String>, bool)> = files
         .into_iter()
         .map(|(p, size, mtime)| {
-            let info = meta.capture_info(&p);
+            let online_only = !cloud::background_read_allowed(&p);
+            let info = if online_only {
+                CaptureInfo::default()
+            } else {
+                meta.capture_info(&p)
+            };
             let t = info.captured.unwrap_or_else(|| {
                 let st = mtime.unwrap_or(SystemTime::UNIX_EPOCH);
                 chrono::DateTime::<chrono::Local>::from(st).naive_local()
             });
-            (p, size, t, info.camera)
+            (p, size, t, info.camera, online_only)
         })
         .collect();
     staged.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
@@ -412,7 +428,7 @@ pub fn plan_ingest(
     let mut reserved: HashSet<String> = HashSet::new();
     let mut items = Vec::with_capacity(staged.len());
     let mut bytes_to_copy = 0;
-    for (i, (src, size, t, camera)) in staged.into_iter().enumerate() {
+    for (i, (src, size, t, camera, online_only)) in staged.into_iter().enumerate() {
         ctx.cancel.check()?;
         let name = paths::name_of(&src);
         let (stem, dot_ext) = paths::split_name_ext(&name);
@@ -465,6 +481,10 @@ pub fn plan_ingest(
                 }
                 Ok(md) if node_kind(&md) == NodeKind::File && md.len() == size => {
                     if source_hash.is_none() {
+                        // Hashing an online-only source would download it: not a known duplicate.
+                        if !cloud::background_read_allowed(&src) {
+                            continue;
+                        }
                         match hashing::hash_file(&src, ctx.cancel, Some(ctx.progress)) {
                             Ok(h) => source_hash = Some(h),
                             Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
@@ -504,6 +524,7 @@ pub fn plan_ingest(
             camera,
             status,
             source_hash,
+            online_only,
         });
     }
     Ok(IngestPlan {
@@ -1297,6 +1318,47 @@ mod tests {
                 .iter()
                 .any(|u| u.path.ends_with("IMG_0001.XMP"))
         );
+    }
+
+    #[test]
+    fn online_only_sources_are_not_read_while_planning_but_still_import() {
+        let c = card();
+        let (cancel, progress) = ctx_parts();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let spec = IngestSpec {
+            folder_template: "{project}".into(),
+            file_template: "{orig_name}".into(),
+            project: "P".into(),
+            write_manifest: false,
+            ..IngestSpec::new(vec![c.card.clone()], c.dest.clone())
+        };
+        let r1 = execute_ingest(&plan_ingest(&spec, &NoMetadata, &ctx).unwrap(), &ctx).unwrap();
+        assert!(r1.is_complete(), "{r1:?}");
+        // Every source now has an identical copy, so a hash check would report it present.
+        let online = c.card.join("DCIM/100CANON/IMG_0001.CR3");
+        cloud::simulate_online_only(&online);
+
+        let reads = std::cell::RefCell::new(Vec::new());
+        let provider = |p: &Path| {
+            reads.borrow_mut().push(p.to_path_buf());
+            meta(p)
+        };
+        let plan = plan_ingest(&spec, &provider, &ctx).unwrap();
+        assert!(!reads.borrow().contains(&online), "{:?}", reads.borrow());
+        assert_eq!(plan.online_only_count(), 1);
+        let item = plan.items.iter().find(|i| i.source == online).unwrap();
+        assert!(item.online_only);
+        assert_eq!(item.source_hash, None);
+        assert_eq!(item.camera, None);
+        assert_ne!(item.status, IngestStatus::AlreadyImported);
+        assert_eq!(plan.count(IngestStatus::AlreadyImported), 2);
+
+        let r2 = execute_ingest(&plan, &ctx).unwrap();
+        assert!(r2.is_complete(), "{r2:?}");
+        assert_eq!(r2.verified.len(), 1);
+        assert_eq!(r2.verified[0].source, online);
+        assert_eq!(fs::read(&item.dest).unwrap(), b"raw-one");
+        cloud::clear_simulated_online_only(&online);
     }
 
     #[test]

@@ -447,8 +447,12 @@ fn analyze_sources(
         };
         let mut cached = cache_get(&key).unwrap_or_default();
         if !cached.capture_done {
-            let exif_time = forge_media::read_image_metadata(&source.path)
-                .ok()
+            // Re-checked live: the listing flag may be stale. Online-only files use the file
+            // date and are not cached, so they are read properly once downloaded.
+            let readable = forge_core::cloud::background_read_allowed(&source.path);
+            let exif_time = readable
+                .then(|| forge_media::read_image_metadata(&source.path).ok())
+                .flatten()
                 .and_then(|metadata| {
                     metadata.capture_timestamp.map(|secs| {
                         secs as f64 + metadata.capture_millis.unwrap_or(0) as f64 / 1000.0
@@ -458,8 +462,10 @@ fn analyze_sources(
                 return;
             }
             cached.capture_time = exif_time.or_else(|| source.modified.map(system_time_secs));
-            cached.capture_done = true;
-            cache_put(key.clone(), cached.clone());
+            cached.capture_done = readable;
+            if readable {
+                cache_put(key.clone(), cached.clone());
+            }
         }
         work.push(WorkItem {
             source,
@@ -491,13 +497,18 @@ fn analyze_sources(
         }
         let mut cached = cache_get(&item.key).unwrap_or_default();
         if !cached.hash_done {
-            let dhash = hash_thumbnail(&item.source.path, cancel);
+            let readable = forge_core::cloud::background_read_allowed(&item.source.path);
+            let dhash = readable
+                .then(|| hash_thumbnail(&item.source.path, cancel))
+                .flatten();
             if cancel.check().is_err() {
                 return;
             }
             cached.dhash = dhash;
-            cached.hash_done = true;
-            cache_put(item.key.clone(), cached.clone());
+            cached.hash_done = readable;
+            if readable {
+                cache_put(item.key.clone(), cached.clone());
+            }
         }
         if let Some(delta) = grouper.push(AnalyzedItem {
             index: item.source.index,

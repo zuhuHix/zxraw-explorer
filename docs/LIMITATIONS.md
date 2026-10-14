@@ -55,11 +55,19 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 * Online-only cloud files (OneDrive, Dropbox, Google Drive placeholders) are detected from
   their attributes and never read by background work, so they show a cloud badge and no
-  thumbnail or metadata, even when Windows has a cached shell thumbnail. Detection has only been
-  tested with simulated placeholders, not a live sync client. A file downloaded outside ZXraw
-  keeps its badge until the folder is refreshed. The copy/move download warning counts only the
-  selected files, not online-only files inside selected folders. Folder sync in Folder compare
-  still reads online-only files when it compares content.
+  thumbnail or metadata, even when Windows has a cached shell thumbnail. Workers re-check the
+  attributes just before reading. If the attributes cannot be read, the file is treated as
+  online-only. Detection has only been tested with simulated placeholders, not a live sync
+  client. A file downloaded outside ZXraw keeps its badge until the folder is refreshed.
+* Online-only *folders* are still listed by the indexer, scans and file operations. Listing a
+  placeholder folder fetches names and sizes from the cloud, not file contents. Skipping them
+  would hide whole OneDrive trees.
+* The copy/move download warning walks selected folders only up to an entry and time limit.
+  Past that limit it gives a general warning instead of an exact count. Folder sync in Folder
+  compare still reads online-only files when it compares content.
+* Background reads check the attributes, then open the file normally. A file that becomes
+  online-only between the check and the open is still downloaded. Windows has no documented
+  way to open a Cloud Files placeholder for reading without downloading it.
 
 ## Default apps and folder opening
 

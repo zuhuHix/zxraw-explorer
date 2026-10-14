@@ -248,7 +248,7 @@ pub fn read_image_metadata(path: &Path) -> Result<ImageMetadata> {
         None => read_embedded_xmp(&mut src, fmt),
     }
     .map(|x| parse_xmp(&x, XmpSource::Embedded));
-    let sidecar = read_xmp_sidecar(path).ok().flatten();
+    let sidecar = read_sidecar(path, true).ok().flatten();
     m.xmp = merge_xmp(sidecar, embedded);
     Ok(m)
 }
@@ -1052,13 +1052,23 @@ pub fn sidecar_paths(path: &Path) -> Vec<PathBuf> {
     vec![PathBuf::from(s), path.with_extension("xmp")]
 }
 
-/// Reads and parses an XMP sidecar next to `path`, if one exists.
+/// Reads and parses an XMP sidecar next to `path`, if one exists. For explicit user actions:
+/// this reads the sidecar even when it is an online-only cloud file.
 pub fn read_xmp_sidecar(path: &Path) -> Result<Option<XmpData>> {
+    read_sidecar(path, false)
+}
+
+/// With `background`, an online-only sidecar is not read (that would download it): the
+/// metadata then has no sidecar fields, as if none existed.
+fn read_sidecar(path: &Path, background: bool) -> Result<Option<XmpData>> {
     if forge_core::model::ext_of(path) == "xmp" {
         return Ok(None);
     }
     for p in sidecar_paths(path) {
         if p.is_file() {
+            if background && !forge_core::cloud::background_read_allowed(&p) {
+                return Ok(None);
+            }
             let b = bin_util::read_prefix(&p, XMP_MAX_LEN as u64)?;
             let s = decode_sidecar_xmp(&b, &p)?;
             return Ok(Some(crate::xmp_write::parse_sidecar_xmp(&s, path)));

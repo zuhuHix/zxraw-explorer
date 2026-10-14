@@ -169,6 +169,7 @@ pub fn walk_tree(
         if n.is_multiple_of(64) {
             cancel.check()?;
         }
+        // Cloud placeholder folders are listed too: that fetches names and sizes, not contents.
         let descend = e.is_dir().then(|| (e.path.clone(), e.rel.clone(), e.depth));
         visit(&WalkItem::Entry(e));
         if let Some((path, rel, depth)) = descend
