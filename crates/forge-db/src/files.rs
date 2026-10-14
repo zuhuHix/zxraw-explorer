@@ -659,97 +659,38 @@ impl Db {
     /// Rewritten rows are marked present only when their destination exists on disk. Missing
     /// targets are listed in `offline_paths`.
     pub fn relink(&self, old: &Path, new: &Path, volume: Option<VolumeId>) -> Result<RelinkReport> {
-        let old_s = normalize_dir(&path_str(old));
-        let new_s = normalize_dir(&path_str(new));
-        if old_s.is_empty() || new_s.is_empty() {
-            return Err(DbError::Invalid("relink paths must not be empty".into()));
+        self.with_tx(|tx| relink_tx(tx, old, new, volume))
+    }
+
+    /// Several renames or moves made together (a batch rename), applied as one set in one
+    /// transaction. Every source is first parked under a unique temporary path, then moved
+    /// to its destination, so swaps (A→B, B→A) and cycles keep each row's annotations on the
+    /// right file instead of merging them. A case-only rename (`a.jpg` → `A.jpg`) also
+    /// updates the stored path this way. Pairs whose paths are identical are skipped.
+    pub fn relink_many(&self, pairs: &[(PathBuf, PathBuf)]) -> Result<RelinkReport> {
+        let pairs: Vec<&(PathBuf, PathBuf)> = pairs.iter().filter(|(o, n)| o != n).collect();
+        for (old, new) in &pairs {
+            relink_paths(old, new)?;
         }
-        if old_s.eq_ignore_ascii_case(&new_s) {
-            return Ok(RelinkReport::default());
-        }
-        let (lo, hi) = subtree_bounds(&old_s);
-        if new_s.len() > old_s.len()
-            && new_s
-                .to_ascii_lowercase()
-                .starts_with(&lo.to_ascii_lowercase())
-        {
-            return Err(DbError::Invalid(
-                "cannot relink a folder into itself".into(),
-            ));
-        }
-        let old_root = volume_root_of(Path::new(&old_s));
-        let new_root = volume_root_of(Path::new(&new_s));
+        let nonce = now_ms();
         self.with_tx(|tx| {
-            let mut rows: Vec<(FileId, String, VolumeId)> = {
-                let mut st = tx.prepare(
-                    "SELECT id, path, volume_id FROM files
-                     WHERE (path = ?1 OR (path >= ?2 AND path < ?3)) AND (?4 IS NULL OR volume_id = ?4)",
-                )?;
-                st.query_map(params![old_s, lo, hi, volume], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            // Parents before children keeps parent_path consistent at every step.
-            rows.sort_by_key(|(_, p, _)| p.len());
-            let new_volume = if old_root.eq_ignore_ascii_case(&new_root) {
-                None
-            } else {
-                Some(VolumeCache::new().get(tx, Path::new(&new_s))?)
-            };
+            let mut parked = Vec::with_capacity(pairs.len());
+            for (i, (old, new)) in pairs.iter().enumerate() {
+                let mut root = volume_root_of(Path::new(&normalize_dir(&path_str(old))));
+                if !root.ends_with(SEP) {
+                    root.push(SEP);
+                }
+                let temp = PathBuf::from(format!("{root}.zxraw-relink-{nonce}-{i}"));
+                relink_tx(tx, old, &temp, None)?;
+                parked.push((temp, new));
+            }
             let mut report = RelinkReport::default();
-            let mut find = tx.prepare_cached("SELECT id FROM files WHERE path = ?1")?;
-            let mut update = tx.prepare_cached(
-                "UPDATE files SET path = ?2, path_lc = ?3, parent_path = ?4, name = ?5, name_lc = ?6,
-                     volume_id = ?7 WHERE id = ?1",
-            )?;
-            for (id, path, vol) in rows {
-                // NOCASE matched only ASCII case differences, so byte lengths agree.
-                let rest = &path[old_s.len()..];
-                let np = format!("{new_s}{rest}");
-                let pb = PathBuf::from(&np);
-                let present = std::fs::symlink_metadata(&pb).is_ok();
-                if let Some(target) = find.query_row([&np], |r| r.get::<_, i64>(0)).optional()?
-                    && target != id
-                {
-                    merge_rows_tx(
-                        tx,
-                        id,
-                        target,
-                        Path::new(&path),
-                        &pb,
-                        &mut report.conflicts,
-                    )?;
-                    tx.execute(
-                        "UPDATE files SET present = ?2 WHERE id = ?1",
-                        params![target, present],
-                    )?;
-                    if !present {
-                        report.offline_paths.push(pb);
-                    }
-                    report.merged += 1;
-                    continue;
-                }
-                let name = pb
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| np.clone());
-                let parent = pb.parent().map(path_str).unwrap_or_default();
-                update.execute(params![
-                    id,
-                    np,
-                    np.to_lowercase(),
-                    parent,
-                    name,
-                    name.to_lowercase(),
-                    new_volume.unwrap_or(vol)
-                ])?;
-                tx.execute(
-                    "UPDATE files SET present = ?2 WHERE id = ?1",
-                    params![id, present],
-                )?;
-                if !present {
-                    report.offline_paths.push(pb);
-                }
-                report.moved += 1;
+            for (temp, new) in parked {
+                let part = relink_tx(tx, &temp, new, None)?;
+                report.moved += part.moved;
+                report.merged += part.merged;
+                report.conflicts.extend(part.conflicts);
+                report.offline_paths.extend(part.offline_paths);
             }
             Ok(report)
         })
@@ -1095,6 +1036,116 @@ fn relink_conflict(source: &Path, destination: &Path, field: &str) -> RelinkConf
         destination: destination.to_path_buf(),
         field: field.to_string(),
     }
+}
+
+/// Validated, normalized `(old, new)` for a relink, or `None` when they name the same path.
+fn relink_paths(old: &Path, new: &Path) -> Result<Option<(String, String)>> {
+    let old_s = normalize_dir(&path_str(old));
+    let new_s = normalize_dir(&path_str(new));
+    if old_s.is_empty() || new_s.is_empty() {
+        return Err(DbError::Invalid("relink paths must not be empty".into()));
+    }
+    if old_s.eq_ignore_ascii_case(&new_s) {
+        return Ok(None);
+    }
+    let (lo, _) = subtree_bounds(&old_s);
+    if new_s.len() > old_s.len()
+        && new_s
+            .to_ascii_lowercase()
+            .starts_with(&lo.to_ascii_lowercase())
+    {
+        return Err(DbError::Invalid(
+            "cannot relink a folder into itself".into(),
+        ));
+    }
+    Ok(Some((old_s, new_s)))
+}
+
+/// [`Db::relink`] inside a caller's transaction.
+fn relink_tx(
+    tx: &Transaction<'_>,
+    old: &Path,
+    new: &Path,
+    volume: Option<VolumeId>,
+) -> Result<RelinkReport> {
+    let Some((old_s, new_s)) = relink_paths(old, new)? else {
+        return Ok(RelinkReport::default());
+    };
+    let (lo, hi) = subtree_bounds(&old_s);
+    let old_root = volume_root_of(Path::new(&old_s));
+    let new_root = volume_root_of(Path::new(&new_s));
+    let mut rows: Vec<(FileId, String, VolumeId)> = {
+        let mut st = tx.prepare(
+            "SELECT id, path, volume_id FROM files
+             WHERE (path = ?1 OR (path >= ?2 AND path < ?3)) AND (?4 IS NULL OR volume_id = ?4)",
+        )?;
+        st.query_map(params![old_s, lo, hi, volume], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    // Parents before children keeps parent_path consistent at every step.
+    rows.sort_by_key(|(_, p, _)| p.len());
+    let new_volume = if old_root.eq_ignore_ascii_case(&new_root) {
+        None
+    } else {
+        Some(VolumeCache::new().get(tx, Path::new(&new_s))?)
+    };
+    let mut report = RelinkReport::default();
+    let mut find = tx.prepare_cached("SELECT id FROM files WHERE path = ?1")?;
+    let mut update = tx.prepare_cached(
+        "UPDATE files SET path = ?2, path_lc = ?3, parent_path = ?4, name = ?5, name_lc = ?6,
+             volume_id = ?7 WHERE id = ?1",
+    )?;
+    for (id, path, vol) in rows {
+        // NOCASE matched only ASCII case differences, so byte lengths agree.
+        let rest = &path[old_s.len()..];
+        let np = format!("{new_s}{rest}");
+        let pb = PathBuf::from(&np);
+        let present = std::fs::symlink_metadata(&pb).is_ok();
+        if let Some(target) = find.query_row([&np], |r| r.get::<_, i64>(0)).optional()?
+            && target != id
+        {
+            merge_rows_tx(
+                tx,
+                id,
+                target,
+                Path::new(&path),
+                &pb,
+                &mut report.conflicts,
+            )?;
+            tx.execute(
+                "UPDATE files SET present = ?2 WHERE id = ?1",
+                params![target, present],
+            )?;
+            if !present {
+                report.offline_paths.push(pb);
+            }
+            report.merged += 1;
+            continue;
+        }
+        let name = pb
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| np.clone());
+        let parent = pb.parent().map(path_str).unwrap_or_default();
+        update.execute(params![
+            id,
+            np,
+            np.to_lowercase(),
+            parent,
+            name,
+            name.to_lowercase(),
+            new_volume.unwrap_or(vol)
+        ])?;
+        tx.execute(
+            "UPDATE files SET present = ?2 WHERE id = ?1",
+            params![id, present],
+        )?;
+        if !present {
+            report.offline_paths.push(pb);
+        }
+        report.moved += 1;
+    }
+    Ok(report)
 }
 
 #[cfg(test)]

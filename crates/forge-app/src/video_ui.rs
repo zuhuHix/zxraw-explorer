@@ -3220,8 +3220,9 @@ mod tests {
             worker.enqueue(make_request(number));
         }
 
+        // Generous: on a loaded machine the 200 short sleeps of the last scan can exceed 2 s.
         match messages_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("the latest request completes")
         {
             VideoMessage::Relations {

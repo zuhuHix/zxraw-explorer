@@ -234,6 +234,7 @@ pub fn update_sidecar(image_path: &Path, update: &SidecarUpdate) -> Result<Sidec
     let _guard = lock.lock();
 
     let mut snapshot = read_snapshot(&path)?;
+    let mut in_use = false;
     for _ in 0..=MAX_CHANGE_RETRIES {
         let Some(original) = snapshot.as_deref() else {
             let merged =
@@ -276,19 +277,75 @@ pub fn update_sidecar(image_path: &Path, update: &SidecarUpdate) -> Result<Sidec
         // Check again after backup I/O, which creates another opportunity for an external save.
         let bak = backup_path(&path);
         write_atomic(&bak, original)?;
-        let latest = read_snapshot(&path)?;
-        if latest.as_deref() != Some(original) {
-            snapshot = latest;
-            continue;
+        match replace_if_unchanged(&path, original, merged.as_bytes())? {
+            Replace::Done => return Ok(SidecarOutcome::Updated(path)),
+            Replace::Changed => {}
+            Replace::InUse => in_use = true,
         }
-        write_atomic(&path, merged.as_bytes())?;
-        return Ok(SidecarOutcome::Updated(path));
+        snapshot = read_snapshot(&path)?;
     }
 
+    if in_use {
+        return Err(MediaError::Unsupported(format!(
+            "{} is open for writing in another program; no update was written",
+            path.display()
+        )));
+    }
     Err(MediaError::Unsupported(format!(
         "{} changed repeatedly during the metadata edit; no update was written",
         path.display()
     )))
+}
+
+/// The result of [`replace_if_unchanged`].
+#[derive(Debug, PartialEq, Eq)]
+enum Replace {
+    Done,
+    /// The sidecar no longer holds the bytes the merge was based on.
+    Changed,
+    /// Another program has the sidecar open for writing.
+    InUse,
+}
+
+/// Replaces `path` with `bytes` only if it still holds exactly `expected`. While comparing and
+/// replacing, a handle that denies write access to everyone else is held, so another program
+/// cannot save the sidecar between the check and the rename (the rename itself is allowed
+/// because the handle shares delete access).
+fn replace_if_unchanged(path: &Path, expected: &[u8], bytes: &[u8]) -> Result<Replace> {
+    let tmp = write_temp(path, bytes)?;
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x1;
+            const FILE_SHARE_DELETE: u32 = 0x4;
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE);
+        }
+        let guard = match options.open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Replace::Changed),
+            // ERROR_SHARING_VIOLATION: someone holds the sidecar open for writing.
+            Err(e) if e.raw_os_error() == Some(32) => return Ok(Replace::InUse),
+            Err(e) => return Err(MediaError::io(path, e)),
+        };
+        let mut current = Vec::new();
+        (&guard)
+            .take(MAX_SIDECAR_BYTES + 1)
+            .read_to_end(&mut current)
+            .map_err(|e| MediaError::io(path, e))?;
+        if current != expected {
+            return Ok(Replace::Changed);
+        }
+        fs::rename(&tmp, path).map_err(|e| MediaError::io(path, e))?;
+        drop(guard);
+        Ok(Replace::Done)
+    })();
+    if !matches!(result, Ok(Replace::Done)) {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Reads the properties ZXraw edits from the RDF description belonging to this image. The
@@ -2451,6 +2508,46 @@ mod tests {
             std::fs::read(backup_path(&side)).unwrap(),
             external.as_bytes()
         );
+    }
+
+    #[test]
+    fn conditional_replace_only_replaces_the_expected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let side = dir.path().join("cond.xmp");
+        std::fs::write(&side, b"before").unwrap();
+        assert_eq!(
+            replace_if_unchanged(&side, b"other", b"after").unwrap(),
+            Replace::Changed
+        );
+        assert_eq!(std::fs::read(&side).unwrap(), b"before");
+        // The rename succeeds while the guard handle is held.
+        assert_eq!(
+            replace_if_unchanged(&side, b"before", b"after").unwrap(),
+            Replace::Done
+        );
+        assert_eq!(std::fs::read(&side).unwrap(), b"after");
+        let leftovers = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "temp files are cleaned up");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sidecar_open_for_writing_elsewhere_is_reported_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("busy.jpg");
+        write_file(dir.path(), "busy.xmp", LR_ATTRS);
+        let side = dir.path().join("busy.xmp");
+        let other_writer = OpenOptions::new().write(true).open(&side).unwrap();
+        let note = SidecarUpdate {
+            note: Some(Some("client proof".into())),
+            ..update()
+        };
+        let error = update_sidecar(&img, &note).unwrap_err().to_string();
+        assert!(error.contains("open for writing"), "{error}");
+        assert_eq!(std::fs::read_to_string(&side).unwrap(), LR_ATTRS);
+        drop(other_writer);
+        update_sidecar(&img, &note).unwrap();
+        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("client proof"));
     }
 
     #[test]

@@ -661,6 +661,7 @@ pub fn open_file(app: &mut ZxrawApp, path: &Path) {
 }
 
 pub fn poll(app: &mut ZxrawApp) -> bool {
+    crate::tags_ui::tick(app);
     let folders: Vec<PathBuf> = app
         .tabs
         .get(app.active)
@@ -837,6 +838,7 @@ pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
 }
 
 pub fn shutdown(app: &mut ZxrawApp) {
+    crate::tags_ui::flush_for_exit(app);
     // Cancel running jobs; copies clean up their partial files on cancel.
     app.ops.jobs.cancel_all();
     for q in app.ops.conflicts.drain(..) {

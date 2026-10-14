@@ -192,3 +192,83 @@ fn search_matches_notes_and_has_missing_notes() {
         set(&["IMG_003.jpg", "proof_scan.jpg"])
     );
 }
+
+/// The note now stored at path `p`.
+fn note_at(db: &Db, p: &str) -> Option<String> {
+    let id = db.file_id(Path::new(p)).unwrap().expect(p);
+    db.annotation(id).unwrap().notes
+}
+
+#[test]
+fn relink_many_swaps_two_names_without_mixing_notes() {
+    let db = Db::open_in_memory().unwrap();
+    let a = add(&db, r"D:\Shoot\a.jpg");
+    let b = add(&db, r"D:\Shoot\b.jpg");
+    db.set_notes(&[a], Some("note of a")).unwrap();
+    db.set_notes(&[b], Some("note of b")).unwrap();
+    db.set_rating(&[a], 5).unwrap();
+
+    // A batch rename that swaps the two names.
+    let report = db
+        .relink_many(&[
+            (PathBuf::from(r"D:\Shoot\a.jpg"), PathBuf::from(r"D:\Shoot\b.jpg")),
+            (PathBuf::from(r"D:\Shoot\b.jpg"), PathBuf::from(r"D:\Shoot\a.jpg")),
+        ])
+        .unwrap();
+    assert_eq!(report.moved, 2);
+    assert_eq!(report.merged, 0);
+    assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+
+    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("note of a"));
+    assert_eq!(note_at(&db, r"D:\Shoot\a.jpg").as_deref(), Some("note of b"));
+    // Row identities moved with their files.
+    assert_eq!(db.file_id(Path::new(r"D:\Shoot\b.jpg")).unwrap(), Some(a));
+    assert_eq!(db.annotation(a).unwrap().rating, 5);
+    assert_eq!(db.annotation(b).unwrap().rating, 0);
+}
+
+#[test]
+fn relink_many_rotates_a_three_cycle() {
+    let db = Db::open_in_memory().unwrap();
+    for (name, note) in [("a", "first"), ("b", "second"), ("c", "third")] {
+        let id = add(&db, &format!(r"D:\Shoot\{name}.jpg"));
+        db.set_notes(&[id], Some(note)).unwrap();
+    }
+    let p = |n: &str| PathBuf::from(format!(r"D:\Shoot\{n}.jpg"));
+    // a→b, b→c, c→a in one batch.
+    db.relink_many(&[(p("a"), p("b")), (p("b"), p("c")), (p("c"), p("a"))])
+        .unwrap();
+    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("first"));
+    assert_eq!(note_at(&db, r"D:\Shoot\c.jpg").as_deref(), Some("second"));
+    assert_eq!(note_at(&db, r"D:\Shoot\a.jpg").as_deref(), Some("third"));
+    // No temporary rows are left behind.
+    // Every row is back under its real name; no parked temporary row is left behind.
+    let all: BTreeSet<PathBuf> = db
+        .search_str(
+            "",
+            &SearchOptions {
+                include_offline: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == EntryKind::File)
+        .map(|r| r.path)
+        .collect();
+    let expected: BTreeSet<PathBuf> = ["a", "b", "c"].iter().map(|n| p(n)).collect();
+    assert_eq!(all, expected);
+}
+
+#[test]
+fn relink_many_applies_a_case_only_rename() {
+    let db = Db::open_in_memory().unwrap();
+    let id = add(&db, r"D:\Shoot\img.jpg");
+    db.set_notes(&[id], Some("keep")).unwrap();
+    db.relink_many(&[(PathBuf::from(r"D:\Shoot\img.jpg"), PathBuf::from(r"D:\Shoot\IMG.jpg"))])
+        .unwrap();
+    let rec = db.file(id).unwrap().unwrap();
+    assert_eq!(rec.path, PathBuf::from(r"D:\Shoot\IMG.jpg"));
+    assert_eq!(rec.name, "IMG.jpg");
+    assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("keep"));
+}

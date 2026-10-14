@@ -199,8 +199,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   program keeps its note on the old path until it is relinked (Collections › Relink).
 * The sidecar writer is tested for lossless merges, namespaces, and same-process serialisation,
   but it has not been tested with Lightroom, Capture One, or darktable.
-* A small cross-process race window remains. Updates within ZXraw are serialised. Another process
-  writing the same sidecar at the same moment is not excluded by a lock.
+* Updates within ZXraw are serialised. Against other programs, the final compare and replace run
+  while ZXraw holds a handle that denies other writers, and a sidecar another program has open
+  for writing is reported as a conflict instead of overwritten. A program that replaces the
+  sidecar by renaming a new file over it in that same instant is not excluded.
 * EXIF and XMP reading is tested on synthetic JPEG, TIFF, PNG, WebP, CR3, RAF, and ORF data. It has
   not been validated against real camera files from every vendor.
 
