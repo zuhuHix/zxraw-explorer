@@ -73,9 +73,22 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   and `powershell_reads_file_drop_list` pass. The file-list round trip is what these tests prove; the preferred drop effect is
   set by the same module but is not checked on its own.
 * 🟡 Clipboard interoperability with Explorer — paste into and out of Explorer has not been checked.
-* 🟡 Operation queue, pause/cancel, and report UI — `forge-app/src/ops_ui.rs` and `forge-jobs`.
-  The job pool, bounded queue, and cancellation tokens are tested (`forge-jobs`); the visual
-  queue workflow is not automated, and pause is not covered by a test.
+* ✅ Copy line: copies and moves run one at a time in a queue (Settings › File operations,
+  "Run copies and moves": queue by default, or all at once). Queued jobs wait as "Queued" in
+  the Operations panel in run order, with buttons to move a job up or down, start it now,
+  cancel it before it starts, and pause or resume the whole queue. Transfers between
+  different physical drives still run side by side (`forge_win::physical_disks`; unknown
+  drives such as network paths wait for everything ahead). A queued job plans and asks about
+  conflicts only when it starts, skips sources that vanished meanwhile ("no longer exists"),
+  and closing the app with transfers pending asks first. Engine tests in `forge-jobs`
+  (`queue_runs_one_at_a_time_in_order`, `queue_reordering_changes_what_runs_next`,
+  `cancelling_a_queued_job_never_runs_it`, `pausing_the_queue_holds_waiting_and_pauses_running_jobs`,
+  `start_now_jumps_the_queue_even_when_paused`, `transfers_on_different_disks_run_side_by_side`,
+  `parallel_mode_starts_everything`, `a_panicking_transfer_frees_the_queue`); e2e
+  `queued_copies_wait_and_a_cancelled_one_never_runs`, `queued_copy_resolves_a_conflict_created_while_it_waited`,
+  `queued_copy_skips_a_source_deleted_while_waiting` and `closing_with_queued_copies_warns`.
+* 🟡 Operation report UI — `forge-app/src/ops_ui.rs`. Per-job pause/resume works for
+  running jobs but has no test of its own; the panel layout is not checked visually.
 * ✅ Atomic, no-overwrite publishing of new files — `forge-core/src/paths.rs::never_replaces_and_moves_when_free`
   (uses `rename_no_replace`), `ops.rs::racing_destination_without_keep_both_is_reported_and_preserved`,
   `ingest.rs::ingest_manifest_publish_does_not_replace_a_racing_destination`, and

@@ -5,6 +5,7 @@
 //! * [`WorkerPool`] — a fixed-size pool with a *bounded*, *prioritised* queue so that
 //!   browsing can never spawn unlimited decode work (backpressure by design).
 //! * [`JobRegistry`] — the list of user-visible long-running jobs (copy queues, indexing…).
+//! * [`TransferQueue`] — runs copies and moves one at a time (per disk) in a user-ordered queue.
 
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -382,7 +383,7 @@ pub struct JobHandle {
     pub progress: Arc<Progress>,
     state: Arc<Mutex<JobState>>,
     log: Arc<Mutex<Vec<String>>>,
-    started: Instant,
+    started: Arc<Mutex<Instant>>,
 }
 
 impl JobHandle {
@@ -407,8 +408,10 @@ impl JobHandle {
     pub fn log_lines(&self) -> Vec<String> {
         self.log.lock().clone()
     }
+    /// Time since the job started running (a queued job's clock starts when it leaves
+    /// the queue).
     pub fn elapsed(&self) -> Duration {
-        self.started.elapsed()
+        self.started.lock().elapsed()
     }
 }
 
@@ -418,6 +421,7 @@ impl JobHandle {
 pub struct JobRegistry {
     jobs: Arc<Mutex<Vec<JobHandle>>>,
     next: Arc<AtomicU64>,
+    transfers: TransferQueue,
 }
 
 impl JobRegistry {
@@ -431,22 +435,87 @@ impl JobRegistry {
     where
         F: FnOnce(&JobHandle) -> Result<(), String> + Send + 'static,
     {
+        self.spawn_inner(kind, title.into(), None, f, || {})
+    }
+
+    /// The queue that orders copies and moves (see [`TransferQueue`]).
+    pub fn transfers(&self) -> &TransferQueue {
+        &self.transfers
+    }
+
+    /// Like [`JobRegistry::spawn`], but the job waits in [`JobRegistry::transfers`] as
+    /// [`JobState::Queued`] until its turn, and only then runs `f`. `disks` are the
+    /// physical disks the job reads and writes (`None` if unknown). If the job is
+    /// cancelled before it starts, `f` never runs and `unstarted` runs instead.
+    pub fn spawn_queued<F, U>(
+        &self,
+        kind: &str,
+        title: impl Into<String>,
+        disks: DiskSet,
+        f: F,
+        unstarted: U,
+    ) -> JobHandle
+    where
+        F: FnOnce(&JobHandle) -> Result<(), String> + Send + 'static,
+        U: FnOnce() + Send + 'static,
+    {
+        self.spawn_inner(kind, title.into(), Some(disks), f, unstarted)
+    }
+
+    fn spawn_inner<F, U>(
+        &self,
+        kind: &str,
+        title: String,
+        queued: Option<DiskSet>,
+        f: F,
+        unstarted: U,
+    ) -> JobHandle
+    where
+        F: FnOnce(&JobHandle) -> Result<(), String> + Send + 'static,
+        U: FnOnce() + Send + 'static,
+    {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let h = JobHandle {
             id,
-            title: title.into().into(),
+            title: title.into(),
             kind: kind.into(),
             cancel: CancelToken::new(),
             progress: Progress::new(),
-            state: Arc::new(Mutex::new(JobState::Running)),
+            state: Arc::new(Mutex::new(if queued.is_some() {
+                JobState::Queued
+            } else {
+                JobState::Running
+            })),
             log: Arc::new(Mutex::new(Vec::new())),
-            started: Instant::now(),
+            started: Arc::new(Mutex::new(Instant::now())),
         };
+        // Enqueue before the thread starts, so the queue order is the order of the calls.
+        let queue = queued.map(|disks| {
+            self.transfers.enqueue(id, disks);
+            self.transfers.clone()
+        });
         self.jobs.lock().push(h.clone());
         let hh = h.clone();
         let spawn = std::thread::Builder::new()
             .name(format!("job-{id}"))
             .spawn(move || {
+                // Held while `f` runs; frees the job's disks when dropped, panic or not.
+                let _slot = match &queue {
+                    Some(q) => match q.wait_turn(id, &hh.cancel) {
+                        Ok(slot) => {
+                            *hh.started.lock() = Instant::now();
+                            hh.set_state(JobState::Running);
+                            Some(slot)
+                        }
+                        Err(Cancelled) => {
+                            hh.log("cancelled before it started");
+                            hh.set_state(JobState::Cancelled);
+                            unstarted();
+                            return;
+                        }
+                    },
+                    None => None,
+                };
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&hh)));
                 let state = match r {
                     Ok(Ok(())) if hh.cancel.is_cancelled() => JobState::Cancelled,
@@ -467,6 +536,7 @@ impl JobRegistry {
                 hh.set_state(state);
             });
         if spawn.is_err() {
+            self.transfers.remove(id);
             h.log("could not start worker thread");
             h.set_state(JobState::Failed);
         }
@@ -493,6 +563,276 @@ impl JobRegistry {
         for j in self.jobs.lock().iter() {
             j.cancel.cancel();
         }
+        self.transfers.wake();
+    }
+
+    /// Cancels one job. A queued job leaves the queue at once without running.
+    pub fn cancel(&self, job: &JobHandle) {
+        job.cancel.cancel();
+        if self.transfers.remove(job.id) {
+            // Show the outcome now; the job's thread confirms it within a moment.
+            job.set_state(JobState::Cancelled);
+        }
+    }
+
+    /// Copies and moves that are waiting in the queue or running.
+    pub fn pending_transfers(&self) -> usize {
+        self.transfers.waiting().len() + self.transfers.running()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer queue
+// ---------------------------------------------------------------------------
+
+/// Physical disk numbers a transfer reads or writes. `None` means unknown, which is
+/// treated as sharing a disk with every other transfer.
+pub type DiskSet = Option<Vec<u32>>;
+
+fn disks_overlap(a: &DiskSet, b: &DiskSet) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.iter().any(|d| b.contains(d)),
+        _ => true,
+    }
+}
+
+/// Orders copies and moves. In serial mode (the default) a transfer starts only when no
+/// running transfer, and no transfer ahead of it in the queue, uses one of its disks, so
+/// transfers between unrelated disks still run side by side. In parallel mode every
+/// transfer starts at once. Pausing the queue holds waiting transfers and pauses running
+/// ones; "start now" lets one transfer jump the queue.
+#[derive(Clone)]
+pub struct TransferQueue {
+    inner: Arc<QueueInner>,
+}
+
+struct QueueInner {
+    state: Mutex<QueueState>,
+    cv: Condvar,
+}
+
+struct QueueState {
+    serial: bool,
+    paused: bool,
+    waiting: Vec<Waiting>,
+    running: Vec<Running>,
+}
+
+struct Running {
+    id: JobId,
+    disks: DiskSet,
+    cancel: CancelToken,
+}
+
+struct Waiting {
+    id: JobId,
+    disks: DiskSet,
+    forced: bool,
+}
+
+impl Default for TransferQueue {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(QueueInner {
+                state: Mutex::new(QueueState {
+                    serial: true,
+                    paused: false,
+                    waiting: Vec::new(),
+                    running: Vec::new(),
+                }),
+                cv: Condvar::new(),
+            }),
+        }
+    }
+}
+
+/// Held by a running transfer; frees its disks when dropped.
+pub struct QueueSlot {
+    queue: TransferQueue,
+    id: JobId,
+}
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        let id = self.id;
+        self.queue.inner.state.lock().running.retain(|r| r.id != id);
+        self.queue.inner.cv.notify_all();
+    }
+}
+
+impl QueueState {
+    /// Whether `waiting[at]` may start now.
+    fn admissible(&self, at: usize) -> bool {
+        let w = &self.waiting[at];
+        if w.forced {
+            return true;
+        }
+        if self.paused {
+            return false;
+        }
+        if !self.serial {
+            return true;
+        }
+        !self
+            .running
+            .iter()
+            .any(|r| disks_overlap(&r.disks, &w.disks))
+            && !self.waiting[..at]
+                .iter()
+                .any(|e| disks_overlap(&e.disks, &w.disks))
+    }
+}
+
+impl TransferQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn enqueue(&self, id: JobId, disks: DiskSet) {
+        self.inner.state.lock().waiting.push(Waiting {
+            id,
+            disks,
+            forced: false,
+        });
+        self.inner.cv.notify_all();
+    }
+
+    /// Blocks until the job may run, then returns its slot. `Err` if `cancel` fires or
+    /// the job is removed first; the job has then left the queue.
+    pub fn wait_turn(&self, id: JobId, cancel: &CancelToken) -> Result<QueueSlot, Cancelled> {
+        let mut st = self.inner.state.lock();
+        loop {
+            let at = st.waiting.iter().position(|w| w.id == id);
+            let at = match at {
+                Some(at) if !cancel.is_cancelled() => at,
+                _ => {
+                    st.waiting.retain(|w| w.id != id);
+                    drop(st);
+                    self.inner.cv.notify_all();
+                    return Err(Cancelled);
+                }
+            };
+            if st.admissible(at) {
+                let w = st.waiting.remove(at);
+                st.running.push(Running {
+                    id,
+                    disks: w.disks,
+                    cancel: cancel.clone(),
+                });
+                drop(st);
+                // Jobs behind this one may have waited only for it to leave the queue.
+                self.inner.cv.notify_all();
+                return Ok(QueueSlot {
+                    queue: self.clone(),
+                    id,
+                });
+            }
+            // Timed, so a cancelled token is noticed even without a notification.
+            self.inner.cv.wait_for(&mut st, Duration::from_millis(100));
+        }
+    }
+
+    /// Removes a waiting job; true if it was waiting.
+    pub fn remove(&self, id: JobId) -> bool {
+        let mut st = self.inner.state.lock();
+        let before = st.waiting.len();
+        st.waiting.retain(|w| w.id != id);
+        let removed = st.waiting.len() != before;
+        drop(st);
+        self.inner.cv.notify_all();
+        removed
+    }
+
+    fn wake(&self) {
+        self.inner.cv.notify_all();
+    }
+
+    /// Waiting job ids, next to run first.
+    pub fn waiting(&self) -> Vec<JobId> {
+        self.inner
+            .state
+            .lock()
+            .waiting
+            .iter()
+            .map(|w| w.id)
+            .collect()
+    }
+
+    /// 1-based place of a waiting job in the queue.
+    pub fn position(&self, id: JobId) -> Option<usize> {
+        self.inner
+            .state
+            .lock()
+            .waiting
+            .iter()
+            .position(|w| w.id == id)
+            .map(|i| i + 1)
+    }
+
+    /// Number of transfers holding a slot.
+    pub fn running(&self) -> usize {
+        self.inner.state.lock().running.len()
+    }
+
+    /// Moves a waiting job one place earlier (`up`) or later. False if it cannot move.
+    pub fn move_by(&self, id: JobId, up: bool) -> bool {
+        let mut st = self.inner.state.lock();
+        let Some(at) = st.waiting.iter().position(|w| w.id == id) else {
+            return false;
+        };
+        let to = if up { at.checked_sub(1) } else { Some(at + 1) };
+        match to {
+            Some(to) if to < st.waiting.len() => {
+                st.waiting.swap(at, to);
+                drop(st);
+                self.inner.cv.notify_all();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Lets a waiting job start at once, even if the queue is busy or paused.
+    pub fn start_now(&self, id: JobId) -> bool {
+        let mut st = self.inner.state.lock();
+        let Some(w) = st.waiting.iter_mut().find(|w| w.id == id) else {
+            return false;
+        };
+        w.forced = true;
+        drop(st);
+        self.inner.cv.notify_all();
+        true
+    }
+
+    /// Pauses or resumes the whole queue: waiting transfers stay queued and running ones
+    /// pause (or resume) at their next safe point. A transfer started with "start now"
+    /// while the queue is paused runs until paused itself.
+    pub fn set_paused(&self, paused: bool) {
+        let mut st = self.inner.state.lock();
+        st.paused = paused;
+        for r in &st.running {
+            r.cancel.set_paused(paused);
+        }
+        drop(st);
+        self.inner.cv.notify_all();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner.state.lock().paused
+    }
+
+    /// One at a time per disk (`true`, the default) or all at once.
+    pub fn set_serial(&self, serial: bool) {
+        let mut st = self.inner.state.lock();
+        if st.serial != serial {
+            st.serial = serial;
+            drop(st);
+            self.inner.cv.notify_all();
+        }
+    }
+
+    pub fn is_serial(&self) -> bool {
+        self.inner.state.lock().serial
     }
 }
 
@@ -568,5 +908,231 @@ mod tests {
         assert_eq!(ok.state(), JobState::Completed);
         assert_eq!(bad.state(), JobState::Failed);
         assert_eq!(can.state(), JobState::Cancelled);
+    }
+
+    fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let t0 = Instant::now();
+        while !cond() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A queued job that records its start in `order` and then runs until `gate` gets a
+    /// message (or is dropped).
+    fn gated(
+        reg: &JobRegistry,
+        name: &'static str,
+        disks: DiskSet,
+        order: &Arc<Mutex<Vec<&'static str>>>,
+    ) -> (JobHandle, mpsc::Sender<()>) {
+        let (tx, rx) = mpsc::channel::<()>();
+        let order = order.clone();
+        let h = reg.spawn_queued(
+            "transfer",
+            name,
+            disks,
+            move |_| {
+                order.lock().push(name);
+                let _ = rx.recv();
+                Ok(())
+            },
+            || {},
+        );
+        (h, tx)
+    }
+
+    fn quiet(reg: &JobRegistry) {
+        wait_until("all finished", || reg.running_count() == 0);
+    }
+
+    #[test]
+    fn queue_runs_one_at_a_time_in_order() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        let (c, gc) = gated(&reg, "c", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(b.state(), JobState::Queued);
+        assert_eq!(c.state(), JobState::Queued);
+        assert_eq!(reg.transfers().waiting(), vec![b.id, c.id]);
+        assert_eq!(reg.transfers().position(c.id), Some(2));
+        assert_eq!(reg.pending_transfers(), 3);
+        drop(ga);
+        wait_until("b runs", || b.state() == JobState::Running);
+        assert_eq!(c.state(), JobState::Queued);
+        drop(gb);
+        drop(gc);
+        quiet(&reg);
+        assert_eq!(*order.lock(), vec!["a", "b", "c"]);
+        assert_eq!(reg.pending_transfers(), 0);
+    }
+
+    #[test]
+    fn queue_reordering_changes_what_runs_next() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        let (c, gc) = gated(&reg, "c", None, &order);
+        let (d, gd) = gated(&reg, "d", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        let q = reg.transfers();
+        assert!(q.move_by(d.id, true));
+        assert!(q.move_by(d.id, true));
+        assert!(!q.move_by(d.id, true), "already first");
+        assert!(q.move_by(b.id, false));
+        assert!(!q.move_by(b.id, false), "already last");
+        assert!(!q.move_by(a.id, true), "running jobs are not in the queue");
+        assert_eq!(q.waiting(), vec![d.id, c.id, b.id]);
+        drop((ga, gb, gc, gd));
+        quiet(&reg);
+        assert_eq!(*order.lock(), vec!["a", "d", "c", "b"]);
+    }
+
+    #[test]
+    fn cancelling_a_queued_job_never_runs_it() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let ran = Arc::new(AtomicBool::new(false));
+        let unstarted = Arc::new(AtomicBool::new(false));
+        let (r, u) = (ran.clone(), unstarted.clone());
+        let b = reg.spawn_queued(
+            "transfer",
+            "b",
+            None,
+            move |_| {
+                r.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            move || u.store(true, Ordering::SeqCst),
+        );
+        let (c, gc) = gated(&reg, "c", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        reg.cancel(&b);
+        assert_eq!(b.state(), JobState::Cancelled);
+        assert_eq!(reg.transfers().waiting(), vec![c.id]);
+        wait_until("unstarted callback", || unstarted.load(Ordering::SeqCst));
+        drop((ga, gc));
+        quiet(&reg);
+        assert!(!ran.load(Ordering::SeqCst));
+        assert_eq!(b.state(), JobState::Cancelled);
+        assert_eq!(*order.lock(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn cancel_all_releases_queued_jobs() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, _ga) = gated(&reg, "a", None, &order);
+        let (b, _gb) = gated(&reg, "b", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        reg.cancel_all();
+        wait_until("b cancelled", || b.state() == JobState::Cancelled);
+        assert_eq!(*order.lock(), vec!["a"]);
+    }
+
+    #[test]
+    fn pausing_the_queue_holds_waiting_and_pauses_running_jobs() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        let q = reg.transfers();
+        q.set_paused(true);
+        assert!(q.is_paused());
+        assert_eq!(a.state(), JobState::Paused);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        drop(ga);
+        wait_until("a done", || a.state() == JobState::Completed);
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(b.state(), JobState::Queued, "a paused queue starts nothing");
+        q.set_paused(false);
+        wait_until("b runs", || b.state() == JobState::Running);
+        assert!(!b.cancel.is_paused());
+        drop(gb);
+        quiet(&reg);
+        assert_eq!(*order.lock(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn start_now_jumps_the_queue_even_when_paused() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", None, &order);
+        let (b, gb) = gated(&reg, "b", None, &order);
+        let (c, gc) = gated(&reg, "c", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        reg.transfers().set_paused(true);
+        assert!(reg.transfers().start_now(c.id));
+        wait_until("c runs beside a", || c.state() == JobState::Running);
+        assert_eq!(b.state(), JobState::Queued);
+        reg.transfers().set_paused(false);
+        drop(gc);
+        drop(ga);
+        wait_until("b runs", || b.state() == JobState::Running);
+        drop(gb);
+        quiet(&reg);
+        assert_eq!(*order.lock(), vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn transfers_on_different_disks_run_side_by_side() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, ga) = gated(&reg, "a", Some(vec![0, 1]), &order);
+        let (b, gb) = gated(&reg, "b", Some(vec![2]), &order);
+        let (c, gc) = gated(&reg, "c", Some(vec![1, 3]), &order);
+        // Unknown disks wait for everything ahead of them.
+        let (d, gd) = gated(&reg, "d", None, &order);
+        // Disk 4 is free, but d (unknown disks) is ahead of it.
+        let (e, ge) = gated(&reg, "e", Some(vec![4]), &order);
+        wait_until("a and b run", || {
+            a.state() == JobState::Running && b.state() == JobState::Running
+        });
+        std::thread::sleep(Duration::from_millis(150));
+        for j in [&c, &d, &e] {
+            assert_eq!(j.state(), JobState::Queued, "{}", j.title);
+        }
+        drop(ga);
+        wait_until("c runs", || c.state() == JobState::Running);
+        assert_eq!(d.state(), JobState::Queued);
+        drop(gb);
+        drop(gc);
+        wait_until("d runs", || d.state() == JobState::Running);
+        assert_eq!(e.state(), JobState::Queued);
+        drop(gd);
+        drop(ge);
+        quiet(&reg);
+    }
+
+    #[test]
+    fn parallel_mode_starts_everything() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (a, _ga) = gated(&reg, "a", None, &order);
+        wait_until("a runs", || a.state() == JobState::Running);
+        let (b, _gb) = gated(&reg, "b", None, &order);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(b.state(), JobState::Queued);
+        reg.transfers().set_serial(false);
+        wait_until("b runs", || b.state() == JobState::Running);
+        let (c, _gc) = gated(&reg, "c", None, &order);
+        wait_until("c runs", || c.state() == JobState::Running);
+    }
+
+    #[test]
+    fn a_panicking_transfer_frees_the_queue() {
+        let reg = JobRegistry::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let a = reg.spawn_queued("transfer", "a", None, |_| panic!("boom"), || {});
+        let (b, gb) = gated(&reg, "b", None, &order);
+        wait_until("b runs", || b.state() == JobState::Running);
+        assert_eq!(a.state(), JobState::Failed);
+        drop(gb);
+        quiet(&reg);
     }
 }

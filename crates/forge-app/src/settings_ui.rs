@@ -655,12 +655,26 @@ fn file_operations_page(ui: &mut egui::Ui, settings: &mut Settings) {
     page_heading(
         ui,
         "File operations",
-        "Choose whether copied files are checked after they are written.",
+        "Choose how copies are checked and whether they run one at a time.",
     );
     ui.add_space(10.0);
     ui.checkbox(
         &mut settings.verify_copies,
         "Verify copies with a BLAKE3 checksum",
+    );
+    ui.add_space(12.0);
+    ui.label("Run copies and moves:");
+    ui.horizontal(|ui| {
+        ui.radio_value(&mut settings.transfer_queue, true, "One at a time (queue)");
+        ui.radio_value(&mut settings.transfer_queue, false, "All at once");
+    });
+    ui.label(
+        RichText::new(
+            "In queue mode, transfers wait their turn in the Operations panel. \
+             Transfers between different physical drives can still run at the same time.",
+        )
+        .weak()
+        .small(),
     );
 }
 

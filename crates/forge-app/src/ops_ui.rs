@@ -120,7 +120,38 @@ fn start_transfer_with(
     // move-copy path in that case so tests exercise the same verified fallback used for
     // cross-volume moves. Not `testhook.active()`: it is false while a script step runs.
     let force_copy_for_move = kind == OpKind::Move && forge_core::fault::is_armed();
-    app.ops.jobs.spawn("transfer", title, move |job| {
+    app.ops
+        .jobs
+        .transfers()
+        .set_serial(app.settings.transfer_queue);
+    let disks = transfer_disks(&sources, &dest);
+    // Taken by whichever runs: the job, or the callback for a job cancelled while queued.
+    let completion = std::sync::Arc::new(parking_lot::Mutex::new(completion));
+    let unstarted = {
+        let (completion, tx, ctx) = (completion.clone(), tx.clone(), ctx.clone());
+        let title = title.clone();
+        move || {
+            let _ = tx.send(Event::Toast(format!(
+                "{title} — cancelled before it started"
+            )));
+            if let Some(completion) = completion.lock().take() {
+                let _ = tx.send(Event::MoveFinished {
+                    sources: completion.sources,
+                    ok: false,
+                    clipboard_generation: completion.generation,
+                    expected_sequence: completion.expected_sequence,
+                });
+            }
+            ctx.request_repaint();
+        }
+    };
+    let job_body = move |job: &JobHandle| {
+        let completion = completion.lock().take();
+        // A queued job starts later: anything that vanished meanwhile is skipped, not
+        // failed. Conflicts are looked at only now, when the job runs.
+        let (sources, vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
+            .into_iter()
+            .partition(|s| forge_core::paths::exists_no_follow(s));
         let opts = OpOptions {
             policy,
             verify,
@@ -169,7 +200,12 @@ fn start_transfer_with(
                 }
             }
         };
-        let report = ops::execute(&plan, job, &mut resolver);
+        let mut report = ops::execute(&plan, job, &mut resolver);
+        for path in vanished {
+            report
+                .skipped
+                .push(ops::OpIssue::new(path, "no longer exists"));
+        }
         let move_ok = report.failed.is_empty() && report.skipped.is_empty() && !report.cancelled;
         finish_report(
             job,
@@ -191,7 +227,45 @@ fn start_transfer_with(
         }
         ctx.request_repaint();
         Ok(())
-    });
+    };
+    app.ops
+        .jobs
+        .spawn_queued("transfer", title, disks, job_body, unstarted);
+}
+
+/// Physical disks a transfer reads and writes, or `None` if any of them is unknown
+/// (network paths). Looked up per drive letter and cached briefly, because a drive
+/// letter can be given to another card reader or USB disk.
+fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
+    use std::collections::HashMap;
+    use std::path::Component;
+    use std::sync::LazyLock;
+    use std::time::Instant;
+
+    static CACHE: LazyLock<parking_lot::Mutex<HashMap<String, (Instant, Option<Vec<u32>>)>>> =
+        LazyLock::new(Default::default);
+    let mut disks = Vec::new();
+    for path in sources.iter().map(PathBuf::as_path).chain([dest]) {
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return None;
+        };
+        let key = prefix.as_os_str().to_string_lossy().to_lowercase();
+        let found = {
+            let mut cache = CACHE.lock();
+            match cache.get(&key) {
+                Some((at, found)) if at.elapsed() < Duration::from_secs(30) => found.clone(),
+                _ => {
+                    let found = forge_win::physical_disks(path);
+                    cache.insert(key, (Instant::now(), found.clone()));
+                    found
+                }
+            }
+        };
+        disks.extend(found?);
+    }
+    disks.sort_unstable();
+    disks.dedup();
+    Some(disks)
 }
 
 fn finish_report(
@@ -399,7 +473,17 @@ pub fn conflict_dialog(app: &mut ZxrawApp, ctx: &egui::Context) -> bool {
     true
 }
 
+/// What the user asked for in a queued row.
+enum QueueAction {
+    Up,
+    Down,
+    StartNow,
+}
+
 pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
+    close_guard(app, ctx);
+    let queue = app.ops.jobs.transfers().clone();
+    queue.set_serial(app.settings.transfer_queue);
     let mut open = app.ops.show_jobs;
     egui::Window::new("Operations")
         .open(&mut open)
@@ -410,14 +494,59 @@ pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
             if jobs.is_empty() {
                 ui.label(RichText::new("No operations yet.").weak());
             }
+            let waiting = queue.waiting();
+            let paused = queue.is_paused();
+            if !waiting.is_empty() || paused || app.ops.jobs.pending_transfers() > 0 {
+                ui.horizontal(|ui| {
+                    let text = match (waiting.len(), paused) {
+                        (0, true) => "Queue paused".to_string(),
+                        (n, true) => format!("Queue paused · {n} waiting"),
+                        (n, false) => format!("{n} waiting in the queue"),
+                    };
+                    ui.label(RichText::new(text).strong());
+                    let label = if paused {
+                        "Resume queue"
+                    } else {
+                        "Pause queue"
+                    };
+                    if ui
+                        .button(label)
+                        .on_hover_text(
+                            "Pausing holds waiting copies and moves and pauses running ones",
+                        )
+                        .clicked()
+                    {
+                        queue.set_paused(!paused);
+                    }
+                });
+                ui.separator();
+            }
+            let mut action = None;
             egui::ScrollArea::vertical()
                 .max_height(420.0)
                 .show(ui, |ui| {
-                    for j in jobs.iter().rev() {
-                        job_row(ui, j);
+                    // Waiting transfers first, in the order they will run.
+                    for (i, id) in waiting.iter().enumerate() {
+                        let Some(j) = jobs.iter().find(|j| j.id == *id) else {
+                            continue;
+                        };
+                        let place = (i + 1, waiting.len());
+                        if let Some(a) = job_row(ui, &app.ops.jobs, j, Some(place)) {
+                            action = Some((j.id, a));
+                        }
+                        ui.separator();
+                    }
+                    for j in jobs.iter().rev().filter(|j| !waiting.contains(&j.id)) {
+                        job_row(ui, &app.ops.jobs, j, None);
                         ui.separator();
                     }
                 });
+            match action {
+                Some((id, QueueAction::Up)) => _ = queue.move_by(id, true),
+                Some((id, QueueAction::Down)) => _ = queue.move_by(id, false),
+                Some((id, QueueAction::StartNow)) => _ = queue.start_now(id),
+                None => {}
+            }
             if ui.button("Clear finished").clicked() {
                 app.ops.jobs.clear_finished();
             }
@@ -425,27 +554,141 @@ pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     app.ops.show_jobs = open;
 }
 
-fn job_row(ui: &mut Ui, j: &JobHandle) {
+/// Lets the close guard run in automation (scripts that test it turn it on).
+pub static CLOSE_GUARD_IN_AUTOMATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn close_warning_id() -> egui::Id {
+    egui::Id::new("close-with-transfers")
+}
+
+/// True while the "copies still waiting" warning is shown.
+pub fn close_warning_open(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(close_warning_id()))
+        .unwrap_or(false)
+}
+
+/// Warns before the window closes while copies or moves are queued or running: closing
+/// cancels them (running copies remove their partial files).
+fn close_guard(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let guarded = !app.testhook.active()
+        || CLOSE_GUARD_IN_AUTOMATION.load(std::sync::atomic::Ordering::Relaxed);
+    let pending = app.ops.jobs.pending_transfers();
+    let confirmed_id = egui::Id::new("close-with-transfers-confirmed");
+    let confirmed = ctx
+        .data(|d| d.get_temp::<bool>(confirmed_id))
+        .unwrap_or(false);
+    if guarded && pending > 0 && !confirmed && ctx.input(|i| i.viewport().close_requested()) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        ctx.data_mut(|d| d.insert_temp(close_warning_id(), true));
+    }
+    if !close_warning_open(ctx) {
+        return;
+    }
+    if pending == 0 {
+        // Everything finished while the warning was open.
+        ctx.data_mut(|d| d.insert_temp(close_warning_id(), false));
+        return;
+    }
+    let waiting = app.ops.jobs.transfers().waiting().len();
+    let mut choice = None;
+    egui::Modal::new(close_warning_id()).show(ctx, |ui| {
+        ui.set_width(420.0);
+        ui.heading("Copies are not finished");
+        ui.add_space(4.0);
+        let running = pending - waiting;
+        ui.label(format!(
+            "{running} copy or move operation(s) running and {waiting} waiting in the queue. \
+             Closing cancels them; files already copied stay where they are."
+        ));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Keep open").clicked() {
+                choice = Some(false);
+            }
+            if ui.button("Show operations").clicked() {
+                app.ops.show_jobs = true;
+                choice = Some(false);
+            }
+            let close =
+                egui::Button::new(RichText::new("Close anyway").color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(170, 60, 50));
+            if ui.add(close).clicked() {
+                choice = Some(true);
+            }
+        });
+    });
+    if let Some(close) = choice {
+        ctx.data_mut(|d| d.insert_temp(close_warning_id(), false));
+        if close {
+            ctx.data_mut(|d| d.insert_temp(confirmed_id, true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+}
+
+fn job_row(
+    ui: &mut Ui,
+    jobs: &forge_jobs::JobRegistry,
+    j: &JobHandle,
+    place: Option<(usize, usize)>,
+) -> Option<QueueAction> {
     let snap = j.progress.snapshot();
     let state = j.state();
+    let mut action = None;
     ui.horizontal(|ui| {
+        if let Some((n, _)) = place {
+            ui.label(RichText::new(format!("{n}.")).weak());
+        }
         ui.label(RichText::new(j.title.as_ref()).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !state.is_finished() {
                 if ui.small_button("Cancel").clicked() {
-                    j.cancel.cancel();
+                    jobs.cancel(j);
                 }
-                let paused = state == JobState::Paused;
-                if ui
-                    .small_button(if paused { "Resume" } else { "Pause" })
-                    .clicked()
-                {
-                    j.cancel.set_paused(!paused);
+                if let Some((n, len)) = place {
+                    if ui
+                        .small_button("Start now")
+                        .on_hover_text("Start this one without waiting for its turn")
+                        .clicked()
+                    {
+                        action = Some(QueueAction::StartNow);
+                    }
+                    if ui
+                        .add_enabled(n < len, egui::Button::new("⏷").small())
+                        .on_hover_text("Run later")
+                        .clicked()
+                    {
+                        action = Some(QueueAction::Down);
+                    }
+                    if ui
+                        .add_enabled(n > 1, egui::Button::new("⏶").small())
+                        .on_hover_text("Run sooner")
+                        .clicked()
+                    {
+                        action = Some(QueueAction::Up);
+                    }
+                } else if state != JobState::Queued {
+                    let paused = state == JobState::Paused;
+                    if ui
+                        .small_button(if paused { "Resume" } else { "Pause" })
+                        .clicked()
+                    {
+                        j.cancel.set_paused(!paused);
+                    }
                 }
             }
             ui.label(RichText::new(format!("{state:?}")).weak());
         });
     });
+    if state == JobState::Queued {
+        ui.label(
+            RichText::new("Waiting for its turn. Conflicts are checked when it starts.")
+                .small()
+                .weak(),
+        );
+        return action;
+    }
     let frac = snap.fraction();
     let secs = j.elapsed().as_secs_f64().max(0.001);
     let rate = snap.bytes_done as f64 / secs;
@@ -497,4 +740,5 @@ fn job_row(ui: &mut Ui, j: &JobHandle) {
             }
         });
     }
+    action
 }

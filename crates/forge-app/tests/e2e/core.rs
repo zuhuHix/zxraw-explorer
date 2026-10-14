@@ -117,6 +117,150 @@ fn copy_with_conflict_keep_both_writes_a_numbered_copy() {
 }
 
 #[test]
+fn queued_copies_wait_and_a_cancelled_one_never_runs() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    let a = noise(64 * 1024, 11);
+    let b = noise(64 * 1024, 12);
+    let c = noise(96 * 1024, 13);
+    let c2 = noise(8 * 1024, 14);
+    write_file(&src.join("a.txt"), &a);
+    write_file(&src.join("b.txt"), &b);
+    write_file(&src.join("c.txt"), &c);
+    write_file(&src.join("c2.txt"), &c2);
+    fs::create_dir_all(&dst).unwrap();
+    // Titles read "Copying N item(s) to dst", so the queued copies get distinct item counts
+    // (a: 1, b: 1, c: 2) that `assert-queue-order` can tell apart.
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "ui system pause-queue",
+            "select a.txt",
+            "cmd CopyToOtherPane",
+            "select b.txt",
+            "cmd CopyToOtherPane",
+            "select c.txt, c2.txt",
+            "cmd CopyToOtherPane",
+            "ui system assert-queued 3",
+            "sleep 300",
+            &format!("assert-missing {}", shown(&dst.join("a.txt"))),
+            "ui system assert-queue-order 1 item(s), 1 item(s), 2 item(s)",
+            "ui system queue-cancel 2",
+            "ui system assert-queued 2",
+            "ui system assert-queue-order 1 item(s), 2 item(s)",
+            "ui system queue-up 2",
+            "ui system assert-queue-order 2 item(s), 1 item(s)",
+            "ui system resume-queue",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dst.join("a.txt")).unwrap(), a);
+    assert_eq!(fs::read(dst.join("c.txt")).unwrap(), c);
+    assert_eq!(fs::read(dst.join("c2.txt")).unwrap(), c2);
+    assert!(
+        !dst.join("b.txt").exists(),
+        "a cancelled queued copy must never run"
+    );
+}
+
+#[test]
+fn queued_copy_resolves_a_conflict_created_while_it_waited() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    write_file(&src.join("name.txt"), b"incoming");
+    fs::create_dir_all(&dst).unwrap();
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "ui system pause-queue",
+            "select name.txt",
+            "cmd CopyToOtherPane",
+            &format!("ui tools external create {}", shown(&dst.join("name.txt"))),
+            "ui system resume-queue",
+            "conflict keep-both",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(
+        fs::read(dst.join("name.txt")).unwrap(),
+        vec![b'x'; 4096],
+        "the file created while the copy waited must be kept"
+    );
+    assert_eq!(fs::read(dst.join("name (2).txt")).unwrap(), b"incoming");
+}
+
+#[test]
+fn queued_copy_skips_a_source_deleted_while_waiting() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    write_file(&src.join("x.txt"), b"x stays");
+    write_file(&src.join("y.txt"), b"y goes away");
+    fs::create_dir_all(&dst).unwrap();
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "ui system pause-queue",
+            "select x.txt, y.txt",
+            "cmd CopyToOtherPane",
+            &format!("ui tools external delete {}", shown(&src.join("y.txt"))),
+            "ui system resume-queue",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dst.join("x.txt")).unwrap(), b"x stays");
+    assert!(
+        !dst.join("y.txt").exists(),
+        "a source that vanished while queued must be skipped"
+    );
+}
+
+#[test]
+fn closing_with_queued_copies_warns() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    let bytes = noise(16 * 1024, 21);
+    write_file(&src.join("f.txt"), &bytes);
+    fs::create_dir_all(&dst).unwrap();
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "ui system pause-queue",
+            "select f.txt",
+            "cmd CopyToOtherPane",
+            "ui system request-close",
+            "ui system assert-close-warning",
+            "ui system resume-queue",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dst.join("f.txt")).unwrap(), bytes);
+}
+
+#[test]
 fn move_to_other_pane_removes_the_source() {
     let sandbox = tempfile::tempdir().unwrap();
     let src = sandbox.path().join("src");

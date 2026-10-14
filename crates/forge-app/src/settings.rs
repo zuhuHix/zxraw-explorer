@@ -95,6 +95,9 @@ pub struct Settings {
     pub thumb_mem_cache_mb: u64,
     pub thumb_disk_cache_mb: u64,
     pub verify_copies: bool,
+    /// Run copies and moves one at a time in a queue (`true`, default) or all at once.
+    /// Transfers between unrelated physical disks may still run side by side in queue mode.
+    pub transfer_queue: bool,
     pub ffmpeg_dir: Option<PathBuf>,
     pub bookmarks: Vec<PathBuf>,
     pub external_tools: Vec<ExternalTool>,
@@ -137,6 +140,7 @@ impl Default for Settings {
             thumb_mem_cache_mb: 512,
             thumb_disk_cache_mb: 4096,
             verify_copies: false,
+            transfer_queue: true,
             ffmpeg_dir: None,
             bookmarks: Vec::new(),
             external_tools: Vec::new(),
@@ -273,6 +277,15 @@ mod tests {
         assert_eq!(settings.accent, Accent::Blue);
         assert_eq!(settings.bookmarks, vec![PathBuf::from(r"C:\Photos")]);
         assert_eq!(settings.keybindings.get("NewTab"), Some(&Some("Ctrl+Shift+T".to_string())));
+    }
+
+    #[test]
+    fn settings_without_transfer_queue_default_to_queue() {
+        let settings: Settings = serde_json::from_str(r#"{"verify_copies": true}"#).unwrap();
+        assert!(settings.transfer_queue);
+        assert!(settings.verify_copies);
+        let settings: Settings = serde_json::from_str(r#"{"transfer_queue": false}"#).unwrap();
+        assert!(!settings.transfer_queue);
     }
 
     #[test]
