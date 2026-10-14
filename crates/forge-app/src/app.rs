@@ -592,10 +592,17 @@ impl ZxrawApp {
         // - any other widget (a toolbar or sidebar button that was clicked) or nothing: the
         //   file list. A clicked button keeps egui focus, and egui would otherwise move that
         //   focus between buttons with the arrow keys instead of moving the file cursor.
-        let focused = ctx.memory(|m| m.focused());
-        let list_focus = [false, true]
-            .into_iter()
-            .any(|right| views::list_has_focus(ctx, egui::Id::new(("pane", self.active, right))));
+        let mut focused = ctx.memory(|m| m.focused());
+        // A row of the other pane can keep egui focus after the active pane changed (Tab, a
+        // click, a command). Only the active pane's list handles keys, so that stale focus
+        // would swallow them: drop it, and the active pane's cursor row takes focus.
+        let inactive = egui::Id::new(("pane", self.active, self.tab().focus != Side::Right));
+        if views::list_has_focus(ctx, inactive) {
+            if let Some(id) = focused.take() {
+                ctx.memory_mut(|m| m.surrender_focus(id));
+            }
+        }
+        let list_focus = views::list_has_focus(ctx, self.pane_view_id());
         let text_focus = ctx.text_edit_focused() || list_focus;
         // A focused button still answers Tab, Enter and Space itself (keyboard access).
         let widget_focus = focused.is_some() && !text_focus;
