@@ -428,7 +428,8 @@ fn folders_open_in_place_with_arrows_and_clicks() {
         late = shown(&work.join("Shoot").join("Selects").join("late.txt")),
         work = shown(&work),
         shot = shown(&shot),
-        img02 = shown(&work.join("Shoot").join("img_02.txt")),        selects = shown(&work.join("Shoot").join("Selects")),
+        img02 = shown(&work.join("Shoot").join("img_02.txt")),
+        selects = shown(&work.join("Shoot").join("Selects")),
     );
     let outcome = run_app(temp.path(), &profile, &script);
     expect_ok(&outcome);
