@@ -64,7 +64,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Duplicates re-verified on disk before recycling — `forge-app/src/tools_ui.rs::recycle_reverifies_against_disk`
   and `duplicate_selection_safety_refuses_to_remove_the_last_copy`.
 * 🟡 Open files, Open With, Properties, and reveal in Explorer — `forge-win/src/shell.rs`.
-  No test drives these Windows shell calls.
+  Opened files start in their own folder, as in Explorer, so scripts and programs using relative
+  paths work — `shell::tests::opened_batch_script_runs_in_its_own_folder` runs a real `.bat`.
+  No test drives Open With, Properties, or reveal.
 * ✅ Clipboard engine: copy and move as `CF_HDROP` — `forge-win/src/clipboard.rs` tests
   `files_round_trip_for_copy_and_move_including_long_unicode_paths`,
   `setting_files_increments_clipboard_sequence`, `clear_if_owned_files_does_not_clear_a_changed_sequence`,
