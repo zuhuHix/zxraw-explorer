@@ -14,8 +14,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use gix::status::plumbing::index_as_worktree::EntryStatus;
 use gix::status::plumbing::index_as_worktree::traits::{CompareBlobs, ReadData, SubmoduleStatus};
+use gix::status::plumbing::index_as_worktree::{Change, EntryStatus};
 use gix::status::plumbing::index_as_worktree_with_renames::{Entry, VisitEntry};
 
 /// Longest a status walk may take before it is stopped.
@@ -578,10 +578,14 @@ fn read_within(
     let mut status = RepoStatus::new(root.to_path_buf(), branch);
 
     // Tracked files: stat data against the index.
+    let mut tracked = Tracked {
+        status: &mut status,
+        suspects: Vec::new(),
+    };
     repo.index_worktree_status(
         &index,
         None::<&str>,
-        &mut Tracked(&mut status),
+        &mut tracked,
         StatOnly,
         NoSubmodules,
         &mut gix::progress::Discard,
@@ -594,6 +598,17 @@ fn read_within(
         },
     )
     .map_err(|e| err(&e))?;
+    // Same size but a new time: hash the bytes, as git would after a touch or right after a
+    // commit. Past the caps a file simply counts as modified.
+    let suspects = std::mem::take(&mut tracked.suspects);
+    for (n, (rela_path, id)) in suspects.into_iter().enumerate() {
+        if over() {
+            return Err(Failure::TooBig);
+        }
+        if n >= MAX_HASHED_FILES || !same_as_blob(&root.join(&rela_path), &id) {
+            status.add(&rela_path, GitBadge::Modified);
+        }
+    }
     if over() {
         return Err(Failure::TooBig);
     }
@@ -676,22 +691,43 @@ fn git_file_points_to_network(root: &Path) -> bool {
     target.starts_with(r"\\") || target.starts_with("//")
 }
 
-/// Compares tracked files by their index stat data only. Never reading a file is what keeps
-/// filter drivers (`filter.<name>.clean` / `.process`) from running.
+/// Compares tracked files by their index stat data only, reporting whether the size changed.
+/// It never reads a file through gix: that is what keeps filter drivers
+/// (`filter.<name>.clean` / `.process`) from running.
 #[derive(Clone)]
 struct StatOnly;
 
 impl CompareBlobs for StatOnly {
-    type Output = ();
+    /// `true` when the size differs from the index (certainly modified).
+    type Output = bool;
     fn compare_blobs<'a, 'b>(
         &mut self,
-        _entry: &gix::index::Entry,
-        _worktree_blob_size: u64,
+        entry: &gix::index::Entry,
+        worktree_blob_size: u64,
         _data: impl ReadData<'a>,
         _buf: &mut Vec<u8>,
-    ) -> gix::Result<Option<()>> {
-        Ok(Some(()))
+    ) -> gix::Result<Option<bool>> {
+        Ok(Some(worktree_blob_size != u64::from(entry.stat.size)))
     }
+}
+
+/// Most same-size files whose contents are hashed to tell a real change from a touched or
+/// racily-clean file (one written in the same second as the index).
+const MAX_HASHED_FILES: usize = 256;
+/// Largest file hashed for that check; bigger ones count as modified.
+const MAX_HASHED_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Does the file at `path` still hash to `id` as a blob? Reads the raw bytes itself, with no
+/// filter or line-ending conversion, so a filtered file may count as changed, never the
+/// reverse.
+fn same_as_blob(path: &Path, id: &gix::ObjectId) -> bool {
+    if std::fs::symlink_metadata(path).map_or(true, |m| !m.is_file() || m.len() > MAX_HASHED_BYTES)
+    {
+        return false;
+    }
+    std::fs::read(path).is_ok_and(|bytes| {
+        gix::objs::compute_hash(id.kind(), gix::objs::Kind::Blob, &bytes).is_ok_and(|h| h == *id)
+    })
 }
 
 /// Submodules are listed as folders without looking inside them.
@@ -709,25 +745,39 @@ impl SubmoduleStatus for NoSubmodules {
     }
 }
 
-/// Badges for tracked files that differ from the index.
-struct Tracked<'s>(&'s mut RepoStatus);
+/// Badges for tracked files that differ from the index. Same-size changes go to `suspects`
+/// for a content check.
+struct Tracked<'s> {
+    status: &'s mut RepoStatus,
+    suspects: Vec<(String, gix::ObjectId)>,
+}
 
 impl<'index> VisitEntry<'index> for Tracked<'_> {
-    type ContentChange = ();
+    type ContentChange = bool;
     type SubmoduleStatus = ();
 
-    fn visit_entry(&mut self, entry: Entry<'index, (), ()>) {
+    fn visit_entry(&mut self, entry: Entry<'index, bool, ()>) {
         if let Entry::Modification {
-            rela_path, status, ..
+            rela_path,
+            status,
+            entry,
+            ..
         } = entry
         {
             let badge = match status {
                 EntryStatus::Conflict { .. } => GitBadge::Conflicted,
                 EntryStatus::IntentToAdd => GitBadge::Added,
                 EntryStatus::NeedsUpdate(_) => return,
+                EntryStatus::Change(Change::Modification {
+                    content_change: Some(false),
+                    ..
+                }) => {
+                    self.suspects.push((rela_path.to_string(), entry.id));
+                    return;
+                }
                 EntryStatus::Change(_) => GitBadge::Modified,
             };
-            self.0.add(&rela_path.to_string(), badge);
+            self.status.add(&rela_path.to_string(), badge);
         }
     }
 }
@@ -1089,6 +1139,21 @@ mod tests {
         assert_eq!(
             small(|l| l.time = Duration::ZERO).unwrap_err(),
             Failure::TooBig
+        );
+    }
+
+    #[test]
+    fn a_rewritten_file_with_the_same_contents_is_clean() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        // The committed `.gitignore`, rewritten byte for byte: new time, same size and content.
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        let status = read_status(root).expect("status");
+        assert_eq!(status.badge(&root.join(".gitignore"), false), None);
+        assert_eq!(
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
         );
     }
 }

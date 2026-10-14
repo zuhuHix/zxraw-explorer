@@ -216,8 +216,10 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * 🟡 Git status badges — `forge-app/src/git_status.rs`: modified, new (added or untracked),
   ignored (dimmed) and conflicted entries, rolled up to folders, and the branch in the status
   bar. Read in-process with `gix` on one background thread; no external program ever runs (no
-  `git.exe`, no fsmonitor, no filter drivers: file contents are never read, a tracked file whose
-  stat data differs from the index counts as modified). Config is the repository's own only.
+  `git.exe`, no fsmonitor, no filter drivers: gix never reads file contents; a size change counts
+  as modified, and a same-size file with a new time is hashed by the app from its raw bytes,
+  at most 256 files of up to 16 MB, to tell a real change from a touch or a racily-clean entry).
+  Config is the repository's own only.
   One budget covers the whole read, from opening the repository: 4 s, a 64 MB / 100,000-entry
   index and 50,000 folders and files visited by the walk (each file of an untracked folder
   counts); a repository over any of them is skipped for the session. Refused without being

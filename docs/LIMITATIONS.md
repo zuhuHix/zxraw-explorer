@@ -29,9 +29,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 ## Windows shell and file exchange
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
-  administrator or on a network (UNC) path; choose PowerShell instead. Git badges compare file
-  size and time with the index and never read contents, so a file rewritten with identical
-  contents, or one changed within the same second as the last commit, can show as modified.
+  administrator or on a network (UNC) path; choose PowerShell instead. Git badges never run
+  filters or line-ending conversion, so a same-size file that Git stores converted (for example
+  a Git LFS file, or `autocrlf` content) can show as modified after its time changes, as can
+  same-size changes beyond the first 256 or files over 16 MB.
   Repositories that take over 4 s, have an index over 100,000 entries or need over 50,000
   folders and files walked show no badges, and neither does any repository inside OneDrive or
   another cloud-synced folder (its `.gitignore` files could be online-only).
