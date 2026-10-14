@@ -343,15 +343,20 @@ fn folder_context_menu_opens_a_terminal_in_that_folder() {
 
     // Automated runs only record the launch, so no terminal window opens.
     let script = format!(
-        "dismiss-notices\nnavigate {}\nwait-entry Shoot & 100% ^ it's ;x\n\
+        "limit 120\ndismiss-notices\nnavigate {}\nwait-entry Shoot & 100% ^ it's ;x\n\
          right-click-entry Shoot & 100% ^ it's ;x\n\
          ui system click-menu Open terminal here\n\
-         ui system wait-terminal {} | 20\n\
+         ui system wait-terminal {} | 60\n\
          assert-no-error-toast\nexit\n",
         shown(&media),
         shown(&folder),
     );
-    let outcome = run_app(sandbox.path(), &profile, &script);
+    // Generous limits: the whole e2e suite runs several app windows at once.
+    let opts = RunOpts {
+        limit: Some(std::time::Duration::from_secs(150)),
+        ..Default::default()
+    };
+    let outcome = run_app_with(sandbox.path(), &profile, &script, &opts);
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
