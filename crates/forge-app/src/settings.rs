@@ -84,6 +84,7 @@ pub struct ExternalTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(deserialize_with = "lenient")]
     pub theme: ThemeChoice,
     pub ui_scale: f32,
     #[serde(deserialize_with = "lenient")]
@@ -93,7 +94,9 @@ pub struct Settings {
     pub show_hidden: bool,
     pub show_system: bool,
     pub confirm_recycle: bool,
+    #[serde(deserialize_with = "lenient")]
     pub default_sort: SortSpec,
+    #[serde(deserialize_with = "lenient")]
     pub default_view: ViewMode,
     pub thumb_size: f32,
     pub thumb_mem_cache_mb: u64,
@@ -222,11 +225,15 @@ pub struct Layout {
 pub struct TabSession {
     pub left: PathBuf,
     pub right: Option<PathBuf>,
+    #[serde(deserialize_with = "lenient")]
     pub view: ViewMode,
     /// Absent in files from before layouts: the default sort applies.
+    #[serde(deserialize_with = "lenient")]
     pub sort: Option<SortSpec>,
     /// The right pane's view and sort, when they differ from the left pane's.
+    #[serde(deserialize_with = "lenient")]
     pub right_view: Option<ViewMode>,
+    #[serde(deserialize_with = "lenient")]
     pub right_sort: Option<SortSpec>,
     #[serde(flatten)]
     pub extra: Extra,
@@ -448,6 +455,29 @@ mod tests {
         assert_eq!(saved["layouts"][0]["pinned"], true);
         assert_eq!(saved["layouts"][0]["tabs"][0]["zoom"], 2);
         assert_eq!(saved["theme"], "Light");
+    }
+
+    #[test]
+    fn unknown_enum_values_from_a_newer_version_keep_the_rest_of_the_file() {
+        let json = r#"{
+            "theme": "Sepia",
+            "default_view": "Filmstrip",
+            "default_sort": {"key": "Colour", "descending": true, "dirs_first": true},
+            "pins": [{"path": "C:/Shoots"}],
+            "layouts": [{"name": "Cull", "tabs": [{
+                "left": "C:/Shoots", "right": "D:/Backup", "view": "Filmstrip",
+                "right_view": "Timeline", "sort": {"key": "Colour"}
+            }]}]
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.theme, ThemeChoice::Dark);
+        assert_eq!(settings.default_view, ViewMode::Details);
+        assert_eq!(settings.default_sort, SortSpec::default());
+        assert_eq!(settings.pins.len(), 1);
+        let tab = &settings.layouts[0].tabs[0];
+        assert_eq!(tab.left, PathBuf::from("C:/Shoots"));
+        assert_eq!(tab.right, Some(PathBuf::from("D:/Backup")));
+        assert_eq!((tab.view, tab.right_view, tab.sort), (ViewMode::Details, None, None));
     }
 
     #[test]
