@@ -30,6 +30,7 @@ mod modal;
 mod notices;
 mod ops_ui;
 mod pane;
+mod path_probe;
 mod palette;
 mod platform;
 mod preview;

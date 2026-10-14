@@ -7,6 +7,10 @@ use forge_core::listing::SortSpec;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Fields of a settings object that this version doesn't know. They are kept and written back,
+/// so a setting added by a newer version survives being saved by this one.
+pub type Extra = serde_json::Map<String, serde_json::Value>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ThemeChoice {
     #[default]
@@ -129,6 +133,10 @@ pub struct Settings {
     /// Reopen the previous session's tabs at startup (the behaviour before this was a
     /// setting, so it defaults to on).
     pub restore_session: bool,
+    /// Settings this version doesn't know (written by a newer one), kept so saving doesn't
+    /// drop them.
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 impl Default for Settings {
@@ -164,6 +172,7 @@ impl Default for Settings {
             pins: Vec::new(),
             layouts: Vec::new(),
             restore_session: true,
+            extra: Extra::new(),
         }
     }
 }
@@ -176,8 +185,7 @@ impl Settings {
             if !self.pins.iter().any(|p| p.path == path) {
                 self.pins.push(Pin {
                     path,
-                    label: None,
-                    file: false,
+                    ..Default::default()
                 });
             }
         }
@@ -193,6 +201,8 @@ pub struct Pin {
     pub label: Option<String>,
     /// Pinned as a file: a click opens it with its default app instead of navigating.
     pub file: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// A saved set of tabs, restored by "Load layout".
@@ -202,6 +212,8 @@ pub struct Layout {
     pub name: String,
     pub tabs: Vec<TabSession>,
     pub active_tab: usize,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// One tab of a session or a saved layout. The split is on when `right` is set.
@@ -216,6 +228,8 @@ pub struct TabSession {
     /// The right pane's view and sort, when they differ from the left pane's.
     pub right_view: Option<ViewMode>,
     pub right_sort: Option<SortSpec>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -347,8 +361,8 @@ mod tests {
             ..Default::default()
         };
         settings.pins = vec![
-            Pin { path: PathBuf::from(r"C:\Shoots"), label: None, file: false },
-            Pin { path: PathBuf::from(r"C:\Shoots\cover.cr3"), label: Some("Cover".into()), file: true },
+            Pin { path: PathBuf::from(r"C:\Shoots"), label: None, file: false, ..Default::default() },
+            Pin { path: PathBuf::from(r"C:\Shoots\cover.cr3"), label: Some("Cover".into()), file: true, ..Default::default() },
         ];
         settings.layouts = vec![Layout {
             name: "Culling".into(),
@@ -359,8 +373,10 @@ mod tests {
                 sort: Some(SortSpec { descending: true, ..Default::default() }),
                 right_view: Some(ViewMode::Details),
                 right_sort: None,
+                extra: Default::default(),
             }],
             active_tab: 0,
+            extra: Default::default(),
         }];
         let json = serde_json::to_string(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -409,8 +425,29 @@ mod tests {
     fn a_pin_with_missing_fields_still_loads() {
         let settings: Settings =
             serde_json::from_str(r#"{"pins":[{"path":"C:\\X"},{"label":"no path"}]}"#).unwrap();
-        assert_eq!(settings.pins[0], Pin { path: PathBuf::from(r"C:\X"), label: None, file: false });
+        assert_eq!(settings.pins[0], Pin { path: PathBuf::from(r"C:\X"), label: None, file: false, ..Default::default() });
         assert_eq!(settings.pins.len(), 2);
+    }
+
+    #[test]
+    fn unknown_fields_from_a_newer_version_survive_a_save() {
+        let json = r#"{
+            "theme": "Light",
+            "network_locations": [{"name": "NAS", "path": "//nas/photos"}],
+            "pins": [{"path": "C:/Shoots", "colour": "red"}],
+            "layouts": [{"name": "Cull", "pinned": true,
+                         "tabs": [{"left": "C:/Shoots", "zoom": 2}]}]
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.theme, ThemeChoice::Light);
+        assert_eq!(settings.pins[0].path, PathBuf::from("C:/Shoots"));
+        let saved: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(saved["network_locations"][0]["name"], "NAS");
+        assert_eq!(saved["pins"][0]["colour"], "red");
+        assert_eq!(saved["layouts"][0]["pinned"], true);
+        assert_eq!(saved["layouts"][0]["tabs"][0]["zoom"], 2);
+        assert_eq!(saved["theme"], "Light");
     }
 
     #[test]

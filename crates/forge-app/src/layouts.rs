@@ -3,10 +3,12 @@
 //! `Settings::layouts`; each tab is the same [`TabSession`] the session file uses.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::app::ZxrawApp;
 use crate::commands::Cmd;
 use crate::modal::{Modal, Prompt, PromptKind};
+use crate::path_probe::Batch;
 use crate::settings::{Layout, TabSession};
 
 /// Shown in the sidebar before the list gets too long.
@@ -17,6 +19,22 @@ const SIDEBAR_LIMIT: usize = 8;
 pub struct LayoutsUi {
     load_open: bool,
     manage_open: bool,
+    /// A layout waiting for its folder checks before it opens.
+    loading: Option<Loading>,
+    /// Folder checks for the tabs restored from the last session.
+    restored: Option<Batch>,
+}
+
+struct Loading {
+    layout: Layout,
+    check: Batch,
+}
+
+/// Every folder a set of tabs opens.
+fn tab_paths(tabs: &[TabSession]) -> Vec<PathBuf> {
+    tabs.iter()
+        .flat_map(|t| std::iter::once(t.left.clone()).chain(t.right.clone()))
+        .collect()
 }
 
 /// A row action in the layout lists.
@@ -56,6 +74,24 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd) {
 
 /// Draws the layout windows; called every frame.
 pub fn show(app: &mut ZxrawApp, ctx: &egui::Context) {
+    if let Some(loading) = &app.layouts.loading {
+        let mut cancel = false;
+        egui::Window::new("Loading layout")
+            .collapsible(false)
+            .resizable(false)
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 80.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Loading layout “{}”…", loading.layout.name));
+                    cancel = ui.small_button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            app.layouts.loading = None;
+        }
+    }
     if app.layouts.load_open {
         show_load(app, ctx);
     }
@@ -144,6 +180,7 @@ pub fn sidebar_section(app: &mut ZxrawApp, ui: &mut egui::Ui) {
 pub fn capture(app: &ZxrawApp, name: &str) -> Layout {
     let session = app.session();
     Layout {
+        extra: Default::default(),
         name: name.to_string(),
         tabs: session.tabs,
         active_tab: session.active_tab,
@@ -214,6 +251,7 @@ pub fn plan(layout: &Layout, exists: impl Fn(&Path) -> bool) -> Plan {
                 ..t.clone()
             }),
             (false, Some(right)) if right_ok => Some(TabSession {
+                extra: Default::default(),
                 left: right.clone(),
                 right: None,
                 view: t.right_view.unwrap_or(t.view),
@@ -262,41 +300,111 @@ pub fn load_by_name(app: &mut ZxrawApp, name: &str) -> bool {
     true
 }
 
-/// Replaces the open tabs with the ones of `layout` that still exist. If none survive,
-/// the current tabs stay.
+/// Starts loading `layout`: its folders are checked off the UI thread (an offline share can
+/// take the OS a long time to give up on), and [`tick`] opens it when they have answered.
 fn open_layout(app: &mut ZxrawApp, layout: &Layout) {
-    let plan = plan(layout, Path::is_dir);
+    let check = Batch::start(tab_paths(&layout.tabs), None);
+    app.layouts.loading = Some(Loading {
+        layout: layout.clone(),
+        check,
+    });
+}
+
+/// True while a layout's folder checks are running.
+#[allow(dead_code)] // used by the test hook
+pub fn is_loading(app: &ZxrawApp) -> bool {
+    app.layouts.loading.is_some()
+}
+
+/// Checks the folders of the tabs restored from the last session; see [`tick`].
+pub fn check_restored(app: &mut ZxrawApp) {
+    let tabs = app.session().tabs;
+    app.layouts.restored = Some(Batch::start(tab_paths(&tabs), None));
+}
+
+/// Applies finished folder checks. Called every frame from `logic`.
+pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let now = Instant::now();
+    let mut pending = false;
+    if let Some(loading) = &mut app.layouts.loading {
+        if loading.check.poll(now) {
+            let loading = app.layouts.loading.take().expect("checked above");
+            finish_load(app, &loading.layout, &loading.check);
+        } else {
+            pending = true;
+        }
+    }
+    if let Some(check) = &mut app.layouts.restored {
+        if check.poll(now) {
+            let check = app.layouts.restored.take().expect("checked above");
+            fix_restored(app, &check);
+        } else {
+            pending = true;
+        }
+    }
+    if pending {
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+/// Replaces the open tabs with the ones of `layout` whose folders were found. If none
+/// survive, the current tabs stay. Missing and unreachable folders are reported.
+fn finish_load(app: &mut ZxrawApp, layout: &Layout, check: &Batch) {
+    let plan = plan(layout, |p| check.is_dir(p));
+    let unreachable = check.unanswered();
+    let (offline, missing): (Vec<PathBuf>, Vec<PathBuf>) =
+        plan.missing.iter().cloned().partition(|p| unreachable.contains(p));
     if plan.tabs.is_empty() {
         app.toast_err(format!(
-            "Layout “{}”: none of its folders were found",
-            layout.name
+            "Layout “{}”: none of its folders were found{}",
+            layout.name,
+            if offline.is_empty() { String::new() } else { format!(" ({} not reachable)", offline.len()) }
         ));
         return;
     }
-    let fallback = app.start_folder();
-    app.tabs = plan
-        .tabs
-        .iter()
-        .map(|t| app.tab_from_session(t, &fallback).0)
-        .collect();
+    app.tabs = plan.tabs.iter().map(|t| app.tab_from_session(t)).collect();
     app.active = plan.active.min(app.tabs.len() - 1);
     if plan.missing.is_empty() {
         app.toast(format!("Layout “{}” loaded", layout.name));
-    } else {
-        let shown: Vec<String> = plan
-            .missing
-            .iter()
-            .take(3)
-            .map(|p| p.display().to_string())
-            .collect();
-        let more = if plan.missing.len() > 3 { "…" } else { "" };
-        app.toast_err(format!(
-            "Layout “{}”: {} folder(s) not found: {}{}",
-            layout.name,
-            plan.missing.len(),
-            shown.join(", "),
-            more
-        ));
+        return;
+    }
+    let mut parts = Vec::new();
+    if !missing.is_empty() {
+        parts.push(format!("{} folder(s) not found: {}", missing.len(), path_list(&missing)));
+    }
+    if !offline.is_empty() {
+        parts.push(format!("{} not reachable: {}", offline.len(), path_list(&offline)));
+    }
+    app.toast_err(format!("Layout “{}”: {}", layout.name, parts.join("; ")));
+}
+
+fn path_list(paths: &[PathBuf]) -> String {
+    let shown: Vec<String> = paths.iter().take(3).map(|p| p.display().to_string()).collect();
+    let more = if paths.len() > 3 { "…" } else { "" };
+    format!("{}{more}", shown.join(", "))
+}
+
+/// Restored panes whose folder has vanished or is offline switch to the start folder, unless
+/// the user has already navigated away.
+fn fix_restored(app: &mut ZxrawApp, check: &Batch) {
+    let fallback = app.start_folder();
+    let mut stale = Vec::new();
+    for (t, tab) in app.tabs.iter().enumerate() {
+        for (right, pane) in std::iter::once((false, &tab.left)).chain(tab.right.iter().map(|r| (true, r))) {
+            if !pane.can_back() && !check.is_dir(&pane.path) && check.knows(&pane.path) {
+                stale.push((t, right));
+            }
+        }
+    }
+    for (t, right) in stale {
+        let old = if right { app.tabs[t].right.as_ref() } else { Some(&app.tabs[t].left) };
+        let Some(old) = old else { continue };
+        let mut pane = app.new_pane(fallback.clone(), old.view);
+        pane.sort = old.sort;
+        match right {
+            false => app.tabs[t].left = pane,
+            true => app.tabs[t].right = Some(pane),
+        }
     }
 }
 
@@ -446,6 +554,7 @@ mod tests {
 
     fn layout(tabs: Vec<TabSession>, active_tab: usize) -> Layout {
         Layout {
+            extra: Default::default(),
             name: "Work".into(),
             tabs,
             active_tab,
@@ -490,6 +599,7 @@ mod tests {
         assert_eq!(
             p.tabs,
             vec![TabSession {
+                extra: Default::default(),
                 left: "C".into(),
                 right: None,
                 view: ViewMode::Grid,
@@ -556,6 +666,7 @@ mod tests {
         assert_eq!(list[2].name, "Beta");
 
         let replacement = Layout {
+            extra: Default::default(),
             name: "WORK".into(),
             tabs: vec![tab("Z", None)],
             active_tab: 0,
