@@ -215,12 +215,15 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   handling was checked by hand once; the administrator variant was not run.
 * 🟡 Git status badges — `forge-app/src/git_status.rs`: modified, new (added or untracked),
   ignored (dimmed) and conflicted entries, rolled up to folders, and the branch in the status
-  bar. `git status --porcelain=v2 -z` runs on one background thread with a 4 s and 8 MB limit
-  (a repository over either is skipped for the session), without optional locks, cached per
-  repository and refreshed when the folder watcher fires or after 15 s. Needs `git.exe` on
-  PATH or in Program Files. Unit tests cover porcelain parsing (renames, conflicts, untracked and
-  ignored folders, detached HEAD), roll-up, repo-root detection and one real `git init`
-  repository. Badge drawing is not covered by a test.
+  bar. Read in-process with `gix` on one background thread; no external program ever runs (no
+  `git.exe`, no fsmonitor, no filter drivers: file contents are never read, a tracked file whose
+  stat data differs from the index counts as modified). Config is the repository's own only.
+  A 4 s and 50,000-entry limit skips a repository for the session; results are cached per
+  repository and refreshed when the folder watcher fires or after 15 s, and an online-only
+  cloud folder is never read. Unit tests cover lookup and roll-up, repo-root detection, a real
+  repository (modified, staged, untracked, ignored) and `repository_config_cannot_run_programs`
+  (a repository whose `core.fsmonitor` and filter drivers point at a marker-writing script; the
+  marker is never created). Badge drawing is not covered by a test.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).

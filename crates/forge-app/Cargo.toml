@@ -39,6 +39,7 @@ forge-jobs.workspace = true
 forge-db.workspace = true
 forge-media.workspace = true
 forge-win.workspace = true
+gix = { version = "0.89", default-features = false, features = ["status", "dirwalk", "sha1"] }
 notify = { version = "8.2", default-features = false }
 ab_glyph = "0.2"
 

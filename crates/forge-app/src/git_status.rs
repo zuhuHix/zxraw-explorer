@@ -1,27 +1,27 @@
 //! Git status badges for the folder views.
 //!
-//! `git status` runs on one background thread, never on the UI thread. Results are
-//! cached per repository and refreshed when the file watcher reports a change, or
-//! after a short age. Failures are quiet: a repository that cannot be read simply
-//! shows no badges.
+//! Status is read with `gix` on one background thread, never on the UI thread, and never by
+//! running `git` or any other program: a folder from elsewhere can carry a `.git/config` that
+//! names programs (fsmonitor, filter drivers), and merely listing it must not start them. Results
+//! are cached per repository and refreshed when the file watcher reports a change, or after a
+//! short age. Failures are quiet: a repository that cannot be read simply shows no badges.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use gix::status::plumbing::index_as_worktree::EntryStatus;
+use gix::status::plumbing::index_as_worktree::traits::{CompareBlobs, ReadData, SubmoduleStatus};
+use gix::status::plumbing::index_as_worktree_with_renames::{Entry, VisitEntry};
 
-/// Largest `git status` output accepted, in bytes.
-const MAX_OUTPUT: usize = 8 * 1024 * 1024;
-/// Longest a `git status` run may take before it is killed.
+/// Most changed, new or ignored entries collected; a repository with more is skipped.
+const MAX_ENTRIES: usize = 50_000;
+/// Longest a status walk may take before it is stopped.
 const TIMEOUT: Duration = Duration::from_secs(4);
-/// How often the worker checks whether `git status` has finished.
-const POLL: Duration = Duration::from_millis(10);
 /// Age after which a cached status is refetched while its folder is shown.
 const FRESH_FOR: Duration = Duration::from_secs(15);
 /// Wait before retrying a repository after an unexpected error.
@@ -76,7 +76,7 @@ impl GitBadge {
     }
 }
 
-/// Parsed `git status --porcelain=v2 -z --branch` output for one repository.
+/// The Git status of one repository.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RepoStatus {
     /// Repository root folder.
@@ -90,57 +90,24 @@ pub struct RepoStatus {
 }
 
 impl RepoStatus {
-    /// Parses the NUL-separated porcelain v2 output of `git status` for the repository at `root`.
-    pub fn parse(root: PathBuf, out: &[u8]) -> RepoStatus {
-        let mut status = RepoStatus {
+    /// An empty status for the repository at `root`.
+    fn new(root: PathBuf, branch: Option<String>) -> RepoStatus {
+        RepoStatus {
             root,
-            branch: None,
+            branch,
             entries: HashMap::new(),
             rollup: HashMap::new(),
-        };
-        let mut records = out.split(|&b| b == 0);
-        while let Some(record) = records.next() {
-            if record.is_empty() {
-                continue;
-            }
-            let line = String::from_utf8_lossy(record);
-            if let Some(head) = line.strip_prefix("# branch.head ") {
-                status.branch = if head == "(detached)" {
-                    None
-                } else {
-                    Some(head.to_string())
-                };
-            } else if line.starts_with("# ") {
-                continue;
-            } else if let Some(rest) = line.strip_prefix("1 ") {
-                // XY sub mH mI mW hH hI path
-                let parts: Vec<&str> = rest.splitn(8, ' ').collect();
-                if parts.len() == 8 {
-                    let badge = xy_badge(parts[0]);
-                    status.add(parts[7], badge);
-                }
-            } else if let Some(rest) = line.strip_prefix("2 ") {
-                // XY sub mH mI mW hH hI Xscore path; the original path follows as its own record
-                let parts: Vec<&str> = rest.splitn(9, ' ').collect();
-                // Skip the original path record that follows the rename or copy.
-                records.next();
-                if parts.len() == 9 {
-                    let badge = xy_badge(parts[0]);
-                    status.add(parts[8], badge);
-                }
-            } else if let Some(rest) = line.strip_prefix("u ") {
-                // XY sub m1 m2 m3 mW h1 h2 h3 path
-                let parts: Vec<&str> = rest.splitn(10, ' ').collect();
-                if parts.len() == 10 {
-                    status.add(parts[9], GitBadge::Conflicted);
-                }
-            } else if let Some(path) = line.strip_prefix("? ") {
-                status.add(path, GitBadge::Added);
-            } else if let Some(path) = line.strip_prefix("! ") {
-                status.add(path, GitBadge::Ignored);
-            }
         }
-        status
+    }
+
+    /// Records a staged change (index against HEAD) next to the worktree one already there.
+    /// A file new to HEAD shows as new even if edited since staging; a conflict always wins.
+    fn add_staged(&mut self, path: &str, badge: GitBadge) {
+        match self.entries.get(&path.to_lowercase()) {
+            Some(GitBadge::Conflicted) => {}
+            Some(existing) if badge != GitBadge::Added && existing.rank() >= badge.rank() => {}
+            _ => self.add(path, badge),
+        }
     }
 
     /// Records one entry and rolls its badge up into the parent folders.
@@ -184,15 +151,6 @@ impl RepoStatus {
             }
         }
         None
-    }
-}
-
-/// Maps the two-letter XY field of a `1` or `2` record to a badge.
-fn xy_badge(xy: &str) -> GitBadge {
-    if xy.starts_with('A') {
-        GitBadge::Added
-    } else {
-        GitBadge::Modified
     }
 }
 
@@ -261,7 +219,7 @@ pub fn paint_badge(painter: &egui::Painter, right_center: egui::Pos2, badge: Git
 enum Request {
     /// Find the repository containing this folder.
     FindRoot(PathBuf),
-    /// Run `git status` in this repository.
+    /// Read the status of this repository.
     Status(PathBuf),
 }
 
@@ -280,9 +238,7 @@ enum Reply {
 /// Why a status could not be fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Failure {
-    /// No `git.exe` was found.
-    NoGit,
-    /// Output too large, or the run timed out.
+    /// Too many entries, or the walk took too long.
     TooBig,
     /// Reading this repository in the background is not allowed.
     Unsafe,
@@ -513,11 +469,7 @@ fn worker(requests: Receiver<Request>, replies: Sender<Reply>, ctx: egui::Contex
                     dir,
                 },
                 Request::Status(root) => {
-                    let result = match git_exe() {
-                        Some(git) => run_git_status(git, &root)
-                            .map(|out| RepoStatus::parse(root.clone(), &out)),
-                        None => Err(Failure::NoGit),
-                    };
+                    let result = read_status(&root);
                     Reply::Status { root, result }
                 }
             };
@@ -529,179 +481,209 @@ fn worker(requests: Receiver<Request>, replies: Sender<Reply>, ctx: egui::Contex
     }
 }
 
-/// Finds `git.exe` once: on PATH, else in `%ProgramFiles%\Git\cmd`.
-fn git_exe() -> Option<&'static Path> {
-    static GIT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    GIT.get_or_init(locate_git).as_deref()
-}
-
-fn locate_git() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("git.exe");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    let program_files = std::env::var_os("ProgramFiles")?;
-    let candidate = PathBuf::from(program_files)
-        .join("Git")
-        .join("cmd")
-        .join("git.exe");
-    candidate.is_file().then_some(candidate)
-}
-
-/// May `git status` read the repository at `path` in the background? Not when the folder is a
-/// cloud placeholder whose data is not on this PC: git would download it.
-// TODO: use forge_core::cloud::background_read_allowed once the cloud-placeholder check (#10)
-// is on main; this reads the same attributes without opening the folder.
-fn background_read_allowed(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        // FILE_ATTRIBUTE_OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
-        const ONLINE_ONLY: u32 = 0x0000_1000 | 0x0004_0000 | 0x0040_0000;
-        std::fs::symlink_metadata(path).map_or(true, |md| md.file_attributes() & ONLINE_ONLY == 0)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        true
-    }
-}
-
-/// Runs `git status` in `root` and returns its raw porcelain v2 output.
-fn run_git_status(git: &Path, root: &Path) -> Result<Vec<u8>, Failure> {
-    if !background_read_allowed(root) {
+/// Reads the status of the repository at `root` with `gix`, in this process.
+///
+/// No external program ever runs: gix implements no fsmonitor, configuration is loaded in
+/// isolation (the repository's own config only, never `git` itself, system or user config),
+/// and file contents are never read, so no filter driver from `.gitattributes` can start. A
+/// tracked file whose size or time differs from the index counts as modified.
+fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
+    if !forge_core::cloud::background_read_allowed(root) {
         return Err(Failure::Unsafe);
     }
-    let mut cmd = Command::new(git);
-    cmd.arg("-C")
-        .arg(root)
-        .args([
-            "--no-optional-locks",
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--untracked-files=normal",
-            "--ignored=traditional",
-        ])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .stdout(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: no console window flashes up.
-        cmd.creation_flags(0x0800_0000);
-    }
+    let err = |e: &dyn std::fmt::Display| Failure::Error(e.to_string());
+    let repo = gix::open_opts(root, gix::open::Options::isolated().strict_config(false))
+        .map_err(|e| err(&e))?;
+    let branch = repo
+        .head_name()
+        .ok()
+        .flatten()
+        .map(|name| name.shorten().to_string());
+    let index = repo.index_or_empty().map_err(|e| err(&e))?;
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| Failure::Error(format!("could not start git: {err}")))?;
-    let Some(mut stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(Failure::Error("git stdout was not piped".into()));
-    };
-
-    // The reader stops early once the output passes the limit; the worker then kills git.
-    let too_big = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&too_big);
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            match stdout.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if buf.len() + n > MAX_OUTPUT {
-                        flag.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-                Err(err) if err.kind() == ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
+    // Stop a walk that takes too long; the timer is released as soon as the walk returns.
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let (done, finished) = crossbeam_channel::bounded::<()>(0);
+    let flag = Arc::clone(&interrupt);
+    thread::spawn(move || {
+        if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = finished.recv_timeout(TIMEOUT) {
+            flag.store(true, Ordering::SeqCst);
         }
-        buf
     });
 
-    let started = Instant::now();
-    let status = loop {
-        if too_big.load(Ordering::SeqCst) || started.elapsed() >= TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Failure::TooBig);
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => thread::sleep(POLL),
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(Failure::Error(err.to_string()));
-            }
-        }
+    let mut collect = Collect {
+        status: RepoStatus::new(root.to_path_buf(), branch),
+        count: 0,
+        interrupt: Arc::clone(&interrupt),
     };
-
-    let out = reader.join().unwrap_or_default();
-    if too_big.load(Ordering::SeqCst) {
+    let dirwalk = repo
+        .dirwalk_options()
+        .map_err(|e| err(&e))?
+        .emit_untracked(gix::dir::walk::EmissionMode::CollapseDirectory)
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory));
+    let walked = repo.index_worktree_status(
+        &index,
+        None::<&str>,
+        &mut collect,
+        StatOnly,
+        NoSubmodules,
+        &mut gix::progress::Discard,
+        &interrupt,
+        gix::status::index_worktree::Options {
+            sorting: None,
+            dirwalk_options: Some(dirwalk),
+            rewrites: None,
+            thread_limit: Some(1),
+        },
+    );
+    drop(done);
+    if interrupt.load(Ordering::SeqCst) {
         return Err(Failure::TooBig);
     }
-    if !status.success() {
-        return Err(Failure::Error(format!(
-            "git status exited with code {}",
-            status.code().unwrap_or(-1)
-        )));
+    walked.map_err(|e| err(&e))?;
+
+    // Staged changes: the index against HEAD's tree. Compares object ids only.
+    let status = &mut collect.status;
+    match repo.head_tree_id() {
+        Ok(tree) => {
+            repo.tree_index_status(
+                &tree,
+                &index,
+                None,
+                gix::status::tree_index::TrackRenames::Disabled,
+                |change, _, _| {
+                    use gix::diff::index::ChangeRef;
+                    let (location, badge) = match &change {
+                        ChangeRef::Addition { location, .. } => (location, GitBadge::Added),
+                        ChangeRef::Deletion { location, .. }
+                        | ChangeRef::Modification { location, .. }
+                        | ChangeRef::Rewrite { location, .. } => (location, GitBadge::Modified),
+                    };
+                    status.add_staged(&location.to_string(), badge);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )
+            .map_err(|e| err(&e))?;
+        }
+        // Unborn branch: everything in the index is new.
+        Err(_) => {
+            for entry in index.entries() {
+                status.add_staged(&entry.path(&index).to_string(), GitBadge::Added);
+            }
+        }
     }
-    Ok(out)
+    Ok(collect.status)
+}
+
+/// Compares tracked files by their index stat data only. Never reading a file is what keeps
+/// filter drivers (`filter.<name>.clean` / `.process`) from running.
+#[derive(Clone)]
+struct StatOnly;
+
+impl CompareBlobs for StatOnly {
+    type Output = ();
+    fn compare_blobs<'a, 'b>(
+        &mut self,
+        _entry: &gix::index::Entry,
+        _worktree_blob_size: u64,
+        _data: impl ReadData<'a>,
+        _buf: &mut Vec<u8>,
+    ) -> gix::Result<Option<()>> {
+        Ok(Some(()))
+    }
+}
+
+/// Submodules are listed as folders without looking inside them.
+#[derive(Clone)]
+struct NoSubmodules;
+
+impl SubmoduleStatus for NoSubmodules {
+    type Output = ();
+    fn status(
+        &mut self,
+        _entry: &gix::index::Entry,
+        _path: &gix::bstr::BStr,
+    ) -> gix::Result<Option<()>> {
+        Ok(None)
+    }
+}
+
+/// Turns gix status entries into badges, stopping the walk past [`MAX_ENTRIES`].
+struct Collect {
+    status: RepoStatus,
+    count: usize,
+    interrupt: Arc<AtomicBool>,
+}
+
+impl<'index> VisitEntry<'index> for Collect {
+    type ContentChange = ();
+    type SubmoduleStatus = ();
+
+    fn visit_entry(&mut self, entry: Entry<'index, (), ()>) {
+        let (path, badge) = match entry {
+            Entry::Modification {
+                rela_path, status, ..
+            } => {
+                let badge = match status {
+                    EntryStatus::Conflict { .. } => GitBadge::Conflicted,
+                    EntryStatus::IntentToAdd => GitBadge::Added,
+                    EntryStatus::NeedsUpdate(_) => return,
+                    EntryStatus::Change(_) => GitBadge::Modified,
+                };
+                (rela_path.to_string(), badge)
+            }
+            Entry::DirectoryContents { entry, .. } => {
+                let badge = match entry.status {
+                    gix::dir::entry::Status::Untracked => GitBadge::Added,
+                    gix::dir::entry::Status::Ignored(_) => GitBadge::Ignored,
+                    _ => return,
+                };
+                let dir = matches!(entry.disk_kind, Some(gix::dir::entry::Kind::Directory));
+                let slash = if dir { "/" } else { "" };
+                (format!("{}{slash}", entry.rela_path), badge)
+            }
+            Entry::Rewrite { .. } => return,
+        };
+        self.count += 1;
+        if self.count > MAX_ENTRIES {
+            self.interrupt.store(true, Ordering::SeqCst);
+            return;
+        }
+        self.status.add(&path, badge);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Builds a `-z` buffer from records, each followed by a NUL.
-    fn z(records: &[&str]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for record in records {
-            out.extend_from_slice(record.as_bytes());
-            out.push(0);
+    fn status_of(entries: &[(&str, GitBadge)]) -> RepoStatus {
+        let mut status = RepoStatus::new(PathBuf::from(r"C:\repo"), Some("main".into()));
+        for (path, badge) in entries {
+            status.add(path, *badge);
         }
-        out
-    }
-
-    fn parse_records(records: &[&str]) -> RepoStatus {
-        RepoStatus::parse(PathBuf::from(r"C:\repo"), &z(records))
+        status
     }
 
     fn sample() -> RepoStatus {
-        parse_records(&[
-            "# branch.oid 1234abcd",
-            "# branch.head main",
-            "1 .M N... 100644 100644 100644 aaa bbb src/my file.rs",
-            "1 A. N... 000000 100644 100644 000 ccc added.rs",
-            "2 R. N... 100644 100644 100644 aaa bbb R100 renamed.rs",
-            "old name.rs",
-            "u UU N... 100644 100644 100644 100644 aaa bbb ccc conflict.rs",
-            "? new dir/",
-            "? notes.txt",
-            "! target/",
-            "! debug.log",
+        status_of(&[
+            ("src/my file.rs", GitBadge::Modified),
+            ("added.rs", GitBadge::Added),
+            ("conflict.rs", GitBadge::Conflicted),
+            ("new dir/", GitBadge::Added),
+            ("notes.txt", GitBadge::Added),
+            ("target/", GitBadge::Ignored),
+            ("debug.log", GitBadge::Ignored),
         ])
     }
 
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(format!(r"C:\repo\{s}"))
+    }
+
     #[test]
-    fn parses_all_record_kinds() {
+    fn looks_up_badges_case_insensitively() {
         let status = sample();
-        assert_eq!(status.branch.as_deref(), Some("main"));
-        let p = |s: &str| PathBuf::from(format!(r"C:\repo\{s}"));
         assert_eq!(
             status.badge(&p(r"src\my file.rs"), false),
             Some(GitBadge::Modified)
@@ -711,12 +693,6 @@ mod tests {
             Some(GitBadge::Modified)
         );
         assert_eq!(status.badge(&p("added.rs"), false), Some(GitBadge::Added));
-        assert_eq!(
-            status.badge(&p("renamed.rs"), false),
-            Some(GitBadge::Modified)
-        );
-        // The original path of the rename is not an entry.
-        assert_eq!(status.badge(&p("old name.rs"), false), None);
         assert_eq!(
             status.badge(&p("conflict.rs"), false),
             Some(GitBadge::Conflicted)
@@ -728,27 +704,50 @@ mod tests {
             status.badge(&p("debug.log"), false),
             Some(GitBadge::Ignored)
         );
+        assert_eq!(status.badge(&p("clean.rs"), false), None);
     }
 
     #[test]
     fn rolls_up_to_parent_folders() {
-        let status = sample();
-        let p = |s: &str| PathBuf::from(format!(r"C:\repo\{s}"));
-        assert_eq!(status.badge(&p("src"), true), Some(GitBadge::Modified));
-
-        let status = parse_records(&[
-            "1 .M N... 100644 100644 100644 aaa bbb lib/mod.rs",
-            "u UU N... 100644 100644 100644 100644 aaa bbb ccc lib/conflict.rs",
-            "1 A. N... 000000 100644 100644 000 ccc only/new.rs",
+        assert_eq!(sample().badge(&p("src"), true), Some(GitBadge::Modified));
+        let status = status_of(&[
+            ("lib/mod.rs", GitBadge::Modified),
+            ("lib/conflict.rs", GitBadge::Conflicted),
+            ("only/new.rs", GitBadge::Added),
+            ("logs/x.log", GitBadge::Ignored),
         ]);
         assert_eq!(status.badge(&p("lib"), true), Some(GitBadge::Conflicted));
         assert_eq!(status.badge(&p("only"), true), Some(GitBadge::Added));
+        assert_eq!(
+            status.badge(&p("logs"), true),
+            None,
+            "ignored files are not rolled up"
+        );
+    }
+
+    #[test]
+    fn staged_changes_combine_with_worktree_badges() {
+        let mut status = status_of(&[
+            ("c.rs", GitBadge::Conflicted),
+            ("m.rs", GitBadge::Modified),
+            ("edited-new.rs", GitBadge::Modified),
+        ]);
+        status.add_staged("c.rs", GitBadge::Added);
+        status.add_staged("m.rs", GitBadge::Modified);
+        status.add_staged("edited-new.rs", GitBadge::Added);
+        status.add_staged("new.rs", GitBadge::Added);
+        assert_eq!(status.badge(&p("c.rs"), false), Some(GitBadge::Conflicted));
+        assert_eq!(status.badge(&p("m.rs"), false), Some(GitBadge::Modified));
+        assert_eq!(
+            status.badge(&p("edited-new.rs"), false),
+            Some(GitBadge::Added)
+        );
+        assert_eq!(status.badge(&p("new.rs"), false), Some(GitBadge::Added));
     }
 
     #[test]
     fn contents_of_untracked_and_ignored_folders_inherit_badge() {
         let status = sample();
-        let p = |s: &str| PathBuf::from(format!(r"C:\repo\{s}"));
         assert_eq!(
             status.badge(&p(r"new dir\x\y.txt"), false),
             Some(GitBadge::Added)
@@ -757,20 +756,11 @@ mod tests {
             status.badge(&p(r"target\debug\a.exe"), false),
             Some(GitBadge::Ignored)
         );
-        assert_eq!(status.badge(&p("target"), true), Some(GitBadge::Ignored));
     }
 
     #[test]
     fn edge_cases_have_no_badge() {
-        let status = parse_records(&["# branch.head (detached)"]);
-        assert_eq!(status.branch, None);
-
-        let empty = RepoStatus::parse(PathBuf::from(r"C:\repo"), b"");
-        assert_eq!(empty.branch, None);
-        assert_eq!(empty.badge(&PathBuf::from(r"C:\repo\a.txt"), false), None);
-
         let status = sample();
-        let p = |s: &str| PathBuf::from(format!(r"C:\repo\{s}"));
         assert_eq!(status.badge(&p(".git"), true), None);
         assert_eq!(status.badge(&p(r".git\HEAD"), false), None);
         assert_eq!(status.badge(&PathBuf::from(r"D:\other\x.txt"), false), None);
@@ -783,7 +773,6 @@ mod tests {
     #[test]
     fn find_repo_root_walks_up() {
         let tmp = tempfile::tempdir().unwrap();
-
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("a").join("b").join("c")).unwrap();
@@ -812,29 +801,112 @@ mod tests {
         }
     }
 
-    #[test]
-    fn real_git_reports_untracked_file() {
-        let Some(git) = git_exe() else {
-            return;
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let init = Command::new(git)
+    /// Runs the git CLI to build a fixture. Tests that need it are skipped without git.
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
             .arg("-C")
-            .arg(tmp.path())
-            .args(["init", "-q"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !matches!(init, Ok(s) if s.success()) {
-            return;
-        }
-        std::fs::write(tmp.path().join("untracked.txt"), "hi").unwrap();
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "core.autocrlf=false",
+            ])
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 
-        let out = run_git_status(git, tmp.path()).expect("git status should succeed");
-        let status = RepoStatus::parse(tmp.path().to_path_buf(), &out);
+    /// A committed repository: `a.txt` modified, `new.txt` staged, an untracked file and
+    /// folder, and an ignored log.
+    fn fixture_repo() -> Option<tempfile::TempDir> {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        if !git(root, &["init", "-q", "-b", "main"]) {
+            eprintln!("skipped: git is not installed");
+            return None;
+        }
+        std::fs::write(root.join("a.txt"), "hello\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        assert!(git(root, &["add", "."]));
+        assert!(git(root, &["commit", "-q", "-m", "one"]));
+        std::fs::write(root.join("new.txt"), "new\n").unwrap();
+        assert!(git(root, &["add", "new.txt"]));
+        std::fs::write(root.join("a.txt"), "hello, changed\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "u").unwrap();
+        std::fs::create_dir_all(root.join("ud").join("x")).unwrap();
+        std::fs::write(root.join("ud").join("x").join("f"), "f").unwrap();
+        std::fs::write(root.join("b.log"), "log").unwrap();
+        Some(tmp)
+    }
+
+    #[test]
+    fn reads_a_real_repository_without_git() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let status = read_status(root).expect("status");
+        assert_eq!(status.branch.as_deref(), Some("main"));
         assert_eq!(
-            status.badge(&tmp.path().join("untracked.txt"), false),
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+        assert_eq!(
+            status.badge(&root.join("new.txt"), false),
             Some(GitBadge::Added)
+        );
+        assert_eq!(
+            status.badge(&root.join("untracked.txt"), false),
+            Some(GitBadge::Added)
+        );
+        assert_eq!(status.badge(&root.join("ud"), true), Some(GitBadge::Added));
+        assert_eq!(
+            status.badge(&root.join("b.log"), false),
+            Some(GitBadge::Ignored)
+        );
+        assert_eq!(status.badge(&root.join(".gitignore"), false), None);
+    }
+
+    /// A downloaded folder can name programs in its own `.git/config`. Listing it must not
+    /// run them: neither `core.fsmonitor` nor a filter driver applied by `.gitattributes`.
+    #[test]
+    fn repository_config_cannot_run_programs() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let marker = root.join("MARKER");
+        let script = root.join("evil.bat");
+        std::fs::write(
+            &script,
+            format!("@echo off\r\necho ran > \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        let script = script.to_string_lossy().replace('\\', "/");
+        for (key, value) in [
+            ("core.fsmonitor", script.as_str()),
+            ("filter.evil.clean", script.as_str()),
+            ("filter.evil.smudge", script.as_str()),
+            ("filter.evil.process", script.as_str()),
+            ("filter.evil.required", "true"),
+            ("core.hooksPath", "."),
+        ] {
+            assert!(git(root, &["config", key, value]), "git config {key}");
+        }
+        std::fs::write(root.join(".gitattributes"), "* filter=evil\n").unwrap();
+        // Same size, new content and time: the file is stat-dirty, which is where git would
+        // re-read it through the filter.
+        std::fs::write(root.join("a.txt"), "HELLO, CHANGED\n").unwrap();
+
+        let status = read_status(root).expect("status");
+        assert!(
+            !marker.exists(),
+            "a program from the repository's config was run"
+        );
+        assert_eq!(
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
         );
     }
 }
