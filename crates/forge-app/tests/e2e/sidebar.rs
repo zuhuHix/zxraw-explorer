@@ -1,0 +1,253 @@
+//! End-to-end scenarios: sidebar (Quick access pins and saved layouts).
+
+#[allow(unused_imports)]
+use crate::*;
+
+use std::fs;
+use std::path::Path;
+
+/// Settings file of `profile` as JSON (written on exit).
+fn settings_json(profile: &Path) -> serde_json::Value {
+    let path = profile.join("config").join("settings.json");
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    serde_json::from_slice(&bytes).expect("settings.json is JSON")
+}
+
+/// Drops the saved tabs so the next run starts in one fresh tab (the folders of the previous
+/// run may be gone by then).
+fn forget_session(profile: &Path) {
+    let _ = fs::remove_file(profile.join("config").join("session.json"));
+}
+
+#[test]
+fn pins_are_added_reordered_renamed_and_removed() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let docs = sandbox.path().join("docs");
+    let photos = sandbox.path().join("photos");
+    write_file(&docs.join("report.txt"), b"quarterly report\n");
+    fs::create_dir_all(&photos).unwrap();
+    let profile = sandbox.path().join("profile");
+
+    let script = format!(
+        "dismiss-notices\n\
+         navigate {docs}\nwait-entry report.txt\nui sidebar pins\n\
+         select report.txt\ncmd PinToQuickAccess\nui sidebar pins report.txt\n\
+         navigate {photos}\ncmd BookmarkFolder\nui sidebar pins report.txt, photos\n\
+         ui sidebar move-pin 2 1\nui sidebar pins photos, report.txt\n\
+         ui sidebar rename-pin photos | Pictures\nui sidebar pins Pictures, report.txt\n\
+         ui sidebar unpin report.txt\nui sidebar pins Pictures\n\
+         ui sidebar unpin Pictures\nui sidebar pins\n\
+         assert-no-error-toast\nexit\n",
+        docs = shown(&docs),
+        photos = shown(&photos),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn pin_to_a_deleted_file_reports_missing_and_folder_pins_still_navigate() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let docs = sandbox.path().join("docs");
+    let photos = sandbox.path().join("photos");
+    let ghost = docs.join("ghost.txt");
+    write_file(&ghost, b"soon gone\n");
+    fs::create_dir_all(&photos).unwrap();
+    let profile = sandbox.path().join("profile");
+
+    let script = format!(
+        "dismiss-notices\nnavigate {docs}\n\
+         ui sidebar pin-file {ghost}\nui sidebar pin {photos}\n\
+         ui sidebar wait-pin-status ghost.txt present | 20\n\
+         ui sidebar wait-pin-status photos present | 20\n\
+         ui tools external delete {ghost}\n\
+         ui sidebar wait-pin-status ghost.txt missing | 20\n\
+         ui sidebar click-pin ghost.txt\n\
+         assert-toast ghost.txt is not available\n\
+         assert-path {docs}\n\
+         navigate {sandbox}\n\
+         ui sidebar click-pin photos\n\
+         assert-path {photos}\nexit\n",
+        docs = shown(&docs),
+        photos = shown(&photos),
+        ghost = shown(&ghost),
+        sandbox = shown(sandbox.path()),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn pins_persist_across_runs_with_the_same_profile() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let docs = sandbox.path().join("docs");
+    let photos = sandbox.path().join("photos");
+    write_file(&docs.join("report.txt"), b"quarterly report\n");
+    fs::create_dir_all(&photos).unwrap();
+    let report = docs.join("report.txt");
+    let profile = sandbox.path().join("profile");
+
+    let first = format!(
+        "dismiss-notices\nnavigate {docs}\n\
+         ui sidebar pin-file {report}\nui sidebar pin {photos}\n\
+         ui sidebar rename-pin photos | Pictures\nui sidebar pins report.txt, Pictures\nexit\n",
+        docs = shown(&docs),
+        report = shown(&report),
+        photos = shown(&photos),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &first);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let saved = settings_json(&profile).to_string();
+    assert!(
+        saved.contains("Pictures") && saved.contains("report.txt"),
+        "the pins were not saved on exit: {saved}"
+    );
+
+    let second = "dismiss-notices\nui sidebar pins report.txt, Pictures\n\
+                  ui sidebar wait-pin-status Pictures present | 20\nexit\n";
+    let outcome = run_app(sandbox.path(), &profile, second);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn old_folder_bookmarks_show_up_as_pins() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let photos = sandbox.path().join("photos");
+    fs::create_dir_all(&photos).unwrap();
+    let profile = sandbox.path().join("profile");
+    let legacy = serde_json::json!({ "bookmarks": [photos.display().to_string()] });
+    write_file(
+        &profile.join("config").join("settings.json"),
+        legacy.to_string().as_bytes(),
+    );
+
+    let script = format!(
+        "dismiss-notices\nui sidebar pins photos\n\
+         ui sidebar wait-pin-status photos present | 20\n\
+         ui sidebar click-pin photos\nassert-path {photos}\nexit\n",
+        photos = shown(&photos),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+
+    let saved = settings_json(&profile);
+    let bookmarks_left = saved["bookmarks"].as_array().is_none_or(|a| a.is_empty());
+    assert!(
+        bookmarks_left,
+        "the old bookmarks were not moved over: {saved}"
+    );
+}
+
+#[test]
+fn layouts_save_load_and_keep_one_entry_per_name() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let alpha = sandbox.path().join("alpha");
+    let beta = sandbox.path().join("beta");
+    let gamma = sandbox.path().join("gamma");
+    for dir in [&alpha, &beta, &gamma] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let profile = sandbox.path().join("profile");
+
+    // Tab 2 is the one saved: split, with the right pane on beta and the left in grid view.
+    let script = format!(
+        "dismiss-notices\nnavigate {alpha}\n\
+         cmd NewTab\nnavigate {alpha}\ncmd ToggleDualPane\nfocus right\nnavigate {beta}\n\
+         focus left\ncmd ViewGrid\nui sidebar assert-view grid\n\
+         cmd SaveLayout\ntype Culling\naccept\nui sidebar layouts Culling\n\
+         cmd SaveLayout\ntype Culling\naccept\nui sidebar layouts Culling\n\
+         navigate {gamma}\ncmd ToggleDualPane\ncmd ViewDetails\n\
+         ui sidebar assert-split off\nui sidebar assert-view details\n\
+         ui sidebar load-layout Culling\n\
+         assert-tabs 2\nui sidebar assert-split on\n\
+         focus left\nassert-path {alpha}\nui sidebar assert-view grid\n\
+         focus right\nassert-path {beta}\nui sidebar assert-view details\n\
+         assert-no-error-toast\nexit\n",
+        alpha = shown(&alpha),
+        beta = shown(&beta),
+        gamma = shown(&gamma),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let layouts = settings_json(&profile)["layouts"].clone();
+    assert_eq!(
+        layouts.as_array().map(Vec::len),
+        Some(1),
+        "saving the same name twice must keep one layout: {layouts}"
+    );
+}
+
+#[test]
+fn layout_with_a_missing_folder_opens_the_rest_and_says_so() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let one = sandbox.path().join("one");
+    let two = sandbox.path().join("two");
+    fs::create_dir_all(&one).unwrap();
+    fs::create_dir_all(&two).unwrap();
+    let profile = sandbox.path().join("profile");
+
+    let save = format!(
+        "dismiss-notices\nnavigate {one}\ncmd NewTab\nnavigate {two}\n\
+         cmd SaveLayout\ntype Partial\naccept\nui sidebar layouts Partial\nexit\n",
+        one = shown(&one),
+        two = shown(&two),
+    );
+    expect_ok(&run_app(sandbox.path(), &profile, &save));
+    assert_no_crash(&profile);
+
+    // Delete one folder between the runs. Without the saved session the next run starts in
+    // one tab, which the layout then replaces.
+    fs::remove_dir_all(&two).unwrap();
+    forget_session(&profile);
+
+    let load = format!(
+        "dismiss-notices\nui sidebar load-layout Partial\n\
+         assert-toast not found\nassert-tabs 1\nassert-path {one}\nexit\n",
+        one = shown(&one),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &load);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn layout_whose_folders_are_all_missing_keeps_the_open_tabs() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let one = sandbox.path().join("one");
+    let two = sandbox.path().join("two");
+    let keep = sandbox.path().join("keep");
+    for dir in [&one, &two, &keep] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let profile = sandbox.path().join("profile");
+
+    let save = format!(
+        "dismiss-notices\nnavigate {one}\ncmd NewTab\nnavigate {two}\n\
+         cmd SaveLayout\ntype Both\naccept\nui sidebar layouts Both\nexit\n",
+        one = shown(&one),
+        two = shown(&two),
+    );
+    expect_ok(&run_app(sandbox.path(), &profile, &save));
+    assert_no_crash(&profile);
+
+    fs::remove_dir_all(&one).unwrap();
+    fs::remove_dir_all(&two).unwrap();
+    forget_session(&profile);
+
+    let load = format!(
+        "dismiss-notices\nnavigate {keep}\n\
+         ui sidebar load-layout Both\n\
+         assert-toast none of its folders were found\n\
+         assert-tabs 1\nassert-path {keep}\nexit\n",
+        keep = shown(&keep),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &load);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}

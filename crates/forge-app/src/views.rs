@@ -190,6 +190,7 @@ const CONTEXT_FILE: &[Option<Cmd>] = &[
     Some(Cmd::OpenWith),
     Some(Cmd::OpenIn),
     Some(Cmd::RevealInExplorer),
+    Some(Cmd::PinToQuickAccess),
     None,
     Some(Cmd::Cut),
     Some(Cmd::Copy),

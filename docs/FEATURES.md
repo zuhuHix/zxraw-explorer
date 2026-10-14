@@ -32,6 +32,21 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   dual-pane copy/move are e2e-verified (`tabs_are_restored_on_the_next_start`,
   `copy_to_other_pane_duplicates_files_byte_for_byte`). The address bar, breadcrumb UI, and
   drive sidebar are not automated.
+* 🟡 Quick access pins for files and folders — `forge-app/src/sidebar.rs`. Pin with *Pin to Quick
+  access* (file menu or palette), *Pin this folder to Quick access* (Ctrl+D) or by dragging onto the
+  section. A pinned file opens with its default app, started in its own folder; a pinned folder
+  opens in the pane. Pins reorder by drag and have rename, reset name, move up/down, open containing
+  folder and unpin. A pin whose target is missing is greyed out with *Locate…* and *Remove*;
+  availability is checked in the background (every 5 s locally, every 30 s on network paths), so an
+  offline share does not freeze the window. Folder bookmarks move here automatically, and the
+  separate Bookmarks section is gone. The rendered sidebar is not automated.
+* 🟡 Saved layouts (workspaces) — `forge-app/src/layouts.rs`. *Save layout…* stores the open tabs:
+  each tab's left and right folders, view mode, sort, split state and active tab. Load from the
+  sidebar's Layouts section or *Load layout…* in the palette; *Manage layouts…* renames, reorders and
+  deletes. Saving under an existing name updates that layout. Missing folders are skipped and listed
+  in a message. Settings › Browsing's *Reopen the last session's tabs at startup* (on by default) is
+  unchanged, and sessions now also remember each pane's sort. Layouts and pins live in the settings
+  file, and older settings files load unchanged. No test result is recorded for this yet.
 * ✅ Stream directory entries in batches (engine) — `forge-core/src/listing.rs`
   (`lists_unicode_and_streams_batches`, `junctions_are_links`). The 50,000-entry run in
   [BENCHMARKS.md](BENCHMARKS.md) completed with zero listing errors.

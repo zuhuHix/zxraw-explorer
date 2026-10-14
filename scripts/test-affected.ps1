@@ -35,7 +35,7 @@ param(
 # E2E map: changed file -> e2e areas (e2e modules in crates/forge-app/tests/e2e).
 # Paths are relative to the repo root and use -like wildcards. Every matching row adds its
 # areas. 'all' means every area. A forge-app file that matches no row runs every area.
-# Areas: browser, core, ingest, library, media, perf, related, system, tools, viewer.
+# Areas: browser, core, ingest, library, media, perf, related, sidebar, system, tools, viewer.
 #
 # Shared core (app shell, settings, commands, theme, test hook): core only, except where a
 # row names the area that uses the file (settings_ui.rs: media-link rules are in related;
@@ -64,6 +64,7 @@ $E2EMap = @(
     @('crates/forge-app/src/testhook/media.rs', 'media'),
     @('crates/forge-app/src/testhook/perf.rs', 'perf'),
     @('crates/forge-app/src/testhook/related.rs', 'related'),
+    @('crates/forge-app/src/testhook/sidebar.rs', 'sidebar'),
     @('crates/forge-app/src/testhook/system.rs', 'system'),
     @('crates/forge-app/src/testhook/tools.rs', 'tools'),
     @('crates/forge-app/src/testhook/viewer.rs', 'viewer'),
@@ -97,6 +98,10 @@ $E2EMap = @(
     @('crates/forge-app/src/pane.rs', 'browser,core'),
     @('crates/forge-app/src/sidebar*.rs', 'browser'),
     @('crates/forge-app/src/breadcrumb.rs', 'browser'),
+    # sidebar: Quick access pins and saved layouts
+    @('crates/forge-app/src/sidebar.rs', 'sidebar'),
+    @('crates/forge-app/src/sidebar/*', 'sidebar'),
+    @('crates/forge-app/src/layouts.rs', 'sidebar'),
     @('crates/forge-app/src/similar.rs', 'browser'),
     @('crates/forge-app/src/platform.rs', 'browser'),
     # thumbnails and previews are used by the grid everywhere
@@ -121,6 +126,7 @@ $E2EMap = @(
     @('crates/forge-app/tests/e2e/media.rs', 'media'),
     @('crates/forge-app/tests/e2e/perf.rs', 'perf'),
     @('crates/forge-app/tests/e2e/related.rs', 'related'),
+    @('crates/forge-app/tests/e2e/sidebar.rs', 'sidebar'),
     @('crates/forge-app/tests/e2e/system.rs', 'system'),
     @('crates/forge-app/tests/e2e/tools.rs', 'tools'),
     @('crates/forge-app/tests/e2e/viewer.rs', 'viewer'),
@@ -132,7 +138,7 @@ $E2EMap = @(
     @('crates/forge-win/*', 'core,library,system,tools')
 )
 
-$AllAreas = @('browser', 'core', 'ingest', 'library', 'media', 'perf', 'related', 'system', 'tools', 'viewer')
+$AllAreas = @('browser', 'core', 'ingest', 'library', 'media', 'perf', 'related', 'sidebar', 'system', 'tools', 'viewer')
 
 function Expand-Areas([string]$Spec) {
     if ($Spec -eq 'all') { return $AllAreas }

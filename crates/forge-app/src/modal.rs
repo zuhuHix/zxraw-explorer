@@ -19,6 +19,19 @@ pub enum PromptKind {
     NewFolder { dir: PathBuf },
     NewFile { dir: PathBuf },
     Rename { path: PathBuf },
+    /// Name for "Save layout…" (see `layouts`).
+    SaveLayout,
+    /// New label for a layout, by index in `Settings::layouts`.
+    RenameLayout { index: usize },
+    /// New label for a Quick access pin, by its path (see `sidebar`).
+    RenamePin { path: PathBuf },
+}
+
+impl PromptKind {
+    /// A label or name kept in settings rather than a file name on disk.
+    pub fn is_label(&self) -> bool {
+        matches!(self, Self::SaveLayout | Self::RenameLayout { .. } | Self::RenamePin { .. })
+    }
 }
 
 pub struct Prompt {

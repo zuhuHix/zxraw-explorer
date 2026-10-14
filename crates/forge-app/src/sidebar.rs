@@ -1,4 +1,6 @@
-//! Navigation sidebar: quick access, bookmarks, drives.
+//! Navigation sidebar: quick access (known folders and pins), collections, drives.
+
+mod pins;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -6,12 +8,18 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use egui::{RichText, Ui};
+use egui::{RichText, Sense, Ui};
 use parking_lot::Mutex;
 
 use crate::app::ZxrawApp;
+use crate::modal::{Modal, Prompt, PromptKind};
+use crate::settings::Pin;
 use crate::theme;
 use crate::views::DragPaths;
+use forge_core::model::EntryKind;
+use forge_core::paths::paths_equal;
+
+use pins::{PinDrag, PinStatus, PinWatch, add_pins, move_pin, remove_pin, set_label};
 
 #[derive(Clone, Debug)]
 pub struct Drive {
@@ -27,6 +35,8 @@ pub struct SidebarState {
     pub drives: Arc<Mutex<Vec<Drive>>>,
     pub known: Vec<(String, PathBuf)>,
     pub cards: CardWatch,
+    /// Existence checks for Quick access pins.
+    pub pins: PinWatch,
 }
 
 /// Watches removable drives for inserted cards and decides which ones get an import prompt.
@@ -182,6 +192,7 @@ impl SidebarState {
             drives,
             known: crate::platform::known_folders(),
             cards: CardWatch::default(),
+            pins: PinWatch::default(),
         }
     }
 }
@@ -232,132 +243,343 @@ fn nav_item(
 }
 
 pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
-    let collections = app.ops.collections_ui.sidebar_collections().to_vec();
+    let network_roots: Vec<PathBuf> = app
+        .sidebar
+        .drives
+        .lock()
+        .iter()
+        .filter(|d| d.kind == "Network")
+        .map(|d| d.root.clone())
+        .collect();
+    app.sidebar
+        .pins
+        .tick(&app.settings.pins, &network_roots, ui.ctx());
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.add_space(4.0);
-            section(ui, "Quick access");
-            for (name, path) in app.sidebar.known.clone() {
-                nav_item(app, ui, "★", &name, &path, None);
-            }
-
-            if !app.settings.bookmarks.is_empty() {
-                ui.add_space(6.0);
-                section(ui, "Bookmarks");
-                let mut remove = None;
-                for (i, path) in app.settings.bookmarks.clone().iter().enumerate() {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                    let r = nav_item(app, ui, "🔖", &name, path, None);
-                    r.context_menu(|ui| {
-                        if ui.button("Remove bookmark").clicked() {
-                            remove = Some(i);
-                            ui.close();
-                        }
-                        if i > 0 && ui.button("Move up").clicked() {
-                            app.settings.bookmarks.swap(i, i - 1);
-                            ui.close();
-                        }
-                    });
-                }
-                if let Some(i) = remove {
-                    app.settings.bookmarks.remove(i);
-                }
-            }
+            quick_access_section(app, ui);
 
             ui.add_space(6.0);
-            section(ui, "Collections");
-            if collections.is_empty() {
-                ui.label(RichText::new("No collections yet").weak());
-            } else {
-                for collection in collections.iter().take(8) {
-                    let marker = match collection.kind {
-                        forge_db::CollectionKind::Manual => "▤",
-                        forge_db::CollectionKind::Smart => "⌕",
-                    };
-                    if ui
-                        .selectable_label(false, format!("{marker}  {}", collection.name))
-                        .clicked()
-                    {
-                        crate::collections_ui::open_collection(app, collection.id);
-                    }
-                }
-                if collections.len() > 8 {
-                    ui.label(
-                        RichText::new(format!("+ {} more", collections.len() - 8))
-                            .weak()
-                            .small(),
-                    );
-                }
-            }
-            if ui.small_button("Manage collections…").clicked() {
-                app.ops.collections_ui.open = true;
-            }
+            crate::layouts::sidebar_section(app, ui);
 
             ui.add_space(6.0);
-            section(ui, "Drives");
-            let drives = app.sidebar.drives.lock().clone();
-            for d in drives {
-                let label = if d.label.is_empty() {
-                    format!("{} ({})", d.kind, d.root.display())
-                } else {
-                    format!(
-                        "{} ({})",
-                        d.label,
-                        d.root.display().to_string().trim_end_matches('\\')
-                    )
-                };
-                let icon = match d.kind {
-                    "Removable" => "💾",
-                    "Network" => "🖧",
-                    "Optical" => "💿",
-                    _ => "🖴",
-                };
-                if !d.available {
-                    ui.label(
-                        RichText::new(format!("{icon}  {label}  (unavailable)"))
-                            .color(theme::muted(ui)),
-                    );
-                    continue;
-                }
-                nav_item(app, ui, icon, &label, &d.root, None);
-                if d.total > 0 {
-                    let used = 1.0 - d.free as f32 / d.total as f32;
-                    // A slim track with an accent gradient (red when nearly full).
-                    let (rect, bar) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width() - 8.0, 4.0),
-                        egui::Sense::hover(),
-                    );
-                    let painter = ui.painter();
-                    painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
-                    let filled = egui::Rect::from_min_size(
-                        rect.min,
-                        egui::vec2(rect.width() * used.clamp(0.0, 1.0), rect.height()),
-                    );
-                    let (from, to) = if used > 0.9 {
-                        let red = ui.visuals().error_fg_color;
-                        (red, red)
-                    } else {
-                        (
-                            theme::accent(ui.ctx()),
-                            theme::accent_gradient_end(ui.ctx()),
-                        )
-                    };
-                    theme::paint_hgradient(&painter.with_clip_rect(filled), rect, from, to);
-                    bar.on_hover_text(format!(
-                        "{} free of {}",
-                        forge_core::model::format_size(d.free),
-                        forge_core::model::format_size(d.total)
-                    ));
-                }
-            }
+            collections_section(app, ui);
+
+            ui.add_space(6.0);
+            drives_section(app, ui);
         });
 }
 
-fn section(ui: &mut Ui, title: &str) {
+/// Known folders, then the user's pins. Files released anywhere in this section that no
+/// folder row took are pinned.
+fn quick_access_section(app: &mut ZxrawApp, ui: &mut Ui) {
+    let area = ui.scope(|ui| {
+        section(ui, "Quick access");
+        for (name, path) in app.sidebar.known.clone() {
+            nav_item(app, ui, "★", &name, &path, None);
+        }
+        pins_list(app, ui);
+    });
+    let released = ui.ctx().input(|i| i.pointer.any_released());
+    if released && ui.rect_contains_pointer(area.response.rect) {
+        if let Some(payload) = egui::DragAndDrop::take_payload::<DragPaths>(ui.ctx()) {
+            let paths = payload.0.clone();
+            pin_dropped(app, paths);
+        }
+    }
+}
+
+/// A change requested from a pin row this frame. Applied after the list is drawn.
+enum PinEdit {
+    Open(usize),
+    OpenFolder(usize),
+    Rename(usize),
+    ResetName(usize),
+    /// Moves the pin at the first index to the second.
+    Move(usize, usize),
+    Unpin(usize),
+    Locate(usize),
+}
+
+fn pins_list(app: &mut ZxrawApp, ui: &mut Ui) {
+    let pins = app.settings.pins.clone();
+    if pins.is_empty() {
+        ui.label(RichText::new("Drop files or folders here to pin them").weak().small());
+        return;
+    }
+    let current = app.pane().path.clone();
+    let mut edit = None;
+    for (i, pin) in pins.iter().enumerate() {
+        let missing = pin_status(app, &pin.path) == PinStatus::Missing;
+        let is_current = !pin.file && paths_equal(&current, &pin.path);
+        let r = pin_row(ui, i, pin, missing, is_current);
+
+        if r.clicked() {
+            activate_pin(app, i);
+        }
+        if r.middle_clicked() && !pin.file && !missing {
+            app.run(crate::commands::Cmd::NewTab, &ui.ctx().clone());
+            activate_pin(app, i);
+        }
+        // Folder pins take drops like the known folders (copy or move into that folder).
+        if !pin.file && !missing {
+            if let Some(p) = r.dnd_release_payload::<DragPaths>() {
+                let copy = ui.input(|i| i.modifiers.command);
+                crate::actions::transfer(app, p.0.clone(), pin.path.clone(), copy);
+            }
+        }
+        if let Some(p) = r.dnd_release_payload::<PinDrag>() {
+            edit = Some(PinEdit::Move(p.0, i));
+        }
+
+        r.context_menu(|ui| {
+            if missing {
+                if ui.button("Locate…").clicked() {
+                    edit = Some(PinEdit::Locate(i));
+                    ui.close();
+                }
+                if ui.button("Rename…").clicked() {
+                    edit = Some(PinEdit::Rename(i));
+                    ui.close();
+                }
+                if ui.button("Remove").clicked() {
+                    edit = Some(PinEdit::Unpin(i));
+                    ui.close();
+                }
+                return;
+            }
+            if ui.button("Open").clicked() {
+                edit = Some(PinEdit::Open(i));
+                ui.close();
+            }
+            if ui.button("Open containing folder").clicked() {
+                edit = Some(PinEdit::OpenFolder(i));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Rename…").clicked() {
+                edit = Some(PinEdit::Rename(i));
+                ui.close();
+            }
+            if pin.label.is_some() && ui.button("Reset name").clicked() {
+                edit = Some(PinEdit::ResetName(i));
+                ui.close();
+            }
+            ui.separator();
+            if i > 0 && ui.button("Move up").clicked() {
+                edit = Some(PinEdit::Move(i, i - 1));
+                ui.close();
+            }
+            if i + 1 < pins.len() && ui.button("Move down").clicked() {
+                edit = Some(PinEdit::Move(i, i + 1));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Unpin").clicked() {
+                edit = Some(PinEdit::Unpin(i));
+                ui.close();
+            }
+        });
+    }
+    match edit {
+        Some(PinEdit::Open(i)) => activate_pin(app, i),
+        Some(PinEdit::OpenFolder(i)) => open_containing_folder(app, i),
+        Some(PinEdit::Rename(i)) => start_rename(app, i),
+        Some(PinEdit::ResetName(i)) => {
+            if let Some(pin) = app.settings.pins.get_mut(i) {
+                pin.label = None;
+            }
+        }
+        Some(PinEdit::Move(from, to)) => move_pin(&mut app.settings.pins, from, to),
+        Some(PinEdit::Unpin(i)) => remove_pin(&mut app.settings.pins, i),
+        Some(PinEdit::Locate(i)) => locate(app, i),
+        None => {}
+    }
+}
+
+/// One pin row: a drag source for reordering, drawn muted when its target is missing.
+fn pin_row(ui: &mut Ui, index: usize, pin: &Pin, missing: bool, current: bool) -> egui::Response {
+    let icon = if pin.file { "📄" } else { "🔖" };
+    let text = RichText::new(format!("{icon}  {}", pin_label(pin)));
+    let text = if missing {
+        text.color(theme::muted(ui))
+    } else {
+        text
+    };
+    let button = if current {
+        egui::Button::new(text)
+            .selected(true)
+            .fill(theme::palette(ui.ctx()).nav_selected)
+            .stroke(egui::Stroke::NONE)
+    } else {
+        egui::Button::new(text)
+            .selected(false)
+            .frame_when_inactive(false)
+    };
+    let width = ui.available_width();
+    let r = ui
+        .dnd_drag_source(egui::Id::new(("sidebar_pin", index)), PinDrag(index), |ui| {
+            ui.add(button.min_size(egui::vec2(width, 0.0)))
+        })
+        .inner;
+    if current {
+        theme::paint_indicator(ui, r.rect, true);
+    }
+    let tip = if missing {
+        format!("Not found: {}", pin.path.display())
+    } else {
+        pin.path.to_string_lossy().into_owned()
+    };
+    r.on_hover_text(tip)
+}
+
+fn open_containing_folder(app: &mut ZxrawApp, index: usize) {
+    let Some(pin) = app.settings.pins.get(index).cloned() else {
+        return;
+    };
+    // Navigating to a file selects it in its folder.
+    if pin.file {
+        app.navigate(pin.path);
+    } else if let Some(parent) = pin.path.parent() {
+        app.navigate(parent.to_path_buf());
+    }
+}
+
+fn start_rename(app: &mut ZxrawApp, index: usize) {
+    let Some(pin) = app.settings.pins.get(index) else {
+        return;
+    };
+    let prompt = Prompt::new(
+        PromptKind::RenamePin {
+            path: pin.path.clone(),
+        },
+        "Rename pin",
+        pin.label.clone().unwrap_or_default(),
+    );
+    app.ops.modal = Some(Modal::Prompt(prompt));
+}
+
+/// Picks a replacement for a missing pin. The label is kept; the file or folder kind stays as
+/// it was, matching the dialog that was shown.
+fn locate(app: &mut ZxrawApp, index: usize) {
+    let Some(pin) = app.settings.pins.get(index) else {
+        return;
+    };
+    let file = pin.file;
+    let picked = if file {
+        crate::dialogs::pick_file(rfd::FileDialog::new())
+    } else {
+        crate::dialogs::pick_folder(rfd::FileDialog::new())
+    };
+    let Some(path) = picked else {
+        return;
+    };
+    let duplicate = app
+        .settings
+        .pins
+        .iter()
+        .enumerate()
+        .any(|(j, p)| j != index && paths_equal(&p.path, &path));
+    if duplicate {
+        app.toast("Already in Quick access");
+        return;
+    }
+    if let Some(pin) = app.settings.pins.get_mut(index) {
+        pin.path = path;
+    }
+}
+
+fn collections_section(app: &mut ZxrawApp, ui: &mut Ui) {
+    let collections = app.ops.collections_ui.sidebar_collections().to_vec();
+    section(ui, "Collections");
+    if collections.is_empty() {
+        ui.label(RichText::new("No collections yet").weak());
+    } else {
+        for collection in collections.iter().take(8) {
+            let marker = match collection.kind {
+                forge_db::CollectionKind::Manual => "▤",
+                forge_db::CollectionKind::Smart => "⌕",
+            };
+            if ui
+                .selectable_label(false, format!("{marker}  {}", collection.name))
+                .clicked()
+            {
+                crate::collections_ui::open_collection(app, collection.id);
+            }
+        }
+        if collections.len() > 8 {
+            ui.label(
+                RichText::new(format!("+ {} more", collections.len() - 8))
+                    .weak()
+                    .small(),
+            );
+        }
+    }
+    if ui.small_button("Manage collections…").clicked() {
+        app.ops.collections_ui.open = true;
+    }
+}
+
+fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
+    section(ui, "Drives");
+    let drives = app.sidebar.drives.lock().clone();
+    for d in drives {
+        let label = if d.label.is_empty() {
+            format!("{} ({})", d.kind, d.root.display())
+        } else {
+            format!(
+                "{} ({})",
+                d.label,
+                d.root.display().to_string().trim_end_matches('\\')
+            )
+        };
+        let icon = match d.kind {
+            "Removable" => "💾",
+            "Network" => "🖧",
+            "Optical" => "💿",
+            _ => "🖴",
+        };
+        if !d.available {
+            ui.label(
+                RichText::new(format!("{icon}  {label}  (unavailable)")).color(theme::muted(ui)),
+            );
+            continue;
+        }
+        nav_item(app, ui, icon, &label, &d.root, None);
+        if d.total > 0 {
+            let used = 1.0 - d.free as f32 / d.total as f32;
+            // A slim track with an accent gradient (red when nearly full).
+            let (rect, bar) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width() - 8.0, 4.0),
+                Sense::hover(),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(rect, 2.0, ui.visuals().widgets.inactive.bg_fill);
+            let filled = egui::Rect::from_min_size(
+                rect.min,
+                egui::vec2(rect.width() * used.clamp(0.0, 1.0), rect.height()),
+            );
+            let (from, to) = if used > 0.9 {
+                let red = ui.visuals().error_fg_color;
+                (red, red)
+            } else {
+                (
+                    theme::accent(ui.ctx()),
+                    theme::accent_gradient_end(ui.ctx()),
+                )
+            };
+            theme::paint_hgradient(&painter.with_clip_rect(filled), rect, from, to);
+            bar.on_hover_text(format!(
+                "{} free of {}",
+                forge_core::model::format_size(d.free),
+                forge_core::model::format_size(d.total)
+            ));
+        }
+    }
+}
+
+pub(crate) fn section(ui: &mut Ui, title: &str) {
     ui.label(
         RichText::new(title.to_uppercase())
             .small()
@@ -486,4 +708,105 @@ mod card_tests {
         watch.dismiss(&e.root);
         assert_eq!(roots(&watch.prompts), vec![f.root]);
     }
+}
+
+/// The name shown for a pin: its label, else the file or folder name, else the full path.
+pub(crate) fn pin_label(pin: &Pin) -> String {
+    if let Some(label) = pin
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+    {
+        return label.to_string();
+    }
+    pin.path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pin.path.to_string_lossy().into_owned())
+}
+
+/// Last known existence status of a pinned path (`Unknown` until its first check).
+pub(crate) fn pin_status(app: &ZxrawApp, path: &Path) -> PinStatus {
+    app.sidebar.pins.status(path)
+}
+
+/// What a click on pin `index` does. A missing target is not opened; the user is told instead.
+pub(crate) fn activate_pin(app: &mut ZxrawApp, index: usize) {
+    let Some(pin) = app.settings.pins.get(index).cloned() else {
+        return;
+    };
+    if pin_status(app, &pin.path) == PinStatus::Missing {
+        app.toast(format!("{} is not available", pin_label(&pin)));
+        return;
+    }
+    if pin.file {
+        crate::actions::open_file(app, &pin.path);
+    } else {
+        app.navigate(pin.path);
+    }
+}
+
+/// Whether `path` is a file, decided from the listed entries of both panes. Only paths that
+/// are not listed touch the disk.
+fn is_file_path(app: &ZxrawApp, path: &Path) -> bool {
+    let tab = app.tab();
+    let listed = std::iter::once(tab.focused())
+        .chain(tab.other())
+        .flat_map(|pane| pane.entries.iter())
+        .find(|e| e.path.as_path() == path);
+    match listed {
+        Some(entry) => entry.kind == EntryKind::File,
+        None => !path.is_dir(),
+    }
+}
+
+/// Files or folders released on the Quick access section.
+fn pin_dropped(app: &mut ZxrawApp, paths: Vec<PathBuf>) {
+    let items: Vec<(PathBuf, bool)> = paths
+        .into_iter()
+        .map(|p| {
+            let file = is_file_path(app, &p);
+            (p, file)
+        })
+        .collect();
+    pin_paths(app, items);
+}
+
+/// Pins paths to Quick access; `true` marks a file. Already pinned paths are skipped.
+pub fn pin_paths(app: &mut ZxrawApp, paths: Vec<(PathBuf, bool)>) {
+    if paths.is_empty() {
+        return;
+    }
+    if add_pins(&mut app.settings.pins, paths) > 0 {
+        app.toast("Pinned to Quick access");
+    } else {
+        app.toast("Already in Quick access");
+    }
+}
+
+/// `PinToQuickAccess`: pins the selected entries, or the current folder if none.
+pub fn pin_selection(app: &mut ZxrawApp) {
+    let pane = app.pane();
+    let targets = pane.action_targets();
+    let items: Vec<(PathBuf, bool)> = if targets.is_empty() {
+        vec![(pane.path.clone(), false)]
+    } else {
+        targets
+            .into_iter()
+            .map(|p| {
+                let file = is_file_path(app, &p);
+                (p, file)
+            })
+            .collect()
+    };
+    pin_paths(app, items);
+}
+
+/// Applies an accepted `RenamePin` prompt. Blank text clears the label.
+pub fn accept_label(app: &mut ZxrawApp, p: Prompt) -> Option<Modal> {
+    if let PromptKind::RenamePin { path } = &p.kind {
+        set_label(&mut app.settings.pins, path, &p.text);
+    }
+    None
 }

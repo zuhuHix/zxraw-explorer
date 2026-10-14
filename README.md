@@ -168,6 +168,10 @@ Explorer is a file manager designed around that workflow:
 - **Collections without the guesswork.** *New collection…* asks what you want (empty, from the
   current selection, or a smart collection that fills itself from a search), explains how
   collections work, and previews what's inside before you open it.
+- **Favourites and layouts.** Pin files as well as folders to Quick access (right-click › *Pin to
+  Quick access*, or drag them onto the sidebar), and reorder or rename them. *Save layout…* keeps
+  your open tabs, split panes, views and sorting, so a culling or delivery workspace is one click
+  away from the sidebar's Layouts section.
 - **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
   files each get their own icon, alongside the photo, video and audio ones.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
@@ -233,7 +237,8 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 </p>
 
 - No account and no telemetry.
-- Your ratings, tags, index and thumbnail cache live in a local database on your PC.
+- Your ratings, tags, index and thumbnail cache live in a local database on your PC. Quick access
+  pins and saved layouts live in the settings file.
 - Your files and their contents never leave your PC. The app makes only these network
   connections:
   - **A daily update check.** Once a day it asks `api.github.com` for the latest release of

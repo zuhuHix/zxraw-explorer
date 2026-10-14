@@ -68,6 +68,8 @@ pub struct ZxrawApp {
     pub toasts: Vec<Toast>,
     pub palette: Option<crate::palette::Palette>,
     pub sidebar: crate::sidebar::SidebarState,
+    /// "Load layout" and "Manage layouts" windows.
+    pub layouts: crate::layouts::LayoutsUi,
     pub focus_address: bool,
     pub focus_filter: bool,
     pub ops: crate::actions::Actions,
@@ -166,8 +168,13 @@ impl ZxrawApp {
         pending_crash: Option<PathBuf>,
     ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
-        let settings: Settings = settings::load_json(&paths.config.join("settings.json"));
-        let session: Session = settings::load_json(&paths.config.join("session.json"));
+        let mut settings: Settings = settings::load_json(&paths.config.join("settings.json"));
+        settings.migrate();
+        let session: Session = if settings.restore_session {
+            settings::load_json(&paths.config.join("session.json"))
+        } else {
+            Session::default()
+        };
         let mut app = Self {
             ops: crate::actions::Actions::new(&paths, &settings, cc.egui_ctx.clone()),
             paths,
@@ -178,6 +185,7 @@ impl ZxrawApp {
             toasts: Vec::new(),
             palette: None,
             sidebar: crate::sidebar::SidebarState::new(cc.egui_ctx.clone()),
+            layouts: Default::default(),
             focus_address: false,
             focus_filter: false,
             applied_theme: None,
@@ -249,7 +257,7 @@ impl ZxrawApp {
 
     /// Folder for a new window without a restored session. Automated runs start in an
     /// empty folder inside their profile so they never list the user's real home folder.
-    fn start_folder(&self) -> PathBuf {
+    pub(crate) fn start_folder(&self) -> PathBuf {
         if self.testhook.active() {
             let dir = self.paths.data.join("start");
             if std::fs::create_dir_all(&dir).is_ok() {
@@ -266,18 +274,41 @@ impl ZxrawApp {
         p
     }
 
+    /// Builds a tab from a saved session or layout. Folders that no longer exist (or are
+    /// offline) open `fallback` instead and are returned as missing.
+    pub(crate) fn tab_from_session(&self, t: &TabSession, fallback: &Path) -> (Tab, Vec<PathBuf>) {
+        let mut missing = Vec::new();
+        let mut pane = |path: &PathBuf, view: ViewMode, sort: Option<forge_core::listing::SortSpec>| {
+            let path = if path.is_dir() {
+                path.clone()
+            } else {
+                missing.push(path.clone());
+                fallback.to_path_buf()
+            };
+            let mut p = self.new_pane(path, view);
+            if let Some(sort) = sort {
+                p.sort = sort;
+            }
+            p
+        };
+        let left = pane(&t.left, t.view, t.sort);
+        let right = t.right.as_ref().map(|r| {
+            pane(r, t.right_view.unwrap_or(t.view), t.right_sort.or(t.sort))
+        });
+        let tab = Tab {
+            left,
+            right,
+            focus: Side::Left,
+        };
+        (tab, missing)
+    }
+
     fn restore_session(&mut self, s: Session) {
+        // Restore folders that still exist; fall back to home for vanished/offline ones.
+        let home = self.start_folder();
         for t in &s.tabs {
-            // Restore folders that still exist; fall back to home for vanished/offline ones.
-            let home = self.start_folder();
-            let pick = |p: &PathBuf| if p.is_dir() { p.clone() } else { home.clone() };
-            let left = self.new_pane(pick(&t.left), t.view);
-            let right = t.right.as_ref().map(|r| self.new_pane(pick(r), t.view));
-            self.tabs.push(Tab {
-                left,
-                right,
-                focus: Side::Left,
-            });
+            let (tab, _) = self.tab_from_session(t, &home);
+            self.tabs.push(tab);
         }
         if self.tabs.is_empty() {
             let left = self.new_pane(self.start_folder(), self.settings.default_view);
@@ -303,6 +334,9 @@ impl ZxrawApp {
                     left: t.left.path.clone(),
                     right: t.right.as_ref().map(|r| r.path.clone()),
                     view: t.left.view,
+                    sort: Some(t.left.sort),
+                    right_view: t.right.as_ref().map(|r| r.view),
+                    right_sort: t.right.as_ref().map(|r| r.sort),
                 })
                 .collect(),
             active_tab: self.active,
@@ -468,11 +502,10 @@ impl ZxrawApp {
             CompareImages => crate::viewer_host::open(self, crate::viewer::ViewerMode::Compare),
             BookmarkFolder => {
                 let p = self.pane().path.clone();
-                if !self.settings.bookmarks.contains(&p) {
-                    self.settings.bookmarks.push(p);
-                    self.toast("Folder bookmarked");
-                }
+                crate::sidebar::pin_paths(self, vec![(p, false)]);
             }
+            PinToQuickAccess => crate::sidebar::pin_selection(self),
+            SaveLayout | LoadLayout | ManageLayouts => crate::layouts::run(self, cmd),
             CopyPath => {
                 let t: Vec<String> = self
                     .pane()
@@ -1089,6 +1122,7 @@ impl eframe::App for ZxrawApp {
             }
         });
 
+        crate::layouts::show(self, &ctx);
         crate::actions::modals(self, ui);
         crate::notices::show(self, &ctx);
         self.palette_ui(&ctx);

@@ -842,6 +842,10 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
 /// Apply an accepted dialog. Returns the dialog again (with an error) if it must stay open.
 pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
     match m {
+        Modal::Prompt(p) if p.kind.is_label() => match p.kind {
+            PromptKind::RenamePin { .. } => crate::sidebar::accept_label(app, p),
+            _ => crate::layouts::accept_label(app, p),
+        },
         Modal::Prompt(mut p) => {
             let name = p.text.trim().to_string();
             if let Err(e) = forge_core::paths::validate_file_name(&name) {
@@ -880,6 +884,9 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                     }
                     (res, dir)
                 }
+                PromptKind::SaveLayout
+                | PromptKind::RenameLayout { .. }
+                | PromptKind::RenamePin { .. } => unreachable!("labels are accepted above"),
             };
             match res {
                 Ok(()) => {

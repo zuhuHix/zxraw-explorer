@@ -583,6 +583,10 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(&mut settings.show_hidden, "Show hidden files");
     ui.checkbox(&mut settings.show_system, "Show system files");
     ui.checkbox(
+        &mut settings.restore_session,
+        "Reopen the last session's tabs at startup",
+    );
+    ui.checkbox(
         &mut settings.confirm_recycle,
         "Confirm before moving items to the Recycle Bin",
     );

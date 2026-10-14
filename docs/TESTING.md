@@ -13,7 +13,7 @@
   `browser::two_thousand_small_images_record_grouping_frame_times`) always run alone.
 - To run one area, name it after `--`: `cargo test -p forge-app --test e2e -- library::`.
   Several areas can be listed. The areas are browser, core, ingest, library, media, perf,
-  related, system, tools and viewer.
+  related, sidebar, system, tools and viewer.
 
 ## Workspace checks
 
@@ -204,7 +204,7 @@ after the commands, and a run closes itself after 120 s at most.
 `crates/forge-app/tests/e2e/` drives the real `zxraw` window through `ZXRAW_SCRIPT` and asserts on
 the filesystem and the app's own state afterwards. `main.rs` holds the runner and helpers; each
 other file is one area (`core`, `ingest`, `library`, `tools`, `viewer`, `perf`, `browser`, `media`,
-`related`, `system`). Each test builds its own fixtures in a temp directory and uses a fresh
+`related`, `sidebar`, `system`). Each test builds its own fixtures in a temp directory and uses a fresh
 profile (`ZXRAW_PROFILE_DIR`), so no user settings, session, library data or Recycle Bin is
 touched.
 
@@ -286,7 +286,7 @@ Area verbs live next to the code they drive, in `crates/forge-app/src/testhook/<
 `viewer` (open, cull, decode and thumbnail state), `ingest` (card fixtures, fault injection,
 verification report), `library` (index, search, tags, collections, resume), `tools` (zip,
 split/join, duplicates, compare/sync, external filesystem changes), `perf` (frame timing),
-`browser`, `media`, `related` and `system`. Each file's `step` function documents its verbs.
+`browser`, `media`, `related`, `sidebar` and `system`. Each file's `step` function documents its verbs.
 
 `ui perf begin` starts recording per-frame work time (from the raw-input hook to the end of the
 frame) and frame interval; `ui perf end <json>` writes count, mean, p50, p95, p99 and max for both.
