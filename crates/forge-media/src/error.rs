@@ -40,6 +40,9 @@ pub enum MediaError {
     Timeout { tool: &'static str, secs: f64 },
     #[error("{what} output exceeded {limit} bytes")]
     OutputTooLarge { what: &'static str, limit: usize },
+    /// Background work refused to read a cloud placeholder whose data is not on this PC.
+    #[error("online-only file; not downloaded")]
+    OnlineOnly,
     #[error("operation cancelled")]
     Cancelled,
 }

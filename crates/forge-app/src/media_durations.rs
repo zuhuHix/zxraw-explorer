@@ -125,11 +125,9 @@ fn worker(rx: Receiver<Request>, shared: Arc<Mutex<Shared>>, ctx: egui::Context)
                 &tools.insert((request.ffmpeg_dir.clone(), ff)).1
             }
         };
-        let seconds = ff
-            .probe(&request.key.0)
-            .ok()
-            .and_then(|m| m.duration_s)
-            .filter(|d| d.is_finite() && *d > 0.0);
+        let seconds = probe_seconds(&request.key.0, |path| {
+            ff.probe(path).ok().and_then(|m| m.duration_s)
+        });
         {
             let mut shared = shared.lock();
             shared.queued.remove(&request.key);
@@ -139,6 +137,15 @@ fn worker(rx: Receiver<Request>, shared: Arc<Mutex<Shared>>, ctx: egui::Context)
             ctx.request_repaint();
         }
     }
+}
+
+/// Duration of `path` via `probe`, which is never called for cloud placeholders: probing
+/// would download the file.
+fn probe_seconds(path: &Path, probe: impl FnOnce(&Path) -> Option<f64>) -> Option<f64> {
+    if !forge_core::cloud::background_read_allowed(path) {
+        return None;
+    }
+    probe(path).filter(|d| d.is_finite() && *d > 0.0)
 }
 
 /// `" · 3 videos, 12:04"` style suffix; empty when the selection has no media.
@@ -186,6 +193,19 @@ mod tests {
         assert_eq!(total.seconds, 90.5);
         assert_eq!(total.unknown, 1);
         assert_eq!(total.pending, 0);
+    }
+
+    #[test]
+    fn online_only_files_are_never_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cloud.mp4");
+        std::fs::write(&path, b"x").unwrap();
+        forge_core::cloud::simulate_online_only(&path);
+        let never = |_: &Path| -> Option<f64> { panic!("probed an online-only file") };
+        assert_eq!(probe_seconds(&path, never), None);
+        forge_core::cloud::clear_simulated_online_only(&path);
+        assert_eq!(probe_seconds(&path, |_| Some(12.0)), Some(12.0));
+        assert_eq!(probe_seconds(&path, |_| Some(f64::NAN)), None);
     }
 
     #[test]

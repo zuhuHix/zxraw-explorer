@@ -621,6 +621,7 @@ mod tests {
                 hidden: false,
                 readonly: false,
                 system: false,
+                online_only: false,
                 ext: "jpg".into(),
             },
             FileEntry {
@@ -633,6 +634,7 @@ mod tests {
                 hidden: true,
                 readonly: false,
                 system: false,
+                online_only: false,
                 ext: "jpg".into(),
             },
         ];

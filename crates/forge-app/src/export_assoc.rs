@@ -1208,6 +1208,7 @@ mod tests {
                 hidden: false,
                 readonly: false,
                 system: false,
+                online_only: false,
             }
         }
 

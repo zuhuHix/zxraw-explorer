@@ -285,6 +285,7 @@ impl Grouping {
             .filter(|(_, entry)| {
                 entry.kind == EntryKind::File
                     && matches!(entry.media_kind(), MediaKind::Image | MediaKind::Raw)
+                    && forge_core::cloud::background_read_allowed_entry(entry)
             })
             .map(|(index, entry)| Source {
                 index,

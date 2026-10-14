@@ -53,6 +53,7 @@ fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata
         hidden,
         system,
         readonly: md.permissions().readonly(),
+        online_only: crate::cloud::is_online_only_metadata(&path, md),
         ext,
         path,
     }
@@ -118,6 +119,7 @@ pub fn list_dir_streaming(
                     hidden: false,
                     readonly: false,
                     system: false,
+                    online_only: false,
                     ext,
                 });
             }

@@ -38,6 +38,9 @@ pub struct FileEntry {
     pub hidden: bool,
     pub readonly: bool,
     pub system: bool,
+    /// Cloud placeholder whose data is not on this PC (OneDrive/Dropbox files on demand).
+    /// Background readers must skip it; see [`crate::cloud`].
+    pub online_only: bool,
     /// Lowercased extension without the dot ("" if none).
     pub ext: String,
 }

@@ -49,6 +49,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
   (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
 
+* Online-only cloud files (OneDrive, Dropbox, Google Drive placeholders) are detected from
+  their attributes and never read by background work, so they show a cloud badge and no
+  thumbnail or metadata, even when Windows has a cached shell thumbnail. Detection has only been
+  tested with simulated placeholders, not a live sync client. A file downloaded outside ZXraw
+  keeps its badge until the folder is refreshed. The copy/move download warning counts only the
+  selected files, not online-only files inside selected folders. Folder sync in Folder compare
+  still reads online-only files when it compares content.
+
 ## Default apps and folder opening
 
 * After the user clicks **Make ZXraw Explorer my default**, the app registers its photo ProgIDs and

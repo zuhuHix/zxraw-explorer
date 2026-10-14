@@ -8,8 +8,10 @@
 //! * `query` — search query language (parsed to an AST consumed by `forge-db`)
 //! * `ingest` — media import planning & verified copy
 //! * `archive` — safe archive browsing/extraction helpers
+//! * `cloud` — cloud placeholder detection: may background work read a file?
 
 pub mod archive;
+pub mod cloud;
 pub mod compare;
 pub mod disk_usage;
 pub mod duplicates;

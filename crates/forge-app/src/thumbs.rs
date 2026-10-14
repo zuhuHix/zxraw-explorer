@@ -35,6 +35,7 @@ pub struct ThumbManager {
     failed: HashSet<Key>,
     ready: Vec<(Key, Arc<ThumbImage>)>,
     error_texture: Option<egui::TextureHandle>,
+    cloud_texture: Option<egui::TextureHandle>,
     generation: u64,
     context_key: Vec<PathBuf>,
     pub annotations: HashMap<PathBuf, Annotation>,
@@ -57,6 +58,7 @@ impl ThumbManager {
             failed: HashSet::new(),
             ready: Vec::new(),
             error_texture: None,
+            cloud_texture: None,
             generation: 1,
             context_key: Vec::new(),
             annotations: HashMap::new(),
@@ -175,6 +177,19 @@ impl ThumbManager {
         texture
     }
 
+    fn cloud_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        if let Some(texture) = &self.cloud_texture {
+            return texture.clone();
+        }
+        let texture = ctx.load_texture(
+            "thumb-cloud-placeholder",
+            cloud_placeholder_image(),
+            egui::TextureOptions::NEAREST,
+        );
+        self.cloud_texture = Some(texture.clone());
+        texture
+    }
+
     /// Forget failures (e.g. after installing ffmpeg) and textures for a folder that changed.
     pub fn invalidate_dir(&mut self, dir: &Path) {
         self.failed.retain(|(p, _)| p.parent() != Some(dir));
@@ -207,6 +222,9 @@ impl ThumbProvider for ThumbManager {
         let px = (size as f32 * ui.ctx().pixels_per_point()).round() as u32;
         let bucket = bucket_for(px);
         let key = (entry.path.clone(), bucket);
+        if !wants_thumbnail(entry) {
+            return Some(self.cloud_texture(ui.ctx()));
+        }
         if let Some(t) = self.textures.get(&key) {
             return Some(t.clone());
         }
@@ -245,6 +263,11 @@ impl ThumbProvider for ThumbManager {
     }
 }
 
+/// Thumbnails are never requested for cloud placeholders: that would download them.
+fn wants_thumbnail(entry: &FileEntry) -> bool {
+    forge_core::cloud::background_read_allowed_entry(entry)
+}
+
 /// A result is applied only when it was requested for the current folder set.
 fn is_current_result(current: u64, result: u64) -> bool {
     result >= current
@@ -277,9 +300,37 @@ fn error_placeholder_image() -> egui::ColorImage {
     image
 }
 
+fn cloud_placeholder_image() -> egui::ColorImage {
+    const WIDTH: usize = 96;
+    const HEIGHT: usize = 72;
+    let background = egui::Color32::from_rgb(40, 43, 51);
+    let mark = egui::Color32::from_rgb(120, 136, 156);
+    let mut image = egui::ColorImage::filled([WIDTH, HEIGHT], background);
+    // Three overlapping discs and a flat base make a cloud.
+    let discs = [(38, 38, 9), (50, 31, 12), (61, 39, 8)];
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let in_disc = discs.iter().any(|&(cx, cy, r)| {
+                let (dx, dy) = (x as i32 - cx, y as i32 - cy);
+                dx * dx + dy * dy <= r * r
+            });
+            let in_base = (30..66).contains(&x) && (38..46).contains(&y);
+            if in_disc || in_base {
+                image.pixels[y * WIDTH + x] = mark;
+            }
+        }
+    }
+    image
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bucket_for, error_placeholder_image, is_current_result};
+    use super::{
+        bucket_for, cloud_placeholder_image, error_placeholder_image, is_current_result,
+        wants_thumbnail,
+    };
+    use forge_core::{EntryKind, FileEntry};
+    use std::path::PathBuf;
 
     #[test]
     fn only_results_for_the_current_folder_set_are_applied() {
@@ -309,5 +360,40 @@ mod tests {
             image.pixels[30 * 96 + 20],
             egui::Color32::from_rgb(40, 43, 51)
         );
+    }
+
+    #[test]
+    fn cloud_placeholder_is_a_bounded_cloud_card() {
+        let image = cloud_placeholder_image();
+        assert_eq!(image.size, [96, 72]);
+        assert_eq!(image.pixels[0], egui::Color32::from_rgb(40, 43, 51));
+        assert_eq!(
+            image.pixels[40 * 96 + 48],
+            egui::Color32::from_rgb(120, 136, 156)
+        );
+        assert_eq!(
+            image.pixels[10 * 96 + 10],
+            egui::Color32::from_rgb(40, 43, 51)
+        );
+    }
+
+    #[test]
+    fn online_only_entries_get_no_thumbnail_request() {
+        let mut entry = FileEntry {
+            path: PathBuf::from(r"C:\photos\cloud.jpg"),
+            name: "cloud.jpg".into(),
+            kind: EntryKind::File,
+            size: 1024,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            online_only: true,
+            ext: "jpg".into(),
+        };
+        assert!(!wants_thumbnail(&entry));
+        entry.online_only = false;
+        assert!(wants_thumbnail(&entry));
     }
 }
