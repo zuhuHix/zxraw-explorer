@@ -45,7 +45,9 @@ pub use file_types::{
     DefaultApp, FileType, default_app, file_types_registered, open_default_apps_settings,
     refresh_file_types_if_registered, register_file_types, unregister_file_types,
 };
-pub use files::{hard_link_count, is_removable, set_attributes, volume_serial};
+pub use files::{
+    hard_link_count, is_removable, physical_disks, set_attributes, volume_serial,
+};
 pub use integration::{
     default_folder_handler_enabled, is_registered, refresh_default_folder_handler,
     refresh_if_registered, register_context_menu, register_default_folder_handler,

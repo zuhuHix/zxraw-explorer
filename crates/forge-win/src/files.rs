@@ -99,6 +99,91 @@ pub fn is_removable(_path: &Path) -> Result<bool> {
     Err(WinError::Unsupported)
 }
 
+/// Physical disk numbers backing the volume that holds `path` (several for spanned or
+/// mirrored volumes). `None` when unknown: UNC/network paths, no drive letter, or the
+/// query fails. Callers must treat `None` as "may share a disk with anything".
+#[cfg(windows)]
+pub fn physical_disks(path: &Path) -> Option<Vec<u32>> {
+    use std::path::{Component, Prefix};
+
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
+    };
+    use windows::Win32::System::IO::DeviceIoControl;
+    use windows::Win32::System::Ioctl::{DISK_EXTENT, VOLUME_DISK_EXTENTS};
+    use windows::core::PCWSTR;
+
+    /// Room for this many extents; a volume spanning more disks reports `None`.
+    const MAX_EXTENTS: usize = 16;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let letter = match prefix.kind() {
+        Prefix::Disk(b) | Prefix::VerbatimDisk(b) => b as char,
+        _ => return None,
+    };
+    let device = crate::to_wide(format!("\\\\.\\{letter}:"));
+
+    // Zero access rights: no data access is needed, so no administrator rights either.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(device.as_ptr()),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+    }
+    .ok()?;
+
+    // u64 words keep the buffer 8-byte aligned for the DISK_EXTENT fields.
+    let bytes = std::mem::size_of::<VOLUME_DISK_EXTENTS>()
+        + MAX_EXTENTS * std::mem::size_of::<DISK_EXTENT>();
+    let mut buf = vec![0u64; bytes.div_ceil(8)];
+    let mut returned = 0u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+            None,
+            0,
+            Some(buf.as_mut_ptr().cast()),
+            (buf.len() * 8) as u32,
+            Some(&mut returned),
+            None,
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    ok.ok()?;
+
+    let mut disks: Vec<u32> = unsafe {
+        let extents = &*buf.as_ptr().cast::<VOLUME_DISK_EXTENTS>();
+        let count = extents.NumberOfDiskExtents as usize;
+        if count == 0 || count > MAX_EXTENTS {
+            return None;
+        }
+        std::slice::from_raw_parts(extents.Extents.as_ptr(), count)
+            .iter()
+            .map(|e| e.DiskNumber)
+            .collect()
+    };
+    disks.sort_unstable();
+    disks.dedup();
+    Some(disks)
+}
+
+#[cfg(not(windows))]
+pub fn physical_disks(_path: &Path) -> Option<Vec<u32>> {
+    None
+}
+
 /// Sets or clears the read-only and hidden attributes. Other attributes that the user can
 /// set (archive, system, not-content-indexed) are preserved; directory and reparse bits
 /// are never passed back to the system.
@@ -177,6 +262,28 @@ mod tests {
         assert_eq!(md.file_attributes() & consts::FILE_ATTRIBUTE_HIDDEN, 0);
         // Leave the file deletable for the temp directory cleanup.
         std::fs::remove_file(&f).unwrap();
+    }
+
+    #[test]
+    fn physical_disks_of_temp_dir_is_known() {
+        let disks = physical_disks(&std::env::temp_dir()).expect("temp dir volume");
+        assert!(!disks.is_empty());
+        assert!(disks.windows(2).all(|w| w[0] < w[1]), "sorted and unique");
+    }
+
+    #[test]
+    fn physical_disks_of_siblings_match() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        assert_eq!(physical_disks(&a), physical_disks(&b));
+    }
+
+    #[test]
+    fn physical_disks_of_unc_path_is_none() {
+        assert_eq!(physical_disks(Path::new(r"\\server\share\x")), None);
     }
 
     #[test]
