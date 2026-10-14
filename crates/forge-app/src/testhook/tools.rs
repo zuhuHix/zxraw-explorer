@@ -71,7 +71,8 @@
 //! - `replace assert-preview <key=value>…`: counts of the preview. Keys: `files`, `matches`,
 //!   `skipped`.
 //! - `replace assert-skipped <file name> <reason>`: the preview skips that file. Reasons:
-//!   `binary-extension`, `binary`, `too-large`, `online-only`, `read-only`, `changed`.
+//!   `binary-extension`, `unknown-type`, `binary`, `too-large`, `online-only`, `read-only`,
+//!   `changed`, `path-changed`, `unreadable`.
 //! - `replace untick <file name>`: leave a previewed file out of the replace.
 //! - `replace run`: start the replace of the ticked files; `replace wait-apply [secs]` waits for
 //!   it (default 30 s).
@@ -521,11 +522,13 @@ fn finished_apply(app: &mut ZxrawApp) -> Result<ApplyReport, String> {
 fn skip_key(reason: &SkipReason) -> &'static str {
     match reason {
         SkipReason::BinaryExtension => "binary-extension",
+        SkipReason::UnknownType => "unknown-type",
         SkipReason::Binary => "binary",
         SkipReason::TooLarge(_) => "too-large",
         SkipReason::OnlineOnly => "online-only",
         SkipReason::ReadOnly => "read-only",
         SkipReason::Changed => "changed",
+        SkipReason::PathChanged => "path-changed",
         SkipReason::Unreadable(_) => "unreadable",
     }
 }

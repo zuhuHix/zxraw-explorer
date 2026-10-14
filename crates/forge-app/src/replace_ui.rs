@@ -23,7 +23,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText};
 use forge_core::ops::JobCtx;
 use forge_core::text_replace::{
-    self, ApplyReport, FilePreview, ReplaceUndo, ScanOptions, ScanReport, SearchSpec,
+    self, ApplyReport, FilePreview, LineMatch, ReplaceUndo, ScanOptions, ScanReport, SearchSpec,
 };
 use forge_jobs::JobHandle;
 use parking_lot::Mutex;
@@ -32,8 +32,9 @@ use crate::actions::{Event, UndoEntry};
 use crate::app::ZxrawApp;
 use crate::tools_ui::register_click_target;
 
-/// Matching lines shown per file in the preview; the rest are counted.
-const MAX_LINES_PER_FILE: usize = 50;
+/// Height of one row of the preview list. Every row is this tall, so the list can be
+/// virtualised.
+const ROW_HEIGHT: f32 = 22.0;
 /// Backup folders older than this are removed when the window opens.
 const BACKUP_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const OLD_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(81, 25, 25, 90);
@@ -549,8 +550,10 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut ReplaceState) {
             });
             ui.label(
                 RichText::new(
-                    "Binary files, RAW/images/video/archives, files above the size limit and \
-                     online-only cloud files are skipped.",
+                    "Only known text files are searched (.txt, .md, .log, .xmp, code and \
+                     similar); other types are skipped unless their pattern is in Include \
+                     files. Binary files, RAW/images/video/archives, files above the size limit \
+                     and online-only cloud files are skipped.",
                 )
                 .weak(),
             );
@@ -716,71 +719,89 @@ fn draw_preview(
         }
     });
 
+    let rows = preview_rows(report);
+    // Only the visible rows are laid out, so a preview of many files stays responsive.
     egui::ScrollArea::vertical()
         .id_salt("replace:results")
         .max_height(340.0)
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for file in &report.files {
-                ui.horizontal(|ui| {
-                    let mut on = !unticked.contains(&file.path);
-                    if ui
-                        .checkbox(
-                            &mut on,
-                            RichText::new(display_path(roots, &file.path)).strong(),
-                        )
-                        .changed()
-                    {
-                        if on {
-                            unticked.remove(&file.path);
-                        } else {
-                            unticked.insert(file.path.clone());
-                        }
-                    }
-                });
-                ui.label(
-                    RichText::new(format!(
-                        "{} matches · {} · {}",
-                        file.match_count,
-                        file.encoding.label(),
-                        file.line_ending.label()
-                    ))
-                    .weak(),
-                );
-                let shown = file.matches.len().min(MAX_LINES_PER_FILE);
-                for line in &file.matches[..shown] {
-                    let old = with_text_color(
-                        highlight_job(&line.line, &line.ranges, OLD_BACKGROUND),
-                        ui.visuals().text_color(),
-                    );
-                    let new = with_text_color(
-                        highlight_job(&line.replaced, &line.replaced_ranges, NEW_BACKGROUND),
-                        ui.visuals().text_color(),
-                    );
-                    ui.horizontal_top(|ui| {
-                        ui.label(RichText::new(format!("{}: ", line.line_number)).monospace());
-                        ui.label(old);
-                    });
-                    ui.horizontal_top(|ui| {
-                        ui.label(
-                            RichText::new(format!("{}: ", line.line_number))
-                                .monospace()
+        .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                match row {
+                    PreviewRow::File(file) => {
+                        ui.horizontal(|ui| {
+                            let mut on = !unticked.contains(&file.path);
+                            if ui
+                                .checkbox(
+                                    &mut on,
+                                    RichText::new(display_path(roots, &file.path)).strong(),
+                                )
+                                .changed()
+                            {
+                                if on {
+                                    unticked.remove(&file.path);
+                                } else {
+                                    unticked.insert(file.path.clone());
+                                }
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} matches · {} · {}",
+                                    file.match_count,
+                                    file.encoding.label(),
+                                    file.line_ending.label()
+                                ))
                                 .weak(),
-                        );
-                        ui.label(new);
-                    });
+                            );
+                        });
+                    }
+                    PreviewRow::Line { line, new } => {
+                        let color = ui.visuals().text_color();
+                        let (job, number) = if *new {
+                            (
+                                with_text_color(
+                                    highlight_job(
+                                        &line.replaced,
+                                        &line.replaced_ranges,
+                                        NEW_BACKGROUND,
+                                    ),
+                                    color,
+                                ),
+                                RichText::new(format!("{}: ", line.line_number))
+                                    .monospace()
+                                    .weak(),
+                            )
+                        } else {
+                            (
+                                with_text_color(
+                                    highlight_job(&line.line, &line.ranges, OLD_BACKGROUND),
+                                    color,
+                                ),
+                                RichText::new(format!("{}: ", line.line_number)).monospace(),
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(number);
+                            // Long lines are cut to the row; the full line is in the file.
+                            ui.add(egui::Label::new(job).truncate());
+                        });
+                    }
+                    PreviewRow::More(count) => {
+                        ui.label(RichText::new(format!("… and {count} more lines")).weak());
+                    }
                 }
-                if file.matches.len() > shown {
-                    ui.label(
-                        RichText::new(format!("… and {} more", file.matches.len() - shown)).weak(),
-                    );
-                }
-                ui.add_space(6.0);
             }
-            if !report.skipped.is_empty() {
-                egui::CollapsingHeader::new(format!("Skipped ({})", report.skipped.len()))
-                    .id_salt("replace:skipped")
-                    .default_open(false)
+        });
+
+    if !report.skipped.is_empty() {
+        egui::CollapsingHeader::new(format!("Skipped ({})", report.skipped.len()))
+            .id_salt("replace:skipped")
+            .default_open(false)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("replace:skipped-list")
+                    .max_height(160.0)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (path, reason) in &report.skipped {
                             ui.label(format!(
@@ -790,8 +811,36 @@ fn draw_preview(
                             ));
                         }
                     });
-            }
-        });
+            });
+    }
+}
+
+/// One row of the preview list.
+enum PreviewRow<'a> {
+    /// The file's checkbox and summary.
+    File(&'a FilePreview),
+    /// A matching line, before the replace (`new` false) or after it.
+    Line { line: &'a LineMatch, new: bool },
+    /// Matching lines of the file that are not stored in the preview.
+    More(usize),
+}
+
+/// The preview flattened into rows: a header per file, the old and new form of each stored
+/// line, and a count row when the file has more matching lines than are stored.
+fn preview_rows(report: &ScanReport) -> Vec<PreviewRow<'_>> {
+    let mut rows = Vec::new();
+    for file in &report.files {
+        rows.push(PreviewRow::File(file));
+        for line in &file.matches {
+            rows.push(PreviewRow::Line { line, new: false });
+            rows.push(PreviewRow::Line { line, new: true });
+        }
+        let more = file.lines_with_matches.saturating_sub(file.matches.len());
+        if more > 0 {
+            rows.push(PreviewRow::More(more));
+        }
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -1034,7 +1083,9 @@ mod tests {
         assert_eq!(position, text.len());
     }
 
+    // One range is the point of these cases.
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
     fn highlight_job_skips_ranges_inside_a_character() {
         let job = highlight_job("é", &[1..2], Color32::RED);
         assert_eq!(job.text, "é");
@@ -1043,5 +1094,44 @@ mod tests {
                 .iter()
                 .all(|section| section.format.background != Color32::RED)
         );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn preview_rows_flatten_each_file_and_count_the_unstored_lines() {
+        use forge_core::text_replace::{Encoding, Fingerprint, LineEnding};
+
+        let line = LineMatch {
+            line_number: 1,
+            line: "a".into(),
+            ranges: vec![0..1],
+            replaced: "b".into(),
+            replaced_ranges: vec![0..1],
+        };
+        let file = FilePreview {
+            path: "x.txt".into(),
+            root: "r".into(),
+            rel: "x.txt".into(),
+            encoding: Encoding::Utf8,
+            line_ending: LineEnding::Lf,
+            matches: vec![line],
+            match_count: 3,
+            lines_with_matches: 3,
+            fingerprint: Fingerprint {
+                size: 1,
+                hash: [0; 32],
+            },
+            max_file_size: 1,
+        };
+        let report = ScanReport {
+            files: vec![file],
+            ..Default::default()
+        };
+        let rows = preview_rows(&report);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0], PreviewRow::File(_)));
+        assert!(matches!(rows[1], PreviewRow::Line { new: false, .. }));
+        assert!(matches!(rows[2], PreviewRow::Line { new: true, .. }));
+        assert!(matches!(rows[3], PreviewRow::More(2)));
     }
 }

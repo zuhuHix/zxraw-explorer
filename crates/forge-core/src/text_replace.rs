@@ -3,30 +3,42 @@
 //! * [`scan`] walks the roots and returns a [`ScanReport`] of matching files, each with its
 //!   matching lines and a fingerprint of the bytes it saw.
 //! * [`apply`] replaces in those files, but only where the bytes still match the fingerprint,
-//!   keeps the original bytes in a backup file and writes the result with [`write_atomic`].
+//!   keeps the original bytes in a backup file and publishes the result with a replace.
 //! * [`undo`] restores a file from its backup, unless it was edited since.
 //!
 //! Files are decoded (UTF-8, UTF-8 with BOM, UTF-16 with BOM) and searched as whole text, so
 //! line endings and the encoding survive the replace byte-for-byte. Online-only cloud files
-//! are never read, and binary files are skipped.
+//! are never read, binary files are skipped, and only files of a known text type are searched
+//! unless the user names them in the include list.
+//!
+//! Writes never follow a link: each previewed file remembers the canonical root it was found
+//! under and its path relative to that root, and apply checks that path again before it reads
+//! and before it publishes.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 
+use crate::cloud::{
+    AttributeSource, FsAttributes, background_read_allowed, background_read_allowed_with,
+};
 use crate::error::{CoreError, Result};
 use crate::ops::{JobCtx, WalkItem, walk_tree};
-use crate::cloud::background_read_allowed;
+use crate::paths;
 use crate::query::glob_match;
 
 /// Files larger than this are skipped by [`scan`] unless the caller raises the limit.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Matching lines stored per file in a [`FilePreview`]. The counts stay exact past this.
+pub const MAX_PREVIEW_LINES: usize = 200;
 
 /// Longest line shown in a [`LineMatch`]; longer lines are cut to a window around the match.
 const DISPLAY_MAX: usize = 400;
@@ -252,6 +264,120 @@ pub fn is_binary_extension(path: &Path) -> bool {
     BINARY_EXTENSIONS.contains(&ext.as_str())
 }
 
+/// Extensions (and whole file names, for names like `Dockerfile`) of text formats that are
+/// searched by default. Anything else is skipped as [`SkipReason::UnknownType`] unless the
+/// user names it in the include list.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt",
+    "text",
+    "md",
+    "markdown",
+    "rst",
+    "log",
+    "csv",
+    "tsv",
+    "json",
+    "jsonc",
+    "xml",
+    "xmp",
+    "xsl",
+    "svg",
+    "html",
+    "htm",
+    "xhtml",
+    "css",
+    "scss",
+    "js",
+    "mjs",
+    "cjs",
+    "ts",
+    "tsx",
+    "jsx",
+    "vue",
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "properties",
+    "env",
+    "sql",
+    "sh",
+    "bash",
+    "zsh",
+    "bat",
+    "cmd",
+    "ps1",
+    "psm1",
+    "py",
+    "rb",
+    "pl",
+    "php",
+    "lua",
+    "r",
+    "rs",
+    "go",
+    "java",
+    "kt",
+    "kts",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cc",
+    "cs",
+    "swift",
+    "m",
+    "mm",
+    "gradle",
+    "cmake",
+    "make",
+    "mk",
+    "tex",
+    "bib",
+    "srt",
+    "vtt",
+    "ass",
+    "ssa",
+    "sub",
+    "lrc",
+    "cue",
+    "m3u",
+    "m3u8",
+    "pls",
+    "nfo",
+    "gpx",
+    "kml",
+    "geojson",
+    "pp3",
+    "dop",
+    "on1",
+    "cube",
+    "plist",
+    "reg",
+    "gitignore",
+    "gitattributes",
+    "editorconfig",
+    "dockerfile",
+];
+
+/// Is this a known text format (by extension, or by file name for names such as `Dockerfile`)?
+/// The check is by name only; the file is not opened.
+pub fn is_known_text_extension(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    // `.gitignore` has no extension; its name without the leading dot is the list entry.
+    let name = name.trim_start_matches('.').to_ascii_lowercase();
+    if TEXT_EXTENSIONS.contains(&name.as_str()) {
+        return true;
+    }
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| TEXT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
 /// Content identity of a file: byte length and BLAKE3 of the raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprint {
@@ -286,14 +412,26 @@ pub struct LineMatch {
 /// A file with at least one match, as found by [`scan`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilePreview {
+    /// The path as it was found (for display and for matching the user's ticks).
     pub path: PathBuf,
+    /// Canonical form of the root this file was found under. For a file given directly as a
+    /// root, its canonical parent folder.
+    pub root: PathBuf,
+    /// The file's path relative to `root`. [`apply`] writes to `root.join(rel)`, never to
+    /// `path`.
+    pub rel: PathBuf,
     pub encoding: Encoding,
     pub line_ending: LineEnding,
-    /// One entry per line that has at least one match.
+    /// The first [`MAX_PREVIEW_LINES`] lines that have a match.
     pub matches: Vec<LineMatch>,
+    /// Every match in the file, including those not stored in `matches`.
     pub match_count: usize,
+    /// Every line with a match, including those not stored in `matches`.
+    pub lines_with_matches: usize,
     /// Identity of the bytes that were searched. [`apply`] refuses files that no longer match.
     pub fingerprint: Fingerprint,
+    /// The size limit in force when the file was scanned. [`apply`] reads at most this much.
+    pub max_file_size: u64,
 }
 
 /// Why a file was not searched or not changed.
@@ -301,16 +439,21 @@ pub struct FilePreview {
 pub enum SkipReason {
     /// Known binary extension; never read.
     BinaryExtension,
+    /// Not a known text type and not named in the include list; never read.
+    UnknownType,
     /// Contains NUL bytes or is not decodable text.
     Binary,
     /// Larger than the size limit (bytes).
     TooLarge(u64),
-    /// Online-only cloud file; reading it would download it.
+    /// Online-only cloud file, or its attributes could not be read; reading it could download
+    /// it, so it is never read.
     OnlineOnly,
     /// Read-only; matches are not changed.
     ReadOnly,
     /// Changed after the preview was made.
     Changed,
+    /// A folder in its path was replaced by a link, or the file moved.
+    PathChanged,
     /// Could not be read; the message says why.
     Unreadable(String),
 }
@@ -319,11 +462,19 @@ impl SkipReason {
     pub fn describe(&self) -> String {
         match self {
             Self::BinaryExtension => "Binary file type, not searched".into(),
+            Self::UnknownType => {
+                "Not a known text file type; add it to Include files to search it".into()
+            }
             Self::Binary => "Not a text file".into(),
             Self::TooLarge(n) => format!("Too large to search ({n} bytes)"),
-            Self::OnlineOnly => "Online-only cloud file, not downloaded".into(),
+            Self::OnlineOnly => {
+                "Online-only cloud file, or its attributes could not be read; not read".into()
+            }
             Self::ReadOnly => "Read-only file, not changed".into(),
             Self::Changed => "Changed since the preview, not changed".into(),
+            Self::PathChanged => {
+                "A folder in its path was replaced by a link, or the file moved; not changed".into()
+            }
             Self::Unreadable(msg) => format!("Could not be read: {msg}"),
         }
     }
@@ -385,6 +536,17 @@ pub fn scan(
     opts: &ScanOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<ScanReport> {
+    scan_with(roots, spec, opts, ctx, &FsAttributes)
+}
+
+/// [`scan`] with the attribute source injected; the read gate asks `source` for each file.
+fn scan_with(
+    roots: &[PathBuf],
+    spec: &SearchSpec,
+    opts: &ScanOptions,
+    ctx: &JobCtx<'_>,
+    source: &dyn AttributeSource,
+) -> Result<ScanReport> {
     let re = spec.compile()?;
     let mut col = Collector::new(opts);
     for root in roots {
@@ -401,7 +563,7 @@ pub fn scan(
         ctx.cancel.check()?;
         ctx.progress.set_current(cand.path.display().to_string());
         report.files_scanned += 1;
-        scan_file(cand, &re, spec, opts, ctx, &mut report);
+        scan_file(cand, &re, spec, opts, ctx, source, &mut report);
         ctx.progress.add_items(1);
     }
     Ok(report)
@@ -409,8 +571,9 @@ pub fn scan(
 
 struct Candidate {
     path: PathBuf,
+    root: PathBuf,
+    rel: PathBuf,
     size: u64,
-    readonly: bool,
 }
 
 /// Collects the files to scan: applies name globs, drops duplicate paths across roots.
@@ -439,7 +602,8 @@ impl Collector {
         included && !self.exclude.iter().any(|p| glob_match(p, &name))
     }
 
-    fn push(&mut self, path: PathBuf, size: u64, readonly: bool) {
+    /// Adds a file. `root` is the canonical root and `rel` the path under it.
+    fn push(&mut self, path: PathBuf, root: PathBuf, rel: PathBuf, size: u64) {
         let key = if cfg!(windows) {
             path.to_string_lossy().to_lowercase()
         } else {
@@ -448,8 +612,9 @@ impl Collector {
         if self.seen.insert(key) {
             self.out.push(Candidate {
                 path,
+                root,
+                rel,
                 size,
-                readonly,
             });
         }
     }
@@ -459,6 +624,19 @@ fn file_name_of(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// Canonical form of `path` with the `\\?\` prefix removed, the form [`paths`] displays.
+fn canonical_path(path: &Path) -> io::Result<PathBuf> {
+    fs::canonicalize(path).map(|p| PathBuf::from(paths::display_path(&p)))
+}
+
+/// The canonical root and the path of `path` under the root it was walked from (`given`).
+fn root_and_rel(given: &Path, canonical: &Path, path: &Path) -> (PathBuf, PathBuf) {
+    let rel = path
+        .strip_prefix(given)
+        .map_or_else(|_| PathBuf::from(file_name_of(path)), Path::to_path_buf);
+    (canonical.to_path_buf(), rel)
 }
 
 fn collect_root(
@@ -476,17 +654,26 @@ fn collect_root(
         return Ok(());
     }
     if md.is_file() {
-        col.push(root.to_path_buf(), md.len(), md.permissions().readonly());
+        // A file root: its canonical parent is the root, the file name the relative path.
+        let parent = root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let canonical = canonical_path(parent).map_err(|e| CoreError::io(parent, e))?;
+        let rel = PathBuf::from(file_name_of(root));
+        col.push(root.to_path_buf(), canonical, rel, md.len());
         return Ok(());
     }
     if !md.is_dir() {
         return Ok(());
     }
+    let canonical = canonical_path(root).map_err(|e| CoreError::io(root, e))?;
     if opts.recursive {
         walk_tree(root, ctx.cancel, |item| match item {
             WalkItem::Entry(e) => {
                 if e.is_file() && col.name_ok(&file_name_of(&e.path)) {
-                    col.push(e.path.clone(), e.size, e.readonly);
+                    let (canon, rel) = root_and_rel(root, &canonical, &e.path);
+                    col.push(e.path.clone(), canon, rel, e.size);
                 }
             }
             WalkItem::Error { path, error } => col
@@ -515,7 +702,8 @@ fn collect_root(
                 }
             };
             if meta.is_file() && col.name_ok(&file_name_of(&path)) {
-                col.push(path, meta.len(), meta.permissions().readonly());
+                let (canon, rel) = root_and_rel(root, &canonical, &path);
+                col.push(path, canon, rel, meta.len());
             }
         }
     }
@@ -526,27 +714,62 @@ fn skip(report: &mut ScanReport, path: &Path, reason: SkipReason) {
     report.skipped.push((path.to_path_buf(), reason));
 }
 
-/// Checks run per file, in this order: placeholder, extension, size, read, decode, search.
+/// Is `name` (a file name, not a path) explicitly named by the include list? True when the list
+/// is non-empty and one of its patterns matches the name, so the user asked for this type.
+fn named_by_include(include: &[String], name: &str) -> bool {
+    let name = name.to_lowercase();
+    include.iter().any(|p| glob_match(&p.to_lowercase(), &name))
+}
+
+/// Checks run per file, in this order: cloud read gate, binary extension, known text type,
+/// listed size, bounded read, decode, search, read-only.
 fn scan_file(
     cand: &Candidate,
     re: &Regex,
     spec: &SearchSpec,
     opts: &ScanOptions,
     ctx: &JobCtx<'_>,
+    source: &dyn AttributeSource,
     report: &mut ScanReport,
 ) {
     let path = cand.path.as_path();
-    if !background_read_allowed(path) {
+    if !background_read_allowed_with(path, source) {
         return skip(report, path, SkipReason::OnlineOnly);
     }
     if is_binary_extension(path) {
         return skip(report, path, SkipReason::BinaryExtension);
     }
+    let name = file_name_of(path);
+    if !is_known_text_extension(path) && !named_by_include(&opts.include, &name) {
+        return skip(report, path, SkipReason::UnknownType);
+    }
     if cand.size > opts.max_file_size {
         return skip(report, path, SkipReason::TooLarge(cand.size));
     }
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            ctx.progress.add_error();
+            let msg = CoreError::io(path, e).to_string();
+            return skip(report, path, SkipReason::Unreadable(msg));
+        }
+    };
+    // The listing size can be stale: check the open file, then never read past the limit.
+    let md = match file.metadata() {
+        Ok(md) => md,
+        Err(e) => {
+            ctx.progress.add_error();
+            let msg = CoreError::io(path, e).to_string();
+            return skip(report, path, SkipReason::Unreadable(msg));
+        }
+    };
+    if md.len() > opts.max_file_size {
+        return skip(report, path, SkipReason::TooLarge(md.len()));
+    }
+    let bytes = match read_bounded(&mut file, opts.max_file_size) {
+        Ok(Some(bytes)) => bytes,
+        // The file grew after the metadata was read: at least one byte over the limit.
+        Ok(None) => return skip(report, path, SkipReason::TooLarge(opts.max_file_size + 1)),
         Err(e) => {
             ctx.progress.add_error();
             let msg = CoreError::io(path, e).to_string();
@@ -556,21 +779,36 @@ fn scan_file(
     let Some(decoded) = decode(&bytes) else {
         return skip(report, path, SkipReason::Binary);
     };
-    let (matches, match_count) = find_matches(&decoded.text, re, spec);
+    let (matches, match_count, lines_with_matches) = find_matches(&decoded.text, re, spec);
     if match_count == 0 {
         return;
     }
-    if cand.readonly {
+    if md.permissions().readonly() {
         return skip(report, path, SkipReason::ReadOnly);
     }
     report.files.push(FilePreview {
         path: cand.path.clone(),
+        root: cand.root.clone(),
+        rel: cand.rel.clone(),
         encoding: decoded.encoding,
         line_ending: decoded.line_ending,
         matches,
         match_count,
+        lines_with_matches,
         fingerprint: fingerprint(&bytes),
+        max_file_size: opts.max_file_size,
     });
+}
+
+/// Reads at most `limit` bytes from `file`. `Ok(None)` when the file holds more than `limit`
+/// bytes, so the caller can refuse it without reading the rest.
+fn read_bounded(file: &mut File, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// Text used for one match: the expanded template in regex mode, verbatim otherwise.
@@ -644,11 +882,15 @@ struct LineGroup {
     hits: Vec<(Range<usize>, String)>,
 }
 
-/// Group the matches of `text` by line. Returns the lines and the total match count.
-fn find_matches(text: &str, re: &Regex, spec: &SearchSpec) -> (Vec<LineMatch>, usize) {
+/// Group the matches of `text` by line. Returns the first [`MAX_PREVIEW_LINES`] lines with a
+/// match, the total match count and the total number of lines with a match.
+fn find_matches(text: &str, re: &Regex, spec: &SearchSpec) -> (Vec<LineMatch>, usize, usize) {
     let mut groups: Vec<LineGroup> = Vec::new();
     let mut lines = LineCursor::new(text);
     let mut count = 0;
+    let mut lines_total = 0;
+    // Line start of the last line that had a match, stored or not.
+    let mut last_line: Option<usize> = None;
     for caps in real_matches(text, re) {
         let Some(m) = caps.get(0) else { continue };
         count += 1;
@@ -660,18 +902,26 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec) -> (Vec<LineMatch>, u
             continue;
         }
         let rep = replacement_text(&caps, spec);
-        match groups.last_mut() {
-            Some(g) if g.line_start == line_start => g.hits.push((start..end, rep)),
-            _ => groups.push(LineGroup {
+        if last_line == Some(line_start) {
+            // Another match on a line already counted. Only a stored line takes it.
+            if let Some(g) = groups.last_mut().filter(|g| g.line_start == line_start) {
+                g.hits.push((start..end, rep));
+            }
+            continue;
+        }
+        last_line = Some(line_start);
+        lines_total += 1;
+        if groups.len() < MAX_PREVIEW_LINES {
+            groups.push(LineGroup {
                 line_no,
                 line_start,
                 content_end,
                 hits: vec![(start..end, rep)],
-            }),
+            });
         }
     }
     let lines = groups.iter().map(|g| finish_line(text, g)).collect();
-    (lines, count)
+    (lines, count, lines_total)
 }
 
 fn finish_line(text: &str, g: &LineGroup) -> LineMatch {
@@ -772,16 +1022,33 @@ pub fn replace_text(
 enum Outcome {
     Replaced(ReplaceUndo),
     Skipped(SkipReason),
+    /// The job was cancelled inside this file; the file was not changed.
+    Cancelled,
 }
 
 /// Replace in each previewed file. A file is changed only if its bytes still match the preview
 /// fingerprint; the original bytes go to a backup in `backup_dir` first. A failure on one file
 /// is recorded and the rest continue. Errors only for a bad spec or an uncreatable backup dir.
+///
+/// The file is written to `root.join(rel)`, after checking that no folder on that path is a link
+/// (see [`FilePreview`]).
 pub fn apply(
     files: &[FilePreview],
     spec: &SearchSpec,
     backup_dir: &Path,
     ctx: &JobCtx<'_>,
+) -> Result<ApplyReport> {
+    apply_with_hook(files, spec, backup_dir, ctx, &|_| {})
+}
+
+/// [`apply`] with a hook that runs for each file at the last moment before it is published.
+/// Tests use it to change the job or the file exactly there.
+fn apply_with_hook(
+    files: &[FilePreview],
+    spec: &SearchSpec,
+    backup_dir: &Path,
+    ctx: &JobCtx<'_>,
+    before_publish: &dyn Fn(&Path),
 ) -> Result<ApplyReport> {
     let re = spec.compile()?;
     fs::create_dir_all(backup_dir).map_err(|e| CoreError::io(backup_dir, e))?;
@@ -789,14 +1056,25 @@ pub fn apply(
 
     let mut report = ApplyReport::default();
     for (index, file) in files.iter().enumerate() {
-        if ctx.cancel.check().is_err() {
+        if ctx.cancel.is_cancelled() {
             report.cancelled = true;
             break;
         }
         ctx.progress.set_current(file.path.display().to_string());
-        match replace_one(file, index, &re, spec, backup_dir) {
+        let step = Step {
+            re: &re,
+            spec,
+            backup_dir,
+            ctx,
+            before_publish,
+        };
+        match replace_one(file, index, &step) {
             Ok(Outcome::Replaced(undo)) => report.undo.push(undo),
             Ok(Outcome::Skipped(reason)) => report.skipped.push((file.path.clone(), reason)),
+            Ok(Outcome::Cancelled) => {
+                report.cancelled = true;
+                break;
+            }
             Err(e) => {
                 ctx.progress.add_error();
                 report.failed.push((file.path.clone(), e.to_string()));
@@ -807,46 +1085,208 @@ pub fn apply(
     Ok(report)
 }
 
-fn replace_one(
-    file: &FilePreview,
-    index: usize,
-    re: &Regex,
-    spec: &SearchSpec,
-    backup_dir: &Path,
-) -> Result<Outcome> {
-    let path = file.path.as_path();
-    if !background_read_allowed(path) {
+/// What one file's replace needs besides the file itself.
+struct Step<'a> {
+    re: &'a Regex,
+    spec: &'a SearchSpec,
+    backup_dir: &'a Path,
+    ctx: &'a JobCtx<'a>,
+    before_publish: &'a dyn Fn(&Path),
+}
+
+/// Size and modification time: what a concurrent writer changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn stamp(md: &fs::Metadata) -> Stamp {
+    Stamp {
+        len: md.len(),
+        modified: md.modified().ok(),
+    }
+}
+
+/// True when `file.root.join(&file.rel)` is still the previewed file: every folder on the way is
+/// a real folder (not a symlink or junction), the file is a regular file, and the root and the
+/// file still canonicalize to where they did at scan time. Cloud placeholders are not links, so
+/// they pass.
+fn location_intact(file: &FilePreview) -> bool {
+    let mut names = Vec::new();
+    for component in file.rel.components() {
+        match component {
+            Component::Normal(name) => names.push(name),
+            _ => return false,
+        }
+    }
+    let Some(last) = names.len().checked_sub(1) else {
+        return false;
+    };
+    let mut cur = file.root.clone();
+    for (i, name) in names.iter().enumerate() {
+        cur.push(name);
+        let Ok(md) = fs::symlink_metadata(&cur) else {
+            return false;
+        };
+        if md.file_type().is_symlink() {
+            return false;
+        }
+        let expected = if i == last { md.is_file() } else { md.is_dir() };
+        if !expected {
+            return false;
+        }
+    }
+    match canonical_path(&file.root) {
+        Ok(root) if root == file.root => {}
+        _ => return false,
+    }
+    canonical_path(&cur).is_ok_and(|now| now.starts_with(&file.root))
+}
+
+/// Opens `path` for reading and replacing. On Windows the handle shares read and delete only,
+/// so no other process can write to the file while it is open: the bytes read through it cannot
+/// change under us. Elsewhere this is a plain open.
+fn open_locked(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+/// Replace in one file. Order: location, cloud gate, locked open, bounded read, fingerprint,
+/// replacement in memory, backup written from the bytes read, then [`publish_replacement`].
+/// A stop (changed, moved, cancelled, failed) after the backup was written removes the backup.
+fn replace_one(file: &FilePreview, index: usize, step: &Step<'_>) -> Result<Outcome> {
+    let target = file.root.join(&file.rel);
+    if !background_read_allowed(&target) {
         return Ok(Outcome::Skipped(SkipReason::OnlineOnly));
     }
-    let md = fs::metadata(path).map_err(|e| CoreError::io(path, e))?;
+    if !location_intact(file) {
+        return Ok(Outcome::Skipped(SkipReason::PathChanged));
+    }
+    let mut handle = open_locked(&target).map_err(|e| CoreError::io(&target, e))?;
+    let md = handle.metadata().map_err(|e| CoreError::io(&target, e))?;
     if md.permissions().readonly() {
         return Ok(Outcome::Skipped(SkipReason::ReadOnly));
     }
-    let original = fs::read(path).map_err(|e| CoreError::io(path, e))?;
-    if fingerprint(&original) != file.fingerprint {
+    let original = match read_bounded(&mut handle, file.max_file_size) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(Outcome::Skipped(SkipReason::Changed)),
+        Err(e) => return Err(CoreError::io(&target, e)),
+    };
+    if original.len() as u64 != file.fingerprint.size || fingerprint(&original) != file.fingerprint
+    {
         return Ok(Outcome::Skipped(SkipReason::Changed));
     }
     let Some(decoded) = decode(&original) else {
         return Ok(Outcome::Skipped(SkipReason::Binary));
     };
-    let (text, count) = replace_text(&decoded.text, re, spec, decoded.line_ending);
+    let (text, count) = replace_text(&decoded.text, step.re, step.spec, decoded.line_ending);
     if count == 0 {
         return Ok(Outcome::Skipped(SkipReason::Changed));
     }
     let new_bytes = encode(&text, decoded.encoding);
-
-    let backup = backup_dir.join(format!("{index:05}-{}", file_name_of(path)));
-    write_new_file(&backup, &original).map_err(|e| CoreError::io(&backup, e))?;
-    if let Err(e) = write_atomic(path, &new_bytes) {
-        let _ = fs::remove_file(&backup);
-        return Err(e);
+    if step.ctx.cancel.is_cancelled() {
+        return Ok(Outcome::Cancelled);
     }
-    Ok(Outcome::Replaced(ReplaceUndo {
-        path: file.path.clone(),
-        backup,
-        written: fingerprint(&new_bytes),
-        replacements: count,
-    }))
+
+    let backup = step
+        .backup_dir
+        .join(format!("{index:05}-{}", file_name_of(&target)));
+    write_new_file(&backup, &original).map_err(|e| CoreError::io(&backup, e))?;
+    match publish_replacement(file, &target, handle, &new_bytes, step) {
+        Ok(None) => Ok(Outcome::Replaced(ReplaceUndo {
+            path: target,
+            backup,
+            written: fingerprint(&new_bytes),
+            replacements: count,
+        })),
+        Ok(Some(stop)) => {
+            let _ = fs::remove_file(&backup);
+            Ok(stop)
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&backup);
+            Err(e)
+        }
+    }
+}
+
+/// Write `new_bytes` to a temp file and publish it over `target`. `handle` is the locked
+/// handle the bytes were read through. Returns `None` when published, or the outcome that
+/// stopped it (the temp file is removed in that case).
+///
+/// The handle is closed only just before the replace, since ReplaceFileW cannot run while it
+/// is open. The size and modification time are compared with the handle's stamp after it is
+/// closed, and again right before the replace. A writer that gets in between that last
+/// comparison and ReplaceFileW (a window of microseconds) is not caught; the backup still holds
+/// the bytes that were replaced.
+fn publish_replacement(
+    file: &FilePreview,
+    target: &Path,
+    handle: File,
+    new_bytes: &[u8],
+    step: &Step<'_>,
+) -> Result<Option<Outcome>> {
+    let md = handle.metadata().map_err(|e| CoreError::io(target, e))?;
+    let perms = md.permissions();
+    let before = stamp(&md);
+
+    let (temp, mut temp_file) = create_temp(target)?;
+    let written = temp_file
+        .write_all(new_bytes)
+        .and_then(|()| temp_file.sync_all());
+    drop(temp_file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(CoreError::io(target, e));
+    }
+
+    drop(handle);
+    if let Some(stop) = last_checks(file, target, &before, step) {
+        let _ = fs::remove_file(&temp);
+        return Ok(Some(stop));
+    }
+    match replace_into_place(&temp, target, perms) {
+        Ok(()) => Ok(None),
+        Err(e) => {
+            let _ = fs::remove_file(&temp);
+            Err(CoreError::io(target, e))
+        }
+    }
+}
+
+/// The checks right before publishing: the stamp is unchanged, the location is still intact,
+/// the test hook has run, and the job is not cancelled. Returns the outcome that stops the
+/// replace, if any.
+fn last_checks(
+    file: &FilePreview,
+    target: &Path,
+    before: &Stamp,
+    step: &Step<'_>,
+) -> Option<Outcome> {
+    match fs::metadata(target) {
+        Ok(now) if stamp(&now) == *before => {}
+        _ => return Some(Outcome::Skipped(SkipReason::Changed)),
+    }
+    if !location_intact(file) {
+        return Some(Outcome::Skipped(SkipReason::PathChanged));
+    }
+    (step.before_publish)(target);
+    if step.ctx.cancel.is_cancelled() {
+        return Some(Outcome::Cancelled);
+    }
+    None
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -878,35 +1318,6 @@ fn create_temp(path: &Path) -> Result<(PathBuf, File)> {
         "{}: could not create a temporary file",
         path.display()
     )))
-}
-
-/// Atomically replace the contents of the existing file `path` with `bytes`. The data goes to
-/// a temp file in the same folder first, then replaces the target, so a crash leaves either
-/// the old or the new content.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let perms = fs::metadata(path)
-        .map_err(|e| CoreError::io(path, e))?
-        .permissions();
-    let (tmp, file) = create_temp(path)?;
-    if let Err(e) = write_and_replace(file, &tmp, path, bytes, perms) {
-        let _ = fs::remove_file(&tmp);
-        return Err(CoreError::io(path, e));
-    }
-    Ok(())
-}
-
-fn write_and_replace(
-    mut file: File,
-    tmp: &Path,
-    path: &Path,
-    bytes: &[u8],
-    perms: fs::Permissions,
-) -> io::Result<()> {
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    // Close the handle before the file is moved over the target.
-    drop(file);
-    replace_into_place(tmp, path, perms)
 }
 
 #[cfg(windows)]
@@ -949,7 +1360,8 @@ fn rename_over(tmp: &Path, path: &Path, perms: fs::Permissions) -> io::Result<()
 }
 
 /// Undo one replace. Refused if the file changed since the replace; otherwise the backup
-/// bytes are written back and the backup is deleted.
+/// bytes are published over it the same way as a replace (locked read, fingerprint, temp file,
+/// stamp check, replace) and the backup is deleted.
 pub fn undo(rec: &ReplaceUndo) -> Result<()> {
     if !background_read_allowed(&rec.path) {
         return Err(CoreError::Invalid(format!(
@@ -957,15 +1369,47 @@ pub fn undo(rec: &ReplaceUndo) -> Result<()> {
             rec.path.display()
         )));
     }
-    let current = fs::read(&rec.path).map_err(|e| CoreError::io(&rec.path, e))?;
-    if fingerprint(&current) != rec.written {
-        return Err(CoreError::Invalid(format!(
+    let modified_err = || {
+        CoreError::Invalid(format!(
             "{} has been modified since the replace",
             rec.path.display()
-        )));
+        ))
+    };
+    let mut handle = open_locked(&rec.path).map_err(|e| CoreError::io(&rec.path, e))?;
+    let current = match read_bounded(&mut handle, rec.written.size) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Err(modified_err()),
+        Err(e) => return Err(CoreError::io(&rec.path, e)),
+    };
+    if fingerprint(&current) != rec.written {
+        return Err(modified_err());
     }
     let original = fs::read(&rec.backup).map_err(|e| CoreError::io(&rec.backup, e))?;
-    write_atomic(&rec.path, &original)?;
+    let md = handle.metadata().map_err(|e| CoreError::io(&rec.path, e))?;
+    let perms = md.permissions();
+    let before = stamp(&md);
+
+    let (temp, mut temp_file) = create_temp(&rec.path)?;
+    let written = temp_file
+        .write_all(&original)
+        .and_then(|()| temp_file.sync_all());
+    drop(temp_file);
+    if let Err(e) = written {
+        let _ = fs::remove_file(&temp);
+        return Err(CoreError::io(&rec.path, e));
+    }
+    drop(handle);
+    match fs::metadata(&rec.path) {
+        Ok(now) if stamp(&now) == before => {}
+        _ => {
+            let _ = fs::remove_file(&temp);
+            return Err(modified_err());
+        }
+    }
+    if let Err(e) = replace_into_place(&temp, &rec.path, perms) {
+        let _ = fs::remove_file(&temp);
+        return Err(CoreError::io(&rec.path, e));
+    }
     fs::remove_file(&rec.backup).map_err(|e| CoreError::io(&rec.backup, e))?;
     Ok(())
 }
@@ -1387,5 +1831,176 @@ mod tests {
             &ctx,
         );
         assert!(matches!(r, Err(CoreError::Cancelled)));
+    }
+
+    /// Attributes that can never be read: every file must be treated as online-only.
+    struct NoAttributes;
+
+    impl AttributeSource for NoAttributes {
+        fn attributes(&self, _path: &Path) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn unreadable_attributes_fail_closed_in_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), b"foo").unwrap();
+        let cancel = CancelToken::new();
+        let progress = Progress::new();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let s = spec("foo", "bar");
+        let report = scan_with(
+            &[dir.path().to_path_buf()],
+            &s,
+            &ScanOptions::default(),
+            &ctx,
+            &NoAttributes,
+        )
+        .unwrap();
+        assert!(report.files.is_empty());
+        // The gate returns before the file is opened, so no read error is counted either.
+        assert_eq!(skip_reason(&report, "a.txt"), Some(&SkipReason::OnlineOnly));
+        assert_eq!(progress.snapshot().errors, 0);
+
+        // The same file is searched when the attributes are readable.
+        let report = run_scan(dir.path(), &s, &ScanOptions::default());
+        assert_eq!(report.files.len(), 1);
+    }
+
+    #[test]
+    fn only_known_text_types_are_searched_unless_named_in_include() {
+        assert!(is_known_text_extension(Path::new("A.TXT")));
+        assert!(is_known_text_extension(Path::new("Dockerfile")));
+        assert!(is_known_text_extension(Path::new(".gitignore")));
+        assert!(!is_known_text_extension(Path::new("photo.cr3")));
+        assert!(!is_known_text_extension(Path::new("Makefile")));
+        assert!(!is_known_text_extension(Path::new("notes")));
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), "hit").unwrap();
+        fs::write(dir.path().join("sample.xyz"), "hit").unwrap();
+        fs::write(dir.path().join("Makefile"), "hit").unwrap();
+        fs::write(dir.path().join("Dockerfile"), "hit").unwrap();
+        let s = spec("hit", "x");
+
+        let report = run_scan(dir.path(), &s, &ScanOptions::default());
+        assert_eq!(names(&report), ["Dockerfile", "notes.txt"]);
+        assert_eq!(
+            skip_reason(&report, "sample.xyz"),
+            Some(&SkipReason::UnknownType)
+        );
+        assert_eq!(
+            skip_reason(&report, "Makefile"),
+            Some(&SkipReason::UnknownType)
+        );
+
+        // Naming the type in the include list searches it, if it decodes as text.
+        let opts = ScanOptions {
+            include: ScanOptions::parse_patterns("*.xyz"),
+            ..Default::default()
+        };
+        let report = run_scan(dir.path(), &s, &opts);
+        assert_eq!(names(&report), ["sample.xyz"]);
+        assert!(report.skipped.is_empty());
+    }
+
+    #[test]
+    fn preview_keeps_counts_past_the_stored_line_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = MAX_PREVIEW_LINES + 100;
+        fs::write(dir.path().join("many.txt"), "foo foo\n".repeat(lines)).unwrap();
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &ScanOptions::default());
+        let file = &report.files[0];
+        assert_eq!(file.match_count, 2 * lines);
+        assert_eq!(file.lines_with_matches, lines);
+        assert_eq!(file.matches.len(), MAX_PREVIEW_LINES);
+        assert_eq!(file.matches[0].ranges.len(), 2);
+        assert_eq!(file.matches.last().unwrap().line_number, MAX_PREVIEW_LINES);
+    }
+
+    #[test]
+    fn cancel_inside_a_file_leaves_it_untouched_and_stops_the_job() {
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a.txt");
+        let second = dir.path().join("b.txt");
+        fs::write(&first, b"foo one").unwrap();
+        fs::write(&second, b"foo two").unwrap();
+        let s = spec("foo", "bar");
+        let mut files = run_scan(dir.path(), &s, &ScanOptions::default()).files;
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(files.len(), 2);
+
+        let cancel = CancelToken::new();
+        let progress = Progress::new();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let hook_calls = AtomicUsize::new(0);
+        let hook = |_: &Path| {
+            hook_calls.fetch_add(1, Ordering::Relaxed);
+            cancel.cancel();
+        };
+        let report = apply_with_hook(&files, &s, backups.path(), &ctx, &hook).unwrap();
+
+        assert!(report.cancelled);
+        assert!(report.undo.is_empty());
+        assert_eq!(
+            hook_calls.load(Ordering::Relaxed),
+            1,
+            "the second file was not reached"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"foo one");
+        assert_eq!(fs::read(&second).unwrap(), b"foo two");
+        assert!(
+            fs::read_dir(backups.path()).unwrap().next().is_none(),
+            "no backup left behind"
+        );
+        let temps = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temps, 0, "no temp file left behind");
+    }
+
+    /// A folder on the previewed path replaced by a junction must not redirect the write.
+    #[cfg(windows)]
+    #[test]
+    fn folder_replaced_by_a_junction_after_preview_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("doc.txt"), b"foo inside").unwrap();
+        let victim = outside.path().join("doc.txt");
+        fs::write(&victim, b"foo outside").unwrap();
+        let s = spec("foo", "bar");
+        let report = run_scan(dir.path(), &s, &ScanOptions::default());
+        assert_eq!(report.files.len(), 1);
+
+        fs::remove_dir_all(&sub).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&sub)
+            .arg(outside.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J failed");
+
+        let applied = run_apply(&report.files, &s, backups.path());
+        assert!(
+            matches!(applied.skipped.as_slice(), [(_, SkipReason::PathChanged)]),
+            "{:?}",
+            applied.skipped
+        );
+        assert_eq!(applied.replacements(), 0);
+        assert!(applied.failed.is_empty());
+        assert_eq!(fs::read(&victim).unwrap(), b"foo outside");
+
+        // Remove the junction itself; its target is untouched.
+        fs::remove_dir(&sub).unwrap();
     }
 }

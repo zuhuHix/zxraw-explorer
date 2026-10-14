@@ -187,9 +187,11 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   (*Verify backup…*, or the button in *Compare folders*); e2e `tools::` scenarios drive it.
 * 🟡 Find and replace in files — `forge-core/src/text_replace.rs` with the preview window in
   `forge-app/src/replace_ui.rs`. Literal or regex search, match case, whole word, include and
-  exclude patterns, recursion. Skips binary files (NUL bytes or known RAW/image/video/archive
-  extensions), files above a size limit (16 MiB by default), read-only files and online-only
-  cloud files. UTF-8 (with or without BOM) and UTF-16 LE/BE are kept, as are CRLF/LF/mixed line
+  exclude patterns, recursion. Only known text file types are searched unless *Include files*
+  names another type; binary files (NUL bytes or known RAW/image/video/archive extensions),
+  files above a size limit (16 MiB by default, checked on the bytes read), read-only files and
+  online-only cloud files are skipped. A file whose folder was swapped for a junction or link
+  after the preview is refused. UTF-8 (with or without BOM) and UTF-16 LE/BE are kept, as are CRLF/LF/mixed line
   endings. Each file is written to a temporary file and swapped in with `ReplaceFileW`, which
   keeps its creation time and attributes; a file edited after the preview is left alone. The
   originals are backed up in the profile, and *Undo* restores them only if the file is still as
