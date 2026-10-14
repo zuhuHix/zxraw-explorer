@@ -43,6 +43,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   because `cmd.exe` cannot use a UNC path as its working directory; Explorer behaves the same.
   **Open With** goes through the Windows dialog, which does not take a working directory, so a
   program chosen there starts in ZXraw's own working directory.
+* A queued move checks that each source is still the item that was picked, using its Windows
+  file ID (NTFS, ReFS, exFAT/FAT). Only if the ID cannot be read does it compare size, modified
+  time and kind instead, and that fallback misses a same-size replacement that keeps the old
+  modified time.
 * Shell operations are Windows-only. Their non-Windows implementations return unsupported results
   or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
 * Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox
