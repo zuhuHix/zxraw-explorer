@@ -23,7 +23,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText};
 use forge_core::ops::JobCtx;
 use forge_core::text_replace::{
-    self, ApplyReport, FilePreview, LineMatch, ReplaceUndo, ScanOptions, ScanReport, SearchSpec,
+    self, ApplyReport, FilePreview, ReplaceUndo, ScanOptions, ScanReport, SearchSpec,
 };
 use forge_jobs::JobHandle;
 use parking_lot::Mutex;
@@ -129,11 +129,49 @@ struct ApplyRun {
     outcome: Outcome<ApplyReport>,
 }
 
-/// A finished preview and the files the user has unticked.
+/// A finished preview, the files the user has unticked, and the row list drawn from the result.
 struct Preview {
     options: Options,
     result: Result<ScanReport, String>,
     unticked: HashSet<PathBuf>,
+    rows: Vec<PreviewRow>,
+}
+
+impl Preview {
+    /// Stores a finished preview. The rows are built here, once, so drawing only indexes them.
+    fn new(options: Options, result: Result<ScanReport, String>) -> Self {
+        let rows = result.as_ref().map(preview_rows).unwrap_or_default();
+        Self {
+            options,
+            result,
+            unticked: HashSet::new(),
+            rows,
+        }
+    }
+}
+
+/// The form's validation result, kept for the options it was computed from. `check` compiles
+/// the regex, so it runs only when the options change, not every frame.
+#[derive(Default)]
+struct Validation {
+    cached: Option<(Options, Result<ScanOptions, String>)>,
+    /// How many times `check` has run. Tests use it to prove the cache is hit.
+    #[cfg(test)]
+    computations: usize,
+}
+
+impl Validation {
+    fn get(&mut self, options: &Options) -> &Result<ScanOptions, String> {
+        let fresh = matches!(&self.cached, Some((key, _)) if key == options);
+        if !fresh {
+            #[cfg(test)]
+            {
+                self.computations += 1;
+            }
+            self.cached = Some((options.clone(), options.check()));
+        }
+        &self.cached.as_ref().expect("filled above").1
+    }
 }
 
 #[derive(Default)]
@@ -141,6 +179,7 @@ struct ReplaceState {
     open: bool,
     roots: Vec<PathBuf>,
     options: Options,
+    validation: Validation,
     scan: Option<ScanRun>,
     preview: Option<Preview>,
     apply: Option<ApplyRun>,
@@ -253,11 +292,7 @@ fn poll(state: &mut ReplaceState) {
     if let Some(result) = scan_result
         && let Some(run) = state.scan.take()
     {
-        state.preview = Some(Preview {
-            options: run.options,
-            result,
-            unticked: HashSet::new(),
-        });
+        state.preview = Some(Preview::new(run.options, result));
     }
 
     let apply_result = state.apply.as_ref().and_then(|run| {
@@ -284,7 +319,7 @@ fn start_preview(app: &mut ZxrawApp, state: &mut ReplaceState) -> Result<(), Str
         return Err("Nothing to search in.".into());
     }
     let options = state.options.clone();
-    let scan_options = options.check()?;
+    let scan_options = state.validation.get(&options).clone()?;
     let spec = options.search_spec();
     let roots = state.roots.clone();
     let title = format!("Finding “{}” in {}", options.find, scope_label(&roots));
@@ -495,7 +530,8 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut ReplaceState) {
     if busy {
         ctx.request_repaint_after(Duration::from_millis(250));
     }
-    let check = state.options.check();
+    // Errors only: a valid form needs no clone of its options.
+    let check_error = state.validation.get(&state.options).as_ref().err().cloned();
     let find_empty = state.options.find.is_empty();
     let scope = scope_label(&state.roots);
 
@@ -557,13 +593,13 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut ReplaceState) {
                 )
                 .weak(),
             );
-            if !find_empty && let Err(error) = &check {
+            if !find_empty && let Some(error) = &check_error {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
 
             ui.separator();
             ui.horizontal(|ui| {
-                let can_preview = !find_empty && check.is_ok() && !busy;
+                let can_preview = !find_empty && check_error.is_none() && !busy;
                 let response = ui.add_enabled(can_preview, egui::Button::new("Preview"));
                 register_click_target(ui.ctx(), "replace:Preview", &response);
                 if response.clicked() {
@@ -673,7 +709,10 @@ fn draw_preview(
     action: &mut Option<Action>,
 ) {
     let Preview {
-        result, unticked, ..
+        result,
+        unticked,
+        rows,
+        ..
     } = preview;
     ui.separator();
     let report = match result {
@@ -719,7 +758,6 @@ fn draw_preview(
         }
     });
 
-    let rows = preview_rows(report);
     // Only the visible rows are laid out, so a preview of many files stays responsive.
     egui::ScrollArea::vertical()
         .id_salt("replace:results")
@@ -727,8 +765,9 @@ fn draw_preview(
         .auto_shrink([false, false])
         .show_rows(ui, ROW_HEIGHT, rows.len(), |ui, range| {
             for row in &rows[range] {
-                match row {
-                    PreviewRow::File(file) => {
+                match *row {
+                    PreviewRow::File(index) => {
+                        let file = &report.files[index];
                         ui.horizontal(|ui| {
                             let mut on = !unticked.contains(&file.path);
                             if ui
@@ -755,9 +794,10 @@ fn draw_preview(
                             );
                         });
                     }
-                    PreviewRow::Line { line, new } => {
+                    PreviewRow::Line { file, line, new } => {
+                        let line = &report.files[file].matches[line];
                         let color = ui.visuals().text_color();
-                        let (job, number) = if *new {
+                        let (job, number) = if new {
                             (
                                 with_text_color(
                                     highlight_job(
@@ -815,25 +855,35 @@ fn draw_preview(
     }
 }
 
-/// One row of the preview list.
-enum PreviewRow<'a> {
-    /// The file's checkbox and summary.
-    File(&'a FilePreview),
-    /// A matching line, before the replace (`new` false) or after it.
-    Line { line: &'a LineMatch, new: bool },
+/// One row of the preview list. Rows hold indexes into the report they were built from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewRow {
+    /// The file's checkbox and summary: index into `report.files`.
+    File(usize),
+    /// A matching line, before the replace (`new` false) or after it. `file` indexes
+    /// `report.files` and `line` indexes that file's `matches`.
+    Line { file: usize, line: usize, new: bool },
     /// Matching lines of the file that are not stored in the preview.
     More(usize),
 }
 
 /// The preview flattened into rows: a header per file, the old and new form of each stored
 /// line, and a count row when the file has more matching lines than are stored.
-fn preview_rows(report: &ScanReport) -> Vec<PreviewRow<'_>> {
+fn preview_rows(report: &ScanReport) -> Vec<PreviewRow> {
     let mut rows = Vec::new();
-    for file in &report.files {
-        rows.push(PreviewRow::File(file));
-        for line in &file.matches {
-            rows.push(PreviewRow::Line { line, new: false });
-            rows.push(PreviewRow::Line { line, new: true });
+    for (index, file) in report.files.iter().enumerate() {
+        rows.push(PreviewRow::File(index));
+        for line in 0..file.matches.len() {
+            rows.push(PreviewRow::Line {
+                file: index,
+                line,
+                new: false,
+            });
+            rows.push(PreviewRow::Line {
+                file: index,
+                line,
+                new: true,
+            });
         }
         let more = file.lines_with_matches.saturating_sub(file.matches.len());
         if more > 0 {
@@ -1099,7 +1149,7 @@ mod tests {
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
     fn preview_rows_flatten_each_file_and_count_the_unstored_lines() {
-        use forge_core::text_replace::{Encoding, Fingerprint, LineEnding};
+        use forge_core::text_replace::{Encoding, Fingerprint, LineEnding, LineMatch};
 
         let line = LineMatch {
             line_number: 1,
@@ -1127,11 +1177,38 @@ mod tests {
             files: vec![file],
             ..Default::default()
         };
-        let rows = preview_rows(&report);
+        let preview = Preview::new(Options::default(), Ok(report));
+        let rows = &preview.rows;
         assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0], PreviewRow::File(_)));
+        assert!(matches!(rows[0], PreviewRow::File(0)));
         assert!(matches!(rows[1], PreviewRow::Line { new: false, .. }));
         assert!(matches!(rows[2], PreviewRow::Line { new: true, .. }));
         assert!(matches!(rows[3], PreviewRow::More(2)));
+    }
+
+    #[test]
+    fn a_failed_preview_has_no_rows() {
+        let preview = Preview::new(Options::default(), Err("boom".into()));
+        assert!(preview.rows.is_empty());
+    }
+
+    #[test]
+    fn validation_runs_check_once_for_unchanged_options() {
+        let mut validation = Validation::default();
+        let mut options = Options {
+            find: "a".into(),
+            ..Options::default()
+        };
+        // Two frames with the same options: one compile.
+        assert!(validation.get(&options).is_ok());
+        assert!(validation.get(&options).is_ok());
+        assert_eq!(validation.computations, 1);
+
+        // A changed option is checked again, and the error is cached too.
+        options.regex = true;
+        options.find = "(".into();
+        assert!(validation.get(&options).is_err());
+        assert!(validation.get(&options).is_err());
+        assert_eq!(validation.computations, 2);
     }
 }

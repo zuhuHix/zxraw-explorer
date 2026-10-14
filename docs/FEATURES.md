@@ -190,13 +190,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   exclude patterns, recursion. Only known text file types are searched unless *Include files*
   names another type; binary files (NUL bytes or known RAW/image/video/archive extensions),
   files above a size limit (16 MiB by default, checked on the bytes read), read-only files and
-  online-only cloud files are skipped. A file whose folder was swapped for a junction or link
-  after the preview is refused. UTF-8 (with or without BOM) and UTF-16 LE/BE are kept, as are CRLF/LF/mixed line
-  endings. Each file is written to a temporary file and swapped in with `ReplaceFileW`, which
-  keeps its creation time and attributes; a file edited after the preview is left alone. The
-  originals are backed up in the profile, and *Undo* restores them only if the file is still as
-  the replace left it. Unit tests cover every encoding, line endings, binary skipping, regex and
-  whole word, the atomic write and undo; e2e `tools::` scenarios drive the window.
+  online-only cloud files and hard-linked files are skipped. A file whose folder was swapped for
+  a junction or link after the preview is refused, by apply and by undo. UTF-8 (with or without
+  BOM) and UTF-16 LE/BE are kept, as are CRLF/LF/mixed line endings. Each file is written to a
+  temporary file and swapped in with `ReplaceFileW`, which keeps its creation time, attributes,
+  ACLs and streams; if it cannot, the file is reported as failed and left untouched (no rename
+  fallback). A file edited after the preview is detected on a best-effort basis (see
+  [LIMITATIONS.md](LIMITATIONS.md)). The originals are backed up in the profile, and *Undo*
+  restores them only if the file is still as the replace left it. Unit tests cover every
+  encoding, line endings, binary and hard-link skipping, regex and whole word, junction swaps,
+  last-moment edits, a failed `ReplaceFileW`, and undo; e2e `tools::` scenarios drive the
+  window.
 * 🟡 Batch export / convert — `forge-app/src/batch_export.rs`: JPEG, PNG, TIFF and lossless WebP,
   never-upscale resize, JPEG quality, naming template (`{name}`, `{n:3}`, `{w}`, `{h}`, `{ext}`),
   RAW via the embedded preview, EXIF orientation applied, no-replace publishing. Unit tests cover

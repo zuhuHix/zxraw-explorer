@@ -158,6 +158,21 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * When Windows cannot recycle an item (for example on some network drives), the shell asks
   whether to delete it permanently. Answering yes deletes it outside the preview.
 
+## Find and replace in files
+
+* Protection against a concurrent edit is best-effort, with a window of microseconds. While a
+  file is read, checked and backed up, other programs cannot write to it. The deny-write handle
+  must be closed before `ReplaceFileW` can run, so the size, last-write time and file ID are
+  compared again as the very last step before the swap. A writer that gets in between that
+  comparison and `ReplaceFileW` is not detected: its edit is replaced. The backup in the profile
+  still holds the bytes that were read. Undo works the same way.
+* Junction and link checks run on every folder between the chosen root and the file, before the
+  file is read and again right before the swap (apply and undo). A junction swapped in during the
+  same microsecond window is not detected.
+* Hard-linked files (more than one link) are always skipped; there is no option to replace them.
+* Only known text file types are searched unless *Include files* names the type. An include
+  pattern of `*` therefore opts every type in, although known binary types are still skipped.
+
 ## Scale and background work
 
 * A pane keeps the complete `FileEntry` list and a separate visible-index list
