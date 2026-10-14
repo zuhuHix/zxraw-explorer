@@ -38,6 +38,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
   of other applications, has not been checked.
+* Opening a file (double-click, Enter, or **Open**) starts it in the file's own folder, as
+  Explorer does. Scripts in a UNC folder (`\\server\share`) still run in the Windows folder,
+  because `cmd.exe` cannot use a UNC path as its working directory; Explorer behaves the same.
+  **Open With** goes through the Windows dialog, which does not take a working directory, so a
+  program chosen there starts in ZXraw's own working directory.
 * Shell operations are Windows-only. Their non-Windows implementations return unsupported results
   or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
 * Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox

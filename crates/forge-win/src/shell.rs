@@ -167,15 +167,39 @@ pub fn open_folder_in_explorer(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
+/// The working directory a file opened from ZXraw gets: its own folder, as Explorer does, so
+/// scripts and programs that use relative paths find their neighbours. `None` (inherit) for
+/// URLs, shell URIs and anything else that is not an absolute path in an existing folder.
+/// `cmd.exe` cannot run in a UNC folder and falls back to the Windows folder, as it does when
+/// a script is started from Explorer.
+pub(crate) fn working_dir_for(path: &Path) -> Option<&Path> {
+    if !path.is_absolute() {
+        return None;
+    }
+    path.parent()
+        .filter(|dir| !dir.as_os_str().is_empty() && dir.is_dir())
+}
+
 #[cfg(windows)]
 fn shell_execute(verb: &str, path: &Path) -> Result<()> {
-    use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    shell_execute_with(verb, path, SW_SHOWNORMAL)
+}
+
+#[cfg(windows)]
+fn shell_execute_with(
+    verb: &str,
+    path: &Path,
+    show: windows::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD,
+) -> Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::core::PCWSTR;
 
     let _com = com::ComGuard::apartment_threaded()?;
     let verb = crate::to_wide(verb);
     let file = crate::to_wide(path);
+    let dir = working_dir_for(path).map(crate::to_wide);
+    let dir_ptr = dir.as_ref().map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
     // ShellExecuteW returns a value greater than 32 on success, otherwise an SE_ERR code.
     let rc = unsafe {
         ShellExecuteW(
@@ -183,8 +207,8 @@ fn shell_execute(verb: &str, path: &Path) -> Result<()> {
             PCWSTR(verb.as_ptr()),
             PCWSTR(file.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
+            dir_ptr,
+            show,
         )
     };
     let code = rc.0 as isize;
@@ -577,6 +601,62 @@ mod tests {
         assert!(
             present.exists(),
             "nothing may move when one item is missing"
+        );
+    }
+
+    #[test]
+    fn working_dir_is_the_files_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let script = d.path().join("run.bat");
+        assert_eq!(working_dir_for(&script), Some(d.path()));
+        assert_eq!(
+            working_dir_for(Path::new(r"C:\run.bat")),
+            Some(Path::new(r"C:\"))
+        );
+        // Not absolute paths or folders that do not exist: inherit.
+        assert_eq!(working_dir_for(Path::new("run.bat")), None);
+        assert_eq!(
+            working_dir_for(&d.path().join("gone").join("run.bat")),
+            None
+        );
+        assert_eq!(working_dir_for(Path::new(r"C:\")), None);
+        // URLs and shell URIs also go through `open_default`.
+        assert_eq!(working_dir_for(Path::new("https://example.com/a/b")), None);
+        assert_eq!(working_dir_for(Path::new("ms-settings:defaultapps")), None);
+    }
+
+    #[test]
+    fn opened_batch_script_runs_in_its_own_folder() {
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        let d = tempfile::tempdir().unwrap();
+        let folder = d.path().join("script folder");
+        std::fs::create_dir(&folder).unwrap();
+        let script = folder.join("where.bat");
+        std::fs::write(&script, "@echo %CD%> \"%~dp0cwd.txt\"\r\n").unwrap();
+        let out = folder.join("cwd.txt");
+        shell_execute_with("open", &script, SW_HIDE).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let recorded = loop {
+            if let Ok(text) = std::fs::read_to_string(&out)
+                && text.ends_with('\n')
+            {
+                break text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the script did not write {}",
+                out.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert!(
+            recorded
+                .trim()
+                .eq_ignore_ascii_case(&folder.to_string_lossy()),
+            "script ran in {recorded:?}, expected {}",
+            folder.display()
         );
     }
 
