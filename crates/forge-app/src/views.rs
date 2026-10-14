@@ -280,10 +280,8 @@ fn handle_drop(resp: &egui::Response, target_dir: &Path, out: &mut Vec<ViewEvent
 fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
     if resp.drag_started() {
         let paths = if pane.is_selected(entry) {
-            pane.selected_entries()
-                .iter()
-                .map(|e| e.path.clone())
-                .collect()
+            // A selected folder already carries the selected items inside it.
+            pane.selected_roots()
         } else {
             vec![entry.path.clone()]
         };
@@ -1402,8 +1400,19 @@ pub fn details(
             let name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
             let name_rect =
                 Rect::from_min_size(pos2(name_left, rect.top()), vec2(name_width, row_h));
+            let child_error = if expanded { pane.child_error(&entry.path) } else { None };
             let (galley, truncated) =
                 truncated_name_galley(&painter, &entry.name, font, text_color, name_width);
+            if let Some(error) = child_error {
+                // An open folder that could not be listed says so instead of showing nothing.
+                painter.with_clip_rect(name_rect.intersect(rect)).text(
+                    pos2(name_rect.left() + galley.size().x + 10.0, cy),
+                    Align2::LEFT_CENTER,
+                    format!("\u{26A0} cannot be read: {error}"),
+                    small.clone(),
+                    ui.visuals().error_fg_color,
+                );
+            }
             painter.with_clip_rect(name_rect.intersect(rect)).galley(
                 pos2(name_rect.left(), cy - galley.size().y / 2.0),
                 galley,

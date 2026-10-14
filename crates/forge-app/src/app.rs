@@ -1043,7 +1043,11 @@ impl eframe::App for ZxrawApp {
         {
             crate::viewer_host::open_launched(self, photo);
         }
-        if changed || self.ops.thumbs.busy() || self.tabs.iter().any(|t| t.left.is_loading()) {
+        let busy = self
+            .tabs
+            .iter()
+            .any(|t| t.left.is_busy() || t.right.as_ref().is_some_and(Pane::is_busy));
+        if changed || self.ops.thumbs.busy() || busy {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         if self.last_session_save.elapsed() > Duration::from_secs(30) {
