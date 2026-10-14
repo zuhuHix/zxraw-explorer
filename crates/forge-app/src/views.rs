@@ -1510,7 +1510,9 @@ pub fn details(
                 response
             };
             let entry_clone = entry.clone();
+            // A right-click on the arrow behaves like one on the row (selection, menu).
             let on_arrow = expandable
+                && !response.secondary_clicked()
                 && response
                     .interact_pointer_pos()
                     .is_some_and(|p| arrow_rect.contains(p));
