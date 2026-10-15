@@ -269,9 +269,9 @@ pub struct TagsUi {
     /// flight, or failed. Dropped once confirmed; a failed one stays until it is saved (select
     /// the file again to retry) and is kept in the recovery file at exit.
     left_behind: HashMap<PathBuf, NotesDraft>,
-    /// Answered once the library has relinked the rows of files ZXraw moved. Until then, and
-    /// until the selection is read again, no draft is compared with the database.
-    relinked: Option<crossbeam_channel::Receiver<()>>,
+    /// Each answered once the library has relinked the rows of files ZXraw moved. Until all
+    /// are, and the selection is read again, no draft is compared with the database.
+    relinked: Vec<crossbeam_channel::Receiver<()>>,
     /// The frame the panel was last drawn in. A note left behind when the panel stops being
     /// drawn is saved by [`tick`].
     panel_frame: u64,
@@ -296,7 +296,7 @@ impl Default for TagsUi {
             highlight: None,
             notes: None,
             left_behind: HashMap::new(),
-            relinked: None,
+            relinked: Vec::new(),
             panel_frame: 0,
             manage: ManageState::default(),
             tx,
@@ -556,7 +556,7 @@ impl TagsUi {
             _ => None,
         };
         if self.notes.as_ref().map(|d| &d.path) == want.as_ref() {
-            self.check_restored_note();
+            self.check_restored_note(ctx);
             return;
         }
         self.save_notes(library, ctx);
@@ -573,7 +573,7 @@ impl TagsUi {
         if let Some(mut draft) = self.left_behind.remove(&path) {
             draft.check_db = true;
             self.notes = Some(draft);
-            self.check_restored_note();
+            self.check_restored_note(ctx);
             return;
         }
         let Some(cache) = self.cache.as_ref() else {
@@ -592,13 +592,16 @@ impl TagsUi {
 
     /// Compares a brought-back draft with the database once its save in flight is answered
     /// and a read of the file, started after the selection changed, is in.
-    fn check_restored_note(&mut self) {
-        if let Some(relinked) = &self.relinked {
-            if relinked.try_recv() == Err(crossbeam_channel::TryRecvError::Empty) {
+    fn check_restored_note(&mut self, ctx: &egui::Context) {
+        if !self.relinked.is_empty() {
+            self.relinked
+                .retain(|r| r.try_recv() == Err(crossbeam_channel::TryRecvError::Empty));
+            if !self.relinked.is_empty() {
+                // The writer wakes the UI when done; this is a backstop.
+                ctx.request_repaint_after(Duration::from_millis(100));
                 return;
             }
-            // The rows followed the move (a collision merges notes): read them again.
-            self.relinked = None;
+            // The rows followed the moves (a collision merges notes): read them again.
             if let Some(cache) = self.cache.as_mut() {
                 cache.files = None;
             }
@@ -632,13 +635,14 @@ impl TagsUi {
     /// follow their file, so an edit not saved yet is saved at the new path. A move onto an
     /// annotated file merges the two notes, so the moved draft is compared with the database
     /// again once the rows have followed (`relinked` is answered), and is not saved before.
+    /// Earlier moves still being relinked are waited for too.
     pub fn follow_moves(
         &mut self,
         pairs: &[(PathBuf, PathBuf)],
-        relinked: crossbeam_channel::Receiver<()>,
+        relinked: Option<crossbeam_channel::Receiver<()>>,
     ) {
         use crate::library::moved_by;
-        self.relinked = Some(relinked);
+        self.relinked.extend(relinked);
         if let Some(draft) = self.notes.as_mut()
             && let Some(to) = moved_by(&draft.path, pairs)
         {
@@ -1744,6 +1748,46 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_move_batch_never_ends_the_wait_for_an_earlier_relink() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let mut library = crate::library::test_library(std::sync::Arc::new(
+            forge_db::Db::open_in_memory().unwrap(),
+        ));
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        st.cache = Some(Selected {
+            paths: vec![a.clone()],
+            files: Some(vec![(a.clone(), Annotation::default())]),
+        });
+        st.notes = Some(NotesDraft {
+            path: a.clone(),
+            ..draft("my edit", "", None)
+        });
+        let (done, relinked) = crossbeam_channel::bounded(1);
+        st.follow_moves(&[(a.clone(), b.clone())], Some(relinked));
+        // An undo with no moves in it: nothing to relink, and no answer to wait for.
+        assert!(library.follow_moves(Vec::new()).is_none());
+        st.follow_moves(&[], library.follow_moves(Vec::new()));
+
+        st.sync_selection(std::slice::from_ref(&b));
+        st.cache.as_mut().unwrap().files = Some(vec![(b.clone(), Annotation::default())]);
+        st.sync_notes(&mut library, &ctx);
+        let d = st.notes.as_ref().unwrap();
+        assert!(d.check_db, "still waiting for the first relink");
+        assert!(st.cache.as_ref().unwrap().files.is_some(), "the read is not redone yet");
+
+        done.send(()).unwrap();
+        st.sync_notes(&mut library, &ctx);
+        assert!(st.relinked.is_empty());
+        assert!(st.cache.as_ref().unwrap().files.is_none(), "read again after the relink");
+        st.cache.as_mut().unwrap().files = Some(vec![(b.clone(), Annotation::default())]);
+        st.sync_notes(&mut library, &ctx);
+        let d = st.notes.as_ref().unwrap();
+        assert!(!d.check_db && d.conflict.is_none());
+        assert!(note_dirty(d));
+    }
+
+    #[test]
     fn a_recheck_replaces_a_stale_conflict_with_the_latest_note() {
         let mut d = draft("mine", "old", None);
         d.check_against("first".into());
@@ -1793,10 +1837,7 @@ mod tests {
                 ..draft("x", "", None)
             },
         );
-        st.follow_moves(
-            &[(PathBuf::from("a.jpg"), PathBuf::from("b.jpg"))],
-            crossbeam_channel::bounded(1).1,
-        );
+        st.follow_moves(&[(PathBuf::from("a.jpg"), PathBuf::from("b.jpg"))], None);
         assert_eq!(
             st.left_behind[&PathBuf::from("b.jpg")].path,
             PathBuf::from("b.jpg")
