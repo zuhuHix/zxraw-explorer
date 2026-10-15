@@ -28,8 +28,8 @@ use serde::Serialize;
 
 use crate::error::{DbError, Result};
 use crate::files::{
-    NewFile, VolumeCache, VolumeId, VolumeInfo, mark_subtree_missing_tx, normalize_dir,
-    subtree_bounds, system_time_ms, upsert_files_tx, upsert_volume_tx,
+    NewFile, VolumeCache, VolumeId, VolumeInfo, mark_subtree_missing_tx, next_scan_id_tx,
+    normalize_dir, subtree_bounds, system_time_ms, upsert_files_tx, upsert_volume_tx,
 };
 use crate::settings::{IndexRoot, ScanStatus};
 use crate::{Db, now_ms, path_str};
@@ -183,25 +183,6 @@ impl<'a> Indexer<'a> {
         now_ms()
     }
 
-    /// Id (and start time) for a new pass: the first clock reading strictly after the
-    /// moment the pass begins. The end-of-pass sweep treats rows with
-    /// `indexed_at >= scan_id` as refreshed by someone else during the pass, so every row
-    /// written before the pass started must have `indexed_at < scan_id`. Taking `now_ms()`
-    /// directly fails when a pass starts in the same millisecond as earlier writes (a
-    /// re-index right after a previous pass or an exclusion change): those rows would
-    /// escape the sweep, and the new id could even equal the previous pass's id. Waiting
-    /// for the next tick costs at most one millisecond.
-    fn new_scan_id(&mut self) -> i64 {
-        let started = self.clock_ms();
-        loop {
-            let t = self.clock_ms();
-            if t > started {
-                return t;
-            }
-            std::thread::yield_now();
-        }
-    }
-
     fn read_dir(&self, dir: &Path) -> std::io::Result<fs::ReadDir> {
         #[cfg(test)]
         if self.fail_read_dirs.contains(dir) {
@@ -328,9 +309,11 @@ impl<'a> Indexer<'a> {
 
         // Resume or start a pass.
         let state = self.db.index_state(root.id)?;
-        let (scan_id, mut stack, resumed) = match state {
+        // A resumed pass keeps its id: rows refreshed by others since it started still have
+        // `indexed_at >= scan_id`, and the rows it already saw carry that id.
+        let (mut scan_id, mut stack, resumed) = match state {
             Some(s) if s.is_resumable() => (s.scan_id, s.pending, true),
-            _ => (self.new_scan_id(), vec![root_path.clone()], false),
+            _ => (0, vec![root_path.clone()], false),
         };
         report.resumed = resumed;
         let mut batch: Vec<NewFile> = Vec::with_capacity(self.batch_size.min(65_536));
@@ -343,8 +326,11 @@ impl<'a> Indexer<'a> {
                 Ok(())
             })?;
         } else {
-            self.db.with_conn(|c| {
-                c.execute(
+            // A fresh id above every earlier stamp, so the end sweep sees all older rows.
+            let now = self.clock_ms();
+            scan_id = self.db.with_tx(|tx| {
+                let scan_id = next_scan_id_tx(tx, now)?;
+                tx.execute(
                     "INSERT INTO index_state(root_id, scan_id, status, started_at, updated_at, pending,
                                              items_seen, errors, finished_at, last_error)
                      VALUES (?1, ?2, 'running', ?2, ?2, ?3, 0, 0, NULL, NULL)
@@ -354,7 +340,7 @@ impl<'a> Indexer<'a> {
                          last_error = NULL",
                     params![root.id, scan_id, pending_json(&stack)],
                 )?;
-                Ok(())
+                Ok(scan_id)
             })?;
             batch.push(new_file(&root_path, EntryKind::Dir, &root_md));
         }
@@ -752,32 +738,169 @@ mod tests {
         (tmp, db, root_id, root, dir, file)
     }
 
+    fn scan_id(db: &Db, root_id: i64) -> i64 {
+        db.index_state(root_id).unwrap().unwrap().scan_id
+    }
+
+    fn present(db: &Db, path: &Path) -> bool {
+        db.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT present FROM files WHERE path = ?1",
+                params![path_str(path)],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn pass_started_in_the_same_millisecond_still_sweeps_newly_excluded_rows() {
-        let (_tmp, db, root_id, _root, _dir, _file) = indexed_tree();
-        // Pretend the previous pass ran, and wrote its rows, in the very millisecond the
-        // next pass starts: same indexed_at, and the same clock value as its scan id.
+        let (_tmp, db, root_id, _root, dir, file) = indexed_tree();
+        // The previous pass ran, and wrote its rows, in the very millisecond the next pass
+        // starts: same indexed_at, and that clock value as its scan id.
         let t = now_ms() + 60_000;
         db.with_conn(|c| {
-            c.execute(
-                "UPDATE files SET indexed_at = ?1, seen_scan = ?1",
-                params![t],
-            )?;
+            c.execute_batch(&format!(
+                "UPDATE files SET indexed_at = {t}, seen_scan = {t};
+                 UPDATE index_state SET scan_id = {t};
+                 UPDATE index_clock SET value = {t};"
+            ))?;
             Ok(())
         })
         .unwrap();
         db.add_exclusion(crate::ExclusionKind::Name, "sub").unwrap();
-        // The clock stays on `t` for a few readings before ticking over.
-        let mut calls = 0;
         let report = Indexer::new(&db)
-            .clock_for_test(move || {
-                calls += 1;
-                if calls <= 3 { t } else { t + 1 }
-            })
+            .clock_for_test(move || t)
             .index_root(root_id)
             .unwrap();
-        assert_eq!(report.marked_missing, 2); // sub + sub\keep.jpg
-        assert_eq!(db.index_state(root_id).unwrap().unwrap().scan_id, t + 1);
+        assert_eq!(report.marked_missing, 2); // sub + its file
+        assert!(!present(&db, &dir) && !present(&db, &file));
+        assert_eq!(scan_id(&db, root_id), t + 1);
+    }
+
+    #[test]
+    fn clock_set_back_between_passes_still_sweeps_newly_excluded_rows() {
+        let (_tmp, db, root_id, _root, dir, file) = indexed_tree();
+        let first = scan_id(&db, root_id);
+        db.add_exclusion(crate::ExclusionKind::Name, "sub").unwrap();
+        // The wall clock now reads far earlier than the first pass.
+        let report = Indexer::new(&db)
+            .clock_for_test(|| 1_000)
+            .index_root(root_id)
+            .unwrap();
+        assert_eq!(report.outcome, IndexOutcome::Completed);
+        assert_eq!(report.marked_missing, 2);
+        assert!(!present(&db, &dir) && !present(&db, &file));
+        assert!(scan_id(&db, root_id) > first);
+    }
+
+    #[test]
+    fn frozen_clock_does_not_hang_and_ids_keep_increasing() {
+        let (_tmp, db, root_id, root, _dir, _file) = indexed_tree();
+        let mut last = scan_id(&db, root_id);
+        for n in 0..3 {
+            fs::write(root.join(format!("new{n}.jpg")), b"x").unwrap();
+            let report = Indexer::new(&db)
+                .clock_for_test(|| 42)
+                .index_root(root_id)
+                .unwrap();
+            assert_eq!(report.outcome, IndexOutcome::Completed);
+            assert_eq!(report.marked_missing, 0);
+            let id = scan_id(&db, root_id);
+            assert!(id > last, "pass {n}: {id} <= {last}");
+            last = id;
+        }
+    }
+
+    #[test]
+    fn reconcile_during_a_pass_survives_a_clock_set_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        for d in 0..4 {
+            let dir = root.join(format!("d{d}"));
+            fs::create_dir_all(&dir).unwrap();
+            for f in 0..5 {
+                fs::write(dir.join(format!("f{f}.jpg")), b"x").unwrap();
+            }
+        }
+        let db = Db::open_in_memory().unwrap();
+        let root_id = db.add_index_root(&root).unwrap();
+        // Earlier stamps are an hour ahead of the wall clock, as after a clock set back.
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE index_clock SET value = ?1",
+                params![now_ms() + 3_600_000],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let token = CancelToken::new();
+        let t2 = token.clone();
+        let rep = Indexer::new(&db)
+            .batch_size(3)
+            .cancel_token(token)
+            .on_batch(move |_| t2.cancel())
+            .index_root(root_id)
+            .unwrap();
+        assert_eq!(rep.outcome, IndexOutcome::Cancelled);
+        // A watcher refreshes every folder while the pass is paused.
+        let mut late = Vec::new();
+        for d in 0..4 {
+            let dir = root.join(format!("d{d}"));
+            let p = dir.join("late.jpg");
+            fs::write(&p, b"x").unwrap();
+            Indexer::new(&db).reconcile_dir(&dir).unwrap();
+            late.push(p);
+        }
+        let rep = Indexer::new(&db).index_root(root_id).unwrap();
+        assert!(rep.resumed);
+        assert_eq!(rep.marked_missing, 0);
+        assert!(late.iter().all(|p| present(&db, p)));
+    }
+
+    #[test]
+    fn checkpoint_from_an_older_build_restarts_and_sweeps_excluded_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let dir = root.join("sub");
+        let file = dir.join("keep.jpg");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&file, b"present").unwrap();
+        fs::write(root.join("other.jpg"), b"x").unwrap();
+        let db_path = tmp.path().join("forge.db");
+        let root_id;
+        {
+            let db = Db::open(&db_path).unwrap();
+            root_id = db.add_index_root(&root).unwrap();
+            Indexer::new(&db).index_root(root_id).unwrap();
+            // Rewind to a schema-v2 database holding an interrupted checkpoint whose id
+            // equals the earlier rows' indexed_at, which the interrupted pass already saw.
+            let t = now_ms();
+            db.with_conn(|c| {
+                c.execute_batch(&format!(
+                    "UPDATE files SET indexed_at = {t}, seen_scan = {t};
+                     UPDATE index_state SET scan_id = {t}, status = 'interrupted',
+                         finished_at = NULL;
+                     DROP TABLE index_clock;
+                     DELETE FROM schema_migrations WHERE version >= 3;"
+                ))?;
+                c.execute(
+                    "UPDATE index_state SET pending = ?1",
+                    params![pending_json(std::slice::from_ref(&root))],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            assert!(db.index_state(root_id).unwrap().unwrap().is_resumable());
+        }
+        let db = Db::open(&db_path).unwrap();
+        assert!(!db.index_state(root_id).unwrap().unwrap().is_resumable());
+        db.add_exclusion(crate::ExclusionKind::Name, "sub").unwrap();
+        let report = Indexer::new(&db).index_root(root_id).unwrap();
+        assert!(!report.resumed);
+        assert_eq!(report.marked_missing, 2);
+        assert!(!present(&db, &dir) && !present(&db, &file));
+        assert!(present(&db, &root.join("other.jpg")));
     }
 
     #[test]
