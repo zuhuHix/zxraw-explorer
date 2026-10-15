@@ -2542,11 +2542,15 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
             verify_path = Some(path);
         }
     });
-    if let Some(totals) = state.prompt.as_ref().map(|prompt| prompt.totals) {
+    if let Some((totals, text)) = state
+        .prompt
+        .as_ref()
+        .map(|prompt| (prompt.totals, online_only_prompt_text(prompt)))
+    {
         let mut policy = None;
         let mut cancel = false;
         ui.separator();
-        ui.label(RichText::new(online_only_prompt_text(totals)).strong());
+        ui.label(RichText::new(text).strong());
         ui.label(
             RichText::new(if totals.manifest_online_only {
                 "Skip stops here: the manifest is needed to know which files to check."
@@ -2880,12 +2884,20 @@ fn answer_online_only_prompt(prompt: OnlineOnlyPrompt, policy: OnlineOnlyPolicy)
     }
 }
 
-fn online_only_prompt_text(totals: OnlineOnlyTotals) -> String {
+fn online_only_prompt_text(prompt: &OnlineOnlyPrompt) -> String {
+    let totals = prompt.totals;
     let size = format_size(totals.bytes);
     if totals.manifest_online_only {
+        let name = match &prompt.work {
+            ChecksumWork::Verify { manifest, .. } => manifest
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| manifest.display().to_string()),
+            ChecksumWork::Build { .. } => "file".into(),
+        };
         return format!(
-            "The manifest is online-only and would be downloaded ({size}) before its files \
-             can be checked."
+            "The manifest {name} is online-only and would be downloaded ({size}) before its \
+             files can be checked."
         );
     }
     if totals.count == 1 {
@@ -3778,6 +3790,16 @@ mod tests {
         assert!(selected_duplicate_targets(&groups, &unsafe_all).is_none());
     }
 
+    fn files_prompt(totals: OnlineOnlyTotals) -> OnlineOnlyPrompt {
+        OnlineOnlyPrompt {
+            work: ChecksumWork::Build {
+                root: PathBuf::from(r"C:\shoot"),
+                selection: Vec::new(),
+            },
+            totals,
+        }
+    }
+
     #[test]
     fn online_only_prompt_counts_read_naturally() {
         let one = OnlineOnlyTotals {
@@ -3786,7 +3808,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            online_only_prompt_text(one),
+            online_only_prompt_text(&files_prompt(one)),
             format!(
                 "1 file is online-only and would be downloaded ({}).",
                 format_size(512)
@@ -3798,7 +3820,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            online_only_prompt_text(many),
+            online_only_prompt_text(&files_prompt(many)),
             format!(
                 "3 files are online-only and would be downloaded ({}).",
                 format_size(3 << 30)
@@ -3814,7 +3836,6 @@ mod tests {
             bytes: 100,
             manifest_online_only: true,
         };
-        assert!(online_only_prompt_text(totals).starts_with("The manifest is online-only"));
         let prompt = || OnlineOnlyPrompt {
             work: ChecksumWork::Verify {
                 manifest: manifest.clone(),
@@ -3822,6 +3843,14 @@ mod tests {
             },
             totals,
         };
+        assert_eq!(
+            online_only_prompt_text(&prompt()),
+            format!(
+                "The manifest checksums.b3 is online-only and would be downloaded ({}) before \
+                 its files can be checked.",
+                format_size(100)
+            )
+        );
         // Download reads the manifest, then counts its files (which may ask again).
         assert!(matches!(
             answer_online_only_prompt(prompt(), OnlineOnlyPolicy::Download),

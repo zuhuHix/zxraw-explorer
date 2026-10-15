@@ -107,6 +107,9 @@ fn a_copy_started_while_a_dialog_is_open_is_refused_not_lost() {
             "cmd DeletePermanently",
             "cmd CopyToOtherPane",
             "assert-toast The copy did not start: close the open dialog first",
+            // A move within one volume needs no cloud check, and is refused all the same.
+            "cmd MoveToOtherPane",
+            "assert-toast The move did not start: close the open dialog first",
             "cancel",
             "wait-jobs 20",
         ],
@@ -115,7 +118,7 @@ fn a_copy_started_while_a_dialog_is_open_is_refused_not_lost() {
     let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
 
     expect_ok(&outcome);
-    assert!(!dst.join("a.txt").exists(), "the refused copy never ran");
+    assert!(!dst.join("a.txt").exists(), "the refused copy and move never ran");
     assert_eq!(fs::read(src.join("a.txt")).unwrap(), b"keep me");
 }
 

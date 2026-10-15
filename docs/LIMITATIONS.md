@@ -70,7 +70,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * A queued move checks that each source is still the item that was picked, using its Windows
   file ID (NTFS, ReFS, exFAT/FAT). Only if the ID cannot be read does it compare size, modified
   time and kind instead, and that fallback misses a same-size replacement that keeps the old
-  modified time.
+  modified time. The IDs are read when the move is queued, by two shared background workers
+  for local paths and two for network paths, with queued moves taking turns. If reading one
+  source takes more than 10 seconds (an unreachable share), the move fails without moving
+  anything and names that source; time spent waiting behind other moves does not count.
 * Shell operations are Windows-only. Their non-Windows implementations return unsupported results
   or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
 * Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox
@@ -86,14 +89,27 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Online-only *folders* are still listed by the indexer, scans and file operations. Listing a
   placeholder folder fetches names and sizes from the cloud, not file contents. Skipping them
   would hide whole OneDrive trees.
-* The copy/move download warning checks the selection (selected files first, then folders)
-  only up to an entry and time limit. A check that could not cover everything (a limit hit, a
-  folder or item it could not read) always asks before the transfer: with online-only files
-  found it gives their count and size as "at least"; with none found it says not every file
-  could be checked. So copying a very large local folder always asks once. The check runs off
-  the UI thread; a "Checking for online-only files" dialog appears if it takes longer than
-  150 ms, and closing that dialog stops the check. While any dialog is open, a new copy or
-  move is refused with a message rather than queued; start it again afterwards.
+* The copy/move download warning checks each selected file (up to 100,000 files or 3 s). A
+  selected folder is walked only if it may hold cloud files: it is inside a sync root (it or
+  an ancestor carries the Cloud Files tag or online-only attribute, or that cannot be read), or
+  a sync root registered with Windows (or named by the `OneDrive` environment variables) lies
+  inside it, or the registrations cannot be read. A folder positively outside every cloud
+  location, such as a local shoot, is not walked, so its size never causes a prompt. Before
+  skipping a folder, the first 256 entries of its listing are sampled: an online-only entry
+  there (an offline file on a tiered share such as Azure File Sync) makes it walked too, but
+  offline files only deeper down in such a folder are missed. A sync root spelled differently
+  from the selected folder (a `subst` drive, `\\localhost\c$`, a short 8.3 name) is not
+  recognised as lying inside it. A walk
+  stops at 20,000 entries or 300 ms; a check that could not cover everything (a limit hit, a
+  folder or item it could not read) always asks: with online-only files found it gives their
+  count and size as "at least", with none found it says not every file could be checked. A
+  sync root created by a provider that skips the Windows shell registration is seen only from
+  inside it (its folder's tag), not when a folder above it is copied. The check runs off the
+  UI thread; a "Checking for online-only files" dialog appears if it takes longer than 150 ms,
+  and closing that dialog stops the check. While a confirmation dialog (such as Delete
+  permanently or that check) is open, a new copy or move (including a paste, a drop, or a move
+  within one drive) is refused with a message rather than queued; start it again afterwards.
+  Conflict questions and tool windows do not block it.
 * The checksum tool counts online-only files before hashing and asks whether to download and
   hash them, skip them, or cancel. That count walks the whole selection with no limit, as
   hashing does. Skipped files are listed, never hashed, and are not in the saved manifest. A
