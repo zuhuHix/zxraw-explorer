@@ -89,8 +89,9 @@ pub struct ThumbConfig {
     pub cache_dir: Option<PathBuf>,
     /// Memory LRU budget in bytes.
     pub memory_budget_bytes: usize,
-    /// Workers for image thumbnails of local files. Images on network locations run in
-    /// their own pool of at most `forge_core::netpolicy::NETWORK_THUMB_WORKERS` workers.
+    /// Workers for image thumbnails of local files. Thumbnails of files on network locations
+    /// (images and videos) share one pool of at most
+    /// `forge_core::netpolicy::NETWORK_THUMB_WORKERS` workers.
     pub image_threads: usize,
     pub video_threads: usize,
     pub queue_capacity: usize,
@@ -277,11 +278,29 @@ impl Drop for InflightGuard {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    Image,
+    Video,
+    Network,
+}
+
+/// Which pool a thumbnail job runs on. Every job for a file on a network location, image or
+/// video, shares the one network pool, so a mixed folder on a NAS never has more than
+/// `NETWORK_THUMB_WORKERS` reads in flight.
+fn pool_for(is_video: bool, network: bool) -> Pool {
+    match (network, is_video) {
+        (true, _) => Pool::Network,
+        (false, true) => Pool::Video,
+        (false, false) => Pool::Image,
+    }
+}
+
 pub struct ThumbnailService {
     inner: Arc<Inner>,
     rx: Receiver<ThumbResult>,
     image_pool: WorkerPool,
-    /// Image thumbnails of files on network locations (see `forge_core::netpolicy`).
+    /// Image and video thumbnails of files on network locations (see `forge_core::netpolicy`).
     network_pool: WorkerPool,
     video_pool: WorkerPool,
 }
@@ -405,12 +424,10 @@ impl ThumbnailService {
             generation: req.generation,
         };
         let is_video = media_kind_for_ext(&ext_of(&req.path)) == MediaKind::Video;
-        let pool = if is_video {
-            &self.video_pool
-        } else if is_network_path(&req.path) {
-            &self.network_pool
-        } else {
-            &self.image_pool
+        let pool = match pool_for(is_video, is_network_path(&req.path)) {
+            Pool::Network => &self.network_pool,
+            Pool::Video => &self.video_pool,
+            Pool::Image => &self.image_pool,
         };
         let inner = self.inner.clone();
         let priority = req.priority;
@@ -952,6 +969,14 @@ fn box_reduce_raw(src: &[u8], w: u32, h: u32, c: usize, k: u32) -> (u32, u32, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_images_and_videos_share_the_network_pool() {
+        assert_eq!(pool_for(true, true), Pool::Network);
+        assert_eq!(pool_for(false, true), Pool::Network);
+        assert_eq!(pool_for(true, false), Pool::Video);
+        assert_eq!(pool_for(false, false), Pool::Image);
+    }
 
     #[test]
     fn box_reduce_averages() {

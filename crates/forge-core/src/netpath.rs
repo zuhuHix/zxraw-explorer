@@ -1,8 +1,10 @@
 //! Network paths: UNC shares (`\\server\share\…`) and mapped network drives.
 //!
 //! Everything here except [`is_network_path`] is lexical. [`is_network_path`] asks Windows
-//! for the type of a drive letter (`GetDriveTypeW`), which answers from the local device
-//! table and never contacts the server, so it is safe on the UI thread. Nothing in this
+//! for the type of a drive letter (`GetDriveTypeW`). In practice that answers from the local
+//! device table without contacting the server, but Windows does not document that it never
+//! touches the network (see docs/LIMITATIONS.md). UNC paths are decided lexically and never
+//! reach that call. Nothing in this
 //! module opens a path on a share: callers must do that on a worker thread with a timeout,
 //! because an offline server can block a file call for tens of seconds.
 
@@ -24,8 +26,9 @@ pub fn unc_parts(path: &Path) -> Option<(String, String)> {
         text.strip_prefix(r"\\")?
     };
     let mut parts = rest.split('\\');
-    let server = parts.next()?.trim();
-    let share = parts.next()?.trim();
+    // Kept exactly as written: `\\nas\ photos` is a different share from `\\nas\photos`.
+    let server = parts.next()?;
+    let share = parts.next()?;
     if server.is_empty() || share.is_empty() {
         return None;
     }
@@ -54,7 +57,8 @@ fn drive_letter(path: &Path) -> Option<char> {
 /// Is `path` on a network location: a UNC path or a drive letter mapped to a share?
 ///
 /// Background work uses this to pick gentler concurrency, and the UI to avoid file calls
-/// on its own thread. It never contacts the server.
+/// on its own thread. UNC paths are recognised lexically; only a drive letter asks
+/// `GetDriveTypeW`, which in practice answers locally.
 pub fn is_network_path(path: &Path) -> bool {
     if is_unc(path) {
         return true;
@@ -123,8 +127,8 @@ pub fn is_login_error_code(code: i32) -> bool {
 
 /// Validates a network location typed by the user and returns it normalized as
 /// `\\server\share[\sub\folders]`. Accepts `\\server\share`, `//server/share`,
-/// `smb://server/share` and `file://server/share`, with or without a trailing separator.
-/// Lexical: nothing is contacted.
+/// `\\?\UNC\server\share`, `smb://server/share` and `file://server/share`, with or without a
+/// trailing separator. Lexical: nothing is contacted.
 pub fn validate_share_path(input: &str) -> Result<PathBuf, String> {
     let mut s = input.trim().trim_matches('"').trim().to_string();
     if s.is_empty() {
@@ -136,7 +140,11 @@ pub fn validate_share_path(input: &str) -> Result<PathBuf, String> {
             break;
         }
     }
-    let s = s.replace('/', "\\");
+    let mut s = s.replace('/', "\\");
+    // The long form of a UNC path names the same share.
+    if let Some(rest) = strip_prefix_ci(&s, r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    }
     if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
         return Err("Device paths (\\\\?\\ and \\\\.\\) are not network shares.".into());
     }
@@ -154,6 +162,10 @@ pub fn validate_share_path(input: &str) -> Result<PathBuf, String> {
         }
         [server, ..] => unc_server(server)?,
     };
+    let share = comps[1];
+    if share.trim() != share {
+        return Err(format!("The share name \"{share}\" cannot start or end with a space."));
+    }
     for c in &comps[1..] {
         if *c == "." || *c == ".." {
             return Err("The path cannot contain . or .. folders.".into());
@@ -243,6 +255,15 @@ mod tests {
             share_root(Path::new(r"\\nas\photos\2024")),
             Some(PathBuf::from(r"\\nas\photos"))
         );
+        // Spaces belong to the name: they are not trimmed into another share.
+        assert_eq!(
+            unc_parts(Path::new(r"\\nas\ photos \x")),
+            Some(("nas".to_string(), " photos ".to_string()))
+        );
+        assert_eq!(
+            share_root(Path::new(r"\\nas\ photos")),
+            Some(PathBuf::from(r"\\nas\ photos"))
+        );
     }
 
     #[test]
@@ -277,6 +298,8 @@ mod tests {
             PathBuf::from(r"\\fe80--1.ipv6-literal.net\photos")
         );
         assert_eq!(ok(r"\\192.0.2.1\x\sub dir\"), PathBuf::from(r"\\192.0.2.1\x\sub dir"));
+        assert_eq!(ok(r"\\?\UNC\nas\photos\2024"), PathBuf::from(r"\\nas\photos\2024"));
+        assert_eq!(ok(r"\\?\unc\nas\photos"), PathBuf::from(r"\\nas\photos"));
         assert_eq!(ok(r"\\my_nas\Photo Archive"), PathBuf::from(r"\\my_nas\Photo Archive"));
 
         for bad in [
@@ -288,7 +311,10 @@ mod tests {
             r"\\nas",
             r"\\nas\",
             r"\\\nas\photos",
-            r"\\?\UNC\nas\photos",
+            r"\\?\C:\photos",
+            r"\\?\UNC\nas",
+            r"\\nas\ photos",
+            r"\\nas\photos \x",
             r"\\.\pipe\x",
             r"\\na s\photos",
             r"\\-nas\photos",

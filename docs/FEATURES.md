@@ -51,8 +51,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   the context menu. *Add to Network…* is also in the file list's context menu and on the
   address bar's segments when the folder is on a share. *Connect…* (or clicking a share that
   needs sign-in) lets Windows show its own sign-in dialog: the app never asks for, sees or
-  stores a password. Background work is gentler on network paths: image thumbnails of network
-  files run on their own pool of 2 workers (local ones keep half the cores), duplicate scans
+  stores a password. Background work is gentler on network paths: thumbnails of network
+  files, images and videos alike, share one pool of 2 workers (local images keep half the
+  cores), duplicate scans
   with a network root use 2 workers for partial hashes and 1 for full hashes (local: up to 8
   and 4), and in queue mode a copy to or from a network location never runs side by side with
   another transfer (`forge-core/src/netpolicy.rs`). Verified by unit tests (path validation,

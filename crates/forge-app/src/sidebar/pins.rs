@@ -95,9 +95,9 @@ pub fn check_interval(path: &Path, network_roots: &[PathBuf]) -> Duration {
 struct Slot {
     status: PinStatus,
     last_checked: Option<Instant>,
-    /// Submitted and waiting for a worker. At most one queued check per path, so a dead share
-    /// can't grow the queue.
-    queued: bool,
+    /// When the check was submitted, while it waits for a worker. At most one queued check
+    /// per path, so a dead share can't grow the queue.
+    queued_since: Option<Instant>,
     /// When a worker picked the check up; `None` once it answered.
     running_since: Option<Instant>,
     pinned: bool,
@@ -106,9 +106,24 @@ struct Slot {
 }
 
 impl Slot {
-    fn timed_out(&self, now: Instant) -> bool {
+    /// A worker has run the check for `limit` without an answer.
+    fn timed_out(&self, now: Instant, limit: Duration) -> bool {
         self.running_since
-            .is_some_and(|started| now.saturating_duration_since(started) >= CHECK_TIMEOUT)
+            .is_some_and(|started| now.saturating_duration_since(started) >= limit)
+    }
+
+    /// No answer within `limit`: the check ran that long, or waited that long for a worker
+    /// (all of them busy with hung checks of other paths). A stalled check that is still
+    /// queued is not submitted again; it runs when a worker frees up.
+    fn stalled(&self, now: Instant, limit: Duration) -> bool {
+        self.timed_out(now, limit)
+            || self
+                .queued_since
+                .is_some_and(|queued| now.saturating_duration_since(queued) >= limit)
+    }
+
+    fn queued(&self) -> bool {
+        self.queued_since.is_some()
     }
 }
 
@@ -116,15 +131,26 @@ impl Slot {
 /// thread. Checks go through the shared probe service (see `path_probe`), whose local and
 /// network lanes keep local pins answering while a network share hangs. The Network section
 /// uses a second watch for its locations (see `network`).
-#[derive(Default)]
 pub struct PinWatch {
     slots: HashMap<PathBuf, Slot>,
     /// Connected on the first tick that has something to check.
     probe: Option<Client>,
+    /// How long a check may go unanswered (see [`CHECK_TIMEOUT`]).
+    timeout: Duration,
 }
 
-/// A check that has been running this long shows its pin as unreachable, and the pin is
-/// checked again at its next interval.
+impl Default for PinWatch {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            probe: None,
+            timeout: CHECK_TIMEOUT,
+        }
+    }
+}
+
+/// A check that has gone this long without an answer (running, or queued behind other
+/// checks) shows its pin as unreachable. A running one is retried at its next interval.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl PinWatch {
@@ -138,11 +164,11 @@ impl PinWatch {
         self.slots.get(path).and_then(|s| s.last.as_ref())
     }
 
-    /// The check of `path` has run longer than [`CHECK_TIMEOUT`] without an answer.
-    pub fn timed_out(&self, path: &Path) -> bool {
+    /// The check of `path` has gone unanswered longer than the timeout, running or queued.
+    pub fn stalled(&self, path: &Path) -> bool {
         self.slots
             .get(path)
-            .is_some_and(|s| s.timed_out(Instant::now()))
+            .is_some_and(|s| s.stalled(Instant::now(), self.timeout))
     }
 
     /// Checks `path` again on the next tick, unless a check of it is already queued or
@@ -155,10 +181,11 @@ impl PinWatch {
 
     /// A watch whose checks go to `client` instead of the shared service.
     #[cfg(test)]
-    pub(crate) fn with_client(client: Client) -> Self {
+    pub(crate) fn with_client(client: Client, timeout: Duration) -> Self {
         Self {
             slots: HashMap::new(),
             probe: Some(client),
+            timeout,
         }
     }
 
@@ -212,7 +239,7 @@ impl PinWatch {
             self.slots.entry(path.clone()).or_default().pinned = true;
         }
         self.slots
-            .retain(|_, slot| slot.pinned || slot.queued || slot.running_since.is_some());
+            .retain(|_, slot| slot.pinned || slot.queued() || slot.running_since.is_some());
     }
 
     /// Pinned paths whose interval has passed and that have no check queued or running (a
@@ -224,8 +251,8 @@ impl PinWatch {
             .iter()
             .filter(|(path, slot)| {
                 slot.pinned
-                    && !slot.queued
-                    && (slot.running_since.is_none() || slot.timed_out(now))
+                    && !slot.queued()
+                    && (slot.running_since.is_none() || slot.timed_out(now, self.timeout))
                     && slot.last_checked.is_none_or(|checked| {
                         now.saturating_duration_since(checked) >= check_interval(path, network_roots)
                     })
@@ -239,7 +266,7 @@ impl PinWatch {
     /// Marks a check of `path` as submitted at `now`.
     fn start(&mut self, path: &Path, now: Instant) {
         if let Some(slot) = self.slots.get_mut(path) {
-            slot.queued = true;
+            slot.queued_since = Some(now);
             slot.last_checked = Some(now);
         }
     }
@@ -247,16 +274,16 @@ impl PinWatch {
     /// A worker picked up the check of `path`; its timeout counts from here.
     fn started(&mut self, path: &Path, now: Instant) {
         if let Some(slot) = self.slots.get_mut(path) {
-            slot.queued = false;
+            slot.queued_since = None;
             slot.running_since = Some(now);
         }
     }
 
-    /// Pins whose check has run longer than [`CHECK_TIMEOUT`] show as unreachable. Queued
-    /// checks never time out: they have not touched the disk yet.
+    /// Pins whose check has gone unanswered longer than the timeout, running or still
+    /// queued, show as unreachable.
     fn expire(&mut self, now: Instant) {
         for slot in self.slots.values_mut() {
-            if slot.pinned && slot.timed_out(now) {
+            if slot.pinned && slot.stalled(now, self.timeout) {
                 slot.status = PinStatus::Unreachable;
             }
         }
@@ -267,7 +294,7 @@ impl PinWatch {
         let Some(slot) = self.slots.get_mut(path) else {
             return;
         };
-        slot.queued = false;
+        slot.queued_since = None;
         slot.running_since = None;
         if slot.pinned {
             slot.last = Some(found.clone());
@@ -525,19 +552,21 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_check_never_times_out() {
+    fn a_check_queued_past_the_timeout_shows_unreachable_but_is_not_resubmitted() {
         let mut watch = PinWatch::default();
-        let path = PathBuf::from(r"C:\photos");
-        watch.sync(&pins_of(&[r"C:\photos"]));
+        let path = PathBuf::from(r"\\nas\photos");
+        watch.sync(&pins_of(&[r"\\nas\photos"]));
         let t0 = Instant::now();
         watch.start(&path, t0);
-        watch.expire(t0 + CHECK_TIMEOUT * 10);
+        watch.expire(t0 + CHECK_TIMEOUT / 2);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
-        // Once a worker runs it, the timeout counts from then.
+        // Every worker is busy with hung checks: no answer in time is unreachable.
+        watch.expire(t0 + CHECK_TIMEOUT);
+        assert_eq!(watch.status(&path), PinStatus::Unreachable);
+        assert!(watch.due(t0 + NETWORK_INTERVAL * 3, &[]).is_empty(), "still queued once");
+        // It answers when a worker frees up.
         let t1 = t0 + CHECK_TIMEOUT * 10;
         watch.started(&path, t1);
-        watch.expire(t1 + CHECK_TIMEOUT / 2);
-        assert_eq!(watch.status(&path), PinStatus::Unknown);
         watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Present);
     }
