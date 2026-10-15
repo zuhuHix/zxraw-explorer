@@ -197,9 +197,14 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   ACLs and streams; if it cannot, the file is reported as failed and left untouched (no rename
   fallback). A file edited after the preview is detected on a best-effort basis (see
   [LIMITATIONS.md](LIMITATIONS.md)). The originals are backed up in the profile, and *Undo*
-  restores them only if the file is still as the replace left it. Unit tests cover every
-  encoding, line endings, binary and hard-link skipping, regex and whole word, junction swaps,
-  last-moment edits, a failed `ReplaceFileW`, and undo; e2e `tools::` scenarios drive the
+  restores them only if the file is still as the replace left it. The preview shows each
+  stored match in full, including matches that span lines (breaks shown as `\n`). Stored
+  matches are capped (100 per line, 2,000 per file, 50,000 per scan, none longer than 4 KiB),
+  and a scan stops after 50,000 files or 1 GiB read. Matches past a cap are still counted, and
+  the window says how many are not shown (or how many files were not searched) before you
+  press *Replace*. Unit tests cover every encoding, line endings, binary and hard-link skipping,
+  regex and whole word, junction swaps, last-moment edits, a failed `ReplaceFileW`, undo, the
+  preview caps, and multi-line and newline-only matches; e2e `tools::` scenarios drive the
   window.
 * 🟡 Batch export / convert — `forge-app/src/batch_export.rs`: JPEG, PNG, TIFF and lossless WebP,
   never-upscale resize, JPEG quality, naming template (`{name}`, `{n:3}`, `{w}`, `{h}`, `{ext}`),

@@ -99,6 +99,7 @@ impl Options {
             exclude: ScanOptions::parse_patterns(&self.exclude),
             recursive: self.recursive,
             max_file_size: mib.saturating_mul(1024 * 1024),
+            ..ScanOptions::default()
         })
     }
 
@@ -736,6 +737,9 @@ fn draw_preview(
         report.files_scanned,
         report.skipped.len()
     ));
+    if let Some(notice) = report.truncation_notice() {
+        ui.colored_label(ui.visuals().warn_fg_color, notice);
+    }
     let ticked = report
         .files
         .iter()
@@ -827,7 +831,10 @@ fn draw_preview(
                         });
                     }
                     PreviewRow::More(count) => {
-                        ui.label(RichText::new(format!("… and {count} more lines")).weak());
+                        let word = if count == 1 { "match" } else { "matches" };
+                        ui.label(
+                            RichText::new(format!("… and {count} more {word} not shown")).weak(),
+                        );
                     }
                 }
             }
@@ -863,12 +870,12 @@ enum PreviewRow {
     /// A matching line, before the replace (`new` false) or after it. `file` indexes
     /// `report.files` and `line` indexes that file's `matches`.
     Line { file: usize, line: usize, new: bool },
-    /// Matching lines of the file that are not stored in the preview.
+    /// Matches of the file that are not shown in the preview.
     More(usize),
 }
 
 /// The preview flattened into rows: a header per file, the old and new form of each stored
-/// line, and a count row when the file has more matching lines than are stored.
+/// line, and a count row when the file has matches that are not shown.
 fn preview_rows(report: &ScanReport) -> Vec<PreviewRow> {
     let mut rows = Vec::new();
     for (index, file) in report.files.iter().enumerate() {
@@ -885,9 +892,8 @@ fn preview_rows(report: &ScanReport) -> Vec<PreviewRow> {
                 new: true,
             });
         }
-        let more = file.lines_with_matches.saturating_sub(file.matches.len());
-        if more > 0 {
-            rows.push(PreviewRow::More(more));
+        if file.hidden_matches > 0 {
+            rows.push(PreviewRow::More(file.hidden_matches));
         }
     }
     rows
@@ -1148,7 +1154,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
-    fn preview_rows_flatten_each_file_and_count_the_unstored_lines() {
+    fn preview_rows_flatten_each_file_and_count_the_hidden_matches() {
         use forge_core::text_replace::{Encoding, Fingerprint, LineEnding, LineMatch};
 
         let line = LineMatch {
@@ -1166,6 +1172,7 @@ mod tests {
             line_ending: LineEnding::Lf,
             matches: vec![line],
             match_count: 3,
+            hidden_matches: 2,
             lines_with_matches: 3,
             fingerprint: Fingerprint {
                 size: 1,

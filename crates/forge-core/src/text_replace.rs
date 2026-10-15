@@ -36,13 +36,25 @@ use crate::query::glob_match;
 /// Files larger than this are skipped by [`scan`] unless the caller raises the limit.
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 16 * 1024 * 1024;
 
-/// Matching lines stored per file in a [`FilePreview`]. The counts stay exact past this.
+/// Preview lines stored per file in a [`FilePreview`]. The counts stay exact past this.
 pub const MAX_PREVIEW_LINES: usize = 200;
 /// Preview lines stored across all files of one scan. Later files still count their matches,
 /// but store no preview lines once this is reached.
 pub const MAX_PREVIEW_TOTAL_LINES: usize = 20_000;
+/// Matches stored per line; later matches on the line are counted, not stored.
+pub const MAX_PREVIEW_HITS_PER_LINE: usize = 100;
+/// Matches stored per file.
+pub const MAX_PREVIEW_HITS_PER_FILE: usize = 2_000;
+/// Matches stored across all files of one scan.
+pub const MAX_PREVIEW_TOTAL_HITS: usize = 50_000;
+/// Longest match (bytes) shown in the preview. A longer match is counted as not shown.
+pub const MAX_SHOWN_MATCH: usize = 4_096;
+/// Files a scan examines before it stops, unless the caller changes the limit.
+pub const DEFAULT_MAX_TOTAL_FILES: usize = 50_000;
+/// Bytes a scan reads before it stops, unless the caller changes the limit.
+pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Longest line shown in a [`LineMatch`]; longer lines are cut to a window around the match.
+/// Longest text shown in a [`LineMatch`]; longer lines are cut to a window around the matches.
 const DISPLAY_MAX: usize = 400;
 /// Bytes of context kept before the first match when a line is cut.
 const DISPLAY_CONTEXT: usize = 100;
@@ -95,6 +107,20 @@ pub struct ScanOptions {
     pub recursive: bool,
     /// Files larger than this (bytes) are skipped as [`SkipReason::TooLarge`].
     pub max_file_size: u64,
+    /// The scan stops after examining this many files.
+    #[serde(default = "default_max_total_files")]
+    pub max_total_files: usize,
+    /// The scan stops before a file that would take the bytes read past this.
+    #[serde(default = "default_max_total_bytes")]
+    pub max_total_bytes: u64,
+}
+
+fn default_max_total_files() -> usize {
+    DEFAULT_MAX_TOTAL_FILES
+}
+
+fn default_max_total_bytes() -> u64 {
+    DEFAULT_MAX_TOTAL_BYTES
 }
 
 impl Default for ScanOptions {
@@ -104,6 +130,8 @@ impl Default for ScanOptions {
             exclude: Vec::new(),
             recursive: true,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            max_total_files: DEFAULT_MAX_TOTAL_FILES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
         }
     }
 }
@@ -394,18 +422,18 @@ fn fingerprint(bytes: &[u8]) -> Fingerprint {
     }
 }
 
-/// One line of a file that contains at least one match.
+/// Matches shown together: one line of a file, or a window of a long line. A match that runs
+/// over several lines brings them all in, so every stored match is shown in full.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineMatch {
-    /// 1-based line where the match starts.
+    /// 1-based line where the first match starts.
     pub line_number: usize,
-    /// That line without its line ending. Cut to a window of about 400 bytes for long lines.
+    /// The text around the matches, single-line view: line breaks show as `\n` (a lone
+    /// carriage return as `\r`). Long lines are cut to a window of about 400 bytes.
     pub line: String,
-    /// Byte ranges of the matches inside `line`. A match continuing past the line end is
-    /// clipped to the line end.
+    /// Byte ranges of the matches inside `line`, each covering the whole match.
     pub ranges: Vec<Range<usize>>,
-    /// The line after replacement (single-line view; line breaks in the replacement show as
-    /// `\n`).
+    /// `line` after replacement, in the same single-line view.
     pub replaced: String,
     /// Byte ranges of the inserted replacement text inside `replaced`.
     pub replaced_ranges: Vec<Range<usize>>,
@@ -424,10 +452,14 @@ pub struct FilePreview {
     pub rel: PathBuf,
     pub encoding: Encoding,
     pub line_ending: LineEnding,
-    /// The first [`MAX_PREVIEW_LINES`] lines that have a match.
+    /// The matches stored for the preview, at most [`MAX_PREVIEW_LINES`] entries.
     pub matches: Vec<LineMatch>,
     /// Every match in the file, including those not stored in `matches`.
     pub match_count: usize,
+    /// Matches counted in `match_count` but not shown in `matches`: past a preview limit, or
+    /// longer than [`MAX_SHOWN_MATCH`]. [`apply`] replaces them too.
+    #[serde(default)]
+    pub hidden_matches: usize,
     /// Every line with a match, including those not stored in `matches`.
     pub lines_with_matches: usize,
     /// Identity of the bytes that were searched. [`apply`] refuses files that no longer match.
@@ -493,11 +525,44 @@ pub struct ScanReport {
     pub skipped: Vec<(PathBuf, SkipReason)>,
     /// Files examined, including skipped ones; files without a match are counted here only.
     pub files_scanned: usize,
+    /// Files not examined because the scan reached its file or byte limit.
+    #[serde(default)]
+    pub files_not_scanned: usize,
 }
 
 impl ScanReport {
     pub fn total_matches(&self) -> usize {
         self.files.iter().map(|f| f.match_count).sum()
+    }
+
+    /// Matches that will be replaced but are not shown in the preview.
+    pub fn hidden_matches(&self) -> usize {
+        self.files.iter().map(|f| f.hidden_matches).sum()
+    }
+
+    /// What the preview leaves out, for the user to read before replacing. `None` when the
+    /// preview shows every match and every file was searched.
+    pub fn truncation_notice(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        let hidden = self.hidden_matches();
+        if hidden > 0 {
+            let word = if hidden == 1 { "match" } else { "matches" };
+            parts.push(format!(
+                "Preview truncated: {hidden} more {word} not shown, but Replace changes them too"
+            ));
+        }
+        if self.files_not_scanned > 0 {
+            let word = if self.files_not_scanned == 1 {
+                "file"
+            } else {
+                "files"
+            };
+            parts.push(format!(
+                "Search stopped at its file or size limit: {} {word} not searched or changed",
+                self.files_not_scanned
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join(". "))
     }
 }
 
@@ -567,12 +632,22 @@ fn scan_with(
         skipped: col.skipped,
         ..Default::default()
     };
-    let mut budget = MAX_PREVIEW_TOTAL_LINES;
-    for cand in &col.out {
+    let mut budget = Budget {
+        lines: MAX_PREVIEW_TOTAL_LINES,
+        hits: MAX_PREVIEW_TOTAL_HITS,
+    };
+    let mut bytes_read: u64 = 0;
+    for (index, cand) in col.out.iter().enumerate() {
         ctx.cancel.check()?;
+        if report.files_scanned >= opts.max_total_files
+            || bytes_read.saturating_add(cand.size) > opts.max_total_bytes
+        {
+            report.files_not_scanned = col.out.len() - index;
+            break;
+        }
         ctx.progress.set_current(cand.path.display().to_string());
         report.files_scanned += 1;
-        scan_file(cand, &re, spec, opts, ctx, source, &mut budget, &mut report);
+        bytes_read += scan_file(cand, &re, spec, opts, ctx, source, &mut budget, &mut report);
         ctx.progress.add_items(1);
     }
     Ok(report)
@@ -719,8 +794,10 @@ fn collect_root(
     Ok(())
 }
 
-fn skip(report: &mut ScanReport, path: &Path, reason: SkipReason) {
+/// Records a skipped file read before any bytes were read; returns 0, the bytes read.
+fn skip(report: &mut ScanReport, path: &Path, reason: SkipReason) -> u64 {
     report.skipped.push((path.to_path_buf(), reason));
+    0
 }
 
 /// Is `name` (a file name, not a path) explicitly named by the include list? True when the list
@@ -731,7 +808,7 @@ fn named_by_include(include: &[String], name: &str) -> bool {
 }
 
 /// Checks run per file, in this order: cloud read gate, binary extension, known text type,
-/// listed size, bounded read, decode, search, read-only.
+/// listed size, bounded read, decode, search, read-only. Returns the bytes read.
 fn scan_file(
     cand: &Candidate,
     re: &Regex,
@@ -739,9 +816,9 @@ fn scan_file(
     opts: &ScanOptions,
     ctx: &JobCtx<'_>,
     source: &dyn AttributeSource,
-    budget: &mut usize,
+    budget: &mut Budget,
     report: &mut ScanReport,
-) {
+) -> u64 {
     let path = cand.path.as_path();
     if !background_read_allowed_with(path, source) {
         return skip(report, path, SkipReason::OnlineOnly);
@@ -788,24 +865,30 @@ fn scan_file(
     let bytes = match read_bounded(&mut file, opts.max_file_size) {
         Ok(Some(bytes)) => bytes,
         // The file grew after the metadata was read: at least one byte over the limit.
-        Ok(None) => return skip(report, path, SkipReason::TooLarge(opts.max_file_size + 1)),
+        Ok(None) => {
+            skip(report, path, SkipReason::TooLarge(opts.max_file_size + 1));
+            return opts.max_file_size + 1;
+        }
         Err(e) => {
             ctx.progress.add_error();
             let msg = CoreError::io(path, e).to_string();
             return skip(report, path, SkipReason::Unreadable(msg));
         }
     };
+    let read = bytes.len() as u64;
     let Some(decoded) = decode(&bytes) else {
-        return skip(report, path, SkipReason::Binary);
+        skip(report, path, SkipReason::Binary);
+        return read;
     };
-    let limit = MAX_PREVIEW_LINES.min(*budget);
-    let (matches, match_count, lines_with_matches) = find_matches(&decoded.text, re, spec, limit);
-    if match_count == 0 {
-        return;
+    let found = find_matches(&decoded.text, re, spec, budget);
+    if found.count == 0 {
+        return read;
     }
-    *budget -= matches.len();
+    budget.lines -= found.matches.len();
+    budget.hits -= found.shown;
     if md.permissions().readonly() {
-        return skip(report, path, SkipReason::ReadOnly);
+        skip(report, path, SkipReason::ReadOnly);
+        return read;
     }
     report.files.push(FilePreview {
         path: cand.path.clone(),
@@ -813,12 +896,14 @@ fn scan_file(
         rel: cand.rel.clone(),
         encoding: decoded.encoding,
         line_ending: decoded.line_ending,
-        matches,
-        match_count,
-        lines_with_matches,
+        hidden_matches: found.count - found.shown,
+        matches: found.matches,
+        match_count: found.count,
+        lines_with_matches: found.lines_with_matches,
         fingerprint: fingerprint(&bytes),
         max_file_size: opts.max_file_size,
     });
+    read
 }
 
 /// Reads at most `limit` bytes from `file`. `Ok(None)` when the file holds more than `limit`
@@ -894,83 +979,143 @@ impl<'a> LineCursor<'a> {
     }
 }
 
-/// The matches on one line, before they are turned into a [`LineMatch`].
-struct LineGroup {
+/// Preview storage left for the rest of a scan.
+struct Budget {
+    lines: usize,
+    hits: usize,
+}
+
+/// What [`find_matches`] found in one file.
+struct Found {
+    matches: Vec<LineMatch>,
+    count: usize,
+    lines_with_matches: usize,
+    /// Matches stored in `matches`; every other match is counted only.
+    shown: usize,
+}
+
+/// Matches shown together in one [`LineMatch`]: they start on the same line (or on the last
+/// line of a multi-line match before them) and fit in one display window.
+struct Group {
     line_no: usize,
-    line_start: usize,
-    content_end: usize,
-    /// Byte range inside the line, and the replacement text for that match.
+    /// Start of the line holding the last byte of the last match.
+    last_line_start: usize,
+    /// Start of the display window.
+    from: usize,
+    /// End of the last covered line, or later when a match takes the line break.
+    cover_end: usize,
+    /// Absolute byte range of each match and its replacement text.
     hits: Vec<(Range<usize>, String)>,
 }
 
-/// Group the matches of `text` by line. Returns the first `limit` lines with a match, the total
-/// match count and the total number of lines with a match.
-fn find_matches(
-    text: &str,
-    re: &Regex,
-    spec: &SearchSpec,
-    limit: usize,
-) -> (Vec<LineMatch>, usize, usize) {
-    let mut groups: Vec<LineGroup> = Vec::new();
+/// Find the matches of `text`. Counts every match, but stores at most
+/// [`MAX_PREVIEW_HITS_PER_LINE`] per line, [`MAX_PREVIEW_HITS_PER_FILE`] per file and what is
+/// left of `budget`. Each stored match is shown in full, line breaks included; a match longer
+/// than [`MAX_SHOWN_MATCH`] is counted but not stored. Replacement text is only built for
+/// stored matches.
+fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> Found {
+    let line_limit = MAX_PREVIEW_LINES.min(budget.lines);
+    let hit_limit = MAX_PREVIEW_HITS_PER_FILE.min(budget.hits);
     let mut lines = LineCursor::new(text);
+    let mut out: Vec<LineMatch> = Vec::new();
+    let mut group: Option<Group> = None;
     let mut count = 0;
     let mut lines_total = 0;
-    // Line start of the last line that had a match, stored or not.
+    let mut shown = 0;
+    // Line start of the last line where a match started, and the matches stored on it.
     let mut last_line: Option<usize> = None;
+    let mut on_line = 0;
     for caps in real_matches(text, re) {
         let Some(m) = caps.get(0) else { continue };
         count += 1;
         let (line_no, line_start, content_end) = lines.locate(m.start());
-        // The match may run past the line end (multi-line pattern); clip it to the line.
-        let start = m.start() - line_start;
-        let end = m.end().min(content_end) - line_start;
-        if end <= start {
+        if last_line != Some(line_start) {
+            last_line = Some(line_start);
+            lines_total += 1;
+            on_line = 0;
+        }
+        if m.len() > MAX_SHOWN_MATCH || on_line >= MAX_PREVIEW_HITS_PER_LINE || shown >= hit_limit {
             continue;
         }
-        let rep = replacement_text(&caps, spec);
-        if last_line == Some(line_start) {
-            // Another match on a line already counted. Only a stored line takes it.
-            if let Some(g) = groups.last_mut().filter(|g| g.line_start == line_start) {
-                g.hits.push((start..end, rep));
+        // The line holding the last byte of the match. A match that takes the line break
+        // covers it, so the break is shown.
+        let (_, end_line_start, end_content_end) = lines.locate(m.end() - 1);
+        let cover_end = end_content_end.max(m.end());
+        let joins = group
+            .as_ref()
+            .is_some_and(|g| g.last_line_start == line_start && m.end() - g.from <= DISPLAY_MAX);
+        if !joins {
+            if let Some(g) = group.take() {
+                out.push(finish_group(text, &g));
             }
-            continue;
-        }
-        last_line = Some(line_start);
-        lines_total += 1;
-        if groups.len() < limit {
-            groups.push(LineGroup {
+            if out.len() >= line_limit {
+                continue;
+            }
+            // Short lines are shown whole; long ones from a little before the first match.
+            let from = if content_end.max(cover_end) - line_start <= DISPLAY_MAX
+                || m.start() - line_start <= DISPLAY_CONTEXT
+            {
+                line_start
+            } else {
+                floor_boundary(text, m.start() - DISPLAY_CONTEXT)
+            };
+            group = Some(Group {
                 line_no,
-                line_start,
-                content_end,
-                hits: vec![(start..end, rep)],
+                last_line_start: line_start,
+                from,
+                cover_end: content_end,
+                hits: Vec::new(),
             });
         }
+        let Some(g) = group.as_mut() else { continue };
+        g.last_line_start = end_line_start;
+        g.cover_end = g.cover_end.max(cover_end);
+        g.hits.push((m.range(), replacement_text(&caps, spec)));
+        on_line += 1;
+        shown += 1;
     }
-    let lines = groups.iter().map(|g| finish_line(text, g)).collect();
-    (lines, count, lines_total)
+    if let Some(g) = group.take() {
+        out.push(finish_group(text, &g));
+    }
+    Found {
+        matches: out,
+        count,
+        lines_with_matches: lines_total,
+        shown,
+    }
 }
 
-fn finish_line(text: &str, g: &LineGroup) -> LineMatch {
-    let line = &text[g.line_start..g.content_end];
-    let mut replaced = String::with_capacity(line.len());
-    let mut replaced_ranges = Vec::new();
+/// Render a group: the window from `g.from`, cut after [`DISPLAY_MAX`] bytes unless a match
+/// runs further, with line breaks shown as `\n`.
+fn finish_group(text: &str, g: &Group) -> LineMatch {
+    let last_end = g.hits.last().map_or(g.from, |(r, _)| r.end);
+    let to = if g.cover_end - g.from <= DISPLAY_MAX {
+        g.cover_end
+    } else {
+        floor_boundary(text, g.from + DISPLAY_MAX).max(last_end)
+    };
+    let mut line = String::new();
     let mut ranges = Vec::with_capacity(g.hits.len());
-    let mut prev = 0;
+    let mut replaced = String::new();
+    let mut replaced_ranges = Vec::with_capacity(g.hits.len());
+    let mut prev = g.from;
     for (range, rep) in &g.hits {
-        replaced.push_str(&line[prev..range.start]);
-        let shown = one_line(rep);
+        let between = one_line(&text[prev..range.start]);
+        line.push_str(&between);
+        replaced.push_str(&between);
+        let begin = line.len();
+        line.push_str(&one_line(&text[range.clone()]));
+        ranges.push(begin..line.len());
         let begin = replaced.len();
-        replaced.push_str(&shown);
-        if !shown.is_empty() {
+        replaced.push_str(&one_line(rep));
+        if replaced.len() > begin {
             replaced_ranges.push(begin..replaced.len());
         }
-        ranges.push(range.clone());
         prev = range.end;
     }
-    replaced.push_str(&line[prev..]);
-
-    let (line, ranges) = window(line, &ranges);
-    let (replaced, replaced_ranges) = window(&replaced, &replaced_ranges);
+    let rest = one_line(&text[prev..to]);
+    line.push_str(&rest);
+    replaced.push_str(&rest);
     LineMatch {
         line_number: g.line_no,
         line,
@@ -980,29 +1125,12 @@ fn finish_line(text: &str, g: &LineGroup) -> LineMatch {
     }
 }
 
-/// Single-line display form of a replacement: line breaks become a visible `\n`.
-fn one_line(rep: &str) -> String {
-    rep.replace("\r\n", "\\n").replace('\n', "\\n")
-}
-
-/// Cut `text` to a window of about [`DISPLAY_MAX`] bytes around the first range, and shift
-/// the ranges into the window. Short text is returned unchanged.
-fn window(text: &str, ranges: &[Range<usize>]) -> (String, Vec<Range<usize>>) {
-    if text.len() <= DISPLAY_MAX {
-        return (text.to_string(), ranges.to_vec());
-    }
-    let first = ranges.first().map_or(0, |r| r.start);
-    let start = floor_boundary(text, first.saturating_sub(DISPLAY_CONTEXT));
-    let end = floor_boundary(text, start + DISPLAY_MAX);
-    let shifted = ranges
-        .iter()
-        .filter_map(|r| {
-            let s = r.start.max(start);
-            let e = r.end.min(end);
-            (s < e).then(|| s - start..e - start)
-        })
-        .collect();
-    (text[start..end].to_string(), shifted)
+/// Single-line display form of text: a line break (`\r\n` or `\n`) becomes a visible `\n`,
+/// and a lone `\r` a visible `\r`.
+fn one_line(text: &str) -> String {
+    text.replace("\r\n", "\\n")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 fn floor_boundary(text: &str, mut i: usize) -> usize {
@@ -2265,6 +2393,214 @@ mod tests {
                 .files
                 .iter()
                 .all(|f| f.lines_with_matches == per_file)
+        );
+    }
+
+    fn regex_spec(pattern: &str, replacement: &str) -> SearchSpec {
+        SearchSpec {
+            regex: true,
+            case_sensitive: true,
+            ..spec(pattern, replacement)
+        }
+    }
+
+    fn shown(file: &FilePreview) -> usize {
+        file.matches.iter().map(|m| m.ranges.len()).sum()
+    }
+
+    #[test]
+    fn a_huge_single_line_stores_capped_matches_and_reports_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let len = 1024 * 1024;
+        fs::write(dir.path().join("huge.txt"), "a".repeat(len)).unwrap();
+        let report = run_scan(dir.path(), &spec("a", "b"), &ScanOptions::default());
+        let file = &report.files[0];
+        assert_eq!(file.match_count, len);
+        assert_eq!(file.lines_with_matches, 1);
+        assert_eq!(shown(file), MAX_PREVIEW_HITS_PER_LINE);
+        assert_eq!(file.hidden_matches, len - MAX_PREVIEW_HITS_PER_LINE);
+        for m in &file.matches {
+            assert!(m.line.len() <= DISPLAY_MAX && m.replaced.len() <= DISPLAY_MAX);
+            assert_eq!(m.line_number, 1);
+        }
+        let notice = report.truncation_notice().unwrap();
+        assert!(
+            notice.contains(&format!("{} more matches not shown", file.hidden_matches)),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn matches_stored_are_capped_per_file_and_per_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        // 200 lines of 50 matches: 10,000 matches per file.
+        let body = format!("{}\n", "foo ".repeat(50)).repeat(200);
+        let files = MAX_PREVIEW_TOTAL_HITS / MAX_PREVIEW_HITS_PER_FILE + 2;
+        for i in 0..files {
+            fs::write(dir.path().join(format!("f{i:03}.txt")), &body).unwrap();
+        }
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &ScanOptions::default());
+        assert_eq!(report.files.len(), files);
+        let first = &report.files[0];
+        assert_eq!(first.match_count, 10_000);
+        assert_eq!(shown(first), MAX_PREVIEW_HITS_PER_FILE);
+        assert_eq!(first.matches.len(), MAX_PREVIEW_HITS_PER_FILE / 50);
+        let stored: usize = report.files.iter().map(shown).sum();
+        assert_eq!(stored, MAX_PREVIEW_TOTAL_HITS);
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|f| shown(f) + f.hidden_matches == f.match_count)
+        );
+        assert_eq!(
+            report.hidden_matches(),
+            files * 10_000 - MAX_PREVIEW_TOTAL_HITS
+        );
+    }
+
+    #[test]
+    fn a_scan_stops_at_its_file_and_byte_limits_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("f{i}.txt")), "foo\n").unwrap();
+        }
+        let opts = ScanOptions {
+            max_total_files: 2,
+            ..ScanOptions::default()
+        };
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &opts);
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.files_not_scanned, 3);
+        assert!(
+            report
+                .truncation_notice()
+                .unwrap()
+                .contains("3 files not searched")
+        );
+
+        let opts = ScanOptions {
+            max_total_bytes: 10,
+            ..ScanOptions::default()
+        };
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &opts);
+        assert_eq!(report.files_scanned, 2);
+        assert_eq!(report.files_not_scanned, 3);
+
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &ScanOptions::default());
+        assert_eq!(report.files_not_scanned, 0);
+        assert_eq!(report.truncation_notice(), None);
+    }
+
+    #[test]
+    fn a_multi_line_match_is_shown_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("m.txt"),
+            "x BEGIN one\ntwo END y BEGIN z END\nnext\r\nBEGIN crlf\r\nEND.\n",
+        )
+        .unwrap();
+        let report = run_scan(
+            dir.path(),
+            &regex_spec(r"(?s)BEGIN.*?END", "R"),
+            &ScanOptions::default(),
+        );
+        let file = &report.files[0];
+        assert_eq!(file.match_count, 3);
+        assert_eq!(file.hidden_matches, 0);
+        assert_eq!(file.matches.len(), 2);
+
+        // The second match starts on the line where the first ends: both are shown together.
+        let first = &file.matches[0];
+        assert_eq!(first.line_number, 1);
+        assert_eq!(first.line, r"x BEGIN one\ntwo END y BEGIN z END");
+        let spans: Vec<&str> = first
+            .ranges
+            .iter()
+            .map(|r| &first.line[r.clone()])
+            .collect();
+        assert_eq!(spans, [r"BEGIN one\ntwo END", "BEGIN z END"]);
+        assert_eq!(first.replaced, "x R y R");
+        assert_eq!(first.replaced_ranges, vec![2..3, 6..7]);
+
+        let second = &file.matches[1];
+        assert_eq!(second.line_number, 4);
+        assert_eq!(second.line, r"BEGIN crlf\nEND.");
+        assert_eq!(&second.line[second.ranges[0].clone()], r"BEGIN crlf\nEND");
+        assert_eq!(second.replaced, "R.");
+        assert_eq!(report.truncation_notice(), None);
+    }
+
+    #[test]
+    fn a_newline_only_match_is_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.txt"), "ab\ncd\r\nef").unwrap();
+        let report = run_scan(dir.path(), &regex_spec(r"\n", " "), &ScanOptions::default());
+        let file = &report.files[0];
+        assert_eq!(file.match_count, 2);
+        assert_eq!(file.hidden_matches, 0);
+        assert_eq!(file.matches.len(), 2);
+
+        let first = &file.matches[0];
+        assert_eq!(first.line_number, 1);
+        assert_eq!(first.line, r"ab\n");
+        assert_eq!(first.ranges, vec![2..4]);
+        assert_eq!(first.replaced, "ab ");
+
+        // Only the `\n` of a CRLF break matches; the `\r` that stays is shown too.
+        let second = &file.matches[1];
+        assert_eq!(second.line_number, 2);
+        assert_eq!(second.line, r"cd\r\n");
+        assert_eq!(&second.line[second.ranges[0].clone()], r"\n");
+        assert_eq!(second.replaced, r"cd\r ");
+    }
+
+    #[test]
+    fn a_match_too_long_to_show_is_reported_as_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!(
+            "BEGIN\n{}\nEND\nshort BEGIN END",
+            "x\n".repeat(MAX_SHOWN_MATCH)
+        );
+        fs::write(dir.path().join("l.txt"), body).unwrap();
+        let report = run_scan(
+            dir.path(),
+            &regex_spec(r"(?s)BEGIN.*?END", "R"),
+            &ScanOptions::default(),
+        );
+        let file = &report.files[0];
+        assert_eq!(file.match_count, 2);
+        assert_eq!(file.hidden_matches, 1);
+        assert_eq!(shown(file), 1);
+        assert_eq!(file.matches[0].line, "short BEGIN END");
+        assert!(
+            report
+                .truncation_notice()
+                .unwrap()
+                .contains("1 more match not shown")
+        );
+    }
+
+    #[test]
+    fn matches_far_apart_on_a_long_line_get_their_own_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("foo{}foo{}", "x".repeat(1000), "y".repeat(1000));
+        fs::write(dir.path().join("w.txt"), body).unwrap();
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &ScanOptions::default());
+        let file = &report.files[0];
+        assert_eq!(file.hidden_matches, 0);
+        assert_eq!(file.matches.len(), 2);
+        assert_eq!(file.lines_with_matches, 1);
+        for m in &file.matches {
+            assert!(m.line.len() <= DISPLAY_MAX);
+            assert_eq!(&m.line[m.ranges[0].clone()], "foo");
+            assert_eq!(&m.replaced[m.replaced_ranges[0].clone()], "bar");
+        }
+        assert!(
+            file.matches[1]
+                .line
+                .starts_with(&"x".repeat(DISPLAY_CONTEXT))
         );
     }
 }

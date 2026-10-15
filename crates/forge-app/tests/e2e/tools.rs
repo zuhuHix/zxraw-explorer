@@ -1082,7 +1082,7 @@ fn find_replace_undo_restores_the_original_bytes() {
          ui tools replace set regex on\n\
          ui tools replace preview\n\
          ui tools replace wait-preview 30\n\
-         ui tools replace assert-preview files=3 matches=5 skipped=0\n\
+         ui tools replace assert-preview files=3 matches=5 hidden=0 skipped=0\n\
          ui tools replace run\n\
          ui tools replace wait-apply 30\n\
          ui tools replace assert-apply files=3 replacements=5 skipped=0 failed=0\n\
