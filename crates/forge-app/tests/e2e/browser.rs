@@ -489,8 +489,8 @@ fn rename_with_the_selection_filtered_out_renames_nothing() {
 
 #[test]
 fn arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked() {
-    let (temp, work, profile) =
-        list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt"]);
+    // Three tiles, so they share one row even in a narrow window.
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt"]);
     let script = format!(
         "navigate {work}\ncmd TogglePreview\ncmd ViewGrid\nwait-frames 5\n\
          click-entry a.txt\nui browser assert-cursor a.txt\n\
@@ -498,8 +498,8 @@ fn arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked() {
          ui browser click-control group-similar\nui browser assert-grouping on\n\
          key ArrowRight\nui browser assert-cursor b.txt\n\
          # Down from the only row stops on the last tile instead of leaving the grid.\n\
-         key ArrowDown\nui browser assert-cursor f.txt\n\
-         key ArrowRight\nui browser assert-cursor f.txt\n\
+         key ArrowDown\nui browser assert-cursor c.txt\n\
+         key ArrowRight\nui browser assert-cursor c.txt\n\
          key Home\nkey ArrowLeft\nui browser assert-cursor a.txt\n\
          ui browser assert-grouping on\n\
          # Details view: Up on the first row must not send focus to the toolbar.\n\
@@ -507,8 +507,8 @@ fn arrows_move_the_file_cursor_after_a_toolbar_toggle_was_clicked() {
          key ArrowUp\nui browser assert-cursor a.txt\n\
          key ArrowDown\nui browser assert-cursor b.txt\n\
          key ArrowDown\nui browser assert-cursor c.txt\n\
-         key End\nkey ArrowDown\nui browser assert-cursor f.txt\n\
-         key ArrowUp\nui browser assert-cursor e.txt\nexit\n",
+         key End\nkey ArrowDown\nui browser assert-cursor c.txt\n\
+         key ArrowUp\nui browser assert-cursor b.txt\nexit\n",
         work = shown(&work),
     );
     let outcome = run_app(temp.path(), &profile, &script);
@@ -553,6 +553,99 @@ fn after_switching_panes_the_arrows_move_the_active_panes_cursor() {
         ],
     )
     .replace("assert-path RIGHT", &format!("assert-path {}", shown(&right)));
+    let outcome = run_app(temp.path(), &temp.path().join("profile"), &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn delete_after_closing_the_folder_of_the_selection_touches_no_file() {
+    let (temp, work, profile) =
+        list_fixture(&["Shoot/img_01.txt", "Shoot/img_02.txt", "notes.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         ui browser click-arrow Shoot\nwait-entry img_01.txt\nwait-frames 3\n\
+         cmd ToggleStickySelection\nclick-entry img_01.txt\nclick-entry img_02.txt\n\
+         assert-selection img_01.txt, img_02.txt\n\
+         # Closing the folder hides the selection: Delete must not take the folder instead.\n\
+         ui browser click-arrow Shoot\nui browser assert-collapsed-folder Shoot\n\
+         key Delete\nwait-frames 10\nwait-jobs 10\nui browser assert-no-dialog\n\
+         assert-toast Nothing to delete\n\
+         assert-exists {shoot}\nassert-exists {img01}\nassert-exists {img02}\n\
+         # Reopening shows the selection again, and Delete takes just those files.\n\
+         ui browser click-arrow Shoot\nwait-entry img_01.txt\nwait-frames 3\n\
+         assert-selection img_01.txt, img_02.txt\n\
+         key Delete\nwait-jobs 20\nwait-no-entry img_02.txt\n\
+         assert-missing {img01}\nassert-missing {img02}\nassert-exists {shoot}\nexit\n",
+        work = shown(&work),
+        shoot = shown(&work.join("Shoot")),
+        img01 = shown(&work.join("Shoot").join("img_01.txt")),
+        img02 = shown(&work.join("Shoot").join("img_02.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn right_click_on_a_selected_row_makes_it_the_single_item_target() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         # Sticky clicks select a and b, then leave the cursor on c (clicked on and off).\n\
+         cmd ToggleStickySelection\nclick-entry a.txt\nclick-entry b.txt\n\
+         click-entry c.txt\nclick-entry c.txt\n\
+         ui browser assert-cursor c.txt\nassert-selection a.txt, b.txt\n\
+         # The right-click on a keeps the selection and moves the cursor there.\n\
+         right-click-entry a.txt\nwait-frames 2\n\
+         ui browser assert-cursor a.txt\nassert-selection a.txt, b.txt\n\
+         cmd Rename\ntype renamed.txt\naccept\nwait-exists {renamed}\n\
+         assert-missing {a}\nassert-exists {b}\nassert-exists {c}\nexit\n",
+        work = shown(&work),
+        a = shown(&work.join("a.txt")),
+        b = shown(&work.join("b.txt")),
+        c = shown(&work.join("c.txt")),
+        renamed = shown(&work.join("renamed.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn right_click_in_the_other_split_pane_targets_the_clicked_tile() {
+    let temp = tempfile::tempdir().unwrap();
+    let left = temp.path().join("left");
+    let right = temp.path().join("right");
+    write_file(&left.join("l1.txt"), b"x");
+    for name in ["r1.txt", "r2.txt", "r3.txt"] {
+        write_file(&right.join(name), b"x");
+    }
+    let script = dual_pane_script(
+        &left,
+        &right,
+        &[
+            "focus right",
+            "cmd ViewGrid",
+            "wait-frames 5",
+            "cmd ToggleStickySelection",
+            "click-entry r1.txt",
+            "click-entry r2.txt",
+            "click-entry r3.txt",
+            "click-entry r3.txt",
+            "ui browser assert-cursor r3.txt",
+            "right-click-entry r1.txt",
+            "wait-frames 2",
+            "ui browser assert-cursor r1.txt",
+            "assert-selection r1.txt, r2.txt",
+            "cmd Rename",
+            "type renamed.txt",
+            "accept",
+            "wait-exists RENAMED",
+            "assert-exists R2",
+            "assert-exists R3",
+        ],
+    )
+    .replace("RENAMED", &shown(&right.join("renamed.txt")))
+    .replace("R2", &shown(&right.join("r2.txt")))
+    .replace("R3", &shown(&right.join("r3.txt")));
     let outcome = run_app(temp.path(), &temp.path().join("profile"), &script);
     expect_ok(&outcome);
 }

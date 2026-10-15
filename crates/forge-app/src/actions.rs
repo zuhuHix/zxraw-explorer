@@ -225,6 +225,19 @@ pub fn modal_open(app: &ZxrawApp) -> bool {
     app.ops.modal.is_some() || app.ops.batch_rename.is_some() || !app.ops.conflicts.is_empty()
 }
 
+/// Whether the selection is entirely hidden (filtered out, hidden files off, inside a
+/// closed folder), so `verb` has nothing to act on; then a toast says why.
+fn hidden_selection(app: &mut ZxrawApp, verb: &str) -> bool {
+    let p = app.pane();
+    let hidden = !p.selected.is_empty() && p.action_targets().is_empty();
+    if hidden {
+        app.toast(format!(
+            "Nothing to {verb}: the selected items are hidden. Press Esc to clear the selection."
+        ));
+    }
+    hidden
+}
+
 pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
     let dir = app.pane().path.clone();
     match cmd {
@@ -247,6 +260,9 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             )));
         }
         Cmd::Rename => {
+            if hidden_selection(app, "rename") {
+                return;
+            }
             if let Some(e) = app.pane().rename_target().cloned() {
                 app.ops.modal = Some(Modal::Prompt(Prompt::new(
                     PromptKind::Rename {
@@ -260,6 +276,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::DeletePermanently => {
             let targets = app.pane().action_targets();
             if targets.is_empty() {
+                hidden_selection(app, "delete");
                 return;
             }
             app.ops.modal = Some(Modal::Confirm(Confirm {
@@ -277,6 +294,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Recycle => {
             let targets = app.pane().action_targets();
             if targets.is_empty() {
+                hidden_selection(app, "delete");
                 return;
             }
             if app.settings.confirm_recycle {
@@ -298,13 +316,14 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             }
         }
         Cmd::Properties => {
-            let t = app.pane().action_targets();
-            let p = t.into_iter().next().unwrap_or_else(|| dir.clone());
+            // One item: the right-clicked (cursor) one when it is a target.
+            let t = app.pane().rename_target().map(|e| e.path.clone());
+            let p = t.unwrap_or_else(|| dir.clone());
             app.ops
                 .spawn_shell("Properties", move || forge_win::show_properties(&p));
         }
         Cmd::OpenWith => {
-            if let Some(p) = app.pane().action_targets().into_iter().next() {
+            if let Some(p) = app.pane().rename_target().map(|e| e.path.clone()) {
                 app.ops
                     .spawn_shell("Open with", move || forge_win::open_with_dialog(&p));
             }
