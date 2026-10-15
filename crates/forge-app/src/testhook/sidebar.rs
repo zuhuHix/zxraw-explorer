@@ -17,6 +17,18 @@
 //! - `wait-pin-status <label> present|missing [| seconds]`: wait until the last existence check
 //!   of the pin reports that state (default 30 s).
 //!
+//! Network locations (named by their display label, see `sidebar::network::location_label`):
+//! - `net [label, label…]`: fail unless the saved locations are exactly these, in order.
+//! - `net-add <path> | <name>`: fill in the "Add network location" dialog and accept it, as
+//!   the Add button does. Fails with the dialog's error if it stays open.
+//! - `net-add-fails <path>`: the same, but the dialog must refuse the path.
+//! - `net-rename <label> | <new label>`: rename through the Rename prompt (blank: default).
+//! - `net-remove <label>`: remove the location, as its context menu does.
+//! - `net-click <label>`: what a click on the location does; fails if the click itself took
+//!   longer than 250 ms (it must never wait for the server).
+//! - `wait-net-status <label> checking|online|offline|signin|notfound [| seconds]`.
+//! - `responsive <frames> | <ms>`: wait for that many frames; fail if any frame took longer.
+//!
 //! Saved layouts:
 //! - `layouts [name, name…]`: fail unless the saved layouts have exactly these names, in order.
 //!   With no arguments it checks that there are none.
@@ -38,13 +50,14 @@ use crate::actions;
 use crate::app::ZxrawApp;
 use crate::modal::{Modal, Prompt, PromptKind};
 use crate::settings::ViewMode;
+use crate::sidebar::network::{self, location_label};
 use crate::sidebar::{activate_pin, pin_label, pin_paths, pin_status};
 
 const WAIT_LIMIT: Duration = Duration::from_secs(30);
 
 pub(super) fn step(
     app: &mut ZxrawApp,
-    _ctx: &egui::Context,
+    ctx: &egui::Context,
     verb: &str,
     args: &str,
     st: &mut StepState,
@@ -147,6 +160,145 @@ pub(super) fn step(
                 )))
             }
         }
+        "net" => {
+            let expected = names_list(args);
+            let found: Vec<String> = app
+                .settings
+                .network_locations
+                .iter()
+                .map(location_label)
+                .collect();
+            if found == expected {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("expected network locations {expected:?}, found {found:?}"))
+            }
+        }
+        "net-add" | "net-add-fails" => {
+            let (path, name) = args.split_once(" | ").unwrap_or((args, ""));
+            network::open_add_dialog(app, path.trim().to_string());
+            if let Some(dialog) = app.sidebar.network.dialog.as_mut()
+                && !name.trim().is_empty()
+            {
+                dialog.name = name.trim().to_string();
+            }
+            let result = network::accept_dialog(app);
+            app.sidebar.network.dialog = None;
+            match (verb, result) {
+                ("net-add", Ok(())) | ("net-add-fails", Err(_)) => Ok(Flow::Done),
+                ("net-add", Err(e)) => Err(format!("the location was refused: {e}")),
+                _ => Err(format!("`{}` was accepted", path.trim())),
+            }
+        }
+        "net-rename" => {
+            let (label, text) = args
+                .split_once(" | ")
+                .ok_or("expected `<label> | <new label>`")?;
+            let index = find_location(app, label.trim())?;
+            let path = app.settings.network_locations[index].path.clone();
+            let prompt = Prompt::new(
+                PromptKind::RenameNetworkLocation { path },
+                "Rename network location",
+                text.trim(),
+            );
+            match actions::accept(app, Modal::Prompt(prompt)) {
+                None => Ok(Flow::Done),
+                Some(_) => Err("the rename prompt stayed open".into()),
+            }
+        }
+        "net-remove" => {
+            let index = find_location(app, one(args)?)?;
+            network::remove_location(app, index);
+            Ok(Flow::Done)
+        }
+        "net-click" => {
+            let index = find_location(app, one(args)?)?;
+            let entry = network::entries(app)
+                .into_iter()
+                .find(|e| e.saved == Some(index))
+                .ok_or("the location has no row")?;
+            let started = Instant::now();
+            network::activate(app, &entry);
+            let took = started.elapsed();
+            if took > Duration::from_millis(250) {
+                Err(format!("the click blocked the UI for {} ms", took.as_millis()))
+            } else {
+                Ok(Flow::Done)
+            }
+        }
+        "wait-net-status" => {
+            let (body, timeout) = match args.split_once('|') {
+                Some((body, seconds)) => {
+                    let seconds = seconds
+                        .trim()
+                        .parse::<u64>()
+                        .map_err(|_| "status timeout must be integer seconds")?;
+                    if !(1..=120).contains(&seconds) {
+                        return Err("status timeout must be between 1 and 120 seconds".into());
+                    }
+                    (body, Duration::from_secs(seconds))
+                }
+                None => (args, WAIT_LIMIT),
+            };
+            let (label, want) = body
+                .trim()
+                .rsplit_once(char::is_whitespace)
+                .ok_or("expected `<label> checking|online|offline|signin|notfound`")?;
+            if !["checking", "online", "offline", "signin", "notfound"].contains(&want) {
+                return Err(format!("unknown network status `{want}`"));
+            }
+            let index = find_location(app, label.trim())?;
+            let path = app.settings.network_locations[index].path.clone();
+            let status = network::status_of(app, &path);
+            if status.word() == want {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= timeout {
+                Err(format!(
+                    "network location `{}` is {status:?} after {} s, expected {want}",
+                    label.trim(),
+                    timeout.as_secs()
+                ))
+            } else {
+                Ok(Flow::Wait(format!(
+                    "waiting for network location `{}` to be {want}",
+                    label.trim()
+                )))
+            }
+        }
+        "responsive" => {
+            let (frames, ms) = args
+                .split_once('|')
+                .ok_or("expected `<frames> | <ms>`")?;
+            let frames: u32 = frames.trim().parse().map_err(|_| "frames must be a number")?;
+            let limit = Duration::from_millis(
+                ms.trim()
+                    .parse()
+                    .map_err(|_| "the frame limit must be milliseconds")?,
+            );
+            let now = Instant::now();
+            // (previous frame, slowest gap so far)
+            let (last, worst) = st
+                .data
+                .as_ref()
+                .and_then(|d| d.downcast_ref::<(Instant, Duration)>())
+                .copied()
+                .unwrap_or((now, Duration::ZERO));
+            let worst = worst.max(now - last);
+            st.data = Some(Box::new((now, worst)));
+            st.phase += 1;
+            if worst > limit {
+                Err(format!(
+                    "a frame took {} ms (limit {} ms)",
+                    worst.as_millis(),
+                    limit.as_millis()
+                ))
+            } else if st.phase >= frames {
+                Ok(Flow::Done)
+            } else {
+                ctx.request_repaint();
+                Ok(Flow::Wait(format!("frame {} of {frames}", st.phase)))
+            }
+        }
         "layouts" => {
             let expected = names_list(args);
             let found: Vec<String> = app
@@ -206,6 +358,18 @@ pub(super) fn step(
         }
         _ => Err(format!("unknown `ui sidebar` verb `{verb}`")),
     }
+}
+
+/// Index of the saved network location whose display label is `label`.
+fn find_location(app: &ZxrawApp, label: &str) -> Result<usize, String> {
+    let locations = &app.settings.network_locations;
+    locations
+        .iter()
+        .position(|l| location_label(l) == label)
+        .ok_or_else(|| {
+            let shown: Vec<String> = locations.iter().map(location_label).collect();
+            format!("no network location labelled `{label}`; locations are {shown:?}")
+        })
 }
 
 /// Index of the pin whose display label is `label` (case-sensitive, as shown).

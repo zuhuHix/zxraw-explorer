@@ -22,6 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use forge_core::model::{MediaKind, ext_of, media_kind_for_ext};
+use forge_core::netpath::is_network_path;
+use forge_core::netpolicy::NETWORK_THUMB_WORKERS;
 use forge_jobs::{CancelToken, Priority, WorkerPool};
 use image::{DynamicImage, ImageDecoder, ImageReader, Limits, RgbaImage};
 use lru::LruCache;
@@ -87,6 +89,8 @@ pub struct ThumbConfig {
     pub cache_dir: Option<PathBuf>,
     /// Memory LRU budget in bytes.
     pub memory_budget_bytes: usize,
+    /// Workers for image thumbnails of local files. Images on network locations run in
+    /// their own pool of at most `forge_core::netpolicy::NETWORK_THUMB_WORKERS` workers.
     pub image_threads: usize,
     pub video_threads: usize,
     pub queue_capacity: usize,
@@ -277,6 +281,8 @@ pub struct ThumbnailService {
     inner: Arc<Inner>,
     rx: Receiver<ThumbResult>,
     image_pool: WorkerPool,
+    /// Image thumbnails of files on network locations (see `forge_core::netpolicy`).
+    network_pool: WorkerPool,
     video_pool: WorkerPool,
 }
 
@@ -290,6 +296,11 @@ impl ThumbnailService {
         }
         let ff = cfg.ff_tools.clone().unwrap_or_else(FfTools::discover);
         let image_pool = WorkerPool::new("thumb-image", cfg.image_threads, cfg.queue_capacity);
+        let network_pool = WorkerPool::new(
+            "thumb-network",
+            NETWORK_THUMB_WORKERS.min(cfg.image_threads),
+            cfg.queue_capacity,
+        );
         let video_pool = WorkerPool::new(
             "thumb-video",
             cfg.video_threads,
@@ -319,6 +330,7 @@ impl ThumbnailService {
             inner,
             rx,
             image_pool,
+            network_pool,
             video_pool,
         }
     }
@@ -344,7 +356,9 @@ impl ThumbnailService {
             g.token.cancel();
             g.token = CancelToken::new();
         }
-        let n = self.image_pool.clear_queue() + self.video_pool.clear_queue();
+        let n = self.image_pool.clear_queue()
+            + self.network_pool.clear_queue()
+            + self.video_pool.clear_queue();
         self.inner.cancelled.fetch_add(n as u64, Ordering::Relaxed);
         self.inner.inflight.lock().retain(|_, g| *g >= generation);
     }
@@ -393,6 +407,8 @@ impl ThumbnailService {
         let is_video = media_kind_for_ext(&ext_of(&req.path)) == MediaKind::Video;
         let pool = if is_video {
             &self.video_pool
+        } else if is_network_path(&req.path) {
+            &self.network_pool
         } else {
             &self.image_pool
         };
@@ -428,7 +444,7 @@ impl ThumbnailService {
     }
 
     pub fn is_idle(&self) -> bool {
-        self.image_pool.is_idle() && self.video_pool.is_idle()
+        self.image_pool.is_idle() && self.network_pool.is_idle() && self.video_pool.is_idle()
     }
 
     pub fn clear_memory(&self) {

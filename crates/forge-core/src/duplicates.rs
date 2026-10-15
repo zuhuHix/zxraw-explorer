@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::cloud::{background_read_allowed, is_online_only_metadata};
 use crate::error::{CoreError, Result};
 use crate::hashing::{self, Digest};
+use crate::netpath::is_network_path;
+use crate::netpolicy::{NETWORK_HASH_WORKERS, NETWORK_SCAN_WORKERS, pick_workers};
 use crate::ops::{JobCtx, NodeKind, OpIssue, WalkItem, node_kind, walk_tree};
 use crate::paths;
 
@@ -140,6 +142,8 @@ pub fn find_duplicates(
     ctx: &JobCtx<'_>,
 ) -> Result<DupReport> {
     let mut report = DupReport::default();
+    // Any network root makes the whole scan gentler: the stages mix files from all roots.
+    let network = roots.iter().any(|r| is_network_path(r));
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut errors = Vec::new();
@@ -189,16 +193,20 @@ pub fn find_duplicates(
         .into_iter()
         .flat_map(|(size, files)| files.into_iter().map(move |p| (size, p)))
         .collect();
-    let hashed = par_map(&items, io_threads(8), |(_, p)| {
-        if ctx.cancel.is_cancelled() {
-            return Err(CoreError::Cancelled);
-        }
-        // Checked live at the moment of reading: an online-only file would download.
-        if !background_read_allowed(p) {
-            return Ok(None);
-        }
-        hashing::partial_hash(p).map(Some)
-    });
+    let hashed = par_map(
+        &items,
+        pick_workers(network, io_threads(8), NETWORK_SCAN_WORKERS),
+        |(_, p)| {
+            if ctx.cancel.is_cancelled() {
+                return Err(CoreError::Cancelled);
+            }
+            // Checked live at the moment of reading: an online-only file would download.
+            if !background_read_allowed(p) {
+                return Ok(None);
+            }
+            hashing::partial_hash(p).map(Some)
+        },
+    );
     ctx.cancel.check()?;
     for ((size, p), r) in items.into_iter().zip(hashed) {
         match r {
@@ -226,12 +234,16 @@ pub fn find_duplicates(
         .flat_map(|((size, _), files)| files.into_iter().map(move |p| (size, p)))
         .collect();
     // Fewer threads here: these are full reads, and too many would thrash spinning disks.
-    let hashed = par_map(&items, io_threads(4), |(_, p)| {
-        if !background_read_allowed(p) {
-            return Ok(None);
-        }
-        hashing::hash_file(p, ctx.cancel, Some(ctx.progress)).map(Some)
-    });
+    let hashed = par_map(
+        &items,
+        pick_workers(network, io_threads(4), NETWORK_HASH_WORKERS),
+        |(_, p)| {
+            if !background_read_allowed(p) {
+                return Ok(None);
+            }
+            hashing::hash_file(p, ctx.cancel, Some(ctx.progress)).map(Some)
+        },
+    );
     for ((size, p), r) in items.into_iter().zip(hashed) {
         match r {
             Ok(Some(h)) => by_full.entry((size, h)).or_default().push(p),

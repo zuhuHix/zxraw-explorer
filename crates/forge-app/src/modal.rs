@@ -25,12 +25,20 @@ pub enum PromptKind {
     RenameLayout { index: usize },
     /// New label for a Quick access pin, by its path (see `sidebar`).
     RenamePin { path: PathBuf },
+    /// New name for a saved network location, by its path (see `sidebar::network`).
+    RenameNetworkLocation { path: PathBuf },
 }
 
 impl PromptKind {
     /// A label or name kept in settings rather than a file name on disk.
     pub fn is_label(&self) -> bool {
-        matches!(self, Self::SaveLayout | Self::RenameLayout { .. } | Self::RenamePin { .. })
+        matches!(
+            self,
+            Self::SaveLayout
+                | Self::RenameLayout { .. }
+                | Self::RenamePin { .. }
+                | Self::RenameNetworkLocation { .. }
+        )
     }
 }
 

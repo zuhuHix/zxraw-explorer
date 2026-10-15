@@ -225,6 +225,20 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   or a network-backed file stalls, the thumbnail worker waits, and closing the app waits for it.
 * Export-association previews are scanned by a single worker; a scan stuck on an unreachable
   network folder delays the previews queued behind it.
+* Network locations: there is no browsing of `\\` (no SMB discovery of servers or shares), no
+  mapping of drive letters, and no stored credentials; sign-in is Windows' own dialog. A
+  status check that has not answered after 10 s shows the location as offline; the check
+  itself keeps running in the OS until Windows gives up (often 20–60 s on an unreachable
+  host), and it holds one of the probe service's 3 network workers meanwhile.
+* *Connect…* on a mapped drive connects the drive's share without a letter; Windows then
+  reconnects the letter on its next use. A share already connected as another user fails
+  with Windows' "multiple connections" error until that connection is closed.
+* Network thumbnail and hashing work have no per-file timeout: a file that stalls on the
+  server holds one of the 2 network thumbnail workers (or the single full-hash worker)
+  until the OS call returns. Local folders are not affected because they use separate
+  workers.
+* Clicking a network location whose first check is still running opens it; the folder listing
+  then runs in the background and shows its own error if the share does not answer.
 * The copy path keeps the fault-injection reader used by the e2e "card pulled" tests in release
   builds. When not armed it costs one relaxed atomic load per read chunk.
 

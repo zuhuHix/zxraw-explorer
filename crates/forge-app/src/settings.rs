@@ -230,6 +230,10 @@ pub struct Settings {
     pub pins: Vec<Pin>,
     /// Saved tab layouts ("Save layout…"), in the order they were saved.
     pub layouts: Vec<Layout>,
+    /// Network shares saved to the sidebar's Network section, in display order. Only the
+    /// path and a name are kept: sign-in is left to Windows, which remembers credentials
+    /// itself if the user asks it to.
+    pub network_locations: Vec<NetworkLocation>,
     /// Reopen the previous session's tabs at startup (the behaviour before this was a
     /// setting, so it defaults to on).
     pub restore_session: bool,
@@ -278,6 +282,7 @@ impl Default for Settings {
             search_backend: "index".into(),
             pins: Vec::new(),
             layouts: Vec::new(),
+            network_locations: Vec::new(),
             restore_session: true,
             list_typing: ListTyping::Jump.into(),
             terminal: Default::default(),
@@ -311,6 +316,17 @@ pub struct Pin {
     pub label: Option<String>,
     /// Pinned as a file: a click opens it with its default app instead of navigating.
     pub file: bool,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// A network share (`\\server\share[\folder]`) saved to the sidebar's Network section.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NetworkLocation {
+    pub path: PathBuf,
+    /// Shown instead of the path when set.
+    pub name: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -613,6 +629,34 @@ mod tests {
         assert_eq!(saved["layouts"][0]["pinned"], true);
         assert_eq!(saved["layouts"][0]["tabs"][0]["zoom"], 2);
         assert_eq!(saved["theme"], "Light");
+    }
+
+    #[test]
+    fn network_locations_round_trip_with_unknown_fields() {
+        let json = r#"{
+            "network_locations": [
+                {"path": "\\\\nas\\photos", "name": "NAS", "protocol": "smb3"},
+                {"path": "\\\\192.168.1.10\\share\\sub"}
+            ],
+            "network_sort": "name"
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            settings.network_locations[0].path,
+            PathBuf::from(r"\\nas\photos")
+        );
+        assert_eq!(settings.network_locations[0].name.as_deref(), Some("NAS"));
+        assert_eq!(settings.network_locations[1].name, None);
+        let text = serde_json::to_string(&settings).unwrap();
+        let back: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.network_locations, settings.network_locations);
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(saved["network_locations"][0]["protocol"], "smb3");
+        assert_eq!(saved["network_locations"][1]["path"], r"\\192.168.1.10\share\sub");
+        assert_eq!(saved["network_sort"], "name");
+        // Older files have no network locations at all.
+        let old: Settings = serde_json::from_str(r#"{"theme": "Light"}"#).unwrap();
+        assert!(old.network_locations.is_empty());
     }
 
     #[test]

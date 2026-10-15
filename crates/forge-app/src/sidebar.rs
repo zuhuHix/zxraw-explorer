@@ -1,5 +1,7 @@
-//! Navigation sidebar: quick access (known folders and pins), collections, drives.
+//! Navigation sidebar: quick access (known folders and pins), collections, network
+//! locations, drives.
 
+pub mod network;
 mod pins;
 
 use std::collections::{HashMap, HashSet};
@@ -37,6 +39,10 @@ pub struct SidebarState {
     pub cards: CardWatch,
     /// Existence checks for Quick access pins.
     pub pins: PinWatch,
+    /// Saved network locations: status checks, the add dialog, "Connect…".
+    pub network: network::NetworkState,
+    /// Repaints the UI when a background result arrives.
+    pub ctx: egui::Context,
 }
 
 /// Watches removable drives for inserted cards and decides which ones get an import prompt.
@@ -163,6 +169,7 @@ impl SidebarState {
     pub fn new(ctx: egui::Context) -> Self {
         let drives: Arc<Mutex<Vec<Drive>>> = Arc::new(Mutex::new(Vec::new()));
         let d = drives.clone();
+        let repaint = ctx.clone();
         // Drive enumeration can stall on disconnected network drives; it lives on its own
         // thread and refreshes periodically to pick up inserted cards / USB drives.
         let _ = std::thread::Builder::new()
@@ -193,6 +200,8 @@ impl SidebarState {
             known: crate::platform::known_folders(),
             cards: CardWatch::default(),
             pins: PinWatch::default(),
+            network: network::NetworkState::default(),
+            ctx: repaint,
         }
     }
 }
@@ -254,6 +263,7 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
     app.sidebar
         .pins
         .tick(&app.settings.pins, &network_roots, ui.ctx());
+    network::tick(app, ui.ctx());
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -265,6 +275,9 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
 
             ui.add_space(6.0);
             collections_section(app, ui);
+
+            ui.add_space(6.0);
+            network::section(app, ui);
 
             ui.add_space(6.0);
             drives_section(app, ui);
@@ -526,7 +539,8 @@ fn collections_section(app: &mut ZxrawApp, ui: &mut Ui) {
 fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
     section(ui, "Drives");
     let drives = app.sidebar.drives.lock().clone();
-    for d in drives {
+    // Mapped network drives are listed in the Network section, with their status.
+    for d in drives.into_iter().filter(|d| d.kind != "Network") {
         let label = if d.label.is_empty() {
             format!("{} ({})", d.kind, d.root.display())
         } else {

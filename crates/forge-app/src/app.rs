@@ -547,6 +547,7 @@ impl ZxrawApp {
                 crate::sidebar::pin_paths(self, vec![(p, false)]);
             }
             PinToQuickAccess => crate::sidebar::pin_selection(self),
+            AddToNetwork => crate::sidebar::network::add_from_selection(self),
             SaveLayout | LoadLayout | ManageLayouts => crate::layouts::run(self, cmd),
             CopyPath => {
                 let t: Vec<String> = self

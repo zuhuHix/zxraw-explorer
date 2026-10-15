@@ -251,3 +251,43 @@ fn layout_whose_folders_are_all_missing_keeps_the_open_tabs() {
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
+
+#[test]
+fn network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737): never routable, so the share never answers and
+    // every check of it runs into the probe's timeout.
+    let script = format!(
+        "dismiss-notices\nnavigate {sandbox}\nui sidebar net\n\
+         ui sidebar net-add-fails \\\\nas\n\
+         ui sidebar net-add-fails C:\\photos\n\
+         ui sidebar net-add \\\\192.0.2.1\\x | Lab NAS\n\
+         ui sidebar net-add-fails //192.0.2.1/X/\n\
+         ui sidebar net Lab NAS\n\
+         ui sidebar responsive 30 | 1000\n\
+         ui sidebar wait-net-status Lab NAS offline | 60\n\
+         ui sidebar net-click Lab NAS\n\
+         assert-toast Lab NAS is offline or unreachable\n\
+         assert-path {sandbox}\n\
+         ui sidebar responsive 30 | 1000\n\
+         ui sidebar net-rename Lab NAS | Studio share\nui sidebar net Studio share\n\
+         exit\n",
+        sandbox = shown(sandbox.path()),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let saved = settings_json(&profile)["network_locations"].clone();
+    assert_eq!(saved[0]["path"], r"\\192.0.2.1\x", "{saved}");
+    assert_eq!(saved[0]["name"], "Studio share", "{saved}");
+
+    let second = "dismiss-notices\nui sidebar net Studio share\n\
+                  ui sidebar net-remove Studio share\nui sidebar net\nexit\n";
+    let outcome = run_app(sandbox.path(), &profile, second);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let saved = settings_json(&profile)["network_locations"].clone();
+    assert_eq!(saved.as_array().map(Vec::len), Some(0), "{saved}");
+}
