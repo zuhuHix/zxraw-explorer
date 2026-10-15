@@ -67,6 +67,30 @@ struct PendingSave {
     result: crossbeam_channel::Receiver<Result<(), String>>,
 }
 
+/// Picks up the answer to the draft's save in flight, if any.
+fn poll_draft(draft: &mut NotesDraft, ctx: &egui::Context) {
+    let Some(pending) = draft.saving.as_ref() else {
+        return;
+    };
+    match pending.result.try_recv() {
+        Ok(Ok(())) => {
+            draft.saved = pending.text.clone();
+            draft.saving = None;
+        }
+        Ok(Err(error)) => {
+            draft.error = Some(error);
+            draft.saving = None;
+        }
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            draft.error = Some("the library database is not available".into());
+            draft.saving = None;
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+}
+
 /// What the note's status line says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NoteStatus {
@@ -150,6 +174,10 @@ pub struct TagsUi {
     input: String,
     highlight: Option<usize>,
     notes: Option<NotesDraft>,
+    /// Drafts of files no longer selected whose save the database has not confirmed: in
+    /// flight, or failed. Dropped once confirmed; a failed one stays until it is saved (select
+    /// the file again to retry) and is kept in the recovery file at exit.
+    left_behind: HashMap<PathBuf, NotesDraft>,
     /// The frame the panel was last drawn in. A note left behind when the panel stops being
     /// drawn is saved by [`tick`].
     panel_frame: u64,
@@ -173,6 +201,7 @@ impl Default for TagsUi {
             input: String::new(),
             highlight: None,
             notes: None,
+            left_behind: HashMap::new(),
             panel_frame: 0,
             manage: ManageState::default(),
             tx,
@@ -433,8 +462,20 @@ impl TagsUi {
             return;
         }
         self.save_notes(library, ctx);
-        self.notes = None;
-        let (Some(path), Some(cache)) = (want, self.cache.as_ref()) else {
+        if let Some(draft) = self.notes.take()
+            && unconfirmed_note(&draft).is_some()
+        {
+            self.left_behind.insert(draft.path.clone(), draft);
+        }
+        let Some(path) = want else {
+            return;
+        };
+        // Back on a file whose save is unconfirmed: show that draft, not the database text.
+        if let Some(draft) = self.left_behind.remove(&path) {
+            self.notes = Some(draft);
+            return;
+        }
+        let Some(cache) = self.cache.as_ref() else {
             return;
         };
         let Some(files) = cache.files.as_ref() else {
@@ -464,6 +505,22 @@ impl TagsUi {
         {
             draft.path = to;
         }
+        let moved: Vec<(PathBuf, PathBuf)> = self
+            .left_behind
+            .keys()
+            .filter_map(|path| moved_by(path, pairs).map(|to| (path.clone(), to)))
+            .collect();
+        let taken: Vec<NotesDraft> = moved
+            .into_iter()
+            .filter_map(|(from, to)| {
+                let mut draft = self.left_behind.remove(&from)?;
+                draft.path = to;
+                Some(draft)
+            })
+            .collect();
+        for draft in taken {
+            self.left_behind.insert(draft.path.clone(), draft);
+        }
         if let Some(cache) = self.cache.as_mut() {
             for path in cache.paths.iter_mut() {
                 if let Some(to) = moved_by(path, pairs) {
@@ -478,32 +535,43 @@ impl TagsUi {
         }
     }
 
-    /// Picks up the answer to a save in flight: `saved` moves only once the database
-    /// confirms the write.
+    /// Picks up the answers to saves in flight, for the open draft and the drafts left behind:
+    /// `saved` moves only once the database confirms the write. A left-behind draft is dropped
+    /// once confirmed and kept when its save failed.
     fn poll_note_save(&mut self, ctx: &egui::Context) {
-        let Some(draft) = self.notes.as_mut() else {
-            return;
-        };
-        let Some(pending) = draft.saving.as_ref() else {
-            return;
-        };
-        match pending.result.try_recv() {
-            Ok(Ok(())) => {
-                draft.saved = pending.text.clone();
-                draft.saving = None;
-            }
-            Ok(Err(error)) => {
-                draft.error = Some(error);
-                draft.saving = None;
-            }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                draft.error = Some("the library database is not available".into());
-                draft.saving = None;
-            }
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                ctx.request_repaint_after(Duration::from_millis(50));
-            }
+        if let Some(draft) = self.notes.as_mut() {
+            poll_draft(draft, ctx);
         }
+        self.left_behind.retain(|path, draft| {
+            let was_saving = draft.saving.is_some();
+            poll_draft(draft, ctx);
+            if was_saving && let (None, Some(error)) = (&draft.saving, &draft.error) {
+                tracing::warn!(path = %path.display(), "a note could not be saved: {error}");
+            }
+            unconfirmed_note(draft).is_some()
+        });
+    }
+
+    /// Notes of files no longer selected that could not be saved, for the panel to report.
+    fn failed_left_behind(&self) -> Vec<(&Path, &str)> {
+        let mut failed: Vec<(&Path, &str)> = self
+            .left_behind
+            .values()
+            .filter(|d| d.saving.is_none())
+            .filter_map(|d| d.error.as_deref().map(|e| (d.path.as_path(), e)))
+            .collect();
+        failed.sort();
+        failed
+    }
+
+    /// Every note the database has not confirmed, the open draft last so it wins for its path.
+    fn unconfirmed_notes(&self) -> Vec<crate::library::PendingNote> {
+        let mut left: Vec<&NotesDraft> = self.left_behind.values().collect();
+        left.sort_by(|a, b| a.path.cmp(&b.path));
+        left.into_iter()
+            .chain(self.notes.as_ref())
+            .filter_map(unconfirmed_note)
+            .collect()
     }
 
     fn save_notes(&mut self, library: &mut Library, ctx: &egui::Context) {
@@ -638,9 +706,9 @@ pub fn save_note_now(app: &mut ZxrawApp) {
     app.ops.tags_ui.save_notes(&mut app.ops.library, &ctx);
 }
 
-/// At exit: saves an unsaved note and waits for the library writer to confirm it. A note the
-/// database has not confirmed by then is written to the recovery file and saved at the next
-/// start.
+/// At exit: saves an unsaved note and waits for the library writer to confirm it and every
+/// earlier save. Each note the database has not confirmed by then (the open draft and the
+/// drafts left behind) is written to the recovery file and saved at the next start.
 pub fn flush_for_exit(app: &mut ZxrawApp) {
     let ctx = app.ops.ctx.clone();
     let st = &mut app.ops.tags_ui;
@@ -649,13 +717,18 @@ pub fn flush_for_exit(app: &mut ZxrawApp) {
         tracing::warn!("the library writer did not finish before exit");
     }
     st.poll_note_save(&ctx);
-    let Some(pending) = st.notes.as_ref().and_then(unconfirmed_note) else {
+    let pending = st.unconfirmed_notes();
+    if pending.is_empty() {
         return;
-    };
+    }
     let file = app.ops.library.notes_recovery_path().to_path_buf();
-    match crate::library::write_note_recovery(&file, &[pending]) {
-        Ok(()) => tracing::warn!("an unsaved note was kept in {}", file.display()),
-        Err(e) => tracing::error!("could not keep an unsaved note in {}: {e}", file.display()),
+    match crate::library::write_note_recovery(&file, &pending) {
+        Ok(()) => tracing::warn!(
+            "{} unsaved note(s) kept in {}",
+            pending.len(),
+            file.display()
+        ),
+        Err(e) => tracing::error!("could not keep unsaved notes in {}: {e}", file.display()),
     }
 }
 
@@ -665,6 +738,25 @@ fn unconfirmed_note(draft: &NotesDraft) -> Option<crate::library::PendingNote> {
         path: draft.path.clone(),
         note: Some(draft.text.trim().to_string()).filter(|n| !n.is_empty()),
     })
+}
+
+/// Notes of other files whose save failed: kept, and named so they can be selected and retried.
+fn show_failed_left_behind(st: &TagsUi, ui: &mut Ui) {
+    for (path, error) in st.failed_left_behind() {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        ui.label(
+            RichText::new(format!("Note on {name} not saved"))
+                .small()
+                .color(ui.visuals().error_fg_color),
+        )
+        .on_hover_text(format!(
+            "The note on {} could not be saved: {error}\nIt is kept until it is saved. Select the file to try again.",
+            path.display()
+        ));
+    }
 }
 
 pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
@@ -874,6 +966,7 @@ Edit it or leave the field to try again."
                 },
             );
         });
+        show_failed_left_behind(st, ui);
         let mut lost_focus = false;
         match st.notes.as_mut() {
             Some(draft) => {
@@ -922,6 +1015,7 @@ Edit it or leave the field to try again."
         }
     } else {
         ui.label(RichText::new("Note").weak());
+        show_failed_left_behind(st, ui);
         ui.label(
             RichText::new("Select one file to edit its notes.")
                 .weak()
@@ -1261,6 +1355,84 @@ mod tests {
         assert!(db.file_id(&old).unwrap().is_none());
         drop(library);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_save_after_switching_files_keeps_the_draft_for_recovery() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        let (save, answer) = pending("client proof");
+        st.notes = Some(NotesDraft {
+            saving: Some(save),
+            ..draft("client proof", "", None)
+        });
+        // The selection moves on while the save is in flight.
+        let mut library = crate::library::test_library(std::sync::Arc::new(
+            forge_db::Db::open_in_memory().unwrap(),
+        ));
+        st.cache = Some(Selected {
+            paths: vec![b.clone()],
+            files: Some(vec![(b.clone(), Annotation::default())]),
+        });
+        st.sync_notes(&mut library, &ctx);
+        assert_eq!(st.notes.as_ref().unwrap().path, b);
+        assert!(st.left_behind.contains_key(&a));
+
+        answer.send(Err("disk full".into())).unwrap();
+        st.poll_note_save(&ctx);
+        assert_eq!(st.failed_left_behind(), vec![(a.as_path(), "disk full")]);
+        // It goes into the recovery file at exit, alongside the open draft.
+        st.notes.as_mut().unwrap().text = "second".into();
+        let kept = st.unconfirmed_notes();
+        assert_eq!(
+            kept,
+            vec![
+                crate::library::PendingNote {
+                    path: a.clone(),
+                    note: Some("client proof".into()),
+                },
+                crate::library::PendingNote {
+                    path: b.clone(),
+                    note: Some("second".into()),
+                },
+            ]
+        );
+        // Selecting the file again brings the unsaved text back, marked as not saved.
+        st.notes.as_mut().unwrap().text.clear();
+        st.cache = Some(Selected {
+            paths: vec![a.clone()],
+            files: Some(vec![(a.clone(), Annotation::default())]),
+        });
+        st.sync_notes(&mut library, &ctx);
+        let d = st.notes.as_ref().unwrap();
+        assert_eq!(d.text, "client proof");
+        assert_eq!(note_status(d), NoteStatus::Failed("disk full".into()));
+        assert!(st.left_behind.is_empty());
+    }
+
+    #[test]
+    fn a_left_behind_draft_is_dropped_once_confirmed_and_follows_moves() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let (save, answer) = pending("x");
+        st.left_behind.insert(
+            PathBuf::from("a.jpg"),
+            NotesDraft {
+                saving: Some(save),
+                ..draft("x", "", None)
+            },
+        );
+        st.follow_moves(&[(PathBuf::from("a.jpg"), PathBuf::from("b.jpg"))]);
+        assert_eq!(
+            st.left_behind[&PathBuf::from("b.jpg")].path,
+            PathBuf::from("b.jpg")
+        );
+        st.poll_note_save(&ctx);
+        assert_eq!(st.left_behind.len(), 1, "still in flight");
+        answer.send(Ok(())).unwrap();
+        st.poll_note_save(&ctx);
+        assert!(st.left_behind.is_empty());
     }
 
     #[test]
