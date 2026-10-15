@@ -42,16 +42,20 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   (256 KB and 4,096 patterns each, 4 MB and 20,000 patterns together), `packed-refs` (16 MB),
   packs (256 packs, 256 MB of indexes, 16 GB per pack), objects (32 MB each, 512 MB
   inflated and 512 MB compressed in all) or staged changes (200,000, or 64 MB of paths). Nor
-  do they on a share or mapped network drive, below a junction or symlink anywhere in the
-  folder's own path (it is reached from the drive's root without following links), inside
+  do they on a share, a mapped network drive or a SUBST drive (an alias for a folder path,
+  which could hold links), below a junction or symlink anywhere in the folder's own path (it
+  is reached from the drive's root without following links), inside
   OneDrive or another cloud-synced folder, nor submodules and linked worktrees (a
   `.git` file could name any place, so `.git` must be a real folder), nor repositories with a
   link or a hard-linked file anywhere among the Git files read (so clones made from a local
   path, whose objects Git hard-links, show none), a work tree or `core.excludesFile` outside the
   folder, any `objects/info/alternates` entry (so `git clone --shared` clones show none), a
-  split index, or SHA-256 objects. A shallow or partial clone missing `HEAD`'s objects shows
+  split index, SHA-256 objects, or an index with a path over 4 KB or 256 folders deep, or a
+  cached tree deeper than 256 levels. A shallow or partial clone missing `HEAD`'s objects shows
   no staged changes. A repository nested inside another, untracked one is shown as a plain
-  new folder. Online-only `.gitignore` files inside a repository are skipped, not downloaded.
+  new folder. Nothing is opened before its folder's listing says it is not a cloud
+  placeholder: an online-only Git file makes the repository show no badges, an online-only
+  `.gitignore` is skipped and an online-only folder is not entered (nothing is downloaded).
 * The Git scan opens nothing by path but the root of a local drive; everything else is reached
   one name at a time without following links. A hard-linked tracked file whose time changed
   counts as modified (it is never read). The symlink-to-share tests need developer mode and

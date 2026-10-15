@@ -194,10 +194,11 @@ fn find_in(located: &Located, over: &dyn Fn() -> bool) -> Result<Option<PathBuf>
         if over() {
             return Err(Failure::TooBig);
         }
-        let found = match located.fs.dir(level, ".git") {
+        // Only listed, never opened: a `.git` file, link or placeholder still marks a
+        // repository, which the scan then refuses.
+        let found = match located.fs.lookup(level, ".git") {
             Ok(_) => true,
             Err(safe_fs::Error::NotFound | safe_fs::Error::Io(_)) => false,
-            // A file, link or placeholder named `.git`: a repository the scan will refuse.
             Err(_) => true,
         };
         if found {
@@ -246,7 +247,7 @@ fn locate(dir: &Path, record: bool, over: &dyn Fn() -> bool) -> Result<Located, 
         if over() {
             return Err(Failure::TooBig);
         }
-        let next = fs.dir(levels.last().unwrap(), name).map_err(meta)?;
+        let next = fs.dir_named(levels.last().unwrap(), name).map_err(meta)?;
         at.push(name);
         attributes.insert(at.clone(), (next.info.attributes, 0));
         levels.push(next);
@@ -789,7 +790,7 @@ fn scan(
     limits: Limits,
     over: &dyn Fn() -> bool,
 ) -> Result<RepoStatus, Failure> {
-    let git = fs.dir(top, ".git").map_err(meta)?;
+    let git = fs.dir_named(top, ".git").map_err(meta)?;
     let read = |rel: &str| fs.read_opt(&git, rel, MAX_META_BYTES).map_err(meta);
     if read("commondir")?.is_some() {
         return Err(Failure::Unsafe);
@@ -814,13 +815,14 @@ fn scan(
         .map(|name| name.trim())
         .map(|name| name.strip_prefix("refs/heads/").unwrap_or(name).to_string());
 
-    let (index, index_mtime) = match fs.file(&git, "index") {
+    let (index, index_mtime) = match fs.file_named(&git, "index") {
         Ok(file) => {
             if file.info.size > limits.index_bytes {
                 return Err(Failure::TooBig);
             }
             let mtime = file.info.mtime;
             let bytes = file.read_capped(limits.index_bytes).map_err(meta)?;
+            let bytes = sanitize_index(&bytes, limits, over)?;
             let options = gix::index::decode::Options {
                 thread_limit: Some(1),
                 alloc_limit_bytes: Some(4 * limits.index_bytes as usize),
@@ -879,7 +881,7 @@ fn scan(
     }
 
     // Staged changes: the index against HEAD's tree.
-    let objects = match fs.dir(&git, "objects") {
+    let objects = match fs.dir_named(&git, "objects") {
         Ok(dir) => Some(dir),
         Err(safe_fs::Error::NotFound) => None,
         Err(e) => return Err(meta(e)),
@@ -972,6 +974,204 @@ fn check_config(bytes: &[u8], root: &Path) -> Result<Option<String>, Failure> {
     Ok(excludes)
 }
 
+/// Checks the raw index before gix decodes it, iteratively and within the caps, and returns
+/// it with only the parts the scan uses: the entries and the cached-tree extension.
+///
+/// An index is attacker-controlled. Refused as too big: more than `index_entries` entries, a
+/// path over `path_bytes` or deeper than [`MAX_DEPTH`] folders, a cached tree deeper than
+/// that (gix decodes it recursively, so a deep one would exhaust the stack), with more nodes
+/// than entries allow or whose paths add up to more than `staged_bytes`. Refused as unsafe: a
+/// split index (`link`). Other optional extensions are dropped unread.
+fn sanitize_index(
+    data: &[u8],
+    limits: Limits,
+    over: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, Failure> {
+    const HASH: usize = 20;
+    let bad = || Failure::Error("damaged index".into());
+    let be32 = |at: usize| u32::from_be_bytes(data[at..at + 4].try_into().unwrap());
+    if data.len() < 12 + HASH || &data[..4] != b"DIRC" {
+        return Err(bad());
+    }
+    let version = be32(4);
+    if !(2..=4).contains(&version) {
+        return Err(bad());
+    }
+    let count = be32(8) as usize;
+    if count > limits.index_entries {
+        return Err(Failure::TooBig);
+    }
+    let end = data.len() - HASH;
+    let check = |path: &[u8]| {
+        if path.len() > limits.path_bytes || path.iter().filter(|&&b| b == b'/').count() > MAX_DEPTH
+        {
+            Err(Failure::TooBig)
+        } else {
+            Ok(())
+        }
+    };
+    let mut pos = 12;
+    let mut prev: Vec<u8> = Vec::new();
+    for i in 0..count {
+        if i % 1024 == 0 && over() {
+            return Err(Failure::TooBig);
+        }
+        let mut at = pos + 62;
+        if at > end {
+            return Err(bad());
+        }
+        let flags = u16::from_be_bytes([data[pos + 60], data[pos + 61]]);
+        if flags & 0x4000 != 0 {
+            if version < 3 {
+                return Err(bad());
+            }
+            at += 2;
+        }
+        let nul = |from: usize| {
+            data.get(from..end)
+                .and_then(|rest| rest.iter().position(|&b| b == 0))
+                .ok_or_else(bad)
+        };
+        if version == 4 {
+            // The path is the previous one less `strip` bytes, then a NUL-terminated suffix.
+            let (strip, used) = v4_varint(data.get(at..end).ok_or_else(bad)?).ok_or_else(bad)?;
+            at += used;
+            let len = nul(at)?;
+            if strip > prev.len() || len > limits.path_bytes {
+                return Err(if strip > prev.len() {
+                    bad()
+                } else {
+                    Failure::TooBig
+                });
+            }
+            prev.truncate(prev.len() - strip);
+            prev.extend_from_slice(&data[at..at + len]);
+            check(&prev)?;
+            pos = at + len + 1;
+        } else {
+            let len = nul(at)?;
+            check(&data[at..at + len])?;
+            // Entries are padded with 1 to 8 NULs to a multiple of 8 bytes.
+            pos += ((at - pos) + len + 8) & !7;
+            if pos > end {
+                return Err(bad());
+            }
+        }
+    }
+    let mut out = data[..pos].to_vec();
+    while pos + 8 <= end {
+        let signature = &data[pos..pos + 4];
+        let body_end = (pos + 8)
+            .checked_add(be32(pos + 4) as usize)
+            .filter(|&e| e <= end)
+            .ok_or_else(bad)?;
+        match signature {
+            b"TREE" => {
+                check_cached_tree(&data[pos + 8..body_end], limits, over)?;
+                out.extend_from_slice(&data[pos..body_end]);
+            }
+            b"link" => return Err(Failure::Unsafe),
+            // Other mandatory extensions are left for gix to refuse or handle (`sdir`).
+            mandatory if mandatory[0].is_ascii_lowercase() => {
+                out.extend_from_slice(&data[pos..body_end]);
+            }
+            _ => {}
+        }
+        pos = body_end;
+    }
+    // A null checksum: gix does not verify one it was not asked to.
+    out.extend_from_slice(&[0; HASH]);
+    Ok(out)
+}
+
+/// Git's variable-length integer of index version 4: the value and the bytes it took.
+fn v4_varint(data: &[u8]) -> Option<(usize, usize)> {
+    let mut used = 0;
+    let mut byte = *data.get(used)?;
+    used += 1;
+    let mut value = usize::from(byte & 0x7f);
+    while byte & 0x80 != 0 {
+        byte = *data.get(used)?;
+        used += 1;
+        value = value.checked_add(1)?.checked_mul(128)? | usize::from(byte & 0x7f);
+    }
+    Some((value, used))
+}
+
+/// Checks the cached-tree extension (`TREE`) without recursion: depth, path lengths and node
+/// count within the caps, and well formed. Each node is `name NUL count SP subtrees LF`, then
+/// an object id if `count` is not negative, then its subtrees.
+fn check_cached_tree(body: &[u8], limits: Limits, over: &dyn Fn() -> bool) -> Result<(), Failure> {
+    let bad = || Failure::Error("damaged cached tree".into());
+    let max_nodes = limits.index_entries.saturating_mul(2) + 1;
+    // Subtrees still to come, and the path length, of each open node.
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+    let mut nodes = 0usize;
+    let mut path_total = 0usize;
+    loop {
+        if nodes % 1024 == 0 && over() {
+            return Err(Failure::TooBig);
+        }
+        let upto = |from: usize, byte: u8| {
+            body.get(from..)
+                .and_then(|rest| rest.iter().position(|&b| b == byte))
+                .map(|n| from + n)
+                .ok_or_else(bad)
+        };
+        let start = pos;
+        let name_end = upto(pos, 0)?;
+        let count_end = upto(name_end + 1, b' ')?;
+        let subtrees_end = upto(count_end + 1, b'\n')?;
+        let text = |a: usize, b: usize| std::str::from_utf8(&body[a..b]).map_err(|_| bad());
+        let count: i64 = text(name_end + 1, count_end)?.parse().map_err(|_| bad())?;
+        let subtrees: usize = text(count_end + 1, subtrees_end)?
+            .parse()
+            .map_err(|_| bad())?;
+        pos = subtrees_end + 1;
+        if count >= 0 {
+            pos += 20;
+            if pos > body.len() {
+                return Err(bad());
+            }
+        }
+        nodes += 1;
+        // The root has no name; every other node adds `name/` to its parent's path.
+        let path_len = match open.last() {
+            None => 0,
+            Some(&(_, parent)) => parent + (name_end - start) + 1,
+        };
+        path_total += path_len;
+        if nodes > max_nodes
+            || path_len > limits.path_bytes
+            || path_total > limits.staged_bytes
+            || subtrees > body.len()
+        {
+            return Err(Failure::TooBig);
+        }
+        if subtrees > 0 {
+            if open.len() >= MAX_DEPTH {
+                return Err(Failure::TooBig);
+            }
+            open.push((subtrees, path_len));
+            continue;
+        }
+        // This node is complete, and so is every parent whose last subtree it was.
+        loop {
+            match open.last_mut() {
+                None => return Ok(()),
+                Some(top) => {
+                    top.0 -= 1;
+                    if top.0 > 0 {
+                        break;
+                    }
+                    open.pop();
+                }
+            }
+        }
+    }
+}
+
 /// The commit `HEAD` points at, following at most a few symbolic refs, each opened through the
 /// safe layer. `None` for an unborn branch.
 fn head_commit(
@@ -1043,6 +1243,10 @@ fn staged_changes(
     if let Some(root) = index.tree() {
         let mut stack = vec![(Vec::new(), root)];
         while let Some((prefix, node)) = stack.pop() {
+            // Bounded by `sanitize_index`; the deadline still applies.
+            if over() {
+                return Err(odb::OdbError::TooBig);
+            }
             if node.num_entries.is_some() {
                 cached.insert(prefix.clone(), node.id);
             }
@@ -1230,10 +1434,16 @@ impl Ignores {
         Ok(())
     }
 
-    /// Pushes the `.gitignore` of folder `dir` (at `rel`), if it has one. Returns whether it
-    /// did. A linked `.gitignore` is not followed, as Git does not.
-    fn push(&mut self, fs: &Fs, dir: &Dir, rel: &str) -> Result<bool, Failure> {
-        match fs.file(dir, ".gitignore") {
+    /// Pushes `.gitignore` file `entry`, listed in folder `dir` (at `rel`). Returns whether it
+    /// did. A linked or online-only `.gitignore` is not read (Git does not follow links either).
+    fn push(
+        &mut self,
+        fs: &Fs,
+        dir: &Dir,
+        entry: &safe_fs::Entry,
+        rel: &str,
+    ) -> Result<bool, Failure> {
+        match fs.file(dir, entry) {
             Ok(file) => match self.parse(file, rel)? {
                 Some(list) => {
                     self.dirs.push(list);
@@ -1293,8 +1503,14 @@ const MAX_HASHED_BYTES: u64 = 16 * 1024 * 1024;
 /// no filter or line-ending conversion, so a filtered file may count as changed, never the
 /// reverse. An online-only file is never read, which would download it; it counts as changed.
 /// `path` is only used to look up simulated placeholders in tests.
-fn same_as_blob(fs: &Fs, dir: &Dir, name: &str, path: &Path, id: &gix::ObjectId) -> bool {
-    let Ok(file) = fs.file(dir, name) else {
+fn same_as_blob(
+    fs: &Fs,
+    dir: &Dir,
+    entry: &safe_fs::Entry,
+    path: &Path,
+    id: &gix::ObjectId,
+) -> bool {
+    let Ok(file) = fs.file(dir, entry) else {
         return false;
     };
     if file.info.size > MAX_HASHED_BYTES
@@ -1330,8 +1546,9 @@ struct Walker<'a> {
     index_mtime: i64,
     /// Index entries by lowercase path (several when conflicted).
     tracked: HashMap<String, Vec<usize>>,
-    /// Lowercase folders, without a trailing `/`, that hold tracked entries.
-    tracked_dirs: HashSet<String>,
+    /// Lowercase index paths, sorted, to tell whether a folder holds tracked entries without
+    /// storing every folder prefix of every path.
+    sorted: Vec<String>,
     /// Index entries whose file was found and compared.
     checked: Vec<bool>,
     ignores: Ignores,
@@ -1355,21 +1572,19 @@ impl<'a> Walker<'a> {
         over: &'a dyn Fn() -> bool,
     ) -> Self {
         let mut tracked: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut tracked_dirs = HashSet::new();
         for (i, entry) in index.entries().iter().enumerate() {
             let path = entry.path(index).to_string().to_lowercase();
-            for (at, _) in path.match_indices('/') {
-                tracked_dirs.insert(path[..at].to_string());
-            }
             tracked.entry(path).or_default().push(i);
         }
+        let mut sorted: Vec<String> = tracked.keys().cloned().collect();
+        sorted.sort_unstable();
         Walker {
             fs,
             root,
             index,
             index_mtime,
             tracked,
-            tracked_dirs,
+            sorted,
             checked: vec![false; index.entries().len()],
             ignores,
             status,
@@ -1378,6 +1593,15 @@ impl<'a> Walker<'a> {
             hashed: 0,
             over,
         }
+    }
+
+    /// Does lowercase folder path `key` hold tracked entries?
+    fn holds_tracked(&self, key: &str) -> bool {
+        let prefix = format!("{key}/");
+        let at = self
+            .sorted
+            .partition_point(|p| p.as_str() < prefix.as_str());
+        self.sorted.get(at).is_some_and(|p| p.starts_with(&prefix))
     }
 
     /// Walks folder `dir` at root-relative `rel` (empty, or ending in `/`). Inside an ignored
@@ -1401,14 +1625,13 @@ impl<'a> Walker<'a> {
         // either), and never an online-only file, which opening could download.
         let gitignore = entries
             .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(".gitignore"));
-        let pushed = !ignored
-            && gitignore.is_some_and(|e| {
-                !e.info.is_dir()
-                    && !e.info.is_link()
-                    && !forge_core::cloud::is_online_only_attrs(e.info.attributes)
-            })
-            && self.ignores.push(self.fs, dir, rel)?;
+            .find(|e| e.name.eq_ignore_ascii_case(".gitignore"))
+            .filter(|e| !e.info.is_dir() && !e.info.is_link() && !e.is_placeholder())
+            .cloned();
+        let pushed = match &gitignore {
+            Some(e) if !ignored => self.ignores.push(self.fs, dir, e, rel)?,
+            _ => false,
+        };
         for entry in entries {
             if entry.name.eq_ignore_ascii_case(".git") {
                 continue;
@@ -1420,14 +1643,13 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let link = entry.info.is_link();
-            if entry.info.is_dir() && forge_core::cloud::is_online_only_attrs(entry.info.attributes)
-            {
+            if entry.info.is_dir() && entry.is_placeholder() {
                 // An online-only folder is never opened; anything tracked below counts as
                 // modified.
                 continue;
             }
             if entry.info.is_dir() && !link {
-                let has_tracked = self.tracked_dirs.contains(&key);
+                let has_tracked = self.holds_tracked(&key);
                 let is_ignored = ignored || self.ignores.ignored(&path, true);
                 if !has_tracked && is_ignored {
                     self.status.add(&format!("{path}/"), GitBadge::Ignored);
@@ -1435,7 +1657,7 @@ impl<'a> Walker<'a> {
                 }
                 // Changed since listed, not openable (access denied) or not safely: skipped,
                 // and whatever is tracked below counts as modified.
-                if let Ok(sub) = self.fs.dir(dir, &entry.name) {
+                if let Ok(sub) = self.fs.dir(dir, &entry) {
                     self.walk(&sub, &format!("{path}/"), is_ignored, depth + 1)?;
                 }
             } else {
@@ -1503,7 +1725,7 @@ impl<'a> Walker<'a> {
         if info.is_link()
             || forge_core::cloud::is_online_only_attrs(info.attributes)
             || self.hashed > MAX_HASHED_FILES
-            || !same_as_blob(self.fs, dir, &entry.name, &abs, &e.id)
+            || !same_as_blob(self.fs, dir, entry, &abs, &e.id)
         {
             self.status.add(path, GitBadge::Modified);
         }
@@ -2547,10 +2769,11 @@ mod tests {
         let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, b"same\n")
             .unwrap();
         let (fs, top) = fs_at(tmp.path(), false);
-        assert!(same_as_blob(&fs, &top, "f.txt", &path, &id));
+        let entry = fs.lookup(&top, "f.txt").unwrap();
+        assert!(same_as_blob(&fs, &top, &entry, &path, &id));
         forge_core::cloud::simulate_online_only(path.clone());
         assert!(
-            !same_as_blob(&fs, &top, "f.txt", &path, &id),
+            !same_as_blob(&fs, &top, &entry, &path, &id),
             "an online-only file was read"
         );
         forge_core::cloud::clear_simulated_online_only(&path);
@@ -2764,16 +2987,20 @@ mod tests {
         std::fs::write(outside.path().join("f.txt"), "outside").unwrap();
 
         let (fs, top) = fs_at(&root, true);
-        let a = fs.dir(&top, "a").unwrap();
+        let a = fs.dir_named(&top, "a").unwrap();
         std::fs::rename(root.join("a"), root.join("moved")).unwrap();
         if !junction(&root.join("a"), outside.path()) {
             eprintln!("skipped: could not create a junction");
             return;
         }
-        let read = fs.file(&a, "f.txt").unwrap().read_capped(100).unwrap();
+        let read = fs
+            .file_named(&a, "f.txt")
+            .unwrap()
+            .read_capped(100)
+            .unwrap();
         assert_eq!(read, b"original");
-        assert_eq!(fs.dir(&top, "a").err(), Some(safe_fs::Error::Link));
-        assert_eq!(fs.file(&top, "a").err(), Some(safe_fs::Error::WrongKind));
+        assert_eq!(fs.dir_named(&top, "a").err(), Some(safe_fs::Error::Link));
+        assert_eq!(fs.file_named(&top, "a").err(), Some(safe_fs::Error::Link));
         assert_eq!(
             fs.file_at(&top, "a/f.txt").err(),
             Some(safe_fs::Error::Link)
@@ -2782,12 +3009,12 @@ mod tests {
 
         // A held folder moved out of the root is refused from then on.
         std::fs::rename(root.join("moved"), tmp.path().join("gone")).unwrap();
-        assert_eq!(fs.file(&a, "f.txt").err(), Some(safe_fs::Error::Link));
+        assert_eq!(fs.file_named(&a, "f.txt").err(), Some(safe_fs::Error::Link));
 
         // Names that are not one plain component are never passed to the system.
         for bad in ["..", ".", "a/b", r"a\b", "f.txt:stream", ""] {
             assert_eq!(
-                fs.file(&top, bad).err(),
+                fs.file_named(&top, bad).err(),
                 Some(safe_fs::Error::BadName),
                 "{bad}"
             );
@@ -2956,10 +3183,10 @@ mod tests {
         let (fs, top) = fs_at(tmp.path(), false);
         std::fs::hard_link(&theirs, tmp.path().join("linked.txt")).unwrap();
         assert_eq!(
-            fs.file(&top, "linked.txt").err(),
+            fs.file_named(&top, "linked.txt").err(),
             Some(safe_fs::Error::Link)
         );
-        assert!(fs.file(&top, "a.txt").is_ok());
+        assert!(fs.file_named(&top, "a.txt").is_ok());
     }
 
     /// Review item 5: every relative open asks not to follow links, and every file open not
@@ -2974,5 +3201,274 @@ mod tests {
             safe_fs::create_options(true).0 & FILE_OPEN_REPARSE_POINT.0,
             0
         );
+    }
+
+    /// Review r2 item 1: a SUBST drive is an alias for a folder path, which could hold links;
+    /// it is refused before anything is opened.
+    #[test]
+    fn subst_drives_are_refused() {
+        assert!(safe_fs::is_volume_device(r"\Device\HarddiskVolume3"));
+        assert!(safe_fs::is_volume_device(r"\Device\CdRom0"));
+        for target in [
+            r"\??\C:\some\folder",
+            r"\??\UNC\server\share",
+            r"\Device\LanmanRedirector\;Z:0000000000012345\server\share",
+            r"\Device\Mup\server\share",
+            r"\Device\WebDavRedirector\x",
+            r"\Device\HarddiskVolume3\folder",
+            r"\Device\",
+            "",
+        ] {
+            assert!(!safe_fs::is_volume_device(target), "{target}");
+        }
+        assert!(safe_fs::is_volume_root(
+            r"\\?\Volume{0b5e2f9a-1c2d-4e5f-8a9b-0c1d2e3f4a5b}\"
+        ));
+        for path in [
+            r"\\?\Volume{0b5e2f9a-1c2d-4e5f-8a9b-0c1d2e3f4a5b}\folder",
+            r"\\?\Volume{0b5e2f9a}\folder\",
+            r"\\?\C:\",
+            r"\\?\UNC\server\share\",
+        ] {
+            assert!(!safe_fs::is_volume_root(path), "{path}");
+        }
+        // The system drive is a volume.
+        assert_eq!(safe_fs::local_drive(Path::new(r"C:\Windows")), Some('C'));
+
+        // A real SUBST drive (needs no rights), removed again however the test ends.
+        let Some(letter) = ('G'..='Y')
+            .rev()
+            .find(|d| !Path::new(&format!(r"{d}:\")).exists())
+        else {
+            eprintln!("skipped: no free drive letter");
+            return;
+        };
+        let Some(repo) = fixture_repo() else { return };
+        struct Subst(char);
+        impl Drop for Subst {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("subst")
+                    .arg(format!("{}:", self.0))
+                    .arg("/D")
+                    .status();
+            }
+        }
+        let made = std::process::Command::new("subst")
+            .arg(format!("{letter}:"))
+            .arg(repo.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("skipped: could not create a SUBST drive");
+            return;
+        }
+        let _guard = Subst(letter);
+        let drive = PathBuf::from(format!(r"{letter}:\"));
+        assert!(drive.join(".git").exists(), "SUBST drive works");
+        assert_eq!(safe_fs::local_drive(&drive), None);
+        let never = || false;
+        let before = safe_fs::PATH_OPENS.with(|n| n.get());
+        assert_eq!(find_repo_root(&drive, &never).unwrap_err(), Failure::Unsafe);
+        assert_eq!(open_root(&drive, true, &never).err(), Some(Failure::Unsafe));
+        assert_eq!(
+            safe_fs::PATH_OPENS.with(|n| n.get()),
+            before,
+            "something was opened"
+        );
+        assert_eq!(read_status(&drive).unwrap_err(), Failure::Unsafe);
+        // Even when asked directly, the volume opener refuses a root that is not a volume's.
+        assert_eq!(
+            Fs::open_volume(letter, false).err(),
+            Some(safe_fs::Error::Link)
+        );
+    }
+
+    /// Runs `scan_recorded` with listings on this thread reporting the names `fake` matches
+    /// as online-only placeholders; returns the result and the paths opened.
+    fn scan_with_placeholders(
+        root: &Path,
+        fake: impl Fn(&str) -> bool + 'static,
+    ) -> (Result<RepoStatus, Failure>, Vec<String>) {
+        safe_fs::FAKE_PLACEHOLDERS.with(|f| *f.borrow_mut() = Some(Box::new(fake)));
+        let (result, opened, _) = scan_recorded(root, LIMITS);
+        safe_fs::FAKE_PLACEHOLDERS.with(|f| *f.borrow_mut() = None);
+        (result, opened)
+    }
+
+    /// Asserts no opened path ends in a name `matches` accepts.
+    fn assert_never_opened(opened: &[String], what: &str, matches: impl Fn(&str) -> bool) {
+        for path in opened {
+            let name = path.rsplit('\\').next().unwrap_or(path);
+            assert!(!matches(name), "{what}: placeholder opened: {path}");
+        }
+    }
+
+    /// Review r2 item 2: every kind of file the scan reads is refused, without being opened,
+    /// when its folder's listing says it is a cloud placeholder.
+    #[test]
+    fn placeholders_are_never_opened() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path().to_path_buf();
+        let id = head_id(&root);
+        let info = root.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), "").unwrap();
+        assert!(root.join(".git").join("info").join("exclude").exists());
+        let (loose_dir, loose_file) = (id[..2].to_string(), id[2..].to_string());
+        for name in [
+            ".git".to_string(),
+            "HEAD".into(),
+            "config".into(),
+            "index".into(),
+            "main".into(),
+            "exclude".into(),
+            "alternates".into(),
+            "objects".into(),
+            loose_dir,
+            loose_file,
+        ] {
+            let target = name.clone();
+            let (result, opened) =
+                scan_with_placeholders(&root, move |n| n.eq_ignore_ascii_case(&target));
+            assert_eq!(result.unwrap_err(), Failure::Unsafe, "{name}");
+            assert_never_opened(&opened, &name, |n| n.eq_ignore_ascii_case(&name));
+        }
+
+        // Packs, `packed-refs`.
+        let Some(packed) = fixture_repo() else { return };
+        assert!(git(packed.path(), &["gc", "-q"]));
+        for suffix in [".idx", ".pack", "packed-refs"] {
+            let (result, opened) =
+                scan_with_placeholders(packed.path(), move |n| n.ends_with(suffix));
+            assert_eq!(result.unwrap_err(), Failure::Unsafe, "{suffix}");
+            assert_never_opened(&opened, suffix, |n| n.ends_with(suffix));
+        }
+
+        // Work-tree files: a `.gitignore` is skipped (its patterns do not apply), a tracked file
+        // that would be hashed counts as modified; neither is opened.
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let (result, opened) = scan_with_placeholders(root, |n| n == ".gitignore");
+        let status = result.expect("status");
+        assert_never_opened(&opened, ".gitignore", |n| n == ".gitignore");
+        assert_eq!(
+            status.badge(&root.join("b.log"), false),
+            Some(GitBadge::Added)
+        );
+        std::thread::sleep(Duration::from_millis(1100));
+        std::fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+        let (clean, _) = scan_with_placeholders(root, |_| false);
+        assert_eq!(clean.unwrap().badge(&root.join(".gitignore"), false), None);
+        let (result, opened) = scan_with_placeholders(root, |n| n == ".gitignore");
+        let status = result.expect("status");
+        assert_never_opened(&opened, "tracked .gitignore", |n| n == ".gitignore");
+        assert_eq!(
+            status.badge(&root.join(".gitignore"), false),
+            Some(GitBadge::Modified)
+        );
+        // An online-only folder in the work tree is not entered.
+        std::fs::create_dir_all(root.join("cloud")).unwrap();
+        std::fs::write(root.join("cloud").join("x.txt"), "x").unwrap();
+        let (result, opened) = scan_with_placeholders(root, |n| n == "cloud");
+        assert!(result.is_ok());
+        assert_never_opened(&opened, "cloud folder", |n| n == "cloud" || n == "x.txt");
+    }
+
+    /// Writes a version 2 index with one entry per path in `paths`, then `extensions`.
+    fn write_index(root: &Path, paths: &[Vec<u8>], extensions: &[u8]) {
+        let mut out = b"DIRC".to_vec();
+        out.extend(2u32.to_be_bytes());
+        out.extend((paths.len() as u32).to_be_bytes());
+        for path in paths {
+            let start = out.len();
+            out.extend([0u8; 24]);
+            out.extend(0o100644u32.to_be_bytes());
+            out.extend([0u8; 12]);
+            out.extend([0u8; 20]);
+            out.extend((path.len().min(0xfff) as u16).to_be_bytes());
+            out.extend(path);
+            let len = out.len() - start;
+            out.extend(std::iter::repeat_n(0u8, 8 - len % 8));
+        }
+        out.extend(extensions);
+        out.extend([0u8; 20]);
+        std::fs::write(root.join(".git").join("index"), out).unwrap();
+    }
+
+    /// Review r2 item 3: a crafted index cannot make the scan copy huge amounts of path data,
+    /// nor make gix recurse deeply through its cached tree.
+    #[test]
+    fn crafted_indexes_are_refused_before_decoding() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        // A real index (with its cached tree) passes and keeps the tree; so does version 4.
+        assert!(git(root, &["commit", "-q", "-m", "two"]));
+        let real = std::fs::read(root.join(".git").join("index")).unwrap();
+        let clean = sanitize_index(&real, LIMITS, &|| false).unwrap();
+        let options = gix::index::decode::Options::default();
+        let (state, _) = gix::index::State::from_bytes(
+            &clean,
+            filetime::FileTime::zero(),
+            gix::hash::Kind::Sha1,
+            options,
+        )
+        .unwrap();
+        assert!(state.tree().is_some(), "cached tree kept");
+        assert_eq!(state.entries().len(), 3);
+        assert!(git(root, &["update-index", "--index-version", "4"]));
+        let status = read_status(root).expect("version 4");
+        assert_eq!(
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+
+        // A path of ~32k one-character folders, a short path 300 folders deep, a path over
+        // 4 KiB: each would have meant copying every folder prefix.
+        let huge: Vec<u8> = b"a/".repeat(32_000).into_iter().chain(*b"f").collect();
+        let deep: Vec<u8> = b"a/".repeat(300).into_iter().chain(*b"f").collect();
+        let long: Vec<u8> = vec![b'x'; 5000];
+        for (what, path) in [("huge", huge), ("deep", deep), ("long", long)] {
+            write_index(root, &[path], &[]);
+            let started = Instant::now();
+            assert_eq!(read_status(root).unwrap_err(), Failure::TooBig, "{what}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{what}");
+        }
+
+        // A cached tree nested far deeper than the stack could recurse.
+        let tree = |depth: usize| {
+            let mut body = b"\0-1 1\n".to_vec();
+            for i in 0..depth {
+                let last = i + 1 == depth;
+                body.extend(if last {
+                    &b"d\0-1 0\n"[..]
+                } else {
+                    &b"d\0-1 1\n"[..]
+                });
+            }
+            let mut ext = b"TREE".to_vec();
+            ext.extend((body.len() as u32).to_be_bytes());
+            ext.extend(body);
+            ext
+        };
+        write_index(root, &[b"f".to_vec()], &tree(10));
+        assert!(read_status(root).is_ok(), "a shallow cached tree is fine");
+        write_index(root, &[b"f".to_vec()], &tree(1_000_000));
+        let started = Instant::now();
+        assert_eq!(read_status(root).unwrap_err(), Failure::TooBig);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // A split index is refused; other optional extensions are dropped unread.
+        let mut link = b"link".to_vec();
+        link.extend(20u32.to_be_bytes());
+        link.extend([0u8; 20]);
+        write_index(root, &[b"f".to_vec()], &link);
+        assert_eq!(read_status(root).unwrap_err(), Failure::Unsafe);
+        let mut junk = b"UNTR".to_vec();
+        junk.extend(3u32.to_be_bytes());
+        junk.extend(*b"\xff\xff\xff");
+        write_index(root, &[b"f".to_vec()], &junk);
+        assert!(read_status(root).is_ok());
     }
 }

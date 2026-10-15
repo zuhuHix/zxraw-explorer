@@ -108,12 +108,12 @@ impl<'a> Odb<'a> {
 
     fn loose(&mut self, id: &ObjectId) -> Result<Option<(Kind, Vec<u8>)>, OdbError> {
         let hex = id.to_hex().to_string();
-        let dir = match self.fs.dir(&self.objects, &hex[..2]) {
+        let dir = match self.fs.dir_named(&self.objects, &hex[..2]) {
             Ok(dir) => dir,
             Err(safe_fs::Error::NotFound) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let file = match self.fs.file(&dir, &hex[2..]) {
+        let file = match self.fs.file_named(&dir, &hex[2..]) {
             Ok(file) => file,
             Err(safe_fs::Error::NotFound) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -168,7 +168,7 @@ impl<'a> Odb<'a> {
         if self.packs.is_some() {
             return Ok(());
         }
-        let dir = match self.fs.dir(&self.objects, "pack") {
+        let dir = match self.fs.dir_named(&self.objects, "pack") {
             Ok(dir) => dir,
             Err(safe_fs::Error::NotFound) => {
                 self.packs = Some(Vec::new());
@@ -176,7 +176,9 @@ impl<'a> Odb<'a> {
             }
             Err(e) => return Err(e.into()),
         };
+        // The `.idx` and `.pack` entries of each pack, as listed: they are opened from these.
         let mut names = Vec::new();
+        let mut listed: HashMap<String, safe_fs::Entry> = HashMap::new();
         let mut entries = 0usize;
         let mut too_many = false;
         let max_entries = self.limits.packs.saturating_mul(4).max(16);
@@ -195,6 +197,11 @@ impl<'a> Odb<'a> {
                     }
                 }
             }
+            if entry.name.starts_with("pack-")
+                && (entry.name.ends_with(".idx") || entry.name.ends_with(".pack"))
+            {
+                listed.insert(entry.name.clone(), entry);
+            }
             true
         })?;
         if too_many {
@@ -203,18 +210,20 @@ impl<'a> Odb<'a> {
         let mut packs = Vec::new();
         let mut idx_total = 0u64;
         for stem in names {
-            let idx_file = self.fs.file(&dir, &format!("{stem}.idx"))?;
+            let idx_entry = listed
+                .get(&format!("{stem}.idx"))
+                .ok_or(OdbError::Missing)?;
+            let idx_file = self.fs.file(&dir, idx_entry)?;
             idx_total += idx_file.info.size;
             if idx_total > self.limits.idx_bytes {
                 return Err(OdbError::TooBig);
             }
             let idx = idx_file.read_capped(self.limits.idx_bytes)?;
             let count = check_idx(&idx)?;
-            let pack = match self.fs.file(&dir, &format!("{stem}.pack")) {
-                Ok(pack) => pack,
-                Err(safe_fs::Error::NotFound) => continue,
-                Err(e) => return Err(e.into()),
+            let Some(pack_entry) = listed.get(&format!("{stem}.pack")) else {
+                continue;
             };
+            let pack = self.fs.file(&dir, pack_entry)?;
             if pack.info.size > self.limits.pack_bytes {
                 return Err(OdbError::TooBig);
             }
