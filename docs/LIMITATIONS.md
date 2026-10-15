@@ -30,28 +30,25 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
   administrator or on a network (UNC) path; choose PowerShell instead.
-* Git status badges are off by default (Settings › Browsing). With them on, a malicious
-  repository in a browsed folder can still make the app open a file on a network share, which
-  can send the user's Windows (NTLM) credentials hash to that server; no program runs. Known
-  gaps: junctions on tracked paths, chains of symbolic refs, reparse points among object files
-  and in path components, an external Git directory on the same drive, `.gitignore` and
-  `packed-refs` read without a size limit, and a window between the safety checks and the
-  repository being opened. Closing them needs handle-based opens that never follow links,
-  planned as a follow-up. Only turn badges on for folders you trust.
-* Git badges never run filters or line-ending conversion, so a same-size file that Git stores
-  converted (for example a Git LFS file, or `autocrlf` content) can show as modified after its
-  time changes, as can same-size changes, online-only files, beyond the first 256 or files over 16 MB.
-  Repositories that take over 4 s, have an index over 100,000 entries, a config or `HEAD`
-  over 1 MB, or need over 50,000 folders and files walked show no badges, and neither does any
-  repository inside OneDrive or another cloud-synced folder (its `.gitignore` files could be
-  online-only). A repository inside the browsed folder that itself contains a cloud-synced
-  folder is still walked, and Git reads the `.gitignore` files there, which can download them.
-  To keep a folder from elsewhere from sending the app to a network share, repositories also
-  show no badges when their own files name a path off the folder's drive or share (a `.git`
-  file, `commondir`), a work tree other than the folder, an index, excludes, attributes or
-  include file outside the repository, any `objects/info/alternates` entry (so `git clone
-  --shared` clones show none), or contain a symlink or junction among their Git metadata.
-  A repository nested inside another, untracked one is shown as a plain new folder.
+* Git status badges never run filters or line-ending conversion, so a same-size file that Git
+  stores converted (for example a Git LFS file, or `autocrlf` content) can show as modified
+  after its time changes, as can same-size changes beyond the first 256 or in files over
+  16 MB, and online-only files. A tracked path that is (or is below) a symlink or junction is
+  never followed and shows as modified; a symlink Git itself tracks shows clean.
+* Repositories show no badges when they take over 4 s, have an index over 100,000 entries or
+  64 MB, need over 50,000 folders and files walked, or exceed the caps on `.gitignore` files
+  (256 KB and 4,096 patterns each, 4 MB and 20,000 patterns together), `packed-refs` (16 MB),
+  packs (256 packs, 256 MB of indexes) or objects (32 MB each, 512 MB inflated in all). Nor do
+  they inside OneDrive or another cloud-synced folder, nor submodules and linked worktrees (a
+  `.git` file could name any place, so `.git` must be a real folder), nor repositories with a
+  link anywhere among the Git files read, a work tree or `core.excludesFile` outside the
+  folder, any `objects/info/alternates` entry (so `git clone --shared` clones show none), a
+  split index, or SHA-256 objects. A shallow or partial clone missing `HEAD`'s objects shows
+  no staged changes. A repository nested inside another, untracked one is shown as a plain
+  new folder. Online-only `.gitignore` files inside a repository are skipped, not downloaded.
+* The Git scan opens the browsed folder itself as the user reached it (following any link in
+  its own path); nothing below it is opened through a link. The symlink-to-share tests need
+  developer mode and were skipped on the development PC; junctions are tested.
 * Files and folders can be dropped into the app. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another

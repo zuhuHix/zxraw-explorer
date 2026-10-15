@@ -261,28 +261,33 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `folder_context_menu_opens_a_terminal_in_that_folder` right-clicks a folder and clicks the menu
   item (automated runs record the launch instead of opening a window). Windows Terminal's `\;`
   handling was checked by hand once; the administrator variant was not run.
-* 🟡 Git status badges — `forge-app/src/git_status.rs`, **off by default** (opt-in in Settings ›
-  Browsing; see LIMITATIONS.md for the known gaps with malicious repositories): modified, new (added or untracked),
-  ignored (dimmed) and conflicted entries, rolled up to folders, and the branch in the status
-  bar. Read in-process with `gix` on one background thread; no external program ever runs (no
-  `git.exe`, no fsmonitor, no filter drivers: gix never reads file contents; a size change counts
-  as modified, and a same-size file with a new time is hashed by the app from its raw bytes,
-  at most 256 files of up to 16 MB, to tell a real change from a touch or a racily-clean entry).
-  Config is the repository's own only.
-  One budget covers the whole read, from opening the repository: 4 s, a 64 MB / 100,000-entry
-  index and 50,000 folders and files visited by the walk (each file of an untracked folder
-  counts); a repository over any of them is skipped for the session. Refused without being
-  read: a repository inside a cloud sync root (`forge_core::cloud::in_cloud_sync_root`: a
-  Cloud Files reparse tag or online-only attribute on the folder or any ancestor, fail closed),
-  a `.git` file pointing at a network path, and a config whose `core.worktree` moves the work
-  tree away from the folder. Results are cached per repository and refreshed when the folder
-  watcher fires or after 15 s. Unit tests cover lookup and roll-up, repo-root detection, a real
-  repository (modified, staged, untracked, ignored), `repository_config_cannot_run_programs`
-  (`core.fsmonitor` and filter drivers point at a marker-writing script; the marker is never
-  created), `a_config_that_moves_the_work_tree_is_refused`,
-  `a_git_file_pointing_at_a_network_path_is_refused` and `every_part_of_the_scan_is_bounded`
-  (each limit injected small), and `nothing_is_scanned_until_turned_on` (with the setting off,
-  a folder holding `.git` sends no request to the worker). Badge drawing is not covered by a test.
+* 🟡 Git status badges — `forge-app/src/git_status.rs`, on by default (Settings › Browsing):
+  modified, new (added or untracked), ignored (dimmed) and conflicted entries, rolled up to
+  folders, and the branch in the status bar. Read in-process on one background thread; no
+  external program ever runs (no `git.exe`, no fsmonitor, no filter drivers). Every file is
+  opened through `git_status/safe_fs.rs`: the root once, then one name at a time relative to an
+  already-checked folder handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`), refusing any
+  reparse point, any handle off the root's volume or whose final path is outside the root, and
+  reading with a byte cap from the handle that was checked. gix only parses bytes read that way
+  (index, config, refs, ignore files, commits and trees); loose objects and packs, with deltas,
+  are read by `git_status/odb.rs`. Tracked files are compared with the index from folder
+  listings; a same-size file with a new time is hashed from its raw bytes (at most 256 files of
+  up to 16 MB). `.git` must be a real folder in the root, so submodules and linked worktrees
+  show no badges. Caps: 4 s, a 64 MB / 100,000-entry index, 50,000 folders and files walked,
+  `.gitignore` files (256 KB and 4,096 patterns each, 4 MB and 20,000 patterns in all),
+  `packed-refs` (16 MB), 256 packs and 256 MB of pack indexes, 32 MB per object and 512 MB
+  inflated in all, and 5 symbolic refs; a repository over any of them is skipped for the
+  session. Results are cached per repository and refreshed when the folder watcher fires or
+  after 15 s. Unit tests cover lookup and roll-up, repo-root detection, a real repository
+  (modified, staged, untracked, ignored), staged changes read from deltified packs, programs
+  named in the config never running, and one test per class of hostile layout with real
+  junctions in temp folders, each asserting from a recorder that no handle outside the folder
+  was opened: junctions on tracked paths, symbolic ref chains (through a junction, and a loop),
+  `.git` files and junctions to other repositories, junctions inside configured paths, links
+  among loose objects and packs, capped ignore files, `packed-refs` and packs, and a folder
+  swapped for a junction after its handle was opened. Mount points aimed at `\\192.0.2.1\x`
+  are refused unfollowed; the symlink variants need developer mode and skip without it. Badge
+  drawing is not covered by a test.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).
