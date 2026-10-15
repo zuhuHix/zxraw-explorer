@@ -505,9 +505,14 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   text, the video panel, video durations, library metadata extraction, XMP sidecars, duplicate and
   similar-photo scans, folder compare and its sync preview, the ingest preview, and viewer
   prefetching all skip them through one check,
-  `forge_core::cloud::background_read_allowed`. Opening a file still downloads it. A copy (or a
-  move to another drive) of 10 or more online-only files, or 1 GB or more, asks first and gives
-  the count and size. Tests: `forge-core/src/cloud.rs`, `duplicates.rs::online_only_files_are_never_compared`,
+  `forge_core::cloud::background_read_allowed`, re-checked by each worker (video probe,
+  filmstrip, scrub frames and each proxy encode) just before it opens the file. Opening a file
+  still downloads it. A copy (or a move to another drive) of 10 or more online-only files, or
+  1 GB or more, asks first and gives the count and size; the check runs off the UI thread for
+  files and folders alike, and a check that stopped at its limits says "at least" and that it
+  stopped early. The checksum tool counts online-only files first and asks: download and hash,
+  skip them, or cancel (`hashing.rs::online_only_files_are_skipped_or_downloaded`, e2e
+  `tools::checksums_ask_before_hashing_online_only_files`). Tests: `forge-core/src/cloud.rs`, `duplicates.rs::online_only_files_are_never_compared`,
   `compare.rs::online_only_files_are_not_hashed_by_folder_compare`,
   `forge-media/tests/media.rs::background_thumbnails_never_read_online_only_files`,
   `forge-app` `library::tests::metadata_extraction_skips_online_only_photos` and

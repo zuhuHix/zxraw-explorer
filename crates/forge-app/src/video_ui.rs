@@ -297,6 +297,17 @@ where
 /// modification time, and requested time; only the selected file's work is allowed to run.
 const ONLINE_ONLY_VIDEO: &str = "Online-only file: open it to download it from the cloud.";
 
+/// Re-checked inside each worker, just before ffprobe/ffmpeg reads the clip: the selection-time
+/// check can be stale by then.
+fn online_only_check(path: &Path) -> Result<(), String> {
+    use forge_core::cloud::{ReadCheck, read_check};
+    match read_check(path) {
+        ReadCheck::Local => Ok(()),
+        ReadCheck::Missing => Err(format!("{} no longer exists", path.display())),
+        ReadCheck::OnlineOnly { .. } => Err(ONLINE_ONLY_VIDEO.into()),
+    }
+}
+
 pub struct VideoUi {
     tx: Sender<VideoMessage>,
     rx: Receiver<VideoMessage>,
@@ -475,9 +486,11 @@ impl VideoUi {
             let media_key = media.clone();
             let generation = self.generation;
             std::thread::spawn(move || {
-                let result = FfTools::discover_with(ffmpeg_dir.as_deref())
-                    .probe(&path)
-                    .map_err(|e| e.to_string());
+                let result = online_only_check(&path).and_then(|()| {
+                    FfTools::discover_with(ffmpeg_dir.as_deref())
+                        .probe(&path)
+                        .map_err(|e| e.to_string())
+                });
                 let _ = tx.send(VideoMessage::Probe {
                     media: media_key,
                     generation,
@@ -512,9 +525,11 @@ impl VideoUi {
         let ffmpeg_dir = self.ffmpeg_dir.clone();
         let generation = self.generation;
         std::thread::spawn(move || {
-            let result = FfTools::discover_with(ffmpeg_dir.as_deref())
-                .filmstrip(&path, FILMSTRIP_FRAMES, FILMSTRIP_FRAME_EDGE, Some(&cancel))
-                .map_err(|e| e.to_string());
+            let result = online_only_check(&path).and_then(|()| {
+                FfTools::discover_with(ffmpeg_dir.as_deref())
+                    .filmstrip(&path, FILMSTRIP_FRAMES, FILMSTRIP_FRAME_EDGE, Some(&cancel))
+                    .map_err(|e| e.to_string())
+            });
             let _ = tx.send(VideoMessage::Filmstrip {
                 media: media_key,
                 generation,
@@ -533,7 +548,10 @@ impl VideoUi {
                     result,
                 } => {
                     let result = *result;
-                    self.probe_cache.put(media.clone(), result.clone());
+                    // Not cached: the clip is probed once it has been downloaded.
+                    if result.as_ref().err().map(String::as_str) != Some(ONLINE_ONLY_VIDEO) {
+                        self.probe_cache.put(media.clone(), result.clone());
+                    }
                     if self.selection.as_ref() == Some(&media) && self.generation == generation {
                         self.probe_pending = false;
                         self.probe_error = result.err();
@@ -787,9 +805,11 @@ impl VideoUi {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = FfTools::discover_with(ffmpeg_dir.as_deref())
-                .extract_frame_cancellable(&path, seconds, SCRUB_FRAME_EDGE, Some(&token))
-                .map_err(|e| e.to_string());
+            let result = online_only_check(&path).and_then(|()| {
+                FfTools::discover_with(ffmpeg_dir.as_deref())
+                    .extract_frame_cancellable(&path, seconds, SCRUB_FRAME_EDGE, Some(&token))
+                    .map_err(|e| e.to_string())
+            });
             let _ = tx.send(VideoMessage::Frame {
                 key,
                 generation,
@@ -1719,6 +1739,26 @@ fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
                 let name = source.file_name().unwrap_or_default().to_string_lossy();
                 job.progress
                     .set_current(format!("{} ({}/{})", name, index + 1, sources.len()));
+                // The estimate refused online-only clips, but a clip can go online-only while
+                // the job waits: ffmpeg would download it.
+                match forge_core::cloud::read_check(source) {
+                    forge_core::cloud::ReadCheck::Local => {}
+                    forge_core::cloud::ReadCheck::OnlineOnly { .. } => {
+                        let line = format!("skipped {}: {ONLINE_ONLY_VIDEO}", source.display());
+                        job.log(line.clone());
+                        skipped.push(line);
+                        job.progress.add_items(1);
+                        continue;
+                    }
+                    forge_core::cloud::ReadCheck::Missing => {
+                        let line = format!("{}: the clip no longer exists", source.display());
+                        job.log(line.clone());
+                        failures.push(line);
+                        job.progress.add_error();
+                        job.progress.add_items(1);
+                        continue;
+                    }
+                }
                 if let Err(error) = std::fs::create_dir_all(&directory) {
                     failures.push(format!(
                         "{}: could not create {}: {error}",
@@ -3103,6 +3143,21 @@ fn format_timecode_at(start: &str, offset_s: f64, fps: f64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workers_refuse_a_clip_that_is_online_only_when_they_start() {
+        let d = tempfile::tempdir().unwrap();
+        let clip = d.path().join("clip.mp4");
+        std::fs::write(&clip, b"x").unwrap();
+        assert_eq!(super::online_only_check(&clip), Ok(()));
+        forge_core::cloud::simulate_online_only(&clip);
+        let refused = super::online_only_check(&clip);
+        forge_core::cloud::clear_simulated_online_only(&clip);
+        assert_eq!(refused, Err(super::ONLINE_ONLY_VIDEO.to_string()));
+        std::fs::remove_file(&clip).unwrap();
+        let missing = super::online_only_check(&clip).unwrap_err();
+        assert!(missing.ends_with("no longer exists"), "{missing}");
+    }
+
     #[test]
     fn placing_a_proxy_never_replaces_an_existing_file() {
         let d = tempfile::tempdir().unwrap();

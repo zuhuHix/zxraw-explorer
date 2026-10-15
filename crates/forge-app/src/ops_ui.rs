@@ -52,16 +52,6 @@ pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, 
         ask_after_cloud_check(app, sources.clone(), sources, dest, kind, None);
         return;
     }
-    if let Some(body) = cloud_warning_for(&sources, &dest, kind) {
-        let pending = ConfirmKind::DownloadCloudFiles {
-            sources,
-            dest,
-            kind,
-            clipboard: None,
-        };
-        ask_cloud_download(app, body, kind, pending);
-        return;
-    }
     start_transfer_confirmed(app, sources, dest, kind);
 }
 
@@ -144,16 +134,6 @@ fn clipboard_move(
             OpKind::Move,
             Some((generation, expected_sequence)),
         );
-        return true;
-    }
-    if check_cloud && let Some(body) = cloud_warning_for(&sources, &dest, OpKind::Move) {
-        let pending = ConfirmKind::DownloadCloudFiles {
-            sources: clipboard_sources,
-            dest,
-            kind: OpKind::Move,
-            clipboard: Some((generation, expected_sequence)),
-        };
-        ask_cloud_download(app, body, OpKind::Move, pending);
         return true;
     }
     let completion = ClipboardMoveCompletion {
@@ -320,15 +300,11 @@ fn cloud_check_action(
     warning.map_or(CloudCheckAction::Start, CloudCheckAction::Warn)
 }
 
-/// Does the transfer need the folder walk? Top-level files are checked synchronously, and a
-/// move within one volume is a rename that downloads nothing.
+/// Does the transfer need the online-only check? It always runs on the background worker,
+/// for files as for folders: even one attribute query can stall on network or cloud storage.
+/// A move within one volume is a rename that downloads nothing. Path text only, no I/O.
 fn scan_needed(sources: &[PathBuf], dest: &Path, kind: OpKind) -> bool {
-    if kind == OpKind::Move && sources.iter().all(|path| same_volume(path, dest)) {
-        return false;
-    }
-    sources
-        .iter()
-        .any(|path| std::fs::symlink_metadata(path).is_ok_and(|md| md.is_dir()))
+    !(kind == OpKind::Move && sources.iter().all(|path| same_volume(path, dest)))
 }
 
 /// The confirmation text when a transfer of `sources` to `dest` would download online-only
@@ -373,6 +349,9 @@ fn online_only_totals_with(
     let deadline = Instant::now() + time_limit;
     let mut scan = OnlineOnlyScan::default();
     let mut visited = 0;
+    let mut folders = Vec::new();
+    // Selected files first, always in full: the limits are for walking into folders, and a
+    // large folder must not use up the budget before an explicitly selected file is seen.
     for path in sources {
         if kind == OpKind::Move && same_volume(path, dest) {
             continue;
@@ -386,8 +365,14 @@ fn online_only_totals_with(
                 scan.bytes += md.len();
             }
         } else if md.is_dir() {
-            walk_online_only(path, max_entries, deadline, &mut visited, &mut scan);
+            folders.push(path);
         }
+    }
+    for folder in folders {
+        if scan.truncated {
+            break;
+        }
+        walk_online_only(folder, max_entries, deadline, &mut visited, &mut scan);
     }
     scan
 }
@@ -447,10 +432,10 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 /// Pure decision: the body text of the download warning, or `None` when the transfer is
 /// cheap enough to start at once. A move within one volume is a rename and downloads nothing.
 ///
-/// When the folder walk was `truncated` and it had already seen online-only files, the real
-/// total is unknown but not zero, so a generic warning is shown instead of silence. An
-/// online-only file seen before the cap proves the selection holds more of them. A walk that
-/// stopped before seeing any proves nothing, so it stays silent.
+/// When the scan was `truncated` (entry or time limit) and it had already seen online-only
+/// files, the totals are lower bounds: the warning says "at least" and that the scan stopped
+/// early, whatever the count. A scan that stopped before seeing any proves nothing, so it
+/// stays silent rather than warning on every large local folder.
 fn cloud_download_warning(
     count: usize,
     bytes: u64,
@@ -466,28 +451,30 @@ fn cloud_download_warning(
     } else {
         "Moving"
     };
-    if count < CLOUD_WARN_COUNT && bytes < CLOUD_WARN_BYTES {
-        if truncated && count > 0 {
-            return Some(format!(
-                "This folder may contain online-only files. {verb} downloads them from the cloud first."
-            ));
-        }
+    let below_threshold = count < CLOUD_WARN_COUNT && bytes < CLOUD_WARN_BYTES;
+    if count == 0 || (below_threshold && !truncated) {
         return None;
     }
-    let (files, are, them) = if count == 1 && !truncated {
+    let size = format_size(bytes);
+    if truncated {
+        // The scan saw only part of the selection: the totals are lower bounds.
+        let (files, are) = if count == 1 {
+            ("1 file".to_owned(), "is")
+        } else {
+            (format!("{count} files"), "are")
+        };
+        return Some(format!(
+            "At least {files} ({size}) {are} online-only; the scan stopped early, so there may \
+             be more. {verb} them downloads them from the cloud first."
+        ));
+    }
+    let (files, are, them) = if count == 1 {
         ("1 file".to_owned(), "is", "it")
     } else {
         (format!("{count} files"), "are", "them")
     };
-    // A capped walk saw only part of the selection: the totals are lower bounds.
-    let files = if truncated {
-        format!("At least {files}")
-    } else {
-        files
-    };
     Some(format!(
-        "{files} ({}) {are} online-only. {verb} {them} downloads {them} from the cloud first.",
-        format_size(bytes)
+        "{files} ({size}) {are} online-only. {verb} {them} downloads {them} from the cloud first."
     ))
 }
 
@@ -1484,9 +1471,20 @@ mod cloud_warning_tests {
     #[test]
     fn capped_walk_totals_are_lower_bounds() {
         let body = cloud_download_warning(CLOUD_WARN_COUNT, 3, OpKind::Copy, false, true).unwrap();
+        assert_eq!(
+            body,
+            "At least 10 files (3 B) are online-only; the scan stopped early, so there may be \
+             more. Copying them downloads them from the cloud first."
+        );
+        // Below the thresholds a stopped scan still warns: the real total is unknown.
+        let one = cloud_download_warning(1, 3, OpKind::Move, false, true).unwrap();
         assert!(
-            body.starts_with("At least 10 files (3 B) are online-only."),
-            "{body}"
+            one.starts_with("At least 1 file (3 B) is online-only; the scan stopped early"),
+            "{one}"
+        );
+        assert_eq!(
+            cloud_download_warning(0, 0, OpKind::Copy, false, true),
+            None
         );
     }
 
@@ -1559,7 +1557,7 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn entry_cap_with_online_only_file_gives_generic_warning() {
+    fn entry_cap_with_online_only_file_says_the_scan_stopped_early() {
         let dir = tempfile::tempdir().expect("temp directory");
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
@@ -1586,7 +1584,8 @@ mod cloud_warning_tests {
         assert_eq!(
             body.as_deref(),
             Some(
-                "This folder may contain online-only files. Copying downloads them from the cloud first."
+                "At least 2 files (6 B) are online-only; the scan stopped early, so there may be \
+                 more. Copying them downloads them from the cloud first."
             )
         );
         for path in &placeholders {
@@ -1619,6 +1618,56 @@ mod cloud_warning_tests {
     }
 
     #[test]
+    fn every_transfer_but_a_same_volume_move_is_checked_on_the_worker() {
+        let files = [
+            PathBuf::from(r"C:\shoot\a.cr3"),
+            PathBuf::from(r"C:\shoot\b.cr3"),
+        ];
+        // Paths that do not exist: deciding must not touch the filesystem.
+        assert!(scan_needed(&files, Path::new(r"D:\backup"), OpKind::Copy));
+        assert!(scan_needed(&files, Path::new(r"C:\other"), OpKind::Copy));
+        assert!(scan_needed(&files, Path::new(r"D:\backup"), OpKind::Move));
+        assert!(!scan_needed(&files, Path::new(r"c:\other"), OpKind::Move));
+    }
+
+    #[test]
+    fn selected_files_are_checked_in_full_even_after_the_folder_cap() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let big = dir.path().join("big");
+        std::fs::create_dir(&big).unwrap();
+        for i in 0..20 {
+            std::fs::write(big.join(format!("local{i}.bin")), b"abc").unwrap();
+        }
+        let mut sources = vec![big];
+        for i in 0..12 {
+            let path = dir.path().join(format!("f{i}.bin"));
+            std::fs::write(&path, b"abc").unwrap();
+            forge_core::cloud::simulate_online_only(path.clone());
+            sources.push(path);
+        }
+        let elsewhere = dir.path().join("elsewhere");
+        // The folder (listed first) uses up the entry budget; the files still all count.
+        let scan = online_only_totals_with(
+            &sources,
+            &elsewhere,
+            OpKind::Copy,
+            4,
+            Duration::from_secs(60),
+        );
+        assert_eq!(
+            scan,
+            OnlineOnlyScan {
+                count: 12,
+                bytes: 36,
+                truncated: true,
+            }
+        );
+        for path in &sources[1..] {
+            forge_core::cloud::clear_simulated_online_only(path);
+        }
+    }
+
+    #[test]
     fn cloud_check_result_is_applied_only_to_its_own_check() {
         assert_eq!(
             cloud_check_action(Some(3), 3, None),
@@ -1637,29 +1686,19 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn folders_need_the_async_scan_but_top_level_files_do_not() {
+    fn files_and_folders_both_need_the_async_scan() {
         let dir = tempfile::tempdir().expect("temp directory");
         let file = dir.path().join("file.bin");
         let folder = dir.path().join("folder");
         std::fs::write(&file, b"abc").unwrap();
         std::fs::create_dir(&folder).unwrap();
         let elsewhere = dir.path().join("elsewhere");
-        assert!(!scan_needed(
-            std::slice::from_ref(&file),
-            &elsewhere,
-            OpKind::Copy
-        ));
-        assert!(scan_needed(
-            std::slice::from_ref(&folder),
-            &elsewhere,
-            OpKind::Copy
-        ));
-        // A folder moved within its volume is a rename: no scan at all.
-        assert!(!scan_needed(
-            std::slice::from_ref(&folder),
-            &elsewhere,
-            OpKind::Move
-        ));
+        for source in [&file, &folder] {
+            let sources = std::slice::from_ref(source);
+            assert!(scan_needed(sources, &elsewhere, OpKind::Copy));
+            // Moved within its volume it is a rename: no scan at all.
+            assert!(!scan_needed(sources, &elsewhere, OpKind::Move));
+        }
     }
 
     #[test]

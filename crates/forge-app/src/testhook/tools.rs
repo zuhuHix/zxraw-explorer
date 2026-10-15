@@ -61,6 +61,16 @@
 //! - `simulate-online-only <path>`: mark the file as an online-only cloud file for this process,
 //!   so find-and-replace and the backup check skip it the way they skip real placeholders.
 //!
+//! Checksums (the BLAKE3 manifest window):
+//! - `checksums open <folder>`: open the window on the folder and start its online-only count.
+//! - `checksums wait-prompt <count> [secs]`: wait for the "online-only files would be
+//!   downloaded" prompt and check how many files it names; fails if hashing finished without
+//!   asking. Answer it with `click-button checksums:Download and hash`,
+//!   `checksums:Skip online-only` or `checksums:Cancel`.
+//! - `checksums wait [secs]`: wait for the manifest (default 30 s); fails on an error notice.
+//! - `checksums assert <key=value>…`: counts of the manifest. Keys: `entries`, `skipped`
+//!   (online-only files left out).
+//!
 //! Find and replace (`… | …` separates paths; `replace set` takes the rest of the line as the
 //! value):
 //! - `replace open <path> [| <path>…]`: open the window on these files or folders.
@@ -128,6 +138,7 @@ pub(super) fn step(
         "compare" => compare_step(app, args, st),
         "replace" => replace_step(app, args, st),
         "verify" => verify_step(app, args, st),
+        "checksums" => checksums_step(app, args, st),
         "simulate-online-only" => {
             // Only inside the sandbox; the path is matched exactly by the engines.
             forge_core::cloud::simulate_online_only(inside(one_path(args)?)?);
@@ -532,6 +543,68 @@ fn skip_key(reason: &SkipReason) -> &'static str {
         SkipReason::PathChanged => "path-changed",
         SkipReason::HardLinked => "hard-linked",
         SkipReason::Unreadable(_) => "unreadable",
+    }
+}
+
+fn checksums_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Flow, String> {
+    use tools_ui::ChecksumsView;
+    let (sub, rest) = split_verb(args);
+    match sub {
+        "open" => {
+            tools_ui::automation_open_checksums(app, inside(one_path(rest)?)?);
+            Ok(Flow::Done)
+        }
+        "wait-prompt" => {
+            let (count, secs) = split_verb(rest);
+            let expected = count_arg(count)?;
+            let timeout = timeout_arg(secs)?;
+            match tools_ui::automation_checksums(app) {
+                Some(Ok(ChecksumsView::Prompt(totals))) if totals.count == expected => {
+                    Ok(Flow::Done)
+                }
+                Some(Ok(ChecksumsView::Prompt(totals))) => Err(format!(
+                    "expected the prompt to name {expected} online-only file(s), it names {}",
+                    totals.count
+                )),
+                Some(Ok(ChecksumsView::Manifest { .. })) => {
+                    Err("hashing finished without asking about online-only files".into())
+                }
+                Some(Err(error)) => Err(format!("checksums failed: {error}")),
+                None => wait_or_fail(st, timeout, "no online-only prompt yet"),
+            }
+        }
+        "wait" => {
+            let timeout = timeout_arg(rest)?;
+            match tools_ui::automation_checksums(app) {
+                Some(Ok(ChecksumsView::Manifest { .. })) => Ok(Flow::Done),
+                Some(Err(error)) => Err(format!("checksums failed: {error}")),
+                Some(Ok(ChecksumsView::Prompt(_))) | None => {
+                    wait_or_fail(st, timeout, "the manifest is not ready")
+                }
+            }
+        }
+        "assert" => {
+            let counts = key_counts(rest)?;
+            let Some(Ok(ChecksumsView::Manifest { entries, skipped })) =
+                tools_ui::automation_checksums(app)
+            else {
+                return Err("no finished manifest (use `checksums wait`)".into());
+            };
+            for (key, expected) in counts {
+                let found = match key {
+                    "entries" => entries,
+                    "skipped" => skipped,
+                    _ => return Err(format!("unknown checksums count `{key}`")),
+                };
+                if found != expected {
+                    return Err(format!(
+                        "expected {expected} `{key}` in the manifest, found {found}"
+                    ));
+                }
+            }
+            Ok(Flow::Done)
+        }
+        _ => Err(format!("unknown `ui tools checksums` verb `{sub}`")),
     }
 }
 
