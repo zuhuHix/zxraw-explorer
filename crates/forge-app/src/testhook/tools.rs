@@ -427,6 +427,7 @@ fn replace_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
                 let found = match key {
                     "files" => report.files.len(),
                     "matches" => report.total_matches(),
+                    "hidden" => report.hidden_matches(),
                     "skipped" => report.skipped.len(),
                     _ => return Err(format!("unknown preview count `{key}`")),
                 };
