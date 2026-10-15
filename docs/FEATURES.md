@@ -441,7 +441,7 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `failed_export_keeps_existing_destination_intact`. Relink preview counts exact prefixes only
   (`relink_preview_counts_exact_prefix_and_not_siblings`).
 * 🟡 Library and collection browser, editing, and saved-search management UI —
-  `forge-app/src/collections_ui.rs` (reorder, picker filtering), with a "How collections work"
+  `forge-app/src/collections_ui.rs` (reordering items within a collection, picker filtering), with a "How collections work"
   explainer, a guided *New collection…* window (empty / from selection / smart) and a detail
   pane with counts, file preview and actions. User interaction is not automated.
 
