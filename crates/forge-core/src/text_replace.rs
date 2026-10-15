@@ -49,6 +49,12 @@ pub const MAX_PREVIEW_HITS_PER_FILE: usize = 2_000;
 pub const MAX_PREVIEW_TOTAL_HITS: usize = 50_000;
 /// Longest match (bytes) shown in the preview. A longer match is counted as not shown.
 pub const MAX_SHOWN_MATCH: usize = 4_096;
+/// Longest replacement text (bytes) stored per match for the preview; a longer one is cut and
+/// ends in `…`. [`apply`] always inserts the full replacement.
+pub const MAX_SHOWN_REPLACEMENT: usize = 1_024;
+/// Match and replacement text (bytes) stored across all files of one scan. Matches past it are
+/// counted as hidden.
+pub const MAX_PREVIEW_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 /// Files a scan examines before it stops, unless the caller changes the limit.
 pub const DEFAULT_MAX_TOTAL_FILES: usize = 50_000;
 /// Bytes a scan reads before it stops, unless the caller changes the limit.
@@ -627,6 +633,7 @@ fn scan_with(
         collect_root(root, opts, ctx, &mut col)?;
     }
     ctx.progress.add_total_items(col.out.len() as u64);
+    let not_collected = col.overflow;
 
     let mut report = ScanReport {
         skipped: col.skipped,
@@ -635,6 +642,7 @@ fn scan_with(
     let mut budget = Budget {
         lines: MAX_PREVIEW_TOTAL_LINES,
         hits: MAX_PREVIEW_TOTAL_HITS,
+        bytes: MAX_PREVIEW_TOTAL_BYTES,
     };
     let mut bytes_read: u64 = 0;
     for (index, cand) in col.out.iter().enumerate() {
@@ -650,6 +658,8 @@ fn scan_with(
         bytes_read += scan_file(cand, &re, spec, opts, ctx, source, &mut budget, &mut report);
         ctx.progress.add_items(1);
     }
+    // Files the collector found but did not keep were never examined either.
+    report.files_not_scanned += not_collected;
     Ok(report)
 }
 
@@ -660,12 +670,17 @@ struct Candidate {
     size: u64,
 }
 
-/// Collects the files to scan: applies name globs, drops duplicate paths across roots.
+/// Collects the files to scan: applies name globs, drops duplicate paths across roots. Keeps
+/// at most `limit` candidates, the scan's file limit; files found past it are only counted.
 struct Collector {
     include: Vec<String>,
     exclude: Vec<String>,
+    limit: usize,
     seen: HashSet<String>,
     out: Vec<Candidate>,
+    /// Files found after `out` was full. A file reached twice through overlapping roots after
+    /// that point is counted twice.
+    overflow: usize,
     skipped: Vec<(PathBuf, SkipReason)>,
 }
 
@@ -674,8 +689,10 @@ impl Collector {
         Self {
             include: opts.include.iter().map(|p| p.to_lowercase()).collect(),
             exclude: opts.exclude.iter().map(|p| p.to_lowercase()).collect(),
+            limit: opts.max_total_files,
             seen: HashSet::new(),
             out: Vec::new(),
+            overflow: 0,
             skipped: Vec::new(),
         }
     }
@@ -693,7 +710,11 @@ impl Collector {
         } else {
             path.to_string_lossy().into_owned()
         };
-        if self.seen.insert(key) {
+        if self.out.len() >= self.limit {
+            if !self.seen.contains(&key) {
+                self.overflow += 1;
+            }
+        } else if self.seen.insert(key) {
             self.out.push(Candidate {
                 path,
                 root,
@@ -886,6 +907,7 @@ fn scan_file(
     }
     budget.lines -= found.matches.len();
     budget.hits -= found.shown;
+    budget.bytes -= found.bytes;
     if md.permissions().readonly() {
         skip(report, path, SkipReason::ReadOnly);
         return read;
@@ -915,6 +937,30 @@ fn read_bounded(file: &mut File, limit: u64) -> io::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(bytes))
+}
+
+/// [`replacement_text`] cut to [`MAX_SHOWN_REPLACEMENT`] bytes for the preview, ending in `…`
+/// when cut.
+fn shown_replacement(caps: &Captures<'_>, spec: &SearchSpec) -> String {
+    let cut = |text: &str| {
+        let end = floor_boundary(text, MAX_SHOWN_REPLACEMENT);
+        format!("{}…", &text[..end])
+    };
+    if !spec.regex {
+        // Literal text is never copied in full.
+        let full = &spec.replacement;
+        return if full.len() > MAX_SHOWN_REPLACEMENT {
+            cut(full)
+        } else {
+            full.clone()
+        };
+    }
+    let full = replacement_text(caps, spec);
+    if full.len() > MAX_SHOWN_REPLACEMENT {
+        cut(&full)
+    } else {
+        full
+    }
 }
 
 /// Text used for one match: the expanded template in regex mode, verbatim otherwise.
@@ -983,6 +1029,8 @@ impl<'a> LineCursor<'a> {
 struct Budget {
     lines: usize,
     hits: usize,
+    /// Match plus replacement text bytes.
+    bytes: usize,
 }
 
 /// What [`find_matches`] found in one file.
@@ -992,6 +1040,8 @@ struct Found {
     lines_with_matches: usize,
     /// Matches stored in `matches`; every other match is counted only.
     shown: usize,
+    /// Match plus replacement text bytes stored, charged to [`Budget::bytes`].
+    bytes: usize,
 }
 
 /// Matches shown together in one [`LineMatch`]: they start on the same line (or on the last
@@ -1012,7 +1062,8 @@ struct Group {
 /// [`MAX_PREVIEW_HITS_PER_LINE`] per line, [`MAX_PREVIEW_HITS_PER_FILE`] per file and what is
 /// left of `budget`. Each stored match is shown in full, line breaks included; a match longer
 /// than [`MAX_SHOWN_MATCH`] is counted but not stored. Replacement text is only built for
-/// stored matches.
+/// stored matches, and cut to [`MAX_SHOWN_REPLACEMENT`]. Once the stored match and
+/// replacement text would pass `budget.bytes`, later matches are counted only.
 fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> Found {
     let line_limit = MAX_PREVIEW_LINES.min(budget.lines);
     let hit_limit = MAX_PREVIEW_HITS_PER_FILE.min(budget.hits);
@@ -1022,6 +1073,8 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> F
     let mut count = 0;
     let mut lines_total = 0;
     let mut shown = 0;
+    let mut bytes = 0;
+    let mut bytes_full = false;
     // Line start of the last line where a match started, and the matches stored on it.
     let mut last_line: Option<usize> = None;
     let mut on_line = 0;
@@ -1034,12 +1087,27 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> F
             lines_total += 1;
             on_line = 0;
         }
-        if m.len() > MAX_SHOWN_MATCH || on_line >= MAX_PREVIEW_HITS_PER_LINE || shown >= hit_limit {
+        if m.len() > MAX_SHOWN_MATCH
+            || on_line >= MAX_PREVIEW_HITS_PER_LINE
+            || shown >= hit_limit
+            || bytes_full
+        {
             continue;
         }
-        // The line holding the last byte of the match. A match that takes the line break
-        // covers it, so the break is shown.
-        let (_, end_line_start, end_content_end) = lines.locate(m.end() - 1);
+        let rep = shown_replacement(&caps, spec);
+        let cost = m.len() + rep.len();
+        if bytes + cost > budget.bytes {
+            bytes_full = true;
+            continue;
+        }
+        // The line holding the last character of the match, located by its first byte so a
+        // multi-byte character is never split. A match that takes the line break covers it,
+        // so the break is shown.
+        let last_char = text[..m.end()]
+            .char_indices()
+            .next_back()
+            .map_or(m.start(), |(i, _)| i);
+        let (_, end_line_start, end_content_end) = lines.locate(last_char);
         let cover_end = end_content_end.max(m.end());
         let joins = group
             .as_ref()
@@ -1070,7 +1138,8 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> F
         let Some(g) = group.as_mut() else { continue };
         g.last_line_start = end_line_start;
         g.cover_end = g.cover_end.max(cover_end);
-        g.hits.push((m.range(), replacement_text(&caps, spec)));
+        g.hits.push((m.range(), rep));
+        bytes += cost;
         on_line += 1;
         shown += 1;
     }
@@ -1082,6 +1151,7 @@ fn find_matches(text: &str, re: &Regex, spec: &SearchSpec, budget: &Budget) -> F
         count,
         lines_with_matches: lines_total,
         shown,
+        bytes,
     }
 }
 
@@ -2602,5 +2672,208 @@ mod tests {
                 .line
                 .starts_with(&"x".repeat(DISPLAY_CONTEXT))
         );
+    }
+
+    #[test]
+    fn the_collector_stops_keeping_files_at_the_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 0..3 {
+            let sub = dir.path().join(format!("d{d}"));
+            fs::create_dir(&sub).unwrap();
+            for i in 0..10 {
+                fs::write(sub.join(format!("f{i}.txt")), "foo\n").unwrap();
+            }
+        }
+        let opts = ScanOptions {
+            max_total_files: 4,
+            ..ScanOptions::default()
+        };
+        let cancel = CancelToken::new();
+        let progress = Progress::new();
+        let ctx = JobCtx::new(&cancel, &progress);
+        let mut col = Collector::new(&opts);
+        collect_root(dir.path(), &opts, &ctx, &mut col).unwrap();
+        // A kept file given again as a root is not counted twice.
+        let kept = col.out[0].path.clone();
+        collect_root(&kept, &opts, &ctx, &mut col).unwrap();
+        assert_eq!(col.out.len(), 4);
+        assert!(col.seen.len() <= 4);
+        assert_eq!(col.overflow, 26);
+
+        let report = run_scan(dir.path(), &spec("foo", "bar"), &opts);
+        assert_eq!(report.files_scanned, 4);
+        assert_eq!(report.files_not_scanned, 26);
+        assert!(
+            report
+                .truncation_notice()
+                .unwrap()
+                .contains("26 files not searched")
+        );
+
+        // A one-level listing is capped too.
+        let opts = ScanOptions {
+            recursive: false,
+            max_total_files: 3,
+            ..ScanOptions::default()
+        };
+        let mut col = Collector::new(&opts);
+        collect_root(&dir.path().join("d0"), &opts, &ctx, &mut col).unwrap();
+        assert_eq!(col.out.len(), 3);
+        assert_eq!(col.overflow, 7);
+    }
+
+    #[test]
+    fn a_long_replacement_is_cut_in_the_preview_and_charged_to_the_byte_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // 25 files of 40 lines with 50 matches each: 50,000 matches, all within the hit limits.
+        let body = format!("{}\n", "foo ".repeat(50)).repeat(40);
+        let files = 25;
+        for i in 0..files {
+            fs::write(dir.path().join(format!("f{i:02}.txt")), &body).unwrap();
+        }
+        let long = "é".repeat(50 * 1024);
+        let report = run_scan(dir.path(), &spec("foo", &long), &ScanOptions::default());
+        assert_eq!(report.total_matches(), files * 2_000);
+
+        let shown_rep = format!("{}…", "é".repeat(MAX_SHOWN_REPLACEMENT / 2));
+        let cost = "foo".len() + shown_rep.len();
+        let stored: usize = report.files.iter().map(shown).sum();
+        assert_eq!(stored, MAX_PREVIEW_TOTAL_BYTES / cost);
+        assert!(stored < MAX_PREVIEW_TOTAL_HITS);
+        assert_eq!(report.hidden_matches(), files * 2_000 - stored);
+        assert!(
+            report
+                .files
+                .iter()
+                .all(|f| shown(f) + f.hidden_matches == f.match_count)
+        );
+        for m in report.files.iter().flat_map(|f| &f.matches) {
+            for r in &m.replaced_ranges {
+                assert_eq!(&m.replaced[r.clone()], shown_rep);
+            }
+        }
+        let notice = report.truncation_notice().unwrap();
+        assert!(
+            notice.contains(&format!(
+                "{} more matches not shown",
+                report.hidden_matches()
+            )),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn apply_inserts_the_full_replacement_the_preview_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, "x foo y").unwrap();
+        let long = "日".repeat(10_000);
+        let spec = spec("foo", &long);
+        let report = run_scan(dir.path(), &spec, &ScanOptions::default());
+        let line = &report.files[0].matches[0];
+        assert!(line.replaced.len() < 2 * MAX_SHOWN_REPLACEMENT);
+        assert!(line.replaced.ends_with("… y"));
+        let applied = run_apply(&report.files, &spec, backup.path());
+        assert_eq!(applied.replacements(), 1);
+        assert_eq!(fs::read_to_string(&file).unwrap(), format!("x {long} y"));
+    }
+
+    #[test]
+    fn matches_past_the_byte_budget_are_counted_as_hidden() {
+        let re = Regex::new("foo").unwrap();
+        let budget = Budget {
+            lines: 100,
+            hits: 100,
+            bytes: 2 * ("foo".len() + "bar".len()),
+        };
+        let found = find_matches("foo foo foo foo", &re, &spec("foo", "bar"), &budget);
+        assert_eq!(found.count, 4);
+        assert_eq!(found.shown, 2);
+        assert_eq!(found.bytes, 12);
+        assert_eq!(found.matches[0].replaced, "bar bar foo foo");
+    }
+
+    #[test]
+    fn a_multi_line_match_ending_in_a_multi_byte_character_is_shown() {
+        for end in ["é", "日", "😀"] {
+            for eol in ["\n", "\r\n"] {
+                let dir = tempfile::tempdir().unwrap();
+                let body = format!("x a one{eol}two {end} y{eol}next{eol}");
+                fs::write(dir.path().join("m.txt"), body).unwrap();
+                let pattern = format!("(?s)a.*?{end}");
+                let report = run_scan(
+                    dir.path(),
+                    &regex_spec(&pattern, "R"),
+                    &ScanOptions::default(),
+                );
+                let file = &report.files[0];
+                assert_eq!(file.match_count, 1);
+                assert_eq!(file.hidden_matches, 0);
+                let m = &file.matches[0];
+                assert_eq!(m.line_number, 1);
+                assert_eq!(m.line, format!(r"x a one\ntwo {end} y"));
+                assert_eq!(&m.line[m.ranges[0].clone()], format!(r"a one\ntwo {end}"));
+                assert_eq!(m.replaced, "x R y");
+            }
+        }
+    }
+
+    #[test]
+    fn random_text_never_splits_a_character() {
+        let pieces = [
+            "a", "X", "b", " ", "é", "日", "😀", "\n", "\r\n", "\r", "aé", "X\n",
+        ];
+        let patterns = [
+            r"(?s)a.*?X",
+            r"(?s)a.*?é",
+            r"(?s)日.*?😀",
+            r"(?s)é.",
+            r"\r?\n",
+            r"(?s).😀",
+            r"[^a]+",
+        ];
+        let compiled: Vec<Regex> = patterns.iter().map(|p| Regex::new(p).unwrap()).collect();
+        // xorshift64: a fixed seed keeps failures reproducible.
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let full = Budget {
+            lines: MAX_PREVIEW_TOTAL_LINES,
+            hits: MAX_PREVIEW_TOTAL_HITS,
+            bytes: MAX_PREVIEW_TOTAL_BYTES,
+        };
+        for _ in 0..400 {
+            let len = (next() % 1500) as usize;
+            let mut text = String::new();
+            for _ in 0..len {
+                text.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            }
+            let small = Budget {
+                bytes: (next() % 4000) as usize,
+                ..full
+            };
+            for re in &compiled {
+                let rep = if next() % 2 == 0 { "<$0>" } else { "日\n" };
+                let spec = regex_spec(re.as_str(), rep);
+                for budget in [&full, &small] {
+                    let found = find_matches(&text, re, &spec, budget);
+                    assert!(found.bytes <= budget.bytes);
+                    for m in &found.matches {
+                        for r in &m.ranges {
+                            assert!(m.line.get(r.clone()).is_some());
+                        }
+                        for r in &m.replaced_ranges {
+                            assert!(m.replaced.get(r.clone()).is_some());
+                        }
+                    }
+                }
+                let _ = replace_text(&text, re, &spec, LineEnding::CrLf);
+            }
+        }
     }
 }
