@@ -54,6 +54,8 @@ mod viewer;
 pub(crate) struct InputQueue {
     /// Events to hand to egui at the start of the next frame.
     pub pending: Vec<egui::Event>,
+    /// Paste key presses delivered with `pending`, as the Win32 message hook would see them.
+    pub paste_presses: u32,
     /// Frames that have started since the last injection (0 = not delivered yet).
     pub delivered_frames: u32,
     /// Where the mouse pointer was last placed by a script (for wheel events).
@@ -172,6 +174,9 @@ pub fn raw_input(app: &mut ZxrawApp, raw: &mut egui::RawInput) {
     if !hook.input.pending.is_empty() {
         raw.events.append(&mut hook.input.pending);
         hook.input.delivered_frames = 0;
+    }
+    for _ in 0..std::mem::take(&mut hook.input.paste_presses) {
+        crate::paste_key::note_press();
     }
     hook.input.delivered_frames = hook.input.delivered_frames.saturating_add(1);
 }
@@ -943,6 +948,44 @@ fn parse_key(rest: &str) -> Result<Vec<egui::Event>, String> {
         .collect())
 }
 
+/// Key events as egui-winit delivers them from a real keyboard: Ctrl+X/C/V (and the
+/// Shift+Delete, Ctrl+Insert, Shift+Insert forms) become `Cut`, `Copy` and `Paste` with no key
+/// press, and a paste is reported only when the clipboard holds text (its content is not
+/// used). Also returns the number of paste presses the Win32 message hook would see.
+fn as_winit_delivers(events: &[egui::Event], clipboard_has_text: bool) -> (Vec<egui::Event>, u32) {
+    use egui::Key;
+    let mut out = Vec::new();
+    let mut pastes = 0;
+    for event in events {
+        let egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers: m,
+            ..
+        } = event
+        else {
+            out.push(event.clone());
+            continue;
+        };
+        let (key, m) = (*key, *m);
+        if (m.command && key == Key::X) || (m.shift && key == Key::Delete) {
+            out.push(egui::Event::Cut);
+        } else if (m.command && key == Key::C) || (m.ctrl && key == Key::Insert) {
+            out.push(egui::Event::Copy);
+        } else if (m.command && key == Key::V) || (m.shift && key == Key::Insert) {
+            if !m.alt && (key == Key::V || !m.ctrl) {
+                pastes += 1;
+            }
+            if clipboard_has_text {
+                out.push(egui::Event::Paste("text".into()));
+            }
+        } else {
+            out.push(event.clone());
+        }
+    }
+    (out, pastes)
+}
+
 fn script_tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let Some(mut script) = app.testhook.script.take() else {
         return;
@@ -1464,7 +1507,15 @@ fn exec(
                 Ok(Flow::Wait("sleeping".into()))
             }
         }
-        Step::Key(events) => Ok(inject(app, st, events)),
+        Step::Key(events) => {
+            if st.phase == 0 {
+                let (events, pastes) = as_winit_delivers(events, forge_win::clipboard_has_text());
+                app.testhook.input.paste_presses += pastes;
+                Ok(inject(app, st, &events))
+            } else {
+                Ok(inject(app, st, &[]))
+            }
+        }
         Step::Text(text) => Ok(inject(app, st, &[egui::Event::Text(text.clone())])),
         Step::Pointer(pos) => {
             app.testhook.input.pointer = Some(*pos);

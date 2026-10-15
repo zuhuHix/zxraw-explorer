@@ -215,7 +215,8 @@ fn ask_after_cloud_check(
                 ask_cloud_download(app, body, kind, pending);
             }
             CloudCheckAction::Start => start_pending_transfer(app, sources, dest, kind, clipboard),
-            CloudCheckAction::Ignore => {}
+            // Cannot happen (the result is for this check), but never drop a transfer silently.
+            CloudCheckAction::Ignore => app.toast_err("The transfer did not start; try again"),
         }
         return;
     }

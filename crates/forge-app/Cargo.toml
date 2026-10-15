@@ -28,6 +28,7 @@ lru.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
+winit.workspace = true
 rfd.workspace = true
 image = { workspace = true, features = ["png"] }
 kamadak-exif.workspace = true

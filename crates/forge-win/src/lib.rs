@@ -38,7 +38,8 @@ pub mod watch;
 pub mod window;
 
 pub use clipboard::{
-    ClipboardEffect, clear_if_owned_files, clipboard_sequence, get_files, set_files,
+    ClipboardEffect, clear_if_owned_files, clipboard_has_text, clipboard_sequence, get_files,
+    is_paste_keydown, set_files, set_files_without_text,
 };
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use file_types::{

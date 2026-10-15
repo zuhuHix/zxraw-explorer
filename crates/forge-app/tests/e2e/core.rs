@@ -698,3 +698,172 @@ fn dragging_a_marquee_selects_virtual_rows_and_grid_tiles() {
         grid_shot.display()
     );
 }
+
+/// Scenarios that use the real Windows clipboard run one at a time.
+fn clipboard_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Two folders with a file each under `<sandbox>/Desktop`, and an empty `<sandbox>/work`.
+fn clipboard_fixture(sandbox: &Path) -> (PathBuf, PathBuf, [PathBuf; 2]) {
+    let desktop = sandbox.join("Desktop");
+    let work = sandbox.join("work");
+    write_file(&desktop.join("Shoot A").join("a.txt"), b"folder a");
+    write_file(
+        &desktop.join("Shoot B").join("nested").join("b.txt"),
+        b"folder b",
+    );
+    fs::create_dir_all(&work).unwrap();
+    let folders = [desktop.join("Shoot A"), desktop.join("Shoot B")];
+    (desktop, work, folders)
+}
+
+fn assert_folders_moved(work: &Path, folders: &[PathBuf; 2]) {
+    for folder in folders {
+        assert!(!folder.exists(), "{} was not moved away", folder.display());
+    }
+    assert_eq!(
+        fs::read(work.join("Shoot A").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+    assert_eq!(
+        fs::read(work.join("Shoot B").join("nested").join("b.txt")).unwrap(),
+        b"folder b"
+    );
+}
+
+/// The reported bug: folders cut in Explorer (`CF_HDROP` + "Preferred DropEffect" = move, and
+/// no text) and pasted with a real Ctrl+V on the same volume. egui-winit drops Ctrl+V when
+/// the clipboard has no text, so nothing happened at all.
+#[test]
+fn explorer_cut_of_two_folders_pastes_with_ctrl_v() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (_, work, folders) = clipboard_fixture(sandbox.path());
+    let script = format!(
+        "navigate {work}\n\
+         click-empty\n\
+         ui system clipboard-files cut {a}, {b}\n\
+         key ctrl+V\n\
+         wait-exists {moved}\n\
+         wait-jobs 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        work = shown(&work),
+        a = shown(&folders[0]),
+        b = shown(&folders[1]),
+        moved = shown(&work.join("Shoot B").join("nested").join("b.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_folders_moved(&work, &folders);
+}
+
+/// The same with Shift+Insert, before anything in the window was clicked, and a copy rather
+/// than a cut: the sources stay.
+#[test]
+fn explorer_copy_pastes_with_shift_insert_without_a_click() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (_, work, folders) = clipboard_fixture(sandbox.path());
+    let script = format!(
+        "navigate {work}\n\
+         ui system clipboard-files copy {a}, {b}\n\
+         key shift+Insert\n\
+         wait-exists {copied}\n\
+         wait-jobs 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        work = shown(&work),
+        a = shown(&folders[0]),
+        b = shown(&folders[1]),
+        copied = shown(&work.join("Shoot B").join("nested").join("b.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(
+        folders.iter().all(|f| f.is_dir()),
+        "a copy keeps the sources"
+    );
+    assert_eq!(
+        fs::read(work.join("Shoot A").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+    let _ = forge_win::clear_if_owned_files(&folders, None);
+}
+
+/// Cut and paste inside ZXraw with the real shortcuts: a file and a folder.
+#[test]
+fn in_app_cut_pastes_with_ctrl_v() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    write_file(&desktop.join("loose.txt"), b"loose");
+    let script = format!(
+        "navigate {desktop}\n\
+         select Shoot A, loose.txt\n\
+         key ctrl+X\n\
+         navigate {work}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         wait-exists {moved}\n\
+         wait-jobs 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+        work = shown(&work),
+        moved = shown(&work.join("loose.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(!folders[0].exists() && !desktop.join("loose.txt").exists());
+    assert_eq!(
+        fs::read(work.join("Shoot A").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+    assert_eq!(fs::read(work.join("loose.txt")).unwrap(), b"loose");
+    assert!(folders[1].is_dir(), "an item that was not cut stays");
+}
+
+/// An older ZXraw copy must not shadow a newer cut from Explorer. Paste here is the
+/// command the background context menu runs.
+#[test]
+fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    write_file(&desktop.join("stale.txt"), b"stale");
+    let script = format!(
+        "navigate {desktop}\n\
+         select stale.txt\n\
+         cmd Copy\n\
+         ui system clipboard-files cut {a}, {b}\n\
+         navigate {work}\n\
+         cmd Paste\n\
+         wait-exists {moved}\n\
+         wait-jobs 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+        work = shown(&work),
+        a = shown(&folders[0]),
+        b = shown(&folders[1]),
+        moved = shown(&work.join("Shoot B").join("nested").join("b.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_folders_moved(&work, &folders);
+    assert!(
+        !work.join("stale.txt").exists(),
+        "the stale in-app copy was pasted"
+    );
+}
