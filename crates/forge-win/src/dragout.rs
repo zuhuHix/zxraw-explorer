@@ -45,6 +45,30 @@ pub fn active_window() -> Result<isize> {
     Err(WinError::Unsupported)
 }
 
+/// One file or folder to drag out, with what the caller already knows about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragItem {
+    pub path: PathBuf,
+    /// Kind as the caller's listing showed it (`Some(true)` = folder). `None` means unknown;
+    /// only then is a local path statted to give a clear error for a vanished item.
+    pub is_dir: Option<bool>,
+    /// The caller knows this path is on a network share (for example a mapped network drive,
+    /// which only the drive type reveals). UNC paths are also recognized here lexically.
+    pub on_network: bool,
+}
+
+impl DragItem {
+    /// An item with no caller knowledge: its kind is unknown and only UNC paths count as
+    /// network paths.
+    pub fn unknown(path: PathBuf) -> Self {
+        Self {
+            path,
+            is_dir: None,
+            on_network: false,
+        }
+    }
+}
+
 /// Runs the modal shell drag on the calling UI thread.
 ///
 /// `allow_move` defaults to false at call sites because accepting MOVE in Explorer on the
@@ -55,10 +79,37 @@ pub fn drag_out(hwnd: isize, paths: &[PathBuf], allow_move: bool) -> Result<Drop
 }
 
 /// Runs the modal shell drag and uses an already-cached app thumbnail when one is available.
+/// The kind of each path is unknown, so local paths are statted; prefer [`drag_out_items`].
 #[cfg(windows)]
 pub fn drag_out_with_thumbnail(
     hwnd: isize,
     paths: &[PathBuf],
+    allow_move: bool,
+    thumbnail: Option<DragThumbnail<'_>>,
+) -> Result<DropResult> {
+    let items: Vec<_> = paths.iter().cloned().map(DragItem::unknown).collect();
+    drag_out_items(hwnd, &items, allow_move, thumbnail)
+}
+
+/// Runs the modal shell drag for `items` on the calling UI thread, which it must not freeze
+/// on a slow or offline share.
+///
+/// * **Network drags** (any item with `on_network` set, or any UNC path): nothing touches
+///   the share before the drag starts. The data object is an empty shell data object given
+///   only a `CF_HDROP` block built from the path strings. There is no `metadata`, no
+///   `SHParseDisplayName` and no shell item array, since those resolve each path on the
+///   server and block until Windows gives up. The drag image is the app's cached thumbnail
+///   when one is supplied, or else a stock file or folder icon from the local system
+///   resources; the shell is never asked for the remote item's icon. The drop target reads
+///   the paths and does any remote work itself.
+/// * **Local drags**: each path is parsed to a shell item id list and the data object
+///   comes from a shell item array, so targets get the full set of shell formats. A path is
+///   statted only when its kind is unknown (`is_dir == None`). Without a thumbnail, the
+///   drag image is the shell icon of the first item.
+#[cfg(windows)]
+pub fn drag_out_items(
+    hwnd: isize,
+    items: &[DragItem],
     allow_move: bool,
     thumbnail: Option<DragThumbnail<'_>>,
 ) -> Result<DropResult> {
@@ -76,12 +127,12 @@ pub fn drag_out_with_thumbnail(
         ));
     }
     let _apartment = OleApartment::new()?;
-    let pidls = parse_existing_paths(paths)?;
-    let data = create_data_object(&pidls)?;
+    let (data, pidls) = build_data_object(items)?;
     // SHDoDragDrop remains responsible for the OLE source and effect negotiation. The helper
     // adds its bitmap to this shell data object; failure leaves the existing shell fallback in
     // place and must not prevent the file drag itself.
-    let _drag_image = match initialize_drag_image(&data, &pidls[0], thumbnail) {
+    let first_is_dir = items.first().and_then(|item| item.is_dir).unwrap_or(false);
+    let _drag_image = match initialize_drag_image(&data, pidls.first(), first_is_dir, thumbnail) {
         Ok(helper) => Some(helper),
         Err(error) => {
             tracing::debug!("could not initialize file drag image: {error}");
@@ -120,19 +171,123 @@ pub fn drag_out_with_thumbnail(
     Err(WinError::Unsupported)
 }
 
+#[cfg(not(windows))]
+pub fn drag_out_items(
+    _hwnd: isize,
+    _items: &[DragItem],
+    _allow_move: bool,
+    _thumbnail: Option<DragThumbnail<'_>>,
+) -> Result<DropResult> {
+    Err(WinError::Unsupported)
+}
+
 /// Builds the same shell data object used by [`drag_out`] and reads its CF_HDROP paths back.
 /// This verifies the actual IDataObject contract without starting a modal external drag.
 #[cfg(windows)]
 pub fn data_object_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let items: Vec<_> = paths.iter().cloned().map(DragItem::unknown).collect();
+    data_object_item_paths(&items)
+}
+
+/// Like [`data_object_paths`], for the data object [`drag_out_items`] would build.
+#[cfg(windows)]
+pub fn data_object_item_paths(items: &[DragItem]) -> Result<Vec<PathBuf>> {
     let _apartment = OleApartment::new()?;
-    let pidls = parse_existing_paths(paths)?;
-    let data = create_data_object(&pidls)?;
+    let (data, _pidls) = build_data_object(items)?;
     read_hdrop_paths(&data)
 }
 
 #[cfg(not(windows))]
 pub fn data_object_paths(_paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Err(WinError::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn data_object_item_paths(_items: &[DragItem]) -> Result<Vec<PathBuf>> {
+    Err(WinError::Unsupported)
+}
+
+/// How the drag's data object is built.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataSource {
+    /// Shell item array from parsed id lists (local paths only; resolves each path).
+    ShellItems,
+    /// `CF_HDROP` built from the path strings alone (no file system or network access).
+    HdropOnly,
+}
+
+/// The pure decision of what `build_data_object` does with each item.
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DragPlan {
+    source: DataSource,
+    /// Whether item `i` is statted before the drag.
+    stat: Vec<bool>,
+}
+
+#[cfg(windows)]
+fn plan_drag(items: &[DragItem]) -> Result<DragPlan> {
+    if items.is_empty() {
+        return Err(WinError::Invalid("drag-out needs at least one path".into()));
+    }
+    if items
+        .iter()
+        .any(|item| item.on_network || is_unc_path(&item.path))
+    {
+        return Ok(DragPlan {
+            source: DataSource::HdropOnly,
+            stat: vec![false; items.len()],
+        });
+    }
+    Ok(DragPlan {
+        source: DataSource::ShellItems,
+        stat: items.iter().map(|item| item.is_dir.is_none()).collect(),
+    })
+}
+
+/// Lexical: `\\server\share\...` or `\\?\UNC\server\share\...`.
+#[cfg(windows)]
+fn is_unc_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
+}
+
+/// Bytes of a wide-character `DROPFILES` block for `paths`: the 20-byte header followed by
+/// NUL-terminated UTF-16 paths and a final NUL. Pure: it never looks at the files.
+#[cfg(windows)]
+fn hdrop_bytes(paths: &[&Path]) -> Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const HEADER: u32 = 20;
+    if paths.is_empty() {
+        return Err(WinError::Invalid("drag-out needs at least one path".into()));
+    }
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&HEADER.to_le_bytes()); // pFiles
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+    bytes.extend_from_slice(&0i32.to_le_bytes()); // fNC
+    bytes.extend_from_slice(&1i32.to_le_bytes()); // fWide
+    for path in paths {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if wide.is_empty() || wide.contains(&0) {
+            return Err(WinError::Invalid(format!(
+                "cannot drag out the path {}",
+                path.display()
+            )));
+        }
+        for unit in wide.into_iter().chain(Some(0)) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    Ok(bytes)
 }
 
 #[cfg(windows)]
@@ -169,24 +324,44 @@ impl Drop for Pidl {
     }
 }
 
+/// Builds the drag's data object following [`plan_drag`]. The returned id lists are empty
+/// for an HDROP-only object.
 #[cfg(windows)]
-fn parse_existing_paths(paths: &[PathBuf]) -> Result<Vec<Pidl>> {
+fn build_data_object(
+    items: &[DragItem],
+) -> Result<(windows::Win32::System::Com::IDataObject, Vec<Pidl>)> {
+    let plan = plan_drag(items)?;
+    match plan.source {
+        DataSource::HdropOnly => {
+            let paths: Vec<&Path> = items.iter().map(|item| item.path.as_path()).collect();
+            Ok((create_hdrop_data_object(&paths)?, Vec::new()))
+        }
+        DataSource::ShellItems => {
+            let pidls = parse_paths(items, &plan.stat)?;
+            Ok((create_data_object(&pidls)?, pidls))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn parse_paths(items: &[DragItem], stat: &[bool]) -> Result<Vec<Pidl>> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows::Win32::UI::Shell::SHParseDisplayName;
     use windows::core::PCWSTR;
 
-    if paths.is_empty() {
-        return Err(WinError::Invalid("drag-out needs at least one path".into()));
-    }
-    paths
+    items
         .iter()
-        .map(|path| {
-            std::fs::metadata(path).map_err(|source| WinError::Io {
-                op: "validate drag-out path",
-                path: path.clone(),
-                source,
-            })?;
+        .zip(stat)
+        .map(|(item, &stat)| {
+            let path = &item.path;
+            if stat {
+                std::fs::metadata(path).map_err(|source| WinError::Io {
+                    op: "validate drag-out path",
+                    path: path.clone(),
+                    source,
+                })?;
+            }
             let wide = path
                 .as_os_str()
                 .encode_wide()
@@ -226,6 +401,54 @@ fn create_data_object(pidls: &[Pidl]) -> Result<windows::Win32::System::Com::IDa
         .map_err(|e| crate::api_err("IShellItemArray::BindToHandler(BHID_DataObject)", e))
 }
 
+/// An empty shell data object (no id lists, so nothing is resolved) given a `CF_HDROP`
+/// block built from the path strings. The shell object also stores the drag image helper's
+/// private formats, which a hand-written `IDataObject` would have to support itself.
+#[cfg(windows)]
+fn create_hdrop_data_object(paths: &[&Path]) -> Result<windows::Win32::System::Com::IDataObject> {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::System::Com::{
+        DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    };
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock};
+    use windows::Win32::System::Ole::CF_HDROP;
+    use windows::Win32::UI::Shell::SHCreateDataObject;
+
+    let bytes = hdrop_bytes(paths)?;
+    let data: IDataObject = unsafe { SHCreateDataObject(None, None, None::<&IDataObject>) }
+        .map_err(|e| crate::api_err("SHCreateDataObject", e))?;
+    let global = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }
+        .map_err(|e| crate::api_err("GlobalAlloc(CF_HDROP)", e))?;
+    let ptr = unsafe { GlobalLock(global) };
+    if ptr.is_null() {
+        let error = crate::last_io_err("GlobalLock CF_HDROP", Path::new("CF_HDROP"));
+        let _ = unsafe { GlobalFree(Some(global)) };
+        return Err(error);
+    }
+    {
+        let _locked = LockedGlobal(global);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len()) };
+    }
+    let format = FORMATETC {
+        cfFormat: CF_HDROP.0,
+        ptd: std::ptr::null_mut(),
+        dwAspect: DVASPECT_CONTENT.0,
+        lindex: -1,
+        tymed: TYMED_HGLOBAL.0 as u32,
+    };
+    let medium = STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: global },
+        pUnkForRelease: std::mem::ManuallyDrop::new(None),
+    };
+    // With fRelease = TRUE the data object owns the block once SetData succeeds.
+    if let Err(e) = unsafe { data.SetData(&format, &medium, true) } {
+        let _ = unsafe { GlobalFree(Some(global)) };
+        return Err(crate::api_err("IDataObject::SetData(CF_HDROP)", e));
+    }
+    Ok(data)
+}
+
 #[cfg(windows)]
 struct DragPixels {
     width: u32,
@@ -249,7 +472,8 @@ impl Drop for DragBitmap {
 #[cfg(windows)]
 fn initialize_drag_image(
     data: &windows::Win32::System::Com::IDataObject,
-    first_item: &Pidl,
+    first_item: Option<&Pidl>,
+    first_is_dir: bool,
     thumbnail: Option<DragThumbnail<'_>>,
 ) -> Result<windows::Win32::UI::Shell::IDragSourceHelper2> {
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
@@ -258,9 +482,14 @@ fn initialize_drag_image(
         CLSID_DragDropHelper, DSH_ALLOWDROPDESCRIPTIONTEXT, IDragSourceHelper2, SHDRAGIMAGE,
     };
 
+    // Without an id list (network drags) the shell is not asked for the item's icon, which
+    // would resolve it on the server; a local stock icon stands in instead.
     let pixels = thumbnail
         .and_then(|image| build_drag_pixels(image.width, image.height, image.rgba).ok())
-        .or_else(|| shell_icon_pixels(first_item).ok())
+        .or_else(|| match first_item {
+            Some(pidl) => shell_icon_pixels(pidl).ok(),
+            None => stock_icon_pixels(first_is_dir).ok(),
+        })
         .ok_or_else(|| WinError::Invalid("no image is available for the file drag".into()))?;
     let bitmap = create_drag_bitmap(&pixels)?;
     let helper: IDragSourceHelper2 =
@@ -293,9 +522,6 @@ fn initialize_drag_image(
 #[cfg(windows)]
 fn shell_icon_pixels(first_item: &Pidl) -> Result<DragPixels> {
     use windows::Win32::Foundation::SIZE;
-    use windows::Win32::Graphics::Gdi::{
-        BITMAP, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW, HGDIOBJ, ReleaseDC,
-    };
     use windows::Win32::UI::Shell::{
         IShellItemImageFactory, SHCreateShellItemArrayFromIDLists, SIIGBF, SIIGBF_ICONONLY,
         SIIGBF_SCALEUP,
@@ -320,7 +546,62 @@ fn shell_icon_pixels(first_item: &Pidl) -> Result<DragPixels> {
         )
     }
     .map_err(|e| crate::api_err("IShellItemImageFactory::GetImage", e))?;
-    let bitmap = DragBitmap(hbitmap);
+    bitmap_pixels(&DragBitmap(hbitmap))
+}
+
+/// A stock file or folder icon from the local system resources. It names no path, so it
+/// cannot touch a share.
+#[cfg(windows)]
+fn stock_icon_pixels(is_dir: bool) -> Result<DragPixels> {
+    use windows::Win32::UI::Shell::{
+        SHDefExtractIconW, SHGSI_ICONLOCATION, SHGetStockIconInfo, SHSTOCKICONINFO,
+        SIID_DOCNOASSOC, SIID_FOLDER,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
+    use windows::core::PCWSTR;
+
+    let mut info = SHSTOCKICONINFO {
+        cbSize: std::mem::size_of::<SHSTOCKICONINFO>() as u32,
+        ..Default::default()
+    };
+    let id = if is_dir { SIID_FOLDER } else { SIID_DOCNOASSOC };
+    unsafe { SHGetStockIconInfo(id, SHGSI_ICONLOCATION, &mut info) }
+        .map_err(|e| crate::api_err("SHGetStockIconInfo", e))?;
+    let mut icon = HICON::default();
+    unsafe {
+        SHDefExtractIconW(
+            PCWSTR(info.szPath.as_ptr()),
+            info.iIcon,
+            0,
+            Some(&mut icon),
+            None,
+            DRAG_IMAGE_EDGE,
+        )
+    }
+    .ok()
+    .map_err(|e| crate::api_err("SHDefExtractIconW", e))?;
+    if icon.0.is_null() {
+        return Err(WinError::Invalid("the stock drag icon is empty".into()));
+    }
+    let mut parts = ICONINFO::default();
+    let got = unsafe { GetIconInfo(icon, &mut parts) };
+    let _ = unsafe { DestroyIcon(icon) };
+    got.map_err(|e| crate::api_err("GetIconInfo", e))?;
+    let _mask = DragBitmap(parts.hbmMask);
+    if parts.hbmColor.0.is_null() {
+        return Err(WinError::Invalid(
+            "the stock drag icon has no color bitmap".into(),
+        ));
+    }
+    bitmap_pixels(&DragBitmap(parts.hbmColor))
+}
+
+/// Reads a GDI bitmap into drag pixels.
+#[cfg(windows)]
+fn bitmap_pixels(bitmap: &DragBitmap) -> Result<DragPixels> {
+    use windows::Win32::Graphics::Gdi::{
+        BITMAP, DIB_RGB_COLORS, GetDC, GetDIBits, GetObjectW, HGDIOBJ, ReleaseDC,
+    };
 
     let mut info = unsafe { std::mem::zeroed::<BITMAP>() };
     let copied = unsafe {
@@ -618,7 +899,138 @@ fn drop_result(value: u32) -> DropResult {
 #[cfg(windows)]
 #[cfg(test)]
 mod tests {
-    use super::{bitmap_info, build_drag_pixels, data_object_paths};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        DataSource, DragItem, bitmap_info, build_drag_pixels, data_object_item_paths,
+        data_object_paths, hdrop_bytes, is_unc_path, plan_drag, stock_icon_pixels,
+    };
+
+    fn item(path: &str, is_dir: Option<bool>, on_network: bool) -> DragItem {
+        DragItem {
+            path: PathBuf::from(path),
+            is_dir,
+            on_network,
+        }
+    }
+
+    #[test]
+    fn network_paths_take_the_no_probe_branch() {
+        // UNC is recognized lexically even when the caller did not flag it.
+        for path in [r"\\server\share\a.jpg", r"\\?\UNC\server\share\a.jpg"] {
+            let plan = plan_drag(&[item(path, None, false)]).unwrap();
+            assert_eq!(plan.source, DataSource::HdropOnly, "{path}");
+            assert_eq!(plan.stat, vec![false]);
+        }
+        // A mapped drive is only known to the caller; one network item switches the whole
+        // drag, and nothing is statted even when the kind is unknown.
+        let plan = plan_drag(&[
+            item(r"C:\local.jpg", None, false),
+            item(r"Z:\remote.jpg", None, true),
+        ])
+        .unwrap();
+        assert_eq!(plan.source, DataSource::HdropOnly);
+        assert_eq!(plan.stat, vec![false, false]);
+    }
+
+    #[test]
+    fn known_kinds_are_not_statted() {
+        let plan = plan_drag(&[
+            item(r"C:\photos\a.jpg", Some(false), false),
+            item(r"C:\photos\album", Some(true), false),
+            item(r"C:\photos\unknown.jpg", None, false),
+        ])
+        .unwrap();
+        assert_eq!(plan.source, DataSource::ShellItems);
+        assert_eq!(plan.stat, vec![false, false, true]);
+        assert!(plan_drag(&[]).is_err());
+    }
+
+    #[test]
+    fn unc_detection_is_lexical_and_ignores_local_verbatim_paths() {
+        assert!(is_unc_path(Path::new(r"\\nas\media\x")));
+        assert!(!is_unc_path(Path::new(r"\\?\C:\x")));
+        assert!(!is_unc_path(Path::new(r"C:\x")));
+    }
+
+    #[test]
+    fn hdrop_block_is_a_wide_dropfiles_with_double_nul_terminator() {
+        let bytes = hdrop_bytes(&[Path::new(r"\\s\x\a"), Path::new("b")]).unwrap();
+        assert_eq!(&bytes[..4], &20u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1i32.to_le_bytes());
+        let wide: Vec<u16> = bytes[20..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let expected: Vec<u16> = "\\\\s\\x\\a\0b\0\0".encode_utf16().collect();
+        assert_eq!(wide, expected);
+        assert!(hdrop_bytes(&[]).is_err());
+    }
+
+    #[test]
+    fn unroutable_share_builds_its_data_object_without_waiting() {
+        // TEST-NET-1 is never routable: any probe of it would block for seconds.
+        let paths = vec![
+            PathBuf::from(r"\\192.0.2.1\x\a.jpg"),
+            PathBuf::from(r"\\192.0.2.1\x\folder"),
+        ];
+        let started = Instant::now();
+        let read_back = data_object_paths(&paths).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(read_back, paths);
+        assert!(elapsed < Duration::from_millis(250), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn flagged_network_items_are_neither_statted_nor_parsed() {
+        // A mapped-drive path the caller flagged is never statted or parsed, so even a path
+        // that does not exist builds (the drop target reports it, as Explorer would).
+        let path = r"C:\zx-missing-drag-test\nope.jpg";
+        assert_eq!(
+            data_object_item_paths(&[item(path, Some(false), true)]).unwrap(),
+            vec![PathBuf::from(path)]
+        );
+    }
+
+    #[test]
+    fn known_kind_local_items_skip_the_stat_but_still_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        let items = [
+            DragItem {
+                path: file.clone(),
+                is_dir: Some(false),
+                on_network: false,
+            },
+            DragItem {
+                path: dir.path().to_path_buf(),
+                is_dir: Some(true),
+                on_network: false,
+            },
+        ];
+        assert_eq!(
+            data_object_item_paths(&items).unwrap(),
+            vec![file, dir.path().to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn stock_icons_give_a_drag_image_for_files_and_folders() {
+        for is_dir in [false, true] {
+            let pixels = stock_icon_pixels(is_dir).unwrap();
+            assert!(pixels.width == 128 || pixels.height == 128);
+            assert!(
+                pixels
+                    .bgra
+                    .iter()
+                    .skip(3)
+                    .step_by(4)
+                    .any(|alpha| *alpha > 0)
+            );
+        }
+    }
 
     #[test]
     fn drag_dib_fits_within_128_pixels_and_uses_a_top_down_32_bit_header() {

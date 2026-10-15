@@ -3,10 +3,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 /// Quiet period after the last event before a folder is refreshed.
@@ -16,20 +17,54 @@ const MIN_GAP: Duration = Duration::from_millis(1000);
 const MIN_GAP_LARGE: Duration = Duration::from_secs(4);
 
 pub struct FolderWatcher {
-    watcher: Option<RecommendedWatcher>,
+    /// The folders to register, sent to the thread that owns the notify watcher.
+    /// Registering opens each folder (notify checks it and opens a handle), which blocks for
+    /// as long as an offline share takes to fail, so it never happens on the UI thread.
+    register: Option<Sender<HashSet<PathBuf>>>,
+    /// Sets sent to, and sets applied by, the registration thread (tests wait on these).
+    #[cfg_attr(not(test), allow(dead_code))]
+    sent: u64,
+    applied: Arc<AtomicU64>,
     rx: Receiver<PathBuf>,
     /// Directories shown by panes.
     watched: HashSet<PathBuf>,
     /// Copy of `watched` for the notify thread, which probes the filesystem so the UI
     /// thread never has to (an offline network path can block for seconds).
     shown: Arc<Mutex<HashSet<PathBuf>>>,
-    /// Directories registered with notify, including parents so a shown folder's
-    /// external deletion can be noticed.
-    registered: HashSet<PathBuf>,
     /// dir -> time of the most recent event
     pending: HashMap<PathBuf, Instant>,
     last_refresh: HashMap<PathBuf, Instant>,
     ctx: egui::Context,
+}
+
+/// Owns the notify watcher and keeps its registrations equal to the newest wanted set. A
+/// folder that is slow to open holds up only this thread; sets sent meanwhile collapse
+/// into the newest one.
+fn register_loop(
+    mut watcher: RecommendedWatcher,
+    wanted: Receiver<HashSet<PathBuf>>,
+    applied: Arc<AtomicU64>,
+) {
+    let mut registered: HashSet<PathBuf> = HashSet::new();
+    while let Ok(mut want) = wanted.recv() {
+        let mut taken = 1;
+        while let Ok(newer) = wanted.try_recv() {
+            want = newer;
+            taken += 1;
+        }
+        for gone in registered.difference(&want).cloned().collect::<Vec<_>>() {
+            let _ = watcher.unwatch(&gone);
+            registered.remove(&gone);
+        }
+        for new in want.difference(&registered).cloned().collect::<Vec<_>>() {
+            // Unwatchable folders (some network shares, removed drives) just don't
+            // auto-refresh; F5 still works.
+            if watcher.watch(&new, RecursiveMode::NonRecursive).is_ok() {
+                registered.insert(new);
+            }
+        }
+        applied.fetch_add(taken, Ordering::Release);
+    }
 }
 
 impl FolderWatcher {
@@ -71,48 +106,45 @@ impl FolderWatcher {
         })
         .map_err(|e| tracing::warn!("folder watcher unavailable: {e}"))
         .ok();
+        let applied = Arc::new(AtomicU64::new(0));
+        let register = watcher.and_then(|watcher| {
+            let (register, wanted) = unbounded();
+            let applied = Arc::clone(&applied);
+            std::thread::Builder::new()
+                .name("folder-watch-register".into())
+                .spawn(move || register_loop(watcher, wanted, applied))
+                .map_err(|e| tracing::warn!("folder watcher unavailable: {e}"))
+                .ok()
+                .map(|_| register)
+        });
         Self {
-            watcher,
+            register,
+            sent: 0,
+            applied,
             rx,
             watched: HashSet::new(),
             shown,
-            registered: HashSet::new(),
             pending: HashMap::new(),
             last_refresh: HashMap::new(),
             ctx,
         }
     }
 
-    /// Keep the watch set equal to `dirs` (the folders on screen).
+    /// Keep the watch set equal to `dirs` (the folders on screen). Touches no folder: the
+    /// registration thread does that.
     pub fn sync(&mut self, dirs: &[PathBuf]) {
-        let Some(w) = self.watcher.as_mut() else {
+        let Some(register) = &self.register else {
             return;
         };
         let want: HashSet<PathBuf> = dirs.iter().cloned().collect();
-        let mut register = want.clone();
-        register.extend(
-            want.iter()
-                .filter_map(|dir| dir.parent().map(Path::to_path_buf)),
-        );
-        for gone in self
-            .registered
-            .difference(&register)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            let _ = w.unwatch(&gone);
-            self.registered.remove(&gone);
+        if want == self.watched {
+            return;
         }
-        for new in register
-            .difference(&self.registered)
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            // Unwatchable folders (some network shares, removed drives) just don't
-            // auto-refresh; F5 still works.
-            if w.watch(&new, RecursiveMode::NonRecursive).is_ok() {
-                self.registered.insert(new);
-            }
+        // Parents too, so a shown folder's external deletion can be noticed.
+        let mut folders = want.clone();
+        folders.extend(want.iter().filter_map(|dir| dir.parent().map(Path::to_path_buf)));
+        if register.send(folders).is_ok() {
+            self.sent += 1;
         }
         for gone in self.watched.difference(&want).cloned().collect::<Vec<_>>() {
             self.pending.remove(&gone);
@@ -121,6 +153,17 @@ impl FolderWatcher {
             shown.clone_from(&want);
         }
         self.watched = want;
+    }
+
+    /// Waits until the registration thread has applied every set sent so far.
+    #[cfg(test)]
+    fn wait_registered(&self) {
+        let started = Instant::now();
+        while self.applied.load(Ordering::Acquire) < self.sent
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Folders that should be refreshed now. `size_of` gives the entry count for a dir so
@@ -184,6 +227,7 @@ mod tests {
         let mut w = FolderWatcher::new(egui::Context::default());
         let dir = d.path().to_path_buf();
         w.sync(std::slice::from_ref(&dir));
+        w.wait_registered();
         std::fs::write(dir.join("new.txt"), b"x").unwrap();
         let t0 = Instant::now();
         let mut got = Vec::new();
@@ -202,6 +246,7 @@ mod tests {
         std::fs::create_dir(&shown).unwrap();
         let mut watcher = FolderWatcher::new(egui::Context::default());
         watcher.sync(std::slice::from_ref(&shown));
+        watcher.wait_registered();
         std::fs::remove_dir(&shown).unwrap();
 
         let started = Instant::now();
@@ -211,5 +256,18 @@ mod tests {
             due = watcher.due(|_| 0);
         }
         assert_eq!(due, vec![shown]);
+    }
+
+    #[test]
+    fn showing_an_offline_share_never_waits_on_the_caller() {
+        // TEST-NET-1 (RFC 5737) is unroutable: registering it blocks until the network gives
+        // up, which must happen on the registration thread only.
+        let mut watcher = FolderWatcher::new(egui::Context::default());
+        let share = PathBuf::from(r"\\192.0.2.1\x\shoot");
+        let started = Instant::now();
+        watcher.sync(std::slice::from_ref(&share));
+        watcher.sync(&[share.clone(), share.join("day1")]);
+        watcher.sync(std::slice::from_ref(&share));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }

@@ -809,6 +809,29 @@ fn unterminated_quote_in_a_search_is_reported_not_crashed() {
 }
 
 #[test]
+fn rating_a_mixed_selection_rates_only_the_listed_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("shoot");
+    photos(&dir, &["a.jpg"]);
+    fs::create_dir_all(dir.join("sub")).unwrap();
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        "navigate {dir}\n\
+         select a.jpg, sub\n\
+         cmd Rate3\n\
+         ui library assert-rating {a} | 3\n\
+         select sub\n\
+         cmd Rate4\n\
+         assert-toast Select files to rate or label\n\
+         ui library assert-rating {a} | 3\n\
+         exit\n",
+        dir = shown(&dir),
+        a = shown(&dir.join("a.jpg")),
+    );
+    expect_ok(&run_app(sandbox.path(), &profile, &script));
+}
+
+#[test]
 fn note_follows_a_file_renamed_in_the_app() {
     let sandbox = tempfile::tempdir().unwrap();
     let dir = sandbox.path().join("shoot");
@@ -821,7 +844,9 @@ fn note_follows_a_file_renamed_in_the_app() {
          cmd Rename\n\
          type renamed.jpg\n\
          accept\n\
-         assert-exists {renamed}\n\
+         wait-exists {renamed}\n\
+         wait-jobs\n\
+         wait-frames 3\n\
          ui library assert-note {renamed} | Client proof\n\
          exit\n",
         dir = shown(&dir),

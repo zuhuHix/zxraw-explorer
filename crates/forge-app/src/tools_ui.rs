@@ -285,6 +285,8 @@ enum ToolPayload {
     Recycled(Result<(), String>),
     Synced(OpReport),
     BackupVerified(Result<BackupReport, String>),
+    /// Outcome of a background report export: the saved path, or a message for the window.
+    Exported(Result<PathBuf, String>),
 }
 
 enum UiAction {
@@ -341,6 +343,11 @@ enum DeferredAction {
         checks: Vec<RecycleCheck>,
     },
     ExecuteSync(SyncPlan),
+    /// Write an already-rendered backup check report to a path the user chose.
+    ExportVerify {
+        path: PathBuf,
+        text: String,
+    },
 }
 
 impl ToolWindow {
@@ -475,6 +482,11 @@ impl ToolWindow {
                     }
                     Err(error) => self.notice = Some(error),
                 },
+                ToolPayload::Exported(result) => {
+                    if let ToolState::Verify(state) = &mut self.state {
+                        apply_export_result(state, result);
+                    }
+                }
                 ToolPayload::Synced(report) => {
                     self.notice = Some(if report.failed.is_empty() {
                         format!(
@@ -1603,6 +1615,22 @@ fn launch_action(
                 Ok(())
             });
             ("sync-folders", title, handle)
+        }
+        DeferredAction::ExportVerify { path, text } => {
+            let title = format!("Saving report: {}", path.display());
+            let result_tx = result_tx.clone();
+            let ctx = ctx.clone();
+            let handle = jobs.spawn("export-verify", title.clone(), move |_job| {
+                let result = write_report_for_export(&path, &text);
+                let err = result.as_ref().err().cloned();
+                let _ = result_tx.send(ToolEnvelope {
+                    generation,
+                    payload: ToolPayload::Exported(result),
+                });
+                ctx.request_repaint();
+                err.map_or(Ok(()), Err)
+            });
+            ("export-verify", title, handle)
         }
     };
     let _ = (kind, title);
@@ -3485,11 +3513,16 @@ fn render_verify(id: u64, state: &mut VerifyState, ui: &mut egui::Ui) -> Option<
             }
         });
 
-    if let Some((path, csv)) = export {
-        // The report is no longer used here; the save only updates the export status.
-        let _ = export_verify_report(state, &path, csv);
-    }
-    None
+    // Rendering the text is pure computation; the write to the chosen path (which may be on a
+    // network share) runs on a job and reports back through `ToolPayload::Exported`.
+    export.map(|(path, csv)| {
+        let text = if csv {
+            report.to_csv()
+        } else {
+            report.to_text()
+        };
+        UiAction::Start(DeferredAction::ExportVerify { path, text })
+    })
 }
 
 /// Does `filter` show an entry with `status`?
@@ -3534,19 +3567,30 @@ fn export_verify_report(state: &mut VerifyState, path: &Path, csv: bool) -> Resu
     } else {
         report.to_text()
     };
-    match write_report_file(path, &text) {
-        Ok(()) => {
-            state.last_export = Some(path.to_path_buf());
+    let result = write_report_for_export(path, &text);
+    apply_export_result(state, result.clone());
+    result.map(|_| ())
+}
+
+/// Record the outcome of a report export in the window state.
+fn apply_export_result(state: &mut VerifyState, result: Result<PathBuf, String>) {
+    match result {
+        Ok(path) => {
+            state.last_export = Some(path);
             state.export_error = None;
-            Ok(())
         }
-        Err(error) => {
-            let message = format!("Could not save the report to {}: {error}", path.display());
+        Err(message) => {
             state.last_export = None;
-            state.export_error = Some(message.clone());
-            Err(message)
+            state.export_error = Some(message);
         }
     }
+}
+
+/// Write a rendered report and turn any failure into the message the window shows.
+fn write_report_for_export(path: &Path, text: &str) -> Result<PathBuf, String> {
+    write_report_file(path, text)
+        .map(|()| path.to_path_buf())
+        .map_err(|error| format!("Could not save the report to {}: {error}", path.display()))
 }
 
 /// Write `text` to `path` through a temporary file in the same folder, so a failed export
@@ -3642,6 +3686,34 @@ mod tests {
         let missing_folder = dir.path().join("no-such-folder").join("report.txt");
         assert!(write_report_file(&missing_folder, "text").is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn export_result_updates_window_status_on_success_and_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = VerifyState {
+            original: dir.path().to_path_buf(),
+            backup: None,
+            full: false,
+            detect_moves: false,
+            report: None,
+            filter: VerifyFilter::Problems,
+            last_export: None,
+            export_error: Some("old error".into()),
+        };
+        let target = dir.path().join("backup-check.txt");
+        let saved = write_report_for_export(&target, "ok").unwrap();
+        assert_eq!(saved, target);
+        apply_export_result(&mut state, Ok(saved.clone()));
+        assert_eq!(state.last_export.as_deref(), Some(target.as_path()));
+        assert!(state.export_error.is_none());
+
+        let missing = dir.path().join("no-such-folder").join("report.csv");
+        let message = write_report_for_export(&missing, "x").unwrap_err();
+        assert!(message.starts_with("Could not save the report to "), "{message}");
+        apply_export_result(&mut state, Err(message.clone()));
+        assert!(state.last_export.is_none());
+        assert_eq!(state.export_error.as_deref(), Some(message.as_str()));
     }
 
     #[test]

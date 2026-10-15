@@ -19,6 +19,7 @@ use crate::settings::Pin;
 use crate::theme;
 use crate::views::DragPaths;
 use forge_core::model::EntryKind;
+use forge_core::netpath::is_network_path;
 use forge_core::paths::paths_equal;
 
 use pins::{PinDrag, PinStatus, PinWatch, add_pins, move_pin, remove_pin, set_label};
@@ -297,8 +298,7 @@ fn quick_access_section(app: &mut ZxrawApp, ui: &mut Ui) {
     let released = ui.ctx().input(|i| i.pointer.any_released());
     if released && ui.rect_contains_pointer(area.response.rect) {
         if let Some(payload) = egui::DragAndDrop::take_payload::<DragPaths>(ui.ctx()) {
-            let paths = payload.0.clone();
-            pin_dropped(app, paths);
+            pin_dropped(app, payload.0.clone(), payload.1.clone());
         }
     }
 }
@@ -642,26 +642,45 @@ pub(crate) fn activate_pin(app: &mut ZxrawApp, index: usize) {
     }
 }
 
-/// Whether `path` is a file, decided from the listed entries of both panes. Only paths that
-/// are not listed touch the disk.
-fn is_file_path(app: &ZxrawApp, path: &Path) -> bool {
+/// The kind a path has in either pane's listing, `None` if neither pane lists it. No disk call.
+fn listed_kind(app: &ZxrawApp, path: &Path) -> Option<EntryKind> {
     let tab = app.tab();
-    let listed = std::iter::once(tab.focused())
+    std::iter::once(tab.focused())
         .chain(tab.other())
         .flat_map(|pane| pane.entries.iter())
-        .find(|e| e.path.as_path() == path);
-    match listed {
-        Some(entry) => entry.kind == EntryKind::File,
-        None => !path.is_dir(),
+        .find(|e| e.path.as_path() == path)
+        .map(|e| e.kind)
+}
+
+/// Whether a pinned path is a file. `carried` is the kind the pane listed when the drag
+/// started, `listed` the kind in the current listing. A folder pin is made for an unknown
+/// kind on a network path, so `local_probe` (a disk call) only runs for local paths.
+fn pin_is_file(
+    carried: Option<EntryKind>,
+    listed: Option<EntryKind>,
+    network: bool,
+    local_probe: impl FnOnce() -> bool,
+) -> bool {
+    match carried.or(listed) {
+        Some(kind) => kind == EntryKind::File,
+        // A folder pin that is really a file still works: activating it falls back to
+        // opening the file's location.
+        None if network => false,
+        None => local_probe(),
     }
 }
 
-/// Files or folders released on the Quick access section.
-fn pin_dropped(app: &mut ZxrawApp, paths: Vec<PathBuf>) {
+/// Files or folders released on the Quick access section, with the kind each had in the
+/// pane listing when the drag started.
+fn pin_dropped(app: &mut ZxrawApp, paths: Vec<PathBuf>, kinds: Vec<Option<EntryKind>>) {
     let items: Vec<(PathBuf, bool)> = paths
         .into_iter()
-        .map(|p| {
-            let file = is_file_path(app, &p);
+        .enumerate()
+        .map(|(i, p)| {
+            let carried = kinds.get(i).copied().flatten();
+            let listed = listed_kind(app, &p);
+            let network = is_network_path(&p);
+            let file = pin_is_file(carried, listed, network, || !p.is_dir());
             (p, file)
         })
         .collect();
@@ -682,15 +701,21 @@ pub fn pin_paths(app: &mut ZxrawApp, paths: Vec<(PathBuf, bool)>) {
 
 /// `PinToQuickAccess`: pins the selected entries, or the current folder if none.
 pub fn pin_selection(app: &mut ZxrawApp) {
-    let pane = app.pane();
-    let targets = pane.action_targets();
+    let (targets, kinds, folder) = {
+        let pane = app.pane();
+        let targets = pane.action_targets();
+        let kinds = pane.kinds_of(&targets);
+        (targets, kinds, pane.path.clone())
+    };
     let items: Vec<(PathBuf, bool)> = if targets.is_empty() {
-        vec![(pane.path.clone(), false)]
+        vec![(folder, false)]
     } else {
         targets
             .into_iter()
-            .map(|p| {
-                let file = is_file_path(app, &p);
+            .zip(kinds)
+            .map(|(p, kind)| {
+                let network = is_network_path(&p);
+                let file = pin_is_file(None, kind, network, || !p.is_dir());
                 (p, file)
             })
             .collect()
@@ -826,5 +851,46 @@ mod card_tests {
         finish_current(&mut watch, &f.root, true);
         watch.dismiss(&e.root);
         assert_eq!(roots(&watch.prompts), vec![f.root]);
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::*;
+
+    #[test]
+    fn carried_kind_decides_without_probing() {
+        let never = || -> bool { panic!("disk probed") };
+        assert!(pin_is_file(Some(EntryKind::File), None, false, never));
+        assert!(!pin_is_file(Some(EntryKind::Dir), None, false, never));
+        assert!(!pin_is_file(Some(EntryKind::Link), None, false, never));
+        // A carried kind wins over the current listing.
+        assert!(!pin_is_file(
+            Some(EntryKind::Dir),
+            Some(EntryKind::File),
+            false,
+            never
+        ));
+    }
+
+    #[test]
+    fn listed_kind_is_used_when_nothing_was_carried() {
+        let never = || -> bool { panic!("disk probed") };
+        assert!(pin_is_file(None, Some(EntryKind::File), false, never));
+        assert!(!pin_is_file(None, Some(EntryKind::Dir), true, never));
+    }
+
+    #[test]
+    fn network_path_with_unknown_kind_never_probes_the_disk() {
+        let pinned_as_file = pin_is_file(None, None, true, || -> bool {
+            panic!("network path must not be probed")
+        });
+        assert!(!pinned_as_file);
+    }
+
+    #[test]
+    fn local_path_with_unknown_kind_asks_the_disk() {
+        assert!(pin_is_file(None, None, false, || true));
+        assert!(!pin_is_file(None, None, false, || false));
     }
 }

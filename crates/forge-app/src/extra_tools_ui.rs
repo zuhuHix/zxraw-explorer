@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{ArchiveEntry, ExtractOptions};
 use forge_core::model::{EntryKind, MediaKind};
+use forge_core::netpath;
 use forge_core::ops::JobCtx;
 use forge_core::paths::rename_no_replace;
 use forge_jobs::{JobHandle, JobRegistry};
@@ -399,7 +400,10 @@ pub fn split_file(app: &mut ZxrawApp) {
         app.toast_err("Select a file to split");
         return;
     };
-    if !source.is_file() {
+    // The pane already listed the kind, so a folder is refused without touching the disk.
+    // Anything else is checked by the split worker, which reports a non-file as an error.
+    let listed = app.pane().kinds_of(std::slice::from_ref(&source))[0];
+    if matches!(listed, Some(EntryKind::Dir)) {
         app.toast_err("Only regular files can be split");
         return;
     }
@@ -576,9 +580,7 @@ pub(crate) fn automation_split(
     source: PathBuf,
     bytes: u64,
 ) -> Result<(), String> {
-    if !source.is_file() {
-        return Err(format!("{} is not a regular file", source.display()));
-    }
+    // Not checked here: the split worker reports a non-file as an error toast.
     let jobs = app.ops.jobs.clone();
     let event_tx = app.ops.tx.clone();
     let app_ctx = app.ops.ctx.clone();
@@ -2009,7 +2011,7 @@ fn start_create_archive(
 ) -> JobHandle {
     let filename = archive_filename(&name);
     let requested = directory.join(filename);
-    let output = unique_path(&requested);
+    let output = archive_output_hint(&requested);
     let title = format!(
         "Creating {}",
         output.file_name().unwrap_or_default().to_string_lossy()
@@ -2062,6 +2064,16 @@ fn archive_filename(name: &str) -> String {
     } else {
         format!("{clean}.zip")
     }
+}
+
+/// The name shown in the job title. A network folder gets the requested name without a stat,
+/// since a share can block for a long time. The job picks the free name when it publishes
+/// (`ArchiveStaging::publish`), so the final name is the same either way.
+fn archive_output_hint(requested: &Path) -> PathBuf {
+    if netpath::is_network_path(requested) {
+        return requested.to_path_buf();
+    }
+    unique_path(requested)
 }
 
 fn unique_path(requested: &Path) -> PathBuf {
@@ -2250,7 +2262,16 @@ fn start_split(
     let source_for_job = source.clone();
     jobs.spawn("file-split", title, move |job| {
         let job_ctx = JobCtx::from_job(job);
-        match forge_core::split::split_file(&source_for_job, bytes, &job_ctx) {
+        // Checked on the worker: a folder would otherwise fail with an unclear OS error.
+        let result = if source_for_job.is_file() {
+            forge_core::split::split_file(&source_for_job, bytes, &job_ctx)
+        } else {
+            Err(forge_core::CoreError::Invalid(format!(
+                "{} is not a regular file",
+                source_for_job.display()
+            )))
+        };
+        match result {
             Ok(report) => {
                 let _ = tx.send(Event::Toast(format!(
                     "Created {} part(s) and {}",
@@ -2539,5 +2560,34 @@ mod tests {
             build_contact_sheets(&sources, &options, &JobCtx::new(&cancel, &progress)).unwrap();
         assert_eq!(pages.len(), 1);
         println!("contact sheet: {}", pages[0].display());
+    }
+
+    #[test]
+    fn archive_name_hint_does_not_touch_a_network_share() {
+        let requested = Path::new(r"\\192.0.2.1\x\photos\Archive.zip");
+        let started = std::time::Instant::now();
+        assert_eq!(archive_output_hint(requested), requested.to_path_buf());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "a network destination must not be statted on the UI thread"
+        );
+    }
+
+    #[test]
+    fn archive_name_hint_skips_existing_local_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "zxraw-archive-hint-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let requested = dir.join("Archive.zip");
+        assert_eq!(archive_output_hint(&requested), requested);
+        fs::write(&requested, b"x").unwrap();
+        assert_eq!(archive_output_hint(&requested), dir.join("Archive (2).zip"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

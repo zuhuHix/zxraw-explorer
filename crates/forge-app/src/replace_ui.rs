@@ -22,6 +22,7 @@ use crossbeam_channel::Sender;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontId, RichText};
 use forge_core::ops::JobCtx;
+use forge_core::{EntryKind, netpath};
 use forge_core::text_replace::{
     self, ApplyReport, FilePreview, ReplaceUndo, ScanOptions, ScanReport, SearchSpec,
 };
@@ -190,6 +191,8 @@ impl Validation {
 struct ReplaceState {
     open: bool,
     roots: Vec<PathBuf>,
+    /// Whether the single root is a folder. Decided once in `open_with`, never per frame.
+    root_is_folder: bool,
     options: Options,
     validation: Validation,
     scan: Option<ScanRun>,
@@ -231,6 +234,14 @@ pub fn open(app: &mut ZxrawApp) {
 
 fn open_with(app: &ZxrawApp, state: &mut ReplaceState, roots: Vec<PathBuf>) {
     state.open = true;
+    state.root_is_folder = match roots.as_slice() {
+        [single] => {
+            let listed = app.pane().kinds_of(std::slice::from_ref(single))[0];
+            let is_pane_folder = *single == app.pane().path;
+            is_folder_root(single, listed, is_pane_folder)
+        }
+        _ => false,
+    };
     state.roots = roots;
     state.preview = None;
     prune_old_backups(app.paths.data.join("replace-backups"));
@@ -334,7 +345,11 @@ fn start_preview(app: &mut ZxrawApp, state: &mut ReplaceState) -> Result<(), Str
     let scan_options = state.validation.get(&options).clone()?;
     let spec = options.search_spec();
     let roots = state.roots.clone();
-    let title = format!("Finding “{}” in {}", options.find, scope_label(&roots));
+    let title = format!(
+        "Finding “{}” in {}",
+        options.find,
+        scope_label(&roots, state.root_is_folder)
+    );
     let outcome: Outcome<ScanReport> = Arc::new(Mutex::new(None));
     let slot = outcome.clone();
     let ctx = app.ops.ctx.clone();
@@ -545,7 +560,7 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut ReplaceState) {
     // Errors only: a valid form needs no clone of its options.
     let check_error = state.validation.get(&state.options).as_ref().err().cloned();
     let find_empty = state.options.find.is_empty();
-    let scope = scope_label(&state.roots);
+    let scope = scope_label(&state.roots, state.root_is_folder);
 
     egui::Window::new("Find and replace")
         .collapsible(false)
@@ -968,11 +983,25 @@ fn with_text_color(mut job: LayoutJob, color: Color32) -> LayoutJob {
     job
 }
 
+/// Whether a search root is a folder, from what is already known. `listed` is the pane's kind
+/// for the path. The pane's own folder is a folder. Otherwise a network path counts as a
+/// folder when it has no extension, and only a local path is checked on disk (once, when the
+/// roots are set).
+fn is_folder_root(path: &Path, listed: Option<EntryKind>, is_pane_folder: bool) -> bool {
+    match listed {
+        Some(EntryKind::Dir) => true,
+        Some(EntryKind::File) => false,
+        _ if is_pane_folder => true,
+        _ if netpath::is_network_path(path) => path.extension().is_none(),
+        _ => path.is_dir(),
+    }
+}
+
 /// What the window is searching: the single folder, or a count of selected items.
-fn scope_label(roots: &[PathBuf]) -> String {
+fn scope_label(roots: &[PathBuf], root_is_folder: bool) -> String {
     match roots {
         [] => "nothing".into(),
-        [folder] if folder.is_dir() => folder.display().to_string(),
+        [folder] if root_is_folder => folder.display().to_string(),
         _ => {
             let count = roots.len();
             if count == 1 {
@@ -1250,5 +1279,24 @@ mod tests {
         assert!(validation.get(&options).is_err());
         assert!(validation.get(&options).is_err());
         assert_eq!(validation.computations, 2);
+    }
+
+    #[test]
+    fn folder_root_uses_listed_kind_then_lexical_rule_for_network_paths() {
+        let share_folder = Path::new(r"\\192.0.2.1\x\photos\2024");
+        let started = std::time::Instant::now();
+        // Unlisted network path: no extension counts as a folder, with no disk call.
+        assert!(is_folder_root(share_folder, None, false));
+        assert!(!is_folder_root(Path::new(r"\\192.0.2.1\x\a.jpg"), None, false));
+        // The listed kind wins over the name.
+        assert!(!is_folder_root(Path::new(r"\\192.0.2.1\x\dir.d"), Some(EntryKind::File), false));
+        assert!(is_folder_root(Path::new(r"\\192.0.2.1\x\a.jpg"), Some(EntryKind::Dir), false));
+        assert!(is_folder_root(share_folder, None, true));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "a network path must not be probed on disk"
+        );
+        assert_eq!(scope_label(&[share_folder.to_path_buf()], true), share_folder.display().to_string());
+        assert_eq!(scope_label(&[share_folder.to_path_buf()], false), "1 selected item");
     }
 }

@@ -13,7 +13,7 @@ fn new_folder_is_created_from_the_prompt() {
     let dir = sandbox.path().join("work");
     fs::create_dir_all(&dir).unwrap();
     let script = format!(
-        "navigate {}\ncmd NewFolder\ntype Fresh folder\naccept\nassert-exists {}\nexit\n",
+        "navigate {}\ncmd NewFolder\ntype Fresh folder\naccept\nwait-exists {}\nexit\n",
         shown(&dir),
         shown(&dir.join("Fresh folder"))
     );
@@ -40,11 +40,21 @@ fn rename_then_undo_restores_the_original_name() {
          cmd Rename\n\
          type renamed.txt\n\
          accept\n\
-         assert-exists {renamed}\n\
+         wait-exists {renamed}\n\
          assert-missing {original}\n\
+         # The rename ran on a worker; its undo record and selection arrive as events.\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         wait-entry renamed.txt\n\
+         wait-frames 3\n\
+         assert-selection renamed.txt\n\
          cmd Undo\n\
-         assert-exists {original}\n\
+         wait-exists {original}\n\
          assert-missing {renamed}\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         assert-toast Undid rename of 1 item(s)\n\
+         assert-no-error-toast\n\
          exit\n",
         dir = shown(&dir),
         renamed = shown(&dir.join("renamed.txt")),
@@ -56,6 +66,90 @@ fn rename_then_undo_restores_the_original_name() {
     expect_ok(&outcome);
     assert_eq!(fs::read(dir.join("original.txt")).unwrap(), bytes);
     assert!(!dir.join("renamed.txt").exists());
+}
+
+#[test]
+fn renaming_onto_an_existing_name_reports_an_error_toast() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    write_file(&dir.join("a.txt"), b"a");
+    write_file(&dir.join("b.txt"), b"b");
+    let script = format!(
+        "navigate {dir}\n\
+         select a.txt\n\
+         cmd Rename\n\
+         type b.txt\n\
+         accept\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         assert-toast Rename failed: a file with that name already exists\n\
+         assert-exists {a}\n\
+         cmd Undo\n\
+         assert-toast Nothing to undo\n\
+         exit\n",
+        dir = shown(&dir),
+        a = shown(&dir.join("a.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"a");
+    assert_eq!(fs::read(dir.join("b.txt")).unwrap(), b"b");
+}
+
+#[test]
+fn new_folder_and_file_suggest_a_free_name_from_the_listing() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    fs::create_dir_all(dir.join("New folder")).unwrap();
+    write_file(&dir.join("New file.txt"), b"keep");
+    let script = format!(
+        "navigate {dir}\n\
+         cmd NewFolder\naccept\nwait-exists {folder2}\n\
+         cmd NewFile\naccept\nwait-exists {file2}\n\
+         wait-jobs\nwait-frames 3\nassert-no-error-toast\nexit\n",
+        dir = shown(&dir),
+        folder2 = shown(&dir.join("New folder (2)")),
+        file2 = shown(&dir.join("New file (2).txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(dir.join("New folder (2)").is_dir());
+    assert_eq!(fs::read(dir.join("New file.txt")).unwrap(), b"keep");
+}
+
+#[test]
+fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): a file call on it hangs about 20 s until the
+    // network gives up, so each `offline` step fails if its UI call took longer than 250 ms.
+    // Windows remembers an unreachable host for a while and then fails fast, so each run
+    // picks a host the other tests (which use .1) do not.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let share = format!(r"\\192.0.2.{}\x", 2 + nanos % 250);
+    let script = format!(
+        "dismiss-notices\nnavigate {sandbox}\n\
+         ui browser offline rename {share}\\a.txt | b.txt\n\
+         ui sidebar responsive 30 | 1000\n\
+         ui browser offline undo-rename {share}\\a.txt | b.txt\n\
+         ui sidebar responsive 30 | 1000\n\
+         ui sidebar go {share}\n\
+         ui browser offline new-folder Fresh\n\
+         ui browser offline new-file note.txt\n\
+         ui sidebar responsive 30 | 1000\n\
+         navigate {sandbox}\nassert-path {sandbox}\nexit\n",
+        sandbox = shown(sandbox.path()),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
 }
 
 #[test]

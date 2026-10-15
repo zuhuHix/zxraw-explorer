@@ -32,6 +32,12 @@ pub enum Event {
     /// Files or folders were moved (`from` -> `to`) outside an undo record, or an undo moved
     /// them back: their library rows and notes follow.
     FilesMoved(Vec<(PathBuf, PathBuf)>),
+    /// A rename or new folder/file from the name prompt finished: select `name` in the
+    /// focused pane, but only if it still shows `dir` (it may have moved on meanwhile).
+    SelectNew {
+        dir: PathBuf,
+        name: String,
+    },
     /// Our Copy/Cut reached the Windows clipboard (`Ok(sequence)`) or failed.
     ClipboardPublished {
         generation: u64,
@@ -277,8 +283,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
     let dir = app.pane().path.clone();
     match cmd {
         Cmd::NewFolder => {
-            let name = forge_core::paths::unique_name(&dir, "New folder");
-            let name = forge_core::paths::name_of(&name);
+            let name = unique_listed_name(app, &dir, "New folder");
             app.ops.modal = Some(Modal::Prompt(Prompt::new(
                 PromptKind::NewFolder { dir },
                 "New folder",
@@ -286,8 +291,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             )));
         }
         Cmd::NewFile => {
-            let name = forge_core::paths::unique_name(&dir, "New file.txt");
-            let name = forge_core::paths::name_of(&name);
+            let name = unique_listed_name(app, &dir, "New file.txt");
             app.ops.modal = Some(Modal::Prompt(Prompt::new(
                 PromptKind::NewFile { dir },
                 "New file",
@@ -569,32 +573,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
             Some(UndoEntry::TextReplace(records)) => crate::replace_ui::undo(app, records),
-            Some(UndoEntry::Rename(pairs)) => {
-                let r = forge_core::rename::undo(&pairs);
-                // Only the pairs that really moved back: a partial undo follows just those.
-                let undone: Vec<(PathBuf, PathBuf)> = match r.status {
-                    forge_core::rename::RenameStatus::Completed => pairs.clone(),
-                    _ => pairs
-                        .iter()
-                        .filter(|(current, original)| original.exists() && !current.exists())
-                        .cloned()
-                        .collect(),
-                };
-                follow_moves(app, undone);
-                let dirs: std::collections::BTreeSet<PathBuf> = pairs
-                    .iter()
-                    .filter_map(|(_, o)| o.parent().map(Path::to_path_buf))
-                    .collect();
-                for d in dirs {
-                    app.refresh_all_showing(&d);
-                }
-                match r.status {
-                    forge_core::rename::RenameStatus::Completed => {
-                        app.toast(format!("Undid rename of {} item(s)", pairs.len()))
-                    }
-                    other => app.toast_err(format!("Undo failed: {other:?}")),
-                }
-            }
+            Some(UndoEntry::Rename(pairs)) => undo_rename(app, pairs),
         },
         Cmd::BatchRename => {
             let items: Vec<PathBuf> = app.pane().action_targets();
@@ -608,12 +587,155 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
     }
 }
 
-fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
-    let targets: Vec<PathBuf> = app
+/// A free name like `New folder (2)` in the focused pane's folder `dir`, judged from its
+/// listing: asking the disk could block the UI on a slow or offline share. A name the
+/// listing missed fails safely when created (`create_dir` and `create_new` never replace).
+fn unique_listed_name(app: &ZxrawApp, dir: &Path, name: &str) -> String {
+    let taken: std::collections::HashSet<String> = app
         .pane()
-        .action_targets()
+        .entries
+        .iter()
+        .filter(|e| e.path.parent() == Some(dir))
+        .map(|e| e.name.to_lowercase())
+        .collect();
+    let free = forge_core::paths::unique_name_with(dir, name, true, |p| {
+        p.file_name()
+            .is_some_and(|n| taken.contains(&n.to_string_lossy().to_lowercase()))
+    });
+    forge_core::paths::name_of(&free)
+}
+
+/// What an accepted name prompt does on disk. It always runs on a worker (see
+/// [`spawn_name_job`]): on a slow or offline share any file call can block for a long time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NameJob {
+    NewFolder(PathBuf),
+    NewFile(PathBuf),
+    Rename { from: PathBuf, to: PathBuf },
+}
+
+impl NameJob {
+    fn verb(&self) -> &'static str {
+        match self {
+            NameJob::NewFolder(_) => "New folder",
+            NameJob::NewFile(_) => "New file",
+            NameJob::Rename { .. } => "Rename",
+        }
+    }
+
+    /// Touches the disk: call it off the UI thread only.
+    fn run(&self) -> std::io::Result<()> {
+        match self {
+            NameJob::NewFolder(p) => std::fs::create_dir(p),
+            NameJob::NewFile(p) => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(p)
+                .map(|_| ()),
+            NameJob::Rename { from, to } => {
+                // A case-only rename ("a.txt" -> "A.txt") finds itself at the target.
+                let case_only = to != from && forge_core::paths::paths_equal(to, from);
+                if forge_core::paths::exists_no_follow(to) && !case_only {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "a file with that name already exists",
+                    ))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            }
+        }
+    }
+}
+
+/// Runs `job` as a background operation. Success refreshes `dir` and selects `name` in it (a
+/// rename also records its undo and moves the library rows); failure shows an error toast.
+fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) {
+    let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+    let (kind, title) = match &job {
+        NameJob::Rename { .. } => ("rename", format!("Renaming to {name}")),
+        NameJob::NewFolder(_) => ("create", format!("Creating folder {name}")),
+        NameJob::NewFile(_) => ("create", format!("Creating file {name}")),
+    };
+    app.ops.jobs.spawn(kind, title, move |_job| {
+        let result = job.run();
+        match &result {
+            Ok(()) => {
+                if let NameJob::Rename { from, to } = &job {
+                    let _ = tx.send(Event::FilesMoved(vec![(from.clone(), to.clone())]));
+                    let _ = tx.send(Event::Undo(UndoEntry::Rename(vec![(
+                        to.clone(),
+                        from.clone(),
+                    )])));
+                }
+                let _ = tx.send(Event::Changed(dir.clone()));
+                let _ = tx.send(Event::SelectNew { dir, name });
+            }
+            Err(e) => {
+                let _ = tx.send(Event::Error(format!("{} failed: {e}", job.verb())));
+            }
+        }
+        ctx.request_repaint();
+        result.map_err(|e| e.to_string())
+    });
+}
+
+/// Undoes a rename on a worker: the library follows the pairs that really moved back, the
+/// folders involved refresh, and a toast reports the outcome.
+fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
+    let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+    let n = pairs.len();
+    app.ops.jobs.spawn(
+        "undo",
+        format!("Undoing rename of {n} item(s)"),
+        move |_job| {
+            use forge_core::rename::RenameStatus;
+            let r = forge_core::rename::undo(&pairs);
+            let completed = r.status == RenameStatus::Completed;
+            // Only the pairs that really moved back: a partial undo follows just those.
+            let undone: Vec<(PathBuf, PathBuf)> = if completed {
+                pairs.clone()
+            } else {
+                pairs
+                    .iter()
+                    .filter(|(current, original)| original.exists() && !current.exists())
+                    .cloned()
+                    .collect()
+            };
+            if !undone.is_empty() {
+                let _ = tx.send(Event::FilesMoved(undone));
+            }
+            let dirs: std::collections::BTreeSet<PathBuf> = pairs
+                .iter()
+                .filter_map(|(_, o)| o.parent().map(Path::to_path_buf))
+                .collect();
+            for d in dirs {
+                let _ = tx.send(Event::Changed(d));
+            }
+            let result = if completed {
+                let _ = tx.send(Event::Toast(format!("Undid rename of {n} item(s)")));
+                Ok(())
+            } else {
+                let msg = format!("Undo failed: {:?}", r.status);
+                let _ = tx.send(Event::Error(msg.clone()));
+                Err(msg)
+            };
+            ctx.request_repaint();
+            result
+        },
+    );
+}
+
+fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
+    // The listed kind, not the disk: `is_file` could block the UI on an offline share.
+    let pane = app.pane();
+    let all = pane.action_targets();
+    let kinds = pane.kinds_of(&all);
+    let targets: Vec<PathBuf> = all
         .into_iter()
-        .filter(|p| p.is_file())
+        .zip(kinds)
+        .filter(|(_, kind)| *kind == Some(forge_core::EntryKind::File))
+        .map(|(p, _)| p)
         .collect();
     if targets.is_empty() {
         app.toast("Select files to rate or label");
@@ -857,6 +979,12 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 }
             }
             Event::FilesMoved(pairs) => follow_moves(app, pairs),
+            Event::SelectNew { dir, name } => {
+                let pane = app.pane_mut();
+                if pane.path == dir || pane.shows_children_of(&dir) {
+                    pane.set_pending_select(name);
+                }
+            }
         }
     }
     changed
@@ -1005,55 +1133,34 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                 p.error = Some(e.to_string());
                 return Some(Modal::Prompt(p));
             }
-            let (res, dir) = match &p.kind {
-                PromptKind::NewFolder { dir } => {
-                    (std::fs::create_dir(dir.join(&name)), dir.clone())
-                }
-                PromptKind::NewFile { dir } => (
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(dir.join(&name))
-                        .map(|_| ()),
-                    dir.clone(),
-                ),
+            // Nothing here touches the disk: the work runs on a worker and reports back
+            // through events (an error becomes a toast; the prompt is already closed).
+            let (job, dir) = match &p.kind {
+                PromptKind::NewFolder { dir } => (NameJob::NewFolder(dir.join(&name)), dir.clone()),
+                PromptKind::NewFile { dir } => (NameJob::NewFile(dir.join(&name)), dir.clone()),
                 PromptKind::Rename { path } => {
                     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-                    let target = dir.join(&name);
-                    let case_only =
-                        target != *path && forge_core::paths::paths_equal(&target, path);
-                    let res = if target.exists() && !case_only {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "a file with that name already exists",
-                        ))
-                    } else {
-                        std::fs::rename(path, &target)
-                    };
-                    if res.is_ok() {
-                        follow_moves(app, vec![(path.clone(), target.clone())]);
-                        app.ops
-                            .undo
-                            .push(UndoEntry::Rename(vec![(target.clone(), path.clone())]));
+                    let to = dir.join(&name);
+                    if to == *path {
+                        return None; // The name did not change.
                     }
-                    (res, dir)
+                    (
+                        NameJob::Rename {
+                            from: path.clone(),
+                            to,
+                        },
+                        dir,
+                    )
                 }
                 PromptKind::SaveLayout
                 | PromptKind::RenameLayout { .. }
                 | PromptKind::RenamePin { .. }
-                | PromptKind::RenameNetworkLocation { .. } => unreachable!("labels are accepted above"),
+                | PromptKind::RenameNetworkLocation { .. } => {
+                    unreachable!("labels are accepted above")
+                }
             };
-            match res {
-                Ok(()) => {
-                    app.refresh_all_showing(&dir);
-                    app.pane_mut().set_pending_select(name);
-                    None
-                }
-                Err(e) => {
-                    p.error = Some(e.to_string());
-                    Some(Modal::Prompt(p))
-                }
-            }
+            spawn_name_job(app, job, dir, name);
+            None
         }
         Modal::Confirm(c) => {
             match c.kind {
@@ -1239,5 +1346,76 @@ mod clipboard_tests {
             choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, unreadable),
             PasteSource::InApp
         );
+    }
+}
+
+#[cfg(test)]
+mod name_job_tests {
+    use super::*;
+
+    #[test]
+    fn rename_moves_the_file_and_refuses_an_existing_name() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            d.path().join("a.txt"),
+            d.path().join("b.txt"),
+            d.path().join("c.txt"),
+        );
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+
+        let onto_b = NameJob::Rename {
+            from: a.clone(),
+            to: b.clone(),
+        };
+        let err = onto_b.run().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(err.to_string(), "a file with that name already exists");
+        assert_eq!(
+            std::fs::read(&b).unwrap(),
+            b"b",
+            "the existing file is untouched"
+        );
+
+        NameJob::Rename {
+            from: a.clone(),
+            to: c.clone(),
+        }
+        .run()
+        .unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&c).unwrap(), b"a");
+    }
+
+    #[test]
+    fn a_case_only_rename_is_allowed() {
+        let d = tempfile::tempdir().unwrap();
+        let (lower, upper) = (d.path().join("photo.jpg"), d.path().join("PHOTO.jpg"));
+        std::fs::write(&lower, b"x").unwrap();
+        NameJob::Rename {
+            from: lower,
+            to: upper,
+        }
+        .run()
+        .unwrap();
+        let names: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PHOTO.jpg"]);
+    }
+
+    #[test]
+    fn new_folder_and_file_never_replace_an_existing_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let folder = d.path().join("Fresh");
+        let file = d.path().join("note.txt");
+        NameJob::NewFolder(folder.clone()).run().unwrap();
+        NameJob::NewFile(file.clone()).run().unwrap();
+        assert!(folder.is_dir() && file.is_file());
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(NameJob::NewFolder(folder).run().is_err());
+        assert!(NameJob::NewFile(file.clone()).run().is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
     }
 }

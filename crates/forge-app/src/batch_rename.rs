@@ -22,6 +22,41 @@ pub enum BrOutcome {
     },
 }
 
+/// What the dialog needs from the disk: names already in each folder and modified dates.
+struct Scan {
+    existing: ExistingNames,
+    dates: Vec<Option<chrono::NaiveDate>>,
+}
+
+/// Reads the folders of `paths` and their modified dates. Touches the disk: worker only.
+fn scan(paths: &[PathBuf]) -> Scan {
+    let mut existing = ExistingNames::default();
+    let dirs: BTreeSet<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    for d in dirs {
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            let names: Vec<String> = rd
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            existing.add_dir(&d, names);
+        }
+    }
+    // `{date:…}` uses the file's modified date (capture date once indexed).
+    let dates = paths
+        .iter()
+        .map(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .map(|t| chrono::DateTime::<chrono::Local>::from(t).date_naive())
+        })
+        .collect();
+    Scan { existing, dates }
+}
+
 pub struct BatchRename {
     inputs: Vec<RenameInput>,
     existing: ExistingNames,
@@ -29,6 +64,9 @@ pub struct BatchRename {
     previews: Vec<RenamePreview>,
     dirty: bool,
     running: Option<Arc<Mutex<Option<RenameReport>>>>,
+    /// The folders' existing names and the items' modified dates, read off the UI thread (a
+    /// slow or offline share would freeze the window). `None` once they have arrived.
+    scanning: Option<Arc<Mutex<Option<Scan>>>>,
     /// Test hook (`ZXRAW_SCRIPT` `accept`): press the Rename button on the next frame.
     pub(crate) auto_apply: bool,
 }
@@ -64,35 +102,12 @@ fn case_combo(ui: &mut egui::Ui, id: usize, m: &mut CaseMode) -> bool {
 
 impl BatchRename {
     pub fn new(paths: Vec<PathBuf>) -> Self {
-        let mut existing = ExistingNames::default();
-        let dirs: BTreeSet<PathBuf> = paths
-            .iter()
-            .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
-            .collect();
-        for d in dirs {
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                let names: Vec<String> = rd
-                    .filter_map(Result::ok)
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .collect();
-                existing.add_dir(&d, names);
-            }
-        }
-        let inputs = paths
-            .into_iter()
-            .map(|p| {
-                let mut i = RenameInput::new(p.clone());
-                // `{date:…}` uses the file's modified date (capture date once indexed).
-                i.date = std::fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .map(|t| chrono::DateTime::<chrono::Local>::from(t).date_naive());
-                i
-            })
-            .collect();
+        let slot = Arc::new(Mutex::new(None));
+        let (s2, scan_paths) = (slot.clone(), paths.clone());
+        std::thread::spawn(move || *s2.lock() = Some(scan(&scan_paths)));
         Self {
-            inputs,
-            existing,
+            inputs: paths.into_iter().map(RenameInput::new).collect(),
+            existing: ExistingNames::default(),
             rules: vec![RenameRule::Template {
                 pattern: "{name}_{n:3}.{ext}".into(),
                 start: 1,
@@ -101,8 +116,26 @@ impl BatchRename {
             previews: Vec::new(),
             dirty: true,
             running: None,
+            scanning: Some(slot),
             auto_apply: false,
         }
+    }
+
+    /// Takes the folder scan once it has finished; `true` while it is still running.
+    fn still_scanning(&mut self) -> bool {
+        let Some(slot) = &self.scanning else {
+            return false;
+        };
+        let Some(scan) = slot.lock().take() else {
+            return true;
+        };
+        self.existing = scan.existing;
+        for (input, date) in self.inputs.iter_mut().zip(scan.dates) {
+            input.date = date;
+        }
+        self.scanning = None;
+        self.dirty = true;
+        false
     }
 
     fn recompute(&mut self) {
@@ -111,7 +144,10 @@ impl BatchRename {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> BrOutcome {
-        if self.dirty {
+        let scanning = self.still_scanning();
+        if scanning {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        } else if self.dirty {
             self.recompute();
         }
         // Finished?
@@ -293,7 +329,14 @@ impl BatchRename {
             // Preview table.
             let problems = self.previews.iter().filter(|p| p.problem.is_some()).count();
             let changes = self.previews.iter().filter(|p| p.is_change()).count();
-            ui.label(format!("{changes} will be renamed, {problems} problem(s)"));
+            if scanning {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Reading the folder…");
+                });
+            } else {
+                ui.label(format!("{changes} will be renamed, {problems} problem(s)"));
+            }
             let row_h = 20.0;
             egui::ScrollArea::vertical()
                 .max_height(320.0)
@@ -323,7 +366,7 @@ impl BatchRename {
                 });
             ui.separator();
             ui.horizontal(|ui| {
-                let can = problems == 0 && changes > 0 && self.running.is_none();
+                let can = !scanning && problems == 0 && changes > 0 && self.running.is_none();
                 let pressed = ui
                     .add_enabled(can, egui::Button::new(format!("Rename {changes} item(s)")))
                     .clicked();
@@ -402,5 +445,53 @@ impl BatchRename {
             report: lines,
             undo: r.undo,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait_scanned(br: &mut BatchRename) {
+        let t0 = std::time::Instant::now();
+        while br.still_scanning() {
+            assert!(
+                t0.elapsed().as_secs() < 30,
+                "the folder scan never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn opening_on_an_offline_share_returns_at_once() {
+        // TEST-NET-1 (RFC 5737) never answers: any disk call on it blocks for a long time.
+        let paths = vec![PathBuf::from(r"\\192.0.2.1\x\a.jpg")];
+        let t0 = std::time::Instant::now();
+        let mut br = BatchRename::new(paths);
+        assert!(br.still_scanning());
+        assert!(t0.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn the_scan_finds_existing_names_and_dates() {
+        let d = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "taken_001.txt"] {
+            std::fs::write(d.path().join(name), b"x").unwrap();
+        }
+        let mut br = BatchRename::new(vec![d.path().join("a.txt")]);
+        br.rules = vec![RenameRule::Template {
+            pattern: "taken_{n:3}.{ext}".into(),
+            start: 1,
+            step: 1,
+        }];
+        wait_scanned(&mut br);
+        assert!(br.inputs[0].date.is_some());
+        br.recompute();
+        assert!(
+            br.previews[0].problem.is_some(),
+            "the existing name must be flagged: {:?}",
+            br.previews[0]
+        );
     }
 }

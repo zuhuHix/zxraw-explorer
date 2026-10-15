@@ -346,9 +346,13 @@ impl Library {
         // Read the entries now, on this thread: a rename that follows this change is queued
         // behind it, so the writer would otherwise find the old paths already gone. Only small
         // edits (a note, a few files) are read here; large batches would stall the frame.
+        // Files on a network share are never read on this thread (an offline server blocks
+        // for tens of seconds): the writer reads them, so a rename queued right behind a change
+        // on a share can leave that change unsaved, which the writer reports.
         let entries = paths
             .iter()
             .take(if paths.len() <= UI_THREAD_ENTRY_LIMIT { paths.len() } else { 0 })
+            .filter(|p| !forge_core::netpath::is_network_path(p))
             .filter_map(|p| {
                 forge_core::listing::entry_for_path(p)
                     .ok()
@@ -1496,6 +1500,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(sidecar_update(&clear).label, Some(None));
+    }
+
+    #[test]
+    fn rating_a_file_on_an_offline_share_returns_at_once() {
+        // TEST-NET-1 (RFC 5737) is unroutable: reading the file blocks until the network
+        // gives up, which must happen on the writer thread, not the caller's.
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut library = library_with_test_writer(db);
+        let started = std::time::Instant::now();
+        library.annotate(
+            vec![PathBuf::from(r"\\192.0.2.1\x\shoot\a.jpg")],
+            AnnotationChange {
+                rating: Some(3),
+                ..Default::default()
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
     }
 
     #[test]
