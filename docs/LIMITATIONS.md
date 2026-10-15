@@ -30,6 +30,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
   administrator or on a network (UNC) path; choose PowerShell instead.
+* Git status badges are off by default (Settings › Browsing) until the link-safe scan has
+  passed security review.
 * Git status badges never run filters or line-ending conversion, so a same-size file that Git
   stores converted (for example a Git LFS file, or `autocrlf` content) can show as modified
   after its time changes, as can same-size changes beyond the first 256 or in files over
@@ -38,17 +40,22 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Repositories show no badges when they take over 4 s, have an index over 100,000 entries or
   64 MB, need over 50,000 folders and files walked, or exceed the caps on `.gitignore` files
   (256 KB and 4,096 patterns each, 4 MB and 20,000 patterns together), `packed-refs` (16 MB),
-  packs (256 packs, 256 MB of indexes) or objects (32 MB each, 512 MB inflated in all). Nor do
-  they inside OneDrive or another cloud-synced folder, nor submodules and linked worktrees (a
+  packs (256 packs, 256 MB of indexes, 16 GB per pack), objects (32 MB each, 512 MB
+  inflated and 512 MB compressed in all) or staged changes (200,000, or 64 MB of paths). Nor
+  do they on a share or mapped network drive, below a junction or symlink anywhere in the
+  folder's own path (it is reached from the drive's root without following links), inside
+  OneDrive or another cloud-synced folder, nor submodules and linked worktrees (a
   `.git` file could name any place, so `.git` must be a real folder), nor repositories with a
-  link anywhere among the Git files read, a work tree or `core.excludesFile` outside the
+  link or a hard-linked file anywhere among the Git files read (so clones made from a local
+  path, whose objects Git hard-links, show none), a work tree or `core.excludesFile` outside the
   folder, any `objects/info/alternates` entry (so `git clone --shared` clones show none), a
   split index, or SHA-256 objects. A shallow or partial clone missing `HEAD`'s objects shows
   no staged changes. A repository nested inside another, untracked one is shown as a plain
   new folder. Online-only `.gitignore` files inside a repository are skipped, not downloaded.
-* The Git scan opens the browsed folder itself as the user reached it (following any link in
-  its own path); nothing below it is opened through a link. The symlink-to-share tests need
-  developer mode and were skipped on the development PC; junctions are tested.
+* The Git scan opens nothing by path but the root of a local drive; everything else is reached
+  one name at a time without following links. A hard-linked tracked file whose time changed
+  counts as modified (it is never read). The symlink-to-share tests need developer mode and
+  were skipped on the development PC; junctions are tested.
 * Files and folders can be dropped into the app. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another
