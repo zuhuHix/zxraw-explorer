@@ -33,6 +33,7 @@ mod ops_ui;
 mod pane;
 mod path_probe;
 mod palette;
+mod paste_key;
 mod platform;
 mod preview;
 mod replace_ui;
@@ -213,6 +214,11 @@ fn main() -> eframe::Result {
         // hidden window never flashes on screen (see `startup`). Fresh for each attempt.
         let maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = eframe::NativeOptions {
+            // Sees Ctrl+V even when egui-winit drops it. See `paste_key`.
+            event_loop_builder: Some(Box::new(|builder| {
+                use winit::platform::windows::EventLoopBuilderExtWindows;
+                builder.with_msg_hook(paste_key::msg_hook);
+            })),
             viewport: viewport.clone(),
             persistence_path: persistence_path.clone(),
             persist_window: !hidden,

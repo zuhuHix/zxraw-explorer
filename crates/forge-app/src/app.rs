@@ -1098,6 +1098,7 @@ impl ZxrawApp {
 impl eframe::App for ZxrawApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         crate::testhook::raw_input(self, raw_input);
+        crate::paste_key::restore_dropped(raw_input);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

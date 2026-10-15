@@ -61,6 +61,8 @@ zip = { version = "9.0", default-features = false, features = ["deflate"] }
 # ui
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "persistence"] }
 egui = "0.36"
+# Same version eframe uses; only for the Windows message hook (`paste_key`).
+winit = { version = "0.30", default-features = false }
 egui_extras = { version = "0.36", features = ["image"] }
 rfd = "0.17"
 

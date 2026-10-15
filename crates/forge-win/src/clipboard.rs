@@ -14,6 +14,23 @@ pub enum ClipboardEffect {
 /// Places paths on the Windows clipboard in formats understood by Explorer and text editors.
 #[cfg(windows)]
 pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
+    set_files_impl(paths, effect, true)
+}
+
+/// Places paths on the clipboard as Explorer's Copy and Cut do: `CF_HDROP` and the preferred
+/// drop effect, with no text. For tests that stand in for another app.
+#[cfg(windows)]
+pub fn set_files_without_text(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
+    set_files_impl(paths, effect, false)
+}
+
+#[cfg(not(windows))]
+pub fn set_files_without_text(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<()> {
+    Err(crate::WinError::Unsupported)
+}
+
+#[cfg(windows)]
+fn set_files_impl(paths: &[PathBuf], effect: ClipboardEffect, with_text: bool) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows::Win32::System::DataExchange::{EmptyClipboard, RegisterClipboardFormatW};
@@ -83,11 +100,13 @@ pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
         &mut effect_handle,
         "SetClipboardData(Preferred DropEffect)",
     )?;
-    set_clipboard_data(
-        CF_UNICODETEXT.0 as u32,
-        &mut text_handle,
-        "SetClipboardData(CF_UNICODETEXT)",
-    )?;
+    if with_text {
+        set_clipboard_data(
+            CF_UNICODETEXT.0 as u32,
+            &mut text_handle,
+            "SetClipboardData(CF_UNICODETEXT)",
+        )?;
+    }
     Ok(())
 }
 
@@ -148,6 +167,60 @@ pub fn clipboard_sequence() -> u32 {
 #[cfg(not(windows))]
 pub fn clipboard_sequence() -> u32 {
     0
+}
+
+/// Whether the clipboard holds text (`CF_UNICODETEXT`). Does not open the clipboard.
+#[cfg(windows)]
+pub fn clipboard_has_text() -> bool {
+    use windows::Win32::System::DataExchange::IsClipboardFormatAvailable;
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_has_text() -> bool {
+    false
+}
+
+/// Whether `msg` (a `*const MSG` from a message loop hook) is a key press of the paste
+/// shortcut: Ctrl+V or Shift+Insert, as egui-winit recognises them.
+#[cfg(windows)]
+pub fn is_paste_keydown(msg: *const std::ffi::c_void) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+    use windows::Win32::UI::WindowsAndMessaging::{MSG, WM_KEYDOWN};
+
+    if msg.is_null() {
+        return false;
+    }
+    // SAFETY: winit passes a valid `MSG` for the duration of the hook call.
+    let msg = unsafe { &*msg.cast::<MSG>() };
+    if msg.message != WM_KEYDOWN {
+        return false;
+    }
+    // The key state as of this message, not the live keyboard.
+    let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
+        GetKeyState(i32::from(vk.0)) < 0
+    };
+    paste_chord(
+        msg.wParam.0 as u16,
+        down(VK_CONTROL),
+        down(VK_SHIFT),
+        down(VK_MENU),
+    )
+}
+
+#[cfg(not(windows))]
+pub fn is_paste_keydown(_msg: *const std::ffi::c_void) -> bool {
+    false
+}
+
+/// Ctrl+V or Shift+Insert for virtual key `vk` and the modifier state. Alt excludes both,
+/// so AltGr (Ctrl+Alt) combinations stay text input.
+fn paste_chord(vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
+    const VK_V: u16 = b'V' as u16;
+    const VK_INSERT: u16 = 0x2D;
+    !alt && ((ctrl && vk == VK_V) || (shift && !ctrl && vk == VK_INSERT))
 }
 
 /// Empties the clipboard if its sequence (when provided) and ordered path list match.
@@ -704,5 +777,22 @@ mod tests {
             .map_err(|e| crate::api_err("SetClipboardData(test text)", e))?;
         handle.transfer();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod paste_key_tests {
+    use super::paste_chord;
+
+    #[test]
+    fn paste_chord_matches_ctrl_v_and_shift_insert_only() {
+        assert!(paste_chord(b'V' as u16, true, false, false));
+        assert!(paste_chord(b'V' as u16, true, true, false));
+        assert!(paste_chord(0x2D, false, true, false));
+        assert!(!paste_chord(b'V' as u16, false, false, false));
+        assert!(!paste_chord(b'V' as u16, true, false, true));
+        assert!(!paste_chord(b'C' as u16, true, false, false));
+        assert!(!paste_chord(0x2D, true, true, false));
+        assert!(!paste_chord(0x2D, false, false, false));
     }
 }

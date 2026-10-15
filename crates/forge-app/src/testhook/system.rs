@@ -25,6 +25,11 @@
 //!   the same as the texts, and each job title contains its text. Titles read
 //!   `Copying N item(s) to <folder>`, so match on the item count, e.g. `2 item(s), 1 item(s)`.
 //!
+//! Clipboard (the real Windows clipboard, shared with the rest of the session):
+//! - `clipboard-files cut|copy <path>, <path>, …`: put the files on the clipboard as another
+//!   app (Explorer) does: `CF_HDROP` and the preferred drop effect, no text. Waits first for
+//!   the app's own copy or cut to finish publishing, so it does not overwrite this.
+//!
 //! Closing with transfers pending:
 //! - `request-close`: arm the close guard for automation and ask the window to close.
 //! - `assert-close-warning`: wait up to 5 s for the "Copies are not finished" warning.
@@ -91,6 +96,26 @@ pub(super) fn step(
             } else {
                 Err(format!("queue is {titles:?}, expected {expected:?}"))
             }
+        }
+        "clipboard-files" => {
+            if app.ops.clipboard.as_ref().is_some_and(|cb| cb.publishing()) {
+                return Ok(Flow::Wait("waiting for the app's clipboard publish".into()));
+            }
+            let (effect, list) = args
+                .split_once(char::is_whitespace)
+                .ok_or("expected `cut|copy <path>, <path>, …`")?;
+            let effect = match effect {
+                "cut" => forge_win::ClipboardEffect::Move,
+                "copy" => forge_win::ClipboardEffect::Copy,
+                other => return Err(format!("expected `cut` or `copy`, got `{other}`")),
+            };
+            let paths = list
+                .split(',')
+                .map(|p| super::sandboxed_entry(Path::new(p.trim())))
+                .collect::<Result<Vec<_>, _>>()?;
+            forge_win::set_files_without_text(&paths, effect)
+                .map_err(|e| format!("could not set the clipboard: {e}"))?;
+            Ok(Flow::Done)
         }
         "request-close" => {
             ops_ui::CLOSE_GUARD_IN_AUTOMATION.store(true, Ordering::SeqCst);

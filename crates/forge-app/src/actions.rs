@@ -41,7 +41,8 @@ pub enum Event {
     PasteSystemRead {
         destination: PathBuf,
         sequence: u32,
-        files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>,
+        /// The file list on the clipboard, `Ok(None)` if it holds no files.
+        files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
     },
     /// A clipboard-originated move finished (`ok` = everything moved, not cancelled).
     MoveFinished {
@@ -78,6 +79,14 @@ pub struct FileClipboard {
     baseline_sequence: u32,
     /// `None` while publishing; `Some(Ok(seq))` once on the Windows clipboard.
     published: Option<Result<u32, ()>>,
+}
+
+impl FileClipboard {
+    /// Still being placed on the Windows clipboard.
+    #[allow(dead_code)] // used by the automation hook
+    pub fn publishing(&self) -> bool {
+        self.published.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,7 +415,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
             std::thread::spawn(move || {
                 let sequence = forge_win::clipboard_sequence();
-                let files = forge_win::get_files().ok().flatten();
+                let files = forge_win::get_files().map_err(|e| e.to_string());
                 let _ = tx.send(Event::PasteSystemRead {
                     destination: dir,
                     sequence,
@@ -603,12 +612,23 @@ fn paste_with(
     app: &mut ZxrawApp,
     dest: PathBuf,
     sequence: u32,
-    files: Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>,
+    files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
 ) {
+    // Every way out of here either starts a transfer or says why it did not.
+    let (files, read_error) = match files {
+        Ok(files) => (files.filter(|(paths, _)| !paths.is_empty()), None),
+        Err(e) => (None, Some(e)),
+    };
     match choose_paste_source(app.ops.clipboard.as_ref(), sequence, files.is_some()) {
-        PasteSource::Empty => app.toast("Clipboard is empty"),
+        PasteSource::Empty => match read_error {
+            Some(e) => app.toast_err(format!("Could not read the clipboard: {e}")),
+            None => app.toast("Nothing to paste: the clipboard has no files"),
+        },
         PasteSource::System => {
-            let Some((paths, effect)) = files else { return };
+            let Some((paths, effect)) = files else {
+                app.toast_err("Could not read the files on the clipboard");
+                return;
+            };
             if effect == forge_win::ClipboardEffect::Move {
                 if !crate::ops_ui::start_clipboard_move(app, paths, dest, None, Some(sequence)) {
                     app.toast("Nothing to move: the items are already in this folder");
@@ -619,6 +639,7 @@ fn paste_with(
         }
         PasteSource::InApp => {
             let Some(cb) = app.ops.clipboard.as_ref() else {
+                app.toast("Nothing to paste: the clipboard has no files");
                 return;
             };
             let (paths, cut, generation) = (cb.paths.clone(), cb.cut, cb.generation);
