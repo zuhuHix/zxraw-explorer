@@ -265,13 +265,18 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   modified, new (added or untracked), ignored (dimmed) and conflicted entries, rolled up to
   folders, and the branch in the status bar. Read in-process on one background thread; no
   external program ever runs (no `git.exe`, no fsmonitor, no filter drivers). Every file is
-  opened through `git_status/safe_fs.rs`: a share, mapped drive or device path is refused
-  before anything is opened; the local drive's root is the only open by path; every folder from
+  opened through `git_status/safe_fs.rs`: a share, mapped drive, SUBST drive (checked with
+  `QueryDosDeviceW`) or device path is refused before anything is opened; the local drive's
+  root is the only open by path, and must be a volume's root (`\\?\Volume{...}\`); every folder from
   there down to the browsed one, and everything in the repository, is opened one name at a time
   relative to an already-checked handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`, and
   `FILE_OPEN_NO_RECALL` for files), refusing any reparse point, hard-linked file, online-only
   placeholder, or handle off the root's volume (64-bit serial) or outside the root, and
-  reading with a byte cap from the handle that was checked. Repository discovery and the scan
+  nothing can be opened except from an entry its held parent folder listed (or looked up by
+  that exact name), so a placeholder is refused before it is opened; the raw index is checked
+  iteratively (path length and depth, cached-tree depth, size and node count) before gix
+  decodes it, and only its entries and cached tree are passed on. Every read is capped and
+  goes through the handle that was checked. Repository discovery and the scan
   both run on a deadlined thread (at most one abandoned at a time). gix only parses bytes read that way
   (index, config, refs, ignore files, commits and trees); loose objects and packs, with deltas,
   are read by `git_status/odb.rs`. Tracked files are compared with the index from folder
