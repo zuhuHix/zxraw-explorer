@@ -246,6 +246,62 @@ fn read_check_from(path: &Path, info: Result<FindInfo, FindError>) -> ReadCheck 
     }
 }
 
+/// Why [`open_for_background_read`] refused or failed.
+#[derive(Debug)]
+pub enum BackgroundOpenError {
+    /// Nothing at that path.
+    Missing,
+    /// The data is not on this PC (or its attributes could not be read).
+    OnlineOnly,
+    /// The open itself failed.
+    Io(std::io::Error),
+}
+
+/// Opens `path` for a background read only if its data is on this PC, with no window for a
+/// download between the check and the read:
+///
+/// 1. The find data is checked first, so a placeholder is never opened at all (opening a
+///    `RECALL_ON_OPEN` placeholder downloads it).
+/// 2. The file is opened (an open does not hydrate a `RECALL_ON_DATA_ACCESS` placeholder,
+///    the kind OneDrive and other Cloud Files providers use; only reading does).
+/// 3. The attributes are read again from the open handle; a placeholder found there is
+///    closed unread.
+///
+/// While the returned handle is open the sync client cannot dehydrate the file
+/// (`CfDehydratePlaceholder` fails with `ERROR_CLOUD_FILE_IN_USE`), so reads through it, or
+/// by another program (ffmpeg) while it is held, never download. Measured with a test Cloud
+/// Files provider: see `docs/LIMITATIONS.md`. `FILE_FLAG_OPEN_NO_RECALL` is not used: the
+/// Cloud Files filter ignores it and hydrates on the first read.
+pub fn open_for_background_read(path: &Path) -> Result<fs::File, BackgroundOpenError> {
+    open_for_background_read_with(path, find_info, handle_attributes)
+}
+
+fn handle_attributes(file: &fs::File) -> std::io::Result<u32> {
+    file.metadata().map(|md| metadata_attributes(&md))
+}
+
+/// [`open_for_background_read`] with injectable find data and handle attributes.
+fn open_for_background_read_with(
+    path: &Path,
+    find: impl Fn(&Path) -> Result<FindInfo, FindError>,
+    on_handle: impl Fn(&fs::File) -> std::io::Result<u32>,
+) -> Result<fs::File, BackgroundOpenError> {
+    match read_check_from(path, find(path)) {
+        ReadCheck::Missing => return Err(BackgroundOpenError::Missing),
+        ReadCheck::OnlineOnly { .. } => return Err(BackgroundOpenError::OnlineOnly),
+        ReadCheck::Local => {}
+    }
+    let file = fs::File::open(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => BackgroundOpenError::Missing,
+        _ => BackgroundOpenError::Io(error),
+    })?;
+    match on_handle(&file) {
+        Ok(attributes) if !is_online_only_attrs(attributes) && !is_simulated(path) => Ok(file),
+        // Became a placeholder between the two checks, or unknown: close it unread.
+        _ => Err(BackgroundOpenError::OnlineOnly),
+    }
+}
+
 /// Pre-filter for an entry from a listing, without a syscall. Used for the badge and to avoid
 /// queueing work; the worker still calls [`background_read_allowed`] before reading.
 pub fn background_read_allowed_entry(entry: &FileEntry) -> bool {
@@ -315,6 +371,60 @@ mod tests {
             read_check_from(p, Err(FindError::Other)),
             ReadCheck::OnlineOnly { size: 0 }
         );
+    }
+
+    #[test]
+    fn background_open_rechecks_on_the_handle() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.bin");
+        std::fs::write(&f, b"12345").unwrap();
+        let local = |_: &Path| {
+            Ok(FindInfo {
+                attributes: 0x20,
+                reparse_tag: 0,
+                size: 5,
+            })
+        };
+        assert!(open_for_background_read_with(&f, local, |_| Ok(0x20)).is_ok());
+        // Local in the find data, a placeholder by the time it was opened: closed unread.
+        assert!(matches!(
+            open_for_background_read_with(&f, local, |_| Ok(0x0040_0000)),
+            Err(BackgroundOpenError::OnlineOnly)
+        ));
+        // Attributes unreadable on the handle: fail closed.
+        assert!(matches!(
+            open_for_background_read_with(&f, local, |_| Err(std::io::Error::other("x"))),
+            Err(BackgroundOpenError::OnlineOnly)
+        ));
+        // A placeholder in the find data is never opened.
+        let online = |_: &Path| {
+            Ok(FindInfo {
+                attributes: 0x0040_0000,
+                reparse_tag: 0,
+                size: 5,
+            })
+        };
+        let opened = std::cell::Cell::new(false);
+        assert!(matches!(
+            open_for_background_read_with(&f, online, |_| {
+                opened.set(true);
+                Ok(0)
+            }),
+            Err(BackgroundOpenError::OnlineOnly)
+        ));
+        assert!(!opened.get());
+        // Real files: local opens, missing is missing, simulated is refused.
+        assert!(open_for_background_read(&f).is_ok());
+        assert!(matches!(
+            open_for_background_read(&d.path().join("gone")),
+            Err(BackgroundOpenError::Missing)
+        ));
+        simulate_online_only(&f);
+        assert!(matches!(
+            open_for_background_read(&f),
+            Err(BackgroundOpenError::OnlineOnly)
+        ));
+        clear_simulated_online_only(&f);
     }
 
     #[test]

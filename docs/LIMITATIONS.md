@@ -86,22 +86,35 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Online-only *folders* are still listed by the indexer, scans and file operations. Listing a
   placeholder folder fetches names and sizes from the cloud, not file contents. Skipping them
   would hide whole OneDrive trees.
-* The copy/move download warning checks the selection (files and folders) only up to an entry
-  and time limit. When it stops early after finding online-only files, the warning gives the
-  count and size found so far as "at least" and says the scan stopped early. When it stops
-  before finding any, it stays silent, so online-only files further down a very large folder
-  can be copied without a warning. The check runs off the UI thread; a "Checking for
-  online-only files" dialog appears if it takes longer than 150 ms.
+* The copy/move download warning checks the selection (selected files first, then folders)
+  only up to an entry and time limit. A check that could not cover everything (a limit hit, a
+  folder or item it could not read) always asks before the transfer: with online-only files
+  found it gives their count and size as "at least"; with none found it says not every file
+  could be checked. So copying a very large local folder always asks once. The check runs off
+  the UI thread; a "Checking for online-only files" dialog appears if it takes longer than
+  150 ms, and closing that dialog stops the check. While any dialog is open, a new copy or
+  move is refused with a message rather than queued; start it again afterwards.
 * The checksum tool counts online-only files before hashing and asks whether to download and
   hash them, skip them, or cancel. That count walks the whole selection with no limit, as
-  hashing does. Skipped files are listed, never hashed, and are not in the saved manifest.
+  hashing does. Skipped files are listed, never hashed, and are not in the saved manifest. A
+  manifest picked for verification that is itself online-only is not read until the user
+  agrees to download it; Skip stops the verification.
 * Proxy generation re-checks each clip just before ffmpeg opens it and skips one that has
   become online-only since the estimate.
 * Folder compare (with content hashing) and its sync preview mark online-only files "not
   compared" and leave them out of the sync. Download them first to compare or sync them.
-* Background reads check the attributes, then open the file normally. A file that becomes
-  online-only between the check and the open is still downloaded. Windows has no documented
-  way to open a Cloud Files placeholder for reading without downloading it.
+* Hashing under *Skip online-only* and the video panel's ffmpeg work open the file first,
+  check the attributes on the open handle, and keep the handle open while reading (or while
+  ffmpeg runs). An open does not download a OneDrive-style (`RECALL_ON_DATA_ACCESS`)
+  placeholder, and the sync client cannot dehydrate a file that has an open handle
+  (`ERROR_CLOUD_FILE_IN_USE`), so those reads cannot download anything. Both were measured on
+  2026-10-15 with a test Cloud Files provider (`CfRegisterSyncRoot`, no live OneDrive on that
+  PC). `FILE_FLAG_OPEN_NO_RECALL` does **not** help: the Cloud Files filter ignored it and
+  fully hydrated the placeholder on the first read. Remaining gaps: a provider that marks
+  files `RECALL_ON_OPEN` hydrates on the open itself, so a file that becomes such a
+  placeholder between the find-data check and the open is downloaded; and other background
+  readers (thumbnails, metadata, duplicate scans) still check the attributes and then open
+  the file separately.
 
 ## Default apps and folder opening
 

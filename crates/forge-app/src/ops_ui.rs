@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{RichText, Ui};
 use forge_core::model::format_size;
 use forge_core::ops::{
     self, ConflictDecision, ConflictInfo, ConflictPolicy, JobCtx, OpKind, OpOptions, OpReport,
     Resolution,
 };
-use forge_jobs::{JobHandle, JobState};
+use forge_jobs::{CancelToken, JobHandle, JobState};
 
 use crate::actions::{Event, UndoEntry};
 use crate::app::ZxrawApp;
@@ -126,6 +126,7 @@ fn clipboard_move(
         return false;
     }
     if check_cloud && scan_needed(&sources, &dest, OpKind::Move) {
+        // Refused with its own message when a dialog is open: still "handled".
         ask_after_cloud_check(
             app,
             sources,
@@ -163,8 +164,22 @@ fn ask_cloud_download(app: &mut ZxrawApp, body: String, kind: OpKind, pending: C
     }));
 }
 
+/// Cancels the online-only scan of a "Checking" dialog when the dialog goes away: Cancel,
+/// Continue anyway, or the result arriving (the scan is finished then, so it is a no-op).
+pub struct CloudScanGuard(CancelToken);
+
+impl Drop for CloudScanGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Shows the "Checking" dialog while the online-only scan runs on a background thread.
-/// Cancel drops the dialog, which discards the result. Continue anyway starts the transfer.
+/// Cancel drops the dialog, which stops the scan and discards its result. Continue anyway
+/// starts the transfer.
+///
+/// There is one dialog slot: while any dialog is open the transfer is refused with a message
+/// (never queued behind it, never dropped silently). Returns whether the request was taken.
 fn ask_after_cloud_check(
     app: &mut ZxrawApp,
     scan_sources: Vec<PathBuf>,
@@ -172,13 +187,19 @@ fn ask_after_cloud_check(
     dest: PathBuf,
     kind: OpKind,
     clipboard: Option<(Option<u64>, Option<u32>)>,
-) {
+) -> bool {
+    if app.ops.modal.is_some() {
+        app.toast_err(busy_transfer_message(kind));
+        return false;
+    }
     let id = NEXT_CLOUD_CHECK.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = bounded(1);
     let ctx = app.ops.ctx.clone();
     let scan_dest = dest.clone();
+    let cancel = CancelToken::new();
+    let guard = CloudScanGuard(cancel.clone());
     std::thread::spawn(move || {
-        let warning = cloud_warning_for(&scan_sources, &scan_dest, kind);
+        let warning = cloud_warning_for(&scan_sources, &scan_dest, kind, &cancel);
         let _ = tx.send((id, warning));
         ctx.request_repaint();
     });
@@ -198,7 +219,7 @@ fn ask_after_cloud_check(
             // Cannot happen (the result is for this check), but never drop a transfer silently.
             CloudCheckAction::Ignore => app.toast_err("The transfer did not start; try again"),
         }
-        return;
+        return true;
     }
     app.ops.modal = Some(Modal::Confirm(Confirm {
         kind: ConfirmKind::CheckingCloudFiles {
@@ -208,12 +229,19 @@ fn ask_after_cloud_check(
             dest,
             kind,
             clipboard,
+            _scan: guard,
         },
         title: "Checking for online-only files…".into(),
         body: "Looking for files that would be downloaded from the cloud.".into(),
         confirm_label: "Continue anyway".into(),
         danger: false,
     }));
+    true
+}
+
+fn busy_transfer_message(kind: OpKind) -> String {
+    let verb = if kind == OpKind::Copy { "copy" } else { "move" };
+    format!("The {verb} did not start: close the open dialog first, then try again")
 }
 
 /// Applies a finished online-only check to the dialog that is waiting for it.
@@ -308,14 +336,19 @@ fn scan_needed(sources: &[PathBuf], dest: &Path, kind: OpKind) -> bool {
 }
 
 /// The confirmation text when a transfer of `sources` to `dest` would download online-only
-/// files, or `None`.
-fn cloud_warning_for(sources: &[PathBuf], dest: &Path, kind: OpKind) -> Option<String> {
+/// files, or could not be fully checked; `None` when it can start at once.
+fn cloud_warning_for(
+    sources: &[PathBuf],
+    dest: &Path,
+    kind: OpKind,
+    cancel: &CancelToken,
+) -> Option<String> {
     let same = sources.iter().all(|path| same_volume(path, dest));
     if kind == OpKind::Move && same {
         return None;
     }
-    let scan = online_only_totals(sources, dest, kind);
-    cloud_download_warning(scan.count, scan.bytes, kind, same, scan.truncated)
+    let scan = online_only_totals(sources, dest, kind, cancel);
+    cloud_download_warning(scan.count, scan.bytes, kind, same, scan.incomplete)
 }
 
 /// Online-only files that the transfer would read, and their logical size. Metadata only:
@@ -324,82 +357,123 @@ fn cloud_warning_for(sources: &[PathBuf], dest: &Path, kind: OpKind) -> Option<S
 struct OnlineOnlyScan {
     count: usize,
     bytes: u64,
-    /// The folder walk stopped at its limits, so `count` and `bytes` are lower bounds.
-    truncated: bool,
+    /// Not every item was checked: the entry or time limit was hit, a folder or an item's
+    /// metadata could not be read, or the scan was cancelled. `count` and `bytes` are lower
+    /// bounds, and zero proves nothing.
+    incomplete: bool,
 }
 
-fn online_only_totals(sources: &[PathBuf], dest: &Path, kind: OpKind) -> OnlineOnlyScan {
+fn online_only_totals(
+    sources: &[PathBuf],
+    dest: &Path,
+    kind: OpKind,
+    cancel: &CancelToken,
+) -> OnlineOnlyScan {
     online_only_totals_with(
         sources,
         dest,
         kind,
         CLOUD_WALK_MAX_ENTRIES,
         CLOUD_WALK_TIME_LIMIT,
+        cancel,
     )
 }
 
-/// [`online_only_totals`] with injectable walk limits.
+/// Shared limits of one scan: entries visited, a deadline, and cancellation.
+struct ScanBudget<'a> {
+    visited: usize,
+    max_entries: usize,
+    deadline: Instant,
+    cancel: &'a CancelToken,
+}
+
+impl ScanBudget<'_> {
+    /// Takes one entry from the budget; `false` (and the scan is incomplete) when spent.
+    fn take(&mut self) -> bool {
+        if self.visited >= self.max_entries
+            || Instant::now() >= self.deadline
+            || self.cancel.is_cancelled()
+        {
+            return false;
+        }
+        self.visited += 1;
+        true
+    }
+}
+
+/// [`online_only_totals`] with injectable limits.
 fn online_only_totals_with(
     sources: &[PathBuf],
     dest: &Path,
     kind: OpKind,
     max_entries: usize,
     time_limit: Duration,
+    cancel: &CancelToken,
 ) -> OnlineOnlyScan {
-    let deadline = Instant::now() + time_limit;
+    let mut budget = ScanBudget {
+        visited: 0,
+        max_entries,
+        deadline: Instant::now() + time_limit,
+        cancel,
+    };
     let mut scan = OnlineOnlyScan::default();
-    let mut visited = 0;
     let mut folders = Vec::new();
-    // Selected files first, always in full: the limits are for walking into folders, and a
-    // large folder must not use up the budget before an explicitly selected file is seen.
+    // Selected files first, so a large folder cannot use up the budget before an explicitly
+    // selected file is seen. They count against the same limits: a huge file selection is
+    // bounded too, and stopping makes the scan incomplete, never clean.
     for path in sources {
         if kind == OpKind::Move && same_volume(path, dest) {
             continue;
         }
-        let Ok(md) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        if md.is_file() {
-            if !forge_core::cloud::background_read_allowed(path) {
-                scan.count += 1;
-                scan.bytes += md.len();
+        if !budget.take() {
+            scan.incomplete = true;
+            return scan;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(md) if md.is_file() => {
+                if !forge_core::cloud::background_read_allowed(path) {
+                    scan.count += 1;
+                    scan.bytes += md.len();
+                }
             }
-        } else if md.is_dir() {
-            folders.push(path);
+            Ok(md) if md.is_dir() => folders.push(path),
+            // Links are not followed by the transfer; nothing there downloads.
+            Ok(_) => {}
+            // A source that is gone fails in the transfer itself; anything else is unknown.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => scan.incomplete = true,
         }
     }
     for folder in folders {
-        if scan.truncated {
+        if !walk_online_only(folder, &mut budget, &mut scan) {
+            scan.incomplete = true;
             break;
         }
-        walk_online_only(folder, max_entries, deadline, &mut visited, &mut scan);
     }
     scan
 }
 
 /// Walks the folder `root` and adds its online-only files to `scan`. Listing metadata only:
 /// `DirEntry::metadata` comes from the directory enumeration, so no file is opened. Symlinks
-/// and junctions are not followed. The walk stops, marking `scan.truncated`, when it has
-/// visited `max_entries` entries or passed `deadline`.
-fn walk_online_only(
-    root: &Path,
-    max_entries: usize,
-    deadline: Instant,
-    visited: &mut usize,
-    scan: &mut OnlineOnlyScan,
-) {
+/// and junctions are not followed. A folder or entry that cannot be read marks the scan
+/// incomplete. Returns `false` when the budget ran out (the walk stopped early).
+fn walk_online_only(root: &Path, budget: &mut ScanBudget, scan: &mut OnlineOnlyScan) -> bool {
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
+            scan.incomplete = true;
             continue;
         };
-        for entry in entries.flatten() {
-            if *visited >= max_entries || Instant::now() >= deadline {
-                scan.truncated = true;
-                return;
+        for entry in entries {
+            if !budget.take() {
+                return false;
             }
-            *visited += 1;
+            let Ok(entry) = entry else {
+                scan.incomplete = true;
+                continue;
+            };
             let Ok(file_type) = entry.file_type() else {
+                scan.incomplete = true;
                 continue;
             };
             if file_type.is_symlink() {
@@ -408,15 +482,19 @@ fn walk_online_only(
             let path = entry.path();
             if file_type.is_dir() {
                 pending.push(path);
-            } else if file_type.is_file()
-                && let Ok(md) = entry.metadata()
-                && forge_core::cloud::is_online_only_metadata(&path, &md)
-            {
-                scan.count += 1;
-                scan.bytes += md.len();
+            } else if file_type.is_file() {
+                match entry.metadata() {
+                    Ok(md) if forge_core::cloud::is_online_only_metadata(&path, &md) => {
+                        scan.count += 1;
+                        scan.bytes += md.len();
+                    }
+                    Ok(_) => {}
+                    Err(_) => scan.incomplete = true,
+                }
             }
         }
     }
+    true
 }
 
 /// Are both paths on the same drive (or share the same UNC share / root)?
@@ -432,16 +510,15 @@ fn same_volume(a: &Path, b: &Path) -> bool {
 /// Pure decision: the body text of the download warning, or `None` when the transfer is
 /// cheap enough to start at once. A move within one volume is a rename and downloads nothing.
 ///
-/// When the scan was `truncated` (entry or time limit) and it had already seen online-only
-/// files, the totals are lower bounds: the warning says "at least" and that the scan stopped
-/// early, whatever the count. A scan that stopped before seeing any proves nothing, so it
-/// stays silent rather than warning on every large local folder.
+/// An `incomplete` scan (limits hit, unreadable items, cancelled) always asks: its totals are
+/// lower bounds, and finding nothing proves nothing. With online-only files found it says
+/// "at least"; with none it says the files could not all be checked.
 fn cloud_download_warning(
     count: usize,
     bytes: u64,
     kind: OpKind,
     same_volume: bool,
-    truncated: bool,
+    incomplete: bool,
 ) -> Option<String> {
     if kind == OpKind::Move && same_volume {
         return None;
@@ -451,12 +528,18 @@ fn cloud_download_warning(
     } else {
         "Moving"
     };
+    if incomplete && count == 0 {
+        return Some(format!(
+            "Couldn't check all files for cloud placeholders. {verb} may download some of them \
+             from the cloud first."
+        ));
+    }
     let below_threshold = count < CLOUD_WARN_COUNT && bytes < CLOUD_WARN_BYTES;
-    if count == 0 || (below_threshold && !truncated) {
+    if count == 0 || (below_threshold && !incomplete) {
         return None;
     }
     let size = format_size(bytes);
-    if truncated {
+    if incomplete {
         // The scan saw only part of the selection: the totals are lower bounds.
         let (files, are) = if count == 1 {
             ("1 file".to_owned(), "is")
@@ -464,8 +547,8 @@ fn cloud_download_warning(
             (format!("{count} files"), "are")
         };
         return Some(format!(
-            "At least {files} ({size}) {are} online-only; the scan stopped early, so there may \
-             be more. {verb} them downloads them from the cloud first."
+            "At least {files} ({size}) {are} online-only; not every file could be checked, so \
+             there may be more. {verb} them downloads them from the cloud first."
         ));
     }
     let (files, are, them) = if count == 1 {
@@ -519,12 +602,10 @@ fn start_transfer_with(
         .set_serial(app.settings.transfer_queue);
     let disks = transfer_disks(&sources, &dest);
     // A move deletes its sources, so it must act on the items the user picked: what is
-    // at a source path when the job starts must still be the same item.
-    let identities: Vec<Option<SourceIdentity>> = if kind == OpKind::Move {
-        sources.iter().map(|s| source_identity(s)).collect()
-    } else {
-        Vec::new()
-    };
+    // at a source path when the job starts must still be the same item. The identities are
+    // read now, on a helper thread (one metadata query per source can stall on a network
+    // path), and the job waits for them before it looks at any source.
+    let identities = (kind == OpKind::Move).then(|| capture_identities(sources.clone()));
     // Taken by whichever runs: the job, or the callback for a job cancelled while queued.
     let completion = std::sync::Arc::new(parking_lot::Mutex::new(completion));
     let unstarted = {
@@ -551,6 +632,13 @@ fn start_transfer_with(
         // failed, and a moved source replaced by another item is left alone. A move fails
         // closed: a source whose identity was not captured when queued is not moved
         // either. Conflicts are looked at only now, when the job runs.
+        let identities = match &identities {
+            Some(pending) => match wait_identities(pending, &job.cancel, sources.len()) {
+                Some(identities) => identities,
+                None => return Err("cancelled".into()),
+            },
+            None => Vec::new(),
+        };
         let (sources, changed, unverified) =
             screen_queued_sources(sources, &identities, source_identity);
         let (sources, mut vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
@@ -700,6 +788,35 @@ fn screen_queued_sources(
         }
     }
     (keep, changed, unverified)
+}
+
+/// Starts reading the identities of `sources` on a helper thread.
+fn capture_identities(sources: Vec<PathBuf>) -> Receiver<Vec<Option<SourceIdentity>>> {
+    let (tx, rx) = bounded(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(sources.iter().map(|s| source_identity(s)).collect());
+    });
+    rx
+}
+
+/// The identities from [`capture_identities`], waiting for them unless the job is cancelled
+/// (`None`). If the helper died without an answer, every identity is unknown, so a move
+/// fails closed for every source that still exists.
+fn wait_identities(
+    pending: &Receiver<Vec<Option<SourceIdentity>>>,
+    cancel: &CancelToken,
+    count: usize,
+) -> Option<Vec<Option<SourceIdentity>>> {
+    loop {
+        match pending.recv_timeout(Duration::from_millis(100)) {
+            Ok(identities) => return Some(identities),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => return None,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                return Some((0..count).map(|_| None).collect());
+            }
+        }
+    }
 }
 
 /// `None` if nothing is at `path`. Does not follow a link at the end.
@@ -1473,17 +1590,25 @@ mod cloud_warning_tests {
         let body = cloud_download_warning(CLOUD_WARN_COUNT, 3, OpKind::Copy, false, true).unwrap();
         assert_eq!(
             body,
-            "At least 10 files (3 B) are online-only; the scan stopped early, so there may be \
-             more. Copying them downloads them from the cloud first."
+            "At least 10 files (3 B) are online-only; not every file could be checked, so there \
+             may be more. Copying them downloads them from the cloud first."
         );
-        // Below the thresholds a stopped scan still warns: the real total is unknown.
+        // Below the thresholds an incomplete scan still warns: the real total is unknown.
         let one = cloud_download_warning(1, 3, OpKind::Move, false, true).unwrap();
         assert!(
-            one.starts_with("At least 1 file (3 B) is online-only; the scan stopped early"),
+            one.starts_with("At least 1 file (3 B) is online-only; not every file"),
             "{one}"
         );
+        // Finding nothing proves nothing when the scan was incomplete.
         assert_eq!(
-            cloud_download_warning(0, 0, OpKind::Copy, false, true),
+            cloud_download_warning(0, 0, OpKind::Copy, false, true).as_deref(),
+            Some(
+                "Couldn't check all files for cloud placeholders. Copying may download some of \
+                 them from the cloud first."
+            )
+        );
+        assert_eq!(
+            cloud_download_warning(0, 0, OpKind::Copy, false, false),
             None
         );
     }
@@ -1512,9 +1637,9 @@ mod cloud_warning_tests {
         }
         let dest = dir.path().join("dest");
         let sources = std::slice::from_ref(&folder);
-        assert_eq!(cloud_warning_for(sources, &dest, OpKind::Move), None);
+        assert_eq!(cloud_warning_for(sources, &dest, OpKind::Move, &CancelToken::new()), None);
         // The same folder copied would warn, so the Move result comes from the rule.
-        assert!(cloud_warning_for(sources, &dest, OpKind::Copy).is_some());
+        assert!(cloud_warning_for(sources, &dest, OpKind::Copy, &CancelToken::new()).is_some());
         for path in &placeholders {
             forge_core::cloud::clear_simulated_online_only(path);
         }
@@ -1539,16 +1664,26 @@ mod cloud_warning_tests {
         std::fs::write(&local, b"hello").unwrap();
 
         let elsewhere = dir.path().join("elsewhere");
-        let scan = online_only_totals(std::slice::from_ref(&root), &elsewhere, OpKind::Copy);
+        let scan = online_only_totals(
+            std::slice::from_ref(&root),
+            &elsewhere,
+            OpKind::Copy,
+            &CancelToken::new(),
+        );
         assert_eq!(
             scan,
             OnlineOnlyScan {
                 count: 10,
                 bytes: 30,
-                truncated: false,
+                incomplete: false,
             }
         );
-        let body = cloud_warning_for(std::slice::from_ref(&root), &elsewhere, OpKind::Copy)
+        let body = cloud_warning_for(
+            std::slice::from_ref(&root),
+            &elsewhere,
+            OpKind::Copy,
+            &CancelToken::new(),
+        )
             .expect("ten online-only files warn");
         assert!(body.starts_with("10 files (30 B) are online-only."));
         for path in &placeholders {
@@ -1557,7 +1692,7 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn entry_cap_with_online_only_file_says_the_scan_stopped_early() {
+    fn entry_cap_with_online_only_files_gives_a_lower_bound() {
         let dir = tempfile::tempdir().expect("temp directory");
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
@@ -1569,23 +1704,25 @@ mod cloud_warning_tests {
             placeholders.push(path);
         }
         let elsewhere = dir.path().join("elsewhere");
-        // Every entry is online-only, so the first two visited are seen before the cap.
+        // The selected folder takes one entry; every entry inside is online-only, so the
+        // first two visited are seen before the cap.
         let scan = online_only_totals_with(
             std::slice::from_ref(&root),
             &elsewhere,
             OpKind::Copy,
-            2,
+            3,
             Duration::from_secs(60),
+            &CancelToken::new(),
         );
-        assert!(scan.truncated);
+        assert!(scan.incomplete);
         assert_eq!(scan.count, 2);
         let body =
-            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.truncated);
+            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.incomplete);
         assert_eq!(
             body.as_deref(),
             Some(
-                "At least 2 files (6 B) are online-only; the scan stopped early, so there may be \
-                 more. Copying them downloads them from the cloud first."
+                "At least 2 files (6 B) are online-only; not every file could be checked, so \
+                 there may be more. Copying them downloads them from the cloud first."
             )
         );
         for path in &placeholders {
@@ -1594,7 +1731,7 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn entry_cap_without_online_only_file_stays_silent() {
+    fn entry_cap_without_online_only_file_still_asks() {
         let dir = tempfile::tempdir().expect("temp directory");
         let root = dir.path().join("root");
         std::fs::create_dir(&root).unwrap();
@@ -1608,13 +1745,14 @@ mod cloud_warning_tests {
             OpKind::Copy,
             2,
             Duration::from_secs(60),
+            &CancelToken::new(),
         );
-        assert!(scan.truncated);
+        assert!(scan.incomplete);
         assert_eq!(scan.count, 0);
-        assert_eq!(
-            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.truncated),
-            None
-        );
+        let body =
+            cloud_download_warning(scan.count, scan.bytes, OpKind::Copy, false, scan.incomplete)
+                .expect("an incomplete scan asks even when it found nothing");
+        assert!(body.starts_with("Couldn't check all files"), "{body}");
     }
 
     #[test]
@@ -1631,7 +1769,7 @@ mod cloud_warning_tests {
     }
 
     #[test]
-    fn selected_files_are_checked_in_full_even_after_the_folder_cap() {
+    fn selected_files_are_checked_before_folders_use_the_budget() {
         let dir = tempfile::tempdir().expect("temp directory");
         let big = dir.path().join("big");
         std::fs::create_dir(&big).unwrap();
@@ -1646,25 +1784,124 @@ mod cloud_warning_tests {
             sources.push(path);
         }
         let elsewhere = dir.path().join("elsewhere");
-        // The folder (listed first) uses up the entry budget; the files still all count.
+        // The folder is listed first, but the 12 files are checked before it is walked.
         let scan = online_only_totals_with(
             &sources,
             &elsewhere,
             OpKind::Copy,
-            4,
+            14,
             Duration::from_secs(60),
+            &CancelToken::new(),
         );
         assert_eq!(
             scan,
             OnlineOnlyScan {
                 count: 12,
                 bytes: 36,
-                truncated: true,
+                incomplete: true,
             }
         );
         for path in &sources[1..] {
             forge_core::cloud::clear_simulated_online_only(path);
         }
+    }
+
+    #[test]
+    fn a_large_file_selection_is_capped_and_incomplete() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let files: Vec<PathBuf> = (0..12)
+            .map(|i| {
+                let path = dir.path().join(format!("f{i}.bin"));
+                std::fs::write(&path, b"abc").unwrap();
+                path
+            })
+            .collect();
+        let elsewhere = dir.path().join("elsewhere");
+        let scan = online_only_totals_with(
+            &files,
+            &elsewhere,
+            OpKind::Copy,
+            4,
+            Duration::from_secs(60),
+            &CancelToken::new(),
+        );
+        assert_eq!(
+            scan,
+            OnlineOnlyScan {
+                count: 0,
+                bytes: 0,
+                incomplete: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unreadable_folders_make_the_scan_incomplete() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        // A "folder" that read_dir cannot list: a file posing as the walk root.
+        let not_a_dir = dir.path().join("plain.bin");
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        let mut budget = ScanBudget {
+            visited: 0,
+            max_entries: 100,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &CancelToken::new(),
+        };
+        let mut scan = OnlineOnlyScan::default();
+        assert!(walk_online_only(&not_a_dir, &mut budget, &mut scan));
+        assert!(scan.incomplete);
+    }
+
+    #[test]
+    fn a_cancelled_scan_stops_and_is_incomplete() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let cancel = CancelToken::new();
+        let guard = CloudScanGuard(cancel.clone());
+        drop(guard);
+        assert!(cancel.is_cancelled(), "dismissing the dialog cancels its scan");
+        let scan = online_only_totals_with(
+            std::slice::from_ref(&file),
+            &dir.path().join("elsewhere"),
+            OpKind::Copy,
+            100,
+            Duration::from_secs(60),
+            &cancel,
+        );
+        assert!(scan.incomplete);
+    }
+
+    #[test]
+    fn identities_are_captured_off_the_ui_thread_and_fail_closed() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let pending = capture_identities(vec![file.clone()]);
+        let identities = wait_identities(&pending, &CancelToken::new(), 1).unwrap();
+        assert!(identities[0].is_some());
+        // A helper that died without answering: every identity is unknown.
+        let (tx, rx) = bounded::<Vec<Option<SourceIdentity>>>(1);
+        drop(tx);
+        let unknown = wait_identities(&rx, &CancelToken::new(), 2).unwrap();
+        assert!(unknown.iter().all(Option::is_none));
+        let (keep, _, unverified) =
+            screen_queued_sources(vec![file.clone()], &unknown, source_identity);
+        assert!(keep.is_empty());
+        assert_eq!(unverified, vec![file]);
+        // Cancelled while waiting: the job stops.
+        let (_tx, never) = bounded::<Vec<Option<SourceIdentity>>>(1);
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(wait_identities(&never, &cancel, 1).is_none());
+    }
+
+    #[test]
+    fn a_transfer_is_refused_with_a_message_while_a_dialog_is_open() {
+        assert_eq!(
+            busy_transfer_message(OpKind::Copy),
+            "The copy did not start: close the open dialog first, then try again"
+        );
     }
 
     #[test]
@@ -1724,16 +1961,16 @@ mod cloud_warning_tests {
         let sources = [cloud.clone(), local, folder.clone()];
         let elsewhere = dir.path().join("elsewhere");
         assert_eq!(
-            online_only_totals(&sources, &elsewhere, OpKind::Copy),
+            online_only_totals(&sources, &elsewhere, OpKind::Copy, &CancelToken::new()),
             OnlineOnlyScan {
                 count: 2,
                 bytes: 5,
-                truncated: false,
+                incomplete: false,
             }
         );
         // A move within the same volume is a rename: nothing is read.
         assert_eq!(
-            online_only_totals(&sources, dir.path(), OpKind::Move),
+            online_only_totals(&sources, dir.path(), OpKind::Move, &CancelToken::new()),
             OnlineOnlyScan::default()
         );
         forge_core::cloud::clear_simulated_online_only(&cloud);

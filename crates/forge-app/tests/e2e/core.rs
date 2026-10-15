@@ -92,6 +92,34 @@ fn copy_to_other_pane_duplicates_files_byte_for_byte() {
 }
 
 #[test]
+fn a_copy_started_while_a_dialog_is_open_is_refused_not_lost() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    write_file(&src.join("a.txt"), b"keep me");
+    fs::create_dir_all(&dst).unwrap();
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "select a.txt",
+            // Any open dialog holds the single dialog slot.
+            "cmd DeletePermanently",
+            "cmd CopyToOtherPane",
+            "assert-toast The copy did not start: close the open dialog first",
+            "cancel",
+            "wait-jobs 20",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(!dst.join("a.txt").exists(), "the refused copy never ran");
+    assert_eq!(fs::read(src.join("a.txt")).unwrap(), b"keep me");
+}
+
+#[test]
 fn copy_with_conflict_keep_both_writes_a_numbered_copy() {
     let sandbox = tempfile::tempdir().unwrap();
     let src = sandbox.path().join("src");
