@@ -165,10 +165,17 @@ struct BatchUi {
     /// Preset requested from the "Deliver with" menu, applied by [`deliver`].
     pending_preset: Option<String>,
     prepared: Option<(Watermark, Result<Arc<PreparedWatermark>, String>)>,
+    /// Watermark being prepared on a worker thread, if any.
+    prepare_job: Option<PrepareJob>,
+    /// Bumped for every prepare request; a result from an older request is dropped.
+    prepare_generation: u64,
     preview: WatermarkPreview,
     run: Option<BatchRun>,
-    /// Header dimensions of previewed sources (None = unreadable, e.g. RAW).
+    /// Header dimensions of previewed sources (None = unreadable, e.g. RAW, or not read yet).
     dims_cache: HashMap<PathBuf, Option<(u32, u32)>>,
+    /// Header reads running on a worker thread. Each item is one file's result; `None`
+    /// marks the end of the batch.
+    dims_job: Option<crossbeam_channel::Receiver<Option<(PathBuf, Option<(u32, u32)>)>>>,
 }
 
 impl Default for BatchUi {
@@ -197,9 +204,12 @@ impl Default for BatchUi {
             preset_name: String::new(),
             pending_preset: None,
             prepared: None,
+            prepare_job: None,
+            prepare_generation: 0,
             preview: WatermarkPreview::default(),
             run: None,
             dims_cache: HashMap::new(),
+            dims_job: None,
         }
     }
 }
@@ -584,21 +594,132 @@ fn run_preset_action(app: &mut ZxrawApp, state: &mut BatchUi, action: PresetActi
     }
 }
 
-/// Re-prepares the watermark when its settings changed since the last frame.
-fn refresh_watermark(state: &mut BatchUi) {
+/// A watermark being prepared on a worker thread (decoding a logo can block on a network
+/// share, so it never runs on the UI thread).
+struct PrepareJob {
+    generation: u64,
+    watermark: Watermark,
+    receiver: crossbeam_channel::Receiver<(u64, Result<PreparedWatermark, String>)>,
+}
+
+fn spawn_prepare(ctx: &egui::Context, generation: u64, watermark: Watermark) -> PrepareJob {
+    let (sender, receiver) = crossbeam_channel::bounded(1);
+    let ctx = ctx.clone();
+    let job_watermark = watermark.clone();
+    std::thread::spawn(move || {
+        let prepared = PreparedWatermark::prepare(&watermark);
+        // The receiver is gone when a newer request replaced this one.
+        if sender.send((generation, prepared)).is_ok() {
+            ctx.request_repaint();
+        }
+    });
+    PrepareJob {
+        generation,
+        watermark: job_watermark,
+        receiver,
+    }
+}
+
+/// Takes a finished prepare result into `state.prepared`. A result for superseded settings
+/// or an older generation is dropped.
+fn poll_watermark(state: &mut BatchUi) {
+    let Some(job) = state.prepare_job.take() else {
+        return;
+    };
+    match job.receiver.try_recv() {
+        Ok((generation, prepared)) => {
+            if generation == state.prepare_generation && job.watermark == state.watermark {
+                state.prepared = Some((job.watermark, prepared.map(Arc::new)));
+            }
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => state.prepare_job = Some(job),
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            // The worker died without an answer; report it instead of retrying every frame.
+            if job.generation == state.prepare_generation {
+                state.prepared = Some((
+                    job.watermark,
+                    Err("Could not prepare the watermark.".into()),
+                ));
+            }
+        }
+    }
+}
+
+/// Starts preparing the watermark when its settings changed since the last frame, and
+/// collects the result when it is ready. Until then [`prepared_watermark`] reports "not
+/// ready".
+fn refresh_watermark(ctx: &egui::Context, state: &mut BatchUi) {
     if !state.watermark_on {
         return;
     }
     if let WatermarkSource::Image { path } = &mut state.watermark.source {
         *path = normalize_user_path(state.watermark_path.trim());
     }
+    poll_watermark(state);
     let stale = state
         .prepared
         .as_ref()
         .is_none_or(|(watermark, _)| *watermark != state.watermark);
-    if stale {
-        let prepared = PreparedWatermark::prepare(&state.watermark).map(Arc::new);
-        state.prepared = Some((state.watermark.clone(), prepared));
+    let in_flight = state
+        .prepare_job
+        .as_ref()
+        .is_some_and(|job| job.watermark == state.watermark);
+    if stale && !in_flight {
+        state.prepare_generation += 1;
+        let generation = state.prepare_generation;
+        state.prepare_job = Some(spawn_prepare(ctx, generation, state.watermark.clone()));
+    }
+}
+
+/// Starts header reads on a worker thread for the preview rows that have no size yet.
+/// RAW files are not read at all (they have no header this reader understands).
+fn request_dimensions(ctx: &egui::Context, state: &mut BatchUi, sources: &[PathBuf]) {
+    let mut missing = Vec::new();
+    for source in sources.iter().take(PREVIEW_ROWS) {
+        if state.dims_cache.contains_key(source) {
+            continue;
+        }
+        if is_raw(source) {
+            state.dims_cache.insert(source.clone(), None);
+        } else {
+            missing.push(source.clone());
+        }
+    }
+    if missing.is_empty() || state.dims_job.is_some() {
+        return;
+    }
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        for path in missing {
+            let dims = image::image_dimensions(&path).ok();
+            if sender.send(Some((path, dims))).is_err() {
+                return;
+            }
+            ctx.request_repaint();
+        }
+        let _ = sender.send(None);
+        ctx.request_repaint();
+    });
+    state.dims_job = Some(receiver);
+}
+
+/// Moves finished header reads into `state.dims_cache`.
+fn poll_dimensions(state: &mut BatchUi) {
+    let Some(receiver) = state.dims_job.take() else {
+        return;
+    };
+    loop {
+        match receiver.try_recv() {
+            Ok(Some((path, dims))) => {
+                state.dims_cache.insert(path, dims);
+            }
+            Ok(None) | Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                state.dims_job = Some(receiver);
+                return;
+            }
+        }
     }
 }
 
@@ -839,7 +960,7 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut BatchUi) {
         annotations.get(path).copied()
     });
     let folder = folder_label(&app.pane().path);
-    refresh_watermark(state);
+    refresh_watermark(ctx, state);
     // A thumbnail the grid already decoded spares the preview a decode of the source.
     let cached_preview = sources
         .first()
@@ -1019,8 +1140,12 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut BatchUi) {
             match build_options(state, &folder) {
                 Ok(options) => {
                     if !sources.is_empty() {
+                        poll_dimensions(state);
+                        if options.template.contains("{w") || options.template.contains("{h") {
+                            request_dimensions(ctx, state, &sources);
+                        }
                         let (names, conflicts) =
-                            preview_names(&mut state.dims_cache, &sources, &options);
+                            preview_names(&state.dims_cache, &sources, &options);
                         ui.separator();
                         ui.label(format!(
                             "Preview (first {} of {}):",
@@ -1036,8 +1161,10 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut BatchUi) {
                             ));
                         }
                         ui.label(
-                            egui::RichText::new("Width/height show _ for RAW files until export.")
-                                .weak(),
+                            egui::RichText::new(
+                                "Width/height show _ for RAW files, and for images whose size is not read yet.",
+                            )
+                            .weak(),
                         );
                     }
                 }
@@ -1183,21 +1310,22 @@ fn build_options(state: &BatchUi, folder: &str) -> Result<Options, String> {
     })
 }
 
-/// Output names for the first rows of the batch, plus the number of collisions.
+/// Output names for the first rows of the batch, plus the number of collisions. Reads no
+/// files: sizes come from `cache`, filled by [`request_dimensions`], and a size not there
+/// yet shows as `_`.
 fn preview_names(
-    cache: &mut HashMap<PathBuf, Option<(u32, u32)>>,
+    cache: &HashMap<PathBuf, Option<(u32, u32)>>,
     sources: &[PathBuf],
     options: &Options,
 ) -> (Vec<String>, usize) {
     let mut taken = HashSet::new();
     let mut names = Vec::new();
     let mut conflicts = 0;
+    // The size is only shown when the template asks for it.
+    let wants_size = options.template.contains("{w") || options.template.contains("{h");
     for (index, source) in sources.iter().take(PREVIEW_ROWS).enumerate() {
-        // Reading a header is only worth it when the template shows the size.
-        let dims = if options.template.contains("{w") || options.template.contains("{h") {
-            *cache
-                .entry(source.clone())
-                .or_insert_with(|| image::image_dimensions(source).ok())
+        let dims = if wants_size {
+            cache.get(source).copied().flatten()
         } else {
             None
         };
@@ -2009,5 +2137,62 @@ mod tests {
         assert_eq!(options.zip_name.as_deref(), Some("Wedding_proofs.zip"));
         state.output = OutputKind::Folder;
         assert_eq!(build_options(&state, "Wedding").unwrap().zip_name, None);
+    }
+
+    fn logo_settings(path: &str) -> Watermark {
+        Watermark {
+            source: WatermarkSource::Image {
+                path: PathBuf::from(path),
+            },
+            ..Watermark::default()
+        }
+    }
+
+    #[test]
+    fn starting_a_watermark_prepare_does_not_wait_for_an_unreachable_logo() {
+        // TEST-NET-1 is never routed, so reading the logo can only fail or hang. Starting
+        // the prepare must still return at once; the decode runs on its own thread.
+        let ctx = egui::Context::default();
+        let started = std::time::Instant::now();
+        let _job = spawn_prepare(&ctx, 1, logo_settings(r"\\192.0.2.1\x\logo.png"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "starting the prepare took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_local_logo_is_prepared_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let logo = dir.path().join("logo.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 255, 0, 255]))
+            .save(&logo)
+            .unwrap();
+        let ctx = egui::Context::default();
+        let job = spawn_prepare(&ctx, 7, logo_settings(logo.to_str().unwrap()));
+        let (generation, prepared) = job
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the worker answers");
+        assert_eq!(generation, 7);
+        if let Err(error) = prepared {
+            panic!("the local logo did not prepare: {error}");
+        }
+    }
+
+    #[test]
+    fn preview_names_shows_a_placeholder_until_the_size_is_read() {
+        let source = PathBuf::from("C:/photos/a.jpg");
+        let options = Options {
+            template: "{name}_{w}x{h}".into(),
+            ..options(Path::new("C:/out"), OutFormat::Jpeg)
+        };
+        let mut cache = HashMap::new();
+        let (names, _) = preview_names(&cache, std::slice::from_ref(&source), &options);
+        assert_eq!(names, ["a__x_.jpg"]);
+        cache.insert(source.clone(), Some((400, 300)));
+        let (names, _) = preview_names(&cache, &[source], &options);
+        assert_eq!(names, ["a_400x300.jpg"]);
     }
 }

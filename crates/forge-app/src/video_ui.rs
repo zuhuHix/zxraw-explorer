@@ -310,8 +310,54 @@ fn open_checked(path: &Path) -> Result<std::fs::File, String> {
     })
 }
 
+/// Seconds between re-checks while FFmpeg is missing, so an install made outside the app is
+/// picked up without a stat of the folders on every frame.
+const MISSING_TOOLS_RECHECK: Duration = Duration::from_secs(5);
+
+/// Remembers FFmpeg discovery for one `ffmpeg_dir` setting. Discovery stats the configured
+/// folder and every PATH entry, which is slow when they sit on a network share, so it must not
+/// run every frame or on every selection. Found tools are kept until the setting changes;
+/// missing tools are re-checked after `MISSING_TOOLS_RECHECK`.
+#[derive(Default)]
+struct FfToolsMemo {
+    entry: Option<FfToolsEntry>,
+}
+
+struct FfToolsEntry {
+    ffmpeg_dir: Option<PathBuf>,
+    tools: FfTools,
+    checked_at: Instant,
+}
+
+impl FfToolsMemo {
+    fn get_or_discover(
+        &mut self,
+        ffmpeg_dir: Option<&Path>,
+        now: Instant,
+        discover: impl FnOnce(Option<&Path>) -> FfTools,
+    ) -> FfTools {
+        if let Some(entry) = &self.entry
+            && entry.ffmpeg_dir.as_deref() == ffmpeg_dir
+        {
+            let complete = entry.tools.has_ffmpeg() && entry.tools.has_ffprobe();
+            if complete || now.saturating_duration_since(entry.checked_at) < MISSING_TOOLS_RECHECK
+            {
+                return entry.tools.clone();
+            }
+        }
+        let tools = discover(ffmpeg_dir);
+        self.entry = Some(FfToolsEntry {
+            ffmpeg_dir: ffmpeg_dir.map(Path::to_path_buf),
+            tools: tools.clone(),
+            checked_at: now,
+        });
+        tools
+    }
+}
+
 pub struct VideoUi {
     tx: Sender<VideoMessage>,
+    ffmpeg_tools: FfToolsMemo,
     rx: Receiver<VideoMessage>,
     selection: Option<MediaKey>,
     generation: u64,
@@ -355,6 +401,7 @@ impl Default for VideoUi {
         Self {
             tx,
             rx,
+            ffmpeg_tools: FfToolsMemo::default(),
             selection: None,
             generation: 0,
             generation_cancel: CancelToken::new(),
@@ -399,6 +446,13 @@ impl VideoUi {
     /// Whether the selected clip cannot be previewed because FFmpeg tools are unavailable.
     pub fn tools_unavailable(&self) -> bool {
         self.missing_tools.is_some()
+    }
+
+    /// FFmpeg tools for `ffmpeg_dir`, from the memo when it is fresh. UI-thread callers use this
+    /// instead of `FfTools::discover_with`.
+    fn ffmpeg_tools(&mut self, ffmpeg_dir: Option<&Path>) -> FfTools {
+        self.ffmpeg_tools
+            .get_or_discover(ffmpeg_dir, Instant::now(), FfTools::discover_with)
     }
 
     fn sync_selection(
@@ -457,7 +511,7 @@ impl VideoUi {
         if cached_tool_error {
             self.probe_cache.pop(&media);
         }
-        let tools = FfTools::discover_with(ffmpeg_dir.as_deref());
+        let tools = self.ffmpeg_tools(ffmpeg_dir.as_deref());
         self.ffmpeg_available = tools.has_ffmpeg();
         self.ffprobe_available = tools.has_ffprobe();
         let missing: Vec<&str> = [
@@ -1422,7 +1476,10 @@ fn proxy_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     let mut destination_changed = false;
     let download = app.ops.ffmpeg_setup.status();
     let mut download_clicked = false;
-    let ff = FfTools::discover_with(app.settings.ffmpeg_dir.as_deref());
+    let ff = app
+        .ops
+        .video_ui
+        .ffmpeg_tools(app.settings.ffmpeg_dir.as_deref());
     if let Some(exe) = ff.ffmpeg.as_deref() {
         ensure_encoder_probe(exe, ctx);
     }
@@ -1694,7 +1751,10 @@ fn start_estimate(
 }
 
 fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
-    let ff = FfTools::discover_with(app.settings.ffmpeg_dir.as_deref());
+    let ff = app
+        .ops
+        .video_ui
+        .ffmpeg_tools(app.settings.ffmpeg_dir.as_deref());
     let Some(ffmpeg) = ff.ffmpeg else {
         app.toast_err("ffmpeg is missing; configure it under Settings › Video");
         return;
@@ -3163,6 +3223,59 @@ fn format_timecode_at(start: &str, offset_s: f64, fps: f64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn found(dir: &Path) -> FfTools {
+        FfTools {
+            ffmpeg: Some(dir.join("ffmpeg.exe")),
+            ffprobe: Some(dir.join("ffprobe.exe")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ffmpeg_discovery_runs_once_per_setting_when_tools_are_found() {
+        let mut memo = FfToolsMemo::default();
+        let dir = PathBuf::from("C:/tools/ffmpeg");
+        let start = Instant::now();
+        let calls = Cell::new(0);
+        let discover = |d: Option<&Path>| {
+            calls.set(calls.get() + 1);
+            found(d.unwrap())
+        };
+        for frame in 0..600 {
+            let now = start + Duration::from_millis(frame * 16);
+            let tools = memo.get_or_discover(Some(&dir), now, discover);
+            assert_eq!(tools.ffmpeg, Some(dir.join("ffmpeg.exe")));
+        }
+        assert_eq!(calls.get(), 1);
+
+        // A different setting is discovered once, then memoized in turn.
+        let other = PathBuf::from("D:/ffmpeg");
+        memo.get_or_discover(Some(&other), start, discover);
+        memo.get_or_discover(Some(&other), start, |_| unreachable!("memoized"));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn missing_ffmpeg_is_rechecked_on_an_interval_not_every_frame() {
+        let mut memo = FfToolsMemo::default();
+        let start = Instant::now();
+        let calls = Cell::new(0);
+        let missing = |_: Option<&Path>| {
+            calls.set(calls.get() + 1);
+            FfTools::default()
+        };
+        memo.get_or_discover(None, start, missing);
+        memo.get_or_discover(None, start + Duration::from_millis(16), missing);
+        memo.get_or_discover(None, start + Duration::from_secs(1), missing);
+        assert_eq!(calls.get(), 1);
+        let tools = memo.get_or_discover(None, start + MISSING_TOOLS_RECHECK, missing);
+        assert_eq!(calls.get(), 2);
+        assert!(!tools.has_ffmpeg());
+    }
+
     #[test]
     fn workers_refuse_a_clip_that_is_online_only_when_they_start() {
         let d = tempfile::tempdir().unwrap();
@@ -3217,7 +3330,6 @@ mod tests {
         assert!(owned_directory.exists());
     }
 
-    use super::*;
     use tempfile::TempDir;
 
     #[test]

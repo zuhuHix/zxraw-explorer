@@ -26,6 +26,13 @@
 //! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
 //! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
 //!   folder is open in place.
+//! - `offline rename <path> | <name>`: accept a Rename prompt for `<path>`;
+//!   `offline undo-rename <path> | <name>`: undo a recorded rename of `<path>` to `<name>`;
+//!   `offline new-folder <name>` / `offline new-file <name>`: run New folder / New file in the
+//!   focused pane and accept the prompt with `<name>`. Not sandboxed: the paths (and the
+//!   focused pane's folder) must be on the unroutable TEST-NET-1 share `\\192.0.2.x`, so
+//!   nothing is ever touched. Fails if a UI call took longer than 250 ms or the prompt stayed
+//!   open; it does not wait for the background work (which hangs until the network gives up).
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
@@ -170,7 +177,10 @@ pub(super) fn step(
             if filter == args.trim() {
                 Ok(Flow::Done)
             } else {
-                Err(format!("the filter is `{filter}`, expected `{}`", args.trim()))
+                Err(format!(
+                    "the filter is `{filter}`, expected `{}`",
+                    args.trim()
+                ))
             }
         }
         "assert-sticky" => {
@@ -183,7 +193,10 @@ pub(super) fn step(
             if sticky == expected {
                 Ok(Flow::Done)
             } else {
-                Err(format!("sticky selection is {}", if sticky { "on" } else { "off" }))
+                Err(format!(
+                    "sticky selection is {}",
+                    if sticky { "on" } else { "off" }
+                ))
             }
         }
         "click-arrow" => {
@@ -193,7 +206,9 @@ pub(super) fn step(
                     return Err(format!("`{name}` is not listed"));
                 };
                 let Some(rect) = super::drawn_rect(ctx, super::arrow_rect_id(&path)) else {
-                    return Ok(Flow::Wait(format!("the arrow of `{name}` is not on screen")));
+                    return Ok(Flow::Wait(format!(
+                        "the arrow of `{name}` is not on screen"
+                    )));
                 };
                 st.data = Some(Box::new(rect.center()));
             }
@@ -290,10 +305,87 @@ pub(super) fn step(
             if open == expected {
                 Ok(Flow::Done)
             } else {
-                Err(format!("folder `{name}` open in place is {open}, expected {expected}"))
+                Err(format!(
+                    "folder `{name}` open in place is {open}, expected {expected}"
+                ))
             }
         }
+        "offline" => offline(app, ctx, args),
         other => Err(format!("unknown `ui browser` verb `{other}`")),
+    }
+}
+
+/// A path on the unroutable TEST-NET-1 range (RFC 5737): no file call on it ever succeeds.
+fn on_test_net(path: &std::path::Path) -> bool {
+    forge_core::netpath::is_network_path(path)
+        && path
+            .to_string_lossy()
+            .replace('/', "\\")
+            .starts_with(r"\\192.0.2.")
+}
+
+/// `ui browser offline …`: the UI side of a rename / undo / create on an offline share
+/// must return at once and leave the disk work to a worker.
+fn offline(app: &mut ZxrawApp, ctx: &egui::Context, args: &str) -> Result<Flow, String> {
+    use crate::actions::UndoEntry;
+    use crate::commands::Cmd;
+    use crate::modal::{Modal, Prompt, PromptKind};
+    let (action, rest) = args
+        .trim()
+        .split_once(char::is_whitespace)
+        .ok_or("expected `offline <action> …`")?;
+    let rest = rest.trim();
+    let started = Instant::now();
+    match action {
+        "rename" | "undo-rename" => {
+            let (path, name) = rest.split_once('|').ok_or("expected `<path> | <name>`")?;
+            let (path, name) = (PathBuf::from(path.trim()), name.trim().to_string());
+            if !on_test_net(&path) {
+                return Err("the path must be on the TEST-NET-1 share \\\\192.0.2.x".into());
+            }
+            if action == "rename" {
+                let prompt = Prompt::new(PromptKind::Rename { path }, "Rename", name);
+                if let Some(m) = crate::actions::accept(app, Modal::Prompt(prompt)) {
+                    app.ops.modal = Some(m);
+                    return Err("the rename prompt stayed open".into());
+                }
+            } else {
+                let renamed = path.with_file_name(&name);
+                app.ops.undo.push(UndoEntry::Rename(vec![(renamed, path)]));
+                app.run(Cmd::Undo, ctx);
+            }
+        }
+        "new-folder" | "new-file" => {
+            if !on_test_net(&app.pane().path) {
+                return Err(
+                    "the focused pane must show a TEST-NET-1 share (`ui sidebar go`)".into(),
+                );
+            }
+            let cmd = if action == "new-folder" {
+                Cmd::NewFolder
+            } else {
+                Cmd::NewFile
+            };
+            app.run(cmd, ctx);
+            let Some(Modal::Prompt(mut prompt)) = app.ops.modal.take() else {
+                return Err(format!("{cmd:?} opened no prompt"));
+            };
+            prompt.text = rest.to_string();
+            if let Some(m) = crate::actions::accept(app, Modal::Prompt(prompt)) {
+                app.ops.modal = Some(m);
+                return Err("the prompt stayed open".into());
+            }
+        }
+        other => return Err(format!("unknown offline action `{other}`")),
+    }
+    let took = started.elapsed();
+    if took > Duration::from_millis(250) {
+        Err(format!(
+            "`{action}` blocked the UI for {} ms",
+            took.as_millis()
+        ))
+    } else {
+        Ok(Flow::Done)
     }
 }
 

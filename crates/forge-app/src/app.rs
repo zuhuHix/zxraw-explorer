@@ -150,8 +150,10 @@ pub struct ZxrawApp {
     pub viewer: Option<crate::viewer::Viewer>,
     pub notices: crate::notices::Notices,
     /// A photo passed on the command line (a double-click when ZXraw Explorer is the default
-    /// app): shown in the viewer once its folder has loaded.
-    launch_photo: Option<PathBuf>,
+    /// app): shown in the viewer once its folder has loaded. `confirm` is set for a network
+    /// path, which is never probed on this thread: the viewer opens only if the listing shows
+    /// a file there (a folder named `x.jpg` is just listed).
+    launch_photo: Option<LaunchPhoto>,
     applied_theme: Option<(bool, settings::Accent, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
     applied_icon: settings::AppIcon,
@@ -326,7 +328,10 @@ impl ZxrawApp {
                 if is_file {
                     app.tab_mut().focus = Side::Left;
                     if matches!(kind, forge_core::MediaKind::Image | forge_core::MediaKind::Raw) {
-                        app.launch_photo = Some(p.clone());
+                        app.launch_photo = Some(LaunchPhoto {
+                            path: p.clone(),
+                            confirm: network,
+                        });
                     }
                     app.navigate(p);
                 } else if existing.is_none() {
@@ -1146,8 +1151,9 @@ impl eframe::App for ZxrawApp {
         crate::layouts::tick(self, ctx);
         if !self.pane().is_loading()
             && let Some(photo) = self.launch_photo.take()
+            && (!photo.confirm || launch_confirmed(self.pane(), &photo.path))
         {
-            crate::viewer_host::open_launched(self, photo);
+            crate::viewer_host::open_launched(self, photo.path);
         }
         let busy = self
             .tabs
@@ -1328,6 +1334,21 @@ impl ZxrawApp {
 /// (ratings, delete, copy/paste of files, selection) would act on the file list behind the
 /// field the user is typing in.
 /// Keys that move the file cursor.
+/// A photo from the command line waiting for its folder to load.
+struct LaunchPhoto {
+    path: PathBuf,
+    /// Open it only if the listing confirms a file is there (see `ZxrawApp::launch_photo`).
+    confirm: bool,
+}
+
+/// Did the listing confirm `photo` as a file? After a network file path is listed, the
+/// pane shows its folder with the file at the cursor (see `Pane::open_file_location`).
+fn launch_confirmed(pane: &Pane, photo: &Path) -> bool {
+    pane.cursor_entry().is_some_and(|e| {
+        e.kind == forge_core::EntryKind::File && forge_core::paths::paths_equal(&e.path, photo)
+    })
+}
+
 fn is_navigation_key(key: Key) -> bool {
     matches!(
         key,
@@ -1546,6 +1567,22 @@ mod selection_summary_tests {
         p.rebuild_visible();
         p.selected.insert(p.path.join("a.txt"));
         assert_eq!(summary.get(&p), (2, 40));
+    }
+
+    #[test]
+    fn a_launch_photo_opens_only_when_the_listing_shows_a_file_there() {
+        let mut p = pane(&[("x.jpg", 10)]);
+        let photo = p.path.join("x.jpg");
+        // No cursor yet: nothing confirmed.
+        assert!(!launch_confirmed(&p, &photo));
+        p.cursor = Some(0);
+        assert!(launch_confirmed(&p, &photo));
+        // A folder named like a photo is not a file.
+        p.entries[0].kind = EntryKind::Dir;
+        assert!(!launch_confirmed(&p, &photo));
+        // The pane is inside the folder `x.jpg` (the guess was wrong): nothing to open.
+        let inside = pane(&[("a.jpg", 10)]);
+        assert!(!launch_confirmed(&inside, Path::new(r"C:\fixture")));
     }
 }
 

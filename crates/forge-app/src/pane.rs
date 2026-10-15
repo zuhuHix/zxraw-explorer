@@ -380,6 +380,15 @@ impl Pane {
             return;
         };
         let name = name.to_string_lossy().into_owned();
+        // `navigate` pushed the folder the user came from. When that is the parent, Back
+        // would now hold the folder the pane is showing; drop that duplicate.
+        if self
+            .back
+            .last()
+            .is_some_and(|b| forge_core::paths::paths_equal(b, parent))
+        {
+            self.back.pop();
+        }
         self.load_path(parent.to_path_buf());
         self.editing_path = None;
         self.set_pending_select(name);
@@ -622,6 +631,17 @@ impl Pane {
             .map(|&i| &self.entries[i])
             .filter(|e| self.selected.contains(&e.path))
             .collect()
+    }
+
+    /// The listed kind of each of `paths`, `None` for a path this pane does not list. UI code
+    /// uses this instead of asking the disk, which can block for a long time on a share.
+    pub fn kinds_of(&self, paths: &[PathBuf]) -> Vec<Option<EntryKind>> {
+        let listed: HashMap<&Path, EntryKind> = self
+            .entries
+            .iter()
+            .map(|e| (e.path.as_path(), e.kind))
+            .collect();
+        paths.iter().map(|p| listed.get(p.as_path()).copied()).collect()
     }
 
     /// Selected paths in display order, without the items inside a selected folder.
@@ -2314,5 +2334,32 @@ mod tests {
         pane.refresh();
         settle(&mut pane);
         assert_eq!(visible_names(&pane), ["a", "sub", "a1.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn opening_a_file_from_its_own_folder_does_not_duplicate_back_history() {
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("a.jpg");
+        std::fs::write(&file, b"image").unwrap();
+        let mut pane = Pane::new(
+            folder.path().to_path_buf(),
+            SortSpec::default(),
+            ViewMode::Details,
+        );
+        // `navigate` from P to P\a.jpg leaves P on the back stack and the file as the path.
+        pane.back = vec![folder.path().to_path_buf()];
+        pane.path = file;
+
+        pane.open_file_location();
+
+        assert!(
+            !pane
+                .back
+                .last()
+                .is_some_and(|b| forge_core::paths::paths_equal(b, folder.path())),
+            "back history still ends with the current folder: {:?}",
+            pane.back
+        );
+        assert_eq!(pane.path, folder.path());
     }
 }

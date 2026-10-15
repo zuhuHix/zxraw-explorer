@@ -7,8 +7,9 @@ const EDGE_SLOP_POINTS: f32 = 4.0;
 /// past the edge band between two frames, so the last position seen inside only has to be
 /// this close to an edge for the exit to count.
 const EXIT_MARGIN_POINTS: f32 = 64.0;
-/// Each dragged path costs a shell parse (~4 ms) on the UI thread before the modal drag
-/// starts, so very large selections are refused rather than freezing the window.
+/// Each local dragged path costs a shell parse (~4 ms) on the UI thread before the modal
+/// drag starts (no stat when the listing knows its kind), so very large selections are
+/// refused rather than freezing the window. Network paths cost only string copying.
 const MAX_DRAG_OUT_ITEMS: usize = 500;
 
 /// Called every frame after the app has drawn its widgets.
@@ -46,6 +47,7 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 
     let paths = payload.0.clone();
+    let kinds = payload.1.clone();
     egui::DragAndDrop::clear_payload(ctx);
     ctx.data_mut(|d| d.remove::<egui::Pos2>(last_id));
     if paths.len() > MAX_DRAG_OUT_ITEMS {
@@ -81,10 +83,16 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
             height: image.height,
             rgba: &image.rgba,
         });
+    // This runs on the UI thread, so nothing here may wait on a share. Each item carries the
+    // kind the pane listing showed, so forge-win never stats it, and a network flag (UNC, or a
+    // mapped drive by its drive type, which Windows answers locally). If any item is on the
+    // network, forge-win builds a CF_HDROP-only data object from the path strings, with no
+    // shell resolution, and uses the cached thumbnail or a stock icon as the drag image.
+    let items = drag_items(&paths, &kinds);
     match forge_win::dragout::active_window() {
         Ok(hwnd) => {
             if let Err(error) =
-                forge_win::dragout::drag_out_with_thumbnail(hwnd, &paths, false, drag_thumbnail)
+                forge_win::dragout::drag_out_items(hwnd, &items, false, drag_thumbnail)
             {
                 tracing::warn!("OS drag-out failed: {error}");
             }
@@ -94,6 +102,27 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         }
         Err(error) => tracing::warn!("could not find the app window for drag-out: {error}"),
     }
+}
+
+/// Pairs each dragged path with the kind its listing showed and whether it is on the network.
+/// A symlink or junction counts as known (the listing saw it), so it is not statted either.
+fn drag_items(
+    paths: &[std::path::PathBuf],
+    kinds: &[Option<forge_core::EntryKind>],
+) -> Vec<forge_win::dragout::DragItem> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| forge_win::dragout::DragItem {
+            path: path.clone(),
+            is_dir: kinds
+                .get(index)
+                .copied()
+                .flatten()
+                .map(|kind| kind == forge_core::EntryKind::Dir),
+            on_network: forge_core::netpath::is_network_path(path),
+        })
+        .collect()
 }
 
 /// Pure trigger decision used by the UI and its regression test.
@@ -124,7 +153,26 @@ fn should_start_os_drag(
 
 #[cfg(test)]
 mod tests {
-    use super::should_start_os_drag;
+    use super::{drag_items, should_start_os_drag};
+
+    #[test]
+    fn drag_items_carry_listed_kinds_and_flag_unc_paths() {
+        use forge_core::EntryKind;
+        use std::path::PathBuf;
+
+        let paths = vec![
+            PathBuf::from(r"\\nas\share\a.jpg"),
+            PathBuf::from(r"C:\photos\album"),
+            PathBuf::from(r"C:\photos\b.jpg"),
+        ];
+        let items = drag_items(&paths, &[Some(EntryKind::File), Some(EntryKind::Dir)]);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].is_dir, Some(false));
+        assert!(items[0].on_network);
+        assert_eq!(items[1].is_dir, Some(true));
+        // A missing kind stays unknown rather than guessed.
+        assert_eq!(items[2].is_dir, None);
+    }
 
     fn window() -> egui::Rect {
         egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(800.0, 600.0))

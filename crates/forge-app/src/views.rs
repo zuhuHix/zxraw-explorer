@@ -15,9 +15,17 @@ use crate::commands::Cmd;
 use crate::pane::{LoadState, Pane};
 use crate::theme;
 
-/// Payload for in-app drag and drop.
+/// Payload for in-app drag and drop: the dragged paths and, for each, its kind as the pane
+/// listed it (`None` if unknown). Drop targets use the kind instead of asking the disk.
 #[derive(Clone, Debug)]
-pub struct DragPaths(pub Vec<PathBuf>);
+pub struct DragPaths(pub Vec<PathBuf>, pub Vec<Option<EntryKind>>);
+
+impl DragPaths {
+    pub fn from_pane(pane: &Pane, paths: Vec<PathBuf>) -> Self {
+        let kinds = pane.kinds_of(&paths);
+        Self(paths, kinds)
+    }
+}
 
 #[derive(Debug)]
 pub enum ViewEvent {
@@ -297,7 +305,7 @@ fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
         } else {
             vec![entry.path.clone()]
         };
-        resp.dnd_set_drag_payload(DragPaths(paths));
+        resp.dnd_set_drag_payload(DragPaths::from_pane(pane, paths));
     }
 }
 
@@ -2270,7 +2278,7 @@ pub fn grid(
                     let resp = resp.on_hover_text_at_pointer(tip);
                     if let Some(members) = &item.members {
                         if resp.drag_started() {
-                            resp.dnd_set_drag_payload(DragPaths(members.clone()));
+                            resp.dnd_set_drag_payload(DragPaths::from_pane(pane, members.clone()));
                         }
                         if !badge_clicked {
                             group_row_click(
