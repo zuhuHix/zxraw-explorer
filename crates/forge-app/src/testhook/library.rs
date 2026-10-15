@@ -536,21 +536,21 @@ fn set_setting(app: &mut ZxrawApp, key: &str, value: &str) -> Result<(), String>
     };
     match key {
         "theme" => {
-            *app.settings.theme = match value {
+            app.settings.theme.set(match value {
                 "dark" => ThemeChoice::Dark,
                 "light" => ThemeChoice::Light,
                 "system" => ThemeChoice::System,
                 _ => return Err("theme is dark, light or system".into()),
-            }
+            })
         }
         "show_hidden" => app.settings.show_hidden = bool_value()?,
         "show_system" => app.settings.show_system = bool_value()?,
         "default_view" => {
-            *app.settings.default_view = match value {
+            app.settings.default_view.set(match value {
                 "details" => ViewMode::Details,
                 "grid" => ViewMode::Grid,
                 _ => return Err("default_view is details or grid".into()),
-            }
+            })
         }
         "thumb_size" => {
             app.settings.thumb_size = value

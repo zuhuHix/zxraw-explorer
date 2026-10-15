@@ -229,20 +229,19 @@ pub fn capture(app: &ZxrawApp, name: &str) -> Layout {
 }
 
 /// Stores `layout` under its name. A layout with the same name (case-insensitive) is
-/// replaced in place, keeping the fields a newer version stored on it (and on each tab that
-/// still opens the same folder at the same position); otherwise it is appended. Returns true
-/// when one was replaced.
+/// replaced in place, keeping the fields a newer version stored on it. A tab that still opens
+/// the same folder at the same position also keeps its unknown fields, and the unknown values
+/// of the settings it holds unchanged. Otherwise it is appended. Returns true when one was
+/// replaced.
 pub fn upsert(layouts: &mut Vec<Layout>, mut layout: Layout) -> bool {
     match layouts.iter_mut().find(|l| same_name(&l.name, &layout.name)) {
         Some(slot) => {
             for (key, value) in std::mem::take(&mut slot.extra) {
                 layout.extra.entry(key).or_insert(value);
             }
-            for (new, old) in layout.tabs.iter_mut().zip(&mut slot.tabs) {
-                if new.left == old.left {
-                    for (key, value) in std::mem::take(&mut old.extra) {
-                        new.extra.entry(key).or_insert(value);
-                    }
+            for (new, old) in layout.tabs.iter_mut().zip(&slot.tabs) {
+                if forge_core::paths::paths_equal(&new.left, &old.left) {
+                    new.keep_unknown_from(old);
                 }
             }
             *slot = layout;
@@ -297,10 +296,11 @@ pub fn plan(layout: &Layout, exists: impl Fn(&Path) -> bool) -> Plan {
         let left_ok = check(&t.left);
         let right_ok = t.right.as_deref().is_some_and(&mut check);
         let kept = match (left_ok, &t.right) {
+            (true, _) if right_ok || t.right.is_none() => Some(t.clone()),
             (true, _) => Some(TabSession {
-                right: t.right.clone().filter(|_| right_ok),
-                right_view: t.right_view.filter(|_| right_ok).into(),
-                right_sort: t.right_sort.filter(|_| right_ok).into(),
+                right: None,
+                right_view: None.into(),
+                right_sort: None.into(),
                 ..t.clone()
             }),
             (false, Some(right)) if right_ok => Some(TabSession {
@@ -667,8 +667,8 @@ mod tests {
     #[test]
     fn plan_splits_off_missing_right_pane() {
         let mut t = tab("A", Some("C"));
-        *t.right_view = Some(ViewMode::Grid);
-        *t.right_sort = Some(SortSpec::default());
+        t.right_view.set(Some(ViewMode::Grid));
+        t.right_sort.set(Some(SortSpec::default()));
         let p = plan(&layout(vec![t], 0), existing(&["A"]));
         assert_eq!(p.tabs, vec![tab("A", None)]);
         assert_eq!(p.missing, vec![PathBuf::from("C")]);
@@ -677,13 +677,13 @@ mod tests {
     #[test]
     fn plan_promotes_right_pane_when_left_missing() {
         let mut t = tab("A", Some("C"));
-        *t.view = ViewMode::Details;
-        *t.right_view = Some(ViewMode::Grid);
+        t.view.set(ViewMode::Details);
+        t.right_view.set(Some(ViewMode::Grid));
         let sort = SortSpec {
             descending: true,
             ..SortSpec::default()
         };
-        *t.right_sort = Some(sort);
+        t.right_sort.set(Some(sort));
         let p = plan(&layout(vec![t], 0), existing(&["C"]));
         assert_eq!(
             p.tabs,
@@ -789,6 +789,36 @@ mod tests {
     }
 
     #[test]
+    fn overwriting_a_layout_keeps_unknown_tab_values_the_user_did_not_change() {
+        let json = r#"{"name": "Work", "tabs": [
+            {"left": "A", "view": "Filmstrip", "sort": {"key": "Colour"}},
+            {"left": "B", "view": "Filmstrip", "right_view": "Timeline"}
+        ]}"#;
+        let mut list = vec![serde_json::from_str::<Layout>(json).unwrap()];
+        let mut changed = tab("B", None);
+        changed.view.set(ViewMode::Grid);
+        assert!(upsert(&mut list, layout(vec![tab("A", None), changed], 0)));
+        let saved = serde_json::to_value(&list[0]).unwrap();
+        assert_eq!(saved["tabs"][0]["view"], "Filmstrip");
+        assert_eq!(saved["tabs"][0]["sort"]["key"], "Colour");
+        assert_eq!(saved["tabs"][1]["view"], "Grid", "the user's choice");
+        assert_eq!(saved["tabs"][1]["right_view"], "Timeline");
+    }
+
+    #[test]
+    fn overwriting_a_layout_matches_tab_folders_ignoring_case() {
+        let json = r#"{"name": "Work", "tabs": [
+            {"left": "C:\\Shoots\\2024", "view": "Filmstrip", "zoom": 2}
+        ]}"#;
+        let mut list = vec![serde_json::from_str::<Layout>(json).unwrap()];
+        assert!(upsert(&mut list, layout(vec![tab(r"c:\shoots\2024", None)], 0)));
+        let saved = serde_json::to_value(&list[0]).unwrap();
+        assert_eq!(saved["tabs"][0]["zoom"], 2);
+        assert_eq!(saved["tabs"][0]["view"], "Filmstrip");
+        assert_eq!(saved["tabs"][0]["left"], r"c:\shoots\2024");
+    }
+
+    #[test]
     fn restore_keeps_panes_whose_check_failed_without_not_found() {
         use crate::path_probe::Found;
         let check = Batch::finished([
@@ -835,12 +865,12 @@ mod tests {
     #[test]
     fn layout_round_trips_through_json() {
         let mut t = tab("C:\\A", Some("C:\\B"));
-        *t.view = ViewMode::Grid;
-        *t.sort = Some(SortSpec {
+        t.view.set(ViewMode::Grid);
+        t.sort.set(Some(SortSpec {
             descending: true,
             ..SortSpec::default()
-        });
-        *t.right_view = Some(ViewMode::Details);
+        }));
+        t.right_view.set(Some(ViewMode::Details));
         let l = layout(vec![t], 0);
         let json = serde_json::to_string(&l).unwrap();
         let back: Layout = serde_json::from_str(&json).unwrap();

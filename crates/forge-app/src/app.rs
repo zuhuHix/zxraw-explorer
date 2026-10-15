@@ -22,9 +22,82 @@ pub struct Tab {
     pub left: Pane,
     pub right: Option<Pane>,
     pub focus: Side,
+    /// The tab as opened from the session or a layout, kept only while it holds values or
+    /// fields this version doesn't know, so saving writes them back (see [`Tab::session`]).
+    pub stored: Option<Box<TabSession>>,
 }
 
 impl Tab {
+    /// Opens `t` with panes made by `new_pane` (folder, view).
+    fn from_session(t: &TabSession, new_pane: impl Fn(&PathBuf, ViewMode) -> Pane) -> Tab {
+        let pane = |path: &PathBuf, view: ViewMode, sort: Option<forge_core::listing::SortSpec>| {
+            let mut p = new_pane(path, view);
+            if let Some(sort) = sort {
+                p.sort = sort;
+            }
+            p
+        };
+        let mut left = pane(&t.left, *t.view, *t.sort);
+        let mut right = t.right.as_ref().map(|r| {
+            pane(r, t.right_view.unwrap_or(*t.view), t.right_sort.or(*t.sort))
+        });
+        for pane in std::iter::once(&mut left).chain(right.as_mut()) {
+            pane.expanded.extend(t.expanded.iter().cloned());
+        }
+        let mut tab = Tab {
+            left,
+            right,
+            focus: Side::Left,
+            stored: None,
+        };
+        // Compared later with the tab as it is then, so the values are the ones opened here.
+        let mut stored = tab.to_session();
+        stored.adopt_unknown(t);
+        tab.stored = stored.has_unknown().then(|| Box::new(stored));
+        tab
+    }
+
+    /// The tab as the session file and layouts store it, with what it was opened from that
+    /// this version doesn't know and the user hasn't changed.
+    pub fn session(&self) -> TabSession {
+        let mut s = self.to_session();
+        if let Some(stored) = &self.stored {
+            s.keep_unknown_from(stored);
+        }
+        s
+    }
+
+    /// The tab as the session file and layouts store it, without values this version doesn't
+    /// know.
+    fn to_session(&self) -> TabSession {
+        TabSession {
+            extra: Default::default(),
+            left: self.left.path.clone(),
+            right: self.right.as_ref().map(|r| r.path.clone()),
+            view: self.left.view.into(),
+            sort: Some(self.left.sort).into(),
+            right_view: self.right.as_ref().map(|r| r.view).into(),
+            right_sort: self.right.as_ref().map(|r| r.sort).into(),
+            expanded: std::iter::once(&self.left)
+                .chain(self.right.as_ref())
+                .flat_map(|p| p.expanded.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Drops the unknown stored values of the fields the user has changed since, so changing
+    /// one and back again saves the user's choice.
+    pub fn forget_changed_unknowns(&mut self) {
+        if self.stored.as_ref().is_some_and(|s| s.has_unknown_values()) {
+            let now = self.to_session();
+            if let Some(stored) = &mut self.stored {
+                stored.forget_changed(&now);
+            }
+        }
+    }
+
     pub fn focused(&self) -> &Pane {
         match (self.focus, &self.right) {
             (Side::Right, Some(r)) => r,
@@ -277,26 +350,7 @@ impl ZxrawApp {
     /// Builds a tab from a saved session or layout. Never touches the disk: listings load in
     /// the background, and the caller checks which folders still exist (see `layouts`).
     pub(crate) fn tab_from_session(&self, t: &TabSession) -> Tab {
-        let pane = |path: &PathBuf, view: ViewMode, sort: Option<forge_core::listing::SortSpec>| {
-            let mut p = self.new_pane(path.clone(), view);
-            if let Some(sort) = sort {
-                p.sort = sort;
-            }
-            p
-        };
-        let left = pane(&t.left, *t.view, *t.sort);
-        let mut right = t.right.as_ref().map(|r| {
-            pane(r, t.right_view.unwrap_or(*t.view), t.right_sort.or(*t.sort))
-        });
-        let mut left = left;
-        for pane in std::iter::once(&mut left).chain(right.as_mut()) {
-            pane.expanded.extend(t.expanded.iter().cloned());
-        }
-        Tab {
-            left,
-            right,
-            focus: Side::Left,
-        }
+        Tab::from_session(t, |path, view| self.new_pane(path.clone(), view))
     }
 
     fn restore_session(&mut self, s: Session) {
@@ -312,6 +366,7 @@ impl ZxrawApp {
                 left,
                 right: None,
                 focus: Side::Left,
+                stored: None,
             });
             self.show_sidebar = true;
         } else {
@@ -324,25 +379,7 @@ impl ZxrawApp {
 
     pub fn session(&self) -> Session {
         Session {
-            tabs: self
-                .tabs
-                .iter()
-                .map(|t| TabSession {
-                    extra: Default::default(),
-                    left: t.left.path.clone(),
-                    right: t.right.as_ref().map(|r| r.path.clone()),
-                    view: t.left.view.into(),
-                    sort: Some(t.left.sort).into(),
-                    right_view: t.right.as_ref().map(|r| r.view).into(),
-                    right_sort: t.right.as_ref().map(|r| r.sort).into(),
-                    expanded: std::iter::once(&t.left)
-                        .chain(t.right.as_ref())
-                        .flat_map(|p| p.expanded.iter().cloned())
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                })
-                .collect(),
+            tabs: self.tabs.iter().map(Tab::session).collect(),
             active_tab: self.active,
             show_preview: self.show_preview,
             show_sidebar: self.show_sidebar,
@@ -456,6 +493,7 @@ impl ZxrawApp {
                         left: pane,
                         right: None,
                         focus: Side::Left,
+                        stored: None,
                     },
                 );
                 self.active += 1;
@@ -526,10 +564,11 @@ impl ZxrawApp {
                 self.toast("Path copied");
             }
             ToggleTheme => {
-                *self.settings.theme = match *self.settings.theme {
+                let theme = match *self.settings.theme {
                     ThemeChoice::Dark => ThemeChoice::Light,
                     _ => ThemeChoice::Dark,
                 };
+                self.settings.theme.set(theme);
             }
             ZoomIn => self.settings.ui_scale = (self.settings.ui_scale + 0.1).min(3.0),
             ZoomOut => self.settings.ui_scale = (self.settings.ui_scale - 0.1).max(0.5),
@@ -1077,6 +1116,7 @@ impl eframe::App for ZxrawApp {
             if let Some(r) = &mut t.right {
                 changed |= r.poll();
             }
+            t.forget_changed_unknowns();
         }
         changed |= crate::actions::poll(self);
         crate::updater::tick(self);
@@ -1511,5 +1551,54 @@ mod window_size_tests {
         let fixed = window_size_fix(vec2(300.0, 200.0), small).unwrap();
         assert_eq!(fixed, vec2(921.6, 540.0));
         assert_eq!(window_size_fix(fixed, small), None);
+    }
+}
+
+#[cfg(test)]
+mod tab_session_tests {
+    use super::*;
+    use forge_core::listing::SortSpec;
+
+    fn open(json: &str) -> Tab {
+        let t: TabSession = serde_json::from_str(json).unwrap();
+        Tab::from_session(&t, |path, view| Pane::new(path.clone(), SortSpec::default(), view))
+    }
+
+    #[test]
+    fn unknown_tab_values_survive_session_saves_until_the_user_changes_them() {
+        let mut tab = open(
+            r#"{"left": "C:/Shoots", "right": "C:/Picks", "view": "Filmstrip",
+                "sort": {"key": "Colour"}, "right_view": "Timeline", "zoom": 2,
+                "expanded": ["C:/Shoots/2024"]}"#,
+        );
+        assert_eq!(tab.left.view, ViewMode::Details);
+        // Frames pass and the autosave runs twice: nothing changed, so nothing is lost.
+        for _ in 0..2 {
+            tab.forget_changed_unknowns();
+            let saved = serde_json::to_value(tab.session()).unwrap();
+            assert_eq!(saved["view"], "Filmstrip");
+            assert_eq!(saved["sort"]["key"], "Colour");
+            assert_eq!(saved["right_view"], "Timeline");
+            assert_eq!(saved["zoom"], 2);
+        }
+        // The user switches to the grid and back: their choice is saved, the rest stays.
+        tab.left.view = ViewMode::Grid;
+        tab.forget_changed_unknowns();
+        tab.left.view = ViewMode::Details;
+        tab.forget_changed_unknowns();
+        // A change saved before the next frame (on exit) is saved as well.
+        tab.right.as_mut().unwrap().view = ViewMode::Grid;
+        let saved = serde_json::to_value(tab.session()).unwrap();
+        assert_eq!(saved["view"], "Details");
+        assert_eq!(saved["right_view"], "Grid");
+        assert_eq!(saved["expanded"][0], "C:/Shoots/2024");
+        assert_eq!(saved["sort"]["key"], "Colour");
+        assert_eq!(saved["zoom"], 2);
+    }
+
+    #[test]
+    fn a_tab_with_only_known_values_keeps_nothing() {
+        let tab = open(r#"{"left": "C:/Shoots", "view": "Grid"}"#);
+        assert!(tab.stored.is_none());
     }
 }

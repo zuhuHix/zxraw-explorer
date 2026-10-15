@@ -21,13 +21,67 @@ pub enum ThemeChoice {
 
 /// A setting that falls back to its default when the stored value is not one this version knows
 /// (e.g. written by a newer version), instead of failing the whole settings file. The stored
-/// value is kept and written back unchanged while the setting still holds that default, so
-/// saving here doesn't overwrite the newer version's choice; once the user picks something
-/// else, their choice is saved. Reads and writes go through `Deref`.
+/// value is kept and written back unchanged until the setting is changed here, so saving
+/// doesn't overwrite the newer version's choice; any change (even back to the default) drops
+/// it, and the user's choice is saved. Reads go through `Deref`; changes go through
+/// [`Lenient::set`] or [`Lenient::edit`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Lenient<T> {
     value: T,
     unknown: Option<serde_json::Value>,
+}
+
+impl<T> Lenient<T> {
+    /// Changes the value; an unknown stored value is dropped.
+    pub fn set(&mut self, value: T) {
+        self.value = value;
+        self.unknown = None;
+    }
+
+    /// Lets `f` change the value in place (e.g. an egui widget); an unknown stored value is
+    /// dropped only when `f` actually changes it.
+    pub fn edit<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> R
+    where
+        T: Clone + PartialEq,
+    {
+        let mut value = self.value.clone();
+        let result = f(&mut value);
+        if value != self.value {
+            self.set(value);
+        }
+        result
+    }
+
+    /// Is a stored value this version doesn't know still kept?
+    pub fn has_unknown(&self) -> bool {
+        self.unknown.is_some()
+    }
+
+    /// Takes over `other`'s unknown stored value, whatever the values.
+    pub fn adopt_unknown(&mut self, other: &Self) {
+        self.unknown.clone_from(&other.unknown);
+    }
+
+    /// Takes over `old`'s unknown stored value when both hold the same value, i.e. this one
+    /// was not changed from it.
+    pub fn keep_unknown_from(&mut self, old: &Self)
+    where
+        T: PartialEq,
+    {
+        if self.unknown.is_none() && self.value == old.value {
+            self.adopt_unknown(old);
+        }
+    }
+
+    /// Drops the unknown stored value once the value has changed to `now`.
+    pub fn forget_unknown_unless(&mut self, now: &T)
+    where
+        T: PartialEq,
+    {
+        if self.value != *now {
+            self.unknown = None;
+        }
+    }
 }
 
 impl<T> From<T> for Lenient<T> {
@@ -46,17 +100,11 @@ impl<T> std::ops::Deref for Lenient<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Lenient<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-}
-
-impl<T: Serialize + Default + PartialEq> Serialize for Lenient<T> {
+impl<T: Serialize> Serialize for Lenient<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.unknown {
-            Some(raw) if self.value == T::default() => raw.serialize(serializer),
-            _ => self.value.serialize(serializer),
+            Some(raw) => raw.serialize(serializer),
+            None => self.value.serialize(serializer),
         }
     }
 }
@@ -294,6 +342,58 @@ pub struct TabSession {
     pub expanded: Vec<PathBuf>,
     #[serde(flatten)]
     pub extra: Extra,
+}
+
+impl TabSession {
+    /// Does it hold anything this version doesn't know (an unknown value or field)?
+    pub fn has_unknown(&self) -> bool {
+        self.has_unknown_values() || !self.extra.is_empty()
+    }
+
+    /// Does it hold a value this version doesn't know?
+    pub fn has_unknown_values(&self) -> bool {
+        self.view.has_unknown()
+            || self.sort.has_unknown()
+            || self.right_view.has_unknown()
+            || self.right_sort.has_unknown()
+    }
+
+    /// Takes over everything `loaded` holds that this version doesn't know, whatever the
+    /// values: `self` is the same tab as opened here.
+    pub fn adopt_unknown(&mut self, loaded: &TabSession) {
+        self.view.adopt_unknown(&loaded.view);
+        self.sort.adopt_unknown(&loaded.sort);
+        self.right_view.adopt_unknown(&loaded.right_view);
+        self.right_sort.adopt_unknown(&loaded.right_sort);
+        self.keep_extra_from(loaded);
+    }
+
+    /// Takes over `old`'s unknown fields, and its unknown values for the fields that still
+    /// hold the same value.
+    pub fn keep_unknown_from(&mut self, old: &TabSession) {
+        self.view.keep_unknown_from(&old.view);
+        self.sort.keep_unknown_from(&old.sort);
+        self.right_view.keep_unknown_from(&old.right_view);
+        self.right_sort.keep_unknown_from(&old.right_sort);
+        self.keep_extra_from(old);
+    }
+
+    /// Drops the unknown values of the fields that changed to `now`'s.
+    pub fn forget_changed(&mut self, now: &TabSession) {
+        if !self.has_unknown_values() {
+            return;
+        }
+        self.view.forget_unknown_unless(&now.view);
+        self.sort.forget_unknown_unless(&now.sort);
+        self.right_view.forget_unknown_unless(&now.right_view);
+        self.right_sort.forget_unknown_unless(&now.right_sort);
+    }
+
+    fn keep_extra_from(&mut self, old: &TabSession) {
+        for (key, value) in &old.extra {
+            self.extra.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -566,8 +666,8 @@ mod tests {
         assert_eq!(serde_json::to_value(&again).unwrap(), saved);
 
         // A setting the user changes in this version is saved as they chose it.
-        *settings.theme = ThemeChoice::Light;
-        *settings.accent = Accent::Teal;
+        settings.theme.set(ThemeChoice::Light);
+        settings.accent.set(Accent::Teal);
         let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
         assert_eq!(saved["theme"], "Light");
         assert_eq!(saved["accent"], "Teal");
@@ -581,6 +681,24 @@ mod tests {
         assert!(!settings.git_badges);
         let settings: Settings = serde_json::from_str(r#"{"git_badges": true}"#).unwrap();
         assert!(settings.git_badges);
+    }
+
+    #[test]
+    fn changing_an_unknown_setting_and_back_to_the_default_saves_the_default() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"theme": "Sepia", "default_view": "Filmstrip"}"#).unwrap();
+        assert_eq!(*settings.theme, ThemeChoice::Dark);
+        settings.theme.set(ThemeChoice::Light);
+        settings.theme.set(ThemeChoice::Dark);
+        // An edit that changes nothing (a widget drawn each frame) keeps the stored value.
+        settings.default_view.edit(|_| ());
+        let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["theme"], "Dark");
+        assert_eq!(saved["default_view"], "Filmstrip");
+        settings.default_view.edit(|v| *v = ViewMode::Grid);
+        settings.default_view.edit(|v| *v = ViewMode::Details);
+        let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["default_view"], "Details");
     }
 
     #[test]

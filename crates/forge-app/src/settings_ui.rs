@@ -488,16 +488,18 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
         egui::ComboBox::from_id_salt("settings-theme")
             .selected_text(theme_label(*settings.theme))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut *settings.theme, ThemeChoice::Dark, "Dark");
-                ui.selectable_value(&mut *settings.theme, ThemeChoice::Light, "Light");
-                ui.selectable_value(&mut *settings.theme, ThemeChoice::System, "System");
+                settings.theme.edit(|theme| {
+                    ui.selectable_value(theme, ThemeChoice::Dark, "Dark");
+                    ui.selectable_value(theme, ThemeChoice::Light, "Light");
+                    ui.selectable_value(theme, ThemeChoice::System, "System");
+                });
             });
         ui.add_space(18.0);
         ui.label("Accent")
             .on_hover_text("Used for selections, highlights and the app icon.");
         for (accent, name) in crate::theme::ACCENTS {
             if accent_swatch(ui, accent, name, *settings.accent == accent).clicked() {
-                *settings.accent = accent;
+                settings.accent.set(accent);
             }
         }
     });
@@ -525,7 +527,7 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 .add(egui::Button::image(image).selected(*settings.app_icon == choice))
                 .on_hover_text(label);
             if response.clicked() {
-                *settings.app_icon = choice;
+                settings.app_icon.set(choice);
             }
         }
     });
@@ -610,8 +612,10 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 ViewMode::Grid => "Thumbnail grid",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut *settings.default_view, ViewMode::Details, "Details");
-                ui.selectable_value(&mut *settings.default_view, ViewMode::Grid, "Thumbnail grid");
+                settings.default_view.edit(|view| {
+                    ui.selectable_value(view, ViewMode::Details, "Details");
+                    ui.selectable_value(view, ViewMode::Grid, "Thumbnail grid");
+                });
             });
     });
     ui.horizontal(|ui| {
@@ -623,8 +627,10 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 ListTyping::Filter => "Filter the list",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut *settings.list_typing, ListTyping::Jump, "Jump to name");
-                ui.selectable_value(&mut *settings.list_typing, ListTyping::Filter, "Filter the list");
+                settings.list_typing.edit(|typing| {
+                    ui.selectable_value(typing, ListTyping::Jump, "Jump to name");
+                    ui.selectable_value(typing, ListTyping::Filter, "Filter the list");
+                });
             });
     });
     ui.label(
@@ -639,9 +645,11 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
         egui::ComboBox::from_id_salt("settings-terminal")
             .selected_text(settings.terminal.label())
             .show_ui(ui, |ui| {
-                for choice in crate::terminal::TerminalChoice::ALL {
-                    ui.selectable_value(&mut *settings.terminal, choice, choice.label());
-                }
+                settings.terminal.edit(|terminal| {
+                    for choice in crate::terminal::TerminalChoice::ALL {
+                        ui.selectable_value(terminal, choice, choice.label());
+                    }
+                });
             });
     });
     ui.checkbox(&mut settings.git_badges, "Git status badges and branch");

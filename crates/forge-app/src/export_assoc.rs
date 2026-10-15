@@ -1241,6 +1241,7 @@ mod tests {
             left,
             right: Some(right),
             focus: Side::Right,
+            stored: None,
         }];
         let origin = SelectionOrigin {
             tab_index: 0,

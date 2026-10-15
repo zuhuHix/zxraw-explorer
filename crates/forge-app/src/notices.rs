@@ -270,17 +270,19 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             egui::Grid::new("welcome-setup").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Theme");
                 ui.horizontal(|ui| {
-                    let theme = &mut *app.settings.theme;
-                    ui.selectable_value(theme, ThemeChoice::Dark, "Dark");
-                    ui.selectable_value(theme, ThemeChoice::Light, "Light");
-                    ui.selectable_value(theme, ThemeChoice::System, "System");
+                    app.settings.theme.edit(|theme| {
+                        ui.selectable_value(theme, ThemeChoice::Dark, "Dark");
+                        ui.selectable_value(theme, ThemeChoice::Light, "Light");
+                        ui.selectable_value(theme, ThemeChoice::System, "System");
+                    });
                 });
                 ui.end_row();
                 ui.label("Folders open in");
                 ui.horizontal(|ui| {
-                    let view = &mut *app.settings.default_view;
-                    view_changed |= ui.selectable_value(view, ViewMode::Details, "Details").changed();
-                    view_changed |= ui.selectable_value(view, ViewMode::Grid, "Thumbnails").changed();
+                    app.settings.default_view.edit(|view| {
+                        view_changed |= ui.selectable_value(view, ViewMode::Details, "Details").changed();
+                        view_changed |= ui.selectable_value(view, ViewMode::Grid, "Thumbnails").changed();
+                    });
                 });
                 ui.end_row();
                 ui.label("Ratings & labels");
