@@ -655,9 +655,7 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.checkbox(&mut settings.git_badges, "Git status badges and branch");
     ui.label(
         RichText::new(
-            "Marks modified, new, ignored and conflicted files in Git repositories. Read in the \
-             app without running Git, and never following links out of the folder; very large \
-             repositories, cloud-synced folders, submodules and linked worktrees are skipped.",
+            "Show Git status (modified, new, ignored, conflicted) and the branch in Git folders.",
         )
         .weak(),
     );
