@@ -11,6 +11,10 @@ pub fn drives() -> Vec<Drive> {
         .into_iter()
         .filter(|d| d.kind != DriveKind::NoRootDir)
         .map(|d| Drive {
+            remote: (d.kind == DriveKind::Network)
+                .then(|| d.root.to_string_lossy().chars().next())
+                .flatten()
+                .and_then(forge_win::network::mapped_share),
             kind: match d.kind {
                 DriveKind::Removable => "Removable",
                 DriveKind::Network => "Network",

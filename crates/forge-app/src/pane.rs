@@ -21,6 +21,9 @@ enum ListMsg {
     Batch(Vec<FileEntry>),
     Done { errors: usize },
     Failed(String),
+    /// The path being listed is a file (a network path typed or clicked without being probed
+    /// on the UI thread): open its folder and select it.
+    IsFile,
 }
 
 /// Listing of a folder opened in place. Its messages carry `id`, so a superseded listing
@@ -358,12 +361,28 @@ impl Pane {
                 });
                 let _ = tx.send(match r {
                     Ok(errors) => ListMsg::Done { errors },
+                    // On this worker thread the file check can take as long as it needs.
+                    Err(_) if path.is_file() => ListMsg::IsFile,
                     Err(e) => ListMsg::Failed(e.to_string()),
                 });
             });
         if let Err(e) = spawned {
             self.load = LoadState::Failed(e.to_string());
         }
+    }
+
+    /// The pane was sent to a file: list its folder instead, with the file selected. The
+    /// back history keeps the folder the user came from, not the file.
+    fn open_file_location(&mut self) {
+        let file = self.path.clone();
+        let (Some(parent), Some(name)) = (file.parent(), file.file_name()) else {
+            self.load = LoadState::Failed("Not a folder".into());
+            return;
+        };
+        let name = name.to_string_lossy().into_owned();
+        self.load_path(parent.to_path_buf());
+        self.editing_path = None;
+        self.set_pending_select(name);
     }
 
     /// Drain listing messages. Returns true if anything changed (caller repaints).
@@ -379,6 +398,7 @@ impl Pane {
             return changed;
         };
         let mut finished = None;
+        let mut is_file = false;
         let mut open = Vec::new();
         // Bound the work per frame so a giant folder can't stall a frame.
         for _ in 0..64 {
@@ -412,8 +432,17 @@ impl Pane {
                     finished = Some(LoadState::Failed(e));
                     break;
                 }
+                Ok(ListMsg::IsFile) => {
+                    is_file = true;
+                    break;
+                }
                 Err(_) => break,
             }
+        }
+        if is_file {
+            self.rx = None;
+            self.open_file_location();
+            return true;
         }
         for dir in open {
             self.start_child_load(dir);
@@ -1066,6 +1095,8 @@ impl Pane {
                     load.loading = false;
                     load.error = Some(e);
                 }
+                // Only the pane's own listing sends this; a folder opened in place is a folder.
+                ListMsg::IsFile => load.loading = false,
             }
             self.dirty_sort = true;
             changed = true;
@@ -1779,6 +1810,23 @@ mod tests {
             .iter()
             .position(|&i| pane.entries[i].name == name)
             .unwrap_or_else(|| panic!("{name} is not listed"))
+    }
+
+    #[test]
+    fn navigating_to_a_file_unprobed_opens_its_folder_with_the_file_selected() {
+        // `ZxrawApp::navigate` hands network paths to the pane without checking whether they
+        // are files; the listing worker finds out and the pane opens the folder instead.
+        let (_dir, root) = tree_fixture();
+        let file = root.join("a").join("a1.txt");
+        let mut pane = open_tree_pane(&root);
+        pane.navigate(file.clone());
+        settle(&mut pane);
+        assert_eq!(pane.path, root.join("a"));
+        assert!(pane.selected.contains(&file), "{:?}", pane.selected);
+        assert!(!pane.is_loading());
+        pane.back();
+        settle(&mut pane);
+        assert_eq!(pane.path, root, "back skips the file");
     }
 
     #[test]

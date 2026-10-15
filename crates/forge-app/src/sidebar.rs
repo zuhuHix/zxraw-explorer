@@ -31,6 +31,9 @@ pub struct Drive {
     pub total: u64,
     pub free: u64,
     pub available: bool,
+    /// The share a mapped network drive points at, from Windows' table of connections
+    /// (looked up on the drives thread).
+    pub remote: Option<PathBuf>,
 }
 
 pub struct SidebarState {
@@ -41,8 +44,6 @@ pub struct SidebarState {
     pub pins: PinWatch,
     /// Saved network locations: status checks, the add dialog, "Connect…".
     pub network: network::NetworkState,
-    /// Repaints the UI when a background result arrives.
-    pub ctx: egui::Context,
 }
 
 /// Watches removable drives for inserted cards and decides which ones get an import prompt.
@@ -200,8 +201,7 @@ impl SidebarState {
             known: crate::platform::known_folders(),
             cards: CardWatch::default(),
             pins: PinWatch::default(),
-            network: network::NetworkState::default(),
-            ctx: repaint,
+            network: network::NetworkState::new(repaint),
         }
     }
 }
@@ -718,6 +718,7 @@ mod card_tests {
             total: 0,
             free: 0,
             available: true,
+            remote: None,
         }
     }
 

@@ -292,8 +292,28 @@ impl ZxrawApp {
         // folder with the photo selected and shows it in the viewer.
         if let Some(arg) = std::env::args_os().nth(1) {
             let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
-            let folder = if p.is_file() { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
-            if let Some(folder) = folder.filter(|folder| folder.exists()) {
+            let kind = forge_core::model::media_kind_for_ext(
+                &p.extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default(),
+            );
+            // A network path is not probed here: an offline share would hold the window
+            // before it first appears. A media extension means a file and anything else a
+            // folder; the listing sorts out a wrong guess (see `navigate`).
+            let network = forge_core::netpath::is_network_path(&p);
+            let is_file = if network {
+                matches!(
+                    kind,
+                    forge_core::MediaKind::Image
+                        | forge_core::MediaKind::Raw
+                        | forge_core::MediaKind::Video
+                        | forge_core::MediaKind::Audio
+                )
+            } else {
+                p.is_file()
+            };
+            let folder = if is_file { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
+            if let Some(folder) = folder.filter(|folder| network || folder.exists()) {
                 // Reuse a restored tab already showing this folder instead of piling up tabs.
                 let existing = app
                     .tabs
@@ -303,13 +323,8 @@ impl ZxrawApp {
                     Some(i) => app.active = i,
                     None => app.run(Cmd::NewTab, &cc.egui_ctx),
                 }
-                if p.is_file() {
+                if is_file {
                     app.tab_mut().focus = Side::Left;
-                    let kind = forge_core::model::media_kind_for_ext(
-                        &p.extension()
-                            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                            .unwrap_or_default(),
-                    );
                     if matches!(kind, forge_core::MediaKind::Image | forge_core::MediaKind::Raw) {
                         app.launch_photo = Some(p.clone());
                     }
@@ -442,7 +457,10 @@ impl ZxrawApp {
 
     pub fn navigate(&mut self, path: PathBuf) {
         let path = forge_core::paths::normalize_user_path(&path.to_string_lossy());
-        if path.is_file() {
+        // A network path is never probed here: an offline share would block the UI thread.
+        // It is listed as a folder, and if it turns out to be a file the listing worker says
+        // so and the pane opens its folder with the file selected (see `Pane::poll`).
+        if !forge_core::netpath::is_network_path(&path) && path.is_file() {
             // Navigating to a file opens its folder and selects it.
             if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
                 let name = name.to_string_lossy().into_owned();

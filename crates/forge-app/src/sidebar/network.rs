@@ -9,7 +9,6 @@
 //! and Windows shows its own credential dialog. The app never asks for, sees or stores a
 //! password.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -83,6 +82,107 @@ pub struct Entry {
     pub label: String,
     /// Index in `Settings::network_locations`; `None` for a mapped drive.
     pub saved: Option<usize>,
+    /// The share "Connect…" signs in to (`\\server\share`). A mapped drive and a saved
+    /// location on the same share have the same one. `None` for a drive whose share is
+    /// unknown.
+    pub share: Option<PathBuf>,
+}
+
+/// Signs in to one share; blocks until the user answers Windows' dialog.
+pub type ConnectFn = fn(isize, &Path) -> Result<Connect, String>;
+
+fn connect_with_windows(owner: isize, share: &Path) -> Result<Connect, String> {
+    forge_win::network::connect_share(owner, share).map_err(|e| match e {
+        forge_win::WinError::Api { message, .. } => message,
+        other => other.to_string(),
+    })
+}
+
+/// What [`Connector::request`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    Started,
+    /// This share's sign-in is already on screen.
+    AlreadyRunning,
+    /// Another share's sign-in is on screen; only one runs at a time.
+    Busy(PathBuf),
+}
+
+/// Runs "Connect…" requests on one long-lived worker, one at a time: at most one Windows
+/// sign-in dialog is open and at most one thread can be blocked in `WNetAddConnection3W`.
+/// Requests are keyed by share, so a mapped drive and a saved location on the same share
+/// don't open two dialogs.
+pub struct Connector {
+    connect: ConnectFn,
+    repaint: Option<egui::Context>,
+    /// Started on the first request.
+    jobs: Option<Sender<(isize, PathBuf)>>,
+    results_tx: Sender<(PathBuf, Result<Connect, String>)>,
+    results: Receiver<(PathBuf, Result<Connect, String>)>,
+    busy: Option<PathBuf>,
+}
+
+impl Connector {
+    pub fn new(connect: ConnectFn, repaint: Option<egui::Context>) -> Self {
+        let (results_tx, results) = unbounded();
+        Self {
+            connect,
+            repaint,
+            jobs: None,
+            results_tx,
+            results,
+            busy: None,
+        }
+    }
+
+    /// The share whose sign-in is in progress.
+    pub fn busy(&self) -> Option<&Path> {
+        self.busy.as_deref()
+    }
+
+    /// Starts signing in to `share` unless a sign-in is already running.
+    pub fn request(&mut self, owner: isize, share: PathBuf) -> Request {
+        if let Some(busy) = &self.busy {
+            return if paths_equal(busy, &share) {
+                Request::AlreadyRunning
+            } else {
+                Request::Busy(busy.clone())
+            };
+        }
+        if self.jobs.is_none() {
+            let (tx, rx) = unbounded::<(isize, PathBuf)>();
+            let connect = self.connect;
+            let results = self.results_tx.clone();
+            let repaint = self.repaint.clone();
+            let spawned = std::thread::Builder::new()
+                .name("net-connect".into())
+                .spawn(move || {
+                    for (owner, share) in rx {
+                        let result = connect(owner, &share);
+                        let _ = results.send((share, result));
+                        if let Some(ctx) = &repaint {
+                            ctx.request_repaint();
+                        }
+                    }
+                });
+            if spawned.is_err() {
+                return Request::Busy(share);
+            }
+            self.jobs = Some(tx);
+        }
+        if let Some(jobs) = &self.jobs {
+            let _ = jobs.send((owner, share.clone()));
+        }
+        self.busy = Some(share);
+        Request::Started
+    }
+
+    /// A finished sign-in, if one finished.
+    pub fn poll(&mut self) -> Option<(PathBuf, Result<Connect, String>)> {
+        let done = self.results.try_recv().ok()?;
+        self.busy = None;
+        Some(done)
+    }
 }
 
 /// State of the "Add network location" dialog.
@@ -98,28 +198,20 @@ pub struct AddDialog {
 pub struct NetworkState {
     watch: PinWatch,
     pub dialog: Option<AddDialog>,
-    /// Share roots with a "Connect…" in progress.
-    connecting: HashSet<PathBuf>,
-    connect_tx: Sender<(PathBuf, Result<Connect, String>)>,
-    connect_rx: Receiver<(PathBuf, Result<Connect, String>)>,
-}
-
-impl Default for NetworkState {
-    fn default() -> Self {
-        let (connect_tx, connect_rx) = unbounded();
-        Self {
-            watch: PinWatch::default(),
-            dialog: None,
-            connecting: HashSet::new(),
-            connect_tx,
-            connect_rx,
-        }
-    }
+    connector: Connector,
 }
 
 impl NetworkState {
+    pub fn new(repaint: egui::Context) -> Self {
+        Self {
+            watch: PinWatch::default(),
+            dialog: None,
+            connector: Connector::new(connect_with_windows, Some(repaint)),
+        }
+    }
+
     pub fn status(&self, path: &Path) -> NetStatus {
-        classify(self.watch.found(path), self.watch.timed_out(path))
+        classify(self.watch.found(path), self.watch.stalled(path))
     }
 }
 
@@ -167,6 +259,7 @@ pub fn entries(app: &ZxrawApp) -> Vec<Entry> {
             path: l.path.clone(),
             label: location_label(l),
             saved: Some(i),
+            share: netpath::share_root(&l.path),
         })
         .collect();
     for d in network_drives(app) {
@@ -181,6 +274,7 @@ pub fn entries(app: &ZxrawApp) -> Vec<Entry> {
             path: d.root,
             label,
             saved: None,
+            share: d.remote.as_deref().and_then(netpath::share_root),
         });
     }
     out
@@ -197,12 +291,15 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         .chain(drives.iter().cloned())
         .collect();
     app.sidebar.network.watch.tick_paths(&paths, &drives, Some(ctx));
-    while let Ok((path, result)) = app.sidebar.network.connect_rx.try_recv() {
-        let share = netpath::share_root(&path).unwrap_or_else(|| path.clone());
-        app.sidebar.network.connecting.remove(&share);
+    while let Some((share, result)) = app.sidebar.network.connector.poll() {
         match result {
             Ok(Connect::Connected) => {
-                app.sidebar.network.watch.recheck(&path);
+                // Every entry on this share: saved locations and mapped drives alike.
+                for e in entries(app) {
+                    if e.share.as_deref().is_some_and(|s| paths_equal(s, &share)) {
+                        app.sidebar.network.watch.recheck(&e.path);
+                    }
+                }
                 app.toast(format!("Connected to {}", share.display()));
             }
             Ok(Connect::Cancelled) => {}
@@ -271,7 +368,7 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
     let mut edit = None;
     for (i, entry) in list.iter().enumerate() {
         let status = status_of(app, &entry.path);
-        let connecting = is_connecting(app, &entry.path);
+        let connecting = is_connecting(app, entry);
         let r = row(ui, entry, &status, connecting, paths_equal(&current, &entry.path));
         if r.clicked() {
             edit = Some(Edit::Open(i));
@@ -316,7 +413,7 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
     };
     match edit {
         Edit::Open(_) => activate(app, &entry),
-        Edit::Connect(_) => start_connect(app, &entry.path),
+        Edit::Connect(_) => start_connect(app, &entry),
         Edit::Recheck(_) => app.sidebar.network.watch.recheck(&entry.path),
         Edit::Rename(_) => start_rename(app, &entry),
         Edit::Remove(_) => {
@@ -327,9 +424,11 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
     }
 }
 
-fn is_connecting(app: &ZxrawApp, path: &Path) -> bool {
-    let share = netpath::share_root(path).unwrap_or_else(|| path.to_path_buf());
-    app.sidebar.network.connecting.contains(&share)
+fn is_connecting(app: &ZxrawApp, entry: &Entry) -> bool {
+    match (app.sidebar.network.connector.busy(), &entry.share) {
+        (Some(busy), Some(share)) => paths_equal(busy, share),
+        _ => false,
+    }
 }
 
 /// One row: a status dot, then the label.
@@ -398,7 +497,7 @@ pub fn activate(app: &mut ZxrawApp, entry: &Entry) {
         }
         NetStatus::NeedsSignIn(_) => {
             app.toast(format!("{} needs you to sign in", entry.label));
-            start_connect(app, &entry.path);
+            start_connect(app, entry);
         }
         NetStatus::Offline(why) => {
             app.toast_err(format!(
@@ -411,45 +510,21 @@ pub fn activate(app: &mut ZxrawApp, entry: &Entry) {
     }
 }
 
-/// Starts "Connect…" for `path` on a worker thread. Windows shows its own sign-in dialog,
-/// owned by the app window. A second request for the same share while one runs is ignored.
-pub fn start_connect(app: &mut ZxrawApp, path: &Path) {
-    let share = netpath::share_root(path).unwrap_or_else(|| path.to_path_buf());
-    if !app.sidebar.network.connecting.insert(share.clone()) {
+/// Starts "Connect…" for the entry's share on the connect worker. Windows shows its own
+/// sign-in dialog, owned by the app window. Only one sign-in runs at a time.
+pub fn start_connect(app: &mut ZxrawApp, entry: &Entry) {
+    let Some(share) = entry.share.clone() else {
+        app.toast_err(format!("{} is not connected to a known network share", entry.label));
         return;
-    }
+    };
     let owner = forge_win::dragout::active_window().unwrap_or(0);
-    let tx = app.sidebar.network.connect_tx.clone();
-    let path = path.to_path_buf();
-    let repaint = app.sidebar.ctx.clone();
-    let spawned = std::thread::Builder::new()
-        .name("net-connect".into())
-        .spawn(move || {
-            let result = remote_of(&path)
-                .ok_or_else(|| "this drive is not connected to a network share".to_string())
-                .and_then(|remote| {
-                    forge_win::network::connect_share(owner, &remote).map_err(|e| match e {
-                        forge_win::WinError::Api { message, .. } => message,
-                        other => other.to_string(),
-                    })
-                });
-            let _ = tx.send((path, result));
-            repaint.request_repaint();
-        });
-    if spawned.is_err() {
-        app.sidebar.network.connecting.remove(&share);
-        app.toast_err("Could not start connecting");
+    match app.sidebar.network.connector.request(owner, share) {
+        Request::Started | Request::AlreadyRunning => {}
+        Request::Busy(other) => app.toast(format!(
+            "Finish signing in to {} first",
+            other.display()
+        )),
     }
-}
-
-/// The share to connect for `path`: its UNC share root, or the share a mapped drive points
-/// at (looked up on the worker thread; Windows answers from its own table).
-fn remote_of(path: &Path) -> Option<PathBuf> {
-    if let Some(root) = netpath::share_root(path) {
-        return Some(root);
-    }
-    let letter = path.to_string_lossy().chars().next()?;
-    forge_win::network::mapped_share(letter)
 }
 
 fn start_rename(app: &mut ZxrawApp, entry: &Entry) {
@@ -681,13 +756,13 @@ mod tests {
     #[test]
     fn statuses_come_from_the_injected_probe() {
         let service = Service::new(1, 3, fake_check);
-        let mut watch = PinWatch::with_client(Client::on(&service, None));
+        let mut watch = PinWatch::with_client(Client::on(&service, None), Duration::from_secs(30));
         let paths: Vec<PathBuf> = [r"\\nas\photos", r"\\login\share", r"\\down\share", r"\\hung\share"]
             .map(PathBuf::from)
             .to_vec();
         let status = |watch: &PinWatch, p: &str| {
             let p = Path::new(p);
-            classify(watch.found(p), watch.timed_out(p))
+            classify(watch.found(p), watch.stalled(p))
         };
         let until = Instant::now() + Duration::from_secs(10);
         loop {
@@ -705,6 +780,60 @@ mod tests {
         assert!(matches!(status(&watch, r"\\down\share"), NetStatus::Offline(_)));
         // Still running, not yet past the timeout.
         assert_eq!(status(&watch, r"\\hung\share"), NetStatus::Checking);
+    }
+
+    #[test]
+    fn a_location_queued_behind_hung_checks_goes_offline_at_the_deadline() {
+        // Every network worker hangs on another share; the last location only ever queues.
+        let service = Service::new(1, 2, fake_check);
+        let mut watch = PinWatch::with_client(Client::on(&service, None), Duration::from_millis(300));
+        let paths: Vec<PathBuf> = [r"\\hung\a", r"\\hung\b", r"\\nas\photos"]
+            .map(PathBuf::from)
+            .to_vec();
+        let started = Instant::now();
+        watch.tick_paths(&paths, &[], None);
+        let nas = Path::new(r"\\nas\photos");
+        assert_eq!(classify(watch.found(nas), watch.stalled(nas)), NetStatus::Checking);
+        while started.elapsed() < Duration::from_millis(400) {
+            watch.tick_paths(&paths, &[], None);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = classify(watch.found(nas), watch.stalled(nas));
+        assert!(matches!(status, NetStatus::Offline(_)), "{status:?}");
+        assert!(status.can_connect(), "an offline location offers Connect…");
+    }
+
+    static CONNECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn slow_connect(_owner: isize, _share: &Path) -> Result<Connect, String> {
+        CONNECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(200));
+        Ok(Connect::Connected)
+    }
+
+    #[test]
+    fn one_sign_in_at_a_time_and_aliases_of_a_share_share_it() {
+        let mut connector = Connector::new(slow_connect, None);
+        let share = PathBuf::from(r"\\nas\photos");
+        assert_eq!(connector.request(0, share.clone()), Request::Started);
+        // The same share through a mapped drive (its resolved share) or another case.
+        assert_eq!(connector.request(0, PathBuf::from(r"\\NAS\Photos")), Request::AlreadyRunning);
+        assert_eq!(
+            connector.request(0, PathBuf::from(r"\\other\x")),
+            Request::Busy(share.clone())
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        let done = loop {
+            if let Some(done) = connector.poll() {
+                break done;
+            }
+            assert!(Instant::now() < until, "the sign-in never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(done, (share, Ok(Connect::Connected)));
+        assert_eq!(connector.busy(), None);
+        assert_eq!(CONNECT_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(connector.request(0, PathBuf::from(r"\\other\x")), Request::Started);
     }
 
     #[test]

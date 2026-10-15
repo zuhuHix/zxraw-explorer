@@ -78,7 +78,7 @@ fn classify(path: &Path, metadata: impl Fn(&Path) -> std::io::Result<bool>) -> F
                     code: e.raw_os_error(),
                 }),
             },
-            None => Found::Unknown(e.to_string()),
+            None => Found::Unknown((&e).into()),
         },
         Err(e) => Found::Unknown((&e).into()),
     }

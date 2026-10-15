@@ -227,12 +227,24 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   network folder delays the previews queued behind it.
 * Network locations: there is no browsing of `\\` (no SMB discovery of servers or shares), no
   mapping of drive letters, and no stored credentials; sign-in is Windows' own dialog. A
-  status check that has not answered after 10 s shows the location as offline; the check
-  itself keeps running in the OS until Windows gives up (often 20–60 s on an unreachable
-  host), and it holds one of the probe service's 3 network workers meanwhile.
+  status check that has not answered after 10 s (running, or still queued behind other
+  checks) shows the location as offline; the check itself keeps running in the OS until
+  Windows gives up (often 20–60 s on an unreachable host), and it holds one of the probe
+  service's 3 network workers meanwhile.
+* Deciding whether a drive letter is a network drive uses `GetDriveTypeW`. It answers from
+  Windows' local device table in practice, but Windows does not document that it never
+  touches the network. UNC paths are decided from the text alone.
 * *Connect…* on a mapped drive connects the drive's share without a letter; Windows then
   reconnects the letter on its next use. A share already connected as another user fails
   with Windows' "multiple connections" error until that connection is closed.
+* Only one *Connect…* runs at a time (one Windows sign-in dialog); asking for another share
+  meanwhile says to finish the first. A sign-in dialog that is still open when the app exits
+  is not cancelled by the app: it stays until the user closes it.
+* A network path typed in the address bar (or given on the command line) is not checked on
+  the UI thread: it is opened as a folder, and if it turns out to be a file its folder opens
+  with the file selected once the background listing finds out. On the command line a
+  photo, video or audio extension is taken to mean a file. The address bar offers no folder
+  completions for network paths.
 * Network thumbnail and hashing work have no per-file timeout: a file that stalls on the
   server holds one of the 2 network thumbnail workers (or the single full-hash worker)
   until the OS call returns. Local folders are not affected because they use separate

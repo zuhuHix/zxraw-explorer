@@ -291,3 +291,22 @@ fn network_locations_are_added_renamed_and_removed_without_freezing_on_an_offlin
     let saved = settings_json(&profile)["network_locations"].clone();
     assert_eq!(saved.as_array().map(Vec::len), Some(0), "{saved}");
 }
+
+#[test]
+fn going_to_an_offline_share_path_never_waits_on_the_ui_thread() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    // TEST-NET-1 again: every file call on these paths hangs until the network gives up.
+    let script = format!(
+        "dismiss-notices\nnavigate {sandbox}\n\
+         ui sidebar go \\\\192.0.2.1\\x\\shoot\\a.jpg\n\
+         ui sidebar responsive 30 | 1000\n\
+         ui sidebar go \\\\192.0.2.1\\x\n\
+         ui sidebar responsive 30 | 1000\n\
+         navigate {sandbox}\nassert-path {sandbox}\nexit\n",
+        sandbox = shown(sandbox.path()),
+    );
+    let outcome = run_app(sandbox.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}

@@ -27,6 +27,8 @@
 //! - `net-click <label>`: what a click on the location does; fails if the click itself took
 //!   longer than 250 ms (it must never wait for the server).
 //! - `wait-net-status <label> checking|online|offline|signin|notfound [| seconds]`.
+//! - `go <network path>`: what typing the path in the address bar (or clicking a breadcrumb)
+//!   does; fails if the call itself took longer than 250 ms.
 //! - `responsive <frames> | <ms>`: wait for that many frames; fail if any frame took longer.
 //!
 //! Saved layouts:
@@ -210,6 +212,22 @@ pub(super) fn step(
             let index = find_location(app, one(args)?)?;
             network::remove_location(app, index);
             Ok(Flow::Done)
+        }
+        "go" => {
+            // Not sandboxed: it exists to show that a share path (an unroutable test address)
+            // is handed to the listing without the UI thread waiting on it.
+            let path = std::path::PathBuf::from(one(args)?);
+            if !forge_core::netpath::is_network_path(&path) {
+                return Err("`go` takes a network path; use `navigate` for local folders".into());
+            }
+            let started = Instant::now();
+            app.navigate(path);
+            let took = started.elapsed();
+            if took > Duration::from_millis(250) {
+                Err(format!("navigating blocked the UI for {} ms", took.as_millis()))
+            } else {
+                Ok(Flow::Done)
+            }
         }
         "net-click" => {
             let index = find_location(app, one(args)?)?;

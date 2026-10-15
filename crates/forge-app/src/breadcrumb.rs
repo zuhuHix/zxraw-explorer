@@ -30,6 +30,16 @@ fn segments(path: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
+/// Completion reads run on the UI thread, and a server or share that is offline can block a
+/// directory read for tens of seconds. So nothing that starts like a UNC or device path
+/// (`\\server\`, `//server/`, `\\?\UNC\…`, `\\.\…`) is read, even before a share is typed,
+/// and neither is a mapped network drive.
+fn completes_on_ui_thread(dir: &str) -> bool {
+    let unc_like = dir.starts_with(['\\', '/'])
+        && dir[1..].starts_with(['\\', '/']);
+    !unc_like && !forge_core::netpath::is_network_path(Path::new(dir))
+}
+
 /// Folder-name completions for a partially typed path (cheap: one read_dir of the parent,
 /// capped).
 fn completions(text: &str) -> Vec<String> {
@@ -38,9 +48,7 @@ fn completions(text: &str) -> Vec<String> {
         Some(i) => (&t[..=i], &t[i + 1..]),
         None => return Vec::new(),
     };
-    // This runs on the UI thread; a share that is offline can block a directory read for
-    // tens of seconds, so shares get no completions.
-    if forge_core::netpath::is_network_path(Path::new(dir)) {
+    if !completes_on_ui_thread(dir) {
         return Vec::new();
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -189,5 +197,38 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
         app.pane_mut().editing_path = None;
     } else {
         app.pane_mut().editing_path = Some(text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unc_like_text_is_never_read_on_the_ui_thread() {
+        // 192.0.2.1 is TEST-NET-1: a read would hang until the network gives up.
+        for text in [
+            r"\\192.0.2.1\",
+            r"\\192.0.2.1\x\",
+            r"\\192.0.2.1\x\su",
+            "//192.0.2.1/",
+            r"\\?\UNC\192.0.2.1\x\",
+            r"\\.\UNC\192.0.2.1\",
+            r"\/192.0.2.1\",
+            r"\\192.0.2.1",
+        ] {
+            let started = Instant::now();
+            assert!(completions(text).is_empty(), "{text}");
+            assert!(started.elapsed() < Duration::from_millis(250), "{text}");
+        }
+    }
+
+    #[test]
+    fn local_folders_still_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("Shoots")).unwrap();
+        let text = format!(r"{}\Sh", dir.path().display());
+        assert_eq!(completions(&text), vec![format!(r"{}\Shoots", dir.path().display())]);
     }
 }
