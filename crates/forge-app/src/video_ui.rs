@@ -2047,6 +2047,14 @@ fn file_protocol_arg(path: &Path) -> OsString {
     value
 }
 
+/// Kills `child` and waits until it has exited, so ffmpeg is gone (and no longer reading
+/// the clip) before the caller returns and drops the clip's guard handle.
+/// Returns the exit status, which exists only once the process has been reaped.
+fn stop_child(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let _ = child.kill();
+    child.wait().ok()
+}
+
 fn run_proxy_child(
     exe: &Path,
     args: &[OsString],
@@ -2068,14 +2076,14 @@ fn run_proxy_child(
     let mut child = command
         .spawn()
         .map_err(|e| format!("could not start ffmpeg: {e}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg progress pipe was unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "ffmpeg error pipe was unavailable".to_string())?;
+    let Some(stdout) = child.stdout.take() else {
+        stop_child(&mut child);
+        return Err("ffmpeg progress pipe was unavailable".into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        stop_child(&mut child);
+        return Err("ffmpeg error pipe was unavailable".into());
+    };
     // Keep the last non-empty stderr line so failures say why FFmpeg stopped. The pipe is
     // drained to EOF even when the line is unused, so FFmpeg can never block on a full pipe.
     let error_reader = std::thread::spawn(move || {
@@ -2102,7 +2110,7 @@ fn run_proxy_child(
             }
         })
         .map_err(|e| {
-            let _ = child.kill();
+            stop_child(&mut child);
             format!("could not start progress reader: {e}")
         })?;
 
@@ -3305,6 +3313,19 @@ mod tests {
 
         worker.shutdown();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_stopped_ffmpeg_has_exited_before_the_caller_returns() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let status = stop_child(&mut child).expect("an exit status: the process was reaped");
+        assert!(!status.success(), "killed, not run to the end");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

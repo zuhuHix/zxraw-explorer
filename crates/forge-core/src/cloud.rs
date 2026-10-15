@@ -196,6 +196,234 @@ pub fn in_cloud_sync_root_with(dir: &Path, find: &dyn Fn(&Path) -> Option<(u32, 
     })
 }
 
+/// Sync roots the cloud clients registered with Windows (OneDrive, Dropbox, Google Drive and
+/// other Cloud Files providers that use the shell's sync root manager), plus the OneDrive
+/// folders named by the environment. `None` when the registrations cannot be read: callers
+/// must then assume a sync root could be anywhere.
+///
+/// A provider that calls `CfRegisterSyncRoot` without the shell registration is not listed
+/// (measured: such a root does not appear under `SyncRootManager`); its root folder still
+/// carries the Cloud Files reparse tag, which [`in_cloud_sync_root`] sees from inside it.
+pub fn known_sync_roots() -> Option<Vec<PathBuf>> {
+    let mut roots = registered_sync_roots()?;
+    roots.extend(
+        ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+            .iter()
+            .filter_map(std::env::var_os)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    );
+    Some(roots)
+}
+
+/// The `UserSyncRoots` values under `HKLM\...\Explorer\SyncRootManager\<provider>`.
+#[cfg(windows)]
+fn registered_sync_roots() -> Option<Vec<PathBuf>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RegCloseKey, RegEnumKeyExW,
+        RegEnumValueW, RegOpenKeyExW,
+    };
+    use windows::core::{HSTRING, PWSTR};
+
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: the key was opened by RegOpenKeyExW and is closed once.
+            let _ = unsafe { RegCloseKey(self.0) };
+        }
+    }
+    /// `Ok(None)` when the key does not exist; `Err` for any other failure.
+    fn open(parent: HKEY, sub: &str) -> Result<Option<Key>, ()> {
+        let mut key = HKEY::default();
+        // SAFETY: `sub` is a valid NUL-terminated string and `key` a valid out pointer.
+        let status =
+            unsafe { RegOpenKeyExW(parent, &HSTRING::from(sub), None, KEY_READ, &mut key) };
+        if status == ERROR_SUCCESS {
+            Ok(Some(Key(key)))
+        } else if status == ERROR_FILE_NOT_FOUND {
+            Ok(None)
+        } else {
+            Err(())
+        }
+    }
+
+    let base = match open(
+        HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager",
+    ) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Some(Vec::new()),
+        Err(()) => return None,
+    };
+    let mut roots = Vec::new();
+    for index in 0.. {
+        let mut name = [0u16; 512];
+        let mut name_len = name.len() as u32;
+        // SAFETY: the buffer and its length describe valid memory owned here.
+        let status = unsafe {
+            RegEnumKeyExW(
+                base.0,
+                index,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if status != ERROR_SUCCESS {
+            return None;
+        }
+        let provider = String::from_utf16_lossy(&name[..name_len as usize]);
+        let users = match open(base.0, &format!(r"{provider}\UserSyncRoots")) {
+            Ok(Some(key)) => key,
+            Ok(None) => continue,
+            Err(()) => return None,
+        };
+        for value in 0.. {
+            let mut value_name = [0u16; 512];
+            let mut value_name_len = value_name.len() as u32;
+            let mut data = vec![0u8; 65_536];
+            let mut data_len = data.len() as u32;
+            let mut kind = 0u32;
+            // SAFETY: every buffer and length describes valid memory owned here.
+            let status = unsafe {
+                RegEnumValueW(
+                    users.0,
+                    value,
+                    Some(PWSTR(value_name.as_mut_ptr())),
+                    &mut value_name_len,
+                    None,
+                    Some(&mut kind),
+                    Some(data.as_mut_ptr()),
+                    Some(&mut data_len),
+                )
+            };
+            if status == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            if status != ERROR_SUCCESS {
+                return None;
+            }
+            if kind != REG_SZ.0 && kind != REG_EXPAND_SZ.0 {
+                continue;
+            }
+            let wide: Vec<u16> = data[..data_len as usize]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
+                .take_while(|&unit| unit != 0)
+                .collect();
+            if !wide.is_empty() {
+                let text = String::from_utf16_lossy(&wide);
+                let text = if kind == REG_EXPAND_SZ.0 {
+                    expand_environment(&text)
+                } else {
+                    text
+                };
+                roots.push(PathBuf::from(text));
+            }
+        }
+    }
+    Some(roots)
+}
+
+#[cfg(not(windows))]
+fn registered_sync_roots() -> Option<Vec<PathBuf>> {
+    Some(Vec::new())
+}
+
+/// Could a transfer of the folder `dir` read cloud files? True when `dir` is inside a sync
+/// root ([`in_cloud_sync_root`]: the folder or an ancestor is a Cloud Files placeholder or
+/// online-only, or its attributes cannot be read), when a known sync root lies inside `dir`
+/// or holds it, when `roots` is `None` (the registrations could not be read), or when the
+/// first page of its listing shows an online-only entry or cannot be read. The sample
+/// catches offline files outside any Cloud Files sync root (a tiered file share such as
+/// Azure File Sync), as long as some sit at the top of the folder. False only for a folder
+/// positively outside every cloud location.
+pub fn folder_may_hold_cloud_files(dir: &Path, roots: Option<&[PathBuf]>) -> bool {
+    folder_may_hold_cloud_files_with(dir, roots, &find_data, &|dir| {
+        first_page_has_online_only(dir, LISTING_SAMPLE)
+    })
+}
+
+/// Entries of a folder's listing sampled by [`folder_may_hold_cloud_files`].
+const LISTING_SAMPLE: usize = 256;
+
+fn folder_may_hold_cloud_files_with(
+    dir: &Path,
+    roots: Option<&[PathBuf]>,
+    find: &dyn Fn(&Path) -> Option<(u32, u32)>,
+    sample: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let Some(roots) = roots else {
+        return true;
+    };
+    roots
+        .iter()
+        .any(|root| crate::paths::is_within(dir, root) || crate::paths::is_within(root, dir))
+        || in_cloud_sync_root_with(dir, find)
+        || sample(dir)
+}
+
+/// Does one of the first `limit` entries of `dir`'s listing (files or folders) carry an
+/// online-only attribute? Listing data only, nothing is opened. True when the folder or an
+/// entry cannot be read (fail closed).
+fn first_page_has_online_only(dir: &Path, limit: usize) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return true;
+    };
+    for entry in entries.take(limit) {
+        let Ok(entry) = entry else {
+            return true;
+        };
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(md) if is_online_only_metadata(&path, &md) => return true,
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Expands `%NAME%` references in a `REG_EXPAND_SZ` value from the environment. An unknown
+/// name is left as written (the path then matches nothing, as Windows would leave it).
+fn expand_environment(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) if end > 0 => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    Err(_) => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// May background work (thumbnails, metadata, hashing, scans) read the data of `path`?
 ///
 /// False for cloud placeholders whose data is not on this PC, and false when the attributes
@@ -371,6 +599,81 @@ mod tests {
             read_check_from(p, Err(FindError::Other)),
             ReadCheck::OnlineOnly { size: 0 }
         );
+    }
+
+    #[test]
+    fn only_folders_positively_outside_cloud_locations_skip_the_walk() {
+        let local = |_: &Path| Some((0x10, 0));
+        let roots = [PathBuf::from(r"C:\Users\a\OneDrive")];
+        let shoot = Path::new(r"D:\Shoots\2026");
+        assert!(!folder_may_hold_cloud_files_with(shoot, Some(&roots), &local, &no_sample));
+        // A sync root inside the selected folder (copying the whole profile folder).
+        assert!(folder_may_hold_cloud_files_with(
+            Path::new(r"c:\users\A"),
+            Some(&roots),
+            &local,
+            &no_sample
+        ));
+        // Inside the sync root.
+        assert!(folder_may_hold_cloud_files_with(
+            Path::new(r"C:\Users\a\OneDrive\Pictures"),
+            Some(&roots),
+            &local,
+            &no_sample
+        ));
+        // Registrations unreadable: assume anywhere.
+        assert!(folder_may_hold_cloud_files_with(shoot, None, &local, &no_sample));
+        // Marked by the Cloud Files reparse tag on an ancestor (a root not registered).
+        let tagged = |p: &Path| {
+            if p == Path::new(r"D:\Shoots") {
+                Some((0x410, 0x9000_301A))
+            } else {
+                Some((0x10, 0))
+            }
+        };
+        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &tagged, &no_sample));
+        // Attributes unreadable: fail closed.
+        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &|_| None, &no_sample));
+    }
+
+    fn no_sample(_: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn a_folder_whose_listing_shows_offline_files_is_walked() {
+        let local = |_: &Path| Some((0x10, 0));
+        let shoot = Path::new(r"\\fileserver\tiered\2026");
+        assert!(!folder_may_hold_cloud_files_with(shoot, Some(&[]), &local, &no_sample));
+        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &local, &|_| true));
+
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(d.path().join(format!("{i}.bin")), b"x").unwrap();
+        }
+        assert!(!first_page_has_online_only(d.path(), LISTING_SAMPLE));
+        let offline = d.path().join("3.bin");
+        simulate_online_only(&offline);
+        assert!(first_page_has_online_only(d.path(), LISTING_SAMPLE));
+        clear_simulated_online_only(&offline);
+        // An unreadable folder fails closed.
+        assert!(first_page_has_online_only(&d.path().join("missing"), LISTING_SAMPLE));
+    }
+
+    #[test]
+    fn expandable_registry_paths_are_expanded() {
+        // SAFETY (test): no other test reads this variable.
+        unsafe { std::env::set_var("ZXRAW_TEST_PROFILE", r"C:\Users\a") };
+        assert_eq!(
+            expand_environment(r"%ZXRAW_TEST_PROFILE%\OneDrive"),
+            r"C:\Users\a\OneDrive"
+        );
+        assert_eq!(
+            expand_environment(r"%ZXRAW_NO_SUCH_VAR%\x"),
+            r"%ZXRAW_NO_SUCH_VAR%\x"
+        );
+        assert_eq!(expand_environment("100% sure"), "100% sure");
+        assert_eq!(expand_environment(r"D:\plain"), r"D:\plain");
     }
 
     #[test]

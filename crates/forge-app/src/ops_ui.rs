@@ -1,6 +1,7 @@
 //! Copy/move/delete jobs, the interactive conflict dialog and the operations panel.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -22,10 +23,21 @@ use crate::views;
 /// because reading them downloads everything from the cloud.
 const CLOUD_WARN_COUNT: usize = 10;
 const CLOUD_WARN_BYTES: u64 = 1 << 30;
-/// Limits on the metadata-only walk into selected folders. Hitting either one stops the walk
-/// and marks its totals as a lower bound.
+/// Limits on the metadata-only walk into selected folders that may hold cloud files. Hitting
+/// either one stops the walk and makes the check incomplete (it then asks).
 const CLOUD_WALK_MAX_ENTRIES: usize = 20_000;
 const CLOUD_WALK_TIME_LIMIT: Duration = Duration::from_millis(300);
+/// Limits on checking the selected files one by one (one attribute query each). Larger than
+/// the walk's: a shoot of several thousand selected files must not ask just for its size.
+const CLOUD_FILES_MAX: usize = 100_000;
+const CLOUD_FILES_TIME_LIMIT: Duration = Duration::from_secs(3);
+/// Move-source identities are read by this many shared workers per lane (local, network), so
+/// metadata calls blocked on an unreachable share tie up at most the network lane's threads,
+/// however many moves are queued, and local moves never wait behind them.
+const IDENTITY_WORKERS: usize = 2;
+/// How long one identity read may run before its move fails closed. Time spent queued
+/// behind other moves does not count.
+const IDENTITY_WAIT: Duration = Duration::from_secs(10);
 /// A scan that finishes this quickly needs no "Checking" dialog (local folders, nearly always).
 const CLOUD_CHECK_GRACE: Duration = Duration::from_millis(150);
 /// Ids for online-only checks, so a result is matched to the dialog that asked for it.
@@ -48,6 +60,9 @@ struct ClipboardMoveCompletion {
 /// Start a copy or move of `sources` into `dest` as a background job, after asking first
 /// when it would download online-only files.
 pub fn start_transfer(app: &mut ZxrawApp, sources: Vec<PathBuf>, dest: PathBuf, kind: OpKind) {
+    if refused_while_a_dialog_is_open(app, kind) {
+        return;
+    }
     if scan_needed(&sources, &dest, kind) {
         ask_after_cloud_check(app, sources.clone(), sources, dest, kind, None);
         return;
@@ -94,7 +109,25 @@ pub fn start_clipboard_move(
     generation: Option<u64>,
     expected_sequence: Option<u32>,
 ) -> bool {
+    if refused_while_a_dialog_is_open(app, OpKind::Move) {
+        // Handled: the refusal has its own message.
+        return true;
+    }
     clipboard_move(app, sources, dest, generation, expected_sequence, true)
+}
+
+/// There is one confirmation-dialog slot (`app.ops.modal`), and every new copy or move may
+/// need it (the online-only check and its warning). While a confirmation dialog is open a new
+/// transfer is refused with a message:
+/// never queued out of sight, never dropped silently, and never run past a confirmation the
+/// user is still reading. Checked at the public entry points (copy, move, paste, drag and
+/// drop, to the other pane) before anything else.
+fn refused_while_a_dialog_is_open(app: &mut ZxrawApp, kind: OpKind) -> bool {
+    if app.ops.modal.is_none() {
+        return false;
+    }
+    app.toast_err(busy_transfer_message(kind));
+    true
 }
 
 /// [`start_clipboard_move`] without the cloud check. Used when the user already accepted it.
@@ -126,7 +159,6 @@ fn clipboard_move(
         return false;
     }
     if check_cloud && scan_needed(&sources, &dest, OpKind::Move) {
-        // Refused with its own message when a dialog is open: still "handled".
         ask_after_cloud_check(
             app,
             sources,
@@ -178,8 +210,7 @@ impl Drop for CloudScanGuard {
 /// Cancel drops the dialog, which stops the scan and discards its result. Continue anyway
 /// starts the transfer.
 ///
-/// There is one dialog slot: while any dialog is open the transfer is refused with a message
-/// (never queued behind it, never dropped silently). Returns whether the request was taken.
+/// Only reached from the public entry points, which refuse while a dialog is open.
 fn ask_after_cloud_check(
     app: &mut ZxrawApp,
     scan_sources: Vec<PathBuf>,
@@ -187,11 +218,7 @@ fn ask_after_cloud_check(
     dest: PathBuf,
     kind: OpKind,
     clipboard: Option<(Option<u64>, Option<u32>)>,
-) -> bool {
-    if app.ops.modal.is_some() {
-        app.toast_err(busy_transfer_message(kind));
-        return false;
-    }
+) {
     let id = NEXT_CLOUD_CHECK.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = bounded(1);
     let ctx = app.ops.ctx.clone();
@@ -219,7 +246,7 @@ fn ask_after_cloud_check(
             // Cannot happen (the result is for this check), but never drop a transfer silently.
             CloudCheckAction::Ignore => app.toast_err("The transfer did not start; try again"),
         }
-        return true;
+        return;
     }
     app.ops.modal = Some(Modal::Confirm(Confirm {
         kind: ConfirmKind::CheckingCloudFiles {
@@ -236,7 +263,6 @@ fn ask_after_cloud_check(
         confirm_label: "Continue anyway".into(),
         danger: false,
     }));
-    true
 }
 
 fn busy_transfer_message(kind: OpKind) -> String {
@@ -347,7 +373,10 @@ fn cloud_warning_for(
     if kind == OpKind::Move && same {
         return None;
     }
-    let scan = online_only_totals(sources, dest, kind, cancel);
+    let roots = forge_core::cloud::known_sync_roots();
+    let may_hold =
+        |dir: &Path| forge_core::cloud::folder_may_hold_cloud_files(dir, roots.as_deref());
+    let scan = online_only_totals(sources, dest, kind, cancel, &may_hold);
     cloud_download_warning(scan.count, scan.bytes, kind, same, scan.incomplete)
 }
 
@@ -363,20 +392,44 @@ struct OnlineOnlyScan {
     incomplete: bool,
 }
 
+/// `may_hold(folder)`: could the folder hold cloud files? Only those folders are walked; see
+/// [`forge_core::cloud::folder_may_hold_cloud_files`].
 fn online_only_totals(
     sources: &[PathBuf],
     dest: &Path,
     kind: OpKind,
     cancel: &CancelToken,
+    may_hold: &dyn Fn(&Path) -> bool,
 ) -> OnlineOnlyScan {
     online_only_totals_with(
         sources,
         dest,
         kind,
-        CLOUD_WALK_MAX_ENTRIES,
-        CLOUD_WALK_TIME_LIMIT,
+        ScanLimits {
+            files: (CLOUD_FILES_MAX, CLOUD_FILES_TIME_LIMIT),
+            walk: (CLOUD_WALK_MAX_ENTRIES, CLOUD_WALK_TIME_LIMIT),
+        },
         cancel,
+        may_hold,
     )
+}
+
+/// `(entries, time)` limits for the selected files and for the folder walk.
+#[derive(Clone, Copy)]
+struct ScanLimits {
+    files: (usize, Duration),
+    walk: (usize, Duration),
+}
+
+impl ScanLimits {
+    /// The same limits for both parts (tests).
+    #[cfg(test)]
+    fn both(entries: usize, time: Duration) -> Self {
+        Self {
+            files: (entries, time),
+            walk: (entries, time),
+        }
+    }
 }
 
 /// Shared limits of one scan: entries visited, a deadline, and cancellation.
@@ -387,7 +440,16 @@ struct ScanBudget<'a> {
     cancel: &'a CancelToken,
 }
 
-impl ScanBudget<'_> {
+impl<'a> ScanBudget<'a> {
+    fn new((max_entries, time): (usize, Duration), cancel: &'a CancelToken) -> Self {
+        Self {
+            visited: 0,
+            max_entries,
+            deadline: Instant::now() + time,
+            cancel,
+        }
+    }
+
     /// Takes one entry from the budget; `false` (and the scan is incomplete) when spent.
     fn take(&mut self) -> bool {
         if self.visited >= self.max_entries
@@ -402,25 +464,24 @@ impl ScanBudget<'_> {
 }
 
 /// [`online_only_totals`] with injectable limits.
+///
+/// Selected files are always checked one by one (an online-only file need not sit under a
+/// marked sync root), under their own limits. Selected folders are walked only when they may
+/// hold cloud files; a folder positively outside every cloud location (a local shoot, the
+/// common case) is not walked at all, so its size never makes the check incomplete.
 fn online_only_totals_with(
     sources: &[PathBuf],
     dest: &Path,
     kind: OpKind,
-    max_entries: usize,
-    time_limit: Duration,
+    limits: ScanLimits,
     cancel: &CancelToken,
+    may_hold: &dyn Fn(&Path) -> bool,
 ) -> OnlineOnlyScan {
-    let mut budget = ScanBudget {
-        visited: 0,
-        max_entries,
-        deadline: Instant::now() + time_limit,
-        cancel,
-    };
+    let mut budget = ScanBudget::new(limits.files, cancel);
     let mut scan = OnlineOnlyScan::default();
     let mut folders = Vec::new();
-    // Selected files first, so a large folder cannot use up the budget before an explicitly
-    // selected file is seen. They count against the same limits: a huge file selection is
-    // bounded too, and stopping makes the scan incomplete, never clean.
+    // Selected files first, so a large folder cannot hide an explicitly selected file. A huge
+    // selection is bounded too, and stopping makes the scan incomplete, never clean.
     for path in sources {
         if kind == OpKind::Move && same_volume(path, dest) {
             continue;
@@ -444,7 +505,15 @@ fn online_only_totals_with(
             Err(_) => scan.incomplete = true,
         }
     }
+    let mut budget = ScanBudget::new(limits.walk, cancel);
     for folder in folders {
+        if cancel.is_cancelled() {
+            scan.incomplete = true;
+            break;
+        }
+        if !may_hold(folder) {
+            continue;
+        }
         if !walk_online_only(folder, &mut budget, &mut scan) {
             scan.incomplete = true;
             break;
@@ -605,7 +674,7 @@ fn start_transfer_with(
     // at a source path when the job starts must still be the same item. The identities are
     // read now, on a helper thread (one metadata query per source can stall on a network
     // path), and the job waits for them before it looks at any source.
-    let identities = (kind == OpKind::Move).then(|| capture_identities(sources.clone()));
+    let identities = (kind == OpKind::Move).then(|| IdentityPool::global().capture(&sources));
     // Taken by whichever runs: the job, or the callback for a job cancelled while queued.
     let completion = std::sync::Arc::new(parking_lot::Mutex::new(completion));
     let unstarted = {
@@ -632,10 +701,38 @@ fn start_transfer_with(
         // failed, and a moved source replaced by another item is left alone. A move fails
         // closed: a source whose identity was not captured when queued is not moved
         // either. Conflicts are looked at only now, when the job runs.
+        if identities.is_some() {
+            job.progress
+                .set_current("Checking that the sources are still the items you picked");
+        }
         let identities = match &identities {
-            Some(pending) => match wait_identities(pending, &job.cancel, sources.len()) {
-                Some(identities) => identities,
-                None => return Err("cancelled".into()),
+            Some(pending) => match pending.wait(&job.cancel, IDENTITY_WAIT) {
+                Ok(identities) => identities,
+                Err(failure) => {
+                    let message = match failure {
+                        IdentityWait::Cancelled => "cancelled".to_string(),
+                        IdentityWait::TimedOut(path) => {
+                            let message = format!(
+                                "Nothing was moved: {} did not answer within {} s, so it \
+                                 could not be checked that it is still the item you picked",
+                                path.display(),
+                                IDENTITY_WAIT.as_secs()
+                            );
+                            let _ = tx.send(Event::Error(message.clone()));
+                            message
+                        }
+                    };
+                    if let Some(completion) = completion {
+                        let _ = tx.send(Event::MoveFinished {
+                            sources: completion.sources,
+                            ok: false,
+                            clipboard_generation: completion.generation,
+                            expected_sequence: completion.expected_sequence,
+                        });
+                    }
+                    ctx.request_repaint();
+                    return Err(message);
+                }
             },
             None => Vec::new(),
         };
@@ -754,7 +851,7 @@ fn start_transfer_with(
 }
 
 /// What a source path pointed at when a move was queued.
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum SourceIdentity {
     /// Volume serial and file index (Windows file ID).
     Id {
@@ -790,32 +887,195 @@ fn screen_queued_sources(
     (keep, changed, unverified)
 }
 
-/// Starts reading the identities of `sources` on a helper thread.
-fn capture_identities(sources: Vec<PathBuf>) -> Receiver<Vec<Option<SourceIdentity>>> {
-    let (tx, rx) = bounded(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(sources.iter().map(|s| source_identity(s)).collect());
-    });
-    rx
+/// Progress of one move's identity reads, from the pool to the waiting job.
+enum IdentityEvent {
+    /// A worker started reading this source (the per-read deadline starts now).
+    Started(usize),
+    Done(usize, Option<SourceIdentity>),
 }
 
-/// The identities from [`capture_identities`], waiting for them unless the job is cancelled
-/// (`None`). If the helper died without an answer, every identity is unknown, so a move
-/// fails closed for every source that still exists.
-fn wait_identities(
-    pending: &Receiver<Vec<Option<SourceIdentity>>>,
-    cancel: &CancelToken,
-    count: usize,
-) -> Option<Vec<Option<SourceIdentity>>> {
-    loop {
-        match pending.recv_timeout(Duration::from_millis(100)) {
-            Ok(identities) => return Some(identities),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => return None,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                return Some((0..count).map(|_| None).collect());
+/// The identity reads one move still needs, queued in a lane.
+struct MoveReads {
+    paths: parking_lot::Mutex<std::collections::VecDeque<(usize, PathBuf)>>,
+    /// Set when the move no longer needs them (finished, failed, cancelled): skipped.
+    cancel: CancelToken,
+    reply: Sender<IdentityEvent>,
+}
+
+/// One lane of identity workers. Moves take turns, one read each, so a small move queued
+/// behind a large one is served after at most one read per worker, not after all of them.
+struct IdentityLane {
+    moves: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<MoveReads>>>,
+    ready: parking_lot::Condvar,
+    /// Workers that actually started (a thread can fail to spawn).
+    workers: std::sync::atomic::AtomicUsize,
+}
+
+impl IdentityLane {
+    fn start(name: &str, workers: usize, read: fn(&Path) -> Option<SourceIdentity>) -> Arc<Self> {
+        let lane = Arc::new(Self {
+            moves: Default::default(),
+            ready: parking_lot::Condvar::new(),
+            workers: Default::default(),
+        });
+        for _ in 0..workers.max(1) {
+            let worker = lane.clone();
+            let spawned = std::thread::Builder::new()
+                .name(name.into())
+                .spawn(move || worker.serve(read));
+            if spawned.is_ok() {
+                lane.workers.fetch_add(1, Ordering::Relaxed);
             }
         }
+        lane
+    }
+
+    /// The next read: the first move with work left, which then goes to the back.
+    fn next(&self) -> (Arc<MoveReads>, (usize, PathBuf)) {
+        let mut moves = self.moves.lock();
+        loop {
+            while let Some(reads) = moves.pop_front() {
+                if reads.cancel.is_cancelled() {
+                    continue;
+                }
+                let mut paths = reads.paths.lock();
+                let Some(item) = paths.pop_front() else {
+                    continue;
+                };
+                let more = !paths.is_empty();
+                drop(paths);
+                if more {
+                    moves.push_back(reads.clone());
+                }
+                return (reads, item);
+            }
+            self.ready.wait(&mut moves);
+        }
+    }
+
+    fn serve(&self, read: fn(&Path) -> Option<SourceIdentity>) {
+        loop {
+            let (reads, (index, path)) = self.next();
+            if reads.cancel.is_cancelled() {
+                continue;
+            }
+            let _ = reads.reply.send(IdentityEvent::Started(index));
+            let identity = read(&path);
+            let _ = reads.reply.send(IdentityEvent::Done(index, identity));
+        }
+    }
+}
+
+/// The shared workers that read move-source identities off the UI thread, when a move is
+/// queued. Fixed in number and alive for the whole process (as `path_probe`'s lanes), so a
+/// metadata call stuck on an unreachable share can never pile up threads.
+struct IdentityPool {
+    local: Arc<IdentityLane>,
+    network: Arc<IdentityLane>,
+}
+
+impl IdentityPool {
+    fn global() -> &'static IdentityPool {
+        static POOL: std::sync::OnceLock<IdentityPool> = std::sync::OnceLock::new();
+        POOL.get_or_init(|| IdentityPool::new(IDENTITY_WORKERS, source_identity))
+    }
+
+    fn new(workers: usize, read: fn(&Path) -> Option<SourceIdentity>) -> Self {
+        Self {
+            local: IdentityLane::start("move-identity", workers, read),
+            network: IdentityLane::start("move-identity-net", workers, read),
+        }
+    }
+
+    /// Queues the identities of `sources` in the network lane if any source is on a share
+    /// (no file call: UNC text, or the drive type, which Windows answers locally).
+    fn capture(&self, sources: &[PathBuf]) -> PendingIdentities {
+        let network = sources
+            .iter()
+            .any(|path| forge_core::netpath::is_network_path(path));
+        let lane = if network { &self.network } else { &self.local };
+        let cancel = CancelToken::new();
+        let (reply, events) = crossbeam_channel::unbounded();
+        let pending = PendingIdentities {
+            events,
+            paths: sources.to_vec(),
+            cancel: cancel.clone(),
+        };
+        if lane.workers.load(Ordering::Relaxed) == 0 || sources.is_empty() {
+            // No worker to read them (or nothing to read): the reply side is dropped now, so
+            // every identity is unknown and the move fails closed.
+            return pending;
+        }
+        let reads = Arc::new(MoveReads {
+            paths: parking_lot::Mutex::new(sources.iter().cloned().enumerate().collect()),
+            cancel,
+            reply,
+        });
+        lane.moves.lock().push_back(reads);
+        lane.ready.notify_all();
+        pending
+    }
+}
+
+/// The identities of one move, arriving from the pool. Dropping it (the move finished or was
+/// cancelled, even while still queued) skips its reads that have not started. It holds no
+/// reply sender, so once the pool has dropped the move's reads the channel disconnects.
+struct PendingIdentities {
+    events: Receiver<IdentityEvent>,
+    paths: Vec<PathBuf>,
+    cancel: CancelToken,
+}
+
+impl Drop for PendingIdentities {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum IdentityWait {
+    Cancelled,
+    /// A read of this source ran longer than the limit (an unreachable share, usually).
+    TimedOut(PathBuf),
+}
+
+impl PendingIdentities {
+    /// Waits for every identity, checking `cancel` in between. Reads still queued behind
+    /// other moves wait without a limit; a read that has started may take `per_read`. An
+    /// identity that never arrives because the pool dropped it is unknown, so the move fails
+    /// closed for that source.
+    fn wait(
+        &self,
+        cancel: &CancelToken,
+        per_read: Duration,
+    ) -> Result<Vec<Option<SourceIdentity>>, IdentityWait> {
+        let mut found: Vec<Option<Option<SourceIdentity>>> =
+            (0..self.paths.len()).map(|_| None).collect();
+        let mut remaining = self.paths.len();
+        let mut running: std::collections::HashMap<usize, Instant> = Default::default();
+        while remaining > 0 {
+            if cancel.is_cancelled() {
+                return Err(IdentityWait::Cancelled);
+            }
+            match self.events.recv_timeout(Duration::from_millis(50)) {
+                Ok(IdentityEvent::Started(index)) => {
+                    running.insert(index, Instant::now());
+                }
+                Ok(IdentityEvent::Done(index, identity)) => {
+                    running.remove(&index);
+                    if found[index].is_none() {
+                        remaining -= 1;
+                    }
+                    found[index] = Some(identity);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+            if let Some((&index, _)) = running.iter().find(|(_, at)| at.elapsed() >= per_read) {
+                return Err(IdentityWait::TimedOut(self.paths[index].clone()));
+            }
+        }
+        Ok(found.into_iter().map(Option::flatten).collect())
     }
 }
 
@@ -1553,6 +1813,16 @@ mod tests {
 mod cloud_warning_tests {
     use super::*;
 
+    /// Treats every folder as one that may hold cloud files, so the walk itself is tested.
+    fn cloud_folder(_: &Path) -> bool {
+        true
+    }
+
+    /// The production rule for a folder outside every known sync root.
+    fn local_folder(dir: &Path) -> bool {
+        forge_core::cloud::folder_may_hold_cloud_files(dir, Some(&[]))
+    }
+
     #[test]
     fn small_transfers_do_not_warn() {
         assert_eq!(
@@ -1636,10 +1906,13 @@ mod cloud_warning_tests {
             placeholders.push(path);
         }
         let dest = dir.path().join("dest");
+        // Inside a sync root, so the copy walks it.
+        forge_core::cloud::simulate_online_only(folder.clone());
         let sources = std::slice::from_ref(&folder);
         assert_eq!(cloud_warning_for(sources, &dest, OpKind::Move, &CancelToken::new()), None);
         // The same folder copied would warn, so the Move result comes from the rule.
         assert!(cloud_warning_for(sources, &dest, OpKind::Copy, &CancelToken::new()).is_some());
+        forge_core::cloud::clear_simulated_online_only(&folder);
         for path in &placeholders {
             forge_core::cloud::clear_simulated_online_only(path);
         }
@@ -1669,6 +1942,7 @@ mod cloud_warning_tests {
             &elsewhere,
             OpKind::Copy,
             &CancelToken::new(),
+            &cloud_folder,
         );
         assert_eq!(
             scan,
@@ -1678,6 +1952,7 @@ mod cloud_warning_tests {
                 incomplete: false,
             }
         );
+        forge_core::cloud::simulate_online_only(root.clone());
         let body = cloud_warning_for(
             std::slice::from_ref(&root),
             &elsewhere,
@@ -1686,6 +1961,7 @@ mod cloud_warning_tests {
         )
             .expect("ten online-only files warn");
         assert!(body.starts_with("10 files (30 B) are online-only."));
+        forge_core::cloud::clear_simulated_online_only(&root);
         for path in &placeholders {
             forge_core::cloud::clear_simulated_online_only(path);
         }
@@ -1704,15 +1980,14 @@ mod cloud_warning_tests {
             placeholders.push(path);
         }
         let elsewhere = dir.path().join("elsewhere");
-        // The selected folder takes one entry; every entry inside is online-only, so the
-        // first two visited are seen before the cap.
+        // Every entry inside is online-only, so the first two visited are seen before the cap.
         let scan = online_only_totals_with(
             std::slice::from_ref(&root),
             &elsewhere,
             OpKind::Copy,
-            3,
-            Duration::from_secs(60),
+            ScanLimits::both(2, Duration::from_secs(60)),
             &CancelToken::new(),
+            &cloud_folder,
         );
         assert!(scan.incomplete);
         assert_eq!(scan.count, 2);
@@ -1743,9 +2018,9 @@ mod cloud_warning_tests {
             std::slice::from_ref(&root),
             &elsewhere,
             OpKind::Copy,
-            2,
-            Duration::from_secs(60),
+            ScanLimits::both(2, Duration::from_secs(60)),
             &CancelToken::new(),
+            &cloud_folder,
         );
         assert!(scan.incomplete);
         assert_eq!(scan.count, 0);
@@ -1789,9 +2064,9 @@ mod cloud_warning_tests {
             &sources,
             &elsewhere,
             OpKind::Copy,
-            14,
-            Duration::from_secs(60),
+            ScanLimits::both(14, Duration::from_secs(60)),
             &CancelToken::new(),
+            &cloud_folder,
         );
         assert_eq!(
             scan,
@@ -1821,9 +2096,9 @@ mod cloud_warning_tests {
             &files,
             &elsewhere,
             OpKind::Copy,
-            4,
-            Duration::from_secs(60),
+            ScanLimits::both(4, Duration::from_secs(60)),
             &CancelToken::new(),
+            &cloud_folder,
         );
         assert_eq!(
             scan,
@@ -1865,35 +2140,235 @@ mod cloud_warning_tests {
             std::slice::from_ref(&file),
             &dir.path().join("elsewhere"),
             OpKind::Copy,
-            100,
-            Duration::from_secs(60),
+            ScanLimits::both(100, Duration::from_secs(60)),
             &cancel,
+            &cloud_folder,
         );
         assert!(scan.incomplete);
     }
 
     #[test]
-    fn identities_are_captured_off_the_ui_thread_and_fail_closed() {
+    fn a_large_local_folder_starts_without_asking_but_a_cloud_one_asks() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let shoot = dir.path().join("shoot");
+        std::fs::create_dir(&shoot).unwrap();
+        for i in 0..30 {
+            std::fs::write(shoot.join(format!("IMG_{i:04}.CR3")), b"raw").unwrap();
+        }
+        let elsewhere = dir.path().join("backup");
+        let limits = ScanLimits::both(5, Duration::from_secs(60));
+        // Far over the walk cap, but positively outside every cloud location: not walked,
+        // complete, no prompt.
+        let local = online_only_totals_with(
+            std::slice::from_ref(&shoot),
+            &elsewhere,
+            OpKind::Copy,
+            limits,
+            &CancelToken::new(),
+            &local_folder,
+        );
+        assert_eq!(local, OnlineOnlyScan::default());
+        assert_eq!(
+            cloud_download_warning(local.count, local.bytes, OpKind::Copy, false, local.incomplete),
+            None
+        );
+        // The same tree marked as a cloud folder is walked, hits the cap and asks.
+        forge_core::cloud::simulate_online_only(shoot.clone());
+        let cloud = online_only_totals_with(
+            std::slice::from_ref(&shoot),
+            &elsewhere,
+            OpKind::Copy,
+            limits,
+            &CancelToken::new(),
+            &local_folder,
+        );
+        forge_core::cloud::clear_simulated_online_only(&shoot);
+        assert!(cloud.incomplete);
+        assert!(
+            cloud_download_warning(cloud.count, cloud.bytes, OpKind::Copy, false, cloud.incomplete)
+                .is_some()
+        );
+        // A folder holding a known sync root (the profile folder holding OneDrive) is walked.
+        let holds_root = |d: &Path| {
+            forge_core::cloud::folder_may_hold_cloud_files(d, Some(&[shoot.join("OneDrive")]))
+        };
+        assert!(
+            online_only_totals_with(
+                std::slice::from_ref(&shoot),
+                &elsewhere,
+                OpKind::Copy,
+                limits,
+                &CancelToken::new(),
+                &holds_root,
+            )
+            .incomplete
+        );
+    }
+
+    #[test]
+    fn selected_files_in_a_local_folder_are_still_checked_one_by_one() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("offline.mov");
+        std::fs::write(&file, b"abc").unwrap();
+        forge_core::cloud::simulate_online_only(file.clone());
+        let scan = online_only_totals_with(
+            std::slice::from_ref(&file),
+            &dir.path().join("backup"),
+            OpKind::Copy,
+            ScanLimits::both(100, Duration::from_secs(60)),
+            &CancelToken::new(),
+            &local_folder,
+        );
+        forge_core::cloud::clear_simulated_online_only(&file);
+        assert_eq!((scan.count, scan.bytes), (1, 3));
+    }
+
+    fn slow_identity(_: &Path) -> Option<SourceIdentity> {
+        std::thread::sleep(Duration::from_millis(400));
+        None
+    }
+
+    #[test]
+    fn identities_come_from_a_fixed_pool_and_a_stuck_one_fails_closed() {
         let dir = tempfile::tempdir().expect("temp directory");
         let file = dir.path().join("a.bin");
         std::fs::write(&file, b"x").unwrap();
-        let pending = capture_identities(vec![file.clone()]);
-        let identities = wait_identities(&pending, &CancelToken::new(), 1).unwrap();
+        let pool = IdentityPool::new(1, source_identity);
+        let identities = pool
+            .capture(std::slice::from_ref(&file))
+            .wait(&CancelToken::new(), Duration::from_secs(10))
+            .unwrap();
         assert!(identities[0].is_some());
-        // A helper that died without answering: every identity is unknown.
-        let (tx, rx) = bounded::<Vec<Option<SourceIdentity>>>(1);
-        drop(tx);
-        let unknown = wait_identities(&rx, &CancelToken::new(), 2).unwrap();
-        assert!(unknown.iter().all(Option::is_none));
-        let (keep, _, unverified) =
-            screen_queued_sources(vec![file.clone()], &unknown, source_identity);
-        assert!(keep.is_empty());
-        assert_eq!(unverified, vec![file]);
-        // Cancelled while waiting: the job stops.
-        let (_tx, never) = bounded::<Vec<Option<SourceIdentity>>>(1);
+
+        // A source that does not answer in time fails the move closed, naming it.
+        let stuck = IdentityPool::new(1, slow_identity);
+        let pending = stuck.capture(std::slice::from_ref(&file));
+        assert_eq!(
+            pending.wait(&CancelToken::new(), Duration::from_millis(50)),
+            Err(IdentityWait::TimedOut(file.clone()))
+        );
+        // Cancelled while waiting.
         let cancel = CancelToken::new();
         cancel.cancel();
-        assert!(wait_identities(&never, &cancel, 1).is_none());
+        assert_eq!(
+            stuck
+                .capture(std::slice::from_ref(&file))
+                .wait(&cancel, Duration::from_secs(10)),
+            Err(IdentityWait::Cancelled)
+        );
+    }
+
+    static READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counted_identity(_: &Path) -> Option<SourceIdentity> {
+        READS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(100));
+        None
+    }
+
+    fn paced_identity(_: &Path) -> Option<SourceIdentity> {
+        std::thread::sleep(Duration::from_millis(30));
+        None
+    }
+
+    #[test]
+    fn a_small_move_is_not_failed_by_a_large_one_queued_ahead() {
+        // One worker, 30 ms a read: the large move's 200 reads take 6 s in all. The small
+        // move takes turns with it, and the time it spends queued does not count.
+        let pool = IdentityPool::new(1, paced_identity);
+        let large: Vec<PathBuf> = (0..200).map(|i| PathBuf::from(format!("big{i}"))).collect();
+        let large = pool.capture(&large);
+        let small = pool.capture(&[PathBuf::from("small")]);
+        let started = Instant::now();
+        let identities = small
+            .wait(&CancelToken::new(), Duration::from_millis(500))
+            .expect("served in turn, well within the per-read limit");
+        assert_eq!(identities.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(large);
+    }
+
+    static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn tracked_identity(_: &Path) -> Option<SourceIdentity> {
+        let now = RUNNING.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(20));
+        RUNNING.fetch_sub(1, Ordering::SeqCst);
+        None
+    }
+
+    #[test]
+    fn identity_reads_never_exceed_the_lane_workers() {
+        let pool = IdentityPool::new(2, tracked_identity);
+        let moves: Vec<PendingIdentities> = (0..6)
+            .map(|m| {
+                let paths: Vec<PathBuf> =
+                    (0..5).map(|i| PathBuf::from(format!("m{m}-{i}"))).collect();
+                pool.capture(&paths)
+            })
+            .collect();
+        for pending in &moves {
+            pending
+                .wait(&CancelToken::new(), Duration::from_secs(5))
+                .unwrap();
+        }
+        assert!(PEAK.load(Ordering::SeqCst) <= 2, "at most the lane's two workers");
+    }
+
+    #[test]
+    fn a_hung_network_read_does_not_block_local_moves() {
+        let pool = IdentityPool::new(1, slow_identity);
+        let share = pool.capture(&[PathBuf::from(r"\\nas\photos\a.cr3")]);
+        // The network lane's only worker is busy for 400 ms; the local lane is free.
+        let local = IdentityPool {
+            local: IdentityLane::start("test-local", 1, source_identity),
+            network: pool.network.clone(),
+        };
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let started = Instant::now();
+        local
+            .capture(std::slice::from_ref(&file))
+            .wait(&CancelToken::new(), Duration::from_secs(5))
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(300));
+        drop(share);
+    }
+
+    #[test]
+    fn a_dropped_move_skips_its_queued_identity_reads() {
+        let pool = IdentityPool::new(1, counted_identity);
+        let paths: Vec<PathBuf> = (0..10).map(|i| PathBuf::from(format!("x{i}"))).collect();
+        drop(pool.capture(&paths));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(READS.load(Ordering::SeqCst) <= 1, "queued reads must be skipped");
+    }
+
+    #[test]
+    fn identities_that_never_arrive_fail_closed() {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let file = dir.path().join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let (reply, events) = crossbeam_channel::unbounded();
+        reply
+            .send(IdentityEvent::Done(0, source_identity(&file)))
+            .unwrap();
+        drop(reply);
+        let pending = PendingIdentities {
+            events,
+            paths: vec![file.clone(), file.clone()],
+            cancel: CancelToken::new(),
+        };
+        let identities = pending
+            .wait(&CancelToken::new(), Duration::from_secs(10))
+            .unwrap();
+        assert!(identities[0].is_some() && identities[1].is_none());
+        let (keep, _, unverified) =
+            screen_queued_sources(vec![file.clone(), file.clone()], &identities, source_identity);
+        assert_eq!((keep.len(), unverified.len()), (1, 1));
     }
 
     #[test]
@@ -1961,7 +2436,13 @@ mod cloud_warning_tests {
         let sources = [cloud.clone(), local, folder.clone()];
         let elsewhere = dir.path().join("elsewhere");
         assert_eq!(
-            online_only_totals(&sources, &elsewhere, OpKind::Copy, &CancelToken::new()),
+            online_only_totals(
+                &sources,
+                &elsewhere,
+                OpKind::Copy,
+                &CancelToken::new(),
+                &cloud_folder,
+            ),
             OnlineOnlyScan {
                 count: 2,
                 bytes: 5,
@@ -1970,7 +2451,13 @@ mod cloud_warning_tests {
         );
         // A move within the same volume is a rename: nothing is read.
         assert_eq!(
-            online_only_totals(&sources, dir.path(), OpKind::Move, &CancelToken::new()),
+            online_only_totals(
+                &sources,
+                dir.path(),
+                OpKind::Move,
+                &CancelToken::new(),
+                &cloud_folder,
+            ),
             OnlineOnlyScan::default()
         );
         forge_core::cloud::clear_simulated_online_only(&cloud);
