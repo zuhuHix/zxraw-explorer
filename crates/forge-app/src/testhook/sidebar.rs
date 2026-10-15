@@ -37,6 +37,13 @@
 //! - `load-layout <name>`: open the layout as "Load layout" does and wait until its folder
 //!   checks have answered; fails if there is no such layout (a layout whose folders are missing is reported by its toast instead).
 //!
+//! Collapsible sections (Layouts, Collections) and their "⋯" menus. Click a header with
+//! `ui browser click-control sidebar-<key>` and its menu button with
+//! `ui browser click-control sidebar-<key>-menu`, then a menu item with `ui system click-menu`.
+//! - `assert-section layouts|collections open|closed`: whether the section shows its items.
+//! - `assert-window manage-layouts|collections|new-collection open|closed`: whether that window
+//!   is open.
+//!
 //! Focused tab checks:
 //! - `assert-split on|off`: whether the active tab shows two panes.
 //! - `assert-view details|grid`: the view mode of the focused pane.
@@ -359,6 +366,49 @@ pub(super) fn step(
                 ))
             }
         }
+        "assert-section" => {
+            let (key, want) = key_and_open(args)?;
+            let has_items = match key {
+                "layouts" => !app.settings.layouts.is_empty(),
+                "collections" => !app.ops.collections_ui.sidebar_collections().is_empty(),
+                other => return Err(format!("no collapsible section `{other}`")),
+            };
+            let open = crate::sidebar::section_open(app, key, has_items);
+            if open == want {
+                Ok(Flow::Done)
+            } else {
+                Err(format!(
+                    "expected the {key} section to be {}, it is {}",
+                    open_word(want),
+                    open_word(open)
+                ))
+            }
+        }
+        "assert-window" => {
+            let (name, want) = key_and_open(args)?;
+            let open = match name {
+                "manage-layouts" => crate::layouts::manage_window_open(app),
+                "collections" => app.ops.collections_ui.open,
+                "new-collection" => crate::collections_ui::testhook_new_collection_open(app),
+                other => return Err(format!("no window `{other}`")),
+            };
+            // A window opened by a click shows on the next frame; give it a moment.
+            if open == want {
+                Ok(Flow::Done)
+            } else if elapsed(st) < Duration::from_secs(2) {
+                ctx.request_repaint();
+                Ok(Flow::Wait(format!(
+                    "the {name} window is {}",
+                    open_word(open)
+                )))
+            } else {
+                Err(format!(
+                    "expected the {name} window to be {}, it is {}",
+                    open_word(want),
+                    open_word(open)
+                ))
+            }
+        }
         "assert-view" => {
             let want = match one(args)? {
                 "details" => ViewMode::Details,
@@ -436,6 +486,23 @@ fn on_off(args: &str) -> Result<bool, String> {
         "off" => Ok(false),
         other => Err(format!("expected `on` or `off`, not `{other}`")),
     }
+}
+
+/// `<key> open|closed`.
+fn key_and_open(args: &str) -> Result<(&str, bool), String> {
+    let mut parts = args.split_whitespace();
+    let (Some(key), Some(state), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err("expected `<name> open|closed`".into());
+    };
+    match state {
+        "open" => Ok((key, true)),
+        "closed" => Ok((key, false)),
+        other => Err(format!("expected `open` or `closed`, not `{other}`")),
+    }
+}
+
+fn open_word(open: bool) -> &'static str {
+    if open { "open" } else { "closed" }
 }
 
 fn on_off_word(on: bool) -> &'static str {

@@ -172,14 +172,47 @@ pub fn accept_label(app: &mut ZxrawApp, mut p: Prompt) -> Option<Modal> {
     }
 }
 
-/// The sidebar's "Layouts" section: saved layouts (a click loads one) and the save and
-/// manage actions. Called by `sidebar::show`.
+/// The sidebar's "Layouts" section: a collapsible header whose "⋯" menu explains layouts and
+/// holds the save and manage actions, then the saved layouts (a click loads one). Called by
+/// `sidebar::show`.
 pub fn sidebar_section(app: &mut ZxrawApp, ui: &mut egui::Ui) {
-    crate::sidebar::section(ui, "Layouts");
     let count = app.settings.layouts.len();
+    let open = crate::sidebar::collapsible_header(
+        app,
+        ui,
+        "layouts",
+        "Layouts",
+        count > 0,
+        "Layout actions",
+        |app, ui| {
+            crate::sidebar::menu_explainer(
+                ui,
+                "A layout remembers your open tabs: each tab's folders, split panes, view and \
+                 sorting. Click a saved layout to reopen that arrangement.",
+            );
+            if crate::sidebar::menu_item(
+                ui,
+                "Save current layout…",
+                "Save the open tabs under a name. Saving under an existing name updates that \
+                 layout.",
+            ) {
+                open_save_prompt(app);
+            }
+            if crate::sidebar::menu_item(
+                ui,
+                "Manage layouts…",
+                "Rename, reorder or delete saved layouts",
+            ) {
+                app.layouts.manage_open = true;
+            }
+        },
+    );
+    if !open {
+        return;
+    }
     let mut chosen: Option<(usize, Action)> = None;
     if count == 0 {
-        ui.weak("No saved layouts yet");
+        ui.label(egui::RichText::new("No saved layouts yet").weak().small());
     }
     for (i, layout) in app.settings.layouts.iter().enumerate().take(SIDEBAR_LIMIT) {
         let response = ui.selectable_label(false, format!("▦  {}", layout.name));
@@ -204,14 +237,6 @@ pub fn sidebar_section(app: &mut ZxrawApp, ui: &mut egui::Ui) {
     if count > SIDEBAR_LIMIT {
         ui.weak(format!("+ {} more", count - SIDEBAR_LIMIT));
     }
-    ui.horizontal(|ui| {
-        if ui.small_button("Save layout…").clicked() {
-            open_save_prompt(app);
-        }
-        if ui.small_button("Manage…").clicked() {
-            app.layouts.manage_open = true;
-        }
-    });
     if let Some((i, action)) = chosen {
         apply_action(app, i, action);
     }
@@ -363,6 +388,12 @@ fn open_layout(app: &mut ZxrawApp, layout: &Layout) {
         check,
         started_from: workspace(app),
     });
+}
+
+/// Whether the "Manage layouts" window is open.
+#[allow(dead_code)] // used by the test hook
+pub fn manage_window_open(app: &ZxrawApp) -> bool {
+    app.layouts.manage_open
 }
 
 /// True while a layout's folder checks are running.

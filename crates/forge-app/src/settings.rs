@@ -245,6 +245,9 @@ pub struct Settings {
     /// default (also when a settings file lacks the key): the scan reads repositories through
     /// link-safe, capped file access and never runs a program.
     pub git_badges: bool,
+    /// Sidebar sections the user opened (`true`) or closed, by key ("layouts",
+    /// "collections"). A section missing here starts open exactly when it has items.
+    pub sidebar_sections: std::collections::BTreeMap<String, bool>,
     /// Settings this version doesn't know (written by a newer one), kept so saving doesn't
     /// drop them.
     #[serde(flatten)]
@@ -288,6 +291,7 @@ impl Default for Settings {
             list_typing: ListTyping::Jump.into(),
             terminal: Default::default(),
             git_badges: true,
+            sidebar_sections: Default::default(),
             extra: Extra::new(),
         }
     }

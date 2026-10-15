@@ -1,4 +1,4 @@
-//! End-to-end scenarios: sidebar (Quick access pins and saved layouts).
+//! End-to-end scenarios: sidebar (Quick access pins, saved layouts, section headers and menus).
 
 #[allow(unused_imports)]
 use crate::*;
@@ -180,6 +180,59 @@ fn layouts_save_load_and_keep_one_entry_per_name() {
         layouts.as_array().map(Vec::len),
         Some(1),
         "saving the same name twice must keep one layout: {layouts}"
+    );
+}
+
+#[test]
+fn empty_sections_start_collapsed_and_their_menus_open_the_layout_and_collection_windows() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+
+    // A fresh profile has no layouts or collections: both sections start collapsed. Every
+    // action is reached with real clicks on the header and its "⋯" menu. The collection
+    // windows open over the sidebar, so each run opens only one of them, last.
+    let script = "dismiss-notices\n\
+         ui sidebar assert-section layouts closed\n\
+         ui sidebar assert-section collections closed\n\
+         ui browser click-control sidebar-layouts\n\
+         ui sidebar assert-section layouts open\n\
+         ui browser click-control sidebar-layouts-menu\n\
+         ui system click-menu Save current layout…\n\
+         type Culling\naccept\nui sidebar layouts Culling\n\
+         ui browser click-control sidebar-layouts-menu\n\
+         ui system click-menu Manage layouts…\n\
+         ui sidebar assert-window manage-layouts open\n\
+         ui browser click-control sidebar-collections-menu\n\
+         ui system click-menu New collection…\n\
+         ui sidebar assert-window new-collection open\n\
+         ui sidebar assert-section collections closed\n\
+         assert-no-error-toast\nexit\n";
+    let outcome = run_app(sandbox.path(), &profile, script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let settings = settings_json(&profile);
+    assert_eq!(settings["sidebar_sections"]["layouts"], true, "{settings}");
+    assert!(
+        settings["sidebar_sections"].get("collections").is_none(),
+        "{settings}"
+    );
+
+    // The choice is remembered; collapsing a section with items is remembered too.
+    // "Manage collections…" opens the Collections window.
+    forget_session(&profile);
+    let script = "dismiss-notices\n\
+         ui sidebar assert-section layouts open\n\
+         ui browser click-control sidebar-layouts\n\
+         ui sidebar assert-section layouts closed\n\
+         ui browser click-control sidebar-collections-menu\n\
+         ui system click-menu Manage collections…\n\
+         ui sidebar assert-window collections open\n\
+         assert-no-error-toast\nexit\n";
+    let outcome = run_app(sandbox.path(), &profile, script);
+    expect_ok(&outcome);
+    assert_eq!(
+        settings_json(&profile)["sidebar_sections"]["layouts"],
+        false
     );
 }
 
