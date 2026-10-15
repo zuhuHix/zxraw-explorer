@@ -518,10 +518,10 @@ fn relink_paths(app: &ZxrawApp) -> Result<(PathBuf, PathBuf), String> {
 fn setting(app: &ZxrawApp, key: &str) -> Result<String, String> {
     let s = &app.settings;
     Ok(match key {
-        "theme" => format!("{:?}", s.theme).to_lowercase(),
+        "theme" => format!("{:?}", *s.theme).to_lowercase(),
         "show_hidden" => s.show_hidden.to_string(),
         "show_system" => s.show_system.to_string(),
-        "default_view" => format!("{:?}", s.default_view).to_lowercase(),
+        "default_view" => format!("{:?}", *s.default_view).to_lowercase(),
         "thumb_size" => s.thumb_size.to_string(),
         "xmp_sidecar_sync" => s.xmp_sidecar_sync.to_string(),
         other => return Err(format!("unknown setting `{other}`")),
@@ -536,7 +536,7 @@ fn set_setting(app: &mut ZxrawApp, key: &str, value: &str) -> Result<(), String>
     };
     match key {
         "theme" => {
-            app.settings.theme = match value {
+            *app.settings.theme = match value {
                 "dark" => ThemeChoice::Dark,
                 "light" => ThemeChoice::Light,
                 "system" => ThemeChoice::System,
@@ -546,7 +546,7 @@ fn set_setting(app: &mut ZxrawApp, key: &str, value: &str) -> Result<(), String>
         "show_hidden" => app.settings.show_hidden = bool_value()?,
         "show_system" => app.settings.show_system = bool_value()?,
         "default_view" => {
-            app.settings.default_view = match value {
+            *app.settings.default_view = match value {
                 "details" => ViewMode::Details,
                 "grid" => ViewMode::Grid,
                 _ => return Err("default_view is details or grid".into()),

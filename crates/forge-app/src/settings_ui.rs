@@ -486,18 +486,18 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.horizontal(|ui| {
         ui.label("Theme");
         egui::ComboBox::from_id_salt("settings-theme")
-            .selected_text(theme_label(settings.theme))
+            .selected_text(theme_label(*settings.theme))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut settings.theme, ThemeChoice::Dark, "Dark");
-                ui.selectable_value(&mut settings.theme, ThemeChoice::Light, "Light");
-                ui.selectable_value(&mut settings.theme, ThemeChoice::System, "System");
+                ui.selectable_value(&mut *settings.theme, ThemeChoice::Dark, "Dark");
+                ui.selectable_value(&mut *settings.theme, ThemeChoice::Light, "Light");
+                ui.selectable_value(&mut *settings.theme, ThemeChoice::System, "System");
             });
         ui.add_space(18.0);
         ui.label("Accent")
             .on_hover_text("Used for selections, highlights and the app icon.");
         for (accent, name) in crate::theme::ACCENTS {
-            if accent_swatch(ui, accent, name, settings.accent == accent).clicked() {
-                settings.accent = accent;
+            if accent_swatch(ui, accent, name, *settings.accent == accent).clicked() {
+                *settings.accent = accent;
             }
         }
     });
@@ -522,10 +522,10 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
             let preview = crate::app_icon::preview(ui.ctx(), choice);
             let image = egui::Image::new(&preview).fit_to_exact_size(egui::vec2(40.0, 40.0));
             let response = ui
-                .add(egui::Button::image(image).selected(settings.app_icon == choice))
+                .add(egui::Button::image(image).selected(*settings.app_icon == choice))
                 .on_hover_text(label);
             if response.clicked() {
-                settings.app_icon = choice;
+                *settings.app_icon = choice;
             }
         }
     });
@@ -605,13 +605,13 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     ui.horizontal(|ui| {
         ui.label("Default view for new tabs");
         egui::ComboBox::from_id_salt("settings-default-view")
-            .selected_text(match settings.default_view {
+            .selected_text(match *settings.default_view {
                 ViewMode::Details => "Details",
                 ViewMode::Grid => "Thumbnail grid",
             })
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut settings.default_view, ViewMode::Details, "Details");
-                ui.selectable_value(&mut settings.default_view, ViewMode::Grid, "Thumbnail grid");
+                ui.selectable_value(&mut *settings.default_view, ViewMode::Details, "Details");
+                ui.selectable_value(&mut *settings.default_view, ViewMode::Grid, "Thumbnail grid");
             });
     });
 }

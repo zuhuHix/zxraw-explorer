@@ -11,9 +11,16 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-/// What a finished check found: `None` when the path could not be read, else whether it is a
-/// folder.
-pub type Found = Option<bool>;
+/// What a finished check found. Only `Missing` says the path is gone: any other error (an
+/// offline share, a VPN that isn't up, access denied, a drive that isn't ready) is `Unknown`,
+/// and callers keep the path so it can show its own error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    Folder,
+    File,
+    Missing,
+    Unknown(String),
+}
 
 /// Progress of one submitted check, reported to the client that submitted it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +31,46 @@ pub enum Event {
 }
 
 fn check(path: &Path) -> Found {
-    std::fs::metadata(path).ok().map(|m| m.is_dir())
+    classify(path, |p| std::fs::metadata(p).map(|m| m.is_dir()))
+}
+
+/// Turns a metadata lookup (`Ok(is_dir)`) into a [`Found`]. "Not found" counts only when the
+/// path's volume root answers: an unplugged USB drive or a disconnected mapped drive also
+/// reports its paths as not found, and those must stay.
+fn classify(path: &Path, metadata: impl Fn(&Path) -> std::io::Result<bool>) -> Found {
+    match metadata(path) {
+        Ok(true) => Found::Folder,
+        Ok(false) => Found::File,
+        Err(e) if is_not_found(&e) => match volume_root(path) {
+            Some(root) if root == path => Found::Unknown(e.to_string()),
+            Some(root) => match metadata(&root) {
+                Ok(_) => Found::Missing,
+                Err(e) => Found::Unknown(format!("{}: {e}", root.display())),
+            },
+            None => Found::Missing,
+        },
+        Err(e) => Found::Unknown(e.to_string()),
+    }
+}
+
+/// ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND. Other OS errors that Rust may also report as
+/// `ErrorKind::NotFound` (a bad network path or share name) say nothing about whether the
+/// folder exists.
+fn is_not_found(error: &std::io::Error) -> bool {
+    match error.raw_os_error() {
+        Some(code) => code == 2 || code == 3,
+        None => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+/// The drive or share root of `path` (`C:\`, `\\server\share\`), if it has one.
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let mut root = PathBuf::from(prefix.as_os_str());
+    root.push(std::path::MAIN_SEPARATOR_STR);
+    Some(root)
 }
 
 /// True for UNC paths and paths on a mapped network drive (`network_roots`).
@@ -125,7 +171,7 @@ impl Client {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     Queued,
     Running,
@@ -133,8 +179,9 @@ enum State {
 }
 
 /// A one-off batch of checks (the folders of a layout or a restored session) with a deadline.
-/// Only a finished negative check makes a path missing; a path still queued or running at the
-/// deadline is unknown, and callers open it anyway so its tab can show its own error.
+/// Only a check that finished with "not found" (or found a file) makes a path missing; a path
+/// whose check failed some other way, or was still queued or running at the deadline, is
+/// unknown, and callers open it anyway so its tab can show its own error.
 pub struct Batch {
     client: Client,
     state: HashMap<PathBuf, State>,
@@ -169,6 +216,16 @@ impl Batch {
         }
     }
 
+    /// A batch whose checks have already finished with `results`.
+    #[cfg(test)]
+    pub(crate) fn finished(results: impl IntoIterator<Item = (PathBuf, Found)>) -> Self {
+        Self {
+            client: Client::new(None),
+            state: results.into_iter().map(|(p, f)| (p, State::Done(f))).collect(),
+            deadline: Instant::now(),
+        }
+    }
+
     /// Takes in progress. True once every check has finished or the deadline passed.
     pub fn poll(&mut self, now: Instant) -> bool {
         while let Some(event) = self.client.try_recv() {
@@ -185,17 +242,21 @@ impl Batch {
         self.state.values().all(|s| matches!(s, State::Done(_))) || now >= self.deadline
     }
 
-    /// The check finished and found no folder at `path`.
+    /// The check finished and found no folder at `path`: nothing there, or a file.
     pub fn is_missing(&self, path: &Path) -> bool {
-        matches!(self.state.get(path), Some(State::Done(found)) if *found != Some(true))
+        matches!(
+            self.state.get(path),
+            Some(State::Done(Found::Missing | Found::File))
+        )
     }
 
-    /// Paths whose check had not finished when the batch ended (usually offline shares).
+    /// Paths whose check failed without a clear answer or had not finished when the batch
+    /// ended (usually offline shares).
     pub fn unchecked(&self) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = self
             .state
             .iter()
-            .filter(|(_, s)| !matches!(s, State::Done(_)))
+            .filter(|(_, s)| !matches!(s, State::Done(found) if !matches!(found, Found::Unknown(_))))
             .map(|(p, _)| p.clone())
             .collect();
         out.sort();
@@ -209,14 +270,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Paths under `\\hung` block for a minute, like an offline share; others answer at once
-    /// (`missing` in the name means not found).
+    /// (`missing` in the name means not found, `denied` an access error).
     fn fake_check(path: &Path) -> Found {
         let text = path.to_string_lossy();
         if text.starts_with(r"\\hung") {
             std::thread::sleep(Duration::from_secs(60));
-            return None;
+            return Found::Unknown("timed out".into());
         }
-        (!text.contains("missing")).then_some(true)
+        if text.contains("missing") {
+            Found::Missing
+        } else if text.contains("denied") {
+            Found::Unknown("Access is denied.".into())
+        } else {
+            Found::Folder
+        }
     }
 
     fn wait_for(client: &Client, want: impl Fn(&Event) -> bool) -> bool {
@@ -239,7 +306,7 @@ mod tests {
             client.submit(PathBuf::from(format!(r"\\hung\share{i}")), true);
         }
         client.submit(PathBuf::from(r"C:\photos"), false);
-        assert!(wait_for(&client, |e| *e == Event::Done(PathBuf::from(r"C:\photos"), Some(true))));
+        assert!(wait_for(&client, |e| *e == Event::Done(PathBuf::from(r"C:\photos"), Found::Folder)));
     }
 
     static RUNNING: AtomicUsize = AtomicUsize::new(0);
@@ -250,7 +317,7 @@ mod tests {
         PEAK.fetch_max(now, Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(20));
         RUNNING.fetch_sub(1, Ordering::SeqCst);
-        Some(true)
+        Found::Folder
     }
 
     #[test]
@@ -315,6 +382,74 @@ mod tests {
             batch.unchecked(),
             vec![PathBuf::from(r"\\hung\a"), PathBuf::from(r"\\hung\b")]
         );
+    }
+
+    #[test]
+    fn only_not_found_on_a_reachable_volume_counts_as_missing() {
+        use std::io::{Error, ErrorKind};
+        let disk = |p: &Path| match p.to_str() {
+            Some(r"C:\" | r"C:\dir") => Ok(true),
+            Some(r"C:\a.txt") => Ok(false),
+            _ => Err(Error::from(ErrorKind::NotFound)),
+        };
+        assert_eq!(classify(Path::new(r"C:\dir"), disk), Found::Folder);
+        assert_eq!(classify(Path::new(r"C:\a.txt"), disk), Found::File);
+        assert_eq!(classify(Path::new(r"C:\gone"), disk), Found::Missing);
+        // The volume itself is gone: an unplugged card, a disconnected drive or share.
+        for path in [r"E:\Card\DCIM", r"E:\", r"\\nas\photos\2024"] {
+            assert!(matches!(classify(Path::new(path), disk), Found::Unknown(_)), "{path}");
+        }
+        // Network errors, access denied and the like never mean missing: 5 access denied,
+        // 21 not ready, 53 bad network path, 67 bad share name, 1231 network unreachable.
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::NetworkUnreachable] {
+            let failing = |_: &Path| Err(Error::from(kind));
+            assert!(matches!(classify(Path::new(r"C:\dir"), failing), Found::Unknown(_)), "{kind:?}");
+        }
+        for code in [5, 21, 53, 67, 1231] {
+            // Only the folder fails; its volume answers.
+            let failing = |p: &Path| match p.to_str() {
+                Some(r"C:\") => Ok(true),
+                _ => Err(Error::from_raw_os_error(code)),
+            };
+            assert!(matches!(classify(Path::new(r"C:\dir"), failing), Found::Unknown(_)), "{code}");
+        }
+        for code in [2, 3] {
+            let gone = |p: &Path| match p.to_str() {
+                Some(r"C:\") => Ok(true),
+                _ => Err(Error::from_raw_os_error(code)),
+            };
+            assert_eq!(classify(Path::new(r"C:\dir"), gone), Found::Missing, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_failed_check_is_unknown_not_missing() {
+        let service = Service::new(1, 1, fake_check);
+        let paths = [
+            (PathBuf::from(r"\\nas\denied"), true),
+            (PathBuf::from(r"C:\missing"), false),
+        ];
+        let mut batch = Batch::start_with(
+            Client::on(&service, None),
+            paths,
+            Instant::now() + Duration::from_secs(10),
+        );
+        while !batch.poll(Instant::now()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!batch.is_missing(Path::new(r"\\nas\denied")));
+        assert!(batch.is_missing(Path::new(r"C:\missing")));
+        assert_eq!(batch.unchecked(), vec![PathBuf::from(r"\\nas\denied")]);
+    }
+
+    #[test]
+    fn volume_roots() {
+        assert_eq!(volume_root(Path::new(r"C:\a\b")), Some(PathBuf::from(r"C:\")));
+        assert_eq!(
+            volume_root(Path::new(r"\\nas\photos\x")),
+            Some(PathBuf::from(r"\\nas\photos\"))
+        );
+        assert_eq!(volume_root(Path::new("relative")), None);
     }
 
     #[test]

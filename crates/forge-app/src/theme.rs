@@ -756,8 +756,8 @@ mod tests {
     #[test]
     fn old_settings_files_keep_the_blue_accent() {
         let old: crate::settings::Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(old.accent, Accent::Blue);
-        assert_eq!(accent_base(old.accent), ACCENT);
+        assert_eq!(*old.accent, Accent::Blue);
+        assert_eq!(accent_base(*old.accent), ACCENT);
         let accents: Vec<Accent> = ACCENTS.iter().map(|(a, _)| *a).collect();
         assert_eq!(accents[0], Accent::default());
     }

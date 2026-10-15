@@ -189,7 +189,7 @@ impl ZxrawApp {
             focus_address: false,
             focus_filter: false,
             applied_theme: None,
-            applied_icon: settings.app_icon,
+            applied_icon: *settings.app_icon,
             window_size_checked: false,
             type_ahead: (String::new(), Instant::now()),
             last_session_save: Instant::now(),
@@ -213,7 +213,7 @@ impl ZxrawApp {
         app.restore_session(session);
         if app.applied_icon != Default::default() && !app.testhook.active() {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
-            crate::app_icon::apply_to_shortcuts(app.settings.app_icon);
+            crate::app_icon::apply_to_shortcuts(*app.settings.app_icon);
         }
         // `zxraw.exe <folder>` opens that folder in a new tab; `zxraw.exe <photo>` opens its
         // folder with the photo selected and shows it in the viewer.
@@ -268,7 +268,7 @@ impl ZxrawApp {
     }
 
     pub(crate) fn new_pane(&self, path: PathBuf, view: ViewMode) -> Pane {
-        let mut p = Pane::new(path, self.settings.default_sort, view);
+        let mut p = Pane::new(path, *self.settings.default_sort, view);
         p.show_hidden = self.settings.show_hidden;
         p.show_system = self.settings.show_system;
         p
@@ -284,9 +284,9 @@ impl ZxrawApp {
             }
             p
         };
-        let left = pane(&t.left, t.view, t.sort);
+        let left = pane(&t.left, *t.view, *t.sort);
         let right = t.right.as_ref().map(|r| {
-            pane(r, t.right_view.unwrap_or(t.view), t.right_sort.or(t.sort))
+            pane(r, t.right_view.unwrap_or(*t.view), t.right_sort.or(*t.sort))
         });
         Tab {
             left,
@@ -303,7 +303,7 @@ impl ZxrawApp {
             self.tabs.push(tab);
         }
         if self.tabs.is_empty() {
-            let left = self.new_pane(self.start_folder(), self.settings.default_view);
+            let left = self.new_pane(self.start_folder(), *self.settings.default_view);
             self.tabs.push(Tab {
                 left,
                 right: None,
@@ -327,10 +327,10 @@ impl ZxrawApp {
                     extra: Default::default(),
                     left: t.left.path.clone(),
                     right: t.right.as_ref().map(|r| r.path.clone()),
-                    view: t.left.view,
-                    sort: Some(t.left.sort),
-                    right_view: t.right.as_ref().map(|r| r.view),
-                    right_sort: t.right.as_ref().map(|r| r.sort),
+                    view: t.left.view.into(),
+                    sort: Some(t.left.sort).into(),
+                    right_view: t.right.as_ref().map(|r| r.view).into(),
+                    right_sort: t.right.as_ref().map(|r| r.sort).into(),
                 })
                 .collect(),
             active_tab: self.active,
@@ -516,7 +516,7 @@ impl ZxrawApp {
                 self.toast("Path copied");
             }
             ToggleTheme => {
-                self.settings.theme = match self.settings.theme {
+                *self.settings.theme = match *self.settings.theme {
                     ThemeChoice::Dark => ThemeChoice::Light,
                     _ => ThemeChoice::Dark,
                 };
@@ -1007,14 +1007,14 @@ impl eframe::App for ZxrawApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let dark = match self.settings.theme {
+        let dark = match *self.settings.theme {
             ThemeChoice::Dark => true,
             ThemeChoice::Light => false,
             ThemeChoice::System => ctx.system_theme().is_none_or(|t| t == egui::Theme::Dark),
         };
-        let look = (dark, self.settings.accent, self.settings.ui_scale);
+        let look = (dark, *self.settings.accent, self.settings.ui_scale);
         if self.applied_theme != Some(look) {
-            theme::apply(&ctx, dark, self.settings.accent, self.settings.ui_scale);
+            theme::apply(&ctx, dark, *self.settings.accent, self.settings.ui_scale);
             self.applied_theme = Some(look);
         }
         if !self.window_size_checked {
@@ -1033,7 +1033,7 @@ impl eframe::App for ZxrawApp {
                 }
             }
         }
-        let icon = self.settings.app_icon;
+        let icon = *self.settings.app_icon;
         if self.applied_icon != icon {
             self.applied_icon = icon;
             crate::app_icon::apply_to_window(&ctx, icon);

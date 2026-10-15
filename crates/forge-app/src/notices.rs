@@ -255,7 +255,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
             ui.set_max_width(500.0);
-            let logo = crate::app_icon::preview(ctx, app.settings.app_icon);
+            let logo = crate::app_icon::preview(ctx, *app.settings.app_icon);
             ui.horizontal(|ui| {
                 ui.image((logo.id(), egui::vec2(36.0, 36.0)));
                 ui.label("A fast file manager for photographers and videographers.");
@@ -270,7 +270,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             egui::Grid::new("welcome-setup").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("Theme");
                 ui.horizontal(|ui| {
-                    let theme = &mut app.settings.theme;
+                    let theme = &mut *app.settings.theme;
                     ui.selectable_value(theme, ThemeChoice::Dark, "Dark");
                     ui.selectable_value(theme, ThemeChoice::Light, "Light");
                     ui.selectable_value(theme, ThemeChoice::System, "System");
@@ -278,7 +278,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
                 ui.end_row();
                 ui.label("Folders open in");
                 ui.horizontal(|ui| {
-                    let view = &mut app.settings.default_view;
+                    let view = &mut *app.settings.default_view;
                     view_changed |= ui.selectable_value(view, ViewMode::Details, "Details").changed();
                     view_changed |= ui.selectable_value(view, ViewMode::Grid, "Thumbnails").changed();
                 });
@@ -333,7 +333,7 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
         });
     if view_changed {
         // Apply to the folder already on screen, not just to folders opened later.
-        let view = app.settings.default_view;
+        let view = *app.settings.default_view;
         for tab in &mut app.tabs {
             tab.left.view = view;
             if let Some(right) = &mut tab.right {

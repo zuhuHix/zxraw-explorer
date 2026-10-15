@@ -229,10 +229,22 @@ pub fn capture(app: &ZxrawApp, name: &str) -> Layout {
 }
 
 /// Stores `layout` under its name. A layout with the same name (case-insensitive) is
-/// replaced in place; otherwise it is appended. Returns true when one was replaced.
-pub fn upsert(layouts: &mut Vec<Layout>, layout: Layout) -> bool {
+/// replaced in place, keeping the fields a newer version stored on it (and on each tab that
+/// still opens the same folder at the same position); otherwise it is appended. Returns true
+/// when one was replaced.
+pub fn upsert(layouts: &mut Vec<Layout>, mut layout: Layout) -> bool {
     match layouts.iter_mut().find(|l| same_name(&l.name, &layout.name)) {
         Some(slot) => {
+            for (key, value) in std::mem::take(&mut slot.extra) {
+                layout.extra.entry(key).or_insert(value);
+            }
+            for (new, old) in layout.tabs.iter_mut().zip(&mut slot.tabs) {
+                if new.left == old.left {
+                    for (key, value) in std::mem::take(&mut old.extra) {
+                        new.extra.entry(key).or_insert(value);
+                    }
+                }
+            }
             *slot = layout;
             true
         }
@@ -287,18 +299,18 @@ pub fn plan(layout: &Layout, exists: impl Fn(&Path) -> bool) -> Plan {
         let kept = match (left_ok, &t.right) {
             (true, _) => Some(TabSession {
                 right: t.right.clone().filter(|_| right_ok),
-                right_view: t.right_view.filter(|_| right_ok),
-                right_sort: t.right_sort.filter(|_| right_ok),
+                right_view: t.right_view.filter(|_| right_ok).into(),
+                right_sort: t.right_sort.filter(|_| right_ok).into(),
                 ..t.clone()
             }),
             (false, Some(right)) if right_ok => Some(TabSession {
                 extra: Default::default(),
                 left: right.clone(),
                 right: None,
-                view: t.right_view.unwrap_or(t.view),
-                sort: t.right_sort.or(t.sort),
-                right_view: None,
-                right_sort: None,
+                view: t.right_view.unwrap_or(*t.view).into(),
+                sort: t.right_sort.or(*t.sort).into(),
+                right_view: None.into(),
+                right_sort: None.into(),
             }),
             _ => None,
         };
@@ -400,10 +412,10 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 }
 
-/// Replaces the open tabs with the ones of `layout` whose folders exist. Only a finished
-/// negative check counts as missing: a folder whose check did not answer in time (usually an
-/// offline share) opens anyway and its tab shows its own error. If no tab survives, the
-/// current tabs stay.
+/// Replaces the open tabs with the ones of `layout` whose folders exist. Only a check that
+/// found nothing (or a file) counts as missing: a folder whose check did not answer in time or
+/// failed some other way (an offline share, an unplugged drive) opens anyway and its tab shows
+/// its own error. If no tab survives, the current tabs stay.
 fn finish_load(app: &mut ZxrawApp, layout: &Layout, check: &Batch) {
     let plan = plan(layout, |p| !check.is_missing(p));
     let slow: Vec<PathBuf> = check
@@ -434,7 +446,7 @@ fn finish_load(app: &mut ZxrawApp, layout: &Layout, check: &Batch) {
     }
     if !slow.is_empty() {
         parts.push(format!(
-            "{} not responding yet, opened anyway: {}",
+            "{} could not be checked, opened anyway: {}",
             slow.len(),
             path_list(&slow)
         ));
@@ -449,19 +461,16 @@ fn path_list(paths: &[PathBuf]) -> String {
 }
 
 /// Restored panes whose folder was found to be gone switch to the start folder, unless the user
-/// has already navigated away. A folder whose check did not answer (an offline share) stays,
-/// and its pane shows its own error.
+/// has already navigated away. A folder whose check did not answer or failed some other way (an
+/// offline share, a sleeping NAS, an unplugged drive) stays, and its pane shows its own error.
 fn fix_restored(app: &mut ZxrawApp, check: &Batch) {
     let fallback = app.start_folder();
-    let mut stale = Vec::new();
-    for (t, tab) in app.tabs.iter().enumerate() {
-        for (right, pane) in std::iter::once((false, &tab.left)).chain(tab.right.iter().map(|r| (true, r))) {
-            if !pane.can_back() && check.is_missing(&pane.path) {
-                stale.push((t, right));
-            }
-        }
-    }
-    for (t, right) in stale {
+    let panes = app.tabs.iter().enumerate().flat_map(|(t, tab)| {
+        std::iter::once((t, false, &tab.left))
+            .chain(tab.right.iter().map(move |r| (t, true, r)))
+            .map(|(t, right, pane)| (t, right, pane.path.as_path(), pane.can_back()))
+    });
+    for (t, right) in stale_panes(panes, check) {
         let old = if right { app.tabs[t].right.as_ref() } else { Some(&app.tabs[t].left) };
         let Some(old) = old else { continue };
         let mut pane = app.new_pane(fallback.clone(), old.view);
@@ -471,6 +480,20 @@ fn fix_restored(app: &mut ZxrawApp, check: &Batch) {
             true => app.tabs[t].right = Some(pane),
         }
     }
+}
+
+/// The restored panes (tab index, right pane?) to switch to the start folder: each given as
+/// (tab, right, folder, navigated since), it goes when its folder is confirmed missing and the
+/// user has not navigated away.
+fn stale_panes<'a>(
+    panes: impl IntoIterator<Item = (usize, bool, &'a Path, bool)>,
+    check: &Batch,
+) -> Vec<(usize, bool)> {
+    panes
+        .into_iter()
+        .filter(|&(_, _, path, navigated)| !navigated && check.is_missing(path))
+        .map(|(t, right, ..)| (t, right))
+        .collect()
 }
 
 fn open_save_prompt(app: &mut ZxrawApp) {
@@ -643,8 +666,8 @@ mod tests {
     #[test]
     fn plan_splits_off_missing_right_pane() {
         let mut t = tab("A", Some("C"));
-        t.right_view = Some(ViewMode::Grid);
-        t.right_sort = Some(SortSpec::default());
+        *t.right_view = Some(ViewMode::Grid);
+        *t.right_sort = Some(SortSpec::default());
         let p = plan(&layout(vec![t], 0), existing(&["A"]));
         assert_eq!(p.tabs, vec![tab("A", None)]);
         assert_eq!(p.missing, vec![PathBuf::from("C")]);
@@ -653,13 +676,13 @@ mod tests {
     #[test]
     fn plan_promotes_right_pane_when_left_missing() {
         let mut t = tab("A", Some("C"));
-        t.view = ViewMode::Details;
-        t.right_view = Some(ViewMode::Grid);
+        *t.view = ViewMode::Details;
+        *t.right_view = Some(ViewMode::Grid);
         let sort = SortSpec {
             descending: true,
             ..SortSpec::default()
         };
-        t.right_sort = Some(sort);
+        *t.right_sort = Some(sort);
         let p = plan(&layout(vec![t], 0), existing(&["C"]));
         assert_eq!(
             p.tabs,
@@ -667,10 +690,10 @@ mod tests {
                 extra: Default::default(),
                 left: "C".into(),
                 right: None,
-                view: ViewMode::Grid,
-                sort: Some(sort),
-                right_view: None,
-                right_sort: None,
+                view: ViewMode::Grid.into(),
+                sort: Some(sort).into(),
+                right_view: None.into(),
+                right_sort: None.into(),
             }]
         );
         assert_eq!(p.missing, vec![PathBuf::from("A")]);
@@ -743,6 +766,52 @@ mod tests {
     }
 
     #[test]
+    fn overwriting_a_layout_keeps_fields_from_a_newer_version() {
+        let json = r#"{"name": "Work", "pinned": true, "tabs": [
+            {"left": "A", "zoom": 2},
+            {"left": "B", "zoom": 3},
+            {"left": "C", "zoom": 4}
+        ]}"#;
+        let mut list = vec![serde_json::from_str::<Layout>(json).unwrap()];
+        let mut moved = tab("X", None);
+        moved.extra.insert("zoom".into(), 9.into());
+        let replacement = layout(vec![tab("A", Some("D")), moved, tab("C", None), tab("E", None)], 0);
+        assert!(upsert(&mut list, replacement));
+        let saved = serde_json::to_value(&list[0]).unwrap();
+        assert_eq!(saved["pinned"], true);
+        assert_eq!(saved["tabs"][0]["zoom"], 2, "same folder at the same place");
+        assert_eq!(saved["tabs"][1]["zoom"], 9, "a different folder keeps its own fields");
+        assert_eq!(saved["tabs"][2]["zoom"], 4);
+        assert!(saved["tabs"][3].get("zoom").is_none());
+        assert_eq!(saved["tabs"][0]["right"], "D");
+    }
+
+    #[test]
+    fn restore_keeps_panes_whose_check_failed_without_not_found() {
+        use crate::path_probe::Found;
+        let check = Batch::finished([
+            (PathBuf::from(r"C:\gone"), Found::Missing),
+            (PathBuf::from(r"\\nas\asleep"), Found::Unknown("The network path was not found.".into())),
+            (PathBuf::from(r"C:\here"), Found::Folder),
+            (PathBuf::from(r"C:\file.txt"), Found::File),
+        ]);
+        let panes = [
+            (0, false, Path::new(r"C:\gone"), false),
+            (0, true, Path::new(r"\\nas\asleep"), false),
+            (1, false, Path::new(r"C:\here"), false),
+            (2, false, Path::new(r"C:\file.txt"), false),
+            (3, false, Path::new(r"C:\gone"), true),
+            (4, false, Path::new(r"E:\never-checked"), false),
+        ];
+        assert_eq!(stale_panes(panes, &check), vec![(0, false), (2, false)]);
+        // Loading a layout follows the same rule.
+        let l = layout(vec![tab(r"C:\gone", None), tab(r"\\nas\asleep", None)], 0);
+        let p = plan(&l, |p| !check.is_missing(p));
+        assert_eq!(p.missing, vec![PathBuf::from(r"C:\gone")]);
+        assert_eq!(p.tabs, vec![tab(r"\\nas\asleep", None)]);
+    }
+
+    #[test]
     fn rename_checks_name() {
         let mut list = vec![
             Layout { name: "Alpha".into(), ..Layout::default() },
@@ -764,12 +833,12 @@ mod tests {
     #[test]
     fn layout_round_trips_through_json() {
         let mut t = tab("C:\\A", Some("C:\\B"));
-        t.view = ViewMode::Grid;
-        t.sort = Some(SortSpec {
+        *t.view = ViewMode::Grid;
+        *t.sort = Some(SortSpec {
             descending: true,
             ..SortSpec::default()
         });
-        t.right_view = Some(ViewMode::Details);
+        *t.right_view = Some(ViewMode::Details);
         let l = layout(vec![t], 0);
         let json = serde_json::to_string(&l).unwrap();
         let back: Layout = serde_json::from_str(&json).unwrap();
@@ -783,10 +852,10 @@ mod tests {
         assert_eq!(l.name, "Old");
         assert_eq!(l.tabs.len(), 1);
         assert_eq!(l.tabs[0].left, PathBuf::from("C:\\A"));
-        assert_eq!(l.tabs[0].view, ViewMode::Grid);
-        assert_eq!(l.tabs[0].sort, None);
-        assert_eq!(l.tabs[0].right_view, None);
-        assert_eq!(l.tabs[0].right_sort, None);
+        assert_eq!(*l.tabs[0].view, ViewMode::Grid);
+        assert_eq!(*l.tabs[0].sort, None);
+        assert_eq!(*l.tabs[0].right_view, None);
+        assert_eq!(*l.tabs[0].right_sort, None);
     }
 
     #[test]
