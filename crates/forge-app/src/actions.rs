@@ -38,8 +38,12 @@ pub enum Event {
         dir: PathBuf,
         name: String,
     },
-    /// A name prompt's new name was taken: the prompt opens again with the error.
+    /// A name prompt's new name was taken: the prompt opens again with the error (once no
+    /// other dialog is open).
     NameConflict(crate::modal::Prompt),
+    /// An undo failed without changing anything: its record goes back where it was, so it
+    /// can be retried. `slot` says where (see [`UndoSlot`]).
+    UndoRestore { slot: UndoSlot, entry: UndoEntry },
     /// A job of the name lane finished. Sent after all its other events, so once the count of
     /// pending name jobs is back to zero, their undo records are already on the stack.
     NameJobDone,
@@ -151,8 +155,14 @@ fn choose_paste_source(
 pub struct Actions {
     pub modal: Option<Modal>,
     pub undo: Vec<UndoEntry>,
-    /// Rename, new-item and rename-undo jobs run one at a time on this lane.
-    name_lane: NameLane,
+    /// Rename, new-item and rename-undo jobs, one lane per location (see [`lane_key`]): in
+    /// order within a lane, so a hung share holds up only its own lane.
+    name_lanes: std::collections::HashMap<String, NameLane>,
+    /// Records removed from the bottom of `undo` by the size cap, ever. Keeps an
+    /// [`UndoSlot`] valid while newer records arrive.
+    undo_trimmed: u64,
+    /// Conflict prompts that arrived while another dialog was open, shown in turn.
+    pending_prompts: std::collections::VecDeque<crate::modal::Prompt>,
     /// Name jobs started and not yet reported done ([`Event::NameJobDone`]). Undo waits
     /// for zero, so it never acts on the record before the one a pending rename will push.
     name_jobs_pending: usize,
@@ -215,7 +225,9 @@ impl Actions {
         Self {
             modal: None,
             undo: Vec::new(),
-            name_lane: NameLane::new(),
+            name_lanes: Default::default(),
+            undo_trimmed: 0,
+            pending_prompts: Default::default(),
             name_jobs_pending: 0,
             conflicts: Default::default(),
             clipboard: None,
@@ -582,7 +594,9 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             app.ops.library.search.focus = true;
         }
         // While a rename (or an undo) is still running, its undo record is not on the stack
-        // yet: undoing now would act on the operation before it. Undo waits instead.
+        // yet: undoing now would act on the operation before it. Undo always means "the last
+        // thing done", so this waits for every pending name job, not just those on the same
+        // paths: a per-path check would let Undo reach past the running rename.
         Cmd::Undo if app.ops.name_jobs_pending > 0 => {
             app.toast("Waiting for the rename to finish; try Undo again in a moment")
         }
@@ -590,7 +604,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
             Some(UndoEntry::TextReplace(records)) => crate::replace_ui::undo(app, records),
-            Some(UndoEntry::Rename(pairs)) => undo_rename(app, pairs),
+            Some(UndoEntry::Rename(pairs)) => {
+                let slot = UndoSlot {
+                    index: app.ops.undo.len(),
+                    trimmed: app.ops.undo_trimmed,
+                };
+                undo_rename(app, pairs, slot);
+            }
         },
         Cmd::BatchRename => {
             let items: Vec<PathBuf> = app.pane().action_targets();
@@ -649,6 +669,8 @@ impl NameJob {
                 .create_new(true)
                 .open(p)
                 .map(|_| ()),
+            // The same name again: nothing to do (not "that name is taken").
+            NameJob::Rename { from, to } if from == to => Ok(()),
             NameJob::Rename { from, to } => {
                 // A case-only rename ("a.txt" -> "A.txt") finds itself at the target.
                 let case_only = to != from && forge_core::paths::paths_equal(to, from);
@@ -682,31 +704,87 @@ impl NameJob {
 /// any check (two renames racing for one name: the second fails). A case-only rename goes
 /// through a temporary name, with rollback; see [`forge_core::rename::rename_paths`].
 fn rename_no_replace_one(from: &Path, to: &Path, case_only: bool) -> std::io::Result<()> {
-    use forge_core::rename::RenameStatus;
     let report = forge_core::rename::rename_paths(&[(from.to_path_buf(), to.to_path_buf())]);
+    rename_outcome(report, case_only, || forge_core::paths::exists_no_follow(to))
+}
+
+/// What a finished single rename means for the user. `target_exists` is asked only when the
+/// rename failed and put everything back, to tell "that name is taken" from other errors.
+fn rename_outcome(
+    report: forge_core::rename::RenameReport,
+    case_only: bool,
+    target_exists: impl FnOnce() -> bool,
+) -> std::io::Result<()> {
+    use forge_core::rename::RenameStatus;
     match report.status {
         RenameStatus::Completed | RenameStatus::NothingToDo => Ok(()),
+        // Checked before the conflict below: the file could not be put back, so it sits under
+        // a temporary name, and the user must hear where, not "that name is taken".
+        RenameStatus::RollbackIncomplete { error, .. } => {
+            Err(std::io::Error::other(stranded_message(&error, &report.stranded)))
+        }
         // Refused by the move itself: the name was taken after (or despite) the check above.
-        _ if !case_only && forge_core::paths::exists_no_follow(to) => Err(std::io::Error::new(
+        _ if !case_only && target_exists() => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "a file with that name already exists",
         )),
-        RenameStatus::RollbackIncomplete { error, .. } => {
-            let left = report
-                .stranded
-                .first()
-                .map(|s| format!("; it is now at {}", s.current.display()))
-                .unwrap_or_default();
-            Err(std::io::Error::other(format!("{error}{left}")))
-        }
         RenameStatus::RolledBack { error, .. } => Err(std::io::Error::other(error)),
         other => Err(std::io::Error::other(format!("{other:?}"))),
     }
 }
 
-/// A single worker that runs rename, new-item and rename-undo work strictly in the order it
-/// was submitted from the UI thread. Two renames never race each other, and an undo always
-/// runs after the operation it undoes.
+/// The error for a rename or undo that failed and could not move everything back: which
+/// files are left where, and the name each should get back.
+fn stranded_message(error: &str, stranded: &[forge_core::rename::StrandedFile]) -> String {
+    let files: Vec<String> = stranded
+        .iter()
+        .map(|s| {
+            format!(
+                "{} is left at {} (rename it back to {})",
+                forge_core::paths::name_of(&s.original),
+                s.current.display(),
+                s.original.display()
+            )
+        })
+        .collect();
+    format!("{error}; could not put everything back: {}", files.join("; "))
+}
+
+/// Which name lane runs jobs on `path`: one per network share (`\\server\share`, or the
+/// letter of a mapped drive), one for everything local. A rename stays within one folder, so
+/// all jobs on the same file or folder share a lane and run in order; a hung share holds up
+/// only jobs on that share. Lexical, apart from asking Windows the type of a drive letter.
+fn lane_key(path: &Path) -> String {
+    if let Some(root) = forge_core::netpath::share_root(path) {
+        return root.to_string_lossy().to_lowercase();
+    }
+    if forge_core::netpath::is_network_path(path)
+        && let Some(prefix) = path.components().next()
+    {
+        return prefix.as_os_str().to_string_lossy().to_lowercase();
+    }
+    "local".into()
+}
+
+/// Where an undo record sat on the stack when Undo took it: `index` from the bottom, at a time
+/// when the size cap had removed `trimmed` records. Records pushed meanwhile stay above it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UndoSlot {
+    index: usize,
+    trimmed: u64,
+}
+
+impl UndoSlot {
+    /// The index to put the record back at, given the stack's length and trim count now.
+    fn index_now(self, len: usize, trimmed: u64) -> usize {
+        let shift = usize::try_from(trimmed.saturating_sub(self.trimmed)).unwrap_or(usize::MAX);
+        self.index.saturating_sub(shift).min(len)
+    }
+}
+
+/// A worker that runs rename, new-item and rename-undo work for one location (see
+/// [`lane_key`]) strictly in the order it was submitted from the UI thread. Two renames in one
+/// folder never race each other, and an undo always runs after the operation it undoes.
 struct NameLane {
     tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
 }
@@ -740,6 +818,7 @@ impl NameLane {
 /// own events; [`Event::NameJobDone`] follows them.
 fn submit_name_job(
     app: &mut ZxrawApp,
+    lane: String,
     kind: &str,
     title: String,
     work: impl FnOnce() -> Result<(), String> + Send + 'static,
@@ -747,7 +826,8 @@ fn submit_name_job(
     let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
     let (done_tx, done_rx) = crossbeam_channel::bounded(1);
     app.ops.name_jobs_pending += 1;
-    app.ops.name_lane.submit(Box::new(move || {
+    let lane = app.ops.name_lanes.entry(lane).or_insert_with(NameLane::new);
+    lane.submit(Box::new(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
             .unwrap_or_else(|_| Err("internal error".to_string()));
         let _ = tx.send(Event::NameJobDone);
@@ -761,6 +841,16 @@ fn submit_name_job(
     });
 }
 
+/// Automation: keeps the name lane of `path` busy for `hold`, as a rename stuck on a slow
+/// share would, so tests can check what waits for it and what does not.
+#[cfg(any(debug_assertions, feature = "automation"))]
+pub(crate) fn hold_name_lane(app: &mut ZxrawApp, path: &Path, hold: std::time::Duration) {
+    submit_name_job(app, lane_key(path), "test", "Holding the name lane".into(), move || {
+        std::thread::sleep(hold);
+        Ok(())
+    });
+}
+
 /// Runs `job` as a background operation. Success refreshes `dir` and selects `name` in it (a
 /// rename also records its undo and moves the library rows); failure shows an error toast.
 fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) {
@@ -770,7 +860,11 @@ fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) 
         NameJob::NewFolder(_) => ("create", format!("Creating folder {name}")),
         NameJob::NewFile(_) => ("create", format!("Creating file {name}")),
     };
-    submit_name_job(app, kind, title, move || {
+    let lane = lane_key(match &job {
+        NameJob::NewFolder(p) | NameJob::NewFile(p) => p,
+        NameJob::Rename { from, .. } => from,
+    });
+    submit_name_job(app, lane, kind, title, move || {
         let result = job.run();
         match &result {
             Ok(()) => {
@@ -797,12 +891,18 @@ fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) 
 }
 
 /// Undoes a rename on a worker: the library follows the pairs that really moved back, the
-/// folders involved refresh, and a toast reports the outcome.
-fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
+/// folders involved refresh, and a toast reports the outcome. An undo that fails without
+/// changing anything puts its record back at `slot`, so it can be retried once the obstacle
+/// is gone; one that moved some files but could not finish names the files left behind.
+fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>, slot: UndoSlot) {
     let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
     let n = pairs.len();
+    let lane = pairs
+        .first()
+        .map_or_else(|| "local".to_string(), |(current, _)| lane_key(current));
     submit_name_job(
         app,
+        lane,
         "undo",
         format!("Undoing rename of {n} item(s)"),
         move || {
@@ -829,13 +929,35 @@ fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
             for d in dirs {
                 let _ = tx.send(Event::Changed(d));
             }
-            let result = if completed {
-                let _ = tx.send(Event::Toast(format!("Undid rename of {n} item(s)")));
-                Ok(())
-            } else {
-                let msg = format!("Undo failed: {:?}", r.status);
-                let _ = tx.send(Event::Error(msg.clone()));
-                Err(msg)
+            let result = match &r.status {
+                RenameStatus::Completed => {
+                    let _ = tx.send(Event::Toast(format!("Undid rename of {n} item(s)")));
+                    Ok(())
+                }
+                // Everything is as it was before the undo: keep the record for a retry.
+                RenameStatus::RolledBack { failed, error } => {
+                    let msg = format!(
+                        "Undo failed: {error} ({}); nothing was changed, so Undo can be \
+                         tried again once that is resolved",
+                        failed.display()
+                    );
+                    let _ = tx.send(Event::UndoRestore {
+                        slot,
+                        entry: UndoEntry::Rename(pairs.clone()),
+                    });
+                    let _ = tx.send(Event::Error(msg.clone()));
+                    Err(msg)
+                }
+                RenameStatus::RollbackIncomplete { error, .. } => {
+                    let msg = format!("Undo failed: {}", stranded_message(error, &r.stranded));
+                    let _ = tx.send(Event::Error(msg.clone()));
+                    Err(msg)
+                }
+                other => {
+                    let msg = format!("Undo failed: {other:?}");
+                    let _ = tx.send(Event::Error(msg.clone()));
+                    Err(msg)
+                }
             };
             ctx.request_repaint();
             result
@@ -1090,26 +1212,19 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 if let UndoEntry::Ops(records) = &u {
                     follow_moves(app, undo_record_moves(records));
                 }
-                app.ops.undo.push(u);
-                if app.ops.undo.len() > 50 {
-                    app.ops.undo.remove(0);
-                }
+                push_undo(app, u);
+            }
+            Event::UndoRestore { slot, entry } => {
+                let at = slot.index_now(app.ops.undo.len(), app.ops.undo_trimmed);
+                app.ops.undo.insert(at, entry);
+                trim_undo(app);
             }
             Event::FilesMoved(pairs) => follow_moves(app, pairs),
             Event::NameJobDone => {
                 app.ops.name_jobs_pending = app.ops.name_jobs_pending.saturating_sub(1);
             }
-            Event::NameConflict(prompt) => {
-                if app.ops.modal.is_none() {
-                    app.ops.modal = Some(Modal::Prompt(prompt));
-                } else {
-                    app.toast_err(format!(
-                        "{} failed: {}",
-                        prompt.title,
-                        prompt.error.unwrap_or_default()
-                    ));
-                }
-            }
+            // Shown at once if no dialog is open, else as soon as it closes (see below).
+            Event::NameConflict(prompt) => app.ops.pending_prompts.push_back(prompt),
             Event::SelectNew { dir, name } => {
                 let pane = app.pane_mut();
                 if pane.path == dir || pane.shows_children_of(&dir) {
@@ -1118,7 +1233,43 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             }
         }
     }
+    let ops = &mut app.ops;
+    if show_pending_prompt(&mut ops.modal, ops.batch_rename.is_some(), &mut ops.pending_prompts) {
+        changed = true;
+    }
     changed
+}
+
+/// Opens the next conflict prompt that is waiting, if no dialog is open (`other_dialog`: the
+/// batch rename window). Returns whether one opened.
+fn show_pending_prompt(
+    modal: &mut Option<Modal>,
+    other_dialog: bool,
+    pending: &mut std::collections::VecDeque<crate::modal::Prompt>,
+) -> bool {
+    if modal.is_some() || other_dialog {
+        return false;
+    }
+    let Some(prompt) = pending.pop_front() else {
+        return false;
+    };
+    *modal = Some(Modal::Prompt(prompt));
+    true
+}
+
+/// The undo stack keeps this many records; older ones are dropped.
+const UNDO_LIMIT: usize = 50;
+
+fn push_undo(app: &mut ZxrawApp, entry: UndoEntry) {
+    app.ops.undo.push(entry);
+    trim_undo(app);
+}
+
+fn trim_undo(app: &mut ZxrawApp) {
+    while app.ops.undo.len() > UNDO_LIMIT {
+        app.ops.undo.remove(0);
+        app.ops.undo_trimmed += 1;
+    }
 }
 
 /// ZXraw moved or renamed files (`from` -> `to`): the note being edited and the library rows
@@ -1222,7 +1373,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
                         .collect(),
                 );
                 if !undo.is_empty() {
-                    app.ops.undo.push(UndoEntry::Rename(undo));
+                    push_undo(app, UndoEntry::Rename(undo));
                 }
                 for d in dirs {
                     app.refresh_all_showing(&d);
@@ -1605,6 +1756,122 @@ mod name_job_tests {
         let folder = NameJob::NewFolder(PathBuf::from(r"C:\work\Fresh"));
         let prompt = folder.conflict_prompt("Fresh", "exists".into());
         assert!(matches!(&prompt.kind, PromptKind::NewFolder { dir } if dir == Path::new(r"C:\work")));
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_is_a_no_op() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        std::fs::write(&a, b"a").unwrap();
+        NameJob::Rename {
+            from: a.clone(),
+            to: a.clone(),
+        }
+        .run()
+        .unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+    }
+
+    #[test]
+    fn a_failed_rollback_names_the_stranded_file_not_a_conflict() {
+        use forge_core::rename::{RenameReport, RenameStatus, StrandedFile};
+        let report = RenameReport {
+            status: RenameStatus::RollbackIncomplete {
+                failed: PathBuf::from(r"C:\work\a.txt"),
+                error: "access denied".into(),
+            },
+            renamed: Vec::new(),
+            reverted: Vec::new(),
+            stranded: vec![StrandedFile {
+                current: PathBuf::from(r"C:\work\.forge-rename-1-0-0-0.tmp"),
+                original: PathBuf::from(r"C:\work\a.txt"),
+                error: "access denied".into(),
+            }],
+            undo: Vec::new(),
+        };
+        // The target "exists" too: the stranded report must still win.
+        let err = rename_outcome(report, false, || true).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let text = err.to_string();
+        assert!(text.contains(r"C:\work\.forge-rename-1-0-0-0.tmp"), "{text}");
+        assert!(text.contains(r"rename it back to C:\work\a.txt"), "{text}");
+
+        let rolled_back = RenameReport {
+            status: RenameStatus::RolledBack {
+                failed: PathBuf::from(r"C:\work\a.txt"),
+                error: "destination already exists".into(),
+            },
+            renamed: Vec::new(),
+            reverted: Vec::new(),
+            stranded: Vec::new(),
+            undo: Vec::new(),
+        };
+        let err = rename_outcome(rolled_back, false, || true).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn each_share_and_the_local_disks_get_their_own_lane() {
+        let local = lane_key(Path::new(r"C:\photos\a.jpg"));
+        assert_eq!(local, lane_key(Path::new(r"D:\other\b.jpg")));
+        let share = lane_key(Path::new(r"\\nas\photos\2024\a.jpg"));
+        assert_eq!(share, lane_key(Path::new(r"\\NAS\Photos\2025\b.jpg")));
+        assert_ne!(share, local);
+        assert_ne!(share, lane_key(Path::new(r"\\nas\video\a.mov")));
+    }
+
+    #[test]
+    fn a_stuck_lane_does_not_hold_up_another() {
+        let (stuck, other) = (NameLane::new(), NameLane::new());
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(1);
+        stuck.submit(Box::new(move || {
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+        }));
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        other.submit(Box::new(move || {
+            let _ = done_tx.send(());
+        }));
+        assert!(done_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok());
+        let _ = release_tx.send(());
+    }
+
+    #[test]
+    fn a_restored_undo_record_goes_back_below_newer_ones() {
+        // Taken from the top of a stack of 3 (index 2); one record arrived meanwhile.
+        let slot = UndoSlot {
+            index: 2,
+            trimmed: 0,
+        };
+        assert_eq!(slot.index_now(3, 0), 2);
+        // The cap dropped one old record meanwhile: one lower.
+        assert_eq!(slot.index_now(3, 1), 1);
+        // Never past the end.
+        assert_eq!(slot.index_now(1, 0), 1);
+    }
+
+    #[test]
+    fn a_conflict_prompt_waits_for_the_open_dialog_to_close() {
+        let prompt = |name: &str| {
+            crate::modal::Prompt::new(
+                PromptKind::NewFolder {
+                    dir: PathBuf::from(r"C:\work"),
+                },
+                "New folder",
+                name,
+            )
+        };
+        let mut pending = std::collections::VecDeque::from([prompt("one"), prompt("two")]);
+        let mut modal = Some(Modal::Report {
+            title: "Busy".into(),
+            lines: Vec::new(),
+        });
+        assert!(!show_pending_prompt(&mut modal, false, &mut pending));
+        assert_eq!(pending.len(), 2);
+        modal = None;
+        assert!(!show_pending_prompt(&mut modal, true, &mut pending));
+        assert!(show_pending_prompt(&mut modal, false, &mut pending));
+        assert!(matches!(&modal, Some(Modal::Prompt(p)) if p.text == "one"));
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]

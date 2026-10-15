@@ -3556,7 +3556,8 @@ fn size_label(size: Option<u64>) -> String {
     size.map_or_else(|| "—".to_string(), format_size)
 }
 
-/// Save the report as CSV or text. Failures are kept in the window for display.
+/// Save the report as CSV or text. Failures are kept in the window for display. Synchronous,
+/// so automation only: the window's buttons write the file on a job instead.
 fn export_verify_report(state: &mut VerifyState, path: &Path, csv: bool) -> Result<(), String> {
     let report = state
         .report

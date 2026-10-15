@@ -210,6 +210,17 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   default browser only when clicked. There is no embedded map and no reverse geocoding.
 * Metadata export needs the library database to be open (it is opened at startup), and
   video fields stay empty without `ffprobe`.
+* Renames (single, batch, case-only and Undo) first move each file to a temporary name in its
+  own folder, `.forge-rename-<process>-<run>-<item>-<n>.tmp`, then to its final name, so a
+  rename never replaces an existing file. If the app or Windows stops between the two steps,
+  the file stays under that temporary name; nothing is deleted. Nothing scans for these
+  files at startup. To recover one, rename it back by hand. The library rows and Undo still
+  point to the name before the rename, so the original name is the safe choice. Files with
+  this prefix are never created any other way.
+* Rename, New folder and New file run one at a time per location: one queue for local
+  drives and one per network share. A share that stops answering holds up only its own
+  queue. While any of them is still running, Undo waits for it, because Undo always undoes
+  the most recent action.
 
 ## Folder compare and sync
 

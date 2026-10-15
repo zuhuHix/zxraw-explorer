@@ -69,6 +69,58 @@ fn rename_then_undo_restores_the_original_name() {
 }
 
 #[test]
+fn an_undo_blocked_by_a_new_file_keeps_its_record_for_a_retry() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    write_file(&dir.join("a.txt"), b"a");
+    // After renaming a.txt to b.txt, a new a.txt blocks the undo. Undo must change nothing
+    // and keep its record; once the new file is gone, Undo works.
+    let script = format!(
+        "navigate {dir}\n\
+         select a.txt\n\
+         cmd Rename\n\
+         type b.txt\n\
+         accept\n\
+         wait-exists {b}\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         cmd NewFile\n\
+         type a.txt\n\
+         accept\n\
+         wait-exists {a}\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         cmd Undo\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         assert-toast nothing was changed, so Undo can be tried again\n\
+         assert-exists {b}\n\
+         wait-entry a.txt\n\
+         select a.txt\n\
+         cmd DeletePermanently\n\
+         accept\n\
+         wait-jobs 20\n\
+         assert-missing {a}\n\
+         wait-frames 3\n\
+         cmd Undo\n\
+         wait-exists {a}\n\
+         wait-jobs\n\
+         wait-frames 3\n\
+         assert-toast Undid rename of 1 item(s)\n\
+         exit\n",
+        dir = shown(&dir),
+        a = shown(&dir.join("a.txt")),
+        b = shown(&dir.join("b.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dir.join("a.txt")).unwrap(), b"a");
+    assert!(!dir.join("b.txt").exists());
+}
+
+#[test]
 fn renaming_onto_an_existing_name_reopens_the_prompt_with_the_error() {
     let sandbox = tempfile::tempdir().unwrap();
     let dir = sandbox.path().join("work");
@@ -130,8 +182,7 @@ fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
     // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): a file call on it hangs about 20 s until the
     // network gives up, so each `offline` step fails if its UI call took longer than 250 ms.
     // Windows remembers an unreachable host for a while and then fails fast, so each run
-    // picks a host the other tests (which use .1) do not. While the rename is still waiting on
-    // the share, Undo must not act on an older record: it says it is waiting instead.
+    // picks a host the other tests (which use .1) do not.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -141,7 +192,6 @@ fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
         "dismiss-notices\nnavigate {sandbox}\n\
          ui browser offline rename {share}\\a.txt | b.txt\n\
          ui sidebar responsive 30 | 1000\n\
-         cmd Undo\nassert-toast Waiting for the rename to finish\n\
          ui browser offline undo-rename {share}\\a.txt | b.txt\n\
          ui sidebar responsive 30 | 1000\n\
          ui sidebar go {share}\n\
@@ -154,6 +204,36 @@ fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
     let outcome = run_app(sandbox.path(), &profile, &script);
     expect_ok(&outcome);
     assert_no_crash(&profile);
+}
+
+#[test]
+fn undo_waits_for_a_stuck_rename_while_local_renames_keep_going() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    write_file(&dir.join("local.txt"), b"local");
+    // The share's lane is held as a rename stuck on an unresponsive NAS would hold it (the
+    // path is only used to pick the lane, never opened). Undo must wait for it, since its
+    // record is not on the stack yet; a local rename runs on its own lane and finishes.
+    let script = format!(
+        "navigate {dir}\n\
+         ui browser hold-name-lane \\\\192.0.2.250\\x | 8000\n\
+         cmd Undo\n\
+         assert-toast Waiting for the rename to finish\n\
+         wait-entry local.txt\n\
+         select local.txt\n\
+         cmd Rename\n\
+         type moved.txt\n\
+         accept\n\
+         wait-exists {moved} | 5\n\
+         exit\n",
+        dir = shown(&dir),
+        moved = shown(&dir.join("moved.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dir.join("moved.txt")).unwrap(), b"local");
 }
 
 #[test]
