@@ -203,7 +203,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   note (or rating, label, keywords) is saved in the library only.
 * A note the database had not confirmed when ZXraw closed is kept in `pending-notes.json` in the
   app data folder and saved to the library at the next start. That replay does not update the
-  XMP sidecar; the next edit of the note does.
+  XMP sidecar; the next edit of the note does. A recovery file that cannot be read is renamed to
+  `pending-notes.json.unreadable-<timestamp>` and left for manual recovery; it is not replayed.
 * The sidecar writer is tested for lossless merges, namespaces, and same-process serialisation,
   but it has not been tested with Lightroom, Capture One, or darktable.
 * Updates within ZXraw are serialised. Against other programs, the final compare and replace run

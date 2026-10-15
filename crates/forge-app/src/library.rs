@@ -778,7 +778,13 @@ pub fn write_note_recovery(file: &Path, notes: &[PendingNote]) -> std::io::Resul
         Ok(existing) => existing,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => {
-            tracing::warn!("ignoring an unreadable note recovery file: {e}");
+            // Never overwrite notes we could not read: keep the old file beside the new one.
+            let aside = unreadable_aside_path(file);
+            std::fs::rename(file, &aside)?;
+            tracing::warn!(
+                "the note recovery file could not be read ({e}); kept it as {}",
+                aside.display()
+            );
             Vec::new()
         }
     };
@@ -794,6 +800,25 @@ pub fn write_note_recovery(file: &Path, notes: &[PendingNote]) -> std::io::Resul
     let tmp = file.with_extension("json.tmp");
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, file)
+}
+
+/// Where an unreadable recovery file is set aside: `<name>.unreadable-<unix seconds>`, with a
+/// counter added if that name is taken.
+fn unreadable_aside_path(file: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let name = file.file_name().map_or_else(
+        || "pending-notes.json".into(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let mut aside = file.with_file_name(format!("{name}.unreadable-{stamp}"));
+    let mut n = 1;
+    while aside.exists() {
+        aside = file.with_file_name(format!("{name}.unreadable-{stamp}-{n}"));
+        n += 1;
+    }
+    aside
 }
 
 /// Saves the notes of the recovery file into the library and removes the file. Notes of files
@@ -831,7 +856,7 @@ fn has_note(notes: Option<&str>) -> bool {
 /// The new location of `path` when `old` (a file or folder) was moved to `new`. Components
 /// are compared case-insensitively, so `C:\Shoot` matches `c:\shoot\a.jpg`, while
 /// `C:\Shoot2` does not match `C:\Shoot`.
-fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
+pub(crate) fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     let mut parts = path.components();
     for old_part in old.components() {
         let part = parts.next()?;
@@ -1566,6 +1591,33 @@ mod tests {
         assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("Zürich 🎉 final"));
         assert!(!file.exists(), "the recovery file is removed once replayed");
         assert_eq!(replay_note_recovery(&db, &file), Ok(0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_recovery_file_is_kept_aside_not_overwritten() {
+        let root = temp_root("note-recovery-unreadable");
+        let file = root.join("pending-notes.json");
+        std::fs::write(&file, b"{ not json").unwrap();
+        let note = PendingNote {
+            path: root.join("a.jpg"),
+            note: Some("new".into()),
+        };
+        write_note_recovery(&file, std::slice::from_ref(&note)).unwrap();
+
+        let asides: Vec<PathBuf> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("pending-notes.json.unreadable-")
+            })
+            .collect();
+        assert_eq!(asides.len(), 1, "the unreadable file is set aside once");
+        assert_eq!(std::fs::read(&asides[0]).unwrap(), b"{ not json");
+        assert_eq!(read_note_recovery(&file).unwrap(), vec![note]);
         std::fs::remove_dir_all(root).unwrap();
     }
 

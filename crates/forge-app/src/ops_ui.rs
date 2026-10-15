@@ -763,28 +763,56 @@ fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
     Some(disks)
 }
 
-/// The `(source, destination)` pairs of moved top-level items that have no undo record. A
-/// cross-volume move is a copy plus a delete and records no undo entry, so its pair is read
-/// from the report: the destination must be in `report.done` under the source's own name and
-/// the source must be gone. A keep-both copy (renamed on arrival) is not matched, so its
-/// library row stays at the old path.
-fn uncovered_moves(
-    sources: &[PathBuf],
-    dest: &Path,
-    report: &OpReport,
-) -> Vec<(PathBuf, PathBuf)> {
-    sources
-        .iter()
-        .filter_map(|src| {
-            let target = dest.join(src.file_name()?);
-            let covered = report
-                .undo
-                .iter()
-                .any(|u| matches!(u, ops::UndoRecord::Moved { from, .. } if from == src));
-            let moved = report.done.contains(&target) && !src.exists();
-            (moved && !covered).then(|| (src.clone(), target))
-        })
-        .collect()
+/// The `(source, destination)` pairs of moved items that have no undo record. A cross-volume
+/// move is a copy plus a delete and records no undo entry, so its pairs are read from the
+/// report. A source that is gone moved as a whole when `report.done` has its destination under
+/// the source's own name, or anything inside it (a folder copy reports its files, not the
+/// folder): the source is relinked as one prefix, so everything inside follows. A source that
+/// still partly exists (a partial move) relinks only the reported items whose original is gone.
+/// A keep-both copy (renamed on arrival) is not matched, so its library row stays at the old
+/// path.
+fn uncovered_moves(sources: &[PathBuf], dest: &Path, report: &OpReport) -> Vec<(PathBuf, PathBuf)> {
+    use crate::library::moved_path;
+    let mut pairs = Vec::new();
+    for src in sources {
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let target = dest.join(name);
+        let covered = report
+            .undo
+            .iter()
+            .any(|u| matches!(u, ops::UndoRecord::Moved { from, .. } if from == src));
+        if covered {
+            continue;
+        }
+        // Each reported destination at or under `target`, with the source path it came from.
+        let arrived: Vec<(PathBuf, PathBuf)> = report
+            .done
+            .iter()
+            .filter_map(|done| moved_path(done, &target, src).map(|from| (from, done.clone())))
+            .collect();
+        if !src.exists() {
+            if !arrived.is_empty() {
+                pairs.push((src.clone(), target));
+            }
+            continue;
+        }
+        let mut partial: Vec<(PathBuf, PathBuf)> = arrived
+            .into_iter()
+            .filter(|(from, _)| !from.exists())
+            .collect();
+        // A moved subfolder already carries the files reported inside it.
+        partial.sort_by_key(|(from, _)| from.components().count());
+        let mut kept: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (from, to) in partial {
+            if !kept.iter().any(|(k, _)| moved_path(&from, k, k).is_some()) {
+                kept.push((from, to));
+            }
+        }
+        pairs.extend(kept);
+    }
+    pairs
 }
 
 fn finish_report(
@@ -1278,6 +1306,91 @@ fn job_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn moved_report(done: &[&Path]) -> OpReport {
+        OpReport {
+            done: done.iter().map(|p| p.to_path_buf()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_cross_volume_folder_move_relinks_the_notes_inside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (src, dest) = (root.path().join("trip"), root.path().join("other"));
+        std::fs::create_dir_all(src.join("day1")).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let photo = src.join("day1").join("a.jpg");
+        std::fs::write(&photo, b"photo").unwrap();
+        let db = std::sync::Arc::new(forge_db::Db::open_in_memory().unwrap());
+        db.upsert_entries(&[forge_core::listing::entry_for_path(&photo).unwrap()])
+            .unwrap();
+        let mut library = crate::library::test_library(db.clone());
+        let answer = library.annotate_confirmed(
+            vec![photo.clone()],
+            forge_db::AnnotationChange {
+                notes: Some(Some("day one".into())),
+                ..Default::default()
+            },
+        );
+        assert_eq!(answer.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+
+        // Copy plus delete: the report lists the copied files only, and has no undo record.
+        let moved = dest.join("trip").join("day1").join("a.jpg");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&photo, &moved).unwrap();
+        std::fs::remove_dir_all(&src).unwrap();
+        let pairs = uncovered_moves(std::slice::from_ref(&src), &dest, &moved_report(&[&moved]));
+        assert_eq!(pairs, vec![(src.clone(), dest.join("trip"))]);
+
+        library.follow_moves(pairs);
+        assert!(library.flush(Duration::from_secs(5)));
+        let id = db
+            .file_id(&moved)
+            .unwrap()
+            .expect("the row followed its folder");
+        assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("day one"));
+        assert!(db.file_id(&photo).unwrap().is_none());
+        drop(library);
+    }
+
+    #[test]
+    fn a_partial_folder_move_relinks_only_the_files_that_moved() {
+        let root = tempfile::tempdir().unwrap();
+        let (src, dest) = (root.path().join("trip"), root.path().join("other"));
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        let target = dest.join("trip");
+        std::fs::create_dir_all(target.join("sub")).unwrap();
+        // a.jpg and sub/c.jpg moved; b.jpg failed and is still at the source.
+        std::fs::write(src.join("b.jpg"), b"b").unwrap();
+        for name in ["a.jpg", "b.jpg", "sub/c.jpg"] {
+            std::fs::write(target.join(name), b"x").unwrap();
+        }
+        let report = moved_report(&[
+            &target.join("a.jpg"),
+            &target.join("b.jpg"),
+            &target.join("sub").join("c.jpg"),
+        ]);
+        let mut pairs = uncovered_moves(std::slice::from_ref(&src), &dest, &report);
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (src.join("a.jpg"), target.join("a.jpg")),
+                (
+                    src.join("sub").join("c.jpg"),
+                    target.join("sub").join("c.jpg")
+                ),
+            ]
+        );
+        // A recorded move is left to its undo record.
+        let mut covered = report.clone();
+        covered.undo.push(ops::UndoRecord::Moved {
+            from: src.clone(),
+            to: target.clone(),
+        });
+        assert!(uncovered_moves(std::slice::from_ref(&src), &dest, &covered).is_empty());
+    }
 
     fn meta(len: u64) -> SourceIdentity {
         let dir = tempfile::tempdir().unwrap();
