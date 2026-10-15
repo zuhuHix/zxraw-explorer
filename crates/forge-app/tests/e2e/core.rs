@@ -69,7 +69,7 @@ fn rename_then_undo_restores_the_original_name() {
 }
 
 #[test]
-fn renaming_onto_an_existing_name_reports_an_error_toast() {
+fn renaming_onto_an_existing_name_reopens_the_prompt_with_the_error() {
     let sandbox = tempfile::tempdir().unwrap();
     let dir = sandbox.path().join("work");
     write_file(&dir.join("a.txt"), b"a");
@@ -82,7 +82,9 @@ fn renaming_onto_an_existing_name_reports_an_error_toast() {
          accept\n\
          wait-jobs\n\
          wait-frames 3\n\
-         assert-toast Rename failed: a file with that name already exists\n\
+         ui browser assert-prompt-error a file with that name already exists\n\
+         cancel\n\
+         ui browser assert-no-dialog\n\
          assert-exists {a}\n\
          cmd Undo\n\
          assert-toast Nothing to undo\n\
@@ -128,7 +130,8 @@ fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
     // 192.0.2.0/24 is TEST-NET-1 (RFC 5737): a file call on it hangs about 20 s until the
     // network gives up, so each `offline` step fails if its UI call took longer than 250 ms.
     // Windows remembers an unreachable host for a while and then fails fast, so each run
-    // picks a host the other tests (which use .1) do not.
+    // picks a host the other tests (which use .1) do not. While the rename is still waiting on
+    // the share, Undo must not act on an older record: it says it is waiting instead.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -138,6 +141,7 @@ fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
         "dismiss-notices\nnavigate {sandbox}\n\
          ui browser offline rename {share}\\a.txt | b.txt\n\
          ui sidebar responsive 30 | 1000\n\
+         cmd Undo\nassert-toast Waiting for the rename to finish\n\
          ui browser offline undo-rename {share}\\a.txt | b.txt\n\
          ui sidebar responsive 30 | 1000\n\
          ui sidebar go {share}\n\
