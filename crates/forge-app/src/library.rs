@@ -54,10 +54,12 @@ enum LibraryWrite {
         reply: Sender<Result<bool, String>>,
     },
     /// Files or folders ZXraw moved or renamed: their rows (notes, ratings, tags) follow.
-    /// `done` is answered once the rows are relinked (or the relink failed).
+    /// `done` is answered once the rows are relinked (or the relink failed), and `repaint`
+    /// wakes the UI to pick that up.
     Relink {
         pairs: Vec<(PathBuf, PathBuf)>,
         done: Sender<()>,
+        repaint: egui::Context,
     },
     /// Answered once every write queued before it has been applied.
     Flush(Sender<()>),
@@ -377,25 +379,26 @@ impl Library {
     /// Tell the library that ZXraw moved or renamed files (`old` -> `new`, a file or a folder).
     /// The in-memory annotations are re-keyed at once, and the database rows follow through
     /// the same ordered writer as annotation edits, so a note or rating made before the move
-    /// stays on the file. Pairs where old == new are ignored. The returned channel is answered
-    /// (or disconnected) once the database rows have followed.
-    pub fn follow_moves(&mut self, pairs: Vec<(PathBuf, PathBuf)>) -> Receiver<()> {
-        let (done, relinked) = bounded(1);
+    /// stays on the file. Pairs where old == new are ignored. The returned channel, `None` when
+    /// nothing moved, is answered (or disconnected) once the database rows have followed.
+    pub fn follow_moves(&mut self, pairs: Vec<(PathBuf, PathBuf)>) -> Option<Receiver<()>> {
         let pairs: Vec<(PathBuf, PathBuf)> =
             pairs.into_iter().filter(|(old, new)| old != new).collect();
         if pairs.is_empty() {
-            return relinked;
+            return None;
         }
+        let (done, relinked) = bounded(1);
         rekey_map_with(&mut self.annotations, &pairs, merge_moved_annotation);
         rekey_set(&mut self.locally_edited, &pairs);
         rekey_map(&mut self.annotation_versions, &pairs);
-        let write = LibraryWrite::Relink { pairs, done };
+        let repaint = self.ctx.clone();
+        let write = LibraryWrite::Relink { pairs, done, repaint };
         if self.db.is_some() {
             self.persist(write);
         } else if self.open_error.is_none() {
             self.queued.push(write);
         }
-        relinked
+        Some(relinked)
     }
 
     fn persist(&self, write: LibraryWrite) {
@@ -768,24 +771,32 @@ pub struct PendingNote {
     pub base: Option<String>,
 }
 
+/// Between the two notes [`merged_note`] joins (the database uses the same on a move).
+const MERGE_SEPARATOR: &str = "\n\n--- merged note ---\n\n";
+
 /// An edit and the database's note joined, as the database joins two notes on a move.
 pub(crate) fn merged_note(edit: &str, note: &str) -> String {
     match (edit.trim(), note.trim()) {
         ("", note) => note.to_string(),
         (edit, "") => edit.to_string(),
         (edit, note) if edit == note => edit.to_string(),
-        (edit, note) => format!("{edit}\n\n--- merged note ---\n\n{note}"),
+        (edit, note) => format!("{edit}{MERGE_SEPARATOR}{note}"),
     }
 }
 
 /// What replaying `pending` writes over the database's `current` note: the edit, or the edit
-/// and `current` merged when the note changed since the edit was based on it.
+/// and `current` merged when the note changed since the edit was based on it. Replaying the
+/// same entry again changes nothing: a note that already starts with the merged-in edit (an
+/// earlier replay that stopped before the recovery file was removed) is kept as it is.
 fn replayed_note(pending: &PendingNote, current: Option<&str>) -> Option<String> {
     let current = current.unwrap_or("").trim();
-    let edit = pending.note.as_deref().unwrap_or("");
+    let edit = pending.note.as_deref().unwrap_or("").trim();
     let text = match &pending.base {
-        Some(base) if base.trim() != current => merged_note(edit, current),
-        _ => edit.trim().to_string(),
+        Some(base) if base.trim() != current => {
+            let merged_in = current.starts_with(&format!("{edit}{MERGE_SEPARATOR}"));
+            if merged_in { current.to_string() } else { merged_note(edit, current) }
+        }
+        _ => edit.to_string(),
     };
     Some(text).filter(|t| !t.is_empty())
 }
@@ -1070,7 +1081,7 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<LibraryWrite> {
                     LibraryWrite::Flush(done) => {
                         let _ = done.send(());
                     }
-                    LibraryWrite::Relink { pairs, done } => {
+                    LibraryWrite::Relink { pairs, done, repaint } => {
                         // One set in one transaction: swaps and cycles stay correct.
                         if let Err(error) = db.relink_many(&pairs) {
                             let _ = tx.send(LibMsg::Error(format!(
@@ -1079,6 +1090,7 @@ fn spawn_writer(db: Arc<Db>, tx: Sender<LibMsg>) -> Sender<LibraryWrite> {
                             )));
                         }
                         let _ = done.send(());
+                        repaint.request_repaint();
                     }
                 }
             }
@@ -1693,6 +1705,56 @@ mod tests {
         assert_eq!(note(&same).as_deref(), Some("my edit"), "unchanged since: the edit wins");
         assert_eq!(note(&cleared).as_deref(), Some("changed"), "a clear never drops a newer note");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replaying_the_same_recovery_file_twice_changes_nothing_more() {
+        let root = temp_root("note-recovery-twice");
+        let (merged, same) = (root.join("m.jpg"), root.join("s.jpg"));
+        let db = Db::open_in_memory().unwrap();
+        for path in [&merged, &same] {
+            std::fs::write(path, b"photo").unwrap();
+        }
+        index(&db, &[&merged, &same]);
+        let id = |path: &Path| db.file_id(path).unwrap().unwrap();
+        db.set_notes(&[id(&merged)], Some("changed")).unwrap();
+        db.set_notes(&[id(&same)], Some("old")).unwrap();
+        let file = root.join("pending-notes.json");
+        let pending = |path: &Path| PendingNote {
+            path: path.to_path_buf(),
+            note: Some("my edit".into()),
+            base: Some("old".into()),
+        };
+        let entries = [pending(&merged), pending(&same)];
+        let note = |path: &Path| db.annotation(id(path)).unwrap().notes;
+        for _ in 0..2 {
+            // As if the app stopped before the file was removed: the next start replays it.
+            write_note_recovery(&file, &entries).unwrap();
+            assert_eq!(replay_note_recovery(&db, &file), Ok(2));
+            assert_eq!(
+                note(&merged).as_deref(),
+                Some("my edit\n\n--- merged note ---\n\nchanged")
+            );
+            assert_eq!(note(&same).as_deref(), Some("my edit"));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_finished_relink_wakes_the_ui() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let mut library = test_library(db);
+        let woken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = woken.clone();
+        library.ctx.set_request_repaint_callback(move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let relinked = library
+            .follow_moves(vec![(PathBuf::from(r"C:\x\a.jpg"), PathBuf::from(r"C:\y\a.jpg"))])
+            .expect("a move to relink");
+        relinked.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(library.flush(std::time::Duration::from_secs(5)));
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
