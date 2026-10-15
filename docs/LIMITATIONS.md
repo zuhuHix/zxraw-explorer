@@ -30,8 +30,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
   administrator or on a network (UNC) path; choose PowerShell instead.
-* Git status badges are off by default (Settings › Browsing) until the link-safe scan has
-  passed security review.
+* Git status badges are on by default (turn them off in Settings › Browsing). The scan treats
+  every repository as hostile: it never runs a program, opens nothing by path below a local
+  drive's root, never follows a link, never opens a cloud placeholder, and caps every read,
+  count and the time taken. Submodules, linked worktrees and clones made from a local path
+  (hard-linked objects) show no badges, and SUBST drives and network shares are skipped; the
+  full list of limits follows.
 * Git status badges never run filters or line-ending conversion, so a same-size file that Git
   stores converted (for example a Git LFS file, or `autocrlf` content) can show as modified
   after its time changes, as can same-size changes beyond the first 256 or in files over

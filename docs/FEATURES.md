@@ -261,7 +261,7 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `folder_context_menu_opens_a_terminal_in_that_folder` right-clicks a folder and clicks the menu
   item (automated runs record the launch instead of opening a window). Windows Terminal's `\;`
   handling was checked by hand once; the administrator variant was not run.
-* 🟡 Git status badges — `forge-app/src/git_status.rs`, off by default (opt-in in Settings › Browsing):
+* 🟡 Git status badges — `forge-app/src/git_status.rs`, on by default (can be turned off in Settings › Browsing):
   modified, new (added or untracked), ignored (dimmed) and conflicted entries, rolled up to
   folders, and the branch in the status bar. Read in-process on one background thread; no
   external program ever runs (no `git.exe`, no fsmonitor, no filter drivers). Every file is

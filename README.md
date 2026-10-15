@@ -197,12 +197,13 @@ Explorer is a file manager designed around that workflow:
   <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd>. It uses Windows Terminal when installed, otherwise
   PowerShell, otherwise cmd; Settings › Browsing picks a specific one. An *as administrator*
   variant is on the folder background menu.
-- **Git at a glance (opt-in).** Turn it on in Settings › Browsing, and in a folder inside a
-  Git repository changed files get a small badge (modified, new, conflict), ignored files are
-  dimmed and the status bar shows the branch. The status is read in the background by the app
-  itself, without running Git or anything a repository's settings name. Huge repositories are
-  skipped. It is off by default because a malicious repository can still make the app contact
-  a network server; only turn it on if you trust the folders you browse.
+- **Git at a glance.** In a folder inside a Git repository, changed files get a small badge
+  (modified, new, conflict), ignored files are dimmed and the status bar shows the branch. On
+  by default; turn it off in Settings › Browsing. The status is read in the background by the
+  app itself, without running Git or anything a repository's settings name, and without
+  following links out of the folder or opening network shares, so browsing a downloaded or
+  cloned folder is safe. Huge repositories, submodules, linked worktrees, clones made from a
+  local path (hard-linked objects), SUBST drives and network shares show no badges.
 
 <p align="center">
   <a href="https://github.com/zuhuHix/zxraw-explorer/raw/main/docs/images/screens/collections.jpg"><img src="docs/images/screens/collections.jpg" width="80%" alt="Collections window with a Lisbon portfolio collection and the New collection dialog open"></a>
