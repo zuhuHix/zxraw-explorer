@@ -36,7 +36,8 @@ fn check(path: &Path) -> Found {
 
 /// Turns a metadata lookup (`Ok(is_dir)`) into a [`Found`]. "Not found" counts only when the
 /// path's volume root answers: an unplugged USB drive or a disconnected mapped drive also
-/// reports its paths as not found, and those must stay.
+/// reports its paths as not found, and those must stay. A path without a drive or share prefix
+/// (relative or root-relative) has no volume to ask, so it counts as unknown.
 fn classify(path: &Path, metadata: impl Fn(&Path) -> std::io::Result<bool>) -> Found {
     match metadata(path) {
         Ok(true) => Found::Folder,
@@ -47,7 +48,7 @@ fn classify(path: &Path, metadata: impl Fn(&Path) -> std::io::Result<bool>) -> F
                 Ok(_) => Found::Missing,
                 Err(e) => Found::Unknown(format!("{}: {e}", root.display())),
             },
-            None => Found::Missing,
+            None => Found::Unknown(e.to_string()),
         },
         Err(e) => Found::Unknown(e.to_string()),
     }
@@ -419,6 +420,17 @@ mod tests {
                 _ => Err(Error::from_raw_os_error(code)),
             };
             assert_eq!(classify(Path::new(r"C:\dir"), gone), Found::Missing, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_path_without_a_volume_is_unknown_not_missing() {
+        // No drive or share to ask whether it answers, so "not found" proves nothing.
+        for code in [2, 3] {
+            let gone = |_: &Path| Err(std::io::Error::from_raw_os_error(code));
+            for path in ["relative", r"photos\2024", r"\rooted\dir"] {
+                assert!(matches!(classify(Path::new(path), gone), Found::Unknown(_)), "{path} {code}");
+            }
         }
     }
 
