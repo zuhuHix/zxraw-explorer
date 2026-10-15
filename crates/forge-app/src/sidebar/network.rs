@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use egui::{Key, RichText, Sense, Ui};
+use egui::{Key, RichText, Ui};
 use forge_core::netpath;
 use forge_core::paths::paths_equal;
 use forge_win::network::Connect;
@@ -330,29 +330,18 @@ enum Edit {
 
 /// The section: a header that re-checks on click, then one row per entry.
 pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
-    let header = ui
-        .horizontal(|ui| {
-            let title = ui
-                .add(
-                    egui::Label::new(
-                        RichText::new("NETWORK")
-                            .small()
-                            .strong()
-                            .color(theme::muted(ui)),
-                    )
-                    .sense(Sense::click()),
-                )
-                .on_hover_text("Click to check the network locations again");
-            let add = ui
-                .add(theme::ghost_button("+"))
-                .on_hover_text("Add network location…");
-            (title.clicked(), add.clicked())
-        })
-        .inner;
-    if header.0 {
+    let header = crate::sidebar::header_row(ui, "Network", None, Some("+"));
+    let recheck = header
+        .title
+        .on_hover_text("Click to check the network locations again")
+        .clicked();
+    let add = header
+        .button
+        .is_some_and(|b| b.on_hover_text("Add network location…").clicked());
+    if recheck {
         recheck_all(app);
     }
-    if header.1 {
+    if add {
         open_add_dialog(app, String::new());
     }
     let list = entries(app);

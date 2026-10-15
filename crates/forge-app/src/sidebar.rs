@@ -507,32 +507,64 @@ fn locate(app: &mut ZxrawApp, index: usize) {
 
 fn collections_section(app: &mut ZxrawApp, ui: &mut Ui) {
     let collections = app.ops.collections_ui.sidebar_collections().to_vec();
-    section(ui, "Collections");
-    if collections.is_empty() {
-        ui.label(RichText::new("No collections yet").weak());
-    } else {
-        for collection in collections.iter().take(8) {
-            let marker = match collection.kind {
-                forge_db::CollectionKind::Manual => "▤",
-                forge_db::CollectionKind::Smart => "⌕",
-            };
-            if ui
-                .selectable_label(false, format!("{marker}  {}", collection.name))
-                .clicked()
-            {
-                crate::collections_ui::open_collection(app, collection.id);
-            }
-        }
-        if collections.len() > 8 {
-            ui.label(
-                RichText::new(format!("+ {} more", collections.len() - 8))
-                    .weak()
-                    .small(),
+    let open = collapsible_header(
+        app,
+        ui,
+        "collections",
+        "Collections",
+        !collections.is_empty(),
+        "Collection actions",
+        |app, ui| {
+            menu_explainer(
+                ui,
+                "A collection is a named group of files you pick from any folders in your \
+                 library. Files are never moved or copied: a collection only remembers where \
+                 they are. A smart collection fills itself from a search instead. Click one to \
+                 open it.",
             );
+            if menu_item(
+                ui,
+                "New collection…",
+                "Create an empty collection, one from the selected files, or a smart collection \
+                 that fills itself from a search",
+            ) {
+                crate::collections_ui::open_new_collection(app);
+            }
+            if menu_item(
+                ui,
+                "Manage collections…",
+                "Open the Collections window: browse, rename, reorder and delete collections \
+                 and saved searches",
+            ) {
+                app.ops.collections_ui.open = true;
+            }
+        },
+    );
+    if !open {
+        return;
+    }
+    if collections.is_empty() {
+        ui.label(RichText::new("No collections yet").weak().small());
+        return;
+    }
+    for collection in collections.iter().take(8) {
+        let marker = match collection.kind {
+            forge_db::CollectionKind::Manual => "▤",
+            forge_db::CollectionKind::Smart => "⌕",
+        };
+        if ui
+            .selectable_label(false, format!("{marker}  {}", collection.name))
+            .clicked()
+        {
+            crate::collections_ui::open_collection(app, collection.id);
         }
     }
-    if ui.small_button("Manage collections…").clicked() {
-        app.ops.collections_ui.open = true;
+    if collections.len() > 8 {
+        ui.label(
+            RichText::new(format!("+ {} more", collections.len() - 8))
+                .weak()
+                .small(),
+        );
     }
 }
 
@@ -595,15 +627,138 @@ fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
     }
 }
 
+/// A plain section header (no arrow, no button).
 pub(crate) fn section(ui: &mut Ui, title: &str) {
-    ui.label(
-        RichText::new(title.to_uppercase())
-            .small()
-            .strong()
-            .color(theme::muted(ui)),
-    );
+    header_row(ui, title, None, None);
 }
 
+/// What was clicked on a section header this frame.
+pub(crate) struct Header {
+    /// The title (and the disclosure arrow, when there is one).
+    pub title: egui::Response,
+    /// The small button at the right end of the row, when there is one.
+    pub button: Option<egui::Response>,
+}
+
+/// Height of a section header row: the height of the ghost button, so headers with and without
+/// a button take the same space.
+const HEADER_HEIGHT: f32 = 24.0;
+
+/// One section header row, used by every sidebar section so they line up the same way: the
+/// title in small muted capitals, a disclosure arrow after it when `open` is given, and an
+/// optional ghost `button` (an icon such as "+" or "⋯") at the right end. Everything is centred
+/// vertically on the row. The title senses clicks; plain sections ignore them.
+pub(crate) fn header_row(
+    ui: &mut Ui,
+    title: &str,
+    open: Option<bool>,
+    button: Option<&str>,
+) -> Header {
+    let width = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, HEADER_HEIGHT),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(width, HEADER_HEIGHT));
+            let mut title = ui.add(
+                egui::Label::new(
+                    RichText::new(title.to_uppercase())
+                        .small()
+                        .strong()
+                        .color(theme::muted(ui)),
+                )
+                .selectable(false)
+                .sense(Sense::click()),
+            );
+            if let Some(open) = open {
+                let (_, arrow) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::click());
+                egui::collapsing_header::paint_default_icon(
+                    ui,
+                    if open { 1.0 } else { 0.0 },
+                    &arrow,
+                );
+                title = title.union(arrow);
+                title = title.on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
+            let button = button.map(|icon| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(theme::ghost_button(icon))
+                })
+                .inner
+            });
+            Header { title, button }
+        },
+    )
+    .inner
+}
+
+/// Whether the collapsible section `key` is shown open: the user's last choice for it, else
+/// open exactly when it has items (so an empty section starts collapsed).
+pub(crate) fn section_open(app: &ZxrawApp, key: &str, has_items: bool) -> bool {
+    app.settings
+        .sidebar_sections
+        .get(key)
+        .copied()
+        .unwrap_or(has_items)
+}
+
+/// A collapsible section header with a "⋯" menu button. A click on the title or arrow toggles
+/// the section and remembers the choice in the settings; the button opens a popup menu drawn
+/// by `menu`. Returns whether the section is open.
+pub(crate) fn collapsible_header(
+    app: &mut ZxrawApp,
+    ui: &mut Ui,
+    key: &str,
+    title: &str,
+    has_items: bool,
+    menu_hover: &str,
+    menu: impl FnOnce(&mut ZxrawApp, &mut Ui),
+) -> bool {
+    let open = section_open(app, key, has_items);
+    let header = header_row(ui, title, Some(open), Some("⋯"));
+    let header_title = header.title.on_hover_text(if open {
+        "Click to collapse"
+    } else {
+        "Click to expand"
+    });
+    crate::testhook::note_control_rect(ui, &format!("sidebar-{key}"), header_title.rect);
+    let open = if header_title.clicked() {
+        app.settings.sidebar_sections.insert(key.to_string(), !open);
+        !open
+    } else {
+        open
+    };
+    if let Some(button) = header.button {
+        crate::testhook::note_control_rect(ui, &format!("sidebar-{key}-menu"), button.rect);
+        let button = button.on_hover_text(menu_hover);
+        egui::Popup::menu(&button).show(|ui| {
+            ui.set_max_width(260.0);
+            menu(app, ui);
+        });
+    }
+    open
+}
+
+/// One action in a section's menu, with its tooltip. Returns whether it was clicked (the menu
+/// closes then).
+pub(crate) fn menu_item(ui: &mut Ui, label: &str, hover: &str) -> bool {
+    let response = ui.button(label);
+    crate::testhook::note_menu_rect(ui, label, response.rect);
+    let clicked = response.on_hover_text(hover).clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
+}
+
+/// The short explanation at the top of a section's menu.
+pub(crate) fn menu_explainer(ui: &mut Ui, text: &str) {
+    // Menus lay out justified, which would spread the words of a wrapped label apart.
+    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.add(egui::Label::new(RichText::new(text).weak().small()).wrap());
+    });
+    ui.separator();
+}
 
 /// The name shown for a pin: its label, else the file or folder name, else the full path.
 pub(crate) fn pin_label(pin: &Pin) -> String {

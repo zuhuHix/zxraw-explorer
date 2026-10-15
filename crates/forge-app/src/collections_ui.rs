@@ -459,6 +459,11 @@ pub(crate) fn testhook_idle(app: &ZxrawApp) -> bool {
         && !state.relink_preview_running
 }
 
+/// Test hook: whether the "New collection" window is open.
+pub(crate) fn testhook_new_collection_open(app: &ZxrawApp) -> bool {
+    app.ops.collections_ui.new_collection.is_some()
+}
+
 /// Test hook: names of the rows the open collection shows, once they have loaded for `id`.
 pub(crate) fn testhook_shown_rows(app: &ZxrawApp, id: CollectionId) -> Option<Vec<String>> {
     let state = &app.ops.collections_ui;
@@ -499,6 +504,26 @@ pub(crate) fn testhook_relink_paths(app: &ZxrawApp) -> Option<(PathBuf, PathBuf)
 }
 
 /// Open the management window on a collection. Used by the sidebar.
+/// Opens the "New collection" window, starting from the selected files when there are any
+/// (the window's button and the sidebar's Collections menu).
+pub fn open_new_collection(app: &mut ZxrawApp) {
+    let selection = selected_files(app);
+    let choice = if selection.is_empty() {
+        NewChoice::Empty
+    } else {
+        NewChoice::Selection
+    };
+    let state = &mut app.ops.collections_ui;
+    let name = unique_name(&state.collections, NewCollectionForm::default_name(choice));
+    state.new_collection = Some(NewCollectionForm {
+        choice,
+        name,
+        query: String::new(),
+        selection,
+        auto_name: true,
+    });
+}
+
 pub fn open_collection(app: &mut ZxrawApp, id: CollectionId) {
     let kind = app
         .ops
@@ -1921,23 +1946,7 @@ pub(crate) fn execute_command(app: &mut ZxrawApp, ctx: &egui::Context, command: 
             app.ops.collections_ui.relink_open = false;
         }
         UiCommand::Navigate(path) => app.navigate(path),
-        UiCommand::OpenNewCollection => {
-            let selection = selected_files(app);
-            let choice = if selection.is_empty() {
-                NewChoice::Empty
-            } else {
-                NewChoice::Selection
-            };
-            let state = &mut app.ops.collections_ui;
-            let name = unique_name(&state.collections, NewCollectionForm::default_name(choice));
-            state.new_collection = Some(NewCollectionForm {
-                choice,
-                name,
-                query: String::new(),
-                selection,
-                auto_name: true,
-            });
-        }
+        UiCommand::OpenNewCollection => open_new_collection(app),
         UiCommand::AddSelection { collection_id } => {
             let files = selected_files(app);
             if files.is_empty() {

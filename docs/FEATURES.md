@@ -67,6 +67,13 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   in a message. Settings › Browsing's *Reopen the last session's tabs at startup* (on by default) is
   unchanged, and sessions now also remember each pane's sort. Layouts and pins live in the settings
   file, and older settings files load unchanged. No test result is recorded for this yet.
+* ✅ Sidebar section headers — `forge-app/src/sidebar.rs` (`header_row`, `collapsible_header`).
+  Every section uses one header row, so the titles and Network's *+* line up. Layouts and
+  Collections are collapsible: an empty section starts collapsed, one with items open, and a
+  click on the title remembers the choice in the settings (`sidebar_sections`). Their ⋯ button
+  opens a menu that explains the feature, then *Save current layout…* / *Manage layouts…* or
+  *New collection…* / *Manage collections…*, each with a tooltip. e2e
+  `sidebar::empty_sections_start_collapsed_and_their_menus_open_the_layout_and_collection_windows`.
 * ✅ Stream directory entries in batches (engine) — `forge-core/src/listing.rs`
   (`lists_unicode_and_streams_batches`, `junctions_are_links`). The 50,000-entry run in
   [BENCHMARKS.md](BENCHMARKS.md) completed with zero listing errors.

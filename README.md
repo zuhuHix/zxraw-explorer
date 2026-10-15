@@ -171,7 +171,8 @@ Explorer is a file manager designed around that workflow:
 - **Favourites and layouts.** Pin files as well as folders to Quick access (right-click › *Pin to
   Quick access*, or drag them onto the sidebar), and reorder or rename them. *Save layout…* keeps
   your open tabs, split panes, views and sorting, so a culling or delivery workspace is one click
-  away from the sidebar's Layouts section.
+  away from the sidebar's Layouts section. Layouts and Collections fold away while they're empty;
+  the small ⋯ next to each heading explains the feature and holds its actions (save, new, manage).
 - **Your NAS in the sidebar.** Save shares like `\\nas\photos` to the Network section, next to
   your mapped drives. A status dot shows which are online, and an offline NAS never freezes the
   window. If a share needs a password, *Connect…* lets Windows ask for it: ZXraw Explorer never
