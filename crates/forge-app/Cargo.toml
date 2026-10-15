@@ -40,7 +40,10 @@ forge-jobs.workspace = true
 forge-db.workspace = true
 forge-media.workspace = true
 forge-win.workspace = true
-gix = { version = "0.89", default-features = false, features = ["status", "dirwalk", "sha1"] }
+gix = { version = "0.89", default-features = false, features = ["index", "excludes", "sha1"] }
+filetime = "0.2"
+flate2 = "1"
+windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_System_IO", "Win32_Storage_FileSystem"] }
 notify = { version = "8.2", default-features = false }
 ab_glyph = "0.2"
 

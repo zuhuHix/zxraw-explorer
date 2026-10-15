@@ -241,8 +241,8 @@ pub struct Settings {
     pub list_typing: Lenient<ListTyping>,
     /// The terminal "Open terminal here" starts (see `terminal`).
     pub terminal: Lenient<crate::terminal::TerminalChoice>,
-    /// Show Git status badges and the branch for folders inside a Git repository. Off by
-    /// default: a malicious repository can still steer the scan to a network share.
+    /// Show Git status badges and the branch for folders inside a Git repository. On by
+    /// default: the scan opens files only through link-safe handles inside the folder.
     pub git_badges: bool,
     /// Settings this version doesn't know (written by a newer one), kept so saving doesn't
     /// drop them.
@@ -286,7 +286,7 @@ impl Default for Settings {
             restore_session: true,
             list_typing: ListTyping::Jump.into(),
             terminal: Default::default(),
-            git_badges: false,
+            git_badges: true,
             extra: Extra::new(),
         }
     }
@@ -719,12 +719,12 @@ mod tests {
     }
 
     #[test]
-    fn git_badges_are_off_unless_turned_on() {
-        assert!(!Settings::default().git_badges);
+    fn git_badges_are_on_unless_turned_off() {
+        assert!(Settings::default().git_badges);
         let settings: Settings = serde_json::from_str(r#"{"verify_copies": true}"#).unwrap();
-        assert!(!settings.git_badges);
-        let settings: Settings = serde_json::from_str(r#"{"git_badges": true}"#).unwrap();
         assert!(settings.git_badges);
+        let settings: Settings = serde_json::from_str(r#"{"git_badges": false}"#).unwrap();
+        assert!(!settings.git_badges);
     }
 
     #[test]
