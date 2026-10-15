@@ -24,6 +24,16 @@ const RETRY_BACKOFF: [Duration; 3] = [
 /// Network folders being registered at once. Each attempt runs on its own thread with its
 /// own watcher, so a share that stalls holds up neither local folders nor other shares.
 const NETWORK_SLOTS: usize = 4;
+/// A network registration still running after this long frees its slot: its thread is left
+/// to finish on its own (it may be stuck in an open call on an offline share), but no longer
+/// keeps other shares from being registered.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timed-out registrations allowed to linger at once. While this many are stuck, no new
+/// network registration starts, so stuck threads cannot pile up.
+const HUNG_CAP: usize = 8;
+/// Threads that drop released network watchers. Closing a handle on an offline share can
+/// block, so it happens here, never on the registrar, and never on a thread per release.
+const CLEANUP_THREADS: usize = 2;
 
 pub struct FolderWatcher {
     /// The folders to watch, sent to the registrar thread. Registering opens each folder
@@ -125,21 +135,58 @@ struct Registrar {
     local: Sender<LocalCommand>,
     results: Sender<Attempt>,
     network_watchers: HashMap<PathBuf, RecommendedWatcher>,
+    /// Network attempts holding a slot (running and not timed out).
     network_trying: usize,
+    /// Network attempts that timed out and are still running.
+    hung: usize,
+    register_timeout: Duration,
+    /// Released network watchers go here to be dropped by the cleanup pool.
+    cleanup: Sender<RecommendedWatcher>,
     want: HashSet<PathBuf>,
     /// Attempts still running, wanted or not.
-    trying: HashSet<PathBuf>,
+    trying: HashMap<PathBuf, Running>,
     state: Arc<Mutex<HashMap<PathBuf, Registration>>>,
+}
+
+/// An attempt that has not finished yet.
+struct Running {
+    network: bool,
+    started: Instant,
+    /// It ran past the registration timeout and gave up its slot.
+    timed_out: bool,
+}
+
+/// Starts `threads` threads that drop whatever is sent to them, in order. Dropping can block
+/// (closing a watch on an offline share); a few fixed threads with a queue keep that off the
+/// sender without a thread per item.
+fn cleanup_pool<T: Send + 'static>(threads: usize) -> Sender<T> {
+    let (tx, rx) = unbounded::<T>();
+    for i in 0..threads {
+        let rx = rx.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("folder-watch-cleanup-{i}"))
+            .spawn(move || {
+                for item in rx {
+                    drop(item);
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("folder watch cleanup thread unavailable: {e}");
+        }
+    }
+    tx
 }
 
 impl Registrar {
     fn run(mut self, wanted: Receiver<HashSet<PathBuf>>, results: Receiver<Attempt>) {
         loop {
-            let wait = self
-                .next_retry()
-                .map_or(Duration::from_secs(3600), |at| {
-                    at.saturating_duration_since(Instant::now())
-                });
+            let wake = match (self.next_retry(), self.next_timeout()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let wait = wake.map_or(Duration::from_secs(3600), |at| {
+                at.saturating_duration_since(Instant::now())
+            });
             select! {
                 recv(wanted) -> set => match set {
                     Ok(mut set) => {
@@ -181,7 +228,9 @@ impl Registrar {
     fn release(&mut self, path: &Path) {
         match self.network_watchers.remove(path) {
             // Closing a handle on an offline share can block too: not on this thread.
-            Some(watcher) => drop(std::thread::spawn(move || drop(watcher))),
+            Some(watcher) => {
+                let _ = self.cleanup.send(watcher);
+            }
             None => {
                 let _ = self.local.send(LocalCommand::Unwatch(path.to_path_buf()));
             }
@@ -194,16 +243,24 @@ impl Registrar {
             network,
             result,
         } = attempt;
-        self.trying.remove(&path);
-        if network {
-            self.network_trying = self.network_trying.saturating_sub(1);
+        match self.trying.remove(&path) {
+            Some(Running {
+                timed_out: true, ..
+            }) => {
+                self.hung = self.hung.saturating_sub(1);
+                tracing::info!("a timed-out watch registration of {} finished", path.display());
+            }
+            _ if network => self.network_trying = self.network_trying.saturating_sub(1),
+            _ => {}
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !self.want.contains(&path) {
             drop(state);
             if let Ok(watcher) = result {
                 match watcher {
-                    Some(watcher) => drop(std::thread::spawn(move || drop(watcher))),
+                    Some(watcher) => {
+                        let _ = self.cleanup.send(watcher);
+                    }
                     None => {
                         let _ = self.local.send(LocalCommand::Unwatch(path));
                     }
@@ -239,7 +296,7 @@ impl Registrar {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
             .iter()
-            .filter(|(path, _)| !self.trying.contains(*path))
+            .filter(|(path, _)| !self.trying.contains_key(*path))
             .filter_map(|(_, r)| match r {
                 Registration::Failed { retry_at, .. } => Some(*retry_at),
                 _ => None,
@@ -247,14 +304,44 @@ impl Registrar {
             .min()
     }
 
+    /// When the oldest network attempt still holding a slot times out.
+    fn next_timeout(&self) -> Option<Instant> {
+        self.trying
+            .values()
+            .filter(|r| r.network && !r.timed_out)
+            .map(|r| r.started + self.register_timeout)
+            .min()
+    }
+
+    /// Frees the slots of network attempts that ran past the timeout. Their threads keep
+    /// running (they are stuck in a call that cannot be cancelled) and count as hung.
+    fn expire_timeouts(&mut self, now: Instant) {
+        for (path, running) in &mut self.trying {
+            if running.network
+                && !running.timed_out
+                && now.saturating_duration_since(running.started) >= self.register_timeout
+            {
+                running.timed_out = true;
+                self.network_trying = self.network_trying.saturating_sub(1);
+                self.hung += 1;
+                tracing::warn!(
+                    "watching {} has not answered for {:?}; registering other shares meanwhile",
+                    path.display(),
+                    self.register_timeout
+                );
+            }
+        }
+    }
+
     /// Starts an attempt for every wanted folder that is new or due for a retry.
     fn start_due(&mut self) {
         let now = Instant::now();
+        self.expire_timeouts(now);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut due: Vec<PathBuf> = self
             .want
             .iter()
-            .filter(|p| !self.trying.contains(*p))
+            .filter(|p| !self.trying.contains_key(*p))
             .filter(|p| match state.get(*p) {
                 None => true,
                 Some(Registration::Failed { retry_at, .. }) => *retry_at <= now,
@@ -266,8 +353,8 @@ impl Registrar {
         for path in due {
             let network = forge_core::netpath::is_network_path(&path);
             if network {
-                if self.network_trying >= NETWORK_SLOTS {
-                    continue; // Started when a slot frees up.
+                if self.network_trying >= NETWORK_SLOTS || self.hung >= HUNG_CAP {
+                    continue; // Started when a slot frees up (or a stuck attempt ends).
                 }
                 self.network_trying += 1;
                 let (sink, results, target) =
@@ -299,7 +386,14 @@ impl Registrar {
             if !matches!(state.get(&path), Some(Registration::Failed { .. })) {
                 state.insert(path.clone(), Registration::Trying);
             }
-            self.trying.insert(path);
+            self.trying.insert(
+                path,
+                Running {
+                    network,
+                    started: now,
+                    timed_out: false,
+                },
+            );
         }
     }
 }
@@ -328,10 +422,15 @@ fn local_loop(mut watcher: RecommendedWatcher, commands: Receiver<LocalCommand>,
 
 impl FolderWatcher {
     pub fn new(ctx: egui::Context) -> Self {
-        Self::with_backoff(ctx, RETRY_BACKOFF.to_vec())
+        Self::with_timing(ctx, RETRY_BACKOFF.to_vec(), REGISTER_TIMEOUT)
     }
 
+    #[cfg(test)]
     fn with_backoff(ctx: egui::Context, backoff: Vec<Duration>) -> Self {
+        Self::with_timing(ctx, backoff, REGISTER_TIMEOUT)
+    }
+
+    fn with_timing(ctx: egui::Context, backoff: Vec<Duration>, register_timeout: Duration) -> Self {
         let (tx, rx) = unbounded();
         let shown = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
         let sink = EventSink {
@@ -340,7 +439,8 @@ impl FolderWatcher {
             repaint: ctx.clone(),
         };
         let registrations = Arc::new(Mutex::new(HashMap::new()));
-        let register = Self::start_registrar(sink, backoff, Arc::clone(&registrations));
+        let register =
+            Self::start_registrar(sink, backoff, register_timeout, Arc::clone(&registrations));
         Self {
             register,
             registrations,
@@ -356,6 +456,7 @@ impl FolderWatcher {
     fn start_registrar(
         sink: EventSink,
         backoff: Vec<Duration>,
+        register_timeout: Duration,
         state: Arc<Mutex<HashMap<PathBuf, Registration>>>,
     ) -> Option<Sender<HashSet<PathBuf>>> {
         let watcher = notify::recommended_watcher(sink.clone().handler())
@@ -381,8 +482,11 @@ impl FolderWatcher {
             results: results_tx,
             network_watchers: HashMap::new(),
             network_trying: 0,
+            hung: 0,
+            register_timeout,
+            cleanup: cleanup_pool(CLEANUP_THREADS),
             want: HashSet::new(),
-            trying: HashSet::new(),
+            trying: HashMap::new(),
             state,
         };
         std::thread::Builder::new()
@@ -594,6 +698,59 @@ mod tests {
         // ...and once it appears, a retry watches it without the set changing.
         std::fs::create_dir(&later).unwrap();
         assert!(watcher.wait_watched(&later, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_hung_registration_frees_its_slot_after_the_timeout() {
+        // More stalled shares than slots: without the timeout the last one would wait until
+        // a stuck attempt gave up (about 20 s); with it, it starts right after the timeout.
+        let base = stalled_share();
+        let host = |i: usize| {
+            let text = base.to_string_lossy().into_owned();
+            let rest = text.trim_start_matches(r"\\192.0.2.");
+            let first: usize = rest.split('\\').next().unwrap().parse().unwrap();
+            PathBuf::from(format!(r"\\192.0.2.{}\x", 2 + (first + i * 7) % 250))
+        };
+        let shares: Vec<PathBuf> = (0..=NETWORK_SLOTS).map(host).collect();
+        let mut watcher = FolderWatcher::with_timing(
+            egui::Context::default(),
+            RETRY_BACKOFF.to_vec(),
+            Duration::from_millis(200),
+        );
+        watcher.sync(&shares);
+        let last = shares.last().unwrap();
+        let started = Instant::now();
+        while watcher.registration(last).is_none() && started.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            watcher.registration(last).is_some(),
+            "the last share never got a slot"
+        );
+    }
+
+    #[test]
+    fn the_cleanup_pool_drops_on_a_fixed_number_of_threads() {
+        struct SlowDrop(Sender<std::thread::ThreadId>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                std::thread::sleep(Duration::from_millis(20));
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let pool = cleanup_pool::<SlowDrop>(2);
+        let (tx, rx) = unbounded();
+        let started = Instant::now();
+        for _ in 0..12 {
+            pool.send(SlowDrop(tx.clone())).unwrap();
+        }
+        // Sending never waits for a drop.
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let threads: HashSet<std::thread::ThreadId> = (0..12)
+            .map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert!(threads.len() <= 2, "{} threads dropped items", threads.len());
+        assert!(!threads.contains(&std::thread::current().id()));
     }
 
     #[test]

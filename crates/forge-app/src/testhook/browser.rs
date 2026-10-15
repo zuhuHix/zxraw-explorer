@@ -20,6 +20,8 @@
 //!   Waits until the arrow is on screen.
 //! - `assert-no-dialog`: no dialog (prompt, confirmation, report) is open.
 //! - `assert-prompt-error <text>`: a name prompt is open and its error contains `<text>`.
+//! - `hold-name-lane <path> | <ms>`: keep the rename/new-item lane of `<path>` busy for
+//!   `<ms>` milliseconds, as a rename stuck on an unresponsive share would.
 //! - `click-control <name>`: real pointer click on a named control (`group-similar`: the grid's
 //!   "Group bursts & similar" toggle). Waits until it is on screen.
 //! - `assert-grouping on|off`: whether burst grouping is on in the focused pane.
@@ -269,6 +271,21 @@ pub(super) fn step(
                 };
                 Err(format!("{what} is open"))
             }
+        }
+        "hold-name-lane" => {
+            let (path, ms) = args
+                .rsplit_once('|')
+                .ok_or("expected `hold-name-lane <path> | <ms>`")?;
+            let ms: u64 = ms
+                .trim()
+                .parse()
+                .map_err(|_| format!("expected milliseconds, got `{}`", ms.trim()))?;
+            crate::actions::hold_name_lane(
+                app,
+                std::path::Path::new(path.trim()),
+                Duration::from_millis(ms),
+            );
+            Ok(Flow::Done)
         }
         "assert-prompt-error" => {
             let expected = args.trim();
