@@ -825,7 +825,8 @@ fn handle_focused_view_keys(
                 false
             }
             egui::Event::Paste(_) => {
-                if !seen_commands.contains(&Cmd::Paste) {
+                // Once per fresh Ctrl+V or Shift+Insert press. See `paste_key`.
+                if !seen_commands.contains(&Cmd::Paste) && crate::paste_key::take_file_paste() {
                     seen_commands.push(Cmd::Paste);
                 }
                 false

@@ -632,7 +632,10 @@ impl ZxrawApp {
                     match ev {
                         egui::Event::Copy => cmds.push(Cmd::Copy),
                         egui::Event::Cut => cmds.push(Cmd::Cut),
-                        egui::Event::Paste(_) => cmds.push(Cmd::Paste),
+                        // Once per fresh Ctrl+V or Shift+Insert press. See `paste_key`.
+                        egui::Event::Paste(_) if crate::paste_key::take_file_paste() => {
+                            cmds.push(Cmd::Paste)
+                        }
                         _ => {}
                     }
                 }

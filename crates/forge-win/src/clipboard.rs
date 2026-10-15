@@ -183,8 +183,8 @@ pub fn clipboard_has_text() -> bool {
     false
 }
 
-/// Whether `msg` (a `*const MSG` from a message loop hook) is a key press of the paste
-/// shortcut: Ctrl+V or Shift+Insert, as egui-winit recognises them.
+/// Whether `msg` (a `*const MSG` from a message loop hook) is a fresh key press of the paste
+/// shortcut: exactly Ctrl+V or Shift+Insert. Auto-repeats of a held key do not count.
 #[cfg(windows)]
 pub fn is_paste_keydown(msg: *const std::ffi::c_void) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
@@ -202,11 +202,14 @@ pub fn is_paste_keydown(msg: *const std::ffi::c_void) -> bool {
     let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe {
         GetKeyState(i32::from(vk.0)) < 0
     };
+    // Bit 30 of lParam is the previous key state: set for an auto-repeat.
+    let repeat = msg.lParam.0 & (1 << 30) != 0;
     paste_chord(
         msg.wParam.0 as u16,
         down(VK_CONTROL),
         down(VK_SHIFT),
         down(VK_MENU),
+        repeat,
     )
 }
 
@@ -215,12 +218,12 @@ pub fn is_paste_keydown(_msg: *const std::ffi::c_void) -> bool {
     false
 }
 
-/// Ctrl+V or Shift+Insert for virtual key `vk` and the modifier state. Alt excludes both,
-/// so AltGr (Ctrl+Alt) combinations stay text input.
-fn paste_chord(vk: u16, ctrl: bool, shift: bool, alt: bool) -> bool {
+/// Exactly Ctrl+V or Shift+Insert for virtual key `vk` and the modifier state, and not an
+/// auto-repeat. Extra modifiers (Ctrl+Shift+V, AltGr+V) are other shortcuts or text input.
+fn paste_chord(vk: u16, ctrl: bool, shift: bool, alt: bool, repeat: bool) -> bool {
     const VK_V: u16 = b'V' as u16;
     const VK_INSERT: u16 = 0x2D;
-    !alt && ((ctrl && vk == VK_V) || (shift && !ctrl && vk == VK_INSERT))
+    !repeat && !alt && ((vk == VK_V && ctrl && !shift) || (vk == VK_INSERT && shift && !ctrl))
 }
 
 /// Empties the clipboard if its sequence (when provided) and ordered path list match.
@@ -786,13 +789,21 @@ mod paste_key_tests {
 
     #[test]
     fn paste_chord_matches_ctrl_v_and_shift_insert_only() {
-        assert!(paste_chord(b'V' as u16, true, false, false));
-        assert!(paste_chord(b'V' as u16, true, true, false));
-        assert!(paste_chord(0x2D, false, true, false));
-        assert!(!paste_chord(b'V' as u16, false, false, false));
-        assert!(!paste_chord(b'V' as u16, true, false, true));
-        assert!(!paste_chord(b'C' as u16, true, false, false));
-        assert!(!paste_chord(0x2D, true, true, false));
-        assert!(!paste_chord(0x2D, false, false, false));
+        let v = b'V' as u16;
+        assert!(paste_chord(v, true, false, false, false));
+        assert!(paste_chord(0x2D, false, true, false, false));
+        assert!(!paste_chord(v, true, true, false, false), "Ctrl+Shift+V");
+        assert!(!paste_chord(v, false, false, false, false));
+        assert!(!paste_chord(v, true, false, true, false), "AltGr+V");
+        assert!(!paste_chord(b'C' as u16, true, false, false, false));
+        assert!(!paste_chord(0x2D, true, true, false, false));
+        assert!(!paste_chord(0x2D, false, true, true, false));
+        assert!(!paste_chord(0x2D, false, false, false, false));
+    }
+
+    #[test]
+    fn auto_repeat_of_a_held_paste_key_does_not_count() {
+        assert!(!paste_chord(b'V' as u16, true, false, false, true));
+        assert!(!paste_chord(0x2D, false, true, false, true));
     }
 }

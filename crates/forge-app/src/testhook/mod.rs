@@ -973,7 +973,10 @@ fn as_winit_delivers(events: &[egui::Event], clipboard_has_text: bool) -> (Vec<e
         } else if (m.command && key == Key::C) || (m.ctrl && key == Key::Insert) {
             out.push(egui::Event::Copy);
         } else if (m.command && key == Key::V) || (m.shift && key == Key::Insert) {
-            if !m.alt && (key == Key::V || !m.ctrl) {
+            // The message hook counts exactly Ctrl+V and Shift+Insert.
+            let exact = !m.alt
+                && ((key == Key::V && !m.shift) || (key == Key::Insert && !m.ctrl));
+            if exact {
                 pastes += 1;
             }
             if clipboard_has_text {
