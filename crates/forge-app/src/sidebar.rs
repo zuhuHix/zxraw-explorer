@@ -533,8 +533,8 @@ fn collections_section(app: &mut ZxrawApp, ui: &mut Ui) {
             if menu_item(
                 ui,
                 "Manage collections…",
-                "Open the Collections window: browse, rename, reorder and delete collections \
-                 and saved searches",
+                "Browse, rename and delete collections and saved searches; reorder items \
+                 within a collection",
             ) {
                 app.ops.collections_ui.open = true;
             }
