@@ -60,6 +60,80 @@ struct NotesDraft {
     saving: Option<PendingSave>,
     /// Why the last save failed. Cleared by the next edit or save.
     error: Option<String>,
+    /// A draft brought back from [`TagsUi::left_behind`] waits for a fresh read of the
+    /// database before it may be saved: the note may have changed meanwhile (a move onto
+    /// another annotated file merges both notes).
+    check_db: bool,
+    /// The database's note when it changed since this draft was taken. Nothing is saved until
+    /// the user chooses which text to keep.
+    conflict: Option<String>,
+}
+
+impl NotesDraft {
+    fn new(path: PathBuf, text: String) -> Self {
+        NotesDraft {
+            path,
+            saved: text.clone(),
+            text,
+            changed_at: None,
+            saving: None,
+            error: None,
+            check_db: false,
+            conflict: None,
+        }
+    }
+
+    /// Compares a brought-back draft with the database's current `note`.
+    fn check_against(&mut self, note: String) {
+        self.check_db = false;
+        if self.text == self.saved || note.trim() == self.saved.trim() {
+            return;
+        }
+        if note.trim() == self.text.trim() {
+            // The edit is already in the database.
+            self.saved = self.text.clone();
+            self.error = None;
+        } else {
+            self.conflict = Some(note);
+        }
+    }
+
+    /// Settles a conflict: the database's note, the draft, or both joined. The database's
+    /// note becomes what is confirmed, so a chosen draft is saved after the autosave pause.
+    fn resolve(&mut self, choice: ConflictChoice, now: Instant) {
+        let Some(note) = self.conflict.take() else {
+            return;
+        };
+        self.error = None;
+        match choice {
+            ConflictChoice::KeepSaved => {
+                self.text = note.clone();
+                self.changed_at = None;
+            }
+            ConflictChoice::UseDraft => self.changed_at = Some(now),
+            ConflictChoice::Merge => {
+                self.text = merged_note(&self.text, &note);
+                self.changed_at = Some(now);
+            }
+        }
+        self.saved = note;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConflictChoice {
+    KeepSaved,
+    UseDraft,
+    Merge,
+}
+
+/// The draft and the database's note joined, as the database joins two notes on a move.
+fn merged_note(draft: &str, note: &str) -> String {
+    match (draft.trim(), note.trim()) {
+        ("", note) => note.to_string(),
+        (draft, "") => draft.to_string(),
+        (draft, note) => format!("{draft}\n\n--- merged note ---\n\n{note}"),
+    }
 }
 
 struct PendingSave {
@@ -99,10 +173,18 @@ enum NoteStatus {
     Saved,
     Failed(String),
     Empty,
+    /// A brought-back draft waits for the database's note.
+    Checking,
+    /// The database's note changed since the draft was taken.
+    Conflict,
 }
 
 fn note_status(draft: &NotesDraft) -> NoteStatus {
-    if draft.saving.is_some() {
+    if draft.conflict.is_some() {
+        NoteStatus::Conflict
+    } else if draft.check_db && draft.saving.is_none() && draft.text != draft.saved {
+        NoteStatus::Checking
+    } else if draft.saving.is_some() {
         NoteStatus::Saving
     } else if draft.text != draft.saved {
         match &draft.error {
@@ -117,9 +199,13 @@ fn note_status(draft: &NotesDraft) -> NoteStatus {
 }
 
 /// True when the text needs saving: it differs from what is confirmed and from any save in
-/// flight.
+/// flight. A draft not yet compared with the database, or in conflict with it, is never
+/// saved.
 fn note_dirty(draft: &NotesDraft) -> bool {
-    draft.text != draft.saved && draft.saving.as_ref().is_none_or(|p| p.text != draft.text)
+    draft.text != draft.saved
+        && draft.saving.as_ref().is_none_or(|p| p.text != draft.text)
+        && !draft.check_db
+        && draft.conflict.is_none()
 }
 
 /// True when the text needs saving and has been left alone for the autosave pause. After a
@@ -461,6 +547,7 @@ impl TagsUi {
             _ => None,
         };
         if self.notes.as_ref().map(|d| &d.path) == want.as_ref() {
+            self.check_restored_note();
             return;
         }
         self.save_notes(library, ctx);
@@ -472,9 +559,12 @@ impl TagsUi {
         let Some(path) = want else {
             return;
         };
-        // Back on a file whose save is unconfirmed: show that draft, not the database text.
-        if let Some(draft) = self.left_behind.remove(&path) {
+        // Back on a file whose save is unconfirmed: show that draft, not the database text,
+        // and compare it with what the database has now before saving it.
+        if let Some(mut draft) = self.left_behind.remove(&path) {
+            draft.check_db = true;
             self.notes = Some(draft);
+            self.check_restored_note();
             return;
         }
         let Some(cache) = self.cache.as_ref() else {
@@ -488,14 +578,36 @@ impl TagsUi {
             .find(|(p, _)| *p == path)
             .and_then(|(_, a)| a.notes.clone())
             .unwrap_or_default();
-        self.notes = Some(NotesDraft {
-            path,
-            saved: text.clone(),
-            text,
-            changed_at: None,
-            saving: None,
-            error: None,
-        });
+        self.notes = Some(NotesDraft::new(path, text));
+    }
+
+    /// Compares a brought-back draft with the database once its save in flight is answered
+    /// and a read of the file, started after the selection changed, is in.
+    fn check_restored_note(&mut self) {
+        let Some(draft) = self.notes.as_mut().filter(|d| d.check_db) else {
+            return;
+        };
+        if draft.saving.is_some() {
+            return;
+        }
+        if draft.text == draft.saved {
+            draft.check_db = false;
+            return;
+        }
+        let Some(files) = self
+            .cache
+            .as_ref()
+            .filter(|c| c.paths.len() == 1 && c.paths[0] == draft.path)
+            .and_then(|c| c.files.as_ref())
+        else {
+            return;
+        };
+        let note = files
+            .iter()
+            .find(|(p, _)| *p == draft.path)
+            .and_then(|(_, a)| a.notes.clone())
+            .unwrap_or_default();
+        draft.check_against(note);
     }
 
     /// Files ZXraw moved or renamed: the note being edited, and the selection it belongs to,
@@ -734,12 +846,64 @@ pub fn flush_for_exit(app: &mut ZxrawApp) {
     }
 }
 
-/// The note to keep for the next start when the database has not confirmed the draft.
+/// The note to keep for the next start when the database has not confirmed the draft. A
+/// draft in conflict keeps both texts, so the database's note is never overwritten unseen.
 fn unconfirmed_note(draft: &NotesDraft) -> Option<crate::library::PendingNote> {
-    (draft.text != draft.saved).then(|| crate::library::PendingNote {
-        path: draft.path.clone(),
-        note: Some(draft.text.trim().to_string()).filter(|n| !n.is_empty()),
+    (draft.text != draft.saved).then(|| {
+        let text = match &draft.conflict {
+            Some(note) => merged_note(&draft.text, note),
+            None => draft.text.trim().to_string(),
+        };
+        crate::library::PendingNote {
+            path: draft.path.clone(),
+            note: Some(text).filter(|n| !n.is_empty()),
+        }
     })
+}
+
+/// The database's note changed since the unsaved edit was made: the user picks what to keep.
+fn show_note_conflict(draft: &mut NotesDraft, ui: &mut Ui, now: Instant) {
+    let Some(note) = &draft.conflict else {
+        return;
+    };
+    let saved = if note.trim().is_empty() {
+        "The saved note is now empty.".to_string()
+    } else {
+        format!("The saved note is now:\n{note}")
+    };
+    ui.label(
+        RichText::new("This note changed since your unsaved edit.")
+            .small()
+            .color(ui.visuals().warn_fg_color),
+    )
+    .on_hover_text(saved);
+    let mut choice = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .small_button("Keep saved version")
+            .on_hover_text("Drop your edit and show the saved note.")
+            .clicked()
+        {
+            choice = Some(ConflictChoice::KeepSaved);
+        }
+        if ui
+            .small_button("Use my edit")
+            .on_hover_text("Replace the saved note with your edit.")
+            .clicked()
+        {
+            choice = Some(ConflictChoice::UseDraft);
+        }
+        if ui
+            .small_button("Merge both")
+            .on_hover_text("Keep your edit and the saved note, one after the other.")
+            .clicked()
+        {
+            choice = Some(ConflictChoice::Merge);
+        }
+    });
+    if let Some(choice) = choice {
+        draft.resolve(choice, now);
+    }
 }
 
 /// Notes of other files whose save failed: kept, and named so they can be selected and retried.
@@ -964,11 +1128,22 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut Ui, entry: &FileEntry) {
 Edit it or leave the field to try again."
                             ));
                     }
+                    NoteStatus::Checking => {
+                        ui.label(RichText::new("Checking…").weak());
+                    }
+                    NoteStatus::Conflict => {
+                        ui.label(
+                            RichText::new("Changed elsewhere").color(ui.visuals().warn_fg_color),
+                        );
+                    }
                     NoteStatus::Empty => {}
                 },
             );
         });
         show_failed_left_behind(st, ui);
+        if let Some(draft) = st.notes.as_mut() {
+            show_note_conflict(draft, ui, now);
+        }
         let mut lost_focus = false;
         match st.notes.as_mut() {
             Some(draft) => {
@@ -1296,6 +1471,8 @@ mod tests {
             changed_at,
             saving: None,
             error: None,
+            check_db: false,
+            conflict: None,
         }
     }
 
@@ -1411,6 +1588,71 @@ mod tests {
         assert_eq!(d.text, "client proof");
         assert_eq!(note_status(d), NoteStatus::Failed("disk full".into()));
         assert!(st.left_behind.is_empty());
+    }
+
+    #[test]
+    fn a_brought_back_draft_never_overwrites_a_note_that_changed_meanwhile() {
+        let mut st = TagsUi::default();
+        let ctx = egui::Context::default();
+        let mut library = crate::library::test_library(std::sync::Arc::new(
+            forge_db::Db::open_in_memory().unwrap(),
+        ));
+        let (a, b) = (PathBuf::from("a.jpg"), PathBuf::from("b.jpg"));
+        let failed = || NotesDraft {
+            path: a.clone(),
+            error: Some("disk full".into()),
+            ..draft("my edit", "old", None)
+        };
+        let mut select = |st: &mut TagsUi, path: &PathBuf, note: Option<&str>| {
+            st.sync_selection(std::slice::from_ref(path));
+            st.sync_notes(&mut library, &ctx);
+            // Until the read of the newly selected file is in, a brought-back draft waits.
+            if let Some(d) = st.notes.as_ref().filter(|d| d.path == *path && d.check_db) {
+                assert_eq!(note_status(d), NoteStatus::Checking);
+                assert!(!note_dirty(d));
+            }
+            let annotation = Annotation { notes: note.map(str::to_string), ..Default::default() };
+            st.cache.as_mut().unwrap().files = Some(vec![(path.clone(), annotation)]);
+            st.sync_notes(&mut library, &ctx);
+        };
+
+        // The note was merged by a move while the edit waited: a conflict, nothing is saved.
+        st.left_behind.insert(a.clone(), failed());
+        select(&mut st, &a, Some("merged"));
+        let d = st.notes.as_mut().unwrap();
+        assert_eq!(note_status(d), NoteStatus::Conflict);
+        assert_eq!(d.text, "my edit");
+        assert!(!note_dirty(d), "a conflict is never saved on its own");
+        assert_eq!(
+            unconfirmed_note(d).unwrap().note.as_deref(),
+            Some("my edit\n\n--- merged note ---\n\nmerged"),
+            "kept at exit with both texts"
+        );
+        let now = Instant::now();
+        d.resolve(ConflictChoice::KeepSaved, now);
+        assert_eq!((d.text.as_str(), note_status(d)), ("merged", NoteStatus::Saved));
+
+        let mut d = failed();
+        d.conflict = Some("merged".into());
+        d.resolve(ConflictChoice::UseDraft, now);
+        assert_eq!(d.text, "my edit");
+        assert!(note_dirty(&d) && d.changed_at == Some(now), "saved after the pause");
+
+        let mut d = failed();
+        d.conflict = Some("merged".into());
+        d.resolve(ConflictChoice::Merge, now);
+        assert_eq!(d.text, "my edit\n\n--- merged note ---\n\nmerged");
+        assert_eq!(d.saved, "merged");
+        assert!(note_dirty(&d));
+
+        // Unchanged in the database: the draft is offered for saving again.
+        st.notes = None;
+        select(&mut st, &b, None);
+        st.left_behind.insert(a.clone(), failed());
+        select(&mut st, &a, Some("old"));
+        let d = st.notes.as_ref().unwrap();
+        assert_eq!(note_status(d), NoteStatus::Failed("disk full".into()));
+        assert!(note_dirty(d));
     }
 
     #[test]
