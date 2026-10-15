@@ -19,6 +19,7 @@
 //! - `click-arrow <name>`: real pointer click on a folder's disclosure arrow (details view).
 //!   Waits until the arrow is on screen.
 //! - `assert-no-dialog`: no dialog (prompt, confirmation, report) is open.
+//! - `assert-prompt-error <text>`: a name prompt is open and its error contains `<text>`.
 //! - `click-control <name>`: real pointer click on a named control (`group-similar`: the grid's
 //!   "Group bursts & similar" toggle). Waits until it is on screen.
 //! - `assert-grouping on|off`: whether burst grouping is on in the focused pane.
@@ -267,6 +268,20 @@ pub(super) fn step(
                     _ => "a dialog".to_string(),
                 };
                 Err(format!("{what} is open"))
+            }
+        }
+        "assert-prompt-error" => {
+            let expected = args.trim();
+            match &app.ops.modal {
+                Some(crate::modal::Modal::Prompt(p))
+                    if p.error.as_deref().is_some_and(|e| e.contains(expected)) =>
+                {
+                    Ok(Flow::Done)
+                }
+                Some(crate::modal::Modal::Prompt(p)) => {
+                    Err(format!("the prompt's error is {:?}", p.error))
+                }
+                _ => Err("no prompt is open".into()),
             }
         }
         "assert-depths" => {

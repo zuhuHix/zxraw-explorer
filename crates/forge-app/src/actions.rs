@@ -38,6 +38,11 @@ pub enum Event {
         dir: PathBuf,
         name: String,
     },
+    /// A name prompt's new name was taken: the prompt opens again with the error.
+    NameConflict(crate::modal::Prompt),
+    /// A job of the name lane finished. Sent after all its other events, so once the count of
+    /// pending name jobs is back to zero, their undo records are already on the stack.
+    NameJobDone,
     /// Our Copy/Cut reached the Windows clipboard (`Ok(sequence)`) or failed.
     ClipboardPublished {
         generation: u64,
@@ -146,6 +151,11 @@ fn choose_paste_source(
 pub struct Actions {
     pub modal: Option<Modal>,
     pub undo: Vec<UndoEntry>,
+    /// Rename, new-item and rename-undo jobs run one at a time on this lane.
+    name_lane: NameLane,
+    /// Name jobs started and not yet reported done ([`Event::NameJobDone`]). Undo waits
+    /// for zero, so it never acts on the record before the one a pending rename will push.
+    name_jobs_pending: usize,
     pub conflicts: std::collections::VecDeque<crate::ops_ui::ConflictQuestion>,
     pub clipboard: Option<FileClipboard>,
     clipboard_generation: u64,
@@ -205,6 +215,8 @@ impl Actions {
         Self {
             modal: None,
             undo: Vec::new(),
+            name_lane: NameLane::new(),
+            name_jobs_pending: 0,
             conflicts: Default::default(),
             clipboard: None,
             clipboard_generation: 0,
@@ -569,6 +581,11 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             app.ops.library.search.open = true;
             app.ops.library.search.focus = true;
         }
+        // While a rename (or an undo) is still running, its undo record is not on the stack
+        // yet: undoing now would act on the operation before it. Undo waits instead.
+        Cmd::Undo if app.ops.name_jobs_pending > 0 => {
+            app.toast("Waiting for the rename to finish; try Undo again in a moment")
+        }
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
@@ -641,11 +658,107 @@ impl NameJob {
                         "a file with that name already exists",
                     ))
                 } else {
-                    std::fs::rename(from, to)
+                    rename_no_replace_one(from, to, case_only)
                 }
             }
         }
     }
+
+    /// The prompt to show again when the new name turned out to be taken.
+    fn conflict_prompt(&self, name: &str, error: String) -> crate::modal::Prompt {
+        let parent = |p: &Path| p.parent().map(Path::to_path_buf).unwrap_or_default();
+        let kind = match self {
+            NameJob::NewFolder(p) => PromptKind::NewFolder { dir: parent(p) },
+            NameJob::NewFile(p) => PromptKind::NewFile { dir: parent(p) },
+            NameJob::Rename { from, .. } => PromptKind::Rename { path: from.clone() },
+        };
+        let mut prompt = crate::modal::Prompt::new(kind, self.verb(), name);
+        prompt.error = Some(error);
+        prompt
+    }
+}
+
+/// Renames `from` to `to` without ever replacing an entry at `to`, even one created after
+/// any check (two renames racing for one name: the second fails). A case-only rename goes
+/// through a temporary name, with rollback; see [`forge_core::rename::rename_paths`].
+fn rename_no_replace_one(from: &Path, to: &Path, case_only: bool) -> std::io::Result<()> {
+    use forge_core::rename::RenameStatus;
+    let report = forge_core::rename::rename_paths(&[(from.to_path_buf(), to.to_path_buf())]);
+    match report.status {
+        RenameStatus::Completed | RenameStatus::NothingToDo => Ok(()),
+        // Refused by the move itself: the name was taken after (or despite) the check above.
+        _ if !case_only && forge_core::paths::exists_no_follow(to) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "a file with that name already exists",
+        )),
+        RenameStatus::RollbackIncomplete { error, .. } => {
+            let left = report
+                .stranded
+                .first()
+                .map(|s| format!("; it is now at {}", s.current.display()))
+                .unwrap_or_default();
+            Err(std::io::Error::other(format!("{error}{left}")))
+        }
+        RenameStatus::RolledBack { error, .. } => Err(std::io::Error::other(error)),
+        other => Err(std::io::Error::other(format!("{other:?}"))),
+    }
+}
+
+/// A single worker that runs rename, new-item and rename-undo work strictly in the order it
+/// was submitted from the UI thread. Two renames never race each other, and an undo always
+/// runs after the operation it undoes.
+struct NameLane {
+    tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl NameLane {
+    fn new() -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
+        let spawned = std::thread::Builder::new()
+            .name("name-jobs".into())
+            .spawn(move || {
+                for work in rx {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("name job lane unavailable, running name jobs on their own threads: {e}");
+        }
+        Self { tx }
+    }
+
+    fn submit(&self, work: Box<dyn FnOnce() + Send>) {
+        if let Err(crossbeam_channel::SendError(work)) = self.tx.send(work) {
+            // No lane thread: run it anyway rather than drop a user's action.
+            std::thread::spawn(work);
+        }
+    }
+}
+
+/// Queues `work` on the name lane and shows it in the Operations panel as a job titled
+/// `title`, which runs until the work is done. `work` returns the job's result and sends its
+/// own events; [`Event::NameJobDone`] follows them.
+fn submit_name_job(
+    app: &mut ZxrawApp,
+    kind: &str,
+    title: String,
+    work: impl FnOnce() -> Result<(), String> + Send + 'static,
+) {
+    let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    app.ops.name_jobs_pending += 1;
+    app.ops.name_lane.submit(Box::new(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+            .unwrap_or_else(|_| Err("internal error".to_string()));
+        let _ = tx.send(Event::NameJobDone);
+        ctx.request_repaint();
+        let _ = done_tx.send(result);
+    }));
+    app.ops.jobs.spawn(kind, title, move |_job| {
+        done_rx
+            .recv()
+            .unwrap_or_else(|_| Err("internal error".to_string()))
+    });
 }
 
 /// Runs `job` as a background operation. Success refreshes `dir` and selects `name` in it (a
@@ -657,7 +770,7 @@ fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) 
         NameJob::NewFolder(_) => ("create", format!("Creating folder {name}")),
         NameJob::NewFile(_) => ("create", format!("Creating file {name}")),
     };
-    app.ops.jobs.spawn(kind, title, move |_job| {
+    submit_name_job(app, kind, title, move || {
         let result = job.run();
         match &result {
             Ok(()) => {
@@ -670,6 +783,9 @@ fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) 
                 }
                 let _ = tx.send(Event::Changed(dir.clone()));
                 let _ = tx.send(Event::SelectNew { dir, name });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = tx.send(Event::NameConflict(job.conflict_prompt(&name, e.to_string())));
             }
             Err(e) => {
                 let _ = tx.send(Event::Error(format!("{} failed: {e}", job.verb())));
@@ -685,10 +801,11 @@ fn spawn_name_job(app: &mut ZxrawApp, job: NameJob, dir: PathBuf, name: String) 
 fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
     let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
     let n = pairs.len();
-    app.ops.jobs.spawn(
+    submit_name_job(
+        app,
         "undo",
         format!("Undoing rename of {n} item(s)"),
-        move |_job| {
+        move || {
             use forge_core::rename::RenameStatus;
             let r = forge_core::rename::undo(&pairs);
             let completed = r.status == RenameStatus::Completed;
@@ -979,6 +1096,20 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 }
             }
             Event::FilesMoved(pairs) => follow_moves(app, pairs),
+            Event::NameJobDone => {
+                app.ops.name_jobs_pending = app.ops.name_jobs_pending.saturating_sub(1);
+            }
+            Event::NameConflict(prompt) => {
+                if app.ops.modal.is_none() {
+                    app.ops.modal = Some(Modal::Prompt(prompt));
+                } else {
+                    app.toast_err(format!(
+                        "{} failed: {}",
+                        prompt.title,
+                        prompt.error.unwrap_or_default()
+                    ));
+                }
+            }
             Event::SelectNew { dir, name } => {
                 let pane = app.pane_mut();
                 if pane.path == dir || pane.shows_children_of(&dir) {
@@ -1403,6 +1534,77 @@ mod name_job_tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["PHOTO.jpg"]);
+    }
+
+    #[test]
+    fn two_concurrent_renames_to_one_name_end_in_one_success_and_one_conflict() {
+        for _ in 0..20 {
+            let d = tempfile::tempdir().unwrap();
+            let target = d.path().join("final.txt");
+            let sources = [d.path().join("a.txt"), d.path().join("b.txt")];
+            std::fs::write(&sources[0], b"from a").unwrap();
+            std::fs::write(&sources[1], b"from b").unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = sources
+                .iter()
+                .map(|from| {
+                    let job = NameJob::Rename {
+                        from: from.clone(),
+                        to: target.clone(),
+                    };
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        job.run()
+                    })
+                })
+                .collect();
+            let results: Vec<std::io::Result<()>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{results:?}");
+            let conflict = results.iter().find_map(|r| r.as_ref().err()).unwrap();
+            assert_eq!(conflict.kind(), std::io::ErrorKind::AlreadyExists);
+            // Nothing lost: one file has the final name, the other is still under its own.
+            let mut contents: Vec<Vec<u8>> = std::fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| std::fs::read(e.unwrap().path()).unwrap())
+                .collect();
+            contents.sort();
+            assert_eq!(contents, [b"from a".to_vec(), b"from b".to_vec()]);
+        }
+    }
+
+    #[test]
+    fn the_name_lane_runs_work_in_submission_order() {
+        let lane = NameLane::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for i in 0..50u32 {
+            let tx = tx.clone();
+            lane.submit(Box::new(move || {
+                // Early items take longer: a lane that ran them side by side would reorder.
+                std::thread::sleep(std::time::Duration::from_micros(u64::from(50 - i) * 20));
+                let _ = tx.send(i);
+            }));
+        }
+        let got: Vec<u32> = (0..50)
+            .map(|_| rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(got, (0..50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_rename_conflict_reopens_the_prompt_for_that_item() {
+        let job = NameJob::Rename {
+            from: PathBuf::from(r"C:\work\a.txt"),
+            to: PathBuf::from(r"C:\work\b.txt"),
+        };
+        let prompt = job.conflict_prompt("b.txt", "a file with that name already exists".into());
+        assert!(matches!(&prompt.kind, PromptKind::Rename { path } if path == Path::new(r"C:\work\a.txt")));
+        assert_eq!(prompt.text, "b.txt");
+        assert_eq!(prompt.error.as_deref(), Some("a file with that name already exists"));
+        let folder = NameJob::NewFolder(PathBuf::from(r"C:\work\Fresh"));
+        let prompt = folder.conflict_prompt("Fresh", "exists".into());
+        assert!(matches!(&prompt.kind, PromptKind::NewFolder { dir } if dir == Path::new(r"C:\work")));
     }
 
     #[test]

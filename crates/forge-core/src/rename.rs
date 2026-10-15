@@ -19,10 +19,13 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::NaiveDate;
 use regex::{Regex, RegexBuilder};
 use thiserror::Error;
+
+use crate::paths::rename_no_replace;
 
 /// Characters Windows does not allow in a file name component.
 const INVALID_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
@@ -747,6 +750,14 @@ pub fn undo(pairs: &[(PathBuf, PathBuf)]) -> RenameReport {
     execute(pairs)
 }
 
+/// Moves each `(from, to)` pair with the same two-phase, all-or-nothing procedure as
+/// [`apply`], without previews: a single rename typed by the user, for example. Every step
+/// refuses to replace an existing entry, and a case-only rename (`a.jpg` -> `A.jpg`) goes
+/// through a temporary name, so it never meets itself.
+pub fn rename_paths(pairs: &[(PathBuf, PathBuf)]) -> RenameReport {
+    execute(pairs)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Loc {
     Original,
@@ -770,7 +781,7 @@ fn execute(pairs: &[(PathBuf, PathBuf)]) -> RenameReport {
     // Phase 1: every source to its temporary name. This breaks all chains and cycles.
     let mut failure: Option<(usize, io::Error)> = None;
     for i in 0..n {
-        match fs::rename(&pairs[i].0, &temps[i]) {
+        match rename_no_replace(&pairs[i].0, &temps[i]) {
             Ok(()) => loc[i] = Loc::Temp,
             Err(e) => {
                 failure = Some((i, e));
@@ -779,19 +790,12 @@ fn execute(pairs: &[(PathBuf, PathBuf)]) -> RenameReport {
         }
     }
 
-    // Phase 2: temporary names to final names. Never overwrite an existing entry.
+    // Phase 2: temporary names to final names. Never overwrite an existing entry: the move
+    // itself refuses an existing target (no check-then-rename window), so a concurrent rename
+    // or a file created meanwhile is never replaced.
     if failure.is_none() {
         for i in 0..n {
-            let to = &pairs[i].1;
-            let res = match fs::symlink_metadata(to) {
-                Ok(_) => Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "target name already exists",
-                )),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => fs::rename(&temps[i], to),
-                Err(e) => Err(e),
-            };
-            match res {
+            match rename_no_replace(&temps[i], &pairs[i].1) {
                 Ok(()) => loc[i] = Loc::Target,
                 Err(e) => {
                     failure = Some((i, e));
@@ -841,7 +845,7 @@ fn revert(pairs: &[(PathBuf, PathBuf)], temps: &[PathBuf], loc: &mut [Loc]) -> V
     let mut stranded = Vec::new();
     for i in (0..n).rev() {
         if loc[i] == Loc::Target {
-            match fs::rename(&pairs[i].1, &temps[i]) {
+            match rename_no_replace(&pairs[i].1, &temps[i]) {
                 Ok(()) => loc[i] = Loc::Temp,
                 Err(e) => stranded.push(StrandedFile {
                     current: pairs[i].1.clone(),
@@ -853,7 +857,7 @@ fn revert(pairs: &[(PathBuf, PathBuf)], temps: &[PathBuf], loc: &mut [Loc]) -> V
     }
     for i in (0..n).rev() {
         if loc[i] == Loc::Temp {
-            match fs::rename(&temps[i], &pairs[i].0) {
+            match rename_no_replace(&temps[i], &pairs[i].0) {
                 Ok(()) => loc[i] = Loc::Original,
                 Err(e) => stranded.push(StrandedFile {
                     current: temps[i].clone(),
@@ -868,11 +872,16 @@ fn revert(pairs: &[(PathBuf, PathBuf)], temps: &[PathBuf], loc: &mut [Loc]) -> V
 
 /// A free temporary name in the same folder as `from`.
 fn temp_path_for(from: &Path, index: usize) -> PathBuf {
+    // A per-process sequence number keeps two renames running at once from picking the same
+    // name (the move into it refuses an existing entry anyway, so a clash fails, never
+    // overwrites).
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let dir = from.parent().unwrap_or(Path::new(""));
     let pid = std::process::id();
+    let run = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut k = 0usize;
     loop {
-        let cand = dir.join(format!(".forge-rename-{pid}-{index}-{k}.tmp"));
+        let cand = dir.join(format!(".forge-rename-{pid}-{run}-{index}-{k}.tmp"));
         if fs::symlink_metadata(&cand).is_err() {
             return cand;
         }
@@ -1407,6 +1416,65 @@ mod tests {
         assert_eq!(read(&d.path().join("b.txt")), "A");
         assert_eq!(report.renamed.len(), 2);
         assert!(report.reverted.is_empty() && report.stranded.is_empty());
+    }
+
+    #[test]
+    fn rename_paths_does_a_case_only_rename() {
+        let d = tempfile::tempdir().unwrap();
+        let lower = d.path().join("a.jpg");
+        fs::write(&lower, b"photo").unwrap();
+        let upper = d.path().join("A.jpg");
+        let r = rename_paths(&[(lower.clone(), upper.clone())]);
+        assert_eq!(r.status, RenameStatus::Completed);
+        let names: Vec<String> = fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["A.jpg"]);
+        assert_eq!(fs::read(&upper).unwrap(), b"photo");
+    }
+
+    #[test]
+    fn rename_paths_never_replaces_an_existing_target() {
+        let d = tempfile::tempdir().unwrap();
+        let (a, b) = (d.path().join("a.txt"), d.path().join("b.txt"));
+        fs::write(&a, b"a").unwrap();
+        fs::write(&b, b"b").unwrap();
+        let r = rename_paths(&[(a.clone(), b.clone())]);
+        assert!(matches!(r.status, RenameStatus::RolledBack { .. }), "{:?}", r.status);
+        assert_eq!(fs::read(&a).unwrap(), b"a");
+        assert_eq!(fs::read(&b).unwrap(), b"b");
+    }
+
+    #[test]
+    fn two_concurrent_renames_to_one_name_lose_no_data() {
+        for _ in 0..20 {
+            let d = tempfile::tempdir().unwrap();
+            let (a, b) = (d.path().join("a.txt"), d.path().join("b.txt"));
+            let target = d.path().join("final.txt");
+            fs::write(&a, b"from a").unwrap();
+            fs::write(&b, b"from b").unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let run = |from: PathBuf| {
+                let (barrier, target) = (barrier.clone(), target.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    rename_paths(&[(from, target)]).status
+                })
+            };
+            let (first, second) = (run(a.clone()), run(b.clone()));
+            let statuses = [first.join().unwrap(), second.join().unwrap()];
+            let done = statuses.iter().filter(|s| **s == RenameStatus::Completed).count();
+            assert_eq!(done, 1, "{statuses:?}");
+            // One file has the final name, the other is back under its own name.
+            let mut contents: Vec<Vec<u8>> = fs::read_dir(d.path())
+                .unwrap()
+                .map(|e| fs::read(e.unwrap().path()).unwrap())
+                .collect();
+            contents.sort();
+            assert_eq!(contents, [b"from a".to_vec(), b"from b".to_vec()]);
+            assert!(target.exists());
+        }
     }
 
     #[test]
