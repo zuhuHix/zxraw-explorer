@@ -42,6 +42,9 @@ const NEW_BACKGROUND: Color32 = Color32::from_rgba_premultiplied(25, 67, 35, 90)
 
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Longest replacement text (characters) the form accepts.
+const MAX_REPLACEMENT_CHARS: usize = 64 * 1024;
+
 /// Every setting in the form. A preview is current only while the form equals the options it
 /// was made with.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,13 +106,21 @@ impl Options {
         })
     }
 
-    /// Validates the whole form: the regex (or empty search text) and the size limit.
+    /// Validates the whole form: the regex (or empty search text), the replacement length and
+    /// the size limit.
     fn check(&self) -> Result<ScanOptions, String> {
+        if self.replace.chars().count() > MAX_REPLACEMENT_CHARS {
+            return Err(replacement_limit_message());
+        }
         self.search_spec()
             .compile()
             .map_err(|error| error.to_string())?;
         self.scan_options()
     }
+}
+
+fn replacement_limit_message() -> String {
+    format!("Replace with is limited to {MAX_REPLACEMENT_CHARS} characters.")
 }
 
 /// True when a preview made with `previewed` no longer describes what the form asks for.
@@ -553,9 +564,19 @@ fn draw(app: &mut ZxrawApp, ctx: &egui::Context, state: &mut ReplaceState) {
                     );
                     ui.end_row();
                     ui.label("Replace with");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.options.replace).desired_width(420.0),
-                    );
+                    ui.vertical(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.options.replace)
+                                .char_limit(MAX_REPLACEMENT_CHARS)
+                                .desired_width(420.0),
+                        );
+                        if state.options.replace.chars().count() >= MAX_REPLACEMENT_CHARS {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                replacement_limit_message(),
+                            );
+                        }
+                    });
                     ui.end_row();
                     ui.label("Include files");
                     ui.add(
@@ -1091,6 +1112,18 @@ mod tests {
         let first = next_backup_name();
         let second = next_backup_name();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_replacement_over_the_limit_is_refused() {
+        let mut options = Options {
+            find: "a".into(),
+            replace: "é".repeat(MAX_REPLACEMENT_CHARS),
+            ..Options::default()
+        };
+        assert!(options.check().is_ok());
+        options.replace.push('x');
+        assert_eq!(options.check().unwrap_err(), replacement_limit_message());
     }
 
     #[test]
