@@ -867,3 +867,37 @@ fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
         "the stale in-app copy was pasted"
     );
 }
+
+/// Ctrl+Shift+V is another shortcut: with text on the clipboard egui still reports it as a
+/// paste, but it must not paste files. Ctrl+V then does.
+#[test]
+fn ctrl_shift_v_does_not_paste_files() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, _) = clipboard_fixture(sandbox.path());
+    write_file(&desktop.join("loose.txt"), b"loose");
+    let script = format!(
+        "navigate {desktop}\n\
+         select loose.txt\n\
+         key ctrl+X\n\
+         navigate {work}\n\
+         click-empty\n\
+         key ctrl+shift+V\n\
+         wait-frames 20\n\
+         sleep 500\n\
+         assert-missing {moved}\n\
+         key ctrl+V\n\
+         wait-exists {moved}\n\
+         wait-jobs 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+        work = shown(&work),
+        moved = shown(&work.join("loose.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(work.join("loose.txt")).unwrap(), b"loose");
+}

@@ -94,21 +94,32 @@ enum PasteSource {
     InApp,
     System,
     Empty,
+    /// The Windows clipboard changed since our copy and could not be read.
+    Unreadable,
+}
+
+/// What reading the Windows clipboard found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemFiles {
+    Files,
+    NoFiles,
+    Unreadable,
 }
 
 /// Which clipboard a paste should use. The newest copy wins: our in-app clipboard while
 /// its publish to Windows is still pending or is still what Windows holds; the Windows
-/// clipboard once something else has been copied since (e.g. in Explorer).
+/// clipboard once something else has been copied since (e.g. in Explorer). A changed
+/// clipboard that could not be read never falls back to our older items.
 fn choose_paste_source(
     in_app: Option<&FileClipboard>,
     system_sequence: u32,
-    system_has_files: bool,
+    system: SystemFiles,
 ) -> PasteSource {
     let Some(cb) = in_app else {
-        return if system_has_files {
-            PasteSource::System
-        } else {
-            PasteSource::Empty
+        return match system {
+            SystemFiles::Files => PasteSource::System,
+            SystemFiles::NoFiles => PasteSource::Empty,
+            SystemFiles::Unreadable => PasteSource::Unreadable,
         };
     };
     let ours = match cb.published {
@@ -116,10 +127,13 @@ fn choose_paste_source(
         Some(Ok(seq)) => seq,
         Some(Err(())) => cb.baseline_sequence,
     };
-    if system_sequence != ours && system_has_files {
-        PasteSource::System
-    } else {
-        PasteSource::InApp
+    if system_sequence == ours {
+        return PasteSource::InApp;
+    }
+    match system {
+        SystemFiles::Files => PasteSource::System,
+        SystemFiles::NoFiles => PasteSource::InApp,
+        SystemFiles::Unreadable => PasteSource::Unreadable,
     }
 }
 
@@ -619,11 +633,17 @@ fn paste_with(
         Ok(files) => (files.filter(|(paths, _)| !paths.is_empty()), None),
         Err(e) => (None, Some(e)),
     };
-    match choose_paste_source(app.ops.clipboard.as_ref(), sequence, files.is_some()) {
-        PasteSource::Empty => match read_error {
-            Some(e) => app.toast_err(format!("Could not read the clipboard: {e}")),
-            None => app.toast("Nothing to paste: the clipboard has no files"),
-        },
+    let system = match (&files, &read_error) {
+        (Some(_), _) => SystemFiles::Files,
+        (None, None) => SystemFiles::NoFiles,
+        (None, Some(_)) => SystemFiles::Unreadable,
+    };
+    match choose_paste_source(app.ops.clipboard.as_ref(), sequence, system) {
+        PasteSource::Empty => app.toast("Nothing to paste: the clipboard has no files"),
+        PasteSource::Unreadable => app.toast_err(format!(
+            "Could not read the clipboard: {}",
+            read_error.unwrap_or_default()
+        )),
         PasteSource::System => {
             let Some((paths, effect)) = files else {
                 app.toast_err("Could not read the files on the clipboard");
@@ -1154,36 +1174,65 @@ mod clipboard_tests {
     #[test]
     fn paste_source_prefers_newest_copy() {
         // Nothing copied in-app: the Windows clipboard decides.
-        assert_eq!(choose_paste_source(None, 5, true), PasteSource::System);
-        assert_eq!(choose_paste_source(None, 5, false), PasteSource::Empty);
+        assert_eq!(
+            choose_paste_source(None, 5, SystemFiles::Files),
+            PasteSource::System
+        );
+        assert_eq!(
+            choose_paste_source(None, 5, SystemFiles::NoFiles),
+            PasteSource::Empty
+        );
         // Our publish is still pending: never paste stale Explorer paths.
         assert_eq!(
-            choose_paste_source(Some(&cb(None, 4)), 4, true),
+            choose_paste_source(Some(&cb(None, 4)), 4, SystemFiles::Files),
             PasteSource::InApp
         );
         // Published and still current: ours.
         assert_eq!(
-            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, true),
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, SystemFiles::Files),
             PasteSource::InApp
         );
         // Something was copied in Explorer afterwards: theirs.
         assert_eq!(
-            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, true),
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, SystemFiles::Files),
             PasteSource::System
         );
         // Text copied afterwards (no files): fall back to ours rather than doing nothing.
         assert_eq!(
-            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, false),
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, SystemFiles::NoFiles),
             PasteSource::InApp
         );
         // Publish failed: compare against the sequence from before our copy.
         assert_eq!(
-            choose_paste_source(Some(&cb(Some(Err(())), 4)), 4, true),
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 4, SystemFiles::Files),
             PasteSource::InApp
         );
         assert_eq!(
-            choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, true),
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, SystemFiles::Files),
             PasteSource::System
+        );
+    }
+
+    #[test]
+    fn an_unreadable_clipboard_never_pastes_stale_in_app_items() {
+        let unreadable = SystemFiles::Unreadable;
+        assert_eq!(
+            choose_paste_source(None, 5, unreadable),
+            PasteSource::Unreadable
+        );
+        // Changed since our copy (e.g. a cut in Explorer) but unreadable: stop, say why.
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, unreadable),
+            PasteSource::Unreadable
+        );
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, unreadable),
+            PasteSource::Unreadable
+        );
+        // Unchanged since our copy: ours is still what the clipboard holds.
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, unreadable),
+            PasteSource::InApp
         );
     }
 }
