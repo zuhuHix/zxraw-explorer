@@ -7,9 +7,9 @@
 //! short age. Failures are quiet: a repository that cannot be read simply shows no badges.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,8 @@ const TIMEOUT: Duration = Duration::from_secs(4);
 const FRESH_FOR: Duration = Duration::from_secs(15);
 /// Wait before retrying a repository after an unexpected error.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Wait before retrying a repository that was skipped because earlier scans still run.
+const RETRY_BUSY: Duration = Duration::from_secs(5);
 /// Folder states kept before entries that are no longer shown are dropped.
 const MAX_DIRS: usize = 256;
 /// Deepest folder level searched for a `.git` entry.
@@ -240,6 +242,8 @@ enum Failure {
     TooBig,
     /// Reading this repository in the background is not allowed.
     Unsafe,
+    /// Earlier scans that ran out of time are still running; retried shortly.
+    Busy,
     /// Anything else; retried later.
     Error(String),
 }
@@ -415,6 +419,9 @@ impl GitStatus {
                             tracing::debug!("git status failed in {}: {message}", root.display());
                             entry.retry_after = Some(Instant::now() + RETRY_AFTER);
                         }
+                        Err(Failure::Busy) => {
+                            entry.retry_after = Some(Instant::now() + RETRY_BUSY);
+                        }
                         Err(failure) => {
                             if !entry.given_up {
                                 tracing::info!(
@@ -504,34 +511,78 @@ fn read_status(root: &Path) -> Result<RepoStatus, Failure> {
     read_status_with(root, LIMITS)
 }
 
+/// Scans that ran past their deadline and are still running. Bounded so that a folder full of
+/// slow repositories cannot pile up threads.
+static ABANDONED: AtomicUsize = AtomicUsize::new(0);
+/// Most abandoned scans at once; with the one being waited for, at most two run.
+const MAX_ABANDONED: usize = 1;
+
 /// [`read_status`] with explicit limits.
 ///
 /// No external program ever runs: gix implements no fsmonitor, configuration is loaded in
-/// isolation (the repository's own config only, never `git` itself, system or user config),
-/// and file contents are never read, so no filter driver from `.gitattributes` can start. A
-/// tracked file whose size or time differs from the index counts as modified.
+/// isolation (the repository's own config only, never `git` itself, system or user config,
+/// and no includes), and gix never reads file contents, so no filter driver from
+/// `.gitattributes` can start. A tracked file whose size differs from the index counts as
+/// modified; one whose time alone changed is hashed raw by [`same_as_blob`].
 ///
-/// Refused without reading anything: a repository inside a cloud sync root (the walk would
-/// read `.gitignore` files that may be online-only), a `.git` file pointing at a network
-/// path, and a repository whose config moves its work tree (`core.worktree`) away from `root`.
+/// Refused before gix opens anything (see [`preflight`]): a repository inside a cloud sync
+/// root, one whose `.git` file, `commondir`, config or alternates name a path elsewhere, and
+/// one with links where its metadata should be.
 fn read_status_with(root: &Path, limits: Limits) -> Result<RepoStatus, Failure> {
+    scan_on_thread(root, limits, &ABANDONED)
+}
+
+/// Runs the scan on its own thread and waits at most `limits.time` for it. A scan still
+/// running then is told to stop and left to finish on its own (gix cannot be interrupted
+/// while it opens a repository); it counts in `abandoned` until it does.
+fn scan_on_thread(
+    root: &Path,
+    limits: Limits,
+    abandoned: &'static AtomicUsize,
+) -> Result<RepoStatus, Failure> {
+    if abandoned.load(Ordering::SeqCst) >= MAX_ABANDONED {
+        return Err(Failure::Busy);
+    }
     // The budget covers everything from here on, including opening and loading the index.
     let deadline = Instant::now() + limits.time;
     let interrupt = Arc::new(AtomicBool::new(false));
-    let (done, finished) = crossbeam_channel::bounded::<()>(0);
-    let flag = Arc::clone(&interrupt);
-    let time = limits.time;
-    thread::spawn(move || {
-        if let Err(crossbeam_channel::RecvTimeoutError::Timeout) = finished.recv_timeout(time) {
-            flag.store(true, Ordering::SeqCst);
-        }
-    });
+    // Set by the first of "the scan finished" and "the caller gave up"; the second one to
+    // arrive settles the count.
+    let settled = Arc::new(AtomicBool::new(false));
+    let (done, result) = crossbeam_channel::bounded(1);
+    let spawned = {
+        let root = root.to_path_buf();
+        let interrupt = Arc::clone(&interrupt);
+        let settled = Arc::clone(&settled);
+        thread::Builder::new()
+            .name("git-status-scan".into())
+            .spawn(move || {
+                let _ = done.send(read_within(&root, limits, &interrupt, deadline));
+                if settled.swap(true, Ordering::SeqCst) {
+                    abandoned.fetch_sub(1, Ordering::SeqCst);
+                }
+            })
+    };
+    if let Err(e) = spawned {
+        return Err(Failure::Error(e.to_string()));
+    }
     let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
-    let result = read_within(root, limits, &interrupt, deadline);
-    drop(done);
-    match result {
-        _ if over() => Err(Failure::TooBig),
-        result => result,
+    match result.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(_) if over() => Err(Failure::TooBig),
+        Ok(result) => result,
+        // The scan panicked: it is not running any more.
+        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+            Err(Failure::Error("git status scan stopped".into()))
+        }
+        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+            interrupt.store(true, Ordering::SeqCst);
+            abandoned.fetch_add(1, Ordering::SeqCst);
+            if settled.swap(true, Ordering::SeqCst) {
+                // It finished after all; nothing is left running.
+                abandoned.fetch_sub(1, Ordering::SeqCst);
+            }
+            Err(Failure::TooBig)
+        }
     }
 }
 
@@ -541,24 +592,26 @@ fn read_within(
     interrupt: &AtomicBool,
     deadline: Instant,
 ) -> Result<RepoStatus, Failure> {
-    // The timer thread raises `interrupt` (which gix polls); the clock check makes the
-    // deadline exact between steps.
+    // The caller raises `interrupt` (which gix polls) at the deadline; the clock check makes
+    // it exact between steps.
     let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
     let err = |e: &dyn std::fmt::Display| Failure::Error(e.to_string());
-    if forge_core::cloud::in_cloud_sync_root(root) {
-        return Err(Failure::Unsafe);
-    }
-    if git_file_points_to_network(root) {
-        return Err(Failure::Unsafe);
-    }
-    let repo = gix::open_opts(root, gix::open::Options::isolated().strict_config(false))
-        .map_err(|e| err(&e))?;
-    // `core.worktree` in the repository's own config could point the walk anywhere.
-    let same_tree = match (repo.workdir(), std::fs::canonicalize(root)) {
-        (Some(workdir), Ok(root)) => std::fs::canonicalize(workdir).is_ok_and(|w| w == root),
-        _ => false,
-    };
-    if !same_tree {
+    let layout = preflight(root)?;
+    // Opening `.git` itself, never `root`: gix would otherwise fall back to reading `root` as
+    // a bare repository whose config `preflight` has not checked.
+    let repo = gix::open_opts(
+        root.join(".git"),
+        gix::open::Options::isolated().strict_config(false),
+    )
+    .map_err(|e| err(&e))?;
+    // What gix resolved must be what was checked. Text comparisons only.
+    let same = |a: &Path, b: &Path| lexical(a).is_some_and(|a| path_key(&a) == path_key(b));
+    let index_file = repo.index_path();
+    let as_checked = same(repo.git_dir(), &layout.git_dir)
+        && same(repo.common_dir(), &layout.common_dir)
+        && repo.workdir().is_some_and(|w| same(w, &layout.root))
+        && lexical(&index_file).is_some_and(|i| inside(&i, &layout.git_dir));
+    if !as_checked {
         return Err(Failure::Unsafe);
     }
     let branch = repo
@@ -566,7 +619,6 @@ fn read_within(
         .ok()
         .flatten()
         .map(|name| name.shorten().to_string());
-    let index_file = repo.index_path();
     if std::fs::metadata(&index_file).is_ok_and(|m| m.len() > limits.index_bytes) {
         return Err(Failure::TooBig);
     }
@@ -619,7 +671,12 @@ fn read_within(
         .dirwalk_options()
         .map_err(|e| err(&e))?
         .emit_untracked(gix::dir::walk::EmissionMode::Matching)
-        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory));
+        .emit_ignored(Some(gix::dir::walk::EmissionMode::CollapseDirectory))
+        // Telling a nested repository apart means following its `.git` file, which may name
+        // any path; walk into it like a plain folder instead. Symlinks are never followed.
+        .recurse_repositories(true)
+        .classify_untracked_bare_repositories(false)
+        .symlinks_to_directories_are_ignored_like_directories(false);
     let mut walk = Walk {
         status: &mut status,
         visited: 0,
@@ -673,22 +730,358 @@ fn read_within(
     Ok(status)
 }
 
-/// Does `root/.git` name a git directory on a network path (`gitdir: \\server\...`)? Opening it
-/// would contact that server just because a folder was listed.
-fn git_file_points_to_network(root: &Path) -> bool {
+/// Largest `.git` file, `HEAD`, `commondir`, config or alternates file read before opening a
+/// repository. Real ones are a few kilobytes at most.
+const MAX_META_BYTES: u64 = 1024 * 1024;
+
+/// Children of `objects` checked for links (loose object folders, `pack`, `info`).
+const MAX_OBJECT_DIRS: usize = 512;
+
+/// Where a repository's parts are, as checked by [`preflight`].
+#[derive(Debug)]
+struct Layout {
+    /// The work tree: the folder being browsed, in [`lexical`] form.
+    root: PathBuf,
+    /// The repository's own git directory (`root/.git`, or where a `.git` file points).
+    git_dir: PathBuf,
+    /// Shared git directory of a linked worktree (`commondir`), else `git_dir`.
+    common_dir: PathBuf,
+}
+
+/// Checks everything the repository's own files say about where its parts are, before gix
+/// (or anything else) touches those places.
+///
+/// A folder from elsewhere can carry a `.git` whose files name any path. Even checking that
+/// a network path exists makes Windows connect to the server, which leaks the user's NTLM
+/// hash and can stall for many seconds. So every path read from the repository is first
+/// resolved and compared as text ([`resolve`]), and only touched once it is known to be on
+/// the root's volume and inside the place it belongs:
+///
+/// * the `.git` file (`gitdir:`) and `commondir`: on the root's volume (linked worktrees
+///   and submodules keep their git directory elsewhere on the same disk);
+/// * `core.worktree`: exactly `root`;
+/// * `gitoxide.core.indexFile` and `gitoxide.core.shallowFile`: inside the git directory;
+/// * `core.excludesFile` and `core.attributesFile`: inside `root` or the git directory;
+/// * `include.path` and `includeIf.*.path`: inside the git directory (gix does not follow
+///   includes here anyway);
+/// * `objects/info/alternates`: refused if it lists anything.
+///
+/// The fixed metadata files (`HEAD`, `config`, `index`, `refs`, `objects`, `info/exclude`, ...)
+/// must not be links (symlinks or junctions), which could lead anywhere. Metadata files over
+/// [`MAX_META_BYTES`] make the repository too big rather than being read.
+fn preflight(root: &Path) -> Result<Layout, Failure> {
+    let root = lexical(root).ok_or(Failure::Unsafe)?;
+    if forge_core::cloud::in_cloud_sync_root(&root) {
+        return Err(Failure::Unsafe);
+    }
     let dot_git = root.join(".git");
-    if !std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_file()) {
+    let md = std::fs::symlink_metadata(&dot_git).map_err(|e| Failure::Error(e.to_string()))?;
+    if is_link(&md) {
+        return Err(Failure::Unsafe);
+    }
+    let git_dir = if md.is_file() {
+        let text = read_meta(&dot_git)?.ok_or(Failure::Unsafe)?;
+        let target = text.trim().strip_prefix("gitdir:").ok_or(Failure::Unsafe)?;
+        let git_dir = resolve(&root, target.trim(), &root).ok_or(Failure::Unsafe)?;
+        not_linked_below(&root, &git_dir)?;
+        git_dir
+    } else {
+        dot_git
+    };
+    let common_dir = match read_meta(&git_dir.join("commondir"))? {
+        Some(text) => resolve(&git_dir, text.trim(), &root).ok_or(Failure::Unsafe)?,
+        None => git_dir.clone(),
+    };
+    not_linked_below(&root, &common_dir)?;
+    not_a_link(&git_dir)?;
+    not_a_link(&common_dir)?;
+    for dir in [&git_dir, &common_dir] {
+        if !inside(dir, &root) && forge_core::cloud::in_cloud_sync_root(dir) {
+            return Err(Failure::Unsafe);
+        }
+    }
+
+    // The fixed places gix reads. Missing ones are fine; links are not.
+    for base in [&git_dir, &common_dir] {
+        for rel in [
+            "HEAD",
+            "config",
+            "config.worktree",
+            "index",
+            "commondir",
+            "packed-refs",
+            "shallow",
+            "info",
+            r"info\exclude",
+            r"info\attributes",
+            r"info\sparse-checkout",
+            "objects",
+            r"objects\info",
+            r"objects\info\alternates",
+            r"objects\pack",
+            "refs",
+            r"refs\heads",
+        ] {
+            not_a_link(&base.join(rel))?;
+        }
+    }
+    if let Ok(children) = std::fs::read_dir(common_dir.join("objects")) {
+        for (n, child) in children.enumerate() {
+            if n >= MAX_OBJECT_DIRS {
+                return Err(Failure::TooBig);
+            }
+            let child = child.map_err(|e| Failure::Error(e.to_string()))?;
+            if child.file_type().map_or(true, |t| t.is_symlink()) {
+                return Err(Failure::Unsafe);
+            }
+            not_a_link(&child.path())?;
+        }
+    }
+
+    // HEAD and the branch it names.
+    if let Some(head) = read_meta(&git_dir.join("HEAD"))? {
+        if let Some(target) = head.trim().strip_prefix("ref:") {
+            let mut path = common_dir.clone();
+            for part in target.trim().split('/') {
+                if !plain_name(std::ffi::OsStr::new(part)) {
+                    return Err(Failure::Unsafe);
+                }
+                path.push(part);
+                not_a_link(&path)?;
+            }
+        }
+    }
+
+    // The repository's config, and the per-worktree one gix may add to it.
+    let configs = [common_dir.join("config"), git_dir.join("config.worktree")];
+    for config in &configs {
+        let Some(text) = read_meta(config)? else {
+            continue;
+        };
+        let file = gix::config::File::from_bytes_no_includes(
+            text.as_bytes(),
+            gix::config::file::Metadata::from(gix::config::Source::Local),
+            Default::default(),
+        )
+        .map_err(|e| Failure::Error(e.to_string()))?;
+        let config_dir = config.parent().unwrap_or(&git_dir);
+        let in_git_dir = |p: &Path| inside(p, &git_dir) || inside(p, &common_dir);
+        for section in file.sections() {
+            let name = section.header().name().to_string();
+            let sub = section.header().subsection_name().map(|s| s.to_string());
+            let values = |key: &str| {
+                section
+                    .body()
+                    .values(key)
+                    .into_iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+            };
+            let ok = match (name.to_ascii_lowercase().as_str(), sub.as_deref()) {
+                ("core", _) => {
+                    values("worktree").iter().all(|v| {
+                        resolve(&git_dir, v, &root).is_some_and(|w| path_key(&w) == path_key(&root))
+                    }) && ["excludesFile", "attributesFile"]
+                        .iter()
+                        .flat_map(|key| values(key))
+                        .all(|v| {
+                            absolute(v.strip_prefix(":(optional)").unwrap_or(&v), &root)
+                                .is_some_and(|p| inside(&p, &root) || in_git_dir(&p))
+                        })
+                }
+                ("gitoxide", Some(sub)) if sub.eq_ignore_ascii_case("core") => {
+                    ["indexFile", "shallowFile"]
+                        .iter()
+                        .flat_map(|key| values(key))
+                        .all(|v| absolute(&v, &root).is_some_and(|p| in_git_dir(&p)))
+                }
+                ("include", None) | ("includeif", Some(_)) => values("path")
+                    .iter()
+                    .all(|v| resolve(config_dir, v, &root).is_some_and(|p| in_git_dir(&p))),
+                _ => true,
+            };
+            if !ok {
+                return Err(Failure::Unsafe);
+            }
+        }
+    }
+
+    // Alternates add object folders anywhere, each with alternates of its own.
+    if let Some(text) = read_meta(&common_dir.join(r"objects\info\alternates"))? {
+        if text
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        {
+            return Err(Failure::Unsafe);
+        }
+    }
+    Ok(Layout {
+        root,
+        git_dir,
+        common_dir,
+    })
+}
+
+/// Contents of the metadata file at `path` (already known to be local), or `None` if there is
+/// none. Links are refused and files over [`MAX_META_BYTES`] make the repository too big.
+fn read_meta(path: &Path) -> Result<Option<String>, Failure> {
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if is_link(&md) || !md.is_file() {
+        return Err(Failure::Unsafe);
+    }
+    if md.len() > MAX_META_BYTES {
+        return Err(Failure::TooBig);
+    }
+    let bytes = std::fs::read(path).map_err(|e| Failure::Error(e.to_string()))?;
+    if bytes.len() as u64 > MAX_META_BYTES {
+        return Err(Failure::TooBig);
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Is this a symlink, junction or other reparse point? Read with `symlink_metadata`, so the
+/// link itself is never followed.
+fn is_link(md: &std::fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    md.file_type().is_symlink()
+        || forge_core::cloud::metadata_attributes(md) & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Refuses `path` (already known to be local) if it is a link. A missing path is fine.
+fn not_a_link(path: &Path) -> Result<(), Failure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if is_link(&md) => Err(Failure::Unsafe),
+        _ => Ok(()),
+    }
+}
+
+/// Refuses `path` if it or a folder between `base` and it is a link. Parts outside `base`
+/// are the user's own and not checked.
+fn not_linked_below(base: &Path, path: &Path) -> Result<(), Failure> {
+    let base_key = path_key(base);
+    for ancestor in path.ancestors() {
+        let key = path_key(ancestor);
+        if key.len() <= base_key.len() || !inside(ancestor, base) {
+            break;
+        }
+        not_a_link(ancestor)?;
+    }
+    Ok(())
+}
+
+/// `value` (a path from a repository file) resolved against `base` by text alone, as Windows
+/// would, without touching the file system. `None` unless the result is on `root`'s volume
+/// (same drive, or same server and share). Device paths, drive-relative and rooted paths
+/// (`C:x`, `\x`) and names Windows would silently change are refused.
+fn resolve(base: &Path, value: &str, root: &Path) -> Option<PathBuf> {
+    let value = Path::new(value);
+    let joined = match value.components().next()? {
+        Component::Prefix(_) => value.to_path_buf(),
+        Component::RootDir => return None,
+        _ => base.join(value),
+    };
+    let path = lexical(&joined)?;
+    (volume(&path) == volume(root)).then_some(path)
+}
+
+/// Like [`resolve`], but `value` must already be absolute. Used for keys gix would resolve
+/// against the process's current directory.
+fn absolute(value: &str, root: &Path) -> Option<PathBuf> {
+    match Path::new(value).components().next()? {
+        Component::Prefix(_) => resolve(root, value, root),
+        _ => None,
+    }
+}
+
+/// `path` with `.` and `..` resolved and a plain drive (`C:\`) or share (`\\server\share\`)
+/// prefix, by text alone. `None` for relative paths, device paths (`\\.\`, `\\?\` other than
+/// a drive or share) and names Windows would change on open (trailing dots or spaces, `:`,
+/// reserved device names).
+fn lexical(path: &Path) -> Option<PathBuf> {
+    let mut parts = path.components();
+    let mut out = match parts.next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                PathBuf::from(format!("{}:\\", (d as char).to_ascii_uppercase()))
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                let (server, share) = (server.to_str()?, share.to_str()?);
+                if server.is_empty() || share.is_empty() || server == "." || server == "?" {
+                    return None;
+                }
+                PathBuf::from(format!(r"\\{server}\{share}\"))
+            }
+            Prefix::Verbatim(_) | Prefix::DeviceNS(_) => return None,
+        },
+        _ => return None,
+    };
+    if parts.next() != Some(Component::RootDir) {
+        return None;
+    }
+    for part in parts {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) if plain_name(name) => out.push(name),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A file name Windows opens as written: not empty, no trailing dot or space (stripped on
+/// open, so `.. ` would mean the parent), no `:` (streams), no wildcards, not a device.
+fn plain_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name.contains([':', '*', '?', '"', '<', '>', '|', '\\', '/', '\0'])
+    {
         return false;
     }
-    // A real `.git` file is one short line; anything large is not one.
-    if std::fs::metadata(&dot_git).map_or(true, |m| m.len() > 4096) {
-        return true;
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    let device = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit());
+    !device
+}
+
+/// Lowercase text form of a [`lexical`] path without a trailing `\`, for comparisons.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().trim_end_matches('\\').to_lowercase()
+}
+
+/// The drive or share of a [`lexical`] path, lowercase.
+fn volume(path: &Path) -> String {
+    match path.components().next() {
+        Some(Component::Prefix(p)) => p.as_os_str().to_string_lossy().to_lowercase(),
+        _ => String::new(),
     }
-    let Ok(text) = std::fs::read_to_string(&dot_git) else {
-        return true;
-    };
-    let target = text.trim().strip_prefix("gitdir:").unwrap_or("").trim();
-    target.starts_with(r"\\") || target.starts_with("//")
+}
+
+/// Is [`lexical`] path `path` `dir` itself or below it?
+fn inside(path: &Path, dir: &Path) -> bool {
+    let (path, dir) = (path_key(path), path_key(dir));
+    path == dir
+        || path
+            .strip_prefix(&dir)
+            .is_some_and(|rest| rest.starts_with('\\'))
 }
 
 /// Compares tracked files by their index stat data only, reporting whether the size changed.
@@ -719,10 +1112,14 @@ const MAX_HASHED_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Does the file at `path` still hash to `id` as a blob? Reads the raw bytes itself, with no
 /// filter or line-ending conversion, so a filtered file may count as changed, never the
-/// reverse.
+/// reverse. An online-only file (say, in a sync folder nested in the repository) is never
+/// read, which would download it; it counts as changed.
 fn same_as_blob(path: &Path, id: &gix::ObjectId) -> bool {
     if std::fs::symlink_metadata(path).map_or(true, |m| !m.is_file() || m.len() > MAX_HASHED_BYTES)
     {
+        return false;
+    }
+    if !forge_core::cloud::background_read_allowed(path) {
         return false;
     }
     std::fs::read(path).is_ok_and(|bytes| {
@@ -1105,15 +1502,321 @@ mod tests {
         assert_eq!(read_status(tmp.path()).unwrap_err(), Failure::Unsafe);
     }
 
+    /// An address reserved for documentation (TEST-NET-1): nothing answers there, so a scan
+    /// that tried to reach it would stall for seconds instead of returning at once.
+    const FAKE_SHARE: &str = "//192.0.2.1/share";
+
+    /// Asserts that `root` is refused before anything is opened, and quickly.
+    fn assert_refused(root: &Path, what: &str) {
+        let started = Instant::now();
+        assert_eq!(
+            preflight(root).unwrap_err(),
+            Failure::Unsafe,
+            "{what}: preflight"
+        );
+        assert_eq!(
+            read_status(root).unwrap_err(),
+            Failure::Unsafe,
+            "{what}: scan"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{what}: took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Appends raw text to the repository's `.git/config`, without running git (which could
+    /// itself follow what is written).
+    fn append_config(root: &Path, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.join(".git").join("config"))
+            .unwrap();
+        writeln!(file, "{text}").unwrap();
+    }
+
+    /// `path` as a config value: forward slashes, quoted.
+    fn config_path(path: &Path) -> String {
+        format!("\"{}\"", path.to_string_lossy().replace('\\', "/"))
+    }
+
     #[test]
-    fn a_git_file_pointing_at_a_network_path_is_refused() {
+    fn paths_are_resolved_by_text_alone() {
+        let root = Path::new(r"C:\work\repo");
+        let git_dir = Path::new(r"C:\work\repo\.git");
+        let ok = |base: &Path, v: &str| resolve(base, v, root).map(|p| path_key(&p));
+        assert_eq!(
+            ok(root, "../main/.git").as_deref(),
+            Some(r"c:\work\main\.git")
+        );
+        assert_eq!(ok(git_dir, "..").as_deref(), Some(r"c:\work\repo"));
+        assert_eq!(
+            ok(git_dir, "C:/work/repo/./x/../").as_deref(),
+            Some(r"c:\work\repo")
+        );
+        assert_eq!(
+            ok(git_dir, r"\\?\C:\work\repo").as_deref(),
+            Some(r"c:\work\repo")
+        );
+        for bad in [
+            r"\\server\share\x",
+            "//server/share/x",
+            r"\\?\UNC\server\share\x",
+            r"\\.\pipe\x",
+            "//./pipe/x",
+            "//?/C:/x",
+            r"\\?\GLOBALROOT\Device\x",
+            "D:/other/volume",
+            "C:relative",
+            r"\rooted",
+            "/rooted",
+            r".. \x",
+            "x./y",
+            "file.txt:stream",
+            "NUL",
+            "sub/con.txt",
+            "COM1",
+            "*",
+        ] {
+            assert_eq!(ok(git_dir, bad), None, "{bad}");
+        }
+        // Relative values for keys gix would resolve against the current directory.
+        assert_eq!(absolute("info/exclude", root), None);
+        assert!(absolute("C:/work/repo/.git/info/x", root).is_some());
+        // A repository on a share may point within that share, never at another one.
+        let share_root = Path::new(r"\\nas\code\repo");
+        assert!(resolve(share_root, "../main/.git", share_root).is_some());
+        assert_eq!(resolve(share_root, "//other/code/x", share_root), None);
+        assert!(inside(Path::new(r"C:\work\repo\.git\x"), git_dir));
+        assert!(!inside(Path::new(r"C:\work\repo\.gitx"), git_dir));
+    }
+
+    #[test]
+    fn a_git_file_pointing_elsewhere_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let dot_git = tmp.path().join(".git");
-        std::fs::write(&dot_git, "gitdir: \\\\server\\share\\repo.git\n").unwrap();
-        assert!(git_file_points_to_network(tmp.path()));
-        assert_eq!(read_status(tmp.path()).unwrap_err(), Failure::Unsafe);
-        std::fs::write(&dot_git, "gitdir: C:/code/main/.git/worktrees/x\n").unwrap();
-        assert!(!git_file_points_to_network(tmp.path()));
+        for target in [
+            r"\\192.0.2.1\share\repo.git",
+            FAKE_SHARE,
+            r"\\?\UNC\192.0.2.1\share",
+            r"\\.\pipe\repo",
+            "Q:/repo.git",
+            "relative-but-.. /x",
+        ] {
+            std::fs::write(&dot_git, format!("gitdir: {target}\n")).unwrap();
+            assert_refused(tmp.path(), target);
+        }
+        std::fs::write(&dot_git, "not a git file\n").unwrap();
+        assert_refused(tmp.path(), "no gitdir line");
+    }
+
+    #[test]
+    fn linked_worktrees_and_submodules_still_work() {
+        let Some(main) = fixture_repo() else { return };
+        let wt_parent = tempfile::tempdir_in(main.path().parent().unwrap()).unwrap();
+        let wt = wt_parent.path().join("wt");
+        assert!(git(
+            main.path(),
+            &["worktree", "add", "-q", "-b", "side", &wt.to_string_lossy()]
+        ));
+        std::fs::write(wt.join("a.txt"), "worktree change, longer\n").unwrap();
+        let status = read_status(&wt).expect("linked worktree");
+        assert_eq!(status.branch.as_deref(), Some("side"));
+        assert_eq!(
+            status.badge(&wt.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+
+        // A `commondir` that leaves the volume is refused like a `.git` file would be.
+        let git_dir = main.path().join(".git").join("worktrees").join("wt");
+        std::fs::write(git_dir.join("commondir"), format!("{FAKE_SHARE}/x\n")).unwrap();
+        assert_refused(&wt, "commondir");
+
+        // A submodule: `.git` is a file into the parent's `.git/modules`, whose config sets a
+        // relative `core.worktree` back to the submodule folder.
+        let Some(lib) = fixture_repo() else { return };
+        let lib_url = lib.path().to_string_lossy().replace('\\', "/");
+        assert!(git(
+            main.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &lib_url,
+                "sub"
+            ]
+        ));
+        let sub = main.path().join("sub");
+        std::fs::write(sub.join("a.txt"), "submodule change, longer\n").unwrap();
+        let status = read_status(&sub).expect("submodule");
+        assert_eq!(
+            status.badge(&sub.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+    }
+
+    #[test]
+    fn config_paths_outside_the_repository_are_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("never-opened");
+        std::fs::write(&elsewhere, "[core]\n\tbare = true\n").unwrap();
+        let elsewhere = config_path(&elsewhere);
+        let share = format!("\"{FAKE_SHARE}/x\"");
+        for section in [
+            "[core]\n\tworktree",
+            "[core]\n\texcludesFile",
+            "[core]\n\tattributesFile",
+            "[gitoxide \"core\"]\n\tindexFile",
+            "[gitoxide \"core\"]\n\tshallowFile",
+            "[include]\n\tpath",
+            "[includeIf \"gitdir:/\"]\n\tpath",
+        ] {
+            // A relative include would stay in the git directory, so only the others are tried.
+            let relative = "\"relative/x\"".to_string();
+            let values = if section.contains("include") {
+                vec![&share, &elsewhere]
+            } else {
+                vec![&share, &elsewhere, &relative]
+            };
+            for value in values {
+                let Some(tmp) = fixture_repo() else { return };
+                append_config(tmp.path(), &format!("{section} = {value}"));
+                assert_refused(tmp.path(), &format!("{section} = {value}"));
+            }
+        }
+        // The same keys pointing inside the repository are fine.
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let info = root.join(".git").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("more-excludes"), "*.tmp\n").unwrap();
+        std::fs::write(root.join("x.tmp"), "t").unwrap();
+        append_config(
+            root,
+            &format!(
+                "[core]\n\tworktree = {}\n\texcludesFile = {}",
+                config_path(root),
+                config_path(&info.join("more-excludes"))
+            ),
+        );
+        let status = read_status(root).expect("in-repository config paths");
+        assert_eq!(
+            status.badge(&root.join("x.tmp"), false),
+            Some(GitBadge::Ignored)
+        );
+    }
+
+    #[test]
+    fn alternates_are_refused() {
+        let Some(tmp) = fixture_repo() else { return };
+        let info = tmp.path().join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(info.join("alternates"), "# comment only\n\n").unwrap();
+        assert!(read_status(tmp.path()).is_ok());
+        std::fs::write(info.join("alternates"), format!("{FAKE_SHARE}/objects\n")).unwrap();
+        assert_refused(tmp.path(), "alternates");
+    }
+
+    #[test]
+    fn links_in_the_git_directory_are_refused() {
+        let Some(tmp) = fixture_repo() else { return };
+        let target = tempfile::tempdir().unwrap();
+        let link = tmp.path().join(".git").join("objects").join("zz");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            eprintln!("skipped: could not create a junction");
+            return;
+        }
+        assert_refused(tmp.path(), "junction in objects");
+    }
+
+    #[test]
+    fn a_nested_git_file_pointing_at_a_share_is_never_followed() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join(".git"), format!("gitdir: {FAKE_SHARE}/x\n")).unwrap();
+        std::fs::write(nested.join("f.txt"), "f").unwrap();
+        let started = Instant::now();
+        let status = read_status(root).expect("status");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(status.badge(&nested, true), Some(GitBadge::Added));
+    }
+
+    #[test]
+    fn oversized_metadata_is_not_read() {
+        let big = "#".repeat(MAX_META_BYTES as usize + 1);
+        for file in ["config", "HEAD"] {
+            let Some(tmp) = fixture_repo() else { return };
+            let path = tmp.path().join(".git").join(file);
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            if file == "HEAD" {
+                text = format!("{text}\n{big}");
+            } else {
+                text.push_str(&big);
+            }
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                read_status(tmp.path()).unwrap_err(),
+                Failure::TooBig,
+                "{file}"
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_scans_are_bounded() {
+        let Some(tmp) = fixture_repo() else { return };
+        static FULL: AtomicUsize = AtomicUsize::new(MAX_ABANDONED);
+        assert_eq!(
+            scan_on_thread(tmp.path(), LIMITS, &FULL).unwrap_err(),
+            Failure::Busy
+        );
+        // A scan given no time is abandoned, and settles the count once it ends.
+        static OWN: AtomicUsize = AtomicUsize::new(0);
+        let mut limits = LIMITS;
+        limits.time = Duration::ZERO;
+        assert_eq!(
+            scan_on_thread(tmp.path(), limits, &OWN).unwrap_err(),
+            Failure::TooBig
+        );
+        let started = Instant::now();
+        while OWN.load(Ordering::SeqCst) != 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "abandoned scan never ended"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn online_only_files_are_not_hashed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("f.txt");
+        std::fs::write(&path, "same\n").unwrap();
+        let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, b"same\n")
+            .unwrap();
+        assert!(same_as_blob(&path, &id));
+        forge_core::cloud::simulate_online_only(path.clone());
+        assert!(!same_as_blob(&path, &id), "an online-only file was read");
+        forge_core::cloud::clear_simulated_online_only(&path);
     }
 
     #[test]
@@ -1136,10 +1839,7 @@ mod tests {
         assert_eq!(small(|l| l.index_bytes = 10).unwrap_err(), Failure::TooBig);
         // A single untracked folder is reported as one entry, but all its files are visited.
         assert_eq!(small(|l| l.visited = 10).unwrap_err(), Failure::TooBig);
-        assert_eq!(
-            small(|l| l.time = Duration::ZERO).unwrap_err(),
-            Failure::TooBig
-        );
+        // No time at all is covered by `abandoned_scans_are_bounded`, with its own count.
     }
 
     #[test]

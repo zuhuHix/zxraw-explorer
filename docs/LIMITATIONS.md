@@ -32,10 +32,18 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   administrator or on a network (UNC) path; choose PowerShell instead. Git badges never run
   filters or line-ending conversion, so a same-size file that Git stores converted (for example
   a Git LFS file, or `autocrlf` content) can show as modified after its time changes, as can
-  same-size changes beyond the first 256 or files over 16 MB.
-  Repositories that take over 4 s, have an index over 100,000 entries or need over 50,000
-  folders and files walked show no badges, and neither does any repository inside OneDrive or
-  another cloud-synced folder (its `.gitignore` files could be online-only).
+  same-size changes, online-only files, beyond the first 256 or files over 16 MB.
+  Repositories that take over 4 s, have an index over 100,000 entries, a config or `HEAD`
+  over 1 MB, or need over 50,000 folders and files walked show no badges, and neither does any
+  repository inside OneDrive or another cloud-synced folder (its `.gitignore` files could be
+  online-only). A repository inside the browsed folder that itself contains a cloud-synced
+  folder is still walked, and Git reads the `.gitignore` files there, which can download them.
+  To keep a folder from elsewhere from sending the app to a network share, repositories also
+  show no badges when their own files name a path off the folder's drive or share (a `.git`
+  file, `commondir`), a work tree other than the folder, an index, excludes, attributes or
+  include file outside the repository, any `objects/info/alternates` entry (so `git clone
+  --shared` clones show none), or contain a symlink or junction among their Git metadata.
+  A repository nested inside another, untracked one is shown as a plain new folder.
 * Files and folders can be dropped into the app. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another
