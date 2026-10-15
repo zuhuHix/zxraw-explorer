@@ -16,6 +16,7 @@ use forge_jobs::{CancelToken, Progress};
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::Xxh3;
 
+use crate::cloud;
 use crate::error::{CoreError, Result};
 use crate::ops::{WalkItem, walk_tree};
 use crate::paths;
@@ -196,6 +197,92 @@ fn unescape(s: &str) -> Option<String> {
     Some(out)
 }
 
+/// What to do with files whose data is not on this PC (cloud placeholders). Hashing reads
+/// the data, which downloads an online-only file, so the caller chooses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineOnlyPolicy {
+    /// Hash them anyway, downloading each one.
+    Download,
+    /// Leave them out and report them as skipped.
+    Skip,
+}
+
+/// Is `path` an existing file whose data is not on this PC? Missing files are not
+/// online-only, so they still show up as missing. Unknown attributes count as online-only.
+/// Find data only: the file is never opened (opening a placeholder can download it).
+pub fn is_online_only_file(path: &Path) -> bool {
+    matches!(cloud::read_check(path), cloud::ReadCheck::OnlineOnly { .. })
+}
+
+fn skip_online_only(path: &Path, policy: OnlineOnlyPolicy) -> bool {
+    policy == OnlineOnlyPolicy::Skip && is_online_only_file(path)
+}
+
+/// Online-only files a checksum job would read, and their logical size (what reading them
+/// downloads).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OnlineOnlyTotals {
+    pub count: usize,
+    pub bytes: u64,
+}
+
+impl OnlineOnlyTotals {
+    fn add(&mut self, bytes: u64) {
+        self.count += 1;
+        self.bytes += bytes;
+    }
+
+    /// Adds `path` if it is an existing online-only file. Never opens it.
+    pub fn add_file(&mut self, path: &Path) {
+        if let cloud::ReadCheck::OnlineOnly { size } = cloud::read_check(path) {
+            self.add(size);
+        }
+    }
+}
+
+/// Count the regular files under `root` that [`build_manifest`] would hash and that are
+/// online-only. Uses the same walk as `build_manifest` and reads no file data.
+pub fn count_online_only_tree(root: &Path, cancel: &CancelToken) -> Result<OnlineOnlyTotals> {
+    let mut totals = OnlineOnlyTotals::default();
+    walk_tree(root, cancel, |item| {
+        if let WalkItem::Entry(e) = item
+            && e.is_file()
+            && !cloud::background_read_allowed(&e.path)
+        {
+            totals.add(e.size);
+        }
+    })?;
+    Ok(totals)
+}
+
+/// Count the entries of a manifest whose file is online-only (paths resolved as in
+/// [`verify_manifest`]).
+pub fn count_online_only_manifest(
+    manifest: &Path,
+    cancel: &CancelToken,
+) -> Result<OnlineOnlyTotals> {
+    let text = fs::read_to_string(manifest).map_err(|e| CoreError::io(manifest, e))?;
+    let entries = parse_manifest(&text)?;
+    let root = manifest.parent().unwrap_or(Path::new("."));
+    let mut totals = OnlineOnlyTotals::default();
+    for e in &entries {
+        cancel.check()?;
+        if let Ok(path) = paths::safe_join(root, &e.rel_path) {
+            totals.add_file(&path);
+        }
+    }
+    Ok(totals)
+}
+
+/// Result of [`build_manifest_with`].
+#[derive(Debug, Default)]
+pub struct ManifestBuild {
+    pub entries: Vec<ManifestEntry>,
+    pub errors: Vec<PathError>,
+    /// Relative paths left out under [`OnlineOnlyPolicy::Skip`]. Never in `entries`.
+    pub skipped_online_only: Vec<String>,
+}
+
 /// Hash every regular file under `root` (links are skipped, never followed) and return
 /// manifest entries sorted by path. `exclude` paths (e.g. the manifest file itself) are
 /// skipped.
@@ -205,6 +292,18 @@ pub fn build_manifest(
     cancel: &CancelToken,
     progress: Option<&Progress>,
 ) -> Result<(Vec<ManifestEntry>, Vec<PathError>)> {
+    let build = build_manifest_with(root, exclude, cancel, progress, OnlineOnlyPolicy::Download)?;
+    Ok((build.entries, build.errors))
+}
+
+/// [`build_manifest`] with an online-only policy.
+pub fn build_manifest_with(
+    root: &Path,
+    exclude: &[PathBuf],
+    cancel: &CancelToken,
+    progress: Option<&Progress>,
+    policy: OnlineOnlyPolicy,
+) -> Result<ManifestBuild> {
     let mut files = Vec::new();
     let mut errors = Vec::new();
     walk_tree(root, cancel, |item| match item {
@@ -217,25 +316,35 @@ pub fn build_manifest(
         WalkItem::Error { path, error } => errors.push((path.clone(), error.to_string())),
     })?;
     let mut out = Vec::with_capacity(files.len());
+    let mut skipped = Vec::new();
     for (path, rel) in files {
         cancel.check()?;
         if let Some(p) = progress {
             p.set_current(path.display().to_string());
         }
-        match hash_file(&path, cancel, progress) {
-            Ok(hash) => out.push(ManifestEntry {
-                hash,
-                rel_path: paths::to_slash(&rel),
-            }),
-            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-            Err(e) => errors.push((path, e.to_string())),
+        if skip_online_only(&path, policy) {
+            skipped.push(paths::to_slash(&rel));
+        } else {
+            match hash_file(&path, cancel, progress) {
+                Ok(hash) => out.push(ManifestEntry {
+                    hash,
+                    rel_path: paths::to_slash(&rel),
+                }),
+                Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                Err(e) => errors.push((path, e.to_string())),
+            }
         }
         if let Some(p) = progress {
             p.add_items(1);
         }
     }
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok((out, errors))
+    skipped.sort();
+    Ok(ManifestBuild {
+        entries: out,
+        errors,
+        skipped_online_only: skipped,
+    })
 }
 
 /// Write a manifest atomically (temp file + rename).
@@ -272,6 +381,9 @@ pub struct VerifyReport {
     pub missing: Vec<String>,
     /// Exists but could not be read, or the manifest path itself was unsafe.
     pub unreadable: Vec<(String, String)>,
+    /// Online-only files not read under [`OnlineOnlyPolicy::Skip`]. Neither ok nor a failure.
+    #[serde(default)]
+    pub skipped_online_only: Vec<String>,
 }
 
 impl VerifyReport {
@@ -288,6 +400,17 @@ pub fn verify_entries(
     cancel: &CancelToken,
     progress: Option<&Progress>,
 ) -> Result<VerifyReport> {
+    verify_entries_with(root, entries, cancel, progress, OnlineOnlyPolicy::Download)
+}
+
+/// [`verify_entries`] with an online-only policy.
+pub fn verify_entries_with(
+    root: &Path,
+    entries: &[ManifestEntry],
+    cancel: &CancelToken,
+    progress: Option<&Progress>,
+    policy: OnlineOnlyPolicy,
+) -> Result<VerifyReport> {
     let mut r = VerifyReport::default();
     for e in entries {
         cancel.check()?;
@@ -298,12 +421,16 @@ pub fn verify_entries(
                 continue;
             }
         };
-        match hash_file(&path, cancel, progress) {
-            Ok(h) if h == e.hash => r.ok.push(e.rel_path.clone()),
-            Ok(_) => r.mismatched.push(e.rel_path.clone()),
-            Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
-            Err(CoreError::NotFound(_)) => r.missing.push(e.rel_path.clone()),
-            Err(err) => r.unreadable.push((e.rel_path.clone(), err.to_string())),
+        if skip_online_only(&path, policy) {
+            r.skipped_online_only.push(e.rel_path.clone());
+        } else {
+            match hash_file(&path, cancel, progress) {
+                Ok(h) if h == e.hash => r.ok.push(e.rel_path.clone()),
+                Ok(_) => r.mismatched.push(e.rel_path.clone()),
+                Err(CoreError::Cancelled) => return Err(CoreError::Cancelled),
+                Err(CoreError::NotFound(_)) => r.missing.push(e.rel_path.clone()),
+                Err(err) => r.unreadable.push((e.rel_path.clone(), err.to_string())),
+            }
         }
         if let Some(p) = progress {
             p.add_items(1);
@@ -318,10 +445,20 @@ pub fn verify_manifest(
     cancel: &CancelToken,
     progress: Option<&Progress>,
 ) -> Result<VerifyReport> {
+    verify_manifest_with(manifest, cancel, progress, OnlineOnlyPolicy::Download)
+}
+
+/// [`verify_manifest`] with an online-only policy.
+pub fn verify_manifest_with(
+    manifest: &Path,
+    cancel: &CancelToken,
+    progress: Option<&Progress>,
+    policy: OnlineOnlyPolicy,
+) -> Result<VerifyReport> {
     let text = fs::read_to_string(manifest).map_err(|e| CoreError::io(manifest, e))?;
     let entries = parse_manifest(&text)?;
     let root = manifest.parent().unwrap_or(Path::new("."));
-    verify_entries(root, &entries, cancel, progress)
+    verify_entries_with(root, &entries, cancel, progress, policy)
 }
 
 #[cfg(test)]
@@ -425,5 +562,70 @@ mod tests {
         }];
         let r = verify_entries(d.path(), &hostile, &CancelToken::new(), None).unwrap();
         assert_eq!(r.unreadable.len(), 1);
+    }
+
+    #[test]
+    fn online_only_files_are_skipped_or_downloaded() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("local.txt"), b"local").unwrap();
+        let online = d.path().join("cloud.txt");
+        fs::write(&online, b"cloud").unwrap();
+        cloud::simulate_online_only(&online);
+        let mpath = d.path().join("checksums.b3");
+        let cancel = CancelToken::new();
+        let totals = count_online_only_tree(d.path(), &cancel).unwrap();
+        assert_eq!((totals.count, totals.bytes), (1, 5));
+
+        let skip = build_manifest_with(
+            d.path(),
+            std::slice::from_ref(&mpath),
+            &cancel,
+            None,
+            OnlineOnlyPolicy::Skip,
+        )
+        .unwrap();
+        assert!(skip.errors.is_empty());
+        assert_eq!(skip.skipped_online_only, vec!["cloud.txt".to_string()]);
+        assert_eq!(skip.entries.len(), 1);
+        assert_eq!(skip.entries[0].rel_path, "local.txt");
+
+        let full = build_manifest_with(
+            d.path(),
+            std::slice::from_ref(&mpath),
+            &cancel,
+            None,
+            OnlineOnlyPolicy::Download,
+        )
+        .unwrap();
+        assert!(full.skipped_online_only.is_empty());
+        assert_eq!(full.entries.len(), 2);
+        let cloud_hash = *blake3::hash(b"cloud").as_bytes();
+        assert!(
+            full.entries
+                .iter()
+                .any(|e| e.rel_path == "cloud.txt" && e.hash == cloud_hash)
+        );
+
+        write_manifest(&mpath, &full.entries).unwrap();
+        let totals = count_online_only_manifest(&mpath, &cancel).unwrap();
+        assert_eq!((totals.count, totals.bytes), (1, 5));
+        let skipped = verify_manifest_with(&mpath, &cancel, None, OnlineOnlyPolicy::Skip).unwrap();
+        assert_eq!(skipped.ok, vec!["local.txt".to_string()]);
+        assert_eq!(skipped.skipped_online_only, vec!["cloud.txt".to_string()]);
+        assert!(skipped.mismatched.is_empty());
+        assert!(skipped.missing.is_empty());
+        assert!(skipped.unreadable.is_empty());
+        assert!(skipped.all_ok());
+        let downloaded = verify_manifest(&mpath, &cancel, None).unwrap();
+        assert_eq!(downloaded.ok.len(), 2);
+        assert!(downloaded.skipped_online_only.is_empty());
+
+        // A deleted file is still reported as missing under Skip.
+        fs::remove_file(d.path().join("local.txt")).unwrap();
+        let missing =
+            verify_manifest_with(&mpath, &cancel, None, OnlineOnlyPolicy::Skip).unwrap();
+        assert_eq!(missing.missing, vec!["local.txt".to_string()]);
+        assert_eq!(missing.skipped_online_only, vec!["cloud.txt".to_string()]);
+        cloud::clear_simulated_online_only(&online);
     }
 }

@@ -1179,6 +1179,45 @@ fn find_replace_skips_online_only_files() {
     );
 }
 
+#[test]
+fn checksums_ask_before_hashing_online_only_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path().join("shoot");
+    let local_only = sandbox.path().join("local");
+    let profile = sandbox.path().join("profile");
+    let cloud = root.join("cloud.mov");
+    write_file(&root.join("local.txt"), b"local");
+    write_file(&cloud, b"online-only");
+    write_file(&local_only.join("a.txt"), b"a");
+    write_file(&local_only.join("b.txt"), b"b");
+    let script = format!(
+        "ui tools checksums open {local_only}\n\
+         ui tools checksums wait 30\n\
+         ui tools checksums assert entries=2 skipped=0\n\
+         ui tools simulate-online-only {cloud}\n\
+         ui tools checksums open {root}\n\
+         ui tools checksums wait-prompt 1 30\n\
+         ui tools click-button checksums:Skip online-only\n\
+         ui tools checksums wait 30\n\
+         ui tools checksums assert entries=1 skipped=1\n\
+         ui tools checksums open {root}\n\
+         ui tools checksums wait-prompt 1 30\n\
+         ui tools click-button checksums:Download and hash\n\
+         ui tools checksums wait 30\n\
+         ui tools checksums assert entries=2 skipped=0\n\
+         wait-jobs 20\n\
+         exit\n",
+        cloud = shown(&cloud),
+        root = shown(&root),
+        local_only = shown(&local_only),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
 // ---------------------------------------------------------------------------
 // Backup check
 // ---------------------------------------------------------------------------

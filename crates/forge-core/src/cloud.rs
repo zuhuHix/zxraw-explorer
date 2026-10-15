@@ -80,10 +80,33 @@ impl AttributeSource for FsAttributes {
 
 /// `(attributes, reparse tag)` from the find data of `path`; the tag is 0 unless the entry is
 /// a reparse point. Never opens the file.
-#[cfg(windows)]
 fn find_data(path: &Path) -> Option<(u32, u32)> {
+    find_info(path)
+        .ok()
+        .map(|info| (info.attributes, info.reparse_tag))
+}
+
+/// The find data ZXraw uses: attributes, reparse tag (0 unless a reparse point) and the
+/// logical size (a placeholder reports its full size).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FindInfo {
+    attributes: u32,
+    reparse_tag: u32,
+    size: u64,
+}
+
+/// Why [`find_info`] failed: the path does not exist, or anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindError {
+    NotFound,
+    Other,
+}
+
+#[cfg(windows)]
+fn find_info(path: &Path) -> Result<FindInfo, FindError> {
     {
         use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
         use windows::Win32::Storage::FileSystem::{
             FIND_FIRST_EX_FLAGS, FindClose, FindExInfoBasic, FindExSearchNameMatch,
             FindFirstFileExW, WIN32_FIND_DATAW,
@@ -94,7 +117,7 @@ fn find_data(path: &Path) -> Option<(u32, u32)> {
         let name_part = text.strip_prefix(r"\\?\").unwrap_or(&text);
         // Wildcards would match other names (Windows file names cannot contain them).
         if name_part.is_empty() || name_part.contains(['*', '?']) {
-            return None;
+            return Err(FindError::Other);
         }
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut data = WIN32_FIND_DATAW::default();
@@ -110,7 +133,16 @@ fn find_data(path: &Path) -> Option<(u32, u32)> {
                 FIND_FIRST_EX_FLAGS(0),
             )
         }
-        .ok()?;
+        .map_err(|error| {
+            let code = error.code();
+            if code == ERROR_FILE_NOT_FOUND.to_hresult()
+                || code == ERROR_PATH_NOT_FOUND.to_hresult()
+            {
+                FindError::NotFound
+            } else {
+                FindError::Other
+            }
+        })?;
         // SAFETY: `handle` came from a successful FindFirstFileExW and is closed once.
         let _ = unsafe { FindClose(handle) };
         let tag = if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -118,14 +150,23 @@ fn find_data(path: &Path) -> Option<(u32, u32)> {
         } else {
             0
         };
-        Some((data.dwFileAttributes, tag))
+        Ok(FindInfo {
+            attributes: data.dwFileAttributes,
+            reparse_tag: tag,
+            size: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
+        })
     }
 }
 
 #[cfg(not(windows))]
-fn find_data(_path: &Path) -> Option<(u32, u32)> {
+fn find_info(path: &Path) -> Result<FindInfo, FindError> {
     // No cloud placeholders outside Windows.
-    Some((0, 0))
+    let md = fs::symlink_metadata(path).map_err(|_| FindError::NotFound)?;
+    Ok(FindInfo {
+        attributes: 0,
+        reparse_tag: 0,
+        size: md.len(),
+    })
 }
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -174,6 +215,37 @@ pub fn background_read_allowed_with(path: &Path, source: &dyn AttributeSource) -
         .is_some_and(|a| !is_online_only_attrs(a))
 }
 
+/// What a background job may do with a file, from its find data alone (never opened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadCheck {
+    /// Nothing at that path: report it as missing, not as a cloud file.
+    Missing,
+    /// Data on this PC (or not a regular file); reading downloads nothing.
+    Local,
+    /// Online-only, or the attributes could not be read (fail closed). `size` is the logical
+    /// size reading would download (0 when unknown).
+    OnlineOnly { size: u64 },
+}
+
+/// [`background_read_allowed`] that also tells a missing file apart and gives the size, for
+/// jobs that count what they would download. Never opens the file.
+pub fn read_check(path: &Path) -> ReadCheck {
+    read_check_from(path, find_info(path))
+}
+
+fn read_check_from(path: &Path, info: Result<FindInfo, FindError>) -> ReadCheck {
+    const DIRECTORY: u32 = 0x10;
+    match info {
+        Err(FindError::NotFound) => ReadCheck::Missing,
+        Err(FindError::Other) => ReadCheck::OnlineOnly { size: 0 },
+        Ok(info) if info.attributes & DIRECTORY != 0 => ReadCheck::Local,
+        Ok(info) if is_online_only_attrs(info.attributes) || is_simulated(path) => {
+            ReadCheck::OnlineOnly { size: info.size }
+        }
+        Ok(_) => ReadCheck::Local,
+    }
+}
+
 /// Pre-filter for an entry from a listing, without a syscall. Used for the badge and to avoid
 /// queueing work; the worker still calls [`background_read_allowed`] before reading.
 pub fn background_read_allowed_entry(entry: &FileEntry) -> bool {
@@ -212,6 +284,55 @@ pub fn clear_simulated_online_only(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn read_check_tells_missing_local_and_online_only_apart() {
+        let local = FindInfo {
+            attributes: 0x20,
+            reparse_tag: 0,
+            size: 7,
+        };
+        let p = Path::new(r"C:\x\clip.mov");
+        assert_eq!(read_check_from(p, Ok(local)), ReadCheck::Local);
+        let online = FindInfo {
+            attributes: 0x0040_0000,
+            ..local
+        };
+        assert_eq!(
+            read_check_from(p, Ok(online)),
+            ReadCheck::OnlineOnly { size: 7 }
+        );
+        let dir = FindInfo {
+            attributes: 0x10 | 0x0040_0000,
+            ..local
+        };
+        assert_eq!(read_check_from(p, Ok(dir)), ReadCheck::Local);
+        assert_eq!(
+            read_check_from(p, Err(FindError::NotFound)),
+            ReadCheck::Missing
+        );
+        // Unreadable attributes fail closed.
+        assert_eq!(
+            read_check_from(p, Err(FindError::Other)),
+            ReadCheck::OnlineOnly { size: 0 }
+        );
+    }
+
+    #[test]
+    fn read_check_on_real_files() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.bin");
+        std::fs::write(&f, b"12345").unwrap();
+        assert_eq!(read_check(&f), ReadCheck::Local);
+        assert_eq!(read_check(&d.path().join("gone.bin")), ReadCheck::Missing);
+        assert_eq!(
+            read_check(&d.path().join("no-dir").join("gone.bin")),
+            ReadCheck::Missing
+        );
+        simulate_online_only(&f);
+        assert_eq!(read_check(&f), ReadCheck::OnlineOnly { size: 5 });
+        clear_simulated_online_only(&f);
+    }
+
     use super::*;
     use std::collections::HashMap;
 

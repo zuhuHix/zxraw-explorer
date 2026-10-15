@@ -86,9 +86,17 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Online-only *folders* are still listed by the indexer, scans and file operations. Listing a
   placeholder folder fetches names and sizes from the cloud, not file contents. Skipping them
   would hide whole OneDrive trees.
-* The copy/move download warning walks selected folders only up to an entry and time limit.
-  Past that limit it gives a general warning instead of an exact count. That walk runs off the
-  UI thread; a "Checking for online-only files" dialog appears if it takes longer than 150 ms.
+* The copy/move download warning checks the selection (files and folders) only up to an entry
+  and time limit. When it stops early after finding online-only files, the warning gives the
+  count and size found so far as "at least" and says the scan stopped early. When it stops
+  before finding any, it stays silent, so online-only files further down a very large folder
+  can be copied without a warning. The check runs off the UI thread; a "Checking for
+  online-only files" dialog appears if it takes longer than 150 ms.
+* The checksum tool counts online-only files before hashing and asks whether to download and
+  hash them, skip them, or cancel. That count walks the whole selection with no limit, as
+  hashing does. Skipped files are listed, never hashed, and are not in the saved manifest.
+* Proxy generation re-checks each clip just before ffmpeg opens it and skips one that has
+  become online-only since the estimate.
 * Folder compare (with content hashing) and its sync preview mark online-only files "not
   compared" and leave them out of the sync. Download them first to compare or sync them.
 * Background reads check the attributes, then open the file normally. A file that becomes

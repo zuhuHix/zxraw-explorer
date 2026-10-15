@@ -17,17 +17,16 @@ use forge_core::compare::{self, CompareReport, EntryState, SyncAction, SyncMode,
 use forge_core::disk_usage::{self, UsageReport};
 use forge_core::duplicates::{self, DupOptions, DupReport, DuplicateGroup};
 use forge_core::error::CoreError;
-use forge_core::hashing::{self, ManifestEntry, VerifyReport};
+use forge_core::hashing::{self, ManifestEntry, OnlineOnlyPolicy, OnlineOnlyTotals, VerifyReport};
 use forge_core::model::format_size;
 use forge_core::ops::{JobCtx, OpReport};
-use forge_jobs::{JobHandle, JobRegistry};
+use forge_jobs::{CancelToken, JobHandle, JobRegistry};
 
 use crate::actions::Event;
 use crate::app::ZxrawApp;
 use crate::theme;
 
-type ManifestBuild = (Vec<ManifestEntry>, Vec<(PathBuf, String)>);
-type ManifestJobResult = Result<ManifestBuild, String>;
+type ManifestJobResult = Result<hashing::ManifestBuild, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -81,6 +80,8 @@ impl ToolsState {
                 selection,
                 entries: None,
                 errors: Vec::new(),
+                skipped: Vec::new(),
+                prompt: None,
                 verify: None,
             }),
             Tool::CompareFolders => ToolState::Compare(CompareState {
@@ -116,6 +117,7 @@ impl ToolsState {
             open: true,
             generation: 0,
             initial_pending: start_initial,
+            follow_up: None,
             job: None,
             tx,
             rx,
@@ -130,6 +132,8 @@ struct ToolWindow {
     open: bool,
     generation: u64,
     initial_pending: bool,
+    /// Work started by a finished job without user input (no online-only files found).
+    follow_up: Option<DeferredAction>,
     job: Option<JobHandle>,
     tx: Sender<ToolEnvelope>,
     rx: Receiver<ToolEnvelope>,
@@ -179,7 +183,25 @@ struct ChecksumsState {
     selection: Vec<PathBuf>,
     entries: Option<Vec<ManifestEntry>>,
     errors: Vec<(PathBuf, String)>,
+    skipped: Vec<String>,
+    /// Waiting for the user to choose what to do with online-only files.
+    prompt: Option<OnlineOnlyPrompt>,
     verify: Option<VerifyReport>,
+}
+
+/// A checksum job waiting for its online-only count and the user's choice.
+#[derive(Debug)]
+enum ChecksumWork {
+    Build {
+        root: PathBuf,
+        selection: Vec<PathBuf>,
+    },
+    Verify(PathBuf),
+}
+
+struct OnlineOnlyPrompt {
+    work: ChecksumWork,
+    totals: OnlineOnlyTotals,
 }
 
 struct CompareState {
@@ -250,9 +272,10 @@ struct ToolEnvelope {
 enum ToolPayload {
     Folder(Result<UsageReport, String>),
     Duplicates(Result<(DupReport, HashMap<PathBuf, SystemTime>), String>),
+    OnlineOnlyCount(ChecksumWork, Result<OnlineOnlyTotals, String>),
     Manifest(ManifestJobResult),
     Verify(Result<VerifyReport, String>),
-    Saved(Result<PathBuf, String>),
+    Saved(Result<PathBuf, String>, usize),
     Compare(Result<CompareReport, String>),
     SyncPlan(Result<SyncPlan, String>),
     Recycled(Result<(), String>),
@@ -277,14 +300,18 @@ enum DeferredAction {
         selection: Vec<PathBuf>,
         options: DupOptions,
     },
-    ManifestScan {
-        root: PathBuf,
-        selection: Vec<PathBuf>,
+    /// Phase 1 of a checksum job: count the online-only files it would read.
+    ChecksumCount(ChecksumWork),
+    /// Phase 2: run the checksum job with the chosen policy.
+    Checksum {
+        work: ChecksumWork,
+        policy: OnlineOnlyPolicy,
     },
-    Verify(PathBuf),
     SaveManifest {
         path: PathBuf,
         entries: Vec<ManifestEntry>,
+        /// Online-only files skipped when hashing, so not in the manifest.
+        skipped: usize,
     },
     CompareScan {
         left: PathBuf,
@@ -351,11 +378,35 @@ impl ToolWindow {
                     }
                     Err(error) => self.notice = Some(error),
                 },
+                ToolPayload::OnlineOnlyCount(work, result) => {
+                    if let ToolState::Checksums(state) = &mut self.state {
+                        state.prompt = None;
+                    }
+                    match result {
+                        // Skip, not Download: a file that goes online-only after the count
+                        // is reported as skipped instead of being downloaded unasked.
+                        Ok(totals) if totals.count == 0 => {
+                            self.follow_up = Some(DeferredAction::Checksum {
+                                work,
+                                policy: OnlineOnlyPolicy::Skip,
+                            });
+                            self.notice = None;
+                        }
+                        Ok(totals) => {
+                            if let ToolState::Checksums(state) = &mut self.state {
+                                state.prompt = Some(OnlineOnlyPrompt { work, totals });
+                            }
+                            self.notice = None;
+                        }
+                        Err(error) => self.notice = Some(error),
+                    }
+                }
                 ToolPayload::Manifest(result) => match result {
-                    Ok((entries, errors)) => {
+                    Ok(build) => {
                         if let ToolState::Checksums(state) = &mut self.state {
-                            state.entries = Some(entries);
-                            state.errors = errors;
+                            state.entries = Some(build.entries);
+                            state.errors = build.errors;
+                            state.skipped = build.skipped_online_only;
                             state.verify = None;
                         }
                         self.notice = None;
@@ -364,25 +415,16 @@ impl ToolWindow {
                 },
                 ToolPayload::Verify(result) => match result {
                     Ok(report) => {
-                        self.notice = Some(if report.all_ok() {
-                            format!("Verification complete: {} file(s) OK", report.ok.len())
-                        } else {
-                            format!(
-                                "Verification complete: {} mismatch, {} missing, {} unreadable",
-                                report.mismatched.len(),
-                                report.missing.len(),
-                                report.unreadable.len()
-                            )
-                        });
+                        self.notice = Some(verify_summary(&report));
                         if let ToolState::Checksums(state) = &mut self.state {
                             state.verify = Some(report);
                         }
                     }
                     Err(error) => self.notice = Some(error),
                 },
-                ToolPayload::Saved(result) => {
+                ToolPayload::Saved(result, skipped) => {
                     self.notice = Some(match result {
-                        Ok(path) => format!("Manifest saved to {}", path.display()),
+                        Ok(path) => saved_notice(&path, skipped),
                         Err(error) => error,
                     });
                 }
@@ -467,10 +509,10 @@ impl ToolWindow {
                     byte_compare: state.byte_compare,
                 },
             }),
-            ToolState::Checksums(state) => Some(DeferredAction::ManifestScan {
+            ToolState::Checksums(state) => Some(DeferredAction::ChecksumCount(ChecksumWork::Build {
                 root: state.root.clone(),
                 selection: state.selection.clone(),
-            }),
+            })),
             ToolState::Compare(state) => {
                 state
                     .right
@@ -511,11 +553,21 @@ fn verify_options(state: &VerifyState) -> VerifyOptions {
 pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
     let mut index = 0;
     while index < app.ops.tools.windows.len() {
-        let ui_action = {
+        let follow_up = {
             let window = &mut app.ops.tools.windows[index];
             window.poll_messages();
-            render_window(window, ctx)
+            window.follow_up.take().filter(|_| window.open)
         };
+        // Started before this frame's UI, so a click in the same frame supersedes it like any
+        // running job instead of dropping it.
+        if let Some(action) = follow_up {
+            let jobs = &app.ops.jobs;
+            let event_tx = &app.ops.tx;
+            let app_ctx = &app.ops.ctx;
+            let window = &mut app.ops.tools.windows[index];
+            launch_action(jobs, event_tx, app_ctx, window, action);
+        }
+        let ui_action = render_window(&mut app.ops.tools.windows[index], ctx);
 
         let mut navigate = None;
         let mut deferred = None;
@@ -555,6 +607,51 @@ pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
         } else {
             index += 1;
         }
+    }
+}
+
+pub(crate) fn automation_open_checksums(app: &mut ZxrawApp, folder: PathBuf) {
+    app.ops
+        .tools
+        .open(Tool::Checksums, folder, Vec::new(), None);
+}
+
+/// What the newest checksum window shows: the online-only prompt, a finished manifest, or
+/// neither yet (`None`, or an error notice once its job ended).
+pub(crate) enum ChecksumsView {
+    Prompt(OnlineOnlyTotals),
+    Manifest { entries: usize, skipped: usize },
+}
+
+pub(crate) fn automation_checksums(
+    app: &mut ZxrawApp,
+) -> Option<std::result::Result<ChecksumsView, String>> {
+    let window = app
+        .ops
+        .tools
+        .windows
+        .iter_mut()
+        .rev()
+        .find(|window| matches!(window.state, ToolState::Checksums(_)))?;
+    window.poll_messages();
+    let job_done = window
+        .job
+        .as_ref()
+        .is_none_or(|job| job.state().is_finished());
+    let ToolState::Checksums(state) = &window.state else {
+        unreachable!();
+    };
+    if let Some(prompt) = &state.prompt {
+        Some(Ok(ChecksumsView::Prompt(prompt.totals)))
+    } else if !job_done || window.follow_up.is_some() {
+        None
+    } else if let Some(entries) = &state.entries {
+        Some(Ok(ChecksumsView::Manifest {
+            entries: entries.len(),
+            skipped: state.skipped.len(),
+        }))
+    } else {
+        window.notice.clone().map(Err)
     }
 }
 
@@ -1160,61 +1257,90 @@ fn launch_action(
             });
             ("duplicates", title, handle)
         }
-        DeferredAction::ManifestScan { root, selection } => {
-            let title = if selection.is_empty() {
-                format!("Building BLAKE3 manifest: {}", root.display())
-            } else {
-                format!("Hashing {} selected item(s)", selection.len())
-            };
+        DeferredAction::ChecksumCount(work) => {
+            let title = format!("Checking for online-only files: {}", work.describe());
             let result_tx = result_tx.clone();
             let ctx = ctx.clone();
-            let handle = jobs.spawn("checksums", title.clone(), move |job| {
-                let result = manifest_for_selection(&root, &selection, job)
+            let handle = jobs.spawn("checksums-count", title.clone(), move |job| {
+                job.progress.set_current("Checking for online-only files");
+                let result = count_online_only(&work, &job.cancel)
                     .map_err(|error| error.to_string());
-                if let Ok((_, errors)) = &result {
-                    for _ in errors {
-                        job.progress.add_error();
-                    }
-                }
                 let err = result.as_ref().err().cloned();
                 let _ = result_tx.send(ToolEnvelope {
                     generation,
-                    payload: ToolPayload::Manifest(result),
+                    payload: ToolPayload::OnlineOnlyCount(work, result),
                 });
                 ctx.request_repaint();
                 err.map_or(Ok(()), Err)
             });
-            ("checksums", title, handle)
+            ("checksums-count", title, handle)
         }
-        DeferredAction::Verify(path) => {
-            let title = format!("Verifying manifest: {}", path.display());
-            let result_tx = result_tx.clone();
-            let ctx = ctx.clone();
-            let handle = jobs.spawn("verify-manifest", title.clone(), move |job| {
-                job.progress.set_current("Reading BLAKE3 manifest");
-                if let Ok(text) = std::fs::read_to_string(&path)
-                    && let Ok(entries) = hashing::parse_manifest(&text)
-                {
-                    job.progress.add_total_items(entries.len() as u64);
-                }
-                let result = hashing::verify_manifest(&path, &job.cancel, Some(&job.progress))
-                    .map_err(|error| error.to_string());
-                if let Ok(report) = &result {
-                    for _ in &report.unreadable {
-                        job.progress.add_error();
+        DeferredAction::Checksum { work, policy } => match work {
+            ChecksumWork::Build { root, selection } => {
+                let title = if selection.is_empty() {
+                    format!("Building BLAKE3 manifest: {}", root.display())
+                } else {
+                    format!("Hashing {} selected item(s)", selection.len())
+                };
+                let result_tx = result_tx.clone();
+                let ctx = ctx.clone();
+                let handle = jobs.spawn("checksums", title.clone(), move |job| {
+                    let result = manifest_for_selection(&root, &selection, policy, job)
+                        .map_err(|error| error.to_string());
+                    if let Ok(build) = &result {
+                        for _ in &build.errors {
+                            job.progress.add_error();
+                        }
                     }
-                }
-                let err = result.as_ref().err().cloned();
-                let _ = result_tx.send(ToolEnvelope {
-                    generation,
-                    payload: ToolPayload::Verify(result),
+                    let err = result.as_ref().err().cloned();
+                    let _ = result_tx.send(ToolEnvelope {
+                        generation,
+                        payload: ToolPayload::Manifest(result),
+                    });
+                    ctx.request_repaint();
+                    err.map_or(Ok(()), Err)
                 });
-                ctx.request_repaint();
-                err.map_or(Ok(()), Err)
-            });
-            ("verify-manifest", title, handle)
-        }
-        DeferredAction::SaveManifest { path, entries } => {
+                ("checksums", title, handle)
+            }
+            ChecksumWork::Verify(path) => {
+                let title = format!("Verifying manifest: {}", path.display());
+                let result_tx = result_tx.clone();
+                let ctx = ctx.clone();
+                let handle = jobs.spawn("verify-manifest", title.clone(), move |job| {
+                    job.progress.set_current("Reading BLAKE3 manifest");
+                    if let Ok(text) = std::fs::read_to_string(&path)
+                        && let Ok(entries) = hashing::parse_manifest(&text)
+                    {
+                        job.progress.add_total_items(entries.len() as u64);
+                    }
+                    let result = hashing::verify_manifest_with(
+                        &path,
+                        &job.cancel,
+                        Some(&job.progress),
+                        policy,
+                    )
+                    .map_err(|error| error.to_string());
+                    if let Ok(report) = &result {
+                        for _ in &report.unreadable {
+                            job.progress.add_error();
+                        }
+                    }
+                    let err = result.as_ref().err().cloned();
+                    let _ = result_tx.send(ToolEnvelope {
+                        generation,
+                        payload: ToolPayload::Verify(result),
+                    });
+                    ctx.request_repaint();
+                    err.map_or(Ok(()), Err)
+                });
+                ("verify-manifest", title, handle)
+            }
+        },
+        DeferredAction::SaveManifest {
+            path,
+            entries,
+            skipped,
+        } => {
             let title = format!("Saving BLAKE3 manifest: {}", path.display());
             let result_tx = result_tx.clone();
             let ctx = ctx.clone();
@@ -1227,7 +1353,7 @@ fn launch_action(
                 let err = result.as_ref().err().cloned();
                 let _ = result_tx.send(ToolEnvelope {
                     generation,
-                    payload: ToolPayload::Saved(result),
+                    payload: ToolPayload::Saved(result, skipped),
                 });
                 ctx.request_repaint();
                 err.map_or(Ok(()), Err)
@@ -2372,26 +2498,37 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
     let mut rescan = false;
     let mut save_path = None;
     let mut verify_path = None;
+    // While the online-only prompt waits, its answer is the only way on: a new count would
+    // leave the prompt showing stale totals.
+    let idle = state.prompt.is_none();
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button(if state.entries.is_some() {
-                "Rehash"
-            } else {
-                "Build BLAKE3 manifest"
-            })
+            .add_enabled(
+                idle,
+                egui::Button::new(if state.entries.is_some() {
+                    "Rehash"
+                } else {
+                    "Build BLAKE3 manifest"
+                }),
+            )
             .clicked()
         {
             rescan = true;
         }
         if ui
-            .add_enabled(state.entries.is_some(), egui::Button::new("Save manifest…"))
+            .add_enabled(
+                idle && state.entries.is_some(),
+                egui::Button::new("Save manifest…"),
+            )
             .clicked()
             && let Some(path) =
                 crate::dialogs::save_file(rfd::FileDialog::new().set_file_name("checksums.b3"))
         {
             save_path = Some(path);
         }
-        if ui.button("Verify manifest…").clicked()
+        if ui
+            .add_enabled(idle, egui::Button::new("Verify manifest…"))
+            .clicked()
             && let Some(path) = crate::dialogs::pick_file(
                 rfd::FileDialog::new().add_filter("BLAKE3 manifest", &["b3", "txt"]),
             )
@@ -2399,11 +2536,53 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
             verify_path = Some(path);
         }
     });
+    if let Some(totals) = state.prompt.as_ref().map(|prompt| prompt.totals) {
+        let mut policy = None;
+        let mut cancel = false;
+        ui.separator();
+        ui.label(RichText::new(online_only_prompt_text(totals)).strong());
+        ui.label(
+            RichText::new(
+                "Hashing reads each file whole, so it downloads it from the cloud first.",
+            )
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            let download = ui.button("Download and hash");
+            register_click_target(ui.ctx(), "checksums:Download and hash", &download);
+            if download.clicked() {
+                policy = Some(OnlineOnlyPolicy::Download);
+            }
+            let skip = ui.button("Skip online-only");
+            register_click_target(ui.ctx(), "checksums:Skip online-only", &skip);
+            if skip.clicked() {
+                policy = Some(OnlineOnlyPolicy::Skip);
+            }
+            let cancel_button = ui.button("Cancel");
+            register_click_target(ui.ctx(), "checksums:Cancel", &cancel_button);
+            if cancel_button.clicked() {
+                cancel = true;
+            }
+        });
+        if let Some(policy) = policy
+            && let Some(prompt) = state.prompt.take()
+        {
+            return Some(UiAction::Start(DeferredAction::Checksum {
+                work: prompt.work,
+                policy,
+            }));
+        }
+        if cancel {
+            state.prompt = None;
+        }
+    }
     if rescan {
-        return Some(UiAction::Start(DeferredAction::ManifestScan {
-            root: state.root.clone(),
-            selection: state.selection.clone(),
-        }));
+        return Some(UiAction::Start(DeferredAction::ChecksumCount(
+            ChecksumWork::Build {
+                root: state.root.clone(),
+                selection: state.selection.clone(),
+            },
+        )));
     }
     if let Some(path) = save_path
         && let Some(entries) = &state.entries
@@ -2411,10 +2590,13 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
         return Some(UiAction::Start(DeferredAction::SaveManifest {
             path,
             entries: entries.clone(),
+            skipped: state.skipped.len(),
         }));
     }
     if let Some(path) = verify_path {
-        return Some(UiAction::Start(DeferredAction::Verify(path)));
+        return Some(UiAction::Start(DeferredAction::ChecksumCount(
+            ChecksumWork::Verify(path),
+        )));
     }
     if let Some(entries) = &state.entries {
         ui.horizontal(|ui| {
@@ -2453,6 +2635,16 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
                 }
             });
         }
+        if !state.skipped.is_empty() {
+            ui.collapsing(
+                format!("{} skipped (online-only)", state.skipped.len()),
+                |ui| {
+                    for path in &state.skipped {
+                        ui.label(path);
+                    }
+                },
+            );
+        }
     } else {
         ui.label(RichText::new("Hashes stream into the Operations progress row. The saved file uses b3sum-compatible output.").weak());
     }
@@ -2477,6 +2669,10 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
             ui.label(format!("{} MISMATCH", report.mismatched.len()));
             ui.label(format!("{} MISSING", report.missing.len()));
             ui.label(format!("{} unreadable", report.unreadable.len()));
+            ui.label(format!(
+                "{} skipped (online-only)",
+                report.skipped_online_only.len()
+            ));
         });
         egui::ScrollArea::vertical()
             .id_salt(("verify-results", id))
@@ -2497,36 +2693,46 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
                         format!("UNREADABLE {path}: {error}"),
                     );
                 }
+                for path in &report.skipped_online_only {
+                    ui.label(format!("SKIPPED  {path} (online-only)"));
+                }
             });
     }
     None
 }
 
-fn manifest_for_selection(
-    root: &Path,
-    selection: &[PathBuf],
-    job: &JobHandle,
-) -> forge_core::Result<ManifestBuild> {
-    let progress = Some(job.progress.as_ref());
-    if selection.is_empty() {
-        return hashing::build_manifest(root, &[], &job.cancel, progress);
-    }
+/// The paths a selection hashes: a selected item inside another selected folder is covered
+/// by that folder.
+fn selection_roots(selection: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = selection.to_vec();
-    paths.sort_by_key(|path| path.components().count());
+    // By depth, then by path, so duplicates are adjacent for `dedup`.
+    paths.sort_by(|a, b| (a.components().count(), a).cmp(&(b.components().count(), b)));
     paths.dedup();
-    let mut roots = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
     for path in paths {
         if roots
             .iter()
-            .any(|parent: &PathBuf| forge_core::paths::is_within(parent, &path))
+            .any(|parent| forge_core::paths::is_within(parent, &path))
         {
             continue;
         }
         roots.push(path);
     }
-    let mut entries = Vec::new();
-    let mut errors = Vec::new();
-    for path in roots {
+    roots
+}
+
+fn manifest_for_selection(
+    root: &Path,
+    selection: &[PathBuf],
+    policy: OnlineOnlyPolicy,
+    job: &JobHandle,
+) -> forge_core::Result<hashing::ManifestBuild> {
+    let progress = Some(job.progress.as_ref());
+    if selection.is_empty() {
+        return hashing::build_manifest_with(root, &[], &job.cancel, progress, policy);
+    }
+    let mut build = hashing::ManifestBuild::default();
+    for path in selection_roots(selection) {
         job.cancel
             .check()
             .map_err(|_| forge_core::error::CoreError::Cancelled)?;
@@ -2534,36 +2740,53 @@ fn manifest_for_selection(
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                errors.push((path.clone(), error.to_string()));
+                build.errors.push((path.clone(), error.to_string()));
                 continue;
             }
         };
         if metadata.is_dir() {
-            let (mut found, mut failed) =
-                hashing::build_manifest(&path, &[], &job.cancel, progress)?;
-            let prefix = path.strip_prefix(root).unwrap_or_else(|_| Path::new(""));
-            let prefix = forge_core::paths::to_slash(prefix);
-            for entry in &mut found {
-                if !prefix.is_empty() {
-                    entry.rel_path = format!("{prefix}/{}", entry.rel_path);
+            let mut found =
+                hashing::build_manifest_with(&path, &[], &job.cancel, progress, policy)?;
+            let prefix = forge_core::paths::to_slash(
+                path.strip_prefix(root).unwrap_or_else(|_| Path::new("")),
+            );
+            let with_prefix = |rel: String| {
+                if prefix.is_empty() {
+                    rel
+                } else {
+                    format!("{prefix}/{rel}")
                 }
+            };
+            for entry in &mut found.entries {
+                entry.rel_path = with_prefix(std::mem::take(&mut entry.rel_path));
             }
-            entries.extend(found);
-            errors.append(&mut failed);
+            build.entries.extend(found.entries);
+            build.errors.append(&mut found.errors);
+            build.skipped_online_only.extend(
+                found
+                    .skipped_online_only
+                    .into_iter()
+                    .map(with_prefix),
+            );
         } else if metadata.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .ok()
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .map(forge_core::paths::to_slash)
+                .or_else(|| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| path.display().to_string());
+            if policy == OnlineOnlyPolicy::Skip && hashing::is_online_only_file(&path) {
+                build.skipped_online_only.push(relative);
+                job.progress.add_items(1);
+                continue;
+            }
             match hashing::hash_file(&path, &job.cancel, Some(&job.progress)) {
                 Ok(hash) => {
-                    let relative = path
-                        .strip_prefix(root)
-                        .ok()
-                        .filter(|rel| !rel.as_os_str().is_empty())
-                        .map(forge_core::paths::to_slash)
-                        .or_else(|| {
-                            path.file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                        })
-                        .unwrap_or_else(|| path.display().to_string());
-                    entries.push(ManifestEntry {
+                    build.entries.push(ManifestEntry {
                         hash,
                         rel_path: relative,
                     });
@@ -2572,14 +2795,94 @@ fn manifest_for_selection(
                 Err(forge_core::error::CoreError::Cancelled) => {
                     return Err(forge_core::error::CoreError::Cancelled);
                 }
-                Err(error) => errors.push((path.clone(), error.to_string())),
+                Err(error) => build.errors.push((path.clone(), error.to_string())),
             }
         } else {
-            errors.push((path, "links and non-regular items are skipped".into()));
+            build
+                .errors
+                .push((path, "links and non-regular items are skipped".into()));
         }
     }
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok((entries, errors))
+    build.entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    build.skipped_online_only.sort();
+    Ok(build)
+}
+
+impl ChecksumWork {
+    fn describe(&self) -> String {
+        match self {
+            Self::Build { root, selection } if selection.is_empty() => root.display().to_string(),
+            Self::Build { selection, .. } => format!("{} selected item(s)", selection.len()),
+            Self::Verify(path) => path.display().to_string(),
+        }
+    }
+}
+
+/// How many files the job would read that are online-only. Phase 1 of a checksum job.
+fn count_online_only(
+    work: &ChecksumWork,
+    cancel: &CancelToken,
+) -> forge_core::Result<OnlineOnlyTotals> {
+    match work {
+        ChecksumWork::Build { root, selection } if selection.is_empty() => {
+            hashing::count_online_only_tree(root, cancel)
+        }
+        ChecksumWork::Build { selection, .. } => {
+            let mut totals = OnlineOnlyTotals::default();
+            for path in selection_roots(selection) {
+                cancel.check()?;
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.is_dir() => {
+                        let tree = hashing::count_online_only_tree(&path, cancel)?;
+                        totals.count += tree.count;
+                        totals.bytes += tree.bytes;
+                    }
+                    Ok(metadata) if metadata.is_file() => totals.add_file(&path),
+                    _ => {}
+                }
+            }
+            Ok(totals)
+        }
+        ChecksumWork::Verify(path) => hashing::count_online_only_manifest(path, cancel),
+    }
+}
+
+fn online_only_prompt_text(totals: OnlineOnlyTotals) -> String {
+    let size = format_size(totals.bytes);
+    if totals.count == 1 {
+        format!("1 file is online-only and would be downloaded ({size}).")
+    } else {
+        format!(
+            "{} files are online-only and would be downloaded ({size}).",
+            totals.count
+        )
+    }
+}
+
+fn saved_notice(path: &Path, skipped: usize) -> String {
+    let saved = format!("Manifest saved to {}", path.display());
+    match skipped {
+        0 => saved,
+        1 => format!("{saved}. 1 online-only file was skipped and is not in it"),
+        n => format!("{saved}. {n} online-only files were skipped and are not in it"),
+    }
+}
+
+fn verify_summary(report: &VerifyReport) -> String {
+    let counts = if report.all_ok() {
+        format!("Verification complete: {} file(s) OK", report.ok.len())
+    } else {
+        format!(
+            "Verification complete: {} mismatch, {} missing, {} unreadable",
+            report.mismatched.len(),
+            report.missing.len(),
+            report.unreadable.len()
+        )
+    };
+    match report.skipped_online_only.len() {
+        0 => counts,
+        skipped => format!("{counts}, {skipped} skipped (online-only)"),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3434,5 +3737,59 @@ mod tests {
         let unsafe_all = BTreeSet::from([(0, 0), (0, 1), (1, 0), (1, 1), (1, 2)]);
         assert!(!selection_is_safe(&groups, &unsafe_all));
         assert!(selected_duplicate_targets(&groups, &unsafe_all).is_none());
+    }
+
+    #[test]
+    fn online_only_prompt_counts_read_naturally() {
+        let one = OnlineOnlyTotals {
+            count: 1,
+            bytes: 512,
+        };
+        assert_eq!(
+            online_only_prompt_text(one),
+            format!(
+                "1 file is online-only and would be downloaded ({}).",
+                format_size(512)
+            )
+        );
+        let many = OnlineOnlyTotals {
+            count: 3,
+            bytes: 3 << 30,
+        };
+        assert_eq!(
+            online_only_prompt_text(many),
+            format!(
+                "3 files are online-only and would be downloaded ({}).",
+                format_size(3 << 30)
+            )
+        );
+    }
+
+    #[test]
+    fn selection_roots_are_covered_by_outer_folders() {
+        let folder = PathBuf::from(r"C:\photos\2026");
+        let inner = folder.join("raw");
+        let file = PathBuf::from(r"C:\photos\cover.jpg");
+        let roots = selection_roots(&[inner.clone(), file.clone(), folder.clone(), inner]);
+        assert_eq!(roots, vec![folder, file]);
+    }
+
+    #[test]
+    fn verify_summary_reports_skipped_files() {
+        let mut report = VerifyReport {
+            ok: vec!["a.txt".into()],
+            ..Default::default()
+        };
+        assert_eq!(verify_summary(&report), "Verification complete: 1 file(s) OK");
+        report.skipped_online_only = vec!["b.mov".into(), "c.mov".into()];
+        assert_eq!(
+            verify_summary(&report),
+            "Verification complete: 1 file(s) OK, 2 skipped (online-only)"
+        );
+        report.missing = vec!["d.txt".into()];
+        assert_eq!(
+            verify_summary(&report),
+            "Verification complete: 0 mismatch, 1 missing, 0 unreadable, 2 skipped (online-only)"
+        );
     }
 }
