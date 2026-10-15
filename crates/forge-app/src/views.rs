@@ -301,11 +301,7 @@ fn row_click(resp: &egui::Response, pane: &mut Pane, vis: usize, out: &mut Vec<V
     }
     if resp.secondary_clicked() {
         resp.request_focus();
-        if let Some(e) = pane.entry_at(vis)
-            && !pane.is_selected(e)
-        {
-            pane.click(vis, false, false);
-        }
+        pane.context_click(vis);
         out.push(ViewEvent::Focus);
     }
     if resp.double_clicked() {
@@ -1858,7 +1854,11 @@ fn group_row_click(
     }
     if resp.secondary_clicked() {
         resp.request_focus();
-        if !members.iter().all(|path| pane.selected.contains(path)) {
+        // Like `Pane::context_click`: a selected stack keeps the selection, and the cursor
+        // moves to it so Open, Rename and Properties act on it.
+        if members.iter().all(|path| pane.selected.contains(path)) {
+            pane.cursor = Some(cursor_vis);
+        } else {
             pane.click_group(cursor_vis, members, false, false);
         }
         out.push(ViewEvent::Focus);

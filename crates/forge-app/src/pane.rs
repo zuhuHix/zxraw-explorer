@@ -430,12 +430,19 @@ impl Pane {
             self.dirty_sort = true;
             changed = true;
             // `refresh` keeps the old selection; forget paths that are no longer listed.
-            // Items inside open folders may still be on their way.
+            // Items inside open folders may still be on their way, and items inside a
+            // closed folder stay selected while the folder is listed (see `set_expanded`).
             if !self.selected.is_empty() {
                 let listed: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
                 let expanded = &self.expanded;
+                let root = self.path.as_path();
                 self.selected.retain(|p| {
-                    listed.contains(p.as_path()) || p.parent().is_some_and(|d| expanded.contains(d))
+                    listed.contains(p.as_path())
+                        || p.parent().is_some_and(|d| expanded.contains(d))
+                        || p.ancestors()
+                            .skip(1)
+                            .take_while(|a| *a != root)
+                            .any(|a| listed.contains(a))
                 });
             }
         }
@@ -610,9 +617,10 @@ impl Pane {
         }
     }
 
-    /// What F2 renames: one of the guarded [`Pane::action_targets`], the cursor item when it
-    /// is one of them, else the first. A selection that is entirely hidden renames nothing,
-    /// even when the cursor sits on another, visible file.
+    /// What F2 renames (and what Properties and Open with show): one of the guarded
+    /// [`Pane::action_targets`], the cursor item when it is one of them, else the first. A
+    /// selection that is entirely hidden renames nothing, even when the cursor sits on
+    /// another, visible file.
     pub fn rename_target(&self) -> Option<&FileEntry> {
         let targets = self.action_targets();
         self.cursor_entry()
@@ -668,6 +676,17 @@ impl Pane {
             .map(|&i| self.entries[i].path.clone())
             .collect();
         self.selected = all.difference(&self.selected).cloned().collect();
+    }
+
+    /// A right-click on a row: the menu acts on the selection when the row is part of it
+    /// (the cursor moves to the row, so Open, Rename and Properties take it), else on the
+    /// row alone.
+    pub fn context_click(&mut self, vis: usize) {
+        match self.entry_at(vis) {
+            Some(e) if self.is_selected(e) => self.cursor = Some(vis),
+            Some(_) => self.click(vis, false, false),
+            None => {}
+        }
     }
 
     /// Mouse/keyboard selection semantics matching Explorer.
@@ -843,8 +862,11 @@ impl Pane {
         self.children.keys().map(PathBuf::as_path)
     }
 
-    /// Open or close a listed folder in place. Closing forgets the items listed below it
-    /// (and drops them from the selection); folders open inside it stay remembered.
+    /// Open or close a listed folder in place. Closing forgets the items listed below it;
+    /// folders open inside it stay remembered. Selected items inside stay selected but
+    /// hidden, so they target nothing (see [`Pane::action_targets`]) and show again when
+    /// the folder is reopened: dropping them would leave the cursor, now on the folder, as
+    /// the target, and a Delete would take the whole folder.
     pub fn set_expanded(&mut self, path: &Path, open: bool) {
         if open {
             let listed = self
@@ -858,7 +880,7 @@ impl Pane {
             self.reshape(false, |pane| pane.start_child_load(path.to_path_buf()));
         } else if self.expanded.remove(path) {
             // A cursor inside the folder moves to the folder.
-            self.reshape(true, |pane| pane.drop_children(path, true));
+            self.reshape(true, |pane| pane.drop_children(path, false));
             self.scroll_to_cursor = true;
         }
     }
@@ -1074,7 +1096,8 @@ impl Pane {
             if pane.view != ViewMode::Details {
                 let open: Vec<PathBuf> = pane.children.keys().cloned().collect();
                 for dir in open {
-                    pane.drop_children(&dir, true);
+                    // Kept selected but hidden, as when one folder is closed.
+                    pane.drop_children(&dir, false);
                 }
             } else {
                 let open: Vec<PathBuf> = pane
@@ -1804,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_reaches_nested_items_and_collapsing_drops_them() {
+    fn selection_reaches_nested_items_and_collapsing_hides_them() {
         let (_dir, root) = tree_fixture();
         let a = root.join("a");
         let mut pane = open_tree_pane(&root);
@@ -1823,8 +1846,80 @@ mod tests {
         assert_eq!(picked, ["a1.txt", "b.txt"]);
 
         pane.set_expanded(&a, false);
-        assert_eq!(pane.selected.len(), 1, "the collapsed folder's item leaves the selection");
-        assert!(pane.selected.contains(&root.join("b.txt")));
+        assert_eq!(pane.selected.len(), 2, "the collapsed folder's item stays selected");
+        let shown: Vec<&str> = pane.selected_entries().into_iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(shown, ["b.txt"], "but hidden");
+        assert_eq!(pane.action_targets(), vec![root.join("b.txt")]);
+    }
+
+    #[test]
+    fn collapsing_a_folder_never_widens_the_target_to_it() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.set_expanded(&root.join("a").join("sub"), true);
+        settle(&mut pane);
+
+        let first = row_of(&pane, "a1.txt");
+        pane.click(first, false, false);
+        let last = row_of(&pane, "deep.txt");
+        pane.click(last, true, false);
+        assert_eq!(pane.action_targets().len(), 2);
+
+        // Left arrow on the nested item goes to its folder; closing it leaves the cursor
+        // on `a` with the selection hidden inside.
+        pane.set_expanded(&a, false);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+        assert!(pane.action_targets().is_empty(), "Delete must not take the closed folder");
+        assert_eq!(pane.rename_target(), None);
+
+        // A refresh keeps the hidden selection (dropping it would target the folder too).
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+        assert!(pane.action_targets().is_empty(), "still nothing after a refresh");
+
+        // Reopening shows the selection again.
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        let mut shown: Vec<&str> = pane.selected_entries().into_iter().map(|e| e.name.as_str()).collect();
+        shown.sort();
+        assert_eq!(shown, ["a1.txt", "deep.txt"]);
+
+        // Leaving details view closes every folder the same way.
+        pane.view = ViewMode::Grid;
+        pane.poll();
+        assert!(pane.action_targets().is_empty(), "the grid view hides the selection");
+
+        // Esc is the way out: the cursor item is the target again.
+        pane.escape();
+        assert_eq!(pane.action_targets(), vec![a]);
+    }
+
+    #[test]
+    fn right_click_on_a_selected_row_moves_the_cursor_and_keeps_the_selection() {
+        let (_dir, root) = tree_fixture();
+        let mut pane = open_tree_pane(&root);
+        let a = row_of(&pane, "a");
+        let b = row_of(&pane, "b.txt");
+        pane.click(a, false, false);
+        pane.click(b, true, false);
+        // Ctrl+Up leaves the cursor on `a`; the right-click is on `b.txt`.
+        pane.move_cursor(-1, false, true);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a"));
+
+        pane.context_click(b);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("b.txt"), "Open takes it");
+        assert_eq!(pane.rename_target().map(|e| e.name.as_str()), Some("b.txt"));
+        assert_eq!(pane.action_targets().len(), 2, "the selection stays for Delete and Copy");
+
+        // A row outside the selection replaces it.
+        pane.clear_selection();
+        pane.click(a, false, false);
+        pane.context_click(b);
+        assert_eq!(pane.action_targets(), vec![root.join("b.txt")]);
     }
 
     #[test]
