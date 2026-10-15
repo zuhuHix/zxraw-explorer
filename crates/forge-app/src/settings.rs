@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use forge_core::listing::SortSpec;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Fields of a settings object that this version doesn't know. They are kept and written back,
 /// so a setting added by a newer version survives being saved by this one.
@@ -19,15 +19,59 @@ pub enum ThemeChoice {
     System,
 }
 
-/// Deserializes a setting that falls back to its default when the stored value is not one this
-/// version knows (e.g. written by a newer version), instead of failing the whole settings file.
-fn lenient<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: DeserializeOwned + Default,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).unwrap_or_default())
+/// A setting that falls back to its default when the stored value is not one this version knows
+/// (e.g. written by a newer version), instead of failing the whole settings file. The stored
+/// value is kept and written back unchanged while the setting still holds that default, so
+/// saving here doesn't overwrite the newer version's choice; once the user picks something
+/// else, their choice is saved. Reads and writes go through `Deref`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Lenient<T> {
+    value: T,
+    unknown: Option<serde_json::Value>,
+}
+
+impl<T> From<T> for Lenient<T> {
+    fn from(value: T) -> Self {
+        Self {
+            value,
+            unknown: None,
+        }
+    }
+}
+
+impl<T> std::ops::Deref for Lenient<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Lenient<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+}
+
+impl<T: Serialize + Default + PartialEq> Serialize for Lenient<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.unknown {
+            Some(raw) if self.value == T::default() => raw.serialize(serializer),
+            _ => self.value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: DeserializeOwned + Default> Deserialize<'de> for Lenient<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        Ok(match T::deserialize(&raw) {
+            Ok(value) => value.into(),
+            Err(_) => Self {
+                value: T::default(),
+                unknown: Some(raw),
+            },
+        })
+    }
 }
 
 /// The colour of the app icon's folder-camera mark (see `app_icon`). Independent of the UI
@@ -84,20 +128,15 @@ pub struct ExternalTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    #[serde(deserialize_with = "lenient")]
-    pub theme: ThemeChoice,
+    pub theme: Lenient<ThemeChoice>,
     pub ui_scale: f32,
-    #[serde(deserialize_with = "lenient")]
-    pub app_icon: AppIcon,
-    #[serde(deserialize_with = "lenient")]
-    pub accent: Accent,
+    pub app_icon: Lenient<AppIcon>,
+    pub accent: Lenient<Accent>,
     pub show_hidden: bool,
     pub show_system: bool,
     pub confirm_recycle: bool,
-    #[serde(deserialize_with = "lenient")]
-    pub default_sort: SortSpec,
-    #[serde(deserialize_with = "lenient")]
-    pub default_view: ViewMode,
+    pub default_sort: Lenient<SortSpec>,
+    pub default_view: Lenient<ViewMode>,
     pub thumb_size: f32,
     pub thumb_mem_cache_mb: u64,
     pub thumb_disk_cache_mb: u64,
@@ -145,15 +184,15 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::Dark,
+            theme: ThemeChoice::Dark.into(),
             ui_scale: 1.0,
-            app_icon: AppIcon::Graphite,
-            accent: Accent::Blue,
+            app_icon: AppIcon::Graphite.into(),
+            accent: Accent::Blue.into(),
             show_hidden: false,
             show_system: false,
             confirm_recycle: false,
-            default_sort: SortSpec::default(),
-            default_view: ViewMode::Details,
+            default_sort: SortSpec::default().into(),
+            default_view: ViewMode::Details.into(),
             thumb_size: 160.0,
             thumb_mem_cache_mb: 512,
             thumb_disk_cache_mb: 4096,
@@ -225,16 +264,12 @@ pub struct Layout {
 pub struct TabSession {
     pub left: PathBuf,
     pub right: Option<PathBuf>,
-    #[serde(deserialize_with = "lenient")]
-    pub view: ViewMode,
+    pub view: Lenient<ViewMode>,
     /// Absent in files from before layouts: the default sort applies.
-    #[serde(deserialize_with = "lenient")]
-    pub sort: Option<SortSpec>,
+    pub sort: Lenient<Option<SortSpec>>,
     /// The right pane's view and sort, when they differ from the left pane's.
-    #[serde(deserialize_with = "lenient")]
-    pub right_view: Option<ViewMode>,
-    #[serde(deserialize_with = "lenient")]
-    pub right_sort: Option<SortSpec>,
+    pub right_view: Lenient<Option<ViewMode>>,
+    pub right_sort: Lenient<Option<SortSpec>>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -332,9 +367,9 @@ mod tests {
             assert_eq!(icon, AppIcon::Graphite, "{old}");
         }
         let settings: Settings = serde_json::from_str(r#"{"app_icon":"Round"}"#).unwrap();
-        assert_eq!(settings.app_icon, AppIcon::Graphite);
+        assert_eq!(*settings.app_icon, AppIcon::Graphite);
         let settings: Settings = serde_json::from_str(r#"{"app_icon":"Steel"}"#).unwrap();
-        assert_eq!(settings.app_icon, AppIcon::Steel);
+        assert_eq!(*settings.app_icon, AppIcon::Steel);
     }
 
     #[test]
@@ -346,8 +381,8 @@ mod tests {
             "keybindings": {"NewTab": "Ctrl+Shift+T"}
         }"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.app_icon, AppIcon::Graphite);
-        assert_eq!(settings.accent, Accent::Blue);
+        assert_eq!(*settings.app_icon, AppIcon::Graphite);
+        assert_eq!(*settings.accent, Accent::Blue);
         assert_eq!(settings.bookmarks, vec![PathBuf::from(r"C:\Photos")]);
         assert_eq!(settings.keybindings.get("NewTab"), Some(&Some("Ctrl+Shift+T".to_string())));
     }
@@ -376,10 +411,10 @@ mod tests {
             tabs: vec![TabSession {
                 left: PathBuf::from(r"C:\Shoots"),
                 right: Some(PathBuf::from(r"D:\Backup")),
-                view: ViewMode::Grid,
-                sort: Some(SortSpec { descending: true, ..Default::default() }),
-                right_view: Some(ViewMode::Details),
-                right_sort: None,
+                view: ViewMode::Grid.into(),
+                sort: Some(SortSpec { descending: true, ..Default::default() }).into(),
+                right_view: Some(ViewMode::Details).into(),
+                right_sort: None.into(),
                 extra: Default::default(),
             }],
             active_tab: 0,
@@ -424,8 +459,8 @@ mod tests {
         let session: Session = serde_json::from_str(json).unwrap();
         let tab = &session.tabs[0];
         assert_eq!(tab.right.as_deref(), Some(Path::new(r"C:\B")));
-        assert_eq!(tab.view, ViewMode::Grid);
-        assert_eq!((tab.sort, tab.right_view, tab.right_sort), (None, None, None));
+        assert_eq!(*tab.view, ViewMode::Grid);
+        assert_eq!((*tab.sort, *tab.right_view, *tab.right_sort), (None, None, None));
     }
 
     #[test]
@@ -446,7 +481,7 @@ mod tests {
                          "tabs": [{"left": "C:/Shoots", "zoom": 2}]}]
         }"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.theme, ThemeChoice::Light);
+        assert_eq!(*settings.theme, ThemeChoice::Light);
         assert_eq!(settings.pins[0].path, PathBuf::from("C:/Shoots"));
         let saved: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
@@ -470,20 +505,56 @@ mod tests {
             }]}]
         }"#;
         let settings: Settings = serde_json::from_str(json).unwrap();
-        assert_eq!(settings.theme, ThemeChoice::Dark);
-        assert_eq!(settings.default_view, ViewMode::Details);
-        assert_eq!(settings.default_sort, SortSpec::default());
+        assert_eq!(*settings.theme, ThemeChoice::Dark);
+        assert_eq!(*settings.default_view, ViewMode::Details);
+        assert_eq!(*settings.default_sort, SortSpec::default());
         assert_eq!(settings.pins.len(), 1);
         let tab = &settings.layouts[0].tabs[0];
         assert_eq!(tab.left, PathBuf::from("C:/Shoots"));
         assert_eq!(tab.right, Some(PathBuf::from("D:/Backup")));
-        assert_eq!((tab.view, tab.right_view, tab.sort), (ViewMode::Details, None, None));
+        assert_eq!((*tab.view, *tab.right_view, *tab.sort), (ViewMode::Details, None, None));
+    }
+
+    #[test]
+    fn unknown_enum_values_are_saved_back_unchanged_until_the_user_changes_them() {
+        let json = r#"{
+            "theme": "Sepia",
+            "accent": "Chartreuse",
+            "default_view": "Filmstrip",
+            "default_sort": {"key": "Colour", "descending": true, "dirs_first": true},
+            "layouts": [{"name": "Cull", "tabs": [{
+                "left": "C:/Shoots", "view": "Filmstrip", "right_view": "Timeline",
+                "sort": {"key": "Colour"}
+            }]}]
+        }"#;
+        let mut settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(*settings.theme, ThemeChoice::Dark);
+        let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["theme"], "Sepia");
+        assert_eq!(saved["accent"], "Chartreuse");
+        assert_eq!(saved["default_view"], "Filmstrip");
+        assert_eq!(saved["default_sort"]["key"], "Colour");
+        let tab = &saved["layouts"][0]["tabs"][0];
+        assert_eq!((&tab["view"], &tab["right_view"]), (&"Filmstrip".into(), &"Timeline".into()));
+        assert_eq!(tab["sort"]["key"], "Colour");
+        assert_eq!(tab["right_sort"], serde_json::Value::Null);
+        // Saving and loading again changes nothing.
+        let again: Settings = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&again).unwrap(), saved);
+
+        // A setting the user changes in this version is saved as they chose it.
+        *settings.theme = ThemeChoice::Light;
+        *settings.accent = Accent::Teal;
+        let saved: serde_json::Value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["theme"], "Light");
+        assert_eq!(saved["accent"], "Teal");
+        assert_eq!(saved["default_view"], "Filmstrip");
     }
 
     #[test]
     fn non_string_app_icon_falls_back_to_default() {
         let settings: Settings = serde_json::from_str(r#"{"app_icon": 7, "accent": null}"#).unwrap();
-        assert_eq!(settings.app_icon, AppIcon::Graphite);
-        assert_eq!(settings.accent, Accent::Blue);
+        assert_eq!(*settings.app_icon, AppIcon::Graphite);
+        assert_eq!(*settings.accent, Accent::Blue);
     }
 }

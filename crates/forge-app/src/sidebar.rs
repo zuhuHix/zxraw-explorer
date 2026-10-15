@@ -430,7 +430,7 @@ fn pin_row(ui: &mut Ui, index: usize, pin: &Pin, status: PinStatus, current: boo
     }
     let tip = match status {
         PinStatus::Missing => format!("Not found: {}", pin.path.display()),
-        PinStatus::Unreachable => format!("Not responding: {}", pin.path.display()),
+        PinStatus::Unreachable => format!("Not reachable right now: {}", pin.path.display()),
         _ => pin.path.to_string_lossy().into_owned(),
     };
     r.on_hover_text(tip)

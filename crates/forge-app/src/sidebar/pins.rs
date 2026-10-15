@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use forge_core::paths::paths_equal;
 
-use crate::path_probe::{Client, Event, is_network};
+use crate::path_probe::{Client, Event, Found, is_network};
 use crate::settings::Pin;
 
 /// How often a local pinned path is checked.
@@ -26,8 +26,9 @@ pub enum PinStatus {
     Present,
     /// The check finished and found nothing there.
     Missing,
-    /// The check did not answer in time (usually an offline share). Shown greyed out, but a
-    /// click still tries to open it.
+    /// The check did not answer in time or failed without saying the path is gone (an offline
+    /// share, access denied, a drive that isn't ready). Shown greyed out, but a click still
+    /// tries to open it.
     Unreachable,
 }
 
@@ -143,7 +144,7 @@ impl PinWatch {
         while let Some(event) = self.probe.as_ref().and_then(Client::try_recv) {
             match event {
                 Event::Started(path) => self.started(&path, now),
-                Event::Done(path, found) => self.finish(&path, found.is_some()),
+                Event::Done(path, found) => self.finish(&path, &found),
             }
         }
         self.expire(now);
@@ -214,17 +215,17 @@ impl PinWatch {
     }
 
     /// Records a finished check. A result for a path that is no longer pinned is dropped.
-    fn finish(&mut self, path: &Path, present: bool) {
+    fn finish(&mut self, path: &Path, found: &Found) {
         let Some(slot) = self.slots.get_mut(path) else {
             return;
         };
         slot.queued = false;
         slot.running_since = None;
         if slot.pinned {
-            slot.status = if present {
-                PinStatus::Present
-            } else {
-                PinStatus::Missing
+            slot.status = match found {
+                Found::Folder | Found::File => PinStatus::Present,
+                Found::Missing => PinStatus::Missing,
+                Found::Unknown(_) => PinStatus::Unreachable,
             };
         } else {
             self.slots.remove(path);
@@ -355,7 +356,7 @@ mod tests {
         watch.sync(&pins);
         let t0 = Instant::now();
         watch.start(Path::new(r"C:\a"), t0);
-        watch.finish(Path::new(r"C:\a"), true);
+        watch.finish(Path::new(r"C:\a"), &Found::Folder);
         assert!(watch.due(t0 + Duration::from_secs(4), &[]).is_empty());
         assert_eq!(watch.due(t0 + Duration::from_secs(5), &[]).len(), 1);
     }
@@ -369,7 +370,7 @@ mod tests {
         let t0 = Instant::now();
         for path in watch.due(t0, &roots) {
             watch.start(&path, t0);
-            watch.finish(&path, true);
+            watch.finish(&path, &Found::Folder);
         }
         let at_10 = watch.due(t0 + Duration::from_secs(10), &roots);
         assert_eq!(at_10, vec![PathBuf::from(r"C:\local")]);
@@ -391,6 +392,16 @@ mod tests {
     }
 
     #[test]
+    fn a_check_that_fails_without_not_found_is_unreachable_not_missing() {
+        let mut watch = PinWatch::default();
+        let path = PathBuf::from(r"\\nas\photos");
+        watch.sync(&[Pin { path: path.clone(), ..Default::default() }]);
+        watch.start(&path, Instant::now());
+        watch.finish(&path, &Found::Unknown("The network path was not found.".into()));
+        assert_eq!(watch.status(&path), PinStatus::Unreachable);
+    }
+
+    #[test]
     fn missing_then_present_after_a_later_result() {
         let mut watch = PinWatch::default();
         let path = PathBuf::from(r"E:\photos");
@@ -402,13 +413,13 @@ mod tests {
         }]);
         let t0 = Instant::now();
         watch.start(&path, t0);
-        watch.finish(&path, false);
+        watch.finish(&path, &Found::Missing);
         assert_eq!(watch.status(&path), PinStatus::Missing);
 
         let t1 = t0 + Duration::from_secs(5);
         assert_eq!(watch.due(t1, &[]), vec![path.clone()]);
         watch.start(&path, t1);
-        watch.finish(&path, true);
+        watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Present);
     }
 
@@ -418,7 +429,7 @@ mod tests {
         let path = PathBuf::from(r"C:\a");
         watch.sync(&pins_of(&[r"C:\a"]));
         watch.start(&path, Instant::now());
-        watch.finish(&path, true);
+        watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Present);
         watch.sync(&[]);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
@@ -434,11 +445,11 @@ mod tests {
         watch.start(&path, t0);
         // Unpinned while the check runs; the late result must not resurrect the slot.
         watch.sync(&[]);
-        watch.finish(&path, false);
+        watch.finish(&path, &Found::Missing);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
         assert!(watch.slots.is_empty());
         // A result that arrives for a path with no slot at all is also dropped.
-        watch.finish(&path, true);
+        watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
     }
 
@@ -460,7 +471,7 @@ mod tests {
         assert_eq!(watch.due(t0 + NETWORK_INTERVAL, &[]), vec![path.clone()]);
         watch.start(&path, t0 + NETWORK_INTERVAL);
         assert!(watch.due(t0 + NETWORK_INTERVAL * 3, &[]).is_empty(), "one queued retry at most");
-        watch.finish(&path, true);
+        watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Present);
     }
 
@@ -478,7 +489,7 @@ mod tests {
         watch.started(&path, t1);
         watch.expire(t1 + CHECK_TIMEOUT / 2);
         assert_eq!(watch.status(&path), PinStatus::Unknown);
-        watch.finish(&path, true);
+        watch.finish(&path, &Found::Folder);
         assert_eq!(watch.status(&path), PinStatus::Present);
     }
 }

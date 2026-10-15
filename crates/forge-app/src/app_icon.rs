@@ -139,7 +139,7 @@ mod tests {
             assert_eq!(data.rgba.len(), 256 * 256 * 4);
         }
         let old: crate::settings::Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(old.app_icon, AppIcon::Graphite);
+        assert_eq!(*old.app_icon, AppIcon::Graphite);
         assert_eq!(resource_index(AppIcon::Graphite), 0, "the exe's own icon");
     }
 
