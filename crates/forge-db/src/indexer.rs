@@ -103,6 +103,8 @@ pub struct Indexer<'a> {
     fail_read_dirs: HashSet<PathBuf>,
     #[cfg(test)]
     fail_metadata_paths: HashSet<PathBuf>,
+    #[cfg(test)]
+    clock: Option<Box<dyn FnMut() -> i64 + Send + 'a>>,
 }
 
 impl<'a> Indexer<'a> {
@@ -118,6 +120,8 @@ impl<'a> Indexer<'a> {
             fail_read_dirs: HashSet::new(),
             #[cfg(test)]
             fail_metadata_paths: HashSet::new(),
+            #[cfg(test)]
+            clock: None,
         }
     }
 
@@ -163,6 +167,39 @@ impl<'a> Indexer<'a> {
     fn fail_metadata_for_test(mut self, path: &Path) -> Self {
         self.fail_metadata_paths.insert(path.to_path_buf());
         self
+    }
+
+    #[cfg(test)]
+    fn clock_for_test(mut self, f: impl FnMut() -> i64 + Send + 'a) -> Self {
+        self.clock = Some(Box::new(f));
+        self
+    }
+
+    fn clock_ms(&mut self) -> i64 {
+        #[cfg(test)]
+        if let Some(f) = self.clock.as_mut() {
+            return f();
+        }
+        now_ms()
+    }
+
+    /// Id (and start time) for a new pass: the first clock reading strictly after the
+    /// moment the pass begins. The end-of-pass sweep treats rows with
+    /// `indexed_at >= scan_id` as refreshed by someone else during the pass, so every row
+    /// written before the pass started must have `indexed_at < scan_id`. Taking `now_ms()`
+    /// directly fails when a pass starts in the same millisecond as earlier writes (a
+    /// re-index right after a previous pass or an exclusion change): those rows would
+    /// escape the sweep, and the new id could even equal the previous pass's id. Waiting
+    /// for the next tick costs at most one millisecond.
+    fn new_scan_id(&mut self) -> i64 {
+        let started = self.clock_ms();
+        loop {
+            let t = self.clock_ms();
+            if t > started {
+                return t;
+            }
+            std::thread::yield_now();
+        }
     }
 
     fn read_dir(&self, dir: &Path) -> std::io::Result<fs::ReadDir> {
@@ -293,7 +330,7 @@ impl<'a> Indexer<'a> {
         let state = self.db.index_state(root.id)?;
         let (scan_id, mut stack, resumed) = match state {
             Some(s) if s.is_resumable() => (s.scan_id, s.pending, true),
-            _ => (now_ms(), vec![root_path.clone()], false),
+            _ => (self.new_scan_id(), vec![root_path.clone()], false),
         };
         report.resumed = resumed;
         let mut batch: Vec<NewFile> = Vec::with_capacity(self.batch_size.min(65_536));
@@ -713,6 +750,34 @@ mod tests {
         let initial = Indexer::new(&db).index_root(root_id).unwrap();
         assert_eq!(initial.marked_missing, 0);
         (tmp, db, root_id, root, dir, file)
+    }
+
+    #[test]
+    fn pass_started_in_the_same_millisecond_still_sweeps_newly_excluded_rows() {
+        let (_tmp, db, root_id, _root, _dir, _file) = indexed_tree();
+        // Pretend the previous pass ran, and wrote its rows, in the very millisecond the
+        // next pass starts: same indexed_at, and the same clock value as its scan id.
+        let t = now_ms() + 60_000;
+        db.with_conn(|c| {
+            c.execute(
+                "UPDATE files SET indexed_at = ?1, seen_scan = ?1",
+                params![t],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        db.add_exclusion(crate::ExclusionKind::Name, "sub").unwrap();
+        // The clock stays on `t` for a few readings before ticking over.
+        let mut calls = 0;
+        let report = Indexer::new(&db)
+            .clock_for_test(move || {
+                calls += 1;
+                if calls <= 3 { t } else { t + 1 }
+            })
+            .index_root(root_id)
+            .unwrap();
+        assert_eq!(report.marked_missing, 2); // sub + sub\keep.jpg
+        assert_eq!(db.index_state(root_id).unwrap().unwrap().scan_id, t + 1);
     }
 
     #[test]
