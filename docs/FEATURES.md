@@ -40,6 +40,25 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   availability is checked in the background (every 5 s locally, every 30 s on network paths), so an
   offline share does not freeze the window. Folder bookmarks move here automatically, and the
   separate Bookmarks section is gone. The rendered sidebar is not automated.
+* 🟡 Network locations (NAS and shared folders) — `forge-app/src/sidebar/network.rs`,
+  `forge-core/src/netpath.rs`, `forge-win/src/network.rs`. The sidebar's Network section lists
+  saved shares and mapped network drives, each with a status dot: online, offline or unreachable,
+  needs sign-in, or checking. Status comes from background checks on the shared probe service
+  (every 30 s, and when the section title is clicked), so an offline NAS never freezes the
+  window, and clicking one says it is offline instead of opening it. *Add network location…*
+  (the + button) takes a path such as `\\nas\photos`, `//nas/photos` or `smb://nas/photos`,
+  checks it without contacting the server, and saves it with a name; rename and remove are in
+  the context menu. *Add to Network…* is also in the file list's context menu and on the
+  address bar's segments when the folder is on a share. *Connect…* (or clicking a share that
+  needs sign-in) lets Windows show its own sign-in dialog: the app never asks for, sees or
+  stores a password. Background work is gentler on network paths: image thumbnails of network
+  files run on their own pool of 2 workers (local ones keep half the cores), duplicate scans
+  with a network root use 2 workers for partial hashes and 1 for full hashes (local: up to 8
+  and 4), and in queue mode a copy to or from a network location never runs side by side with
+  another transfer (`forge-core/src/netpolicy.rs`). Verified by unit tests (path validation,
+  status classification with an injected probe, settings round trip, worker selection) and
+  the e2e `sidebar::network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share`
+  against an unroutable test address; no real NAS is used in tests.
 * 🟡 Saved layouts (workspaces) — `forge-app/src/layouts.rs`. *Save layout…* stores the open tabs:
   each tab's left and right folders, view mode, sort, split state and active tab. Load from the
   sidebar's Layouts section or *Load layout…* in the palette; *Manage layouts…* renames, reorders and

@@ -38,6 +38,11 @@ fn completions(text: &str) -> Vec<String> {
         Some(i) => (&t[..=i], &t[i + 1..]),
         None => return Vec::new(),
     };
+    // This runs on the UI thread; a share that is offline can block a directory read for
+    // tens of seconds, so shares get no completions.
+    if forge_core::netpath::is_network_path(Path::new(dir)) {
+        return Vec::new();
+    }
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -72,23 +77,36 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let segs = segments(&path);
                     let mut nav = None;
+                    let mut add_network = None;
                     for (i, (label, target)) in segs.iter().enumerate() {
                         if i > 0 {
                             ui.label(RichText::new(" › ").weak());
                         }
-                        if ui
-                            .add(
-                                egui::Button::new(label.as_str())
-                                    .frame_when_inactive(false)
-                                    .corner_radius(9),
-                            )
-                            .clicked()
-                        {
+                        let r = ui.add(
+                            egui::Button::new(label.as_str())
+                                .frame_when_inactive(false)
+                                .corner_radius(9),
+                        );
+                        if r.clicked() {
                             nav = Some(target.clone());
+                        }
+                        if forge_core::netpath::is_unc(target) {
+                            r.context_menu(|ui| {
+                                if ui.button("Add to Network…").clicked() {
+                                    add_network = Some(target.clone());
+                                    ui.close();
+                                }
+                            });
                         }
                     }
                     if let Some(t) = nav {
                         app.navigate(t);
+                    }
+                    if let Some(t) = add_network {
+                        crate::sidebar::network::open_add_dialog(
+                            app,
+                            t.to_string_lossy().into_owned(),
+                        );
                     }
                     // Click on the blank part of the bar to edit.
                     let rest = ui.allocate_response(

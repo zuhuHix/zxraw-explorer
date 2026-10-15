@@ -198,6 +198,7 @@ const CONTEXT_FILE: &[Option<Cmd>] = &[
     Some(Cmd::RevealInExplorer),
     Some(Cmd::PinToQuickAccess),
     Some(Cmd::OpenTerminal),
+    Some(Cmd::AddToNetwork),
     None,
     Some(Cmd::Cut),
     Some(Cmd::Copy),
@@ -228,18 +229,21 @@ const CONTEXT_BACKGROUND: &[Option<Cmd>] = &[
     Some(Cmd::FolderSize),
     Some(Cmd::FindDuplicates),
     Some(Cmd::BookmarkFolder),
+    Some(Cmd::AddToNetwork),
     Some(Cmd::RevealInExplorer),
     Some(Cmd::OpenTerminal),
     Some(Cmd::OpenTerminalAdmin),
 ];
 
-fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], out: &mut Vec<ViewEvent>) {
+/// `network`: the pane shows a folder on a share, so "Add to Network…" is offered.
+fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], network: bool, out: &mut Vec<ViewEvent>) {
     let overrides = crate::commands::published_key_state(ui.ctx()).overrides;
     for it in items {
         match it {
             None => {
                 ui.separator();
             }
+            Some(Cmd::AddToNetwork) if !network => {}
             Some(c) => {
                 let sc = c.binding_text(&overrides);
                 let button = ui.add(egui::Button::new(c.label()).shortcut_text(sc));
@@ -1586,7 +1590,8 @@ pub fn details(
             }
             remember_accessible_focus(ui, id, &response);
             remember_cursor_accessible_focus(ui, id, &response);
-            response.context_menu(|menu| menu_items(menu, CONTEXT_FILE, &mut out));
+            let network = forge_core::netpath::is_unc(&pane.path);
+            response.context_menu(|menu| menu_items(menu, CONTEXT_FILE, network, &mut out));
         }
     });
     ui.spacing_mut().item_spacing = previous_spacing;
@@ -1661,7 +1666,8 @@ fn background_interactions(
     if bg.secondary_clicked() {
         out.push(ViewEvent::Focus);
     }
-    bg.context_menu(|ui| menu_items(ui, CONTEXT_BACKGROUND, out));
+    let network = forge_core::netpath::is_unc(&dir);
+    bg.context_menu(|ui| menu_items(ui, CONTEXT_BACKGROUND, network, out));
 }
 
 // ---------------------------------------------------------------------------
@@ -2290,7 +2296,8 @@ pub fn grid(
                     }
                     remember_accessible_focus(ui, id, &resp);
                     remember_cursor_accessible_focus(ui, id, &resp);
-                    resp.context_menu(|ui| menu_items(ui, CONTEXT_FILE, &mut out));
+                    let network = forge_core::netpath::is_unc(&pane.path);
+                    resp.context_menu(|ui| menu_items(ui, CONTEXT_FILE, network, &mut out));
                 }
             });
         }

@@ -101,6 +101,8 @@ struct Slot {
     /// When a worker picked the check up; `None` once it answered.
     running_since: Option<Instant>,
     pinned: bool,
+    /// What the last finished check found.
+    last: Option<Found>,
 }
 
 impl Slot {
@@ -112,7 +114,8 @@ impl Slot {
 
 /// Keeps the existence status of pinned paths up to date without touching the disk on the UI
 /// thread. Checks go through the shared probe service (see `path_probe`), whose local and
-/// network lanes keep local pins answering while a network share hangs.
+/// network lanes keep local pins answering while a network share hangs. The Network section
+/// uses a second watch for its locations (see `network`).
 #[derive(Default)]
 pub struct PinWatch {
     slots: HashMap<PathBuf, Slot>,
@@ -130,15 +133,54 @@ impl PinWatch {
         self.slots.get(path).map_or(PinStatus::Unknown, |s| s.status)
     }
 
+    /// What the last finished check of `path` found, if one has finished.
+    pub fn found(&self, path: &Path) -> Option<&Found> {
+        self.slots.get(path).and_then(|s| s.last.as_ref())
+    }
+
+    /// The check of `path` has run longer than [`CHECK_TIMEOUT`] without an answer.
+    pub fn timed_out(&self, path: &Path) -> bool {
+        self.slots
+            .get(path)
+            .is_some_and(|s| s.timed_out(Instant::now()))
+    }
+
+    /// Checks `path` again on the next tick, unless a check of it is already queued or
+    /// running.
+    pub fn recheck(&mut self, path: &Path) {
+        if let Some(slot) = self.slots.get_mut(path) {
+            slot.last_checked = None;
+        }
+    }
+
+    /// A watch whose checks go to `client` instead of the shared service.
+    #[cfg(test)]
+    pub(crate) fn with_client(client: Client) -> Self {
+        Self {
+            slots: HashMap::new(),
+            probe: Some(client),
+        }
+    }
+
     /// Start due checks and apply finished ones. Called once per frame; never blocks.
     pub fn tick(&mut self, pins: &[Pin], network_roots: &[PathBuf], ctx: &egui::Context) {
         self.sync(pins);
+        self.run(network_roots, Some(ctx));
+    }
+
+    /// [`Self::tick`] for a plain list of paths.
+    pub fn tick_paths(&mut self, paths: &[PathBuf], network_roots: &[PathBuf], ctx: Option<&egui::Context>) {
+        self.sync_paths(paths.iter());
+        self.run(network_roots, ctx);
+    }
+
+    fn run(&mut self, network_roots: &[PathBuf], ctx: Option<&egui::Context>) {
         let now = Instant::now();
         for path in self.due(now, network_roots) {
             self.start(&path, now);
             let network = is_network(&path, network_roots);
             self.probe
-                .get_or_insert_with(|| Client::new(Some(ctx.clone())))
+                .get_or_insert_with(|| Client::new(ctx.cloned()))
                 .submit(path, network);
         }
         while let Some(event) = self.probe.as_ref().and_then(Client::try_recv) {
@@ -148,7 +190,9 @@ impl PinWatch {
             }
         }
         self.expire(now);
-        if !self.slots.is_empty() {
+        if let Some(ctx) = ctx
+            && !self.slots.is_empty()
+        {
             // Wake up for the next due check even when nothing else repaints.
             ctx.request_repaint_after(LOCAL_INTERVAL);
         }
@@ -157,11 +201,15 @@ impl PinWatch {
     /// Follows the pin list: every pinned path gets a slot. Slots of unpinned paths are dropped,
     /// except while a check for them is still pending (its result is then ignored).
     fn sync(&mut self, pins: &[Pin]) {
+        self.sync_paths(pins.iter().map(|p| &p.path));
+    }
+
+    fn sync_paths<'a>(&mut self, paths: impl Iterator<Item = &'a PathBuf>) {
         for slot in self.slots.values_mut() {
             slot.pinned = false;
         }
-        for pin in pins {
-            self.slots.entry(pin.path.clone()).or_default().pinned = true;
+        for path in paths {
+            self.slots.entry(path.clone()).or_default().pinned = true;
         }
         self.slots
             .retain(|_, slot| slot.pinned || slot.queued || slot.running_since.is_some());
@@ -222,6 +270,7 @@ impl PinWatch {
         slot.queued = false;
         slot.running_since = None;
         if slot.pinned {
+            slot.last = Some(found.clone());
             slot.status = match found {
                 Found::Folder | Found::File => PinStatus::Present,
                 Found::Missing => PinStatus::Missing,

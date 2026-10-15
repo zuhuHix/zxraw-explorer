@@ -742,6 +742,13 @@ fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
         LazyLock::new(Default::default);
     let mut disks = Vec::new();
     for path in sources.iter().map(PathBuf::as_path).chain([dest]) {
+        // A network location (mapped drive letters included) has no known disk: it counts
+        // as sharing one with every other transfer, so in queue mode a copy to or from a
+        // NAS never runs side by side with another. This also skips the disk query, which
+        // can stall on an offline share.
+        if forge_core::netpath::is_network_path(path) {
+            return None;
+        }
         let Some(Component::Prefix(prefix)) = path.components().next() else {
             return None;
         };

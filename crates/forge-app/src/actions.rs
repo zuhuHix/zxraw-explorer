@@ -932,6 +932,7 @@ pub fn shutdown(app: &mut ZxrawApp) {
 }
 
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
+    crate::sidebar::network::dialog(app, ui.ctx());
     crate::ops_ui::jobs_window(app, ui.ctx());
     crate::search_ui::window(app, ui.ctx());
     crate::ingest_ui::window(app, ui.ctx());
@@ -993,6 +994,9 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
     match m {
         Modal::Prompt(p) if p.kind.is_label() => match p.kind {
             PromptKind::RenamePin { .. } => crate::sidebar::accept_label(app, p),
+            PromptKind::RenameNetworkLocation { .. } => {
+                crate::sidebar::network::accept_label(app, p)
+            }
             _ => crate::layouts::accept_label(app, p),
         },
         Modal::Prompt(mut p) => {
@@ -1036,7 +1040,8 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                 }
                 PromptKind::SaveLayout
                 | PromptKind::RenameLayout { .. }
-                | PromptKind::RenamePin { .. } => unreachable!("labels are accepted above"),
+                | PromptKind::RenamePin { .. }
+                | PromptKind::RenameNetworkLocation { .. } => unreachable!("labels are accepted above"),
             };
             match res {
                 Ok(()) => {

@@ -10,6 +10,8 @@
 //! * `ingest` — media import planning & verified copy
 //! * `archive` — safe archive browsing/extraction helpers
 //! * `cloud` — cloud placeholder detection: may background work read a file?
+//! * `netpath` — UNC shares and mapped network drives (lexical checks, share validation)
+//! * `netpolicy` — worker counts for background work on network locations
 
 pub mod archive;
 pub mod backup_verify;
@@ -23,6 +25,8 @@ pub mod hashing;
 pub mod ingest;
 pub mod listing;
 pub mod model;
+pub mod netpath;
+pub mod netpolicy;
 pub mod ops;
 pub mod paths;
 pub mod query;

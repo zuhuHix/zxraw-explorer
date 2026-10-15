@@ -19,7 +19,34 @@ pub enum Found {
     Folder,
     File,
     Missing,
-    Unknown(String),
+    Unknown(Failure),
+}
+
+/// Why a check could not tell whether a path exists. `code` is the Win32 error when the OS
+/// gave one; the network section uses it to tell a server that wants a sign-in from one that
+/// is offline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub message: String,
+    pub code: Option<i32>,
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        Self {
+            message: message.into(),
+            code: None,
+        }
+    }
+}
+
+impl From<&std::io::Error> for Failure {
+    fn from(e: &std::io::Error) -> Self {
+        Self {
+            message: e.to_string(),
+            code: e.raw_os_error(),
+        }
+    }
 }
 
 /// Progress of one submitted check, reported to the client that submitted it.
@@ -43,14 +70,17 @@ fn classify(path: &Path, metadata: impl Fn(&Path) -> std::io::Result<bool>) -> F
         Ok(true) => Found::Folder,
         Ok(false) => Found::File,
         Err(e) if is_not_found(&e) => match volume_root(path) {
-            Some(root) if root == path => Found::Unknown(e.to_string()),
+            Some(root) if root == path => Found::Unknown((&e).into()),
             Some(root) => match metadata(&root) {
                 Ok(_) => Found::Missing,
-                Err(e) => Found::Unknown(format!("{}: {e}", root.display())),
+                Err(e) => Found::Unknown(Failure {
+                    message: format!("{}: {e}", root.display()),
+                    code: e.raw_os_error(),
+                }),
             },
             None => Found::Unknown(e.to_string()),
         },
-        Err(e) => Found::Unknown(e.to_string()),
+        Err(e) => Found::Unknown((&e).into()),
     }
 }
 
@@ -104,7 +134,7 @@ impl Service {
         SERVICE.get_or_init(|| Service::new(LOCAL_WORKERS, NETWORK_WORKERS, check))
     }
 
-    fn new(local: usize, network: usize, check: fn(&Path) -> Found) -> Self {
+    pub(crate) fn new(local: usize, network: usize, check: fn(&Path) -> Found) -> Self {
         Self {
             local: lane("probe-local", local, check),
             network: lane("probe-network", network, check),
@@ -147,7 +177,7 @@ impl Client {
         Self::on(Service::global(), repaint)
     }
 
-    fn on(service: &Service, repaint: Option<egui::Context>) -> Self {
+    pub(crate) fn on(service: &Service, repaint: Option<egui::Context>) -> Self {
         let (reply, events) = unbounded();
         Self {
             local: service.local.clone(),

@@ -12,6 +12,7 @@
 //! * [`process`] — launching external tools without a shell.
 //! * [`http`] — HTTPS downloads through WinHTTP (the optional FFmpeg download and the
 //!   update check).
+//! * [`network`] — connecting to network shares through Windows' own sign-in dialog.
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
 //! * [`window`] — window placement that never flashes on screen (hidden maximize).
 //! * Opt-in per-user integration: the folder context menu and photo file types
@@ -30,6 +31,7 @@ pub mod drives;
 pub mod ext_search;
 pub mod files;
 pub mod http;
+pub mod network;
 pub mod process;
 pub mod restart;
 pub mod shell;

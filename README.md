@@ -172,6 +172,10 @@ Explorer is a file manager designed around that workflow:
   Quick access*, or drag them onto the sidebar), and reorder or rename them. *Save layout…* keeps
   your open tabs, split panes, views and sorting, so a culling or delivery workspace is one click
   away from the sidebar's Layouts section.
+- **Your NAS in the sidebar.** Save shares like `\\nas\photos` to the Network section, next to
+  your mapped drives. A status dot shows which are online, and an offline NAS never freezes the
+  window. If a share needs a password, *Connect…* lets Windows ask for it: ZXraw Explorer never
+  sees or stores it. Thumbnails, duplicate scans and copies go easier on network folders.
 - **Icons that tell files apart.** Code, documents, spreadsheets, programs, archives and config
   files each get their own icon, alongside the photo, video and audio ones.
 - **Type to filter.** Settings › Browsing › *Typing in the file list* can switch typing from
@@ -271,7 +275,8 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 
 - No account and no telemetry.
 - Your ratings, tags, index and thumbnail cache live in a local database on your PC. Quick access
-  pins and saved layouts live in the settings file.
+  pins, saved layouts and saved network locations live in the settings file. Network
+  locations you add are read over your own network, as File Explorer would.
 - Your files and their contents never leave your PC. The app makes only these network
   connections:
   - **A daily update check.** Once a day it asks `api.github.com` for the latest release of
