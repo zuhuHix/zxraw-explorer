@@ -419,11 +419,13 @@ impl Pane {
             self.start_child_load(dir);
         }
         if let Some(state) = finished {
+            // Only a listing where every item was read shows which selected items are gone.
+            let complete = matches!(state, LoadState::Ready { errors: 0 });
             if let Some(fresh) = self.staged.take() {
                 // A refresh finished (a failed one leaves nothing listed, as before).
                 let fresh = if matches!(state, LoadState::Failed(_)) { Vec::new() } else { fresh };
                 let dir = self.path.clone();
-                self.reshape(false, |pane| pane.swap_children(&dir, fresh));
+                self.reshape(false, |pane| pane.swap_children(&dir, fresh, complete));
             }
             self.load = state;
             self.rx = None;
@@ -432,7 +434,7 @@ impl Pane {
             // `refresh` keeps the old selection; forget paths that are no longer listed.
             // Items inside open folders may still be on their way, and items inside a
             // closed folder stay selected while the folder is listed (see `set_expanded`).
-            if !self.selected.is_empty() {
+            if complete && !self.selected.is_empty() {
                 let listed: HashSet<&Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
                 let expanded = &self.expanded;
                 let root = self.path.as_path();
@@ -954,9 +956,11 @@ impl Pane {
         self.start_listing(dir, false);
     }
 
-    /// Replace the rows listed below `dir` with a complete new listing of it. Rows of
-    /// subfolders that are gone go too; open subfolders that remain keep theirs.
-    fn swap_children(&mut self, dir: &Path, fresh: Vec<FileEntry>) {
+    /// Replace the rows listed below `dir` with a new listing of it. Rows of subfolders that
+    /// are gone go too; open subfolders that remain keep theirs. Selected items the listing
+    /// leaves out are forgotten only when it is `complete` (no item failed to read): an item
+    /// a partial listing missed may still be there.
+    fn swap_children(&mut self, dir: &Path, fresh: Vec<FileEntry>, complete: bool) {
         let listed: HashSet<&Path> = fresh.iter().map(|e| e.path.as_path()).collect();
         let gone: Vec<PathBuf> = self
             .entries
@@ -966,8 +970,10 @@ impl Pane {
             .collect();
         drop(listed);
         for path in &gone {
-            self.drop_children(path, true);
-            self.selected.remove(path);
+            self.drop_children(path, complete);
+            if complete {
+                self.selected.remove(path);
+            }
         }
         let open: Vec<PathBuf> = fresh
             .iter()
@@ -981,7 +987,9 @@ impl Pane {
         self.entries.retain(|e| e.path.parent() != Some(dir));
         self.entries.extend(fresh);
         self.dirty_sort = true;
-        self.prune_hidden_selection(dir);
+        if complete {
+            self.prune_hidden_selection(dir);
+        }
         for path in open {
             self.start_child_load(path);
         }
@@ -1027,7 +1035,7 @@ impl Pane {
         let mut changed = false;
         let mut open = Vec::new();
         let mut swaps = Vec::new();
-        // Folders whose first listing just completed.
+        // Folders whose first listing just completed without read errors.
         let mut listed = Vec::new();
         for _ in 0..64 {
             let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
@@ -1039,9 +1047,9 @@ impl Pane {
                     load.staged.as_mut().unwrap().extend(b);
                     continue;
                 }
-                ListMsg::Done { .. } if load.staged.is_some() => {
+                ListMsg::Done { errors } if load.staged.is_some() => {
                     load.loading = false;
-                    swaps.push((dir, load.staged.take().unwrap()));
+                    swaps.push((dir, load.staged.take().unwrap(), errors == 0));
                     continue;
                 }
                 ListMsg::Failed(e) if load.staged.is_some() => {
@@ -1062,10 +1070,12 @@ impl Pane {
                     }
                     self.entries.extend(b);
                 }
-                ListMsg::Done { .. } => {
+                ListMsg::Done { errors } => {
                     load.loading = false;
                     load.error = None;
-                    listed.push(dir.clone());
+                    if errors == 0 {
+                        listed.push(dir.clone());
+                    }
                 }
                 ListMsg::Failed(e) => {
                     load.loading = false;
@@ -1083,8 +1093,8 @@ impl Pane {
         }
         if !swaps.is_empty() {
             self.reshape(false, |pane| {
-                for (dir, fresh) in swaps {
-                    pane.swap_children(&dir, fresh);
+                for (dir, fresh, complete) in swaps {
+                    pane.swap_children(&dir, fresh, complete);
                 }
             });
             changed = true;
@@ -2114,6 +2124,38 @@ mod tests {
         settle(&mut pane);
         assert!(!pane.selected.contains(&a1));
         assert!(!pane.selected.contains(&deep));
+    }
+
+    #[test]
+    fn a_listing_with_read_errors_never_forgets_a_pick() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let a1 = a.join("a1.txt");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "a1.txt"), false, false);
+        let sub = pane.entries.iter().find(|e| e.name == "sub").unwrap().clone();
+
+        // A re-listing of `a` that could not read `a1.txt`: it lists only `sub`.
+        let relist = |pane: &mut Pane, id: u64, errors: usize| {
+            pane.children.insert(
+                a.clone(),
+                ChildLoad {
+                    id,
+                    cancel: CancelToken::new(),
+                    loading: true,
+                    staged: Some(vec![sub.clone()]),
+                    error: None,
+                },
+            );
+            pane.child_tx.send((id, a.clone(), ListMsg::Done { errors })).unwrap();
+            pane.poll();
+        };
+        relist(&mut pane, 1_000_001, 1);
+        assert!(pane.selected.contains(&a1), "a partial listing keeps the pick");
+        relist(&mut pane, 1_000_002, 0);
+        assert!(!pane.selected.contains(&a1), "a complete one shows it is gone");
     }
 
     #[test]

@@ -865,8 +865,8 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
 /// ZXraw moved or renamed files (`from` -> `to`): the note being edited and the library rows
 /// (notes, ratings, tags) follow them.
 pub fn follow_moves(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>) {
-    app.ops.tags_ui.follow_moves(&pairs);
-    app.ops.library.follow_moves(pairs);
+    let relinked = app.ops.library.follow_moves(pairs.clone());
+    app.ops.tags_ui.follow_moves(&pairs, relinked);
 }
 
 /// The `(from, to)` moves recorded by an operation's undo records (renames and moves).

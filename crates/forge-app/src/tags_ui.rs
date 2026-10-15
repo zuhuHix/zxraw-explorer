@@ -83,17 +83,29 @@ impl NotesDraft {
         }
     }
 
-    /// Compares a brought-back draft with the database's current `note`.
+    /// Compares the draft with the database's current `note`. A conflict found earlier is
+    /// replaced by the latest note, which is what a merge or the recovery file must keep.
     fn check_against(&mut self, note: String) {
         self.check_db = false;
-        if self.text == self.saved || note.trim() == self.saved.trim() {
+        if self.text == self.saved {
+            // No unsaved edit: show what the database has now.
+            self.conflict = None;
+            if note.trim() != self.saved.trim() {
+                self.text = note.clone();
+                self.saved = note;
+            }
             return;
         }
         if note.trim() == self.text.trim() {
             // The edit is already in the database.
             self.saved = self.text.clone();
             self.error = None;
-        } else {
+            self.conflict = None;
+            return;
+        }
+        // The note the edit is up against so far: unchanged since, nothing new to ask.
+        let known = self.conflict.as_deref().unwrap_or(&self.saved);
+        if note.trim() != known.trim() {
             self.conflict = Some(note);
         }
     }
@@ -127,14 +139,7 @@ enum ConflictChoice {
     Merge,
 }
 
-/// The draft and the database's note joined, as the database joins two notes on a move.
-fn merged_note(draft: &str, note: &str) -> String {
-    match (draft.trim(), note.trim()) {
-        ("", note) => note.to_string(),
-        (draft, "") => draft.to_string(),
-        (draft, note) => format!("{draft}\n\n--- merged note ---\n\n{note}"),
-    }
-}
+use crate::library::merged_note;
 
 struct PendingSave {
     text: String,
@@ -264,6 +269,9 @@ pub struct TagsUi {
     /// flight, or failed. Dropped once confirmed; a failed one stays until it is saved (select
     /// the file again to retry) and is kept in the recovery file at exit.
     left_behind: HashMap<PathBuf, NotesDraft>,
+    /// Answered once the library has relinked the rows of files ZXraw moved. Until then, and
+    /// until the selection is read again, no draft is compared with the database.
+    relinked: Option<crossbeam_channel::Receiver<()>>,
     /// The frame the panel was last drawn in. A note left behind when the panel stops being
     /// drawn is saved by [`tick`].
     panel_frame: u64,
@@ -288,6 +296,7 @@ impl Default for TagsUi {
             highlight: None,
             notes: None,
             left_behind: HashMap::new(),
+            relinked: None,
             panel_frame: 0,
             manage: ManageState::default(),
             tx,
@@ -584,14 +593,23 @@ impl TagsUi {
     /// Compares a brought-back draft with the database once its save in flight is answered
     /// and a read of the file, started after the selection changed, is in.
     fn check_restored_note(&mut self) {
+        if let Some(relinked) = &self.relinked {
+            if relinked.try_recv() == Err(crossbeam_channel::TryRecvError::Empty) {
+                return;
+            }
+            // The rows followed the move (a collision merges notes): read them again.
+            self.relinked = None;
+            if let Some(cache) = self.cache.as_mut() {
+                cache.files = None;
+            }
+            self.generation += 1;
+            self.error = None;
+            return;
+        }
         let Some(draft) = self.notes.as_mut().filter(|d| d.check_db) else {
             return;
         };
         if draft.saving.is_some() {
-            return;
-        }
-        if draft.text == draft.saved {
-            draft.check_db = false;
             return;
         }
         let Some(files) = self
@@ -611,13 +629,21 @@ impl TagsUi {
     }
 
     /// Files ZXraw moved or renamed: the note being edited, and the selection it belongs to,
-    /// follow their file, so an edit not saved yet is saved at the new path.
-    pub fn follow_moves(&mut self, pairs: &[(PathBuf, PathBuf)]) {
+    /// follow their file, so an edit not saved yet is saved at the new path. A move onto an
+    /// annotated file merges the two notes, so the moved draft is compared with the database
+    /// again once the rows have followed (`relinked` is answered), and is not saved before.
+    pub fn follow_moves(
+        &mut self,
+        pairs: &[(PathBuf, PathBuf)],
+        relinked: crossbeam_channel::Receiver<()>,
+    ) {
         use crate::library::moved_by;
+        self.relinked = Some(relinked);
         if let Some(draft) = self.notes.as_mut()
             && let Some(to) = moved_by(&draft.path, pairs)
         {
             draft.path = to;
+            draft.check_db = true;
         }
         let moved: Vec<(PathBuf, PathBuf)> = self
             .left_behind
@@ -850,13 +876,16 @@ pub fn flush_for_exit(app: &mut ZxrawApp) {
 /// draft in conflict keeps both texts, so the database's note is never overwritten unseen.
 fn unconfirmed_note(draft: &NotesDraft) -> Option<crate::library::PendingNote> {
     (draft.text != draft.saved).then(|| {
-        let text = match &draft.conflict {
-            Some(note) => merged_note(&draft.text, note),
-            None => draft.text.trim().to_string(),
+        // Kept with the note it was based on: the next start merges rather than overwrites
+        // when the database has changed since (a draft still being checked may be behind).
+        let (text, base) = match &draft.conflict {
+            Some(note) => (merged_note(&draft.text, note), note),
+            None => (draft.text.trim().to_string(), &draft.saved),
         };
         crate::library::PendingNote {
             path: draft.path.clone(),
             note: Some(text).filter(|n| !n.is_empty()),
+            base: Some(base.trim().to_string()),
         }
     })
 }
@@ -1487,6 +1516,14 @@ mod tests {
         )
     }
 
+    /// Takes the relink answer, then stands in for the panel's read of the selection.
+    fn reread(st: &mut TagsUi, library: &mut Library, ctx: &egui::Context, db: &Db) {
+        st.sync_notes(library, ctx);
+        let paths = st.cache.as_ref().unwrap().paths.clone();
+        st.cache.as_mut().unwrap().files = Some(read_files(db, &paths).unwrap());
+        st.sync_notes(library, ctx);
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("zxraw-tags-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1516,14 +1553,17 @@ mod tests {
         // Renamed in the app right away: the rename and the follow happen in the same frame.
         std::fs::rename(&old, &new).unwrap();
         let pairs = vec![(old.clone(), new.clone())];
-        st.follow_moves(&pairs);
-        library.follow_moves(pairs);
+        let relinked = library.follow_moves(pairs.clone());
+        st.follow_moves(&pairs, relinked);
         assert_eq!(st.notes.as_ref().unwrap().path, new);
 
-        // The selection now shows the renamed file: the draft is kept, then saved.
+        // The selection now shows the renamed file: the draft is kept, then saved once it is
+        // compared with the database after the relink.
         st.sync_selection(std::slice::from_ref(&new));
         st.sync_notes(&mut library, &ctx);
         assert_eq!(st.notes.as_ref().unwrap().text, "Café proof 🎉");
+        assert!(library.flush(Duration::from_secs(5)));
+        reread(&mut st, &mut library, &ctx, &db);
         st.save_notes(&mut library, &ctx);
         assert!(library.flush(Duration::from_secs(5)));
         st.poll_note_save(&ctx);
@@ -1570,10 +1610,12 @@ mod tests {
                 crate::library::PendingNote {
                     path: a.clone(),
                     note: Some("client proof".into()),
+                    base: Some(String::new()),
                 },
                 crate::library::PendingNote {
                     path: b.clone(),
                     note: Some("second".into()),
+                    base: Some(String::new()),
                 },
             ]
         );
@@ -1656,6 +1698,90 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_draft_moved_onto_an_annotated_file_is_checked_before_it_is_saved() {
+        let db = std::sync::Arc::new(forge_db::Db::open_in_memory().unwrap());
+        let dir = temp_dir("move-onto-note");
+        let (old, dest) = (dir.join("a.jpg"), dir.join("dest").join("a.jpg"));
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"photo").unwrap();
+        std::fs::write(&dest, b"other").unwrap();
+        let entry = forge_core::listing::entry_for_path(&dest).unwrap();
+        db.upsert_entries(&[entry]).unwrap();
+        let dest_id = db.file_id(&dest).unwrap().unwrap();
+        db.set_notes(&[dest_id], Some("theirs")).unwrap();
+        let mut library = crate::library::test_library(db.clone());
+        let ctx = egui::Context::default();
+        let mut st = TagsUi::default();
+        st.cache = Some(Selected {
+            paths: vec![old.clone()],
+            files: Some(vec![(old.clone(), Annotation::default())]),
+        });
+        // The save failed; the file is then moved onto an annotated one.
+        st.notes = Some(NotesDraft {
+            path: old.clone(),
+            error: Some("disk full".into()),
+            ..draft("my edit", "", None)
+        });
+        std::fs::remove_file(&dest).unwrap();
+        std::fs::rename(&old, &dest).unwrap();
+        let pairs = vec![(old.clone(), dest.clone())];
+        let relinked = library.follow_moves(pairs.clone());
+        st.follow_moves(&pairs, relinked);
+
+        // A retry before the database is read again saves nothing.
+        st.save_notes(&mut library, &ctx);
+        assert!(st.notes.as_ref().unwrap().saving.is_none());
+        assert!(library.flush(Duration::from_secs(5)));
+        reread(&mut st, &mut library, &ctx, &db);
+        let d = st.notes.as_ref().unwrap();
+        assert_eq!(note_status(d), NoteStatus::Conflict);
+        assert_eq!(d.conflict.as_deref(), Some("theirs"));
+        st.save_notes(&mut library, &ctx);
+        assert!(library.flush(Duration::from_secs(5)));
+        assert_eq!(db.annotation(dest_id).unwrap().notes.as_deref(), Some("theirs"));
+        drop(library);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_recheck_replaces_a_stale_conflict_with_the_latest_note() {
+        let mut d = draft("mine", "old", None);
+        d.check_against("first".into());
+        assert_eq!(d.conflict.as_deref(), Some("first"));
+        // Changed again before the user chose: the latest note is what a merge must keep.
+        d.check_db = true;
+        d.check_against("second".into());
+        assert_eq!(d.conflict.as_deref(), Some("second"));
+        assert_eq!(
+            unconfirmed_note(&d).unwrap(),
+            crate::library::PendingNote {
+                path: d.path.clone(),
+                note: Some("mine\n\n--- merged note ---\n\nsecond".into()),
+                base: Some("second".into()),
+            }
+        );
+        // Back to the note the edit was based on: still a choice, against that note.
+        d.check_against("old".into());
+        assert_eq!(d.conflict.as_deref(), Some("old"));
+        // The edit itself is in the database now: nothing left to choose.
+        d.check_against("mine".into());
+        assert_eq!(d.conflict, None);
+        assert_eq!(note_status(&d), NoteStatus::Saved);
+    }
+
+    #[test]
+    fn a_draft_still_being_checked_is_kept_with_the_note_it_was_based_on() {
+        let mut d = draft("my edit", "old", None);
+        d.check_db = true;
+        assert_eq!(note_status(&d), NoteStatus::Checking);
+        assert_eq!(
+            unconfirmed_note(&d).unwrap().base.as_deref(),
+            Some("old"),
+            "the next start merges when the database has moved on from it"
+        );
+    }
+
+    #[test]
     fn a_left_behind_draft_is_dropped_once_confirmed_and_follows_moves() {
         let mut st = TagsUi::default();
         let ctx = egui::Context::default();
@@ -1667,7 +1793,10 @@ mod tests {
                 ..draft("x", "", None)
             },
         );
-        st.follow_moves(&[(PathBuf::from("a.jpg"), PathBuf::from("b.jpg"))]);
+        st.follow_moves(
+            &[(PathBuf::from("a.jpg"), PathBuf::from("b.jpg"))],
+            crossbeam_channel::bounded(1).1,
+        );
         assert_eq!(
             st.left_behind[&PathBuf::from("b.jpg")].path,
             PathBuf::from("b.jpg")
@@ -1691,6 +1820,7 @@ mod tests {
             Some(crate::library::PendingNote {
                 path: PathBuf::from("a.jpg"),
                 note: Some("late note".into()),
+                base: Some(String::new()),
             })
         );
         assert_eq!(unconfirmed_note(&draft("same", "same", None)), None);
