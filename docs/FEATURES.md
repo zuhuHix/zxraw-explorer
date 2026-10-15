@@ -151,7 +151,12 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `setting_files_increments_clipboard_sequence`, `clear_if_owned_files_does_not_clear_a_changed_sequence`,
   and `powershell_reads_file_drop_list` pass. The file-list round trip is what these tests prove; the preferred drop effect is
   set by the same module but is not checked on its own.
-* 🟡 Clipboard interoperability with Explorer — paste into and out of Explorer has not been checked.
+* 🟡 Clipboard interoperability with Explorer — pasting Explorer's files into ZXraw Explorer is
+  covered by e2e tests that put a real CF_HDROP + Preferred DropEffect on the Windows clipboard:
+  `explorer_cut_of_two_folders_pastes_with_ctrl_v`, `explorer_copy_pastes_with_shift_insert_without_a_click`,
+  `explorer_cut_after_an_in_app_copy_pastes_the_explorer_items` and `ctrl_shift_v_does_not_paste_files`
+  (`forge-app/tests/e2e/core.rs`). Copy/cut in ZXraw Explorer publishes the same formats for
+  Explorer to paste, but pasting into Explorer itself is not automated.
 * ✅ Copy line: copies and moves run one at a time in a queue (Settings › File operations,
   "Run copies and moves": queue by default, or all at once). Queued jobs wait as "Queued" in
   the Operations panel in run order, with buttons to move a job up or down, start it now,

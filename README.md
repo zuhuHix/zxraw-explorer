@@ -219,6 +219,21 @@ Explorer is a file manager designed around that workflow:
 
 ---
 
+### Copying and moving
+
+- **Copies wait their turn.** Copies and moves run one at a time in a queue, so a big transfer
+  isn't slowed down by the next one. In the Operations panel you can reorder waiting jobs,
+  start one now, cancel it, or pause the whole queue. Transfers between different drives still
+  run side by side. Prefer everything at once? Settings › File operations.
+- **Works with Explorer's clipboard.** Cut or copy files in Windows Explorer or on the desktop,
+  then press <kbd>Ctrl</kbd>+<kbd>V</kbd> in ZXraw Explorer, and the other way round.
+- **Cloud files stay in the cloud.** OneDrive, Dropbox and other online-only files are never
+  downloaded in the background: thumbnails, checksums, video tools and scans skip them. Before a
+  copy that would download many of them, you're told how many files and how much data, and
+  can cancel. Copying a big local shoot starts straight away.
+- **Renames never overwrite.** If the new name is already taken, you're asked again instead of
+  losing a file, even on a slow network drive.
+
 ### Batch work on a selection
 
 Every one of these is in the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>) and can be
