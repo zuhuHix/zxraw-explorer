@@ -382,7 +382,7 @@ impl Library {
         if pairs.is_empty() {
             return;
         }
-        rekey_map(&mut self.annotations, &pairs);
+        rekey_map_with(&mut self.annotations, &pairs, merge_moved_annotation);
         rekey_set(&mut self.locally_edited, &pairs);
         rekey_map(&mut self.annotation_versions, &pairs);
         let write = LibraryWrite::Relink { pairs };
@@ -879,8 +879,18 @@ pub(crate) fn moved_by(path: &Path, pairs: &[(PathBuf, PathBuf)]) -> Option<Path
 /// Re-keys every entry of `map` that sits under one of the moved paths. All moves are applied
 /// as one set (every entry is taken out before any is put back), so a swap or a cycle of
 /// renames keeps each value with its file. Moved entries replace whatever was keyed at their
-/// destination, as the database merge does.
+/// destination.
 fn rekey_map<V>(map: &mut HashMap<PathBuf, V>, pairs: &[(PathBuf, PathBuf)]) {
+    rekey_map_with(map, pairs, |moved, _| moved);
+}
+
+/// [`rekey_map`], where a moved entry landing on one still keyed at its destination is
+/// combined with it by `merge(moved, existing)`.
+fn rekey_map_with<V>(
+    map: &mut HashMap<PathBuf, V>,
+    pairs: &[(PathBuf, PathBuf)],
+    merge: impl Fn(V, V) -> V,
+) {
     let moves: Vec<(PathBuf, PathBuf)> = map
         .keys()
         .filter_map(|key| moved_by(key, pairs).map(|to| (key.clone(), to)))
@@ -889,7 +899,25 @@ fn rekey_map<V>(map: &mut HashMap<PathBuf, V>, pairs: &[(PathBuf, PathBuf)]) {
         .into_iter()
         .filter_map(|(from, to)| map.remove(&from).map(|value| (to, value)))
         .collect();
-    map.extend(taken);
+    for (to, value) in taken {
+        let value = match map.remove(&to) {
+            Some(existing) => merge(value, existing),
+            None => value,
+        };
+        map.insert(to, value);
+    }
+}
+
+/// A moved file's annotation landing on a file that already has one, as the database merges
+/// the two rows: each field the moved file set wins, the rest come from the destination, and
+/// either note keeps the note badge (the notes are joined).
+fn merge_moved_annotation(moved: Annotation, existing: Annotation) -> Annotation {
+    Annotation {
+        rating: if moved.rating > 0 { moved.rating } else { existing.rating },
+        label: moved.label.or(existing.label),
+        pick: if moved.pick != 0 { moved.pick } else { existing.pick },
+        has_note: moved.has_note || existing.has_note,
+    }
 }
 
 /// The set counterpart of [`rekey_map`].
@@ -1743,6 +1771,34 @@ mod tests {
         assert!(library.annotations[&renamed].has_note);
         drop(library);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_move_onto_an_annotated_file_merges_the_cached_annotations() {
+        let mut map: HashMap<PathBuf, Annotation> = HashMap::new();
+        let (a, b) = (PathBuf::from(r"C:\x\a.jpg"), PathBuf::from(r"C:\y\a.jpg"));
+        map.insert(a.clone(), Annotation { rating: 3, label: None, pick: 0, has_note: false });
+        map.insert(b.clone(), Annotation { rating: 5, label: Some(2), pick: 1, has_note: true });
+        rekey_map_with(&mut map, &[(a.clone(), b.clone())], merge_moved_annotation);
+        assert!(!map.contains_key(&a));
+        // The database keeps the destination's note, so its badge stays.
+        assert_eq!(
+            map[&b],
+            Annotation { rating: 3, label: Some(2), pick: 1, has_note: true }
+        );
+
+        // A swap moves both entries; nothing is merged.
+        let mut map: HashMap<PathBuf, Annotation> = HashMap::new();
+        let with_note = Annotation { has_note: true, ..Default::default() };
+        map.insert(a.clone(), with_note);
+        map.insert(b.clone(), Annotation::default());
+        rekey_map_with(
+            &mut map,
+            &[(a.clone(), b.clone()), (b.clone(), a.clone())],
+            merge_moved_annotation,
+        );
+        assert_eq!(map[&b], with_note);
+        assert_eq!(map[&a], Annotation::default());
     }
 
     #[test]

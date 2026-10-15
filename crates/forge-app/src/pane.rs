@@ -617,14 +617,15 @@ impl Pane {
         }
     }
 
-    /// What F2 renames (and what Properties and Open with show): one of the guarded
-    /// [`Pane::action_targets`], the cursor item when it is one of them, else the first. A
+    /// What F2 renames (and what Properties and Open with show): the cursor item when it is
+    /// selected (a right-clicked row is, even inside a selected folder, which leaves it out
+    /// of [`Pane::action_targets`]) or is the target, else the first of the targets. A
     /// selection that is entirely hidden renames nothing, even when the cursor sits on
     /// another, visible file.
     pub fn rename_target(&self) -> Option<&FileEntry> {
         let targets = self.action_targets();
         self.cursor_entry()
-            .filter(|e| targets.contains(&e.path))
+            .filter(|e| self.is_selected(e) || targets.contains(&e.path))
             .or_else(|| {
                 let first = targets.first()?;
                 self.entries.iter().find(|e| &e.path == first)
@@ -980,6 +981,7 @@ impl Pane {
         self.entries.retain(|e| e.path.parent() != Some(dir));
         self.entries.extend(fresh);
         self.dirty_sort = true;
+        self.prune_hidden_selection(dir);
         for path in open {
             self.start_child_load(path);
         }
@@ -1025,6 +1027,8 @@ impl Pane {
         let mut changed = false;
         let mut open = Vec::new();
         let mut swaps = Vec::new();
+        // Folders whose first listing just completed.
+        let mut listed = Vec::new();
         for _ in 0..64 {
             let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
             let Some(load) = self.children.get_mut(&dir).filter(|l| l.id == id) else {
@@ -1061,6 +1065,7 @@ impl Pane {
                 ListMsg::Done { .. } => {
                     load.loading = false;
                     load.error = None;
+                    listed.push(dir.clone());
                 }
                 ListMsg::Failed(e) => {
                     load.loading = false;
@@ -1073,6 +1078,9 @@ impl Pane {
         for dir in open {
             self.start_child_load(dir);
         }
+        for dir in listed {
+            self.prune_hidden_selection(&dir);
+        }
         if !swaps.is_empty() {
             self.reshape(false, |pane| {
                 for (dir, fresh) in swaps {
@@ -1082,6 +1090,31 @@ impl Pane {
             changed = true;
         }
         changed
+    }
+
+    /// `dir` was just listed completely: forget selected paths below it that the listing
+    /// shows are gone. A selected item inside a closed folder stays selected (hidden) while
+    /// the folder is listed, so it may have been deleted or renamed meanwhile; without this
+    /// it would stay selected, and a file that later appears at its path would be picked.
+    /// Items deeper down stay while the folder holding them is listed here, until that
+    /// folder's own listing completes.
+    fn prune_hidden_selection(&mut self, dir: &Path) {
+        if self.selected.is_empty() {
+            return;
+        }
+        let listed: HashSet<&Path> = self
+            .entries
+            .iter()
+            .filter(|e| e.path.parent() == Some(dir))
+            .map(|e| e.path.as_path())
+            .collect();
+        self.selected.retain(|p| {
+            // The item directly in `dir` that `p` is, or is inside of.
+            match p.ancestors().find(|a| a.parent() == Some(dir)) {
+                Some(top) => listed.contains(top),
+                None => true,
+            }
+        });
     }
 
     /// Leaving details view closes the tree (the open folders stay remembered); coming back
@@ -1747,8 +1780,7 @@ mod tests {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
             pane.poll();
-            let busy = pane.is_loading() || pane.expanded.iter().any(|p| pane.is_child_loading(p));
-            if !busy {
+            if !pane.is_busy() {
                 break;
             }
             assert!(Instant::now() < deadline, "folder listing timed out");
@@ -2028,6 +2060,82 @@ mod tests {
         pane.click(row_of(&pane, "b.txt"), true, false);
         assert_eq!(pane.selected.len(), 3);
         assert_eq!(pane.action_targets(), vec![a, root.join("b.txt")]);
+    }
+
+    #[test]
+    fn right_clicking_a_selected_item_inside_a_selected_folder_targets_the_item() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "a"), false, false);
+        pane.click(row_of(&pane, "a1.txt"), true, false);
+
+        pane.context_click(row_of(&pane, "a1.txt"));
+        // Rename, Properties and Open with take the clicked row, not the folder covering it.
+        assert_eq!(pane.rename_target().map(|e| e.name.as_str()), Some("a1.txt"));
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a1.txt"));
+        // Delete, Copy and Move still act on the folder, which covers the item.
+        assert_eq!(pane.action_targets(), vec![a]);
+    }
+
+    #[test]
+    fn reopening_a_folder_forgets_hidden_picks_that_are_gone() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let sub = a.join("sub");
+        let (a1, deep) = (a.join("a1.txt"), sub.join("deep.txt"));
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "a1.txt"), false, false);
+        pane.click(row_of(&pane, "deep.txt"), true, false);
+        pane.set_expanded(&a, false);
+        settle(&mut pane);
+
+        // Gone while their folder is closed: a refresh cannot tell, the folder is listed.
+        std::fs::remove_file(&a1).unwrap();
+        std::fs::rename(&sub, a.join("moved")).unwrap();
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(pane.selected.len(), 2, "still hidden in the closed folder");
+
+        // Reopening lists the folder: the picks that are gone are forgotten.
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        assert!(pane.selected.is_empty(), "{:?}", pane.selected);
+
+        // A file that appears at the old path later is not picked.
+        std::fs::write(&a1, b"new").unwrap();
+        pane.refresh();
+        settle(&mut pane);
+        assert!(!pane.selected.contains(&a1));
+        assert!(!pane.selected.contains(&deep));
+    }
+
+    #[test]
+    fn a_hidden_pick_in_a_nested_closed_folder_stays_until_that_folder_is_listed() {
+        let (_dir, root) = tree_fixture();
+        let a = root.join("a");
+        let sub = a.join("sub");
+        let deep = sub.join("deep.txt");
+        let mut pane = open_tree_pane(&root);
+        pane.set_expanded(&a, true);
+        settle(&mut pane);
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+        pane.click(row_of(&pane, "deep.txt"), false, false);
+        pane.set_expanded(&sub, false);
+        settle(&mut pane);
+
+        // `a` is listed again, `sub` is still there but closed: the pick stays, hidden.
+        pane.reload_children(&a);
+        settle(&mut pane);
+        assert!(pane.selected.contains(&deep));
+        assert!(pane.action_targets().is_empty(), "hidden picks target nothing");
     }
 
     #[test]
