@@ -3,37 +3,44 @@
 //! The folder being scanned is untrusted: any name in it can be a symlink, junction or other
 //! reparse point leading elsewhere, including to a network share (merely opening such a path
 //! makes Windows connect, which leaks the user's NTLM hash). So the scan never opens anything
-//! by path. The root is opened once; every other file or folder is opened one name at a time,
-//! relative to a handle already validated, with `FILE_OPEN_REPARSE_POINT` so that a link is
-//! opened as itself and never followed. Each handle is then checked before use:
+//! by path except the root of a local volume (`C:\`, checked to be a local drive first). Every
+//! other folder or file, the browsed folder's ancestors included, is opened one name at a time,
+//! relative to a handle already validated, with `FILE_OPEN_REPARSE_POINT` (a link is opened as
+//! itself and never followed) and `FILE_OPEN_NO_RECALL` (a cloud placeholder is not
+//! downloaded). Each handle is then checked before use:
 //!
 //! * it must not be a reparse point (the open did not follow it, so it is refused instead);
-//! * it must be on the root's volume, and its final path must be inside the root's.
+//! * it must be on the root's volume (64-bit volume serial number), and its final path must be
+//!   inside the root's (or, while walking down to the root, be the next folder on the way);
+//! * a file must have no other names (hard links), which could be outside the folder;
+//! * it must not be an online-only placeholder.
 //!
 //! Since a file is read through the handle that was checked, swapping a name for a link
 //! between the check and the read changes nothing. Reads take a byte cap.
 
 use std::ffi::OsString;
 use std::io::Read;
-use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::Mutex;
 
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_NO_RECALL,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_OPTIONS,
+    NtCreateFile,
 };
 use windows::Win32::Foundation::{HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING};
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES,
-    FILE_FULL_DIR_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-    FileFullDirectoryInfo, FileFullDirectoryRestartInfo, GETFINALPATHNAMEBYHANDLE_FLAGS,
-    GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_FULL_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED,
+    FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_TRAVERSE, FileFullDirectoryInfo, FileFullDirectoryRestartInfo, FileIdInfo,
+    GETFINALPATHNAMEBYHANDLE_FLAGS, GetDriveTypeW, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, SYNCHRONIZE,
+    VOLUME_NAME_DOS,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::PCWSTR;
@@ -45,9 +52,11 @@ pub enum Error {
     NotFound,
     /// A folder where a file was expected, or the other way round.
     WrongKind,
-    /// A link (any reparse point), or a handle that ended up off the root's volume or outside
-    /// its folder. Never followed.
+    /// A link (any reparse point), a file with other names (hard links), or a handle that
+    /// ended up off the root's volume or outside its folder. Never followed.
     Link,
+    /// An online-only placeholder; never read, which would download it.
+    OnlineOnly,
     /// A name that cannot be opened as a single plain component.
     BadName,
     /// Larger than the caller's cap.
@@ -84,15 +93,63 @@ pub struct Entry {
 /// The scan's view of the file system: the root it may not leave, and (in tests) a record of
 /// every handle it opened.
 pub struct Fs {
-    volume: u32,
+    volume: u64,
     /// Final path of the root, lowercase, without a trailing `\`.
     root_final: String,
+    /// Final paths of every handle opened, in tests.
     opened: Option<Mutex<Vec<String>>>,
 }
 
 /// An open, checked folder.
 pub struct Dir {
     handle: OwnedHandle,
+    pub info: Info,
+}
+
+/// The drive letter of `path` if it is on a local drive (fixed, removable, CD or RAM disk),
+/// asked of the system without opening anything. `None` for shares, mapped network drives,
+/// device paths and drives that do not exist.
+pub fn local_drive(path: &Path) -> Option<char> {
+    use std::path::{Component, Prefix};
+    let letter = match path.components().next()? {
+        Component::Prefix(p) => match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => (d as char).to_ascii_uppercase(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain([0]).collect();
+    // DRIVE_REMOVABLE, DRIVE_FIXED, DRIVE_CDROM, DRIVE_RAMDISK
+    matches!(
+        unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) },
+        2 | 3 | 5 | 6
+    )
+    .then_some(letter)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Opens by path on this thread, for tests.
+    pub static PATH_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The create options of every relative open: never follow a link, and for files never recall
+/// a cloud placeholder. (NTFS refuses `FILE_OPEN_NO_RECALL` on folders; a placeholder folder is
+/// a reparse point, refused as such, and listings skip online-only folders before any open.)
+pub fn create_options(dir: bool) -> NTCREATEFILE_CREATE_OPTIONS {
+    let kind = if dir {
+        FILE_DIRECTORY_FILE
+    } else {
+        FILE_NON_DIRECTORY_FILE
+    };
+    if dir {
+        kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT
+    } else {
+        kind | FILE_OPEN_REPARSE_POINT | FILE_OPEN_NO_RECALL | FILE_SYNCHRONOUS_IO_NONALERT
+    }
 }
 
 /// An open, checked file.
@@ -102,14 +159,19 @@ pub struct File {
 }
 
 impl Fs {
-    /// Opens the folder at `root`. Links in `root` itself are followed: that is the folder the
-    /// user chose to browse. Nothing below it ever is. With `record`, every opened handle's
-    /// final path is kept (see [`Fs::opened`]).
-    pub fn open_root(root: &Path, record: bool) -> Result<(Fs, Dir), Error> {
-        let wide: Vec<u16> = root.as_os_str().encode_wide().chain([0]).collect();
+    /// Opens the root of local drive `letter` (see [`local_drive`]), the only open by path.
+    /// The root of a volume is never a link. With `record`, every opened handle's final path
+    /// is kept (see [`Fs::opened`]).
+    pub fn open_volume(letter: char, record: bool) -> Result<(Fs, Dir), Error> {
+        #[cfg(test)]
+        PATH_OPENS.with(|n| n.set(n.get() + 1));
+        let path: Vec<u16> = format!(r"\\?\{letter}:\")
+            .encode_utf16()
+            .chain([0])
+            .collect();
         let handle = unsafe {
             CreateFileW(
-                PCWSTR(wide.as_ptr()),
+                PCWSTR(path.as_ptr()),
                 (FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 None,
@@ -120,18 +182,29 @@ impl Fs {
         }
         .map_err(|e| Error::Io(e.to_string()))?;
         let handle = unsafe { OwnedHandle::from_raw_handle(handle.0 as _) };
-        let (info, volume) = by_handle(&handle)?;
+        let (info, _) = by_handle(&handle)?;
         if !info.is_dir() {
             return Err(Error::WrongKind);
         }
         let root_final = final_path(&handle)?;
+        if !root_final.starts_with(r"\\?\") || root_final.to_lowercase().starts_with(r"\\?\unc\") {
+            return Err(Error::Link);
+        }
         let fs = Fs {
-            volume,
+            volume: volume_id(&handle)?,
             root_final: root_final.trim_end_matches('\\').to_lowercase(),
             opened: record.then(|| Mutex::new(Vec::new())),
         };
         fs.note(&root_final);
-        Ok((fs, Dir { handle }))
+        Ok((fs, Dir { handle, info }))
+    }
+
+    /// Makes `dir`, a folder opened through this `Fs`, the root nothing may leave from now on.
+    pub fn narrow(&mut self, dir: &Dir) -> Result<(), Error> {
+        self.root_final = final_path(&dir.handle)?
+            .trim_end_matches('\\')
+            .to_lowercase();
+        Ok(())
     }
 
     /// Final paths of every handle opened so far, if recording.
@@ -175,16 +248,10 @@ impl Fs {
             Attributes: OBJ_CASE_INSENSITIVE,
             ..Default::default()
         };
-        let (access, kind): (FILE_ACCESS_RIGHTS, NTCREATEFILE_CREATE_OPTIONS) = if dir {
-            (
-                FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                FILE_DIRECTORY_FILE,
-            )
+        let access: FILE_ACCESS_RIGHTS = if dir {
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
         } else {
-            (
-                FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                FILE_NON_DIRECTORY_FILE,
-            )
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
         };
         let mut raw = HANDLE::default();
         let mut iosb = IO_STATUS_BLOCK::default();
@@ -198,7 +265,7 @@ impl Fs {
                 FILE_FLAGS_AND_ATTRIBUTES(0),
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 FILE_OPEN,
-                kind | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                create_options(dir),
                 None,
                 0,
             )
@@ -218,12 +285,18 @@ impl Fs {
         // A link was opened as itself, so this is the link's own path.
         let path = final_path(&handle)?;
         self.note(&path);
-        let (info, volume) = by_handle(&handle)?;
-        if info.is_link() || volume != self.volume {
+        let (info, links) = by_handle(&handle)?;
+        if info.is_link() || volume_id(&handle)? != self.volume {
             return Err(Error::Link);
         }
         if info.is_dir() != dir {
             return Err(Error::WrongKind);
+        }
+        if !dir && links > 1 {
+            return Err(Error::Link);
+        }
+        if forge_core::cloud::is_online_only_attrs(info.attributes) {
+            return Err(Error::OnlineOnly);
         }
         if !path
             .to_lowercase()
@@ -237,8 +310,8 @@ impl Fs {
 
     /// Opens folder `name` below `parent`.
     pub fn dir(&self, parent: &Dir, name: &str) -> Result<Dir, Error> {
-        let (handle, _) = self.open(parent, name, true)?;
-        Ok(Dir { handle })
+        let (handle, info) = self.open(parent, name, true)?;
+        Ok(Dir { handle, info })
     }
 
     /// Opens file `name` below `parent`.
@@ -349,7 +422,7 @@ impl File {
     }
 }
 
-/// Attributes, size, write time and volume serial number of an open handle.
+/// Attributes, size and write time of an open handle, and its number of names (hard links).
 fn by_handle(handle: &OwnedHandle) -> Result<(Info, u32), Error> {
     let mut data = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(HANDLE(handle.as_raw_handle() as _), &mut data) }
@@ -361,7 +434,22 @@ fn by_handle(handle: &OwnedHandle) -> Result<(Info, u32), Error> {
         size: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
         mtime: mtime as i64,
     };
-    Ok((info, data.dwVolumeSerialNumber))
+    Ok((info, data.nNumberOfLinks))
+}
+
+/// The 64-bit serial number of the volume an open handle is on.
+fn volume_id(handle: &OwnedHandle) -> Result<u64, Error> {
+    let mut data = FILE_ID_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle() as _),
+            FileIdInfo,
+            (&mut data as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|e| Error::Io(e.to_string()))?;
+    Ok(data.VolumeSerialNumber)
 }
 
 /// Normalized final path of an open handle (`\\?\C:\...` or `\\?\UNC\...`).

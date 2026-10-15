@@ -261,14 +261,18 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `folder_context_menu_opens_a_terminal_in_that_folder` right-clicks a folder and clicks the menu
   item (automated runs record the launch instead of opening a window). Windows Terminal's `\;`
   handling was checked by hand once; the administrator variant was not run.
-* 🟡 Git status badges — `forge-app/src/git_status.rs`, on by default (Settings › Browsing):
+* 🟡 Git status badges — `forge-app/src/git_status.rs`, off by default (opt-in in Settings › Browsing):
   modified, new (added or untracked), ignored (dimmed) and conflicted entries, rolled up to
   folders, and the branch in the status bar. Read in-process on one background thread; no
   external program ever runs (no `git.exe`, no fsmonitor, no filter drivers). Every file is
-  opened through `git_status/safe_fs.rs`: the root once, then one name at a time relative to an
-  already-checked folder handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`), refusing any
-  reparse point, any handle off the root's volume or whose final path is outside the root, and
-  reading with a byte cap from the handle that was checked. gix only parses bytes read that way
+  opened through `git_status/safe_fs.rs`: a share, mapped drive or device path is refused
+  before anything is opened; the local drive's root is the only open by path; every folder from
+  there down to the browsed one, and everything in the repository, is opened one name at a time
+  relative to an already-checked handle (`NtCreateFile` with `FILE_OPEN_REPARSE_POINT`, and
+  `FILE_OPEN_NO_RECALL` for files), refusing any reparse point, hard-linked file, online-only
+  placeholder, or handle off the root's volume (64-bit serial) or outside the root, and
+  reading with a byte cap from the handle that was checked. Repository discovery and the scan
+  both run on a deadlined thread (at most one abandoned at a time). gix only parses bytes read that way
   (index, config, refs, ignore files, commits and trees); loose objects and packs, with deltas,
   are read by `git_status/odb.rs`. Tracked files are compared with the index from folder
   listings; a same-size file with a new time is hashed from its raw bytes (at most 256 files of
@@ -276,7 +280,8 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   show no badges. Caps: 4 s, a 64 MB / 100,000-entry index, 50,000 folders and files walked,
   `.gitignore` files (256 KB and 4,096 patterns each, 4 MB and 20,000 patterns in all),
   `packed-refs` (16 MB), 256 packs and 256 MB of pack indexes, 32 MB per object and 512 MB
-  inflated in all, and 5 symbolic refs; a repository over any of them is skipped for the
+  inflated in all (compressed input capped per object and in all, deadline checked while
+  inflating), 200,000 staged changes or 64 MB of their paths, 4 KB paths, and 5 symbolic refs; a repository over any of them is skipped for the
   session. Results are cached per repository and refreshed when the folder watcher fires or
   after 15 s. Unit tests cover lookup and roll-up, repo-root detection, a real repository
   (modified, staged, untracked, ignored), staged changes read from deltified packs, programs

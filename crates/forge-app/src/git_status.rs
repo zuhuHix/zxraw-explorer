@@ -32,8 +32,8 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 const RETRY_BUSY: Duration = Duration::from_secs(5);
 /// Folder states kept before entries that are no longer shown are dropped.
 const MAX_DIRS: usize = 256;
-/// Deepest folder level searched for a `.git` entry.
-const MAX_ROOT_DEPTH: usize = 64;
+/// Deepest folder level (below a drive's root) that can be in a repository.
+const MAX_ROOT_DEPTH: usize = 128;
 
 /// Badge shown next to an entry in a Git repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -177,19 +177,85 @@ fn norm_key(path: &Path) -> String {
         .to_lowercase()
 }
 
-/// Walks up from `dir` (at most 64 levels) to the first folder containing `.git`.
+/// The deepest folder from `dir` up that contains a `.git` (a folder, or a file as used by
+/// worktrees and submodules, or a link: the scan then refuses it).
 ///
-/// `.git` may be a folder, or a file as used by worktrees and submodules.
-/// Returns that folder.
-pub fn find_repo_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir;
-    for _ in 0..MAX_ROOT_DEPTH {
-        if std::fs::symlink_metadata(current.join(".git")).is_ok() {
-            return Some(current.to_path_buf());
+/// Nothing is looked up by path: `dir` and its ancestors are reached through [`locate`], from
+/// the root of its local drive one name at a time, and each `.git` is probed relative to its
+/// folder's handle. A folder on a share or mapped drive, or below a link, has no repository.
+fn find_repo_root(dir: &Path, over: &dyn Fn() -> bool) -> Result<Option<PathBuf>, Failure> {
+    let located = locate(dir, false, over)?;
+    find_in(&located, over)
+}
+
+/// [`find_repo_root`] for a folder already located.
+fn find_in(located: &Located, over: &dyn Fn() -> bool) -> Result<Option<PathBuf>, Failure> {
+    for (depth, level) in located.levels.iter().enumerate().rev() {
+        if over() {
+            return Err(Failure::TooBig);
         }
-        current = current.parent()?;
+        let found = match located.fs.dir(level, ".git") {
+            Ok(_) => true,
+            Err(safe_fs::Error::NotFound | safe_fs::Error::Io(_)) => false,
+            // A file, link or placeholder named `.git`: a repository the scan will refuse.
+            Err(_) => true,
+        };
+        if found {
+            let mut root = located.path.clone();
+            for _ in depth..located.levels.len() - 1 {
+                root.pop();
+            }
+            return Ok(Some(root));
+        }
     }
-    None
+    Ok(None)
+}
+
+/// A local folder reached from the root of its drive one name at a time, refusing links.
+struct Located {
+    fs: Fs,
+    /// The drive's root, then each folder down to the one asked for.
+    levels: Vec<Dir>,
+    /// The folder asked for, in [`lexical`] form.
+    path: PathBuf,
+}
+
+/// Opens `dir` without following any link on the way: refuses a share, a mapped network drive
+/// or a device path before opening anything; opens the drive's root (the only open by path);
+/// then each folder down to `dir` through [`safe_fs`], so a junction or symlink anywhere in
+/// the path is refused rather than followed. Refuses a folder inside a cloud sync root (whose
+/// files could be online-only), judged from the attributes of the handles just opened.
+fn locate(dir: &Path, record: bool, over: &dyn Fn() -> bool) -> Result<Located, Failure> {
+    let path = lexical(dir).ok_or(Failure::Unsafe)?;
+    let letter = safe_fs::local_drive(&path).ok_or(Failure::Unsafe)?;
+    let names: Vec<String> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if names.len() > MAX_ROOT_DEPTH {
+        return Err(Failure::TooBig);
+    }
+    let (fs, top) = Fs::open_volume(letter, record).map_err(meta)?;
+    let mut levels = vec![top];
+    let mut attributes = HashMap::new();
+    let mut at = PathBuf::from(format!("{letter}:\\"));
+    for name in &names {
+        if over() {
+            return Err(Failure::TooBig);
+        }
+        let next = fs.dir(levels.last().unwrap(), name).map_err(meta)?;
+        at.push(name);
+        attributes.insert(at.clone(), (next.info.attributes, 0));
+        levels.push(next);
+    }
+    let known = |p: &Path| attributes.get(p).copied();
+    if forge_core::cloud::in_cloud_sync_root_with(&path, &known) {
+        return Err(Failure::Unsafe);
+    }
+    Ok(Located { fs, levels, path })
 }
 
 /// Paints `badge` as a small letter pill whose right edge is at `right_center`.
@@ -230,8 +296,12 @@ enum Request {
 /// Result sent from the worker back to the UI thread.
 #[derive(Debug)]
 enum Reply {
-    /// Answer to `FindRoot`.
-    Root { dir: PathBuf, root: Option<PathBuf> },
+    /// Answer to `FindRoot`. `busy`: earlier work still runs; ask again shortly.
+    Root {
+        dir: PathBuf,
+        root: Option<PathBuf>,
+        busy: bool,
+    },
     /// Answer to `Status`.
     Status {
         root: PathBuf,
@@ -256,6 +326,8 @@ enum Failure {
 enum DirState {
     /// The worker has not answered yet.
     Pending,
+    /// The worker was busy; ask again after this time.
+    Retry(Instant),
     /// Not inside any repository.
     NoRepo,
     /// Inside the repository with this root.
@@ -336,15 +408,20 @@ impl GitStatus {
             self.repos.retain(|root, _| roots.contains(root));
         }
 
+        let now = Instant::now();
         for dir in dirs {
-            if !self.dirs.contains_key(dir) {
+            let due = match self.dirs.get(dir) {
+                None => true,
+                Some(DirState::Retry(at)) => now >= *at,
+                Some(_) => false,
+            };
+            if due {
                 self.dirs.insert(dir.clone(), DirState::Pending);
                 self.sent += 1;
                 let _ = self.requests.send(Request::FindRoot(dir.clone()));
             }
         }
 
-        let now = Instant::now();
         let roots: Vec<PathBuf> = dirs
             .iter()
             .filter_map(|dir| match self.dirs.get(dir) {
@@ -402,13 +479,14 @@ impl GitStatus {
                 continue;
             }
             match reply {
-                Reply::Root { dir, root } => {
+                Reply::Root { dir, root, busy } => {
                     if let Some(state) = self.dirs.get_mut(&dir) {
                         *state = match root {
                             Some(root) => {
                                 self.repos.entry(root.clone()).or_default();
                                 DirState::Repo(root)
                             }
+                            None if busy => DirState::Retry(Instant::now() + RETRY_BUSY),
                             None => DirState::NoRepo,
                         };
                         changed = true;
@@ -478,10 +556,17 @@ fn worker(requests: Receiver<Request>, replies: Sender<Reply>, ctx: egui::Contex
                 continue;
             }
             let reply = match request {
-                Request::FindRoot(dir) => Reply::Root {
-                    root: find_repo_root(&dir),
-                    dir,
-                },
+                Request::FindRoot(dir) => {
+                    let found = {
+                        let dir = dir.clone();
+                        on_thread(TIMEOUT, &ABANDONED, move |over| find_repo_root(&dir, over))
+                    };
+                    Reply::Root {
+                        busy: found == Err(Failure::Busy),
+                        root: found.ok().flatten(),
+                        dir,
+                    }
+                }
                 Request::Status(root) => {
                     let result = read_status(&root);
                     Reply::Status { root, result }
@@ -516,6 +601,12 @@ struct Limits {
     ignore_patterns: usize,
     /// Size of `packed-refs`.
     packed_refs_bytes: u64,
+    /// Staged changes (paths that differ between the index and `HEAD`).
+    staged_entries: usize,
+    /// Bytes of the paths of all staged changes.
+    staged_bytes: usize,
+    /// Longest path in `HEAD`'s tree.
+    path_bytes: usize,
     /// Object reading: object sizes, packs, delta chains.
     odb: odb::OdbLimits,
 }
@@ -530,11 +621,16 @@ const LIMITS: Limits = Limits {
     ignore_bytes: 4 * 1024 * 1024,
     ignore_patterns: 20_000,
     packed_refs_bytes: 16 * 1024 * 1024,
+    staged_entries: 200_000,
+    staged_bytes: 64 * 1024 * 1024,
+    path_bytes: 4096,
     odb: odb::OdbLimits {
         object_bytes: 32 * 1024 * 1024,
         total_bytes: 512 * 1024 * 1024,
         packs: 256,
         idx_bytes: 256 * 1024 * 1024,
+        pack_bytes: 16 * 1024 * 1024 * 1024,
+        compressed_bytes: 512 * 1024 * 1024,
         delta_depth: 512,
     },
 };
@@ -567,35 +663,39 @@ const MAX_ABANDONED: usize = 1;
 ///   link counts as modified (Git, too, never follows a link inside a work tree);
 /// * staged changes compare the index with `HEAD`'s tree, read from loose objects and packs.
 fn read_status_with(root: &Path, limits: Limits) -> Result<RepoStatus, Failure> {
-    scan_on_thread(root, limits, &ABANDONED)
+    let root = root.to_path_buf();
+    on_thread(limits.time, &ABANDONED, move |over| {
+        read_within(&root, limits, over)
+    })
 }
 
-/// Runs the scan on its own thread and waits at most `limits.time` for it. A scan still
-/// running then is told to stop and left to finish on its own (an open of a slow file system
-/// cannot be interrupted); it counts in `abandoned` until it does.
-fn scan_on_thread(
-    root: &Path,
-    limits: Limits,
+/// Runs `work` on its own thread and waits at most `time` for it; `work` is given a check
+/// that turns true at the deadline. Work still running then is told to stop and left to finish
+/// on its own (an open of a slow file system cannot be interrupted); it counts in `abandoned`
+/// until it does, and no new work starts while `abandoned` is full.
+fn on_thread<T: Send + 'static>(
+    time: Duration,
     abandoned: &'static AtomicUsize,
-) -> Result<RepoStatus, Failure> {
+    work: impl FnOnce(&dyn Fn() -> bool) -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
     if abandoned.load(Ordering::SeqCst) >= MAX_ABANDONED {
         return Err(Failure::Busy);
     }
-    // The budget covers everything from here on, including opening and loading the index.
-    let deadline = Instant::now() + limits.time;
+    // The budget covers everything from here on, including opening the repository.
+    let deadline = Instant::now() + time;
     let interrupt = Arc::new(AtomicBool::new(false));
-    // Set by the first of "the scan finished" and "the caller gave up"; the second one to
+    // Set by the first of "the work finished" and "the caller gave up"; the second one to
     // arrive settles the count.
     let settled = Arc::new(AtomicBool::new(false));
     let (done, result) = crossbeam_channel::bounded(1);
     let spawned = {
-        let root = root.to_path_buf();
         let interrupt = Arc::clone(&interrupt);
         let settled = Arc::clone(&settled);
         thread::Builder::new()
             .name("git-status-scan".into())
             .spawn(move || {
-                let _ = done.send(read_within(&root, limits, &interrupt, deadline));
+                let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
+                let _ = done.send(work(&over));
                 if settled.swap(true, Ordering::SeqCst) {
                     abandoned.fetch_sub(1, Ordering::SeqCst);
                 }
@@ -608,7 +708,7 @@ fn scan_on_thread(
     match result.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(_) if over() => Err(Failure::TooBig),
         Ok(result) => result,
-        // The scan panicked: it is not running any more.
+        // The work panicked: it is not running any more.
         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
             Err(Failure::Error("git status scan stopped".into()))
         }
@@ -627,33 +727,37 @@ fn scan_on_thread(
 fn read_within(
     root: &Path,
     limits: Limits,
-    interrupt: &AtomicBool,
-    deadline: Instant,
+    over: &dyn Fn() -> bool,
 ) -> Result<RepoStatus, Failure> {
-    // The caller raises `interrupt` at the deadline; the clock check makes it exact.
-    let over = || interrupt.load(Ordering::SeqCst) || Instant::now() >= deadline;
-    let (fs, top, root) = open_root(root, false)?;
-    scan(&fs, &top, &root, limits, &over)
+    let (fs, top, root) = open_root(root, false, over)?;
+    scan(&fs, &top, &root, limits, over)
 }
 
-/// Opens the folder being browsed, refusing one inside a cloud sync root (its files could be
-/// online-only and reading them would download them).
-fn open_root(root: &Path, record: bool) -> Result<(Fs, Dir, PathBuf), Failure> {
-    let root = lexical(root).ok_or(Failure::Unsafe)?;
-    if forge_core::cloud::in_cloud_sync_root(&root) {
-        return Err(Failure::Unsafe);
-    }
-    let (fs, top) = Fs::open_root(&root, record).map_err(meta)?;
-    Ok((fs, top, root))
+/// Opens the repository folder `root` through [`locate`] and makes it the folder the scan may
+/// not leave.
+fn open_root(
+    root: &Path,
+    record: bool,
+    over: &dyn Fn() -> bool,
+) -> Result<(Fs, Dir, PathBuf), Failure> {
+    let Located {
+        mut fs,
+        mut levels,
+        path,
+    } = locate(root, record, over)?;
+    let top = levels.pop().ok_or(Failure::Unsafe)?;
+    fs.narrow(&top).map_err(meta)?;
+    Ok((fs, top, path))
 }
 
 /// A safe-layer error while reading Git metadata. Links and unexpected kinds mean the
 /// repository is unsafe to read.
 fn meta(e: safe_fs::Error) -> Failure {
     match e {
-        safe_fs::Error::Link | safe_fs::Error::WrongKind | safe_fs::Error::BadName => {
-            Failure::Unsafe
-        }
+        safe_fs::Error::Link
+        | safe_fs::Error::WrongKind
+        | safe_fs::Error::BadName
+        | safe_fs::Error::OnlineOnly => Failure::Unsafe,
         safe_fs::Error::TooBig => Failure::TooBig,
         safe_fs::Error::NotFound => Failure::Error("not found".into()),
         safe_fs::Error::Io(message) => Failure::Error(message),
@@ -783,8 +887,8 @@ fn scan(
     match head_commit(fs, &git, &head, limits)? {
         Some(commit) => {
             let objects = objects.ok_or_else(|| Failure::Error("no objects".into()))?;
-            let mut odb = odb::Odb::new(fs, objects, limits.odb);
-            match staged_changes(&mut odb, &commit, &index, over) {
+            let mut odb = odb::Odb::new(fs, objects, limits.odb, over);
+            match staged_changes(&mut odb, &commit, &index, limits, over) {
                 Ok(changes) => {
                     for (path, badge) in changes {
                         status.add_staged(&path, badge);
@@ -921,6 +1025,7 @@ fn staged_changes(
     odb: &mut odb::Odb<'_>,
     commit: &gix::ObjectId,
     index: &gix::index::State,
+    limits: Limits,
     over: &dyn Fn() -> bool,
 ) -> Result<Vec<(String, GitBadge)>, odb::OdbError> {
     let data = odb.read(commit, gix::objs::Kind::Commit)?;
@@ -956,14 +1061,19 @@ fn staged_changes(
         cached,
         seen: vec![false; entries.len()],
         changes: Vec::new(),
+        bytes: 0,
+        limits,
         over,
     };
     diff.tree(tree, &mut Vec::new(), 0)?;
-    for (path, i) in &diff.by_path {
-        if !diff.seen[*i] {
-            diff.changes
-                .push((String::from_utf8_lossy(path).into_owned(), GitBadge::Added));
-        }
+    let added: Vec<Vec<u8>> = diff
+        .by_path
+        .iter()
+        .filter(|(_, i)| !diff.seen[**i])
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in added {
+        diff.push(&path, GitBadge::Added)?;
     }
     Ok(diff.changes)
 }
@@ -976,10 +1086,26 @@ struct Staged<'a, 'o> {
     cached: HashMap<Vec<u8>, gix::ObjectId>,
     seen: Vec<bool>,
     changes: Vec<(String, GitBadge)>,
+    /// Bytes of the paths in `changes`.
+    bytes: usize,
+    limits: Limits,
     over: &'a dyn Fn() -> bool,
 }
 
 impl Staged<'_, '_> {
+    /// Records a change. A small tree can name a huge number of paths (the same subtree under
+    /// many names, nested), so the count and the bytes of the paths are capped.
+    fn push(&mut self, path: &[u8], badge: GitBadge) -> Result<(), odb::OdbError> {
+        self.bytes += path.len();
+        if self.changes.len() >= self.limits.staged_entries || self.bytes > self.limits.staged_bytes
+        {
+            return Err(odb::OdbError::TooBig);
+        }
+        self.changes
+            .push((String::from_utf8_lossy(path).into_owned(), badge));
+        Ok(())
+    }
+
     fn tree(
         &mut self,
         id: gix::ObjectId,
@@ -1003,9 +1129,15 @@ impl Staged<'_, '_> {
         }
         let data = self.odb.read(&id, gix::objs::Kind::Tree)?;
         for entry in gix::objs::TreeRefIter::from_bytes(&data, gix::hash::Kind::Sha1) {
+            if (self.over)() {
+                return Err(odb::OdbError::TooBig);
+            }
             let entry = entry.map_err(|e| odb::OdbError::Bad(e.to_string()))?;
             let len = prefix.len();
             prefix.extend_from_slice(entry.filename);
+            if prefix.len() > self.limits.path_bytes {
+                return Err(odb::OdbError::TooBig);
+            }
             if entry.mode.is_tree() {
                 prefix.push(b'/');
                 self.tree(entry.oid.to_owned(), prefix, depth + 1)?;
@@ -1022,10 +1154,8 @@ impl Staged<'_, '_> {
                     None => true,
                 };
                 if changed {
-                    self.changes.push((
-                        String::from_utf8_lossy(prefix).into_owned(),
-                        GitBadge::Modified,
-                    ));
+                    let path = prefix.clone();
+                    self.push(&path, GitBadge::Modified)?;
                 }
             }
             prefix.truncate(len);
@@ -1290,6 +1420,12 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let link = entry.info.is_link();
+            if entry.info.is_dir() && forge_core::cloud::is_online_only_attrs(entry.info.attributes)
+            {
+                // An online-only folder is never opened; anything tracked below counts as
+                // modified.
+                continue;
+            }
             if entry.info.is_dir() && !link {
                 let has_tracked = self.tracked_dirs.contains(&key);
                 let is_ignored = ignored || self.ignores.ignored(&path, true);
@@ -1633,19 +1769,13 @@ mod tests {
         let root = tmp.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join("a").join("b").join("c")).unwrap();
-        assert_eq!(
-            find_repo_root(&root.join("a").join("b").join("c")),
-            Some(root)
-        );
+        assert_eq!(find(&root.join("a").join("b").join("c")), Some(root));
 
         // A `.git` file, as in worktrees and submodules, also counts.
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(worktree.join("sub")).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
-        assert_eq!(
-            find_repo_root(&worktree.join("sub")),
-            Some(worktree.clone())
-        );
+        assert_eq!(find(&worktree.join("sub")), Some(worktree.clone()));
 
         let plain = tmp.path().join("plain").join("x");
         std::fs::create_dir_all(&plain).unwrap();
@@ -1654,7 +1784,7 @@ mod tests {
             .ancestors()
             .any(|a| a.join(".git").symlink_metadata().is_ok());
         if !ancestor_is_repo {
-            assert_eq!(find_repo_root(&plain), None);
+            assert_eq!(find(&plain), None);
         }
     }
 
@@ -1830,12 +1960,35 @@ mod tests {
         assert_contained(&opened, &root_final, what);
     }
 
+    /// [`find_repo_root`] without a deadline, failures as `None`, as the worker reports them.
+    fn find(dir: &Path) -> Option<PathBuf> {
+        find_repo_root(dir, &|| false).ok().flatten()
+    }
+
+    /// The scan on its own thread, with `abandoned` as the count of abandoned scans.
+    fn scan_on_thread(
+        root: &Path,
+        limits: Limits,
+        abandoned: &'static AtomicUsize,
+    ) -> Result<RepoStatus, Failure> {
+        let root = root.to_path_buf();
+        on_thread(limits.time, abandoned, move |over| {
+            read_within(&root, limits, over)
+        })
+    }
+
+    /// The safe layer narrowed to folder `dir`, reached as the scan reaches a root.
+    fn fs_at(dir: &Path, record: bool) -> (Fs, Dir) {
+        let (fs, top, _) = open_root(dir, record, &|| false).expect("folder opens");
+        (fs, top)
+    }
+
     /// Runs the scan on this thread, recording the final path of every handle it opens.
     fn scan_recorded(
         root: &Path,
         limits: Limits,
     ) -> (Result<RepoStatus, Failure>, Vec<String>, String) {
-        let (fs, top, root) = match open_root(root, true) {
+        let (fs, top, root) = match open_root(root, true, &|| false) {
             Ok(opened) => opened,
             Err(e) => return (Err(e), vec![String::new()], String::new()),
         };
@@ -1844,13 +1997,17 @@ mod tests {
         (result, fs.opened(), fs.root_final().to_string())
     }
 
-    /// Every opened handle was the root or inside it.
+    /// Every opened handle was the root, inside it, or one of the folders on the way down to
+    /// it from its drive's root.
     fn assert_contained(opened: &[String], root_final: &str, what: &str) {
         assert!(!opened.is_empty(), "{what}: nothing recorded");
         for path in opened {
             let key = path.to_lowercase();
+            let key = key.trim_end_matches('\\');
             assert!(
-                key == root_final || key.starts_with(&format!("{root_final}\\")),
+                key == root_final
+                    || key.starts_with(&format!("{root_final}\\"))
+                    || root_final.starts_with(&format!("{key}\\")),
                 "{what}: opened {path} outside {root_final}"
             );
         }
@@ -2389,7 +2546,7 @@ mod tests {
         std::fs::write(&path, "same\n").unwrap();
         let id = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, b"same\n")
             .unwrap();
-        let (fs, top) = Fs::open_root(tmp.path(), false).unwrap();
+        let (fs, top) = fs_at(tmp.path(), false);
         assert!(same_as_blob(&fs, &top, "f.txt", &path, &id));
         forge_core::cloud::simulate_online_only(path.clone());
         assert!(
@@ -2585,6 +2742,14 @@ mod tests {
             with(|l| l.odb.object_bytes = 10).unwrap_err(),
             Failure::TooBig
         );
+        assert_eq!(
+            with(|l| l.odb.pack_bytes = 10).unwrap_err(),
+            Failure::TooBig
+        );
+        assert_eq!(
+            with(|l| l.odb.compressed_bytes = 10).unwrap_err(),
+            Failure::TooBig
+        );
     }
 
     /// Gap 6: files are opened relative to handles already held, so a folder swapped for a
@@ -2598,7 +2763,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("f.txt"), "outside").unwrap();
 
-        let (fs, top) = Fs::open_root(&root, true).unwrap();
+        let (fs, top) = fs_at(&root, true);
         let a = fs.dir(&top, "a").unwrap();
         std::fs::rename(root.join("a"), root.join("moved")).unwrap();
         if !junction(&root.join("a"), outside.path()) {
@@ -2627,5 +2792,187 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Review item 1: repository discovery never looks anything up by path below a drive's
+    /// root, so a junction among the browsed folder's ancestors is refused, not followed.
+    #[test]
+    fn a_junction_among_the_ancestors_is_not_followed() {
+        let Some(repo) = fixture_repo() else { return };
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        assert_eq!(
+            find(&repo.path().join("sub")),
+            Some(lexical(repo.path()).unwrap())
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("j");
+        if !junction(&link, repo.path()) {
+            eprintln!("skipped: could not create a junction");
+            return;
+        }
+        let never = || false;
+        for dir in [link.clone(), link.join("sub")] {
+            assert_eq!(
+                find_repo_root(&dir, &never).unwrap_err(),
+                Failure::Unsafe,
+                "{}",
+                dir.display()
+            );
+            assert_eq!(read_status(&dir).unwrap_err(), Failure::Unsafe);
+        }
+        // A `.git` that is itself a junction is found (so the folder counts as a repository)
+        // but never entered.
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plain.path().join("sub")).unwrap();
+        assert!(junction(
+            &plain.path().join(".git"),
+            &repo.path().join(".git")
+        ));
+        assert_eq!(
+            find(&plain.path().join("sub")),
+            Some(lexical(plain.path()).unwrap())
+        );
+        assert_refused(plain.path(), ".git junction found by discovery");
+    }
+
+    /// Review item 1: a folder on a share, or on no local drive, is refused before anything
+    /// is opened.
+    #[test]
+    fn remote_roots_are_refused_before_any_probe() {
+        let never = || false;
+        let before = safe_fs::PATH_OPENS.with(|n| n.get());
+        let started = Instant::now();
+        for path in [
+            r"\\192.0.2.1\x\repo",
+            "//192.0.2.1/x/repo",
+            r"\\?\UNC\192.0.2.1\x\repo",
+            r"\\.\pipe\x",
+            r"\\?\GLOBALROOT\Device\Mup\192.0.2.1\x",
+        ] {
+            let path = Path::new(path);
+            assert_eq!(
+                find_repo_root(path, &never).unwrap_err(),
+                Failure::Unsafe,
+                "{path:?}"
+            );
+            assert_eq!(
+                open_root(path, true, &never).err(),
+                Some(Failure::Unsafe),
+                "{path:?}"
+            );
+            assert_eq!(read_status(path).unwrap_err(), Failure::Unsafe, "{path:?}");
+        }
+        // A drive letter that is not a local drive (here: none at all).
+        let unused = ('D'..='Z').rev().find(|d| {
+            safe_fs::local_drive(Path::new(&format!(r"{d}:\"))).is_none()
+                && !Path::new(&format!(r"{d}:\")).exists()
+        });
+        if let Some(d) = unused {
+            let path = PathBuf::from(format!(r"{d}:\repo"));
+            assert_eq!(find_repo_root(&path, &never).unwrap_err(), Failure::Unsafe);
+        }
+        assert_eq!(
+            safe_fs::PATH_OPENS.with(|n| n.get()),
+            before,
+            "something was opened"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Review item 2: a tiny tree that names one subtree under many names, nested, would
+    /// expand to millions of paths; the staged diff stops at its caps.
+    #[test]
+    fn staged_changes_are_capped() {
+        let Some(tmp) = fixture_repo() else { return };
+        let root = tmp.path();
+        let with = |f: fn(&mut Limits)| {
+            let mut limits = LIMITS;
+            f(&mut limits);
+            scan_recorded(root, limits).0
+        };
+        // The fixture stages `new.txt`.
+        assert!(with(|_| {}).is_ok());
+        assert_eq!(with(|l| l.staged_entries = 0).unwrap_err(), Failure::TooBig);
+        assert_eq!(with(|l| l.staged_bytes = 3).unwrap_err(), Failure::TooBig);
+        assert_eq!(with(|l| l.path_bytes = 3).unwrap_err(), Failure::TooBig);
+
+        // 16 names for the same subtree, six levels deep: 16.7 million paths from 7 trees.
+        let run = |args: &[&str], input: &str| -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(input.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let blob = run(&["hash-object", "-w", "--stdin"], "x");
+        let mut tree = run(&["mktree"], &format!("100644 blob {blob}\tf\n"));
+        for _ in 0..6 {
+            let listing: String = (0..16)
+                .map(|i| format!("040000 tree {tree}\td{i:02}\n"))
+                .collect();
+            tree = run(&["mktree"], &listing);
+        }
+        let commit = run(&["commit-tree", &tree, "-m", "bomb"], "");
+        assert!(git(root, &["update-ref", "refs/heads/main", &commit]));
+        let started = Instant::now();
+        assert_eq!(read_status(root).unwrap_err(), Failure::TooBig);
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Review item 3: a file with another name (a hard link) could be a file outside the
+    /// folder; it is refused.
+    #[test]
+    fn hard_linked_files_are_refused() {
+        let Some(tmp) = fixture_repo() else { return };
+        let outside = tempfile::tempdir().unwrap();
+        let head = tmp.path().join(".git").join("HEAD");
+        let theirs = outside.path().join("HEAD");
+        std::fs::copy(&head, &theirs).unwrap();
+        std::fs::remove_file(&head).unwrap();
+        std::fs::hard_link(&theirs, &head).unwrap();
+        assert_refused(tmp.path(), "hard-linked HEAD");
+
+        let (fs, top) = fs_at(tmp.path(), false);
+        std::fs::hard_link(&theirs, tmp.path().join("linked.txt")).unwrap();
+        assert_eq!(
+            fs.file(&top, "linked.txt").err(),
+            Some(safe_fs::Error::Link)
+        );
+        assert!(fs.file(&top, "a.txt").is_ok());
+    }
+
+    /// Review item 5: every relative open asks not to follow links, and every file open not
+    /// to recall a cloud placeholder.
+    #[test]
+    fn every_open_asks_for_no_recall_and_no_link_following() {
+        use windows::Wdk::Storage::FileSystem::{FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT};
+        let file = safe_fs::create_options(false).0;
+        assert_ne!(file & FILE_OPEN_NO_RECALL.0, 0);
+        assert_ne!(file & FILE_OPEN_REPARSE_POINT.0, 0);
+        assert_ne!(
+            safe_fs::create_options(true).0 & FILE_OPEN_REPARSE_POINT.0,
+            0
+        );
     }
 }

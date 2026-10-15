@@ -27,9 +27,10 @@ impl From<safe_fs::Error> for OdbError {
     fn from(e: safe_fs::Error) -> Self {
         match e {
             safe_fs::Error::NotFound => OdbError::Missing,
-            safe_fs::Error::Link | safe_fs::Error::WrongKind | safe_fs::Error::BadName => {
-                OdbError::Link
-            }
+            safe_fs::Error::Link
+            | safe_fs::Error::WrongKind
+            | safe_fs::Error::BadName
+            | safe_fs::Error::OnlineOnly => OdbError::Link,
             safe_fs::Error::TooBig => OdbError::TooBig,
             safe_fs::Error::Io(m) => OdbError::Bad(m),
         }
@@ -49,6 +50,10 @@ pub struct OdbLimits {
     pub idx_bytes: u64,
     /// Delta chain length.
     pub delta_depth: usize,
+    /// Size of one `.pack` file.
+    pub pack_bytes: u64,
+    /// Compressed bytes read over the whole scan (loose and packed).
+    pub compressed_bytes: u64,
 }
 
 struct Pack {
@@ -62,8 +67,10 @@ pub struct Odb<'a> {
     fs: &'a Fs,
     objects: Dir,
     limits: OdbLimits,
+    over: &'a dyn Fn() -> bool,
     packs: Option<Vec<Pack>>,
     inflated: u64,
+    compressed: u64,
     /// Resolved packed objects by (pack, offset), as delta bases.
     cache: HashMap<(usize, u64), Arc<(Kind, Vec<u8>)>>,
     cache_bytes: usize,
@@ -72,13 +79,16 @@ pub struct Odb<'a> {
 const CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 impl<'a> Odb<'a> {
-    pub fn new(fs: &'a Fs, objects: Dir, limits: OdbLimits) -> Self {
+    /// `over` turns true at the scan's deadline; inflating checks it as it reads.
+    pub fn new(fs: &'a Fs, objects: Dir, limits: OdbLimits, over: &'a dyn Fn() -> bool) -> Self {
         Odb {
             fs,
             objects,
             limits,
+            over,
             packs: None,
             inflated: 0,
+            compressed: 0,
             cache: HashMap::new(),
             cache_bytes: 0,
         }
@@ -109,7 +119,8 @@ impl<'a> Odb<'a> {
             Err(e) => return Err(e.into()),
         };
         // Compressed data is never much larger than what it inflates to.
-        let compressed = file.read_capped(self.limits.object_bytes + 1024)?;
+        let compressed = file.read_capped(input_cap(self.limits.object_bytes))?;
+        self.count_compressed(compressed.len() as u64)?;
         let mut data = Vec::new();
         flate2::read::ZlibDecoder::new(&compressed[..])
             .take(self.limits.object_bytes + 64)
@@ -134,6 +145,14 @@ impl<'a> Odb<'a> {
         }
         self.count(size)?;
         Ok(Some((kind, body)))
+    }
+
+    fn count_compressed(&mut self, bytes: u64) -> Result<(), OdbError> {
+        self.compressed += bytes;
+        if self.compressed > self.limits.compressed_bytes {
+            return Err(OdbError::TooBig);
+        }
+        Ok(())
     }
 
     fn count(&mut self, bytes: u64) -> Result<(), OdbError> {
@@ -196,6 +215,9 @@ impl<'a> Odb<'a> {
                 Err(safe_fs::Error::NotFound) => continue,
                 Err(e) => return Err(e.into()),
             };
+            if pack.info.size > self.limits.pack_bytes {
+                return Err(OdbError::TooBig);
+            }
             packs.push(Pack { idx, count, pack });
         }
         self.packs = Some(packs);
@@ -362,16 +384,72 @@ impl<'a> Odb<'a> {
     fn inflate(&mut self, pack: usize, offset: u64, size: u64) -> Result<Vec<u8>, OdbError> {
         self.count(size)?;
         let file = &self.packs.as_ref().unwrap()[pack].pack;
-        let reader = std::io::BufReader::with_capacity(16 * 1024, At { file, pos: offset });
-        let mut out = Vec::with_capacity(size.min(1 << 20) as usize);
-        flate2::bufread::ZlibDecoder::new(reader)
-            .take(size + 1)
-            .read_to_end(&mut out)
-            .map_err(|e| OdbError::Bad(e.to_string()))?;
-        if out.len() as u64 != size {
-            return Err(OdbError::Bad("pack entry size".into()));
-        }
+        let at = At { file, pos: offset };
+        let (out, read) = inflate_capped(at, size, input_cap(size), self.over)?;
+        self.count_compressed(read)?;
         Ok(out)
+    }
+}
+
+/// Most compressed bytes read for an object of `size` bytes: zlib's worst case (stored
+/// blocks) adds a few bytes per 64 KB, so anything far beyond that is padding meant to burn
+/// time, such as a long run of empty blocks.
+fn input_cap(size: u64) -> u64 {
+    size + size / 8 + 4096
+}
+
+/// Inflates the zlib stream read from `input` into exactly `size` bytes, reading at most
+/// `max_in` compressed bytes and checking `over` (the deadline) as it reads. Returns the data
+/// and the compressed bytes read.
+fn inflate_capped(
+    input: impl Read,
+    size: u64,
+    max_in: u64,
+    over: &dyn Fn() -> bool,
+) -> Result<(Vec<u8>, u64), OdbError> {
+    let capped = Capped {
+        inner: input,
+        left: max_in,
+        read: 0,
+        over,
+    };
+    let mut decoder =
+        flate2::bufread::ZlibDecoder::new(std::io::BufReader::with_capacity(16 * 1024, capped));
+    let mut out = Vec::with_capacity(size.min(1 << 20) as usize);
+    let result = (&mut decoder).take(size + 1).read_to_end(&mut out);
+    let capped = decoder.into_inner().into_inner();
+    if over() {
+        return Err(OdbError::TooBig);
+    }
+    if result.is_err() && capped.left == 0 {
+        // Ran out of allowed input before the stream ended.
+        return Err(OdbError::TooBig);
+    }
+    result.map_err(|e| OdbError::Bad(e.to_string()))?;
+    if out.len() as u64 != size {
+        return Err(OdbError::Bad("pack entry size".into()));
+    }
+    Ok((out, capped.read))
+}
+
+/// A reader that stops after `left` bytes and fails once `over` turns true.
+struct Capped<'o, R> {
+    inner: R,
+    left: u64,
+    read: u64,
+    over: &'o dyn Fn() -> bool,
+}
+
+impl<R: Read> Read for Capped<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if (self.over)() {
+            return Err(std::io::Error::other("deadline"));
+        }
+        let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+        let n = self.inner.read(&mut buf[..want])?;
+        self.left -= n as u64;
+        self.read += n as u64;
+        Ok(n)
     }
 }
 
@@ -516,6 +594,47 @@ fn apply_delta(base: &[u8], delta: &[u8], cap: u64) -> Result<Vec<u8>, OdbError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A zlib stream of `empty` empty stored blocks followed by `data` in a final one.
+    fn padded_stream(empty: usize, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        for _ in 0..empty {
+            out.extend([0x00, 0x00, 0x00, 0xff, 0xff]);
+        }
+        let len = data.len() as u16;
+        out.push(0x01);
+        out.extend(len.to_le_bytes());
+        out.extend((!len).to_le_bytes());
+        out.extend(data);
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in data {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend(((b << 16) | a).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn compressed_input_is_capped_and_watches_the_deadline() {
+        let never = || false;
+        let ok = padded_stream(2, b"hello");
+        let (data, read) = inflate_capped(&ok[..], 5, input_cap(5), &never).unwrap();
+        assert_eq!((data.as_slice(), read), (&b"hello"[..], ok.len() as u64));
+        // A million empty blocks before five bytes of data: refused once past the cap,
+        // without reading the rest.
+        let padded = padded_stream(1_000_000, b"hello");
+        assert_eq!(
+            inflate_capped(&padded[..], 5, input_cap(5), &never).unwrap_err(),
+            OdbError::TooBig
+        );
+        // The deadline stops a read in progress.
+        let past = || true;
+        assert_eq!(
+            inflate_capped(&ok[..], 5, input_cap(5), &past).unwrap_err(),
+            OdbError::TooBig
+        );
+    }
 
     #[test]
     fn deltas_apply_and_reject_bad_input() {
