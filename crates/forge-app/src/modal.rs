@@ -84,6 +84,8 @@ pub enum ConfirmKind {
         dest: PathBuf,
         kind: OpKind,
         clipboard: Option<(Option<u64>, Option<u32>)>,
+        /// Stops the scan when the dialog goes away (Cancel, Continue anyway, replaced).
+        _scan: crate::ops_ui::CloudScanGuard,
     },
 }
 

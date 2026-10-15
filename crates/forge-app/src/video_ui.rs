@@ -297,15 +297,17 @@ where
 /// modification time, and requested time; only the selected file's work is allowed to run.
 const ONLINE_ONLY_VIDEO: &str = "Online-only file: open it to download it from the cloud.";
 
-/// Re-checked inside each worker, just before ffprobe/ffmpeg reads the clip: the selection-time
-/// check can be stale by then.
-fn online_only_check(path: &Path) -> Result<(), String> {
-    use forge_core::cloud::{ReadCheck, read_check};
-    match read_check(path) {
-        ReadCheck::Local => Ok(()),
-        ReadCheck::Missing => Err(format!("{} no longer exists", path.display())),
-        ReadCheck::OnlineOnly { .. } => Err(ONLINE_ONLY_VIDEO.into()),
-    }
+/// Checked inside each worker, just before ffprobe/ffmpeg reads the clip (the listing flag can
+/// be stale by then). The returned handle is the guard: hold it while ffmpeg runs. It was
+/// checked on the open handle, and while it is open the sync client cannot turn the clip back
+/// into a placeholder, so ffmpeg's reads never download it.
+fn open_checked(path: &Path) -> Result<std::fs::File, String> {
+    use forge_core::cloud::{BackgroundOpenError, open_for_background_read};
+    open_for_background_read(path).map_err(|error| match error {
+        BackgroundOpenError::OnlineOnly => ONLINE_ONLY_VIDEO.into(),
+        BackgroundOpenError::Missing => format!("{} no longer exists", path.display()),
+        BackgroundOpenError::Io(error) => format!("{}: {error}", path.display()),
+    })
 }
 
 pub struct VideoUi {
@@ -408,6 +410,10 @@ impl VideoUi {
         let media = entry
             .filter(|e| e.kind == EntryKind::File && e.media_kind() == MediaKind::Video)
             .map(MediaKey::from_entry);
+        // The listing's flag, no syscall: this runs on the UI thread. Each worker checks the
+        // file itself again before ffmpeg opens it.
+        let listed_online_only =
+            entry.is_some_and(|e| !forge_core::cloud::background_read_allowed_entry(e));
         let ffmpeg_dir = ffmpeg_dir.map(Path::to_path_buf);
         if self.selection == media && self.ffmpeg_dir == ffmpeg_dir {
             return;
@@ -466,7 +472,7 @@ impl VideoUi {
         }
         // Selecting is not opening: probing or extracting frames would download an online-only
         // clip. The flags also stop hover and scrub frames for this selection.
-        if !forge_core::cloud::background_read_allowed(&media.path) {
+        if listed_online_only {
             self.ffmpeg_available = false;
             self.ffprobe_available = false;
             self.probe_error = Some(ONLINE_ONLY_VIDEO.into());
@@ -486,7 +492,7 @@ impl VideoUi {
             let media_key = media.clone();
             let generation = self.generation;
             std::thread::spawn(move || {
-                let result = online_only_check(&path).and_then(|()| {
+                let result = open_checked(&path).and_then(|_guard| {
                     FfTools::discover_with(ffmpeg_dir.as_deref())
                         .probe(&path)
                         .map_err(|e| e.to_string())
@@ -525,7 +531,7 @@ impl VideoUi {
         let ffmpeg_dir = self.ffmpeg_dir.clone();
         let generation = self.generation;
         std::thread::spawn(move || {
-            let result = online_only_check(&path).and_then(|()| {
+            let result = open_checked(&path).and_then(|_guard| {
                 FfTools::discover_with(ffmpeg_dir.as_deref())
                     .filmstrip(&path, FILMSTRIP_FRAMES, FILMSTRIP_FRAME_EDGE, Some(&cancel))
                     .map_err(|e| e.to_string())
@@ -805,7 +811,7 @@ impl VideoUi {
         let tx = self.tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = online_only_check(&path).and_then(|()| {
+            let result = open_checked(&path).and_then(|_guard| {
                 FfTools::discover_with(ffmpeg_dir.as_deref())
                     .extract_frame_cancellable(&path, seconds, SCRUB_FRAME_EDGE, Some(&token))
                     .map_err(|e| e.to_string())
@@ -1741,24 +1747,30 @@ fn start_proxy_job(app: &mut ZxrawApp, dialog: ProxyDialog) {
                     .set_current(format!("{} ({}/{})", name, index + 1, sources.len()));
                 // The estimate refused online-only clips, but a clip can go online-only while
                 // the job waits: ffmpeg would download it.
-                match forge_core::cloud::read_check(source) {
-                    forge_core::cloud::ReadCheck::Local => {}
-                    forge_core::cloud::ReadCheck::OnlineOnly { .. } => {
+                // Held until ffmpeg is done with the clip: see `open_checked`.
+                let _guard = match forge_core::cloud::open_for_background_read(source) {
+                    Ok(file) => file,
+                    Err(forge_core::cloud::BackgroundOpenError::OnlineOnly) => {
                         let line = format!("skipped {}: {ONLINE_ONLY_VIDEO}", source.display());
                         job.log(line.clone());
                         skipped.push(line);
                         job.progress.add_items(1);
                         continue;
                     }
-                    forge_core::cloud::ReadCheck::Missing => {
-                        let line = format!("{}: the clip no longer exists", source.display());
+                    Err(error) => {
+                        let line = match error {
+                            forge_core::cloud::BackgroundOpenError::Io(error) => {
+                                format!("{}: {error}", source.display())
+                            }
+                            _ => format!("{}: the clip no longer exists", source.display()),
+                        };
                         job.log(line.clone());
                         failures.push(line);
                         job.progress.add_error();
                         job.progress.add_items(1);
                         continue;
                     }
-                }
+                };
                 if let Err(error) = std::fs::create_dir_all(&directory) {
                     failures.push(format!(
                         "{}: could not create {}: {error}",
@@ -3148,13 +3160,13 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let clip = d.path().join("clip.mp4");
         std::fs::write(&clip, b"x").unwrap();
-        assert_eq!(super::online_only_check(&clip), Ok(()));
+        assert!(super::open_checked(&clip).is_ok());
         forge_core::cloud::simulate_online_only(&clip);
-        let refused = super::online_only_check(&clip);
+        let refused = super::open_checked(&clip).map(|_| ());
         forge_core::cloud::clear_simulated_online_only(&clip);
         assert_eq!(refused, Err(super::ONLINE_ONLY_VIDEO.to_string()));
         std::fs::remove_file(&clip).unwrap();
-        let missing = super::online_only_check(&clip).unwrap_err();
+        let missing = super::open_checked(&clip).unwrap_err();
         assert!(missing.ends_with("no longer exists"), "{missing}");
     }
 
@@ -3293,6 +3305,18 @@ mod tests {
 
         worker.shutdown();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn selecting_a_clip_uses_the_listing_flag_not_the_filesystem() {
+        // The path does not exist: any filesystem check would say "missing", not online-only.
+        let mut clip = entry("cloud.mp4", None);
+        clip.online_only = true;
+        let mut ui = VideoUi::default();
+        ui.sync_selection(Some(&clip), None, &egui::Context::default());
+        assert_eq!(ui.probe_error.as_deref(), Some(ONLINE_ONLY_VIDEO));
+        assert_eq!(ui.strip_error.as_deref(), Some(ONLINE_ONLY_VIDEO));
+        assert!(!ui.probe_pending && !ui.strip_pending, "no worker for a listed placeholder");
     }
 
     fn entry(name: &str, at: Option<SystemTime>) -> FileEntry {

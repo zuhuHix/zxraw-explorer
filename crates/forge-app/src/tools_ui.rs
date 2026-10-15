@@ -196,7 +196,11 @@ enum ChecksumWork {
         root: PathBuf,
         selection: Vec<PathBuf>,
     },
-    Verify(PathBuf),
+    /// `manifest_allowed`: the user agreed to download an online-only manifest.
+    Verify {
+        manifest: PathBuf,
+        manifest_allowed: bool,
+    },
 }
 
 struct OnlineOnlyPrompt {
@@ -290,7 +294,8 @@ enum UiAction {
     OpenVerify {
         original: PathBuf,
         backup: PathBuf,
-    },
+    },    /// Show a message in the window and start nothing.
+    Notice(String),
 }
 
 enum DeferredAction {
@@ -576,6 +581,7 @@ pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
             Some(UiAction::Navigate(path)) => navigate = Some(path),
             Some(UiAction::Start(action)) => deferred = Some(action),
             Some(UiAction::OpenVerify { original, backup }) => verify = Some((original, backup)),
+            Some(UiAction::Notice(notice)) => app.ops.tools.windows[index].notice = Some(notice),
             None => {}
         }
         if deferred.is_none() {
@@ -1302,7 +1308,7 @@ fn launch_action(
                 });
                 ("checksums", title, handle)
             }
-            ChecksumWork::Verify(path) => {
+            ChecksumWork::Verify { manifest: path, .. } => {
                 let title = format!("Verifying manifest: {}", path.display());
                 let result_tx = result_tx.clone();
                 let ctx = ctx.clone();
@@ -2542,9 +2548,11 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
         ui.separator();
         ui.label(RichText::new(online_only_prompt_text(totals)).strong());
         ui.label(
-            RichText::new(
-                "Hashing reads each file whole, so it downloads it from the cloud first.",
-            )
+            RichText::new(if totals.manifest_online_only {
+                "Skip stops here: the manifest is needed to know which files to check."
+            } else {
+                "Hashing reads each file whole, so it downloads it from the cloud first."
+            })
             .weak(),
         );
         ui.horizontal(|ui| {
@@ -2567,10 +2575,7 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
         if let Some(policy) = policy
             && let Some(prompt) = state.prompt.take()
         {
-            return Some(UiAction::Start(DeferredAction::Checksum {
-                work: prompt.work,
-                policy,
-            }));
+            return Some(answer_online_only_prompt(prompt, policy));
         }
         if cancel {
             state.prompt = None;
@@ -2595,7 +2600,10 @@ fn render_checksums(id: u64, state: &mut ChecksumsState, ui: &mut egui::Ui) -> O
     }
     if let Some(path) = verify_path {
         return Some(UiAction::Start(DeferredAction::ChecksumCount(
-            ChecksumWork::Verify(path),
+            ChecksumWork::Verify {
+                manifest: path,
+                manifest_allowed: false,
+            },
         )));
     }
     if let Some(entries) = &state.entries {
@@ -2779,17 +2787,16 @@ fn manifest_for_selection(
                         .map(|name| name.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| path.display().to_string());
-            if policy == OnlineOnlyPolicy::Skip && hashing::is_online_only_file(&path) {
-                build.skipped_online_only.push(relative);
-                job.progress.add_items(1);
-                continue;
-            }
-            match hashing::hash_file(&path, &job.cancel, Some(&job.progress)) {
-                Ok(hash) => {
+            match hashing::hash_file_with(&path, &job.cancel, Some(&job.progress), policy) {
+                Ok(Some(hash)) => {
                     build.entries.push(ManifestEntry {
                         hash,
                         rel_path: relative,
                     });
+                    job.progress.add_items(1);
+                }
+                Ok(None) => {
+                    build.skipped_online_only.push(relative);
                     job.progress.add_items(1);
                 }
                 Err(forge_core::error::CoreError::Cancelled) => {
@@ -2813,7 +2820,7 @@ impl ChecksumWork {
         match self {
             Self::Build { root, selection } if selection.is_empty() => root.display().to_string(),
             Self::Build { selection, .. } => format!("{} selected item(s)", selection.len()),
-            Self::Verify(path) => path.display().to_string(),
+            Self::Verify { manifest, .. } => manifest.display().to_string(),
         }
     }
 }
@@ -2843,12 +2850,44 @@ fn count_online_only(
             }
             Ok(totals)
         }
-        ChecksumWork::Verify(path) => hashing::count_online_only_manifest(path, cancel),
+        ChecksumWork::Verify {
+            manifest,
+            manifest_allowed,
+        } => hashing::count_online_only_manifest(manifest, cancel, *manifest_allowed),
+    }
+}
+
+/// What the user's answer to the online-only prompt starts. For an online-only manifest,
+/// Download reads it (then counts its files and may ask again) and Skip stops: without the
+/// manifest there is nothing to verify.
+fn answer_online_only_prompt(prompt: OnlineOnlyPrompt, policy: OnlineOnlyPolicy) -> UiAction {
+    match prompt.work {
+        ChecksumWork::Verify { manifest, .. } if prompt.totals.manifest_online_only => {
+            match policy {
+                OnlineOnlyPolicy::Download => {
+                    UiAction::Start(DeferredAction::ChecksumCount(ChecksumWork::Verify {
+                        manifest,
+                        manifest_allowed: true,
+                    }))
+                }
+                OnlineOnlyPolicy::Skip => UiAction::Notice(format!(
+                    "Verification stopped: {} is online-only and was not read",
+                    manifest.display()
+                )),
+            }
+        }
+        work => UiAction::Start(DeferredAction::Checksum { work, policy }),
     }
 }
 
 fn online_only_prompt_text(totals: OnlineOnlyTotals) -> String {
     let size = format_size(totals.bytes);
+    if totals.manifest_online_only {
+        return format!(
+            "The manifest is online-only and would be downloaded ({size}) before its files \
+             can be checked."
+        );
+    }
     if totals.count == 1 {
         format!("1 file is online-only and would be downloaded ({size}).")
     } else {
@@ -3744,6 +3783,7 @@ mod tests {
         let one = OnlineOnlyTotals {
             count: 1,
             bytes: 512,
+            ..Default::default()
         };
         assert_eq!(
             online_only_prompt_text(one),
@@ -3755,6 +3795,7 @@ mod tests {
         let many = OnlineOnlyTotals {
             count: 3,
             bytes: 3 << 30,
+            ..Default::default()
         };
         assert_eq!(
             online_only_prompt_text(many),
@@ -3763,6 +3804,53 @@ mod tests {
                 format_size(3 << 30)
             )
         );
+    }
+
+    #[test]
+    fn an_online_only_manifest_needs_consent_and_skip_stops() {
+        let manifest = PathBuf::from(r"C:\shoot\checksums.b3");
+        let totals = OnlineOnlyTotals {
+            count: 1,
+            bytes: 100,
+            manifest_online_only: true,
+        };
+        assert!(online_only_prompt_text(totals).starts_with("The manifest is online-only"));
+        let prompt = || OnlineOnlyPrompt {
+            work: ChecksumWork::Verify {
+                manifest: manifest.clone(),
+                manifest_allowed: false,
+            },
+            totals,
+        };
+        // Download reads the manifest, then counts its files (which may ask again).
+        assert!(matches!(
+            answer_online_only_prompt(prompt(), OnlineOnlyPolicy::Download),
+            UiAction::Start(DeferredAction::ChecksumCount(ChecksumWork::Verify {
+                manifest_allowed: true,
+                ..
+            }))
+        ));
+        // Skip starts nothing: the manifest is never read.
+        assert!(matches!(
+            answer_online_only_prompt(prompt(), OnlineOnlyPolicy::Skip),
+            UiAction::Notice(n) if n.starts_with("Verification stopped")
+        ));
+        // For files, the answer runs the verification with that policy.
+        let files = OnlineOnlyPrompt {
+            totals: OnlineOnlyTotals {
+                count: 2,
+                bytes: 10,
+                manifest_online_only: false,
+            },
+            ..prompt()
+        };
+        assert!(matches!(
+            answer_online_only_prompt(files, OnlineOnlyPolicy::Skip),
+            UiAction::Start(DeferredAction::Checksum {
+                policy: OnlineOnlyPolicy::Skip,
+                ..
+            })
+        ));
     }
 
     #[test]
