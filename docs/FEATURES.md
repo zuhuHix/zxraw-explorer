@@ -213,7 +213,8 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `folder_context_menu_opens_a_terminal_in_that_folder` right-clicks a folder and clicks the menu
   item (automated runs record the launch instead of opening a window). Windows Terminal's `\;`
   handling was checked by hand once; the administrator variant was not run.
-* 🟡 Git status badges — `forge-app/src/git_status.rs`: modified, new (added or untracked),
+* 🟡 Git status badges — `forge-app/src/git_status.rs`, **off by default** (opt-in in Settings ›
+  Browsing; see LIMITATIONS.md for the known gaps with malicious repositories): modified, new (added or untracked),
   ignored (dimmed) and conflicted entries, rolled up to folders, and the branch in the status
   bar. Read in-process with `gix` on one background thread; no external program ever runs (no
   `git.exe`, no fsmonitor, no filter drivers: gix never reads file contents; a size change counts
@@ -232,7 +233,8 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   (`core.fsmonitor` and filter drivers point at a marker-writing script; the marker is never
   created), `a_config_that_moves_the_work_tree_is_refused`,
   `a_git_file_pointing_at_a_network_path_is_refused` and `every_part_of_the_scan_is_bounded`
-  (each limit injected small). Badge drawing is not covered by a test.
+  (each limit injected small), and `nothing_is_scanned_until_turned_on` (with the setting off,
+  a folder holding `.git` sends no request to the worker). Badge drawing is not covered by a test.
 * ✅ Command palette matching — `forge-app/src/palette.rs::fuzzy`. Keyboard interaction with the
   palette is not automated.
 * ✅ Dual-pane file workflows — see File operations (e2e copy, move, and conflict tests).

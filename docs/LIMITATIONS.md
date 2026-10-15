@@ -29,10 +29,18 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 ## Windows shell and file exchange
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
-  administrator or on a network (UNC) path; choose PowerShell instead. Git badges never run
-  filters or line-ending conversion, so a same-size file that Git stores converted (for example
-  a Git LFS file, or `autocrlf` content) can show as modified after its time changes, as can
-  same-size changes, online-only files, beyond the first 256 or files over 16 MB.
+  administrator or on a network (UNC) path; choose PowerShell instead.
+* Git status badges are off by default (Settings › Browsing). With them on, a malicious
+  repository in a browsed folder can still make the app open a file on a network share, which
+  can send the user's Windows (NTLM) credentials hash to that server; no program runs. Known
+  gaps: junctions on tracked paths, chains of symbolic refs, reparse points among object files
+  and in path components, an external Git directory on the same drive, `.gitignore` and
+  `packed-refs` read without a size limit, and a window between the safety checks and the
+  repository being opened. Closing them needs handle-based opens that never follow links,
+  planned as a follow-up. Only turn badges on for folders you trust.
+* Git badges never run filters or line-ending conversion, so a same-size file that Git stores
+  converted (for example a Git LFS file, or `autocrlf` content) can show as modified after its
+  time changes, as can same-size changes, online-only files, beyond the first 256 or files over 16 MB.
   Repositories that take over 4 s, have an index over 100,000 entries, a config or `HEAD`
   over 1 MB, or need over 50,000 folders and files walked show no badges, and neither does any
   repository inside OneDrive or another cloud-synced folder (its `.gitignore` files could be

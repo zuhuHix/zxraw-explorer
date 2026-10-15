@@ -644,12 +644,12 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
                 }
             });
     });
-    ui.checkbox(&mut settings.git_badges, "Show Git status badges and branch");
+    ui.checkbox(&mut settings.git_badges, "Git status badges and branch");
     ui.label(
         RichText::new(
-            "In folders inside a Git repository, mark modified, new, ignored and conflicted \
-             files. Git does not need to be installed; very large repositories and folders \
-             synced by OneDrive or other cloud storage are skipped.",
+            "Only turn on if you trust the folders you browse: a malicious repository can make \
+             ZXraw contact a network server. Marks modified, new, ignored and conflicted files \
+             in Git repositories; very large repositories and cloud-synced folders are skipped.",
         )
         .weak(),
     );

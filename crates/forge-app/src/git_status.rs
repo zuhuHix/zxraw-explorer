@@ -274,6 +274,8 @@ pub struct GitStatus {
     requests: Sender<Request>,
     replies: Receiver<Reply>,
     enabled: bool,
+    /// Requests handed to the worker; every scan starts with one.
+    sent: usize,
     dirs: HashMap<PathBuf, DirState>,
     repos: HashMap<PathBuf, RepoEntry>,
 }
@@ -292,13 +294,14 @@ impl GitStatus {
         GitStatus {
             requests,
             replies,
-            enabled: true,
+            enabled: false,
+            sent: 0,
             dirs: HashMap::new(),
             repos: HashMap::new(),
         }
     }
 
-    /// Turns badges on or off. Off forgets everything and sends nothing.
+    /// Turns badges on or off (off until turned on). Off forgets everything and sends nothing.
     pub fn set_enabled(&mut self, on: bool) {
         if on == self.enabled {
             return;
@@ -332,6 +335,7 @@ impl GitStatus {
         for dir in dirs {
             if !self.dirs.contains_key(dir) {
                 self.dirs.insert(dir.clone(), DirState::Pending);
+                self.sent += 1;
                 let _ = self.requests.send(Request::FindRoot(dir.clone()));
             }
         }
@@ -357,6 +361,7 @@ impl GitStatus {
             if due {
                 entry.in_flight = true;
                 entry.stale = false;
+                self.sent += 1;
                 let _ = self.requests.send(Request::Status(root));
             }
         }
@@ -1381,6 +1386,33 @@ mod tests {
         if !ancestor_is_repo {
             assert_eq!(find_repo_root(&plain), None);
         }
+    }
+
+    #[test]
+    fn nothing_is_scanned_until_turned_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let dirs = vec![root.clone()];
+
+        let mut git = GitStatus::new(egui::Context::default());
+        for _ in 0..3 {
+            git.track(&dirs);
+            git.invalidate(&root);
+            assert!(!git.poll());
+        }
+        assert_eq!(git.sent, 0, "off by default: no request reaches the worker");
+        assert!(git.repo_for(&root).is_none());
+
+        git.set_enabled(true);
+        git.track(&dirs);
+        assert_eq!(git.sent, 1, "on: the folder's repository is looked up");
+
+        git.set_enabled(false);
+        git.track(&dirs);
+        git.invalidate(&root);
+        assert_eq!(git.sent, 1, "turned off again: nothing more is sent");
+        assert!(git.repo_for(&root).is_none());
     }
 
     /// Runs the git CLI to build a fixture. Tests that need it are skipped without git.
