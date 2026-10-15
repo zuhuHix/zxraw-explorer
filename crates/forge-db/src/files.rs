@@ -368,6 +368,27 @@ impl VolumeCache {
     }
 }
 
+/// Stamp for rows written now: the wall clock, but never below the index clock (see
+/// schema V3), which it advances. Keeps `indexed_at` monotonic across clock rollbacks so
+/// rows written during an indexer pass are always `>=` its pass id.
+pub(crate) fn index_clock_stamp_tx(tx: &Transaction<'_>) -> Result<i64> {
+    Ok(tx.query_row(
+        "UPDATE index_clock SET value = max(value, ?1) WHERE id = 1 RETURNING value",
+        params![now_ms()],
+        |r| r.get(0),
+    )?)
+}
+
+/// Allocate a new indexer pass id strictly above every earlier pass id and `indexed_at`
+/// stamp, preferring the wall clock `now` when it is ahead.
+pub(crate) fn next_scan_id_tx(tx: &Transaction<'_>, now: i64) -> Result<i64> {
+    Ok(tx.query_row(
+        "UPDATE index_clock SET value = max(value + 1, ?1) WHERE id = 1 RETURNING value",
+        params![now],
+        |r| r.get(0),
+    )?)
+}
+
 /// Insert or refresh rows. `volume` overrides per-path volume resolution; `scan_id` is set
 /// by the indexer (others pass `None` and leave the column alone). Content hashes are
 /// dropped when size or mtime changed.
@@ -378,7 +399,7 @@ pub(crate) fn upsert_files_tx(
     scan_id: Option<i64>,
     vols: &mut VolumeCache,
 ) -> Result<Vec<FileId>> {
-    let now = now_ms();
+    let now = index_clock_stamp_tx(tx)?;
     // Fast path for re-scans: when nothing indexed changed, touch only the non-indexed
     // bookkeeping columns (avoids rewriting all eight index entries per row).
     let mut unchanged = tx.prepare_cached(

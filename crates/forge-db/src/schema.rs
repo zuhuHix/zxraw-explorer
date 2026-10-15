@@ -26,6 +26,11 @@ pub const MIGRATIONS: &[Migration] = &[
         description: "notes: clear blank notes, index files with notes",
         sql: V2,
     },
+    Migration {
+        version: 3,
+        description: "index clock: monotonic pass ids and indexed_at stamps",
+        sql: V3,
+    },
 ];
 
 /// Highest schema version this build understands.
@@ -222,6 +227,23 @@ UPDATE annotations SET notes = NULL WHERE notes IS NOT NULL AND trim(notes) = ''
 CREATE INDEX IF NOT EXISTS idx_annotations_notes ON annotations(file_id) WHERE notes IS NOT NULL;
 "#;
 
+const V3: &str = r#"
+-- Monotonic "index clock" (unix ms, never decreases): new indexer pass ids are taken
+-- strictly above it and every indexed_at stamp is at least it, so a pass's end sweep can
+-- tell earlier rows from rows refreshed during the pass even when passes start in the same
+-- millisecond or the wall clock is set back. Seeded from existing rows and pass ids.
+CREATE TABLE index_clock (
+    id     INTEGER PRIMARY KEY CHECK (id = 1),
+    value  INTEGER NOT NULL
+);
+INSERT INTO index_clock(id, value)
+SELECT 1, max(COALESCE((SELECT MAX(indexed_at) FROM files), 0),
+              COALESCE((SELECT MAX(scan_id) FROM index_state), 0));
+-- Checkpoints from older builds may carry a pass id equal to earlier rows' indexed_at,
+-- which would let rows escape the end sweep; restart those passes from the top.
+UPDATE index_state SET pending = '[]' WHERE status <> 'complete';
+"#;
+
 /// Apply all pending migrations. Returns the versions applied by this call.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<Vec<i64>> {
     migrate_with(conn, MIGRATIONS)
@@ -297,8 +319,7 @@ mod tests {
         }
 
         let db = crate::Db::open(&path).unwrap();
-        assert_eq!(latest_version(), 2);
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), latest_version());
         assert_eq!(db.annotation(1).unwrap().notes.as_deref(), Some("keep me"));
         assert_eq!(db.annotation(2).unwrap().notes, None);
         let has_index: i64 = db
@@ -316,7 +337,7 @@ mod tests {
 
         // Reopening applies nothing new.
         let db = crate::Db::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), latest_version());
         let mut conn = Connection::open(&path).unwrap();
         assert!(migrate_with(&mut conn, MIGRATIONS).unwrap().is_empty());
         assert_eq!(db.annotation(1).unwrap().notes.as_deref(), Some("keep me"));
