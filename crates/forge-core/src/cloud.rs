@@ -549,7 +549,7 @@ fn simulated() -> &'static RwLock<HashSet<PathBuf>> {
     SET.get_or_init(Default::default)
 }
 
-fn is_simulated(path: &Path) -> bool {
+pub(crate) fn is_simulated(path: &Path) -> bool {
     ANY_SIMULATED.load(Ordering::Relaxed) && simulated().read().contains(path)
 }
 
