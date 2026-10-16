@@ -744,26 +744,43 @@ fn is_sharing_violation(e: &io::Error) -> bool {
     e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
 }
 
-/// Open `path` itself (a link is not followed) for reading and deleting while denying writers:
-/// this fails with a sharing violation if anyone has it open for writing, and while the handle is
-/// held nobody can open it for writing. The DELETE access lets the object be renamed through this
-/// handle (see [`rename_open_no_replace`]); other programs may still rename or delete it.
-fn open_denying_writers(path: &Path) -> io::Result<File> {
+/// Access for a Replace handle: DELETE to rename it, attributes for its stamp, and its data
+/// only when `read_data` (a hash is checked). Without data access, opening an online-only
+/// placeholder does not recall it.
+#[cfg(windows)]
+fn replace_access(read_data: bool) -> u32 {
+    use windows::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES};
+    if read_data {
+        FILE_GENERIC_READ.0 | DELETE.0
+    } else {
+        FILE_READ_ATTRIBUTES.0 | DELETE.0
+    }
+}
+
+/// Open `path` itself (a link is not followed) for deleting, and reading its data when
+/// `read_data`, while denying writers: this fails with a sharing violation if anyone has it
+/// open for writing, and while the handle is held nobody can open it for writing. The DELETE
+/// access lets the object be renamed through this handle (see [`rename_open_no_replace`]);
+/// other programs may still rename or delete it.
+fn open_denying_writers(path: &Path, read_data: bool) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
-            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-            FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ,
         };
         OpenOptions::new()
-            .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
+            .access_mode(replace_access(read_data))
             .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
             .open(path)
     }
     #[cfg(not(windows))]
-    File::open(path)
+    {
+        let _ = read_data;
+        File::open(path)
+    }
 }
 
 /// Rename the object open as `file` (found at `from`) to `to`, never replacing. Renaming the
@@ -875,7 +892,7 @@ fn replace_guarded(
     state: &ReplaceState,
 ) -> std::result::Result<Option<PathBuf>, ReplaceRefused> {
     let refuse = |reason, kept_as| ReplaceRefused { reason, kept_as };
-    let file = match open_denying_writers(dest) {
+    let file = match open_denying_writers(dest, state.check.reads_data()) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(refuse(Refusal::Changed, None));
@@ -1471,6 +1488,13 @@ enum ContentCheck {
     Unreadable,
 }
 
+impl ContentCheck {
+    /// Whether checking it reads the file's data (only a hash does).
+    fn reads_data(&self) -> bool {
+        matches!(self, Self::Hash(_))
+    }
+}
+
 /// Identity of a destination observed when a Replace decision is presented. It is checked
 /// again immediately before an overwrite is published so a later save at the destination is
 /// preserved. Size and last-write time alone miss a same-size rewrite within one clock tick,
@@ -1508,20 +1532,21 @@ impl ReplaceState {
         let kind = node_kind(metadata);
         match kind {
             NodeKind::Dir => Self::unchecked(kind),
-            NodeKind::File => Self {
-                kind,
-                stamp: path_stamp(path).ok(),
-                check: if !crate::cloud::background_read_allowed_with(path, attrs) {
+            NodeKind::File => {
+                // Find data first: nothing below may read a placeholder's data, and the stamp
+                // opens the file for attributes only.
+                let readable = crate::cloud::background_read_allowed_with(path, attrs);
+                let stamp = path_stamp(path).ok();
+                let check = if !readable || metadata.len() > REPLACE_HASH_LIMIT {
                     ContentCheck::StampOnly
-                } else if metadata.len() <= REPLACE_HASH_LIMIT {
+                } else {
                     match hashing::hash_file(path, &CancelToken::new(), None) {
                         Ok(digest) => ContentCheck::Hash(digest),
                         Err(_) => ContentCheck::Unreadable,
                     }
-                } else {
-                    ContentCheck::StampOnly
-                },
-            },
+                };
+                Self { kind, stamp, check }
+            }
             NodeKind::Link => Self {
                 kind,
                 stamp: path_stamp(path).ok(),
@@ -1561,7 +1586,8 @@ impl ReplaceState {
     /// [`matches_open`](Self::matches_open) for the unit tests, opening `path` itself.
     #[cfg(test)]
     fn still_matches(&self, path: &Path) -> bool {
-        open_denying_writers(path).is_ok_and(|f| self.matches_open(&f, path))
+        open_denying_writers(path, self.check.reads_data())
+            .is_ok_and(|f| self.matches_open(&f, path))
     }
 }
 
@@ -3094,6 +3120,31 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn stamp_only_replace_handles_cannot_read_data() {
+        use windows::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+        const FILE_READ_DATA: u32 = 0x1;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        let access = replace_access(false);
+        assert_eq!(access & (FILE_READ_DATA | GENERIC_READ | GENERIC_ALL), 0);
+        assert_eq!(access, FILE_READ_ATTRIBUTES.0 | DELETE.0);
+        assert_ne!(replace_access(true) & FILE_READ_DATA, 0);
+
+        let f = fx();
+        let path = f.dst.join("placeholder.bin");
+        fs::write(&path, b"cloud file").unwrap();
+        let mut file = open_denying_writers(&path, false).unwrap();
+        assert!(file.read(&mut [0u8; 4]).is_err(), "no data access");
+        let state = ReplaceState {
+            kind: NodeKind::File,
+            stamp: path_stamp(&path).ok(),
+            check: ContentCheck::StampOnly,
+        };
+        assert!(state.matches_open(&file, &path), "stamp via attributes");
+    }
+
     #[test]
     fn replace_state_compares_the_full_identity_through_the_handle() {
         let f = fx();
@@ -3112,8 +3163,8 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert!(!state.matches_open(&open_denying_writers(&b).unwrap(), &b));
-        assert!(state.matches_open(&open_denying_writers(&a).unwrap(), &a));
+        assert!(!state.matches_open(&open_denying_writers(&b, true).unwrap(), &b));
+        assert!(state.matches_open(&open_denying_writers(&a, true).unwrap(), &a));
 
         // The same file, same length and time, different bytes.
         fs::write(&a, b"diff bytes").unwrap();
@@ -3123,7 +3174,7 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert!(!state.matches_open(&open_denying_writers(&a).unwrap(), &a));
+        assert!(!state.matches_open(&open_denying_writers(&a, true).unwrap(), &a));
     }
 
     #[test]
