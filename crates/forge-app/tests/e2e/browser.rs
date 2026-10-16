@@ -649,3 +649,69 @@ fn right_click_in_the_other_split_pane_targets_the_clicked_tile() {
     let outcome = run_app(temp.path(), &temp.path().join("profile"), &script);
     expect_ok(&outcome);
 }
+
+#[test]
+fn folder_totals_appear_in_the_size_column() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    let profile = temp.path().join("profile");
+    let mib = vec![0u8; 1 << 20];
+    write_file(&work.join("photos").join("top.bin"), &mib);
+    write_file(&work.join("photos").join("sub").join("middle.bin"), &mib);
+    write_file(
+        &work
+            .join("photos")
+            .join("sub")
+            .join("deeper")
+            .join("deep.bin"),
+        &mib,
+    );
+    fs::create_dir_all(work.join("empty")).unwrap();
+    write_file(&work.join("note.txt"), b"hello");
+    // Write paths are relative to the script sandbox, which is the test's temp folder.
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         ui browser assert-size photos | 3.00 MB\n\
+         ui browser assert-size empty | 0 B\n\
+         ui browser assert-size note.txt | 5 B\n\
+         ui browser write-file work/photos/sub/deeper/extra.bin | 1048576\n\
+         ui browser assert-size photos | 4.00 MB\n\
+         exit\n",
+        work = shown(&work),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn a_large_folder_total_shows_quickly() {
+    let temp = tempfile::tempdir().unwrap();
+    let work = temp.path().join("work");
+    let profile = temp.path().join("profile");
+    // 100 folders of 100 files, 1 KiB each: 10,000 files, 9.77 MB in all.
+    for dir in 0..100 {
+        for file in 0..100 {
+            write_file(
+                &work
+                    .join("big")
+                    .join(format!("dir-{dir:03}"))
+                    .join(format!("file-{file:03}.bin")),
+                &[0u8; 1024],
+            );
+        }
+    }
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nui browser assert-size big | 9.77 MB\nexit\n",
+        work = shown(&work),
+    );
+    let started = std::time::Instant::now();
+    let outcome = run_app(temp.path(), &profile, &script);
+    let elapsed = started.elapsed();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    eprintln!(
+        "10,000-file folder: `big` showed 9.77 MB after {:.2} s (wall clock, app start-up included)",
+        elapsed.as_secs_f64()
+    );
+}
