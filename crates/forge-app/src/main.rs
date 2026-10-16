@@ -17,6 +17,9 @@ mod dragout;
 mod export_assoc;
 mod extra_tools_ui;
 mod ffmpeg_setup;
+// Wired up in the next commit.
+#[allow(dead_code)]
+mod folder_sizes;
 mod fonts;
 mod git_status;
 mod gps_ui;
