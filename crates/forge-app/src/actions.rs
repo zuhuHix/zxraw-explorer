@@ -1118,23 +1118,8 @@ struct WantKey {
     /// Which panes are in Details view, where the Size column shows folder totals.
     details: (bool, bool),
     right_focused: bool,
-    selection: (usize, u64),
-}
-
-/// Length and hash of the first 64 selected paths, fingerprinted as the status bar's
-/// selection summary does: cheap every frame. A change that keeps both the length and the
-/// first paths of the selection is not seen; the status bar has the same limit.
-fn selection_fingerprint(pane: &Pane) -> (usize, u64) {
-    let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-    let hash = pane
-        .selected
-        .iter()
-        .take(64)
-        .enumerate()
-        .fold(0u64, |acc, (i, path)| {
-            acc.rotate_left(7) ^ std::hash::BuildHasher::hash_one(&hasher, (i, path))
-        });
-    (pane.selected.len(), hash)
+    /// Revision of the focused pane's selection.
+    selection: u64,
 }
 
 impl FolderWants {
@@ -1160,7 +1145,7 @@ impl FolderWants {
                 tab.right.as_ref().is_some_and(|p| p.view == ViewMode::Details),
             ),
             right_focused: tab.focus == Side::Right && tab.right.is_some(),
-            selection: selection_fingerprint(tab.focused()),
+            selection: tab.focused().selected.revision(),
         };
         if self.key != Some(key) {
             self.key = Some(key);

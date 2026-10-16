@@ -1254,9 +1254,9 @@ mod tests {
             .expect("the originating pane still matches");
 
         assert_eq!(count, 1);
-        assert_eq!(tabs[0].left.selected, HashSet::from([export]));
+        assert_eq!(*tabs[0].left.selected, HashSet::from([export]));
         assert_eq!(
-            tabs[0].right.as_ref().unwrap().selected,
+            *tabs[0].right.as_ref().unwrap().selected,
             HashSet::from([existing_right_selection])
         );
     }
