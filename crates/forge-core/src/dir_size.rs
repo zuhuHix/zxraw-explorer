@@ -41,6 +41,11 @@ pub struct DirTotals {
     /// Something below could not be read or was deliberately not entered (an unreadable
     /// folder, a cloud folder whose listing is not on this PC). `bytes` is then a lower bound.
     pub partial: bool,
+    /// Folders below that could not be listed (fully) or were not entered.
+    pub unreadable: u32,
+    /// Order-independent hash of those folders' paths (a wrapping sum of one hash per
+    /// path): two partial results with the same `unreadable` and hash miss the same folders.
+    pub unreadable_hash: u64,
 }
 
 impl DirTotals {
@@ -51,6 +56,15 @@ impl DirTotals {
         self.files = self.files.saturating_add(other.files);
         self.dirs = self.dirs.saturating_add(other.dirs);
         self.partial |= other.partial;
+        self.unreadable = self.unreadable.saturating_add(other.unreadable);
+        self.unreadable_hash = self.unreadable_hash.wrapping_add(other.unreadable_hash);
+    }
+
+    /// `dir` could not be read (fully) or was not entered: the total is a lower bound.
+    fn add_unreadable(&mut self, dir: &Path) {
+        self.partial = true;
+        self.unreadable = self.unreadable.saturating_add(1);
+        self.unreadable_hash = self.unreadable_hash.wrapping_add(path_hash(dir));
     }
 
     fn add_bytes(&mut self, bytes: u64) {
@@ -62,6 +76,18 @@ impl DirTotals {
             }
         }
     }
+}
+
+/// A stable hash of `path`'s spelling (FNV-1a, then a SplitMix64 finish so that the wrapping
+/// sum of several stays well spread).
+fn path_hash(path: &Path) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in path.as_os_str().as_encoded_bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 /// Lets a caller supply totals it already knows (skipping that subtree) and receive the
@@ -229,7 +255,7 @@ impl Walk<'_> {
             let mut scan = Scan::default();
             match self.scan(&node.path, &mut scan) {
                 Ok(()) => {}
-                Err(ScanError::Open(_)) => scan.totals.partial = true,
+                Err(ScanError::Open(_)) => scan.totals.add_unreadable(&node.path),
                 Err(ScanError::Cancelled) => {
                     self.stop();
                     return;
@@ -311,7 +337,7 @@ impl Walk<'_> {
             return Err(ScanError::Cancelled);
         }
         if !complete {
-            scan.totals.partial = true;
+            scan.totals.add_unreadable(dir);
         }
         Ok(())
     }
@@ -325,7 +351,7 @@ impl Walk<'_> {
             totals.dirs = totals.dirs.saturating_add(1);
             let path = dir.join(&entry.name);
             if entry.attributes & NOT_ENTERED != 0 || cloud::is_simulated(&path) {
-                totals.partial = true;
+                totals.add_unreadable(&path);
             } else if let Some(known) = self.cache.lookup(&path) {
                 totals.add(&known);
             } else {
@@ -470,14 +496,30 @@ mod tests {
 
     #[test]
     fn totals_saturate_and_say_so_instead_of_wrapping() {
-        let mut totals = DirTotals { bytes: u64::MAX - 1, files: u64::MAX, ..Default::default() };
-        totals.add(&DirTotals { bytes: 5, files: 1, dirs: 1, partial: false });
+        let mut totals = DirTotals {
+            bytes: u64::MAX - 1,
+            files: u64::MAX,
+            ..Default::default()
+        };
+        totals.add(&DirTotals {
+            bytes: 5,
+            files: 1,
+            dirs: 1,
+            partial: false,
+            ..Default::default()
+        });
         assert_eq!(totals.bytes, u64::MAX);
         assert_eq!(totals.files, u64::MAX);
         assert_eq!(totals.dirs, 1);
         assert!(totals.partial);
         let mut exact = DirTotals::default();
-        exact.add(&DirTotals { bytes: 5, files: 1, dirs: 0, partial: false });
+        exact.add(&DirTotals {
+            bytes: 5,
+            files: 1,
+            dirs: 0,
+            partial: false,
+            ..Default::default()
+        });
         assert!(!exact.partial);
     }
     use std::collections::HashMap;
@@ -538,7 +580,8 @@ mod tests {
                     bytes: 100,
                     files: 4,
                     dirs: 3,
-                    partial: false
+                    partial: false,
+                    ..Default::default()
                 },
                 "threads={threads}"
             );
@@ -579,6 +622,7 @@ mod tests {
             files: 90,
             dirs: 1 + 40 + 1 + 50,
             partial: false,
+            ..Default::default()
         };
         for threads in [1, 3, 8] {
             assert_eq!(totals(d.path(), threads), expected, "threads={threads}");
@@ -610,7 +654,8 @@ mod tests {
                 bytes: 5,
                 files: 1,
                 dirs: 0,
-                partial: false
+                partial: false,
+                ..Default::default()
             }
         );
     }
@@ -646,6 +691,7 @@ mod tests {
             files: 7,
             dirs: 2,
             partial: true,
+            ..Default::default()
         };
         let cache = MapCache {
             known: HashMap::from([(x.clone(), fake)]),
@@ -659,7 +705,8 @@ mod tests {
                 bytes: 10 + 1_000_000,
                 files: 1 + 7,
                 dirs: 2 + 2,
-                partial: true
+                partial: true,
+                ..Default::default()
             }
         );
         let looked_up = cache.looked_up.lock();
@@ -683,7 +730,8 @@ mod tests {
                 bytes: 90,
                 files: 3,
                 dirs: 1,
-                partial: false
+                partial: false,
+                ..Default::default()
             }
         );
         assert_eq!(stored[&x.join("y")].bytes, 70);
@@ -721,10 +769,65 @@ mod tests {
                 bytes: 3,
                 files: 1,
                 dirs: 1,
-                partial: true
+                partial: true,
+                unreadable: 1,
+                unreadable_hash: path_hash(&cloud_dir),
             }
         );
         assert!(cache.looked_up.lock().is_empty());
+    }
+
+    #[test]
+    fn the_unreadable_set_is_hashed_independently_of_order_and_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("p").join("a");
+        let b = d.path().join("q").join("deep").join("b");
+        let c = d.path().join("q").join("c");
+        for dir in [&a, &b, &c] {
+            write(&dir.join("f.bin"), 4);
+        }
+        let walk_with = |hidden: &[&PathBuf], threads: usize, cache: &dyn SizeCache| {
+            for p in hidden {
+                cloud::simulate_online_only(p);
+            }
+            let t = dir_totals(d.path(), cache, threads, &CancelToken::new()).unwrap();
+            for p in hidden {
+                cloud::clear_simulated_online_only(p);
+            }
+            t
+        };
+        let ab = walk_with(&[&a, &b], 1, &NoCache);
+        assert_eq!((ab.unreadable, ab.partial), (2, true));
+        assert_eq!(
+            ab.unreadable_hash,
+            path_hash(&a).wrapping_add(path_hash(&b))
+        );
+        assert_eq!(
+            walk_with(&[&b, &a], 4, &NoCache),
+            ab,
+            "same set, same totals"
+        );
+        let ac = walk_with(&[&a, &c], 2, &NoCache);
+        assert_eq!(ac.unreadable, 2);
+        assert_ne!(
+            ac.unreadable_hash, ab.unreadable_hash,
+            "another folder is missing"
+        );
+        // A sub-tree answered by the cache brings its unreadable folders along.
+        let q = d.path().join("q");
+        let cached_q = walk_with(&[&b], 1, &NoCache);
+        let q_totals = {
+            cloud::simulate_online_only(&b);
+            let t = dir_totals(&q, &NoCache, 1, &CancelToken::new()).unwrap();
+            cloud::clear_simulated_online_only(&b);
+            t
+        };
+        assert_eq!(q_totals.unreadable_hash, path_hash(&b));
+        let cache = MapCache {
+            known: HashMap::from([(q, q_totals)]),
+            ..Default::default()
+        };
+        assert_eq!(walk_with(&[], 2, &cache), cached_q);
     }
 
     #[test]
@@ -769,6 +872,7 @@ mod tests {
         }
         let t = r.unwrap();
         assert_eq!((t.bytes, t.files, t.dirs, t.partial), (8, 1, 1, true));
+        assert_eq!((t.unreadable, t.unreadable_hash), (1, path_hash(&locked)));
         assert!(
             matches!(root_locked, Err(CoreError::AccessDenied(_))),
             "{root_locked:?}"
