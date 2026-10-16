@@ -659,6 +659,25 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
         )
         .weak(),
     );
+    ui.add_space(12.0);
+    ui.checkbox(&mut settings.folder_sizes, "Folder sizes in the Size column")
+        .on_hover_text("Measure the total size of each folder on screen, in the background.");
+    ui.indent("settings-folder-sizes-network", |ui| {
+        ui.add_enabled_ui(settings.folder_sizes, |ui| {
+            ui.checkbox(
+                &mut settings.folder_sizes_network,
+                "Also on network drives (reads every file's entry over the network)",
+            )
+            .on_hover_text("Slow on a share and adds load on the server; off by default.");
+        });
+    });
+    ui.label(
+        RichText::new(
+            "Totals include every file below a folder. Folders on network drives are skipped \
+             unless the option above is on.",
+        )
+        .weak(),
+    );
 }
 
 fn performance_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut SettingsUi) {

@@ -480,7 +480,7 @@ impl FolderSizes {
 
     /// Waits up to `limit` until nothing is queued, running or waiting for a debounce.
     #[cfg(test)]
-    fn wait_idle(&self, limit: Duration) -> bool {
+    pub(crate) fn wait_idle(&self, limit: Duration) -> bool {
         wait_for(limit, || {
             let st = self.shared.state.lock();
             st.queue.is_empty() && st.running.is_empty() && st.dirty.is_empty()

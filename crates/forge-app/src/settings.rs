@@ -245,6 +245,12 @@ pub struct Settings {
     /// default (also when a settings file lacks the key): the scan reads repositories through
     /// link-safe, capped file access and never runs a program.
     pub git_badges: bool,
+    /// Recursive folder totals in the Size column and the selection status bar. On by
+    /// default; measuring reads every file below a folder, so it can be turned off.
+    pub folder_sizes: bool,
+    /// Also measure folders on network drives. Off by default: every file's entry is read
+    /// over the network, which is slow on a share and loads the server.
+    pub folder_sizes_network: bool,
     /// Sidebar sections the user opened (`true`) or closed, by key ("layouts",
     /// "collections"). A section missing here starts open exactly when it has items.
     pub sidebar_sections: std::collections::BTreeMap<String, bool>,
@@ -291,6 +297,8 @@ impl Default for Settings {
             list_typing: ListTyping::Jump.into(),
             terminal: Default::default(),
             git_badges: true,
+            folder_sizes: true,
+            folder_sizes_network: false,
             sidebar_sections: Default::default(),
             extra: Extra::new(),
         }
@@ -730,6 +738,21 @@ mod tests {
         assert!(settings.git_badges, "a settings file without the key gets the default");
         let settings: Settings = serde_json::from_str(r#"{"git_badges": false}"#).unwrap();
         assert!(!settings.git_badges);
+    }
+
+    #[test]
+    fn folder_sizes_are_on_but_network_sizes_are_off_unless_turned_on() {
+        let defaults = Settings::default();
+        assert!(defaults.folder_sizes);
+        assert!(!defaults.folder_sizes_network);
+        let settings: Settings = serde_json::from_str(r#"{"verify_copies": true}"#).unwrap();
+        assert!(settings.folder_sizes, "a settings file without the key gets the default");
+        assert!(!settings.folder_sizes_network, "a settings file without the key gets the default");
+        let settings: Settings =
+            serde_json::from_str(r#"{"folder_sizes": false, "folder_sizes_network": true}"#)
+                .unwrap();
+        assert!(!settings.folder_sizes);
+        assert!(settings.folder_sizes_network);
     }
 
     #[test]

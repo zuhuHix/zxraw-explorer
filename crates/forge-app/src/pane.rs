@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use forge_core::{EntryKind, FileEntry};
@@ -14,7 +14,12 @@ use forge_core::listing::{self, SortKey, SortSpec};
 use forge_core::query::Query;
 use forge_jobs::CancelToken;
 
+use crate::folder_sizes::{FolderSize, FolderSizes};
 use crate::settings::ViewMode;
+
+/// Folder totals are written into the listing at most this often while more keep arriving:
+/// each write re-sorts a listing sorted by size and walks the entries once.
+const SIZE_APPLY_GAP: Duration = Duration::from_millis(250);
 
 /// Messages from the background listing thread.
 enum ListMsg {
@@ -166,6 +171,15 @@ pub struct Pane {
     /// Sticky selection: a plain click toggles an item in or out of the selection, as
     /// Ctrl+click does (`Cmd::ToggleStickySelection`; Esc turns it off).
     pub sticky: bool,
+    /// The folders of `visible`, cached against `listing_rev` (see [`Pane::listed_folders`]).
+    listed_folders: Option<(u64, Vec<PathBuf>)>,
+    /// `(sizes revision, listing revision)` after the last [`Pane::apply_folder_sizes`]: when
+    /// both still match, there is nothing to apply.
+    applied_sizes: Option<(u64, u64)>,
+    /// When the entries were last walked for folder totals (see `SIZE_APPLY_GAP`).
+    last_size_apply: Option<Instant>,
+    /// A size change was held back by `SIZE_APPLY_GAP`; see [`Pane::folder_sizes_retry_in`].
+    size_retry: bool,
 }
 
 /// Whether typing in the file list filters it (Settings › Browsing). The app publishes the
@@ -225,6 +239,10 @@ impl Pane {
             similar: crate::similar::Grouping::default(),
             listing_rev: 0,
             sticky: false,
+            listed_folders: None,
+            applied_sizes: None,
+            last_size_apply: None,
+            size_retry: false,
         };
         p.load_path(path);
         p
@@ -312,6 +330,94 @@ impl Pane {
 
     fn listing_changed(&mut self) {
         self.listing_rev = next_listing_rev();
+    }
+
+    /// The folders among the `visible` rows, in display order: what the folder size service
+    /// is asked to measure. Cached against [`Pane::listing_rev`], so the walk over a
+    /// 50,000-entry listing happens once per change, not every frame.
+    pub fn listed_folders(&mut self) -> &[PathBuf] {
+        let rev = self.listing_rev;
+        let cached = matches!(&self.listed_folders, Some((cached_rev, _)) if *cached_rev == rev);
+        if !cached {
+            let folders: Vec<PathBuf> = self
+                .visible
+                .iter()
+                .map(|&i| &self.entries[i])
+                .filter(|e| e.kind == EntryKind::Dir)
+                .map(|e| e.path.clone())
+                .collect();
+            self.listed_folders = Some((rev, folders));
+        }
+        match &self.listed_folders {
+            Some((_, folders)) => folders,
+            None => &[],
+        }
+    }
+
+    /// Writes the folder totals of `sizes` into the sizes of the `Dir` entries, so the Size
+    /// column and the size sort agree with what is shown. A folder whose total is known, or
+    /// whose older total is shown while it is measured again, takes that total; the others
+    /// keep their size. Returns true if a size changed (the caller repaints).
+    ///
+    /// Free when `sizes` has not changed since the last call. While results keep arriving
+    /// the entries are walked at most once per [`SIZE_APPLY_GAP`]; a held-back change is
+    /// reported by [`Pane::folder_sizes_retry_in`] so the caller can come back for it.
+    pub fn apply_folder_sizes(&mut self, sizes: &FolderSizes) -> bool {
+        let rev = sizes.revision();
+        if self.applied_sizes == Some((rev, self.listing_rev)) {
+            self.size_retry = false;
+            return false;
+        }
+        // A listing that changed since the last apply (new rows, a re-sort) is walked now.
+        let listing_moved = self
+            .applied_sizes
+            .is_some_and(|(_, listing)| listing != self.listing_rev);
+        let recent = self
+            .last_size_apply
+            .is_some_and(|at| at.elapsed() < SIZE_APPLY_GAP);
+        if recent && !listing_moved {
+            self.size_retry = true;
+            return false;
+        }
+        self.last_size_apply = Some(Instant::now());
+        self.size_retry = false;
+
+        let mut changed = false;
+        for e in self.entries.iter_mut().filter(|e| e.kind == EntryKind::Dir) {
+            // Sizes turned off: back to the 0 a listing gives folders, so a Size sort no
+            // longer orders them by totals the column does not show.
+            let bytes = match sizes.get(&e.path) {
+                FolderSize::Known(t) | FolderSize::Pending { stale: Some(t) } => t.bytes,
+                FolderSize::Off => 0,
+                FolderSize::Pending { stale: None } => continue,
+            };
+            if e.size != bytes {
+                e.size = bytes;
+                changed = true;
+            }
+        }
+        if changed {
+            self.listing_changed();
+            // Row order by size is stale now; the next `poll` re-sorts (keeping the cursor
+            // and selection, which are by path).
+            if self.sort.key == SortKey::Size {
+                self.dirty_sort = true;
+            }
+        }
+        self.applied_sizes = Some((rev, self.listing_rev));
+        changed
+    }
+
+    /// How long until a folder size change held back by [`Pane::apply_folder_sizes`] may be
+    /// applied, or `None` when nothing is held back. Results usually trigger a repaint
+    /// themselves, but the last one can arrive inside the gap, so the caller must ask for
+    /// one after this long.
+    pub fn folder_sizes_retry_in(&self) -> Option<Duration> {
+        if !self.size_retry {
+            return None;
+        }
+        let at = self.last_size_apply?;
+        Some(SIZE_APPLY_GAP.saturating_sub(at.elapsed()))
     }
 
     fn load_path(&mut self, path: PathBuf) {
@@ -2361,5 +2467,81 @@ mod tests {
             pane.back
         );
         assert_eq!(pane.path, folder.path());
+    }
+
+    fn entry_size(pane: &Pane, path: &Path) -> u64 {
+        pane.entries.iter().find(|e| e.path == path).unwrap().size
+    }
+
+    #[test]
+    fn listed_folders_are_the_visible_folders_in_display_order_and_cached() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("zeta")).unwrap();
+        std::fs::create_dir(root.path().join("alpha")).unwrap();
+        std::fs::write(root.path().join("mid.txt"), b"x").unwrap();
+        let mut pane = Pane::new(root.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+
+        let names = |folders: &[PathBuf]| -> Vec<String> {
+            folders.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names(pane.listed_folders()), ["alpha", "zeta"]);
+        let first = pane.listed_folders().as_ptr();
+        assert_eq!(pane.listed_folders().as_ptr(), first, "unchanged listing: cached, not rebuilt");
+
+        pane.set_filter("alp".into());
+        assert_eq!(names(pane.listed_folders()), ["alpha"], "only visible rows count");
+    }
+
+    #[test]
+    fn apply_folder_sizes_writes_measured_totals_into_dir_sizes() {
+        let root = tempfile::tempdir().unwrap();
+        let measured = root.path().join("measured");
+        std::fs::create_dir(&measured).unwrap();
+        std::fs::write(measured.join("a.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(root.path().join("file.bin"), vec![0u8; 7]).unwrap();
+        let mut pane = Pane::new(root.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        let folders = pane.listed_folders().to_vec();
+        assert_eq!(folders, [measured.clone()]);
+
+        let mut sizes = FolderSizes::new(egui::Context::default());
+        sizes.want(&folders, &[]);
+        assert!(sizes.wait_idle(Duration::from_secs(5)));
+        assert!(pane.apply_folder_sizes(&sizes));
+        assert_eq!(entry_size(&pane, &measured), 1000);
+        assert_eq!(entry_size(&pane, &root.path().join("file.bin")), 7, "files are not touched");
+        assert!(!pane.apply_folder_sizes(&sizes), "nothing new since the last apply");
+    }
+
+    #[test]
+    fn folder_size_changes_inside_the_gap_wait_for_the_retry() {
+        let root = tempfile::tempdir().unwrap();
+        for (dir, bytes) in [("a", 10usize), ("b", 20)] {
+            std::fs::create_dir(root.path().join(dir)).unwrap();
+            std::fs::write(root.path().join(dir).join("f.bin"), vec![0u8; bytes]).unwrap();
+        }
+        let mut pane = Pane::new(root.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        let folders = pane.listed_folders().to_vec();
+        let (a, b) = (folders[0].clone(), folders[1].clone());
+
+        let mut sizes = FolderSizes::new(egui::Context::default());
+        sizes.want(std::slice::from_ref(&a), &[]);
+        assert!(sizes.wait_idle(Duration::from_secs(5)));
+        assert!(pane.apply_folder_sizes(&sizes));
+
+        // A second total arrives right after the first apply: it waits out the gap.
+        sizes.want(&folders, &[]);
+        assert!(sizes.wait_idle(Duration::from_secs(5)));
+        let before = entry_size(&pane, &b);
+        assert!(!pane.apply_folder_sizes(&sizes), "held back inside the gap");
+        assert!(pane.folder_sizes_retry_in().is_some(), "the caller is told to come back");
+        assert_eq!(entry_size(&pane, &b), before);
+
+        pane.last_size_apply = Some(Instant::now() - SIZE_APPLY_GAP);
+        assert!(pane.apply_folder_sizes(&sizes));
+        assert_eq!(entry_size(&pane, &b), 20);
+        assert!(pane.folder_sizes_retry_in().is_none());
     }
 }
