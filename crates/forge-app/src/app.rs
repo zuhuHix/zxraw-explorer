@@ -7,6 +7,7 @@ use egui::{Align, Key, Layout, RichText, Ui};
 use forge_core::model::format_size;
 
 use crate::commands::Cmd;
+use crate::folder_sizes::FolderSize;
 use crate::pane::{LoadState, Pane};
 use crate::settings::{self, Paths, Session, Settings, TabSession, ThemeChoice, ViewMode};
 use crate::theme;
@@ -164,6 +165,11 @@ pub struct ZxrawApp {
     selection_summary: SelectionSummary,
 }
 
+/// Most selected folders checked for "still measuring" each frame. A selection of tens of
+/// thousands of folders would otherwise cost a lock per folder every frame; past the cap
+/// the rest count as measured.
+const MEASURING_CHECK_CAP: usize = 2_000;
+
 /// The status bar's "N selected (size)". Walking every listed entry each frame cost
 /// ~200 ms per frame in a 50,000-entry folder (debug build) while anything was selected,
 /// so the visible entries are indexed once per listing revision and a selection change
@@ -171,13 +177,16 @@ pub struct ZxrawApp {
 #[derive(Default)]
 struct SelectionSummary {
     listing: Option<u64>,
-    /// Visible entry path → size, modification time, and whether it's a video or audio file.
-    index: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, bool)>,
+    /// Visible entry path → size, modification time, whether it's a video or audio file,
+    /// and whether it's a folder.
+    index: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, bool, bool)>,
     selection: Option<(usize, u64)>,
     count: usize,
     size: u64,
     /// Selected video and audio files, for the running-time total.
     media: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    /// Selected folders, whose sizes may still be measured (see `measuring`).
+    folders: Vec<PathBuf>,
     durations: crate::media_durations::MediaDurations,
 }
 
@@ -195,7 +204,7 @@ impl SelectionSummary {
                             forge_core::model::media_kind_for_ext(&e.ext),
                             forge_core::model::MediaKind::Video | forge_core::model::MediaKind::Audio
                         );
-                    (e.path.clone(), (e.size, e.modified, media))
+                    (e.path.clone(), (e.size, e.modified, media, e.is_dir()))
                 })
                 .collect();
             self.listing = Some(listing);
@@ -219,12 +228,16 @@ impl SelectionSummary {
             let mut count = 0;
             let mut size = 0;
             self.media.clear();
+            self.folders.clear();
             for path in &p.selected {
-                if let Some(&(bytes, modified, media)) = self.index.get(path) {
+                if let Some(&(bytes, modified, media, dir)) = self.index.get(path) {
                     count += 1;
                     size += bytes;
                     if media {
                         self.media.push((path.clone(), modified));
+                    }
+                    if dir {
+                        self.folders.push(path.clone());
                     }
                 }
             }
@@ -233,6 +246,27 @@ impl SelectionSummary {
             self.selection = Some(selection);
         }
         (self.count, self.size)
+    }
+
+    /// Whether a selected folder's size is still being measured, so the total is only so
+    /// far. Asked every frame, so it stops at the first one found and checks at most
+    /// `MEASURING_CHECK_CAP` folders.
+    fn measuring(&self, sizes: &crate::folder_sizes::FolderSizes) -> bool {
+        self.folders
+            .iter()
+            .take(MEASURING_CHECK_CAP)
+            .any(|path| matches!(sizes.get(path), FolderSize::Pending { .. }))
+    }
+}
+
+/// The size shown in the status bar's "N selected (…)": `1.20 GB`, or `1.20 GB so far…`
+/// while a selected folder is still being measured.
+fn selection_size_text(bytes: u64, measuring: bool) -> String {
+    let size = format_size(bytes);
+    if measuring {
+        format!("{size} so far…")
+    } else {
+        size
     }
 }
 
@@ -1002,7 +1036,11 @@ impl ZxrawApp {
             if !p.selected.is_empty() {
                 let (sel, size) = summary.get(p);
                 if sel > 0 {
-                    s += &format!("   ·   {sel} selected ({})", format_size(size));
+                    let measuring = summary.measuring(&self.ops.folder_sizes);
+                    s += &format!(
+                        "   ·   {sel} selected ({})",
+                        selection_size_text(size, measuring)
+                    );
                     if !summary.media.is_empty() {
                         let total = summary.durations.total(
                             &summary.media,
@@ -1572,6 +1610,37 @@ mod selection_summary_tests {
         p.rebuild_visible();
         p.selected.insert(p.path.join("a.txt"));
         assert_eq!(summary.get(&p), (2, 40));
+    }
+
+    #[test]
+    fn a_selected_folder_adds_its_measured_total_and_says_so_while_it_is_measured() {
+        let mut p = pane(&[("a.txt", 10)]);
+        let folder = p.path.join("photos");
+        p.entries.push(FileEntry {
+            kind: EntryKind::Dir,
+            ..file(&p.path, "photos", 5000)
+        });
+        p.rebuild_visible();
+        let sizes = crate::folder_sizes::FolderSizes::new(egui::Context::default());
+        let mut summary = SelectionSummary::default();
+
+        p.selected.insert(p.path.join("a.txt"));
+        assert_eq!(summary.get(&p), (1, 10));
+        assert!(!summary.measuring(&sizes), "no folder selected, nothing to measure");
+
+        p.selected.insert(folder.clone());
+        assert_eq!(summary.get(&p), (2, 5010));
+        assert!(summary.measuring(&sizes), "a folder with no total yet is being measured");
+        assert_eq!(
+            selection_size_text(5010, summary.measuring(&sizes)),
+            format!("{} so far…", format_size(5010))
+        );
+    }
+
+    #[test]
+    fn selection_size_says_so_far_only_while_measuring() {
+        assert_eq!(selection_size_text(1500, false), format_size(1500));
+        assert_eq!(selection_size_text(1500, true), format!("{} so far…", format_size(1500)));
     }
 
     #[test]
