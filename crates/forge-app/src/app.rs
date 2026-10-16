@@ -226,13 +226,13 @@ impl SelectionSummary {
         let selection = (p.selected.len(), fingerprint);
         if self.selection != Some(selection) {
             let mut count = 0;
-            let mut size = 0;
+            let mut size = 0u64;
             self.media.clear();
             self.folders.clear();
             for path in &p.selected {
                 if let Some(&(bytes, modified, media, dir)) = self.index.get(path) {
                     count += 1;
-                    size += bytes;
+                    size = size.saturating_add(bytes);
                     if media {
                         self.media.push((path.clone(), modified));
                     }
@@ -250,19 +250,25 @@ impl SelectionSummary {
 
     /// Whether a selected folder's size is still being measured, so the total is only so
     /// far. Asked every frame, so it stops at the first one found and checks at most
-    /// `MEASURING_CHECK_CAP` folders.
+    /// `MEASURING_CHECK_CAP` folders; past the cap the unchecked ones may still be measuring,
+    /// so a selection that large always says "so far".
     fn measuring(&self, sizes: &crate::folder_sizes::FolderSizes) -> bool {
-        self.folders
-            .iter()
-            .take(MEASURING_CHECK_CAP)
-            .any(|path| matches!(sizes.get(path), FolderSize::Pending { .. }))
+        self.folders.len() > MEASURING_CHECK_CAP
+            || self
+                .folders
+                .iter()
+                .any(|path| matches!(sizes.get(path), FolderSize::Pending { .. }))
     }
 }
 
 /// The size shown in the status bar's "N selected (…)": `1.20 GB`, or `1.20 GB so far…`
 /// while a selected folder is still being measured.
 fn selection_size_text(bytes: u64, measuring: bool) -> String {
-    let size = format_size(bytes);
+    let mut size = format_size(bytes);
+    // The sum saturates: past that it is only a lower bound, marked "+" as folder totals are.
+    if bytes == u64::MAX {
+        size.push('+');
+    }
     if measuring {
         format!("{size} so far…")
     } else {
@@ -1638,9 +1644,24 @@ mod selection_summary_tests {
     }
 
     #[test]
+    fn a_selection_past_the_check_cap_says_so_far_even_when_the_checked_folders_are_done() {
+        let mut sizes = crate::folder_sizes::FolderSizes::new(egui::Context::default());
+        // Off: every folder reads as settled, so only the cap can make it "so far".
+        sizes.configure(false, false);
+        let mut summary = SelectionSummary::default();
+        summary.folders = (0..MEASURING_CHECK_CAP)
+            .map(|i| PathBuf::from(format!(r"C:\x\{i}")))
+            .collect();
+        assert!(!summary.measuring(&sizes));
+        summary.folders.push(PathBuf::from(r"C:\x\last"));
+        assert!(summary.measuring(&sizes), "unchecked folders may still be measuring");
+    }
+
+    #[test]
     fn selection_size_says_so_far_only_while_measuring() {
         assert_eq!(selection_size_text(1500, false), format_size(1500));
         assert_eq!(selection_size_text(1500, true), format!("{} so far…", format_size(1500)));
+        assert!(selection_size_text(u64::MAX, false).ends_with('+'));
     }
 
     #[test]
