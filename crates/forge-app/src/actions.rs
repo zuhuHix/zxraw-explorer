@@ -1,6 +1,7 @@
 //! Bridges UI commands to the engine crates: file operations, dialogs, previews, jobs.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use egui::{RichText, Ui};
 
@@ -9,12 +10,13 @@ use forge_core::ops::OpKind;
 use forge_core::query::{ColorLabel, PickState};
 use forge_db::AnnotationChange;
 
-use crate::app::ZxrawApp;
+use crate::app::{Side, Tab, ZxrawApp};
 use crate::commands::Cmd;
 use crate::media_meta::{self, MediaMeta};
 use crate::modal::{self, Confirm, ConfirmKind, Modal, Outcome, Prompt, PromptKind};
+use crate::pane::Pane;
 use crate::preview::{self, TextPreview};
-use crate::settings::{Paths, Settings};
+use crate::settings::{Paths, Settings, ViewMode};
 use crate::views::ThumbProvider;
 
 /// Results reported back to the UI thread from background work.
@@ -190,6 +192,8 @@ pub struct Actions {
     pub ffmpeg_setup: crate::ffmpeg_setup::FfmpegSetup,
     pub updater: crate::updater::Updater,
     pub git: crate::git_status::GitStatus,
+    pub folder_sizes: crate::folder_sizes::FolderSizes,
+    folder_wants: FolderWants,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -250,6 +254,8 @@ impl Actions {
             ffmpeg_setup: Default::default(),
             updater: Default::default(),
             git: crate::git_status::GitStatus::new(ctx.clone()),
+            folder_sizes: crate::folder_sizes::FolderSizes::new(ctx.clone()),
+            folder_wants: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -1089,6 +1095,84 @@ pub fn open_file(app: &mut ZxrawApp, path: &Path) {
         .spawn_shell("Open", move || forge_win::open_default(&p));
 }
 
+/// The folders the folder size service is asked to measure, kept between frames. It is
+/// rebuilt only when a listing, a view or the focused selection changes, so a steady frame
+/// costs one comparison and no 50,000-entry walk.
+#[derive(Default)]
+pub struct FolderWants {
+    key: Option<WantKey>,
+    folders: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WantKey {
+    /// Listing revisions of the left and right pane (0 without a right pane).
+    listings: (u64, u64),
+    /// Which panes are in Details view, where the Size column shows folder totals.
+    details: (bool, bool),
+    right_focused: bool,
+    selection: (usize, u64),
+}
+
+/// Length and hash of the first 64 selected paths, fingerprinted as the status bar's
+/// selection summary does: cheap every frame. A change that keeps both the length and the
+/// first paths of the selection is not seen; the status bar has the same limit.
+fn selection_fingerprint(pane: &Pane) -> (usize, u64) {
+    let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+    let hash = pane
+        .selected
+        .iter()
+        .take(64)
+        .enumerate()
+        .fold(0u64, |acc, (i, path)| {
+            acc.rotate_left(7) ^ std::hash::BuildHasher::hash_one(&hasher, (i, path))
+        });
+    (pane.selected.len(), hash)
+}
+
+impl FolderWants {
+    /// The folders of the tab at `active`: the listed folders of each pane in Details view
+    /// (the Size column), then the selected folders of the focused pane (the status bar
+    /// totals them in any view).
+    fn refresh(&mut self, tabs: &mut [Tab], active: usize) -> &[PathBuf] {
+        let Some(tab) = tabs.get_mut(active) else {
+            self.key = None;
+            self.folders.clear();
+            return &self.folders;
+        };
+        let key = WantKey {
+            listings: (
+                tab.left.listing_rev(),
+                tab.right.as_ref().map_or(0, Pane::listing_rev),
+            ),
+            details: (
+                tab.left.view == ViewMode::Details,
+                tab.right.as_ref().is_some_and(|p| p.view == ViewMode::Details),
+            ),
+            right_focused: tab.focus == Side::Right && tab.right.is_some(),
+            selection: selection_fingerprint(tab.focused()),
+        };
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.folders.clear();
+            for pane in std::iter::once(&mut tab.left).chain(tab.right.as_mut()) {
+                if pane.view == ViewMode::Details {
+                    self.folders.extend_from_slice(pane.listed_folders());
+                }
+            }
+            let focused = tab.focused();
+            self.folders.extend(
+                focused
+                    .entries
+                    .iter()
+                    .filter(|e| e.is_dir() && focused.selected.contains(&e.path))
+                    .map(|e| e.path.clone()),
+            );
+        }
+        &self.folders
+    }
+}
+
 pub fn poll(app: &mut ZxrawApp) -> bool {
     crate::tags_ui::tick(app);
     let folders: Vec<PathBuf> = app
@@ -1131,6 +1215,30 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             .map(|p| p.entries.len())
             .unwrap_or(0)
     });
+    // Folder sizes: the settings, the folders to measure, then the totals written into the
+    // listings. Every pane of every tab, so a background tab's Size sort stays right too.
+    app.ops
+        .folder_sizes
+        .configure(app.settings.folder_sizes, app.settings.folder_sizes_network);
+    for d in &due {
+        app.ops.folder_sizes.invalidate(d);
+    }
+    let wanted = app.ops.folder_wants.refresh(&mut app.tabs, app.active);
+    app.ops.folder_sizes.want(wanted, &folders);
+    let mut sizes_changed = false;
+    let mut retry: Option<Duration> = None;
+    for tab in app.tabs.iter_mut() {
+        for pane in std::iter::once(&mut tab.left).chain(tab.right.as_mut()) {
+            sizes_changed |= pane.apply_folder_sizes(&app.ops.folder_sizes);
+            if let Some(after) = pane.folder_sizes_retry_in() {
+                retry = Some(retry.map_or(after, |r| r.min(after)));
+            }
+        }
+    }
+    if let Some(after) = retry {
+        // A held-back total may be the last result, which brings no repaint of its own.
+        app.ops.ctx.request_repaint_after(after);
+    }
     app.ops.git.set_enabled(app.settings.git_badges);
     app.ops.git.track(&folders);
     let git_changed = app.ops.git.poll();
@@ -1139,7 +1247,10 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         app.ops.thumbs.invalidate_dir(d);
         app.refresh_all_showing(d);
     }
-    let mut changed = app.ops.thumbs.begin_frame(folders) || !due.is_empty() || git_changed;
+    let mut changed = app.ops.thumbs.begin_frame(folders)
+        || !due.is_empty()
+        || git_changed
+        || sizes_changed;
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     // A finished "Select originals/exports" match (computed off the UI thread).
     changed |= crate::export_assoc::poll(app);

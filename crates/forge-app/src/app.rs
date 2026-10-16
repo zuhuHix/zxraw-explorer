@@ -504,7 +504,12 @@ impl ZxrawApp {
             Back => self.pane_mut().back(),
             Forward => self.pane_mut().forward(),
             Up => self.pane_mut().up(),
-            Refresh => self.pane_mut().refresh(),
+            Refresh => {
+                // The user asked for fresh numbers: totals below the folder are measured again.
+                let dir = self.pane().path.clone();
+                self.ops.folder_sizes.invalidate_tree(&dir);
+                self.pane_mut().refresh();
+            }
             Open => self.open_cursor(),
             NewTab => {
                 let p = self.pane().path.clone();
