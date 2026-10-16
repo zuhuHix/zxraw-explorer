@@ -29,6 +29,13 @@
 //! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
 //! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
 //!   folder is open in place.
+//! - `assert-size <name> | <text>`: waits (30 s) until the focused pane's entry `<name>` shows
+//!   `<text>` in its Size column, as the details view draws it: a folder's recursive total
+//!   (`folder_size_text` of the folder sizes service), a file's size. On timeout it fails with
+//!   the text last shown. Needs the details view.
+//! - `write-file <path> | <bytes>`: creates a new file of `<bytes>` zero bytes (at most 64 MiB).
+//!   Relative paths resolve inside the script sandbox, missing parent folders are created, and
+//!   an existing file is an error. Sandboxed.
 //! - `offline rename <path> | <name>`: accept a Rename prompt for `<path>`;
 //!   `offline undo-rename <path> | <name>`: undo a recorded rename of `<path>` to `<name>`;
 //!   `offline new-folder <name>` / `offline new-file <name>`: run New folder / New file in the
@@ -342,6 +349,51 @@ pub(super) fn step(
                 ))
             }
         }
+        "assert-size" => {
+            let (name, expected) = args.split_once(" | ").ok_or("expected `<name> | <text>`")?;
+            let (name, expected) = (name.trim(), expected.trim());
+            if !matches!(app.pane().view, crate::settings::ViewMode::Details) {
+                return Err("the Size column is only drawn in the details view".into());
+            }
+            let started = *st.started.get_or_insert_with(Instant::now);
+            let seen = size_cell_text(app, name);
+            if seen.as_deref() == Some(expected) {
+                Ok(Flow::Done)
+            } else if started.elapsed() >= Duration::from_secs(30) {
+                Err(format!(
+                    "`{name}` shows {:?} in the Size column, expected `{expected}`",
+                    seen.unwrap_or_else(|| "no entry".into())
+                ))
+            } else {
+                Ok(Flow::Wait(format!(
+                    "`{name}` shows {:?}, expected `{expected}`",
+                    seen.unwrap_or_else(|| "no entry".into())
+                )))
+            }
+        }
+        "write-file" => {
+            let (path, bytes) = args
+                .split_once(" | ")
+                .ok_or("expected `<path> | <bytes>`")?;
+            let bytes: usize = bytes
+                .trim()
+                .parse()
+                .map_err(|_| format!("expected a byte count, got `{}`", bytes.trim()))?;
+            if bytes > 64 << 20 {
+                return Err("write-file takes at most 64 MiB".into());
+            }
+            let path = super::sandboxed(std::path::Path::new(path.trim()))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+            std::io::Write::write_all(&mut file, &vec![0u8; bytes]).map_err(|e| e.to_string())?;
+            Ok(Flow::Done)
+        }
         "offline" => offline(app, ctx, args),
         other => Err(format!("unknown `ui browser` verb `{other}`")),
     }
@@ -419,6 +471,26 @@ fn offline(app: &mut ZxrawApp, ctx: &egui::Context, args: &str) -> Result<Flow, 
     } else {
         Ok(Flow::Done)
     }
+}
+
+/// The Size-column text of the focused pane's entry `name`, drawn the way the details view
+/// draws it. `None` when the entry is not listed.
+fn size_cell_text(app: &ZxrawApp, name: &str) -> Option<String> {
+    let entry = app
+        .pane()
+        .entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case(name))?;
+    Some(match entry.kind {
+        forge_core::model::EntryKind::File => forge_core::model::format_size(entry.size),
+        forge_core::model::EntryKind::Dir => {
+            let sizes = app.ops.folder_sizes.get(&entry.path);
+            crate::views::folder_size_text(&sizes)
+                .map(|(text, _)| text)
+                .unwrap_or_default()
+        }
+        forge_core::model::EntryKind::Link => String::new(),
+    })
 }
 
 fn entry_path(app: &ZxrawApp, name: &str) -> Option<PathBuf> {
