@@ -45,17 +45,20 @@ pub fn live_file_size(path: &Path, listed: u64, online_only: bool, network: bool
         .map_or(listed, |md| md.len())
 }
 
+/// An entry from metadata read by path (`symlink_metadata` opens the file, so its size is
+/// already live and nothing more is read).
 fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata) -> FileEntry {
     entry_from_listed_metadata(path, name, md, false)
 }
 
 /// Like [`entry_from_metadata`] for an entry of a directory listing, whose size may be stale
-/// (see [`live_file_size`]). `network`: the listed folder is on a network location.
+/// (see [`live_file_size`]). `correct_size`: the listing runs on a background thread over a
+/// local folder, so a 0-byte file may be opened to read its live size.
 fn entry_from_listed_metadata(
     path: std::path::PathBuf,
     name: String,
     md: &fs::Metadata,
-    network: bool,
+    correct_size: bool,
 ) -> FileEntry {
     let ft = md.file_type();
     // On Windows `is_symlink` is true for name-surrogate reparse points: symlinks and
@@ -76,10 +79,10 @@ fn entry_from_listed_metadata(
     };
     let online_only = crate::cloud::is_online_only_metadata(&path, md);
     let size = if kind == EntryKind::File {
-        if network {
-            md.len()
-        } else {
+        if correct_size {
             live_file_size(&path, md.len(), online_only, false)
+        } else {
+            md.len()
         }
     } else {
         0
@@ -144,7 +147,7 @@ pub fn list_dir_streaming(
         };
         let name = de.file_name().to_string_lossy().into_owned();
         match de.metadata() {
-            Ok(md) => buf.push(entry_from_listed_metadata(de.path(), name, &md, network)),
+            Ok(md) => buf.push(entry_from_listed_metadata(de.path(), name, &md, !network)),
             Err(_) => {
                 // Still show the entry (e.g. locked system files) with unknown metadata.
                 errors += 1;

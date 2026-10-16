@@ -44,11 +44,23 @@ pub struct DirTotals {
 }
 
 impl DirTotals {
+    /// Adds `other` in. Sums saturate instead of wrapping (a corrupt or hostile listing can
+    /// report sizes near `u64::MAX`); a saturated total is a lower bound, so it is `partial`.
     fn add(&mut self, other: &DirTotals) {
-        self.bytes += other.bytes;
-        self.files += other.files;
-        self.dirs += other.dirs;
+        self.add_bytes(other.bytes);
+        self.files = self.files.saturating_add(other.files);
+        self.dirs = self.dirs.saturating_add(other.dirs);
         self.partial |= other.partial;
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        match self.bytes.checked_add(bytes) {
+            Some(sum) => self.bytes = sum,
+            None => {
+                self.bytes = u64::MAX;
+                self.partial = true;
+            }
+        }
     }
 }
 
@@ -310,7 +322,7 @@ impl Walk<'_> {
         }
         let totals = &mut scan.totals;
         if entry.is_dir {
-            totals.dirs += 1;
+            totals.dirs = totals.dirs.saturating_add(1);
             let path = dir.join(&entry.name);
             if entry.attributes & NOT_ENTERED != 0 || cloud::is_simulated(&path) {
                 totals.partial = true;
@@ -321,11 +333,11 @@ impl Walk<'_> {
             }
             return;
         }
-        totals.files += 1;
+        totals.files = totals.files.saturating_add(1);
         // A non-zero listed size is always right (live_file_size would return it as is), so
         // only a 0-byte entry needs its path, and online-only placeholders keep their listed
         // size without being opened.
-        totals.bytes += if entry.size == 0 {
+        let bytes = if entry.size == 0 {
             let path = dir.join(&entry.name);
             let online_only =
                 cloud::is_online_only_attrs(entry.attributes) || cloud::is_simulated(&path);
@@ -333,6 +345,7 @@ impl Walk<'_> {
         } else {
             entry.size
         };
+        totals.add_bytes(bytes);
     }
 }
 
@@ -454,6 +467,19 @@ fn enumerate_std(dir: &Path, f: &mut dyn FnMut(RawEntry) -> bool) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn totals_saturate_and_say_so_instead_of_wrapping() {
+        let mut totals = DirTotals { bytes: u64::MAX - 1, files: u64::MAX, ..Default::default() };
+        totals.add(&DirTotals { bytes: 5, files: 1, dirs: 1, partial: false });
+        assert_eq!(totals.bytes, u64::MAX);
+        assert_eq!(totals.files, u64::MAX);
+        assert_eq!(totals.dirs, 1);
+        assert!(totals.partial);
+        let mut exact = DirTotals::default();
+        exact.add(&DirTotals { bytes: 5, files: 1, dirs: 0, partial: false });
+        assert!(!exact.partial);
+    }
     use std::collections::HashMap;
     use std::fs;
 

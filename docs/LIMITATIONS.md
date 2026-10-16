@@ -30,6 +30,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 * "Open terminal here" in Command Prompt cannot open a folder whose name contains `%` as
   administrator or on a network (UNC) path; choose PowerShell instead.
+* Sizes come from folder listings, as in File Explorer. NTFS refreshes the size stored in a
+  listing only when a file is closed, and only for the name it was written through. A file
+  still being written is read again when its listing says 0 bytes (local folders only), but
+  one that already had a size, or the other names of a hard-linked file, can show an older
+  size until the file is closed and the folder is listed again. Folder totals add up those
+  same sizes, count a hard-linked file once per name, and never follow symlinks or junctions.
 * Git status badges are on by default (turn them off in Settings › Browsing). The scan treats
   every repository as hostile: it never runs a program, opens nothing by path below a local
   drive's root, never follows a link, never opens a cloud placeholder, and caps every read,
