@@ -25,10 +25,10 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | arc-swap | 1.9.2 | MIT OR Apache-2.0 | https://github.com/vorner/arc-swap | Permissive |
 | arrayvec | 0.7.8 | MIT OR Apache-2.0 | https://github.com/bluss/arrayvec | Permissive |
 | ash | 0.38.0+1.3.281 | MIT OR Apache-2.0 | https://github.com/ash-rs/ash | Permissive |
-| bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags | Permissive |
-| bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags | Permissive |
 | bit-set | 0.10.0 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-set | Permissive |
 | bit-vec | 0.9.1 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-vec | Permissive |
+| bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags | Permissive |
+| bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags | Permissive |
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | https://github.com/BLAKE3-team/BLAKE3 | Permissive |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | bstr | 1.13.1 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr | Permissive |
@@ -100,13 +100,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.5.1 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.5.2 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
@@ -289,9 +289,9 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | tracing-log | 0.2.0 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | tracing-subscriber | 0.3.23 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | Permissive |
+| type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
 | typed-path | 0.12.3 | MIT OR Apache-2.0 | https://github.com/chipsenkbeil/typed-path | Permissive |
 | typeid | 1.0.3 | MIT OR Apache-2.0 | https://github.com/dtolnay/typeid | Permissive |
-| type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | https://github.com/paholg/typenum | Permissive |
 | unicase | 2.10.0 | MIT OR Apache-2.0 | https://github.com/seanmonstar/unicase | Permissive |
 | unicode-bom | 2.0.3 | Apache-2.0 | https://gitlab.com/philbooth/unicode-bom | Permissive |
