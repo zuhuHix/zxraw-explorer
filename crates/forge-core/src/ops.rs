@@ -387,8 +387,22 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// Test hook after the Replace destination was verified, before it is moved aside (called
+    /// with the destination).
+    static BEFORE_REPLACE_ASIDE: RefCell<Option<BeforeMoveRenameHook>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test hook after the Replace destination was moved aside (called with the destination).
     static AFTER_REPLACE_ASIDE: RefCell<Option<BeforeMoveRenameHook>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook after the new file is in place, before the previous version is deleted (called
+    /// with the previous version's aside path).
+    static BEFORE_ASIDE_DELETE: RefCell<Option<BeforeMoveRenameHook>> = RefCell::new(None);
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -730,25 +744,85 @@ fn is_sharing_violation(e: &io::Error) -> bool {
     e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
 }
 
-/// Open `path` itself (a link is not followed) for reading while denying writers: this fails
-/// with a sharing violation if anyone has it open for writing, and while the handle is held
-/// nobody can open it for writing. Deleting and renaming stay allowed.
+/// Open `path` itself (a link is not followed) for reading and deleting while denying writers:
+/// this fails with a sharing violation if anyone has it open for writing, and while the handle is
+/// held nobody can open it for writing. The DELETE access lets the object be renamed through this
+/// handle (see [`rename_open_no_replace`]); other programs may still rename or delete it.
 fn open_denying_writers(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
         use windows::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-            FILE_SHARE_READ,
+            DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
+            FILE_SHARE_DELETE, FILE_SHARE_READ,
         };
         OpenOptions::new()
-            .read(true)
+            .access_mode(FILE_GENERIC_READ.0 | DELETE.0)
             .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_DELETE.0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0 | FILE_FLAG_BACKUP_SEMANTICS.0)
             .open(path)
     }
     #[cfg(not(windows))]
     File::open(path)
+}
+
+/// Rename the object open as `file` (found at `from`) to `to`, never replacing. Renaming the
+/// handle, not the path, moves exactly the file that was verified through it.
+#[cfg(windows)]
+fn rename_open_no_replace(file: &File, _from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+    let name: Vec<u16> = paths::long_path_if_needed(to)
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = name_offset + (name.len() + 1) * 2;
+    // u64 words keep the buffer 8-byte aligned, as FILE_RENAME_INFO requires. Zeroed, so the
+    // handle-relative RootDirectory is null and the NUL terminator is present.
+    let mut buf = vec![0u64; size.div_ceil(8)];
+    let base = buf.as_mut_ptr().cast::<u8>();
+    // SAFETY: `buf` is zeroed and holds `size` bytes. The header fields are written through
+    // raw pointers, and the name is copied to the byte offset of the FileName array, so no
+    // reference to the one-element array is made and nothing is written past `size`.
+    unsafe {
+        let info = base.cast::<FILE_RENAME_INFO>();
+        (&raw mut (*info).Anonymous.ReplaceIfExists).write(false);
+        (&raw mut (*info).FileNameLength).write((name.len() * 2) as u32);
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            base.add(name_offset).cast::<u16>(),
+            name.len(),
+        );
+    }
+    // SAFETY: `file` is a live handle opened with DELETE access, and `buf` outlives the call
+    // and holds the FILE_RENAME_INFO built above, `size` bytes long.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfo,
+            base.cast(),
+            size as u32,
+        )
+    }
+    .map_err(|e| {
+        // ERROR_ALREADY_EXISTS (183) / ERROR_FILE_EXISTS (80) -> AlreadyExists.
+        let code = (e.code().0 as u32) & 0xFFFF;
+        if code == 183 || code == 80 {
+            io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists")
+        } else {
+            io::Error::from_raw_os_error(code as i32)
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn rename_open_no_replace(_file: &File, from: &Path, to: &Path) -> io::Result<()> {
+    paths::rename_no_replace(from, to)
 }
 
 /// Why [`replace_guarded`] did not publish.
@@ -786,20 +860,13 @@ impl ReplaceRefused {
     }
 }
 
-/// Put back the moved-aside destination at `dest`; if that fails, record where it is kept.
-fn restore_aside(aside: &Path, dest: &Path) -> Option<PathBuf> {
-    paths::rename_no_replace(aside, dest)
-        .err()
-        .map(|_| aside.to_path_buf())
-}
-
 /// Publish `new` at `dest` in place of the destination captured in `state`, only if that is
-/// still the one there. Identity (kind, stamp and file id) is checked before the destination is
-/// renamed aside, because on FAT/exFAT a rename can change the file index. The aside file is
-/// then opened with writers denied, its size, time and content are checked, and the new file is
-/// renamed into place while that handle is still held, so nothing can write to the verified
-/// previous version in between. A save that lands at `dest` meanwhile makes the final
-/// no-replace rename fail and is kept. On any failure the original is renamed back.
+/// still the one there. The destination is opened once, with writers denied, and verified
+/// through that handle (full stamp, file id included, then content). The same handle is then
+/// renamed aside, so the object that was verified is the one moved, and it stays open through
+/// the publish, so nothing can write to it in between. The new file is renamed into `dest`
+/// with no replace: a save that lands there meanwhile makes that rename fail and is kept. On any
+/// failure the previous version is renamed back through the handle.
 /// Returns the aside path when the replace succeeded but that previous version could not be
 /// deleted; a crash midway leaves it under its `.zxraw-replaced-` name, never deleted.
 fn replace_guarded(
@@ -808,19 +875,37 @@ fn replace_guarded(
     state: &ReplaceState,
 ) -> std::result::Result<Option<PathBuf>, ReplaceRefused> {
     let refuse = |reason, kept_as| ReplaceRefused { reason, kept_as };
-    if !state.identity_matches(dest) {
-        return Err(refuse(Refusal::Changed, None));
-    }
-    let dir = dest.parent().unwrap_or(Path::new(""));
-    let aside = dir.join(aside_name(&paths::name_of(dest), &random_hex()[..8]));
-    match paths::rename_no_replace(dest, &aside) {
-        Ok(()) => {}
-        // The destination vanished after the decision: it changed.
+    let file = match open_denying_writers(dest) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(refuse(Refusal::Changed, None));
         }
         Err(e) if is_sharing_violation(&e) => return Err(refuse(Refusal::InUse, None)),
         Err(e) => return Err(refuse(Refusal::Failed(e), None)),
+    };
+    if !state.matches_open(&file, dest) {
+        return Err(refuse(Refusal::Changed, None));
+    }
+    #[cfg(test)]
+    BEFORE_REPLACE_ASIDE.with(|hook| {
+        if let Some(f) = &*hook.borrow() {
+            f(dest);
+        }
+    });
+    let dir = dest.parent().unwrap_or(Path::new(""));
+    let aside = dir.join(aside_name(&paths::name_of(dest), &random_hex()[..8]));
+    if let Err(e) = rename_open_no_replace(&file, dest, &aside) {
+        // If the path no longer holds the verified object, the destination changed.
+        let reason = if fs::symlink_metadata(dest).is_err()
+            || path_stamp(dest).ok().as_ref() != state.stamp.as_ref()
+        {
+            Refusal::Changed
+        } else if is_sharing_violation(&e) {
+            Refusal::InUse
+        } else {
+            Refusal::Failed(e)
+        };
+        return Err(refuse(reason, None));
     }
     #[cfg(test)]
     AFTER_REPLACE_ASIDE.with(|hook| {
@@ -828,31 +913,25 @@ fn replace_guarded(
             f(dest);
         }
     });
-    let file = match open_denying_writers(&aside) {
-        Ok(file) => file,
-        Err(e) => {
-            let reason = if is_sharing_violation(&e) {
-                Refusal::InUse
-            } else {
-                Refusal::Failed(e)
-            };
-            return Err(refuse(reason, restore_aside(&aside, dest)));
-        }
-    };
-    if !state.content_matches(&file, &aside) {
-        drop(file);
-        return Err(refuse(Refusal::Changed, restore_aside(&aside, dest)));
-    }
     match paths::rename_no_replace(new, dest) {
         Ok(()) => {
             drop(file);
+            #[cfg(test)]
+            BEFORE_ASIDE_DELETE.with(|hook| {
+                if let Some(f) = &*hook.borrow() {
+                    f(&aside);
+                }
+            });
             // The replace has succeeded; a leftover aside file is reported, not failed over.
             let leftover = remove_file_force(&aside).or_else(|_| fs::remove_dir(&aside));
             Ok(leftover.err().map(|_| aside))
         }
         Err(e) => {
+            // Put the verified previous version back through the same handle.
+            let kept_as = rename_open_no_replace(&file, &aside, dest)
+                .err()
+                .map(|_| aside.clone());
             drop(file);
-            let kept_as = restore_aside(&aside, dest);
             // AlreadyExists: someone saved a new file at dest meanwhile, and it is kept.
             let reason = if e.kind() == io::ErrorKind::AlreadyExists {
                 Refusal::Changed
@@ -1416,13 +1495,23 @@ impl ReplaceState {
     }
 
     fn capture(path: &Path, metadata: &fs::Metadata) -> Self {
+        Self::capture_with(path, metadata, &crate::cloud::FsAttributes)
+    }
+
+    /// [`capture`](Self::capture) with an injectable attribute source. Files are read only when
+    /// their find data says the data is on this PC.
+    fn capture_with(
+        path: &Path,
+        metadata: &fs::Metadata,
+        attrs: &dyn crate::cloud::AttributeSource,
+    ) -> Self {
         let kind = node_kind(metadata);
         match kind {
             NodeKind::Dir => Self::unchecked(kind),
             NodeKind::File => Self {
                 kind,
                 stamp: path_stamp(path).ok(),
-                check: if crate::cloud::is_online_only_metadata(path, metadata) {
+                check: if !crate::cloud::background_read_allowed_with(path, attrs) {
                     ContentCheck::StampOnly
                 } else if metadata.len() <= REPLACE_HASH_LIMIT {
                     match hashing::hash_file(path, &CancelToken::new(), None) {
@@ -1444,54 +1533,35 @@ impl ReplaceState {
         }
     }
 
-    /// The destination at `path`, under its original name, is still the captured file: same
-    /// kind and full stamp, file id included. Checked before the rename aside, because on
-    /// FAT/exFAT a rename can change the file index.
-    fn identity_matches(&self, path: &Path) -> bool {
-        let Ok(metadata) = fs::symlink_metadata(path) else {
-            return false;
-        };
-        if node_kind(&metadata) != self.kind {
-            return false;
-        }
+    /// The destination open as `file` (found at `path`) is still the captured one: full stamp,
+    /// file id included, then content. It is checked on the open object, before the rename
+    /// aside, so a save that replaces the path meanwhile is not the object that gets moved.
+    fn matches_open(&self, file: &File, path: &Path) -> bool {
         if self.kind == NodeKind::Dir {
-            return true;
+            return false;
         }
         // A destination that could not be stamped when captured is treated as changed.
-        self.stamp.is_some() && path_stamp(path).ok() == self.stamp
-    }
-
-    /// The moved-aside destination, open as `file`, still has the captured size, last-write
-    /// time and content. The file id is not compared (see `identity_matches`).
-    fn content_matches(&self, file: &File, aside: &Path) -> bool {
         let Some(stamp) = &self.stamp else {
             return false;
         };
-        let Ok(now) = handle_stamp(file) else {
-            return false;
-        };
-        if now.len != stamp.len || now.modified != stamp.modified {
+        if handle_stamp(file).ok().as_ref() != Some(stamp) {
             return false;
         }
         match &self.check {
             ContentCheck::StampOnly => true,
             ContentCheck::Hash(digest) => {
-                hashing::hash_reader(file, aside, &CancelToken::new(), None)
+                hashing::hash_reader(file, path, &CancelToken::new(), None)
                     .is_ok_and(|now| now == *digest)
             }
-            ContentCheck::LinkTarget(target) => {
-                fs::read_link(aside).is_ok_and(|now| now == *target)
-            }
+            ContentCheck::LinkTarget(target) => fs::read_link(path).is_ok_and(|now| now == *target),
             ContentCheck::Unreadable => false,
         }
     }
 
-    /// Both checks at once, for the unit tests.
+    /// [`matches_open`](Self::matches_open) for the unit tests, opening `path` itself.
     #[cfg(test)]
     fn still_matches(&self, path: &Path) -> bool {
-        self.identity_matches(path)
-            && (self.kind == NodeKind::Dir
-                || open_denying_writers(path).is_ok_and(|f| self.content_matches(&f, path)))
+        open_denying_writers(path).is_ok_and(|f| self.matches_open(&f, path))
     }
 }
 
@@ -2845,8 +2915,9 @@ mod tests {
         assert!(no_partials(&f.dst));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn replace_restores_the_destination_when_it_changed() {
+    fn replace_denies_writers_while_publishing() {
         let f = fx();
         let source = f.src.join("replace.bin");
         let dest = f.dst.join("replace.bin");
@@ -2854,10 +2925,14 @@ mod tests {
         fs::write(&dest, b"version shown in Replace prompt").unwrap();
         AFTER_REPLACE_ASIDE.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|dest| {
-                // Something rewrites the moved-aside original while it is being verified.
+                // The moved-aside previous version is held open by the Replace: no writer.
                 let aside = replaced_leftovers(dest.parent().unwrap());
                 assert_eq!(aside.len(), 1, "{aside:?}");
-                fs::write(&aside[0], b"rewritten by someone else").unwrap();
+                let err = OpenOptions::new()
+                    .write(true)
+                    .open(&aside[0])
+                    .expect_err("the previous version must not be writable");
+                assert_eq!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION), "{err}");
             }))
         });
 
@@ -2869,17 +2944,8 @@ mod tests {
         );
         AFTER_REPLACE_ASIDE.with(|hook| *hook.borrow_mut() = None);
 
-        assert_eq!(fs::read(&dest).unwrap(), b"rewritten by someone else");
-        assert!(
-            report.failed.iter().any(|issue| {
-                issue.path == source
-                    && issue
-                        .reason
-                        .contains("changed after you chose Replace; not overwritten")
-                    && !issue.reason.contains("kept as")
-            }),
-            "{report:?}"
-        );
+        assert!(report.failed.is_empty(), "{report:?}");
+        assert_eq!(fs::read(&dest).unwrap(), b"replacement bytes");
         assert!(no_replaced_leftovers(&f.dst));
         assert!(no_partials(&f.dst));
     }
@@ -3029,16 +3095,16 @@ mod tests {
     }
 
     #[test]
-    fn replace_state_content_check_ignores_the_file_id() {
+    fn replace_state_compares_the_full_identity_through_the_handle() {
         let f = fx();
         let a = f.dst.join("a.txt");
         let b = f.dst.join("b.txt");
-        let c = f.dst.join("c.txt");
         fs::write(&a, b"same bytes").unwrap();
         let md = fs::symlink_metadata(&a).unwrap();
         let state = ReplaceState::capture(&a, &md);
         let mtime = md.modified().unwrap();
 
+        // Same bytes and time, different file: the file id differs.
         fs::write(&b, b"same bytes").unwrap();
         OpenOptions::new()
             .write(true)
@@ -3046,28 +3112,94 @@ mod tests {
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert!(!state.identity_matches(&b));
-        assert!(state.content_matches(&open_denying_writers(&b).unwrap(), &b));
+        assert!(!state.matches_open(&open_denying_writers(&b).unwrap(), &b));
+        assert!(state.matches_open(&open_denying_writers(&a).unwrap(), &a));
 
-        // Same length and time, different bytes.
-        fs::write(&b, b"diff bytes").unwrap();
+        // The same file, same length and time, different bytes.
+        fs::write(&a, b"diff bytes").unwrap();
         OpenOptions::new()
             .write(true)
-            .open(&b)
+            .open(&a)
             .unwrap()
             .set_modified(mtime)
             .unwrap();
-        assert!(!state.content_matches(&open_denying_writers(&b).unwrap(), &b));
+        assert!(!state.matches_open(&open_denying_writers(&a).unwrap(), &a));
+    }
 
-        // Same bytes, different time.
-        fs::write(&c, b"same bytes").unwrap();
-        OpenOptions::new()
-            .write(true)
-            .open(&c)
-            .unwrap()
-            .set_modified(mtime + std::time::Duration::from_secs(1))
-            .unwrap();
-        assert!(!state.content_matches(&open_denying_writers(&c).unwrap(), &c));
+    #[test]
+    fn replace_state_does_not_hash_files_whose_find_data_says_online_only() {
+        struct Attrs(Option<u32>);
+        impl crate::cloud::AttributeSource for Attrs {
+            fn attributes(&self, _: &Path) -> Option<u32> {
+                self.0
+            }
+        }
+        let f = fx();
+        let path = f.dst.join("local.txt");
+        fs::write(&path, b"local file").unwrap();
+        let md = fs::symlink_metadata(&path).unwrap();
+
+        let recall_on_open = Attrs(Some(crate::cloud::FILE_ATTRIBUTE_RECALL_ON_OPEN));
+        let captured = ReplaceState::capture_with(&path, &md, &recall_on_open);
+        assert_eq!(captured.check, ContentCheck::StampOnly);
+        // Unreadable attributes fail closed: no hash either.
+        let unknown = ReplaceState::capture_with(&path, &md, &Attrs(None));
+        assert_eq!(unknown.check, ContentCheck::StampOnly);
+        let local = ReplaceState::capture_with(&path, &md, &Attrs(Some(0x20)));
+        assert!(matches!(local.check, ContentCheck::Hash(_)));
+    }
+
+    #[test]
+    fn replace_keeps_a_destination_swapped_after_the_check() {
+        let small = b"version shown in Replace prompt".to_vec();
+        let large = vec![b'd'; REPLACE_HASH_LIMIT as usize + 1];
+        for original in [small, large] {
+            let f = fx();
+            let source = f.src.join("replace.bin");
+            let dest = f.dst.join("replace.bin");
+            fs::write(&source, vec![b's'; COPY_CHUNK * 2]).unwrap();
+            fs::write(&dest, &original).unwrap();
+            let original_modified = fs::metadata(&dest).unwrap().modified().unwrap();
+            let saved = vec![b'e'; original.len()];
+            let hook_dest = dest.clone();
+            let hook_saved = saved.clone();
+            BEFORE_REPLACE_ASIDE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    // An editor's save after the check: same size and time, new file id.
+                    let save = hook_dest.with_extension("save");
+                    fs::write(&save, &hook_saved).unwrap();
+                    OpenOptions::new()
+                        .write(true)
+                        .open(&save)
+                        .unwrap()
+                        .set_modified(original_modified)
+                        .unwrap();
+                    // Our handle on the old version shares DELETE, so this replaces it.
+                    fs::rename(&save, &hook_dest).unwrap();
+                }))
+            });
+
+            let report = run(
+                OpKind::Copy,
+                std::slice::from_ref(&source),
+                &f.dst,
+                opts(ConflictPolicy::Overwrite),
+            );
+            BEFORE_REPLACE_ASIDE.with(|hook| *hook.borrow_mut() = None);
+
+            assert_eq!(fs::read(&dest).unwrap(), saved, "{}", original.len());
+            assert!(
+                report.failed.iter().any(|issue| {
+                    issue.path == source
+                        && issue.reason.contains(
+                            "destination changed after you chose Replace; not overwritten",
+                        )
+                }),
+                "{report:?}"
+            );
+            assert!(no_replaced_leftovers(&f.dst), "{report:?}");
+            assert!(no_partials(&f.dst));
+        }
     }
 
     #[test]
@@ -3123,15 +3255,14 @@ mod tests {
         fs::write(&dest, b"version shown in Replace prompt").unwrap();
         let held: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
         let hook_held = Arc::clone(&held);
-        let hook_dir = f.dst.clone();
-        AFTER_REPLACE_ASIDE.with(|hook| {
-            *hook.borrow_mut() = Some(Box::new(move |_| {
-                // Hold the moved-aside file open without FILE_SHARE_DELETE: it cannot be deleted.
-                let aside = replaced_leftovers(&hook_dir).pop().unwrap();
+        BEFORE_ASIDE_DELETE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |aside| {
+                // Hold the previous version open without FILE_SHARE_DELETE: it cannot be deleted.
+                // The Replace's own handle is closed by now.
                 let file = OpenOptions::new()
                     .read(true)
                     .share_mode(FILE_SHARE_READ.0)
-                    .open(&aside)
+                    .open(aside)
                     .unwrap();
                 *hook_held.lock().unwrap() = Some(file);
             }))
@@ -3143,7 +3274,7 @@ mod tests {
             &f.dst,
             opts(ConflictPolicy::Overwrite),
         );
-        AFTER_REPLACE_ASIDE.with(|hook| *hook.borrow_mut() = None);
+        BEFORE_ASIDE_DELETE.with(|hook| *hook.borrow_mut() = None);
 
         assert!(report.failed.is_empty(), "{report:?}");
         assert_eq!(fs::read(&dest).unwrap(), b"replacement bytes");
