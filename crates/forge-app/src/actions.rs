@@ -1107,6 +1107,8 @@ pub fn open_file(app: &mut ZxrawApp, path: &Path) {
 pub struct FolderWants {
     key: Option<WantKey>,
     folders: Vec<PathBuf>,
+    /// Changes only when `folders` does, so the service skips its own comparison.
+    generation: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1139,11 +1141,14 @@ impl FolderWants {
     /// The folders of the tab at `active`: the listed folders of each pane in Details view
     /// (the Size column), then the selected folders of the focused pane (the status bar
     /// totals them in any view).
-    fn refresh(&mut self, tabs: &mut [Tab], active: usize) -> &[PathBuf] {
+    /// Returns the folders and their generation.
+    fn refresh(&mut self, tabs: &mut [Tab], active: usize) -> (u64, &[PathBuf]) {
         let Some(tab) = tabs.get_mut(active) else {
-            self.key = None;
-            self.folders.clear();
-            return &self.folders;
+            if self.key.take().is_some() || !self.folders.is_empty() {
+                self.folders.clear();
+                self.generation += 1;
+            }
+            return (self.generation, &self.folders);
         };
         let key = WantKey {
             listings: (
@@ -1159,22 +1164,29 @@ impl FolderWants {
         };
         if self.key != Some(key) {
             self.key = Some(key);
-            self.folders.clear();
+            // Listing revisions also move when totals are written into the rows (a few times
+            // a second while measuring), mostly leaving the same folders: compared here, at
+            // most once per change, so the generation moves only when the folders do.
+            let mut folders = Vec::with_capacity(self.folders.len());
             for pane in std::iter::once(&mut tab.left).chain(tab.right.as_mut()) {
                 if pane.view == ViewMode::Details {
-                    self.folders.extend_from_slice(pane.listed_folders());
+                    folders.extend_from_slice(pane.listed_folders());
                 }
             }
             let focused = tab.focused();
-            self.folders.extend(
+            folders.extend(
                 focused
                     .entries
                     .iter()
                     .filter(|e| e.is_dir() && focused.selected.contains(&e.path))
                     .map(|e| e.path.clone()),
             );
+            if folders != self.folders {
+                self.folders = folders;
+                self.generation += 1;
+            }
         }
-        &self.folders
+        (self.generation, &self.folders)
     }
 }
 
@@ -1228,8 +1240,8 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     for d in &due {
         app.ops.folder_sizes.invalidate(d);
     }
-    let wanted = app.ops.folder_wants.refresh(&mut app.tabs, app.active);
-    app.ops.folder_sizes.want(wanted, &folders);
+    let (generation, wanted) = app.ops.folder_wants.refresh(&mut app.tabs, app.active);
+    app.ops.folder_sizes.want_at(generation, wanted, &folders);
     let mut sizes_changed = false;
     let mut retry: Option<Duration> = None;
     for tab in app.tabs.iter_mut() {

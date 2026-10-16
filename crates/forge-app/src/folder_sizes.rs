@@ -53,6 +53,11 @@ const BUSY_EVENTS: u32 = 20;
 const NETWORK_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 /// Local totals no watch covers (the watch failed) count as fresh this long.
 const UNWATCHED_MAX_AGE: Duration = Duration::from_secs(30);
+/// Partial totals (a folder could not be read) count as fresh this long: a folder that becomes
+/// readable (its permissions fixed) sends no event to the watch, so it is simply read again.
+/// Only the folders on the way to the unreadable ones are listed again; complete branches
+/// are reused.
+const PARTIAL_MAX_AGE: Duration = Duration::from_secs(30);
 /// Walks below a root whose watch is being set up wait this long for it, so their result
 /// can be trusted instead of having to be measured twice.
 const REGISTER_GRACE: Duration = Duration::from_secs(1);
@@ -92,6 +97,7 @@ struct Timing {
     busy_gap: Duration,
     network_max_age: Duration,
     unwatched_max_age: Duration,
+    partial_max_age: Duration,
     register_grace: Duration,
 }
 
@@ -103,6 +109,7 @@ impl Default for Timing {
             busy_gap: BUSY_GAP,
             network_max_age: NETWORK_MAX_AGE,
             unwatched_max_age: UNWATCHED_MAX_AGE,
+            partial_max_age: PARTIAL_MAX_AGE,
             register_grace: REGISTER_GRACE,
         }
     }
@@ -265,6 +272,8 @@ pub struct FolderSizes {
     register: Option<Sender<Vec<PathBuf>>>,
     last_folders: Vec<PathBuf>,
     last_roots: Vec<PathBuf>,
+    /// The generation given to the last [`FolderSizes::want_at`] (`None` after `want`).
+    last_generation: Option<u64>,
     /// `last_*` have been applied under the current settings.
     applied: bool,
 }
@@ -334,6 +343,7 @@ impl FolderSizes {
             register: None,
             last_folders: Vec::new(),
             last_roots: Vec::new(),
+            last_generation: None,
             applied: false,
         }
     }
@@ -354,17 +364,37 @@ impl FolderSizes {
 
     /// The folders whose totals are on screen now (all panes, visible dir rows) and the
     /// folders the panes show (`roots`). A root gets a recursive change watch only while it
-    /// contains a wanted folder, so a pane with nothing to measure watches nothing. Cheap
-    /// when both lists are unchanged, so it may be called every frame. Queues measurements
+    /// contains a wanted folder, so a pane with nothing to measure watches nothing. Compares
+    /// both lists to the last call's (tests; the app uses [`FolderSizes::want_at`]). Queues measurements
     /// for wanted folders without a fresh result; cancels running/queued work for folders no
     /// longer wanted. Totals that expire later are re-measured by the workers on their own.
+    #[cfg(test)]
     pub fn want(&mut self, folders: &[PathBuf], roots: &[PathBuf]) {
         if self.applied
+            && self.last_generation.is_none()
             && folders == self.last_folders.as_slice()
             && roots == self.last_roots.as_slice()
         {
             return;
         }
+        self.last_generation = None;
+        self.last_folders = folders.to_vec();
+        self.last_roots = roots.to_vec();
+        self.applied = true;
+        self.apply();
+    }
+
+    /// [`FolderSizes::want`] for a caller that calls it every frame: `generation` changes
+    /// whenever `folders` does, so an unchanged frame costs a comparison of `roots` (the few
+    /// folders the panes show) instead of every wanted path.
+    pub fn want_at(&mut self, generation: u64, folders: &[PathBuf], roots: &[PathBuf]) {
+        if self.applied
+            && self.last_generation == Some(generation)
+            && roots == self.last_roots.as_slice()
+        {
+            return;
+        }
+        self.last_generation = Some(generation);
         self.last_folders = folders.to_vec();
         self.last_roots = roots.to_vec();
         self.applied = true;
@@ -665,8 +695,30 @@ impl State {
     }
 
     /// How a total of `dir` from a walk that `tainted` or not, started `trusted` (under a
-    /// watch) or not, is kept: `(fresh, trusted, until)`.
+    /// watch) or not, is kept: `(fresh, trusted, until)`. A `partial` total is never reused
+    /// by later walks and expires (see [`PARTIAL_MAX_AGE`]).
+    #[allow(clippy::too_many_arguments)]
     fn classify(
+        &self,
+        dir: &Path,
+        network: bool,
+        trusted: bool,
+        tainted: bool,
+        partial: bool,
+        now: Instant,
+        timing: &Timing,
+    ) -> (bool, bool, Option<Instant>) {
+        let (fresh, trusted, until) =
+            self.classify_complete(dir, network, trusted, tainted, now, timing);
+        if partial && fresh {
+            let limit = now + timing.partial_max_age;
+            (true, false, Some(until.map_or(limit, |u| u.min(limit))))
+        } else {
+            (fresh, trusted, until)
+        }
+    }
+
+    fn classify_complete(
         &self,
         dir: &Path,
         network: bool,
@@ -1045,7 +1097,7 @@ impl State {
         };
         if let Some(totals) = totals {
             let (fresh, trusted, until) =
-                self.classify(&path, job.network, job.trusted, tainted, now, timing);
+                self.classify(&path, job.network, job.trusted, tainted, totals.partial, now, timing);
             self.insert(
                 path.clone(),
                 Cached {
@@ -1098,6 +1150,7 @@ impl SizeCache for Adapter<'_> {
             job.network,
             job.trusted,
             tainted,
+            totals.partial,
             now,
             &self.shared.timing,
         );
@@ -1401,6 +1454,7 @@ mod tests {
             busy_gap: Duration::from_millis(400),
             network_max_age: NETWORK_MAX_AGE,
             unwatched_max_age: UNWATCHED_MAX_AGE,
+            partial_max_age: PARTIAL_MAX_AGE,
             register_grace: REGISTER_GRACE,
         }
     }
@@ -1864,6 +1918,52 @@ mod tests {
         write(&r.join("c").join("later.bin"), 1000);
         // No event and no new `want`: the total expires and is measured again.
         assert!(wait_known_bytes(&fs, &r, 1350));
+    }
+
+    #[test]
+    fn want_at_skips_an_unchanged_generation_without_looking_at_the_folders() {
+        let mut fs = FolderSizes::with_walk(
+            egui::Context::default(),
+            |_, _, _, _| Ok(DirTotals::default()),
+            quick(),
+        );
+        let a = PathBuf::from(r"C:\fake\a");
+        let b = PathBuf::from(r"C:\fake\b");
+        fs.want_at(1, std::slice::from_ref(&a), &[]);
+        assert!(fs.shared.state.lock().wanted.contains_key(&a));
+        // Same generation: the (deliberately different) list is not even read.
+        fs.want_at(1, std::slice::from_ref(&b), &[]);
+        assert!(!fs.shared.state.lock().wanted.contains_key(&b));
+        fs.want_at(2, std::slice::from_ref(&b), &[]);
+        let st = fs.shared.state.lock();
+        assert!(st.wanted.contains_key(&b) && !st.wanted.contains_key(&a));
+    }
+
+    #[test]
+    fn a_partial_total_is_measured_again_after_a_while() {
+        // The folder is unreadable at first ("+"), then readable: no event says so.
+        let walks = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&walks);
+        let mut fs = FolderSizes::with_parts(
+            egui::Context::default(),
+            move |_, _, _, _| {
+                let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(DirTotals { bytes: if first { 10 } else { 30 }, files: 1, dirs: 0, partial: first })
+            },
+            Timing {
+                partial_max_age: Duration::from_millis(300),
+                ..quick()
+            },
+            Some(Box::new(|_| Some(true))),
+        );
+        let root = PathBuf::from(r"C:\fake\locked");
+        fs.want(std::slice::from_ref(&root), std::slice::from_ref(&root));
+        assert!(wait_for(LIMIT, || known(&fs, &root).is_some_and(|t| t.partial)));
+        assert!(!fs.shared.state.lock().cache[&root].trusted, "later walks must read it again");
+        // No event and no new `want`: the partial total expires and is measured again.
+        assert!(wait_known_bytes(&fs, &root, 30));
+        assert!(!known(&fs, &root).unwrap().partial);
+        assert!(fs.shared.state.lock().cache[&root].trusted, "a complete total under a watch");
     }
 
     #[test]
