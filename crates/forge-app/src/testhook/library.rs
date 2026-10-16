@@ -12,7 +12,7 @@
 //!   containing the text (and shown no results).
 //! - `assert-result-count <n>`.
 //! - `index <folder>`: start an index job for a folder, as the window's "Re-index" button
-//!   does. Use `wait-jobs` to wait for it.
+//!   does (first waiting for the library database to open). Use `wait-jobs` to wait for it.
 //! - `wait-files <min> <max>`: wait until the number of indexed rows is in `min..max`
 //!   (handy for an index job caught part-way).
 //!
@@ -115,6 +115,11 @@ pub(super) fn step(
         }
         "index" => {
             let folder = super::sandboxed(Path::new(&non_empty(args, "expected a folder")?))?;
+            // The database opens (and migrates) on a background thread; a script's first step
+            // can come sooner on a busy machine.
+            if app.ops.library.db.is_none() {
+                return wait(st, "the library database is still opening");
+            }
             let db = library_db(app)?;
             let tx = app.ops.tx.clone();
             let c = ctx.clone();
@@ -126,6 +131,9 @@ pub(super) fn step(
         }
         "wait-files" => {
             let (min, max) = two_numbers(args)?;
+            if app.ops.library.db.is_none() {
+                return wait(st, "the library database is still opening");
+            }
             let db = library_db(app)?;
             let files = db.stats().map_err(|e| e.to_string())?.files as usize;
             if (min..max).contains(&files) {
