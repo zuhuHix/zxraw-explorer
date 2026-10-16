@@ -29,6 +29,7 @@ use crate::error::{CoreError, Result};
 use crate::fault;
 use crate::hashing::{self, Digest};
 use crate::paths;
+use crate::stamp::{Stamp, path_stamp};
 
 /// Copy buffer size. 2 MiB keeps large sequential transfers efficient while still checking
 /// cancellation/pause several times per second even on slow USB media.
@@ -1180,30 +1181,66 @@ enum Placement {
     Fail(String),
 }
 
-/// Metadata observed when a Replace decision is presented. It is checked again immediately
-/// before an overwrite is published so a later save at the destination is preserved.
-#[derive(Debug, Clone, Copy)]
+/// Destinations up to this size are also hashed when a Replace decision is presented: reading
+/// them twice is cheap next to the copy.
+const REPLACE_HASH_LIMIT: u64 = 4 * 1024 * 1024;
+
+/// Identity of a destination observed when a Replace decision is presented. It is checked
+/// again immediately before an overwrite is published so a later save at the destination is
+/// preserved. Size and last-write time alone miss a same-size rewrite within one clock tick,
+/// so the file id (catches saves that rename a new file over it) and, for files up to
+/// [`REPLACE_HASH_LIMIT`], a content hash are compared too.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplaceState {
     kind: NodeKind,
-    size: u64,
-    modified: Option<SystemTime>,
+    stamp: Option<Stamp>,
+    hash: Option<Digest>,
 }
 
 impl ReplaceState {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
+    fn capture(path: &Path, metadata: &fs::Metadata) -> Self {
+        let kind = node_kind(metadata);
+        if kind != NodeKind::File {
+            return Self {
+                kind,
+                stamp: None,
+                hash: None,
+            };
+        }
         Self {
-            kind: node_kind(metadata),
-            size: metadata.len(),
-            modified: metadata.modified().ok(),
+            kind,
+            stamp: path_stamp(path).ok(),
+            hash: if metadata.len() <= REPLACE_HASH_LIMIT {
+                hashing::hash_file(path, &CancelToken::new(), None).ok()
+            } else {
+                None
+            },
         }
     }
 
-    fn still_matches(self, path: &Path) -> bool {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            node_kind(&metadata) == self.kind
-                && metadata.len() == self.size
-                && metadata.modified().ok() == self.modified
-        })
+    fn still_matches(&self, path: &Path) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if node_kind(&metadata) != self.kind {
+            return false;
+        }
+        if self.kind != NodeKind::File {
+            return true;
+        }
+        // A destination that could not be stamped when captured is treated as changed.
+        if self.stamp.is_none() || path_stamp(path).ok() != self.stamp {
+            return false;
+        }
+        match &self.hash {
+            Some(hash) => {
+                hashing::hash_file(path, &CancelToken::new(), None)
+                    .ok()
+                    .as_ref()
+                    == Some(hash)
+            }
+            None => true,
+        }
     }
 }
 
@@ -1338,7 +1375,19 @@ impl Executor<'_, '_, '_> {
         let dkind = node_kind(&dmd);
         // Capture before asking the resolver: it may wait while another app saves a new
         // version, and Replace must apply only to the item described in this prompt.
-        let replace_state = ReplaceState::from_metadata(&dmd);
+        // Hashing is expensive, so only capture when an overwrite is actually possible.
+        let replace_state = if item.kind == NodeKind::File
+            && dkind == NodeKind::File
+            && !matches!(self.policy, ConflictPolicy::Skip | ConflictPolicy::KeepBoth)
+        {
+            ReplaceState::capture(&dest, &dmd)
+        } else {
+            ReplaceState {
+                kind: dkind,
+                stamp: None,
+                hash: None,
+            }
+        };
         if item.kind == NodeKind::Dir && dkind == NodeKind::Dir {
             if is_root && self.policy == ConflictPolicy::KeepBoth {
                 return Ok(Placement::KeepBoth(Self::unique(&dest, item.kind)));
@@ -1656,7 +1705,10 @@ impl Executor<'_, '_, '_> {
                             f(&dest);
                         }
                     });
-                    if !replace_state.is_some_and(|state| state.still_matches(&dest)) {
+                    if !replace_state
+                        .as_ref()
+                        .is_some_and(|state| state.still_matches(&dest))
+                    {
                         self.fail(
                             src,
                             "destination changed after you chose Replace; not overwritten",
@@ -1714,8 +1766,11 @@ impl Executor<'_, '_, '_> {
         };
         let mut counted = 0;
         let replace_guard_path = dest.clone();
-        let replace_still_ok =
-            move || replace_state.is_some_and(|state| state.still_matches(&replace_guard_path));
+        let replace_still_ok = || {
+            replace_state
+                .as_ref()
+                .is_some_and(|state| state.still_matches(&replace_guard_path))
+        };
         let res = copy_file_counted(
             src,
             &mut dest,
@@ -2325,6 +2380,140 @@ mod tests {
             }),
             "{report:?}"
         );
+    }
+
+    #[test]
+    fn replace_detects_a_same_size_rewrite_with_the_same_modified_time() {
+        let f = fx();
+        let source = f.src.join("replace.bin");
+        let dest = f.dst.join("replace.bin");
+        fs::write(&source, vec![b's'; COPY_CHUNK * 2]).unwrap();
+        fs::write(&dest, b"version shown in Replace prompt").unwrap();
+        let original_modified = fs::metadata(&dest).unwrap().modified().unwrap();
+        let rewritten: &[u8] = b"newer version saved during copy";
+        let hook_dest = dest.clone();
+        AFTER_CHUNK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, bytes| {
+                if bytes == COPY_CHUNK as u64 {
+                    // A save within the same clock tick: same size, same last-write time.
+                    fs::write(&hook_dest, rewritten).unwrap();
+                    let file = fs::OpenOptions::new().write(true).open(&hook_dest).unwrap();
+                    file.set_modified(original_modified).unwrap();
+                }
+            }))
+        });
+
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        AFTER_CHUNK.with(|hook| *hook.borrow_mut() = None);
+
+        let metadata = fs::metadata(&dest).unwrap();
+        assert_eq!(metadata.len(), rewritten.len() as u64);
+        assert_eq!(metadata.modified().unwrap(), original_modified);
+        assert_eq!(fs::read(&dest).unwrap(), rewritten);
+        assert!(
+            report.failed.iter().any(|issue| {
+                issue.path == source
+                    && issue
+                        .reason
+                        .contains("changed after you chose Replace; not overwritten")
+            }),
+            "{report:?}"
+        );
+        assert!(no_partials(&f.dst));
+    }
+
+    #[test]
+    fn move_replace_detects_a_same_size_rewrite_with_the_same_modified_time() {
+        let f = fx();
+        let source = f.src.join("move.bin");
+        let dest = f.dst.join("move.bin");
+        fs::write(&source, b"move source").unwrap();
+        fs::write(&dest, b"version shown in Replace prompt").unwrap();
+        let original_modified = fs::metadata(&dest).unwrap().modified().unwrap();
+        let hook_dest = dest.clone();
+        BEFORE_MOVE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_| {
+                fs::write(&hook_dest, b"newer version saved during copy").unwrap();
+                let file = fs::OpenOptions::new().write(true).open(&hook_dest).unwrap();
+                file.set_modified(original_modified).unwrap();
+            }))
+        });
+
+        let report = run(
+            OpKind::Move,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        BEFORE_MOVE_RENAME.with(|hook| *hook.borrow_mut() = None);
+
+        let metadata = fs::metadata(&dest).unwrap();
+        assert_eq!(
+            metadata.len(),
+            b"newer version saved during copy".len() as u64
+        );
+        assert_eq!(metadata.modified().unwrap(), original_modified);
+        assert_eq!(fs::read(&dest).unwrap(), b"newer version saved during copy");
+        assert!(source.exists(), "a refused move must keep its source");
+        assert!(
+            report.failed.iter().any(|issue| {
+                issue.path == source
+                    && issue
+                        .reason
+                        .contains("changed after you chose Replace; not overwritten")
+            }),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn replace_detects_a_file_renamed_over_the_destination() {
+        let f = fx();
+        let source = f.src.join("replace.bin");
+        let dest = f.dst.join("replace.bin");
+        let original: &[u8] = b"version shown in Replace prompt";
+        fs::write(&source, vec![b's'; COPY_CHUNK * 2]).unwrap();
+        fs::write(&dest, original).unwrap();
+        let original_modified = fs::metadata(&dest).unwrap().modified().unwrap();
+        let hook_dest = dest.clone();
+        let saving = f.dst.join("replace.bin.saving");
+        AFTER_CHUNK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_, bytes| {
+                if bytes == COPY_CHUNK as u64 {
+                    // Same bytes and mtime as the original: only the file id differs.
+                    fs::write(&saving, original).unwrap();
+                    let file = fs::OpenOptions::new().write(true).open(&saving).unwrap();
+                    file.set_modified(original_modified).unwrap();
+                    drop(file);
+                    fs::rename(&saving, &hook_dest).unwrap();
+                }
+            }))
+        });
+
+        let report = run(
+            OpKind::Copy,
+            std::slice::from_ref(&source),
+            &f.dst,
+            opts(ConflictPolicy::Overwrite),
+        );
+        AFTER_CHUNK.with(|hook| *hook.borrow_mut() = None);
+
+        assert_eq!(fs::read(&dest).unwrap(), original);
+        assert!(
+            report.failed.iter().any(|issue| {
+                issue.path == source
+                    && issue
+                        .reason
+                        .contains("changed after you chose Replace; not overwritten")
+            }),
+            "{report:?}"
+        );
+        assert!(no_partials(&f.dst));
     }
 
     #[test]

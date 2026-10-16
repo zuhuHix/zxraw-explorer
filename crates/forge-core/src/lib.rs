@@ -32,6 +32,7 @@ pub mod paths;
 pub mod query;
 pub mod rename;
 pub mod split;
+pub(crate) mod stamp;
 pub mod text_replace;
 
 pub use error::{CoreError, Result};
