@@ -8,12 +8,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use egui::{Align2, Color32, FontId, Rect, Sense, Stroke, Ui, Vec2, pos2, vec2};
+use forge_core::dir_size::DirTotals;
 use forge_core::model::{EntryKind, MediaKind, format_size};
 use forge_core::{FileEntry, listing::SortKey};
 
 use crate::commands::Cmd;
+use crate::folder_sizes::FolderSize;
 use crate::pane::{LoadState, Pane};
 use crate::theme;
+use crate::viewer::cull::format_count;
 
 /// Payload for in-app drag and drop: the dragged paths and, for each, its kind as the pane
 /// listed it (`None` if unknown). Drop targets use the kind instead of asking the disk.
@@ -53,6 +56,11 @@ pub trait ThumbProvider {
     /// Optional Git status badge of an entry (see `git_status`).
     fn git_badge(&self, _path: &Path, _is_dir: bool) -> Option<crate::git_status::GitBadge> {
         None
+    }
+    /// Recursive total of a folder for the Size column (see `folder_sizes`). Off unless the
+    /// provider has the folder sizes service.
+    fn folder_size(&self, _path: &Path) -> crate::folder_sizes::FolderSize {
+        crate::folder_sizes::FolderSize::Off
     }
 }
 
@@ -740,13 +748,69 @@ fn register_accessible_node(
     });
 }
 
-fn entry_accessibility_description(entry: &FileEntry, annotation: Option<Annotation>) -> String {
+/// Text of a folder's Size cell and whether it is drawn in the weak colour: an older total
+/// shown while the folder is measured again, or a placeholder when there is none yet.
+/// `None` when folder sizes are off, so the cell stays empty.
+pub fn folder_size_text(size: &FolderSize) -> Option<(String, bool)> {
+    match size {
+        FolderSize::Off => None,
+        FolderSize::Known(totals) => Some((folder_total_text(totals), false)),
+        FolderSize::Pending { stale: Some(totals) } => Some((folder_total_text(totals), true)),
+        FolderSize::Pending { stale: None } => Some(("\u{2026}".to_owned(), true)),
+    }
+}
+
+/// `1.20 GB`, with a `+` when part of the folder could not be counted (a lower bound).
+fn folder_total_text(totals: &DirTotals) -> String {
+    let mut text = format_size(totals.bytes);
+    if totals.partial {
+        text.push('+');
+    }
+    text
+}
+
+/// Hover text for a folder's total, e.g. `12,345 files in 678 folders`.
+fn folder_total_tooltip(totals: &DirTotals) -> String {
+    let mut text = format!(
+        "{} files in {} folders",
+        format_count(totals.files as usize),
+        format_count(totals.dirs as usize)
+    );
+    if totals.partial {
+        text.push_str(
+            "\nSome folders could not be read or are cloud folders not on this PC, \
+             so the total is at least this much.",
+        );
+    }
+    text
+}
+
+/// The folder total a description may state: only a measured one, not a stale or pending one.
+fn known_folder_total(entry: &FileEntry, thumbs: &dyn ThumbProvider) -> Option<DirTotals> {
+    match thumbs.folder_size(&entry.path) {
+        FolderSize::Known(totals) if entry.is_dir() => Some(totals),
+        _ => None,
+    }
+}
+
+fn entry_accessibility_description(
+    entry: &FileEntry,
+    annotation: Option<Annotation>,
+    folder_total: Option<DirTotals>,
+) -> String {
     let mut parts = vec![format!("Type: {}", type_label(entry))];
     if entry.online_only {
         parts.push("Online-only".into());
     }
     if entry.kind == EntryKind::File {
         parts.push(format!("Size: {}", format_size(entry.size)));
+    } else if let Some(totals) = folder_total {
+        let size = format_size(totals.bytes);
+        parts.push(if totals.partial {
+            format!("Size: at least {size}")
+        } else {
+            format!("Size: {size}")
+        });
     }
     if let Some(modified) = entry.modified {
         parts.push(format!("Date modified: {}", format_time(Some(modified))));
@@ -1475,12 +1539,29 @@ pub fn details(
             );
             col_x += name_column.width;
 
+            // Folders show their recursive total (from the folder sizes service); other
+            // rows get `Off`, so their Size cell is empty unless it is a file's size.
+            let folder_size = if entry.kind == EntryKind::Dir {
+                thumbs.folder_size(&entry.path)
+            } else {
+                FolderSize::Off
+            };
+            let mut size_color = text_color;
             for column in columns.iter().skip(1) {
                 let text = match column.label {
                     "Date modified" => format_time(entry.modified),
                     "Type" => type_label(entry),
                     "Size" if entry.kind == EntryKind::File => format_size(entry.size),
-                    "Size" => String::new(),
+                    "Size" => match folder_size_text(&folder_size) {
+                        Some((text, weak)) => {
+                            // A selected row keeps the selection colour for its sizes too.
+                            if weak && !selected {
+                                size_color = ui.visuals().weak_text_color();
+                            }
+                            text
+                        }
+                        None => String::new(),
+                    },
                     "Date created" => {
                         let created = format_time(entry.created);
                         if created.is_empty() {
@@ -1522,8 +1603,20 @@ pub fn details(
                             Align2::RIGHT_CENTER,
                             text,
                             small.clone(),
-                            text_color,
+                            size_color,
                         );
+                    // The breakdown is built only when the pointer is on the cell.
+                    if let FolderSize::Known(totals) | FolderSize::Pending { stale: Some(totals) } =
+                        folder_size
+                    {
+                        let cell =
+                            Rect::from_min_size(pos2(col_x, rect.top()), vec2(column.width, row_h));
+                        let id = ui.id().with(("folder-size", &entry.path));
+                        ui.interact(cell, id, Sense::hover())
+                            .on_hover_ui_at_pointer(move |ui| {
+                                ui.label(folder_total_tooltip(&totals));
+                            });
+                    }
                 } else {
                     painter
                         .with_clip_rect(Rect::from_min_size(
@@ -1541,7 +1634,11 @@ pub fn details(
                 col_x += column.width;
             }
 
-            let description = entry_accessibility_description(entry, annotation);
+            let description = entry_accessibility_description(
+                entry,
+                annotation,
+                known_folder_total(entry, thumbs),
+            );
             register_accessible_node(
                 &response,
                 egui::accesskit::Role::ListItem,
@@ -2247,7 +2344,11 @@ pub fn grid(
                         galley,
                         label_color,
                     );
-                    let description = entry_accessibility_description(&entry, annotation);
+                    let description = entry_accessibility_description(
+                        &entry,
+                        annotation,
+                        known_folder_total(&entry, thumbs),
+                    );
                     register_accessible_node(
                         &resp,
                         egui::accesskit::Role::GridCell,
@@ -2495,14 +2596,15 @@ mod accessibility_tests {
             ..Default::default()
         };
         assert!(
-            entry_accessibility_description(&entry, Some(with_note)).ends_with("Has a note"),
+            entry_accessibility_description(&entry, Some(with_note), None).ends_with("Has a note"),
             "a file with a note is announced"
         );
         assert!(
-            !entry_accessibility_description(&entry, Some(Annotation::default())).contains("note"),
+            !entry_accessibility_description(&entry, Some(Annotation::default()), None)
+                .contains("note"),
             "a file without a note is not"
         );
-        assert!(!entry_accessibility_description(&entry, None).contains("note"));
+        assert!(!entry_accessibility_description(&entry, None, None).contains("note"));
     }
 
     struct NoThumbs;
@@ -2977,7 +3079,86 @@ mod online_only_tests {
 
     #[test]
     fn online_only_entries_are_described_for_screen_readers() {
-        assert!(entry_accessibility_description(&file(true), None).contains("Online-only"));
-        assert!(!entry_accessibility_description(&file(false), None).contains("Online-only"));
+        assert!(entry_accessibility_description(&file(true), None, None).contains("Online-only"));
+        assert!(!entry_accessibility_description(&file(false), None, None).contains("Online-only"));
+    }
+}
+
+#[cfg(test)]
+mod folder_size_tests {
+    use super::{
+        EntryKind, FileEntry, entry_accessibility_description, folder_size_text,
+        folder_total_tooltip,
+    };
+    use crate::folder_sizes::FolderSize;
+    use forge_core::dir_size::DirTotals;
+    use forge_core::model::format_size;
+
+    const TOTALS: DirTotals = DirTotals {
+        bytes: 1500,
+        files: 12_345,
+        dirs: 678,
+        partial: false,
+    };
+    const PARTIAL: DirTotals = DirTotals {
+        partial: true,
+        ..TOTALS
+    };
+
+    #[test]
+    fn folder_size_cell_text_and_colour_follow_the_measurement_state() {
+        let text = format_size(TOTALS.bytes);
+        assert_eq!(folder_size_text(&FolderSize::Off), None);
+        assert_eq!(
+            folder_size_text(&FolderSize::Known(TOTALS)),
+            Some((text.clone(), false))
+        );
+        assert_eq!(
+            folder_size_text(&FolderSize::Known(PARTIAL)),
+            Some((format!("{text}+"), false))
+        );
+        assert_eq!(
+            folder_size_text(&FolderSize::Pending { stale: Some(TOTALS) }),
+            Some((text.clone(), true))
+        );
+        assert_eq!(
+            folder_size_text(&FolderSize::Pending { stale: Some(PARTIAL) }),
+            Some((format!("{text}+"), true))
+        );
+        assert_eq!(
+            folder_size_text(&FolderSize::Pending { stale: None }),
+            Some(("\u{2026}".to_owned(), true))
+        );
+    }
+
+    #[test]
+    fn folder_tooltip_counts_files_and_folders_and_explains_partial_totals() {
+        assert_eq!(folder_total_tooltip(&TOTALS), "12,345 files in 678 folders");
+        let partial = folder_total_tooltip(&PARTIAL);
+        assert!(
+            partial.starts_with("12,345 files in 678 folders\nSome folders could not be read"),
+            "{partial}"
+        );
+    }
+
+    #[test]
+    fn folder_description_states_the_total_only_when_one_is_given() {
+        let folder = FileEntry {
+            path: "C:/data/photos".into(),
+            name: "photos".into(),
+            kind: EntryKind::Dir,
+            size: 0,
+            modified: None,
+            created: None,
+            hidden: false,
+            readonly: false,
+            system: false,
+            online_only: false,
+            ext: String::new(),
+        };
+        let with_total = entry_accessibility_description(&folder, None, Some(TOTALS));
+        assert!(with_total.contains(&format!("Size: {}", format_size(TOTALS.bytes))));
+        let without = entry_accessibility_description(&folder, None, None);
+        assert!(!without.contains("Size:"));
     }
 }

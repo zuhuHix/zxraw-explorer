@@ -390,18 +390,6 @@ impl FolderSizes {
         self.shared.revision.load(Ordering::Acquire)
     }
 
-    /// Wanted folders still waiting to be measured, being measured or waiting for changes
-    /// to settle (for a "measuring…" hint).
-    pub fn pending_count(&self) -> usize {
-        let st = self.shared.state.lock();
-        st.wanted
-            .keys()
-            .filter(|p| {
-                st.queue.contains(*p) || st.running.contains_key(*p) || st.dirty.contains_key(*p)
-            })
-            .count()
-    }
-
     /// The user refreshed `dir` (F5): totals of `dir`, everything below and its ancestors
     /// are no longer trusted, and the wanted ones among them are measured again now. The old
     /// totals stay visible as stale meanwhile, so the column never blanks.
@@ -1033,13 +1021,11 @@ mod tests {
         let rev = fs.revision();
         fs.want(std::slice::from_ref(&dir), &[]);
         assert_eq!(fs.get(&dir), FolderSize::Pending { stale: None });
-        assert_eq!(fs.pending_count(), 1);
         gate_tx.send(()).unwrap();
         assert!(wait_for(LIMIT, || known(&fs, &dir).is_some()));
         assert_eq!(known(&fs, &dir).unwrap().bytes, 42);
         assert!(fs.revision() > rev);
         assert!(fs.wait_idle(LIMIT));
-        assert_eq!(fs.pending_count(), 0);
     }
 
     #[test]

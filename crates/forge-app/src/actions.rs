@@ -201,6 +201,7 @@ pub struct GridProvider<'a> {
     thumbs: &'a mut crate::thumbs::ThumbManager,
     annotations: &'a std::collections::HashMap<PathBuf, crate::views::Annotation>,
     git: &'a crate::git_status::GitStatus,
+    folder_sizes: &'a crate::folder_sizes::FolderSizes,
 }
 
 impl ThumbProvider for GridProvider<'_> {
@@ -220,6 +221,9 @@ impl ThumbProvider for GridProvider<'_> {
     }
     fn git_badge(&self, path: &Path, is_dir: bool) -> Option<crate::git_status::GitBadge> {
         self.git.badge(path, is_dir)
+    }
+    fn folder_size(&self, path: &Path) -> crate::folder_sizes::FolderSize {
+        self.folder_sizes.get(path)
     }
 }
 
@@ -288,6 +292,7 @@ impl Actions {
             thumbs: &mut self.thumbs,
             annotations: &self.library.annotations,
             git: &self.git,
+            folder_sizes: &self.folder_sizes,
         }
     }
 }

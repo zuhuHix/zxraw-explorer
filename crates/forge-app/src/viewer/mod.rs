@@ -14,7 +14,7 @@
 mod cache;
 mod canvas;
 mod chrome;
-mod cull;
+pub(crate) mod cull;
 mod decode;
 mod loader;
 mod meta;
