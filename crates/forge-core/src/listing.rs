@@ -26,7 +26,37 @@ pub fn entry_for_path(path: &Path) -> Result<FileEntry> {
     Ok(entry_from_metadata(path.to_path_buf(), name, &md))
 }
 
+/// The size of a listed file, correcting the one case where the listing is wrong.
+///
+/// NTFS updates the size kept in a file's directory entry (what `FindFirstFileExW`, and so
+/// `read_dir`, returns) only when a handle to the file is closed. A file still being written
+/// (a recording, a download, a copy in progress) is therefore listed as 0 bytes, however big
+/// it already is. For those, the size is read from the file itself through a handle opened
+/// for attributes only, which never downloads a cloud placeholder. Online-only placeholders
+/// carry their real size in the listing, and network paths are not touched (a round trip per
+/// file), so both keep the listed size.
+pub fn live_file_size(path: &Path, listed: u64, online_only: bool, network: bool) -> u64 {
+    if listed != 0 || online_only || network {
+        return listed;
+    }
+    fs::symlink_metadata(path)
+        .ok()
+        .filter(|md| md.is_file())
+        .map_or(listed, |md| md.len())
+}
+
 fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata) -> FileEntry {
+    entry_from_listed_metadata(path, name, md, false)
+}
+
+/// Like [`entry_from_metadata`] for an entry of a directory listing, whose size may be stale
+/// (see [`live_file_size`]). `network`: the listed folder is on a network location.
+fn entry_from_listed_metadata(
+    path: std::path::PathBuf,
+    name: String,
+    md: &fs::Metadata,
+    network: bool,
+) -> FileEntry {
     let ft = md.file_type();
     // On Windows `is_symlink` is true for name-surrogate reparse points: symlinks and
     // junctions. Cloud placeholders (OneDrive files-on-demand) are reparse points too but are
@@ -44,16 +74,26 @@ fn entry_from_metadata(path: std::path::PathBuf, name: String, md: &fs::Metadata
     } else {
         ext_of(&path)
     };
+    let online_only = crate::cloud::is_online_only_metadata(&path, md);
+    let size = if kind == EntryKind::File {
+        if network {
+            md.len()
+        } else {
+            live_file_size(&path, md.len(), online_only, false)
+        }
+    } else {
+        0
+    };
     FileEntry {
         name,
         kind,
-        size: if kind == EntryKind::File { md.len() } else { 0 },
+        size,
         modified: md.modified().ok(),
         created: md.created().ok(),
         hidden,
         system,
         readonly: md.permissions().readonly(),
-        online_only: crate::cloud::is_online_only_metadata(&path, md),
+        online_only,
         ext,
         path,
     }
@@ -91,6 +131,7 @@ pub fn list_dir_streaming(
     mut sink: impl FnMut(Vec<FileEntry>),
 ) -> Result<usize> {
     let rd = fs::read_dir(dir).map_err(|e| CoreError::io(dir, e))?;
+    let network = crate::netpath::is_network_path(dir);
     let mut buf = Vec::with_capacity(batch);
     let mut errors = 0;
     for (i, item) in rd.enumerate() {
@@ -103,7 +144,7 @@ pub fn list_dir_streaming(
         };
         let name = de.file_name().to_string_lossy().into_owned();
         match de.metadata() {
-            Ok(md) => buf.push(entry_from_metadata(de.path(), name, &md)),
+            Ok(md) => buf.push(entry_from_listed_metadata(de.path(), name, &md, network)),
             Err(_) => {
                 // Still show the entry (e.g. locked system files) with unknown metadata.
                 errors += 1;
@@ -281,6 +322,34 @@ mod tests {
         assert_eq!(e.kind, EntryKind::Link);
         assert!(link_targets_dir(&j));
         assert_eq!(entry_for_path(&target).unwrap().kind, EntryKind::Dir);
+    }
+
+    #[test]
+    fn a_file_still_being_written_is_listed_with_its_live_size() {
+        use std::io::Write;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("recording.mp4");
+        // The handle stays open, as a recorder's or a copy's would: NTFS has not yet put
+        // the new size into the directory entry the listing reads.
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&vec![7u8; 300_000]).unwrap();
+        file.flush().unwrap();
+        let listed = list_dir(d.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size, 300_000);
+        drop(file);
+    }
+
+    #[test]
+    fn live_size_keeps_listed_sizes_and_skips_cloud_and_network_files() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.bin");
+        fs::write(&path, vec![1u8; 10]).unwrap();
+        assert_eq!(live_file_size(&path, 5, false, false), 5);
+        assert_eq!(live_file_size(&path, 0, false, false), 10);
+        assert_eq!(live_file_size(&path, 0, true, false), 0);
+        assert_eq!(live_file_size(&path, 0, false, true), 0);
+        assert_eq!(live_file_size(&d.path().join("gone"), 0, false, false), 0);
     }
 
     #[test]
