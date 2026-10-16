@@ -4,6 +4,7 @@
 //! * `model`, `listing`, `paths`, `error` — shared types & directory enumeration
 //! * `ops` — copy/move/delete/create with conflict policies and verification
 //! * `rename` — batch rename templates with preview
+//! * `dir_size` — recursive folder totals (parallel walk, cache hooks)
 //! * `hashing`, `duplicates`, `disk_usage`, `compare`, `backup_verify` — power-user analysis
 //! * `text_replace` — find and replace text in files (preview, atomic write, undo)
 //! * `query` — search query language (parsed to an AST consumed by `forge-db`)
@@ -17,6 +18,7 @@ pub mod archive;
 pub mod backup_verify;
 pub mod cloud;
 pub mod compare;
+pub mod dir_size;
 pub mod disk_usage;
 pub mod duplicates;
 pub mod error;
