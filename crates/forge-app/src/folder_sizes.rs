@@ -6,12 +6,20 @@
 //! with [`forge_core::dir_size::dir_totals`], and every sub-folder a walk completes is kept,
 //! so opening a sub-folder later shows its sizes at once.
 //!
-//! A recursive change watch on each local folder a pane shows decides which kept totals can
-//! be trusted: while it covers a folder, any change below it arrives as an event, so a total
-//! measured under the watch stays right until an event says otherwise. Later walks skip such
-//! trusted sub-trees and only re-read the branch that changed. Network folders are never
-//! watched (a recursive watch on a share is expensive and unreliable), so their totals are
-//! never reused by walks and are re-measured when they are older than a few minutes.
+//! A recursive change watch on each local folder a pane shows (while some of its folders are
+//! wanted) decides which kept totals can be trusted: while it covers a folder, any change
+//! below it arrives as an event, so a total measured by a walk that *started* under the
+//! watch stays right until an event says otherwise. Later walks skip such trusted sub-trees
+//! and only re-read the branch that changed. A walk that started before its watch was set up
+//! may have missed a change, so its result is shown as stale and measured again once the
+//! watch is up (walks wait briefly for a watch being set up, so this is rare). Where no
+//! watch covers a folder (the watch failed, or a network folder: a recursive watch on a
+//! share is expensive and unreliable), totals are never reused by walks and only count as
+//! fresh for a while, after which a wanted folder is measured again.
+//!
+//! Busy trees (a drive root's AppData, caches, the pagefile) send a steady stream of change
+//! events. An event only marks its folder and ancestors (O(depth)); a wanted folder is then
+//! measured at most every few seconds, so a busy volume costs little while idle.
 //!
 //! Nothing here touches the filesystem on the UI thread: `want`, `get` and `invalidate*`
 //! only update maps (the one exception, telling a mapped network drive from a local one, asks
@@ -35,9 +43,19 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// A folder is measured at most this often while changes keep arriving (a long copy): the
 /// total then moves every couple of seconds instead of waiting for the copy to end.
 const MIN_GAP: Duration = Duration::from_secs(2);
+/// The gap for busy folders: those below a watched drive root, or with many changes in one
+/// debounce window. Keeps a busy volume from turning into constant re-measuring.
+const BUSY_GAP: Duration = Duration::from_secs(5);
+/// Changes within one debounce window that make a folder busy.
+const BUSY_EVENTS: u32 = 20;
 /// Network totals are never trusted (no watch); a wanted one older than this is measured
 /// again.
 const NETWORK_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+/// Local totals no watch covers (the watch failed) count as fresh this long.
+const UNWATCHED_MAX_AGE: Duration = Duration::from_secs(30);
+/// Walks below a root whose watch is being set up wait this long for it, so their result
+/// can be trusted instead of having to be measured twice.
+const REGISTER_GRACE: Duration = Duration::from_secs(1);
 /// Kept totals; past this, untrusted and then the oldest entries are dropped.
 const CACHE_CAP: usize = 200_000;
 /// Network folders measured at once. Each walk lists folders one round trip at a time, so a
@@ -63,11 +81,18 @@ type WalkFn = dyn Fn(&Path, &dyn SizeCache, usize, &CancelToken) -> forge_core::
     + Send
     + Sync;
 
+/// Test hook run by the registrar before it watches a root: may block (a slow
+/// registration) and may decide the outcome (`Some(ok)`) instead of the real watch (`None`).
+type WatchHook = dyn Fn(&Path) -> Option<bool> + Send + Sync;
+
 #[derive(Debug, Clone, Copy)]
 struct Timing {
     debounce: Duration,
     min_gap: Duration,
+    busy_gap: Duration,
     network_max_age: Duration,
+    unwatched_max_age: Duration,
+    register_grace: Duration,
 }
 
 impl Default for Timing {
@@ -75,7 +100,10 @@ impl Default for Timing {
         Self {
             debounce: DEBOUNCE,
             min_gap: MIN_GAP,
+            busy_gap: BUSY_GAP,
             network_max_age: NETWORK_MAX_AGE,
+            unwatched_max_age: UNWATCHED_MAX_AGE,
+            register_grace: REGISTER_GRACE,
         }
     }
 }
@@ -85,18 +113,30 @@ impl Default for Timing {
 struct Cached {
     totals: DirTotals,
     at: Instant,
-    /// `get` shows it as `Known`. Cleared by a change below the folder or when the watch
-    /// that covered it went away; the total is then shown as stale until measured again.
+    /// `get` shows it as `Known` (until `until`, if set). Cleared by a change below the
+    /// folder, when the watch that covered it went away, or when the walk may have missed a
+    /// change; the total is then shown as stale until measured again.
     fresh: bool,
-    /// Measured while a recursive watch covered the folder, and nothing changed since: walks
-    /// may use it instead of entering the folder. Implies `fresh`.
+    /// Measured by a walk that started while a recursive watch covered the folder, and
+    /// nothing changed since: walks may use it instead of entering the folder. Implies
+    /// `fresh` and no `until`.
     trusted: bool,
+    /// No watch covers the folder: fresh only until then.
+    until: Option<Instant>,
+}
+
+impl Cached {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.fresh && self.until.is_none_or(|u| now < u)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RootState {
     /// Handed to the registrar thread, not watched yet.
-    Registering,
+    Registering {
+        since: Instant,
+    },
     Watched,
     /// The watch could not be set up; totals below are never trusted.
     Failed,
@@ -138,10 +178,23 @@ impl Job {
     }
 }
 
+/// What a change event says about its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// Created, renamed or moved in: a folder there is not the one measured before.
+    Appeared,
+    /// Modified in place: a file's data, or a folder's own timestamps and attributes.
+    Modified,
+    /// Removed, or anything else.
+    Content,
+}
+
 /// A wanted folder with changes below it, waiting for the debounce.
 struct Dirty {
     first: Instant,
     last: Instant,
+    /// Change events since `first`; many make the folder busy (see `BUSY_GAP`).
+    events: u32,
 }
 
 struct State {
@@ -158,20 +211,41 @@ struct State {
     dirty: HashMap<PathBuf, Dirty>,
     /// When each wanted folder's latest walk started, for `MIN_GAP`.
     last_start: HashMap<PathBuf, Instant>,
-    /// The local folders the panes show, each with a recursive watch.
+    /// Wanted folders whose total is fresh only until the given time (no watch covers them).
+    expiring: HashMap<PathBuf, Instant>,
+    /// Folders that appeared where a total was kept: the totals kept below them belong to
+    /// whatever was there before and are dropped by the next worker (not per event).
+    purge: HashSet<PathBuf>,
+    /// The local folders the panes show that contain wanted folders, each with a recursive
+    /// watch.
     roots: HashMap<PathBuf, RootState>,
     /// Drive letter -> mapped to a network share. Asked once per letter.
     drives: HashMap<u8, bool>,
+    /// Bumped whenever a total is kept, a walk starts or the wanted set changes: what
+    /// `last_event` saw may then be out of date.
+    generation: u64,
+    /// For `invalidate_path`'s fast path.
+    last_event: Option<LastEvent>,
     shutdown: bool,
+}
+
+/// What the latest change event's slow path did: the next event in the same folder can skip
+/// the walk up the ancestors.
+struct LastEvent {
+    parent: PathBuf,
+    generation: u64,
+    /// The wanted ancestors of the folder (now waiting for their debounce).
+    wanted: Vec<PathBuf>,
 }
 
 struct Shared {
     state: Mutex<State>,
-    /// Workers wait here for jobs (and for the next debounced folder to be due).
+    /// Workers wait here for jobs (and for the next debounced or expiring folder to be due).
     wake: Condvar,
     revision: AtomicU64,
     ctx: egui::Context,
     walk: Box<WalkFn>,
+    watch_hook: Option<Box<WatchHook>>,
     timing: Timing,
     /// Threads per local walk; network walks use one.
     local_threads: usize,
@@ -198,9 +272,10 @@ pub struct FolderSizes {
 impl FolderSizes {
     /// Threads start lazily, on the first folder wanted.
     pub fn new(ctx: egui::Context) -> Self {
-        Self::with_walk(ctx, dir_size::dir_totals, Timing::default())
+        Self::with_parts(ctx, dir_size::dir_totals, Timing::default(), None)
     }
 
+    #[cfg(test)]
     fn with_walk(
         ctx: egui::Context,
         walk: impl Fn(&Path, &dyn SizeCache, usize, &CancelToken) -> forge_core::Result<DirTotals>
@@ -208,6 +283,18 @@ impl FolderSizes {
         + Sync
         + 'static,
         timing: Timing,
+    ) -> Self {
+        Self::with_parts(ctx, walk, timing, None)
+    }
+
+    fn with_parts(
+        ctx: egui::Context,
+        walk: impl Fn(&Path, &dyn SizeCache, usize, &CancelToken) -> forge_core::Result<DirTotals>
+        + Send
+        + Sync
+        + 'static,
+        timing: Timing,
+        watch_hook: Option<Box<WatchHook>>,
     ) -> Self {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
         let workers = (cores / 2).clamp(2, 4);
@@ -223,8 +310,12 @@ impl FolderSizes {
             network_running: 0,
             dirty: HashMap::new(),
             last_start: HashMap::new(),
+            expiring: HashMap::new(),
+            purge: HashSet::new(),
             roots: HashMap::new(),
             drives: HashMap::new(),
+            generation: 0,
+            last_event: None,
             shutdown: false,
         };
         Self {
@@ -234,6 +325,7 @@ impl FolderSizes {
                 revision: AtomicU64::new(0),
                 ctx,
                 walk: Box::new(walk),
+                watch_hook,
                 timing,
                 local_threads,
             }),
@@ -261,9 +353,11 @@ impl FolderSizes {
     }
 
     /// The folders whose totals are on screen now (all panes, visible dir rows) and the
-    /// folders the panes show (`roots`, for the recursive change watch). Cheap when both are
-    /// unchanged, so it may be called every frame. Queues measurements for wanted folders
-    /// without a fresh result; cancels running/queued work for folders no longer wanted.
+    /// folders the panes show (`roots`). A root gets a recursive change watch only while it
+    /// contains a wanted folder, so a pane with nothing to measure watches nothing. Cheap
+    /// when both lists are unchanged, so it may be called every frame. Queues measurements
+    /// for wanted folders without a fresh result; cancels running/queued work for folders no
+    /// longer wanted. Totals that expire later are re-measured by the workers on their own.
     pub fn want(&mut self, folders: &[PathBuf], roots: &[PathBuf]) {
         if self.applied
             && folders == self.last_folders.as_slice()
@@ -279,7 +373,6 @@ impl FolderSizes {
 
     fn apply(&mut self) {
         let now = Instant::now();
-        let timing = self.shared.timing;
         let mut guard = self.shared.state.lock();
         let st = &mut *guard;
         let mut changed = false;
@@ -305,13 +398,17 @@ impl FolderSizes {
         st.queue.retain(|p| wanted.contains_key(p));
         st.dirty.retain(|p, _| wanted.contains_key(p));
         st.last_start.retain(|p, _| wanted.contains_key(p));
+        st.expiring.retain(|p, _| wanted.contains_key(p));
 
+        // Only roots with something to measure below them are watched: a pane at a drive
+        // root in a view without the Size column must not watch the whole volume.
         let mut local_roots: Vec<PathBuf> = Vec::new();
-        if st.enabled {
-            for root in &self.last_roots {
-                if !network_of(&mut st.drives, root) && !local_roots.contains(root) {
-                    local_roots.push(root.clone());
-                }
+        for root in &self.last_roots {
+            if local_roots.contains(root) || network_of(&mut st.drives, root) {
+                continue;
+            }
+            if wanted.iter().any(|(p, w)| !w.network && is_within(p, root)) {
+                local_roots.push(root.clone());
             }
         }
         let dropped: Vec<PathBuf> = st
@@ -326,34 +423,35 @@ impl FolderSizes {
         }
         for root in &local_roots {
             if !st.roots.contains_key(root) {
-                st.roots.insert(root.clone(), RootState::Registering);
+                st.roots
+                    .insert(root.clone(), RootState::Registering { since: now });
                 roots_changed = true;
             }
         }
         // Totals under a watch that goes away can no longer be trusted. The registrar keeps
         // an old watch until the new ones are set up, so a folder still covered by a new
         // root (going into a sub-folder) stays trusted.
-        changed |= st.demote_uncovered(&dropped, true);
+        changed |= st.demote_uncovered(&dropped);
 
-        for (path, w) in &wanted {
+        for path in wanted.keys() {
             if st.dirty.contains_key(path) || st.running.contains_key(path) {
                 continue; // Measured when the debounce ends / re-checked when the walk ends.
             }
-            let needed = match st.cache.get_mut(path) {
-                None => true,
-                Some(c) => {
-                    if w.network && c.fresh && now.duration_since(c.at) >= timing.network_max_age {
-                        c.fresh = false;
-                        changed = true;
+            match st.cache.get(path) {
+                // Fresh; one that expires is measured again by a worker when it does.
+                Some(c) if c.is_fresh(now) => {
+                    if let Some(until) = c.until {
+                        st.expiring.insert(path.clone(), until);
                     }
-                    !c.fresh
                 }
-            };
-            if needed {
-                st.queue.insert(path.clone());
+                // Missing, stale, or expired while not wanted (`get` already says so).
+                _ => {
+                    st.queue.insert(path.clone());
+                }
             }
         }
         st.wanted = wanted;
+        st.generation += 1;
         let has_work = !st.wanted.is_empty();
         drop(guard);
 
@@ -377,7 +475,9 @@ impl FolderSizes {
             return FolderSize::Off;
         }
         match st.cache.get(dir) {
-            Some(c) if c.fresh => FolderSize::Known(c.totals),
+            Some(c) if c.fresh && c.until.is_none_or(|u| Instant::now() < u) => {
+                FolderSize::Known(c.totals)
+            }
             Some(c) => FolderSize::Pending {
                 stale: Some(c.totals),
             },
@@ -425,7 +525,7 @@ impl FolderSizes {
         invalidate_paths(
             &self.shared,
             std::slice::from_ref(&path.to_path_buf()),
-            true,
+            Change::Appeared,
         );
     }
 
@@ -441,6 +541,15 @@ impl FolderSizes {
                 .spawn(move || registrar(shared, rx));
             if let Err(e) = spawned {
                 tracing::warn!("folder size change watch unavailable: {e}");
+                // Nothing will ever watch these: measure them as unwatched.
+                let now = Instant::now();
+                let timing = self.shared.timing;
+                let mut st = self.shared.state.lock();
+                for root in &roots {
+                    st.set_root_state(root, false, now, &timing);
+                }
+                drop(st);
+                self.shared.wake.notify_all();
                 return;
             }
             self.register = Some(tx);
@@ -498,9 +607,9 @@ impl Drop for FolderSizes {
 }
 
 impl State {
-    /// Entries in or below any of `gone` that no remaining root covers lose their trust
-    /// (and, with `stale`, show as stale until measured again).
-    fn demote_uncovered(&mut self, gone: &[PathBuf], stale: bool) -> bool {
+    /// Entries in or below any of `gone` that no remaining root covers lose their trust and
+    /// show as stale until measured again.
+    fn demote_uncovered(&mut self, gone: &[PathBuf]) -> bool {
         if gone.is_empty() {
             return false;
         }
@@ -517,10 +626,8 @@ impl State {
             {
                 continue;
             }
-            if stale && c.fresh {
-                c.fresh = false;
-                changed = true;
-            }
+            changed |= c.fresh;
+            c.fresh = false;
             c.trusted = false;
         }
         changed
@@ -533,18 +640,172 @@ impl State {
             .any(|(r, s)| *s == RootState::Watched && is_within(dir, r))
     }
 
+    /// When the watch being set up for a root covering `dir` was asked for, if any.
+    fn registering_since(&self, dir: &Path) -> Option<Instant> {
+        self.roots
+            .iter()
+            .filter(|(r, _)| is_within(dir, r))
+            .filter_map(|(_, s)| match s {
+                RootState::Registering { since } => Some(*since),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// A running walk covers `path`. O(depth).
+    fn walk_covers(&self, path: &Path) -> bool {
+        !self.running.is_empty() && path.ancestors().any(|a| self.running.contains_key(a))
+    }
+
+    /// Below a watched drive root (`C:\`), where changes never stop.
+    fn under_drive_root(&self, dir: &Path) -> bool {
+        self.roots
+            .keys()
+            .any(|r| r.parent().is_none() && is_within(dir, r))
+    }
+
+    /// How a total of `dir` from a walk that `tainted` or not, started `trusted` (under a
+    /// watch) or not, is kept: `(fresh, trusted, until)`.
+    fn classify(
+        &self,
+        dir: &Path,
+        network: bool,
+        trusted: bool,
+        tainted: bool,
+        now: Instant,
+        timing: &Timing,
+    ) -> (bool, bool, Option<Instant>) {
+        if tainted {
+            (false, false, None)
+        } else if network {
+            (true, false, Some(now + timing.network_max_age))
+        } else if self.watched_cover(dir) {
+            // A watch that came up while the walk ran may have missed a change made before:
+            // shown as stale and measured again under the watch.
+            (trusted, trusted, None)
+        } else if self.registering_since(dir).is_some() {
+            // Measured again when the watch is up (or has failed), see `set_root_state`.
+            (false, false, None)
+        } else {
+            (true, false, Some(now + timing.unwatched_max_age))
+        }
+    }
+
+    /// The registrar set up `root`'s watch (`ok`) or failed to. Wanted folders below it
+    /// whose totals are not trusted are measured again: under the watch, or as unwatched
+    /// totals that expire. Totals kept below a failed root lose their trust and expire.
+    fn set_root_state(&mut self, root: &Path, ok: bool, now: Instant, timing: &Timing) {
+        match self.roots.get_mut(root) {
+            Some(s @ RootState::Registering { .. }) => {
+                *s = if ok {
+                    RootState::Watched
+                } else {
+                    RootState::Failed
+                };
+            }
+            _ => return,
+        }
+        if !ok {
+            let until = now + timing.unwatched_max_age;
+            let covering: Vec<PathBuf> = self
+                .roots
+                .iter()
+                .filter(|(_, s)| **s == RootState::Watched)
+                .map(|(r, _)| r.clone())
+                .collect();
+            for (path, c) in &mut self.cache {
+                if !is_within(path, root) || covering.iter().any(|r| is_within(path, r)) {
+                    continue;
+                }
+                c.trusted = false;
+                if c.fresh && c.until.is_none() {
+                    c.until = Some(until);
+                    if self.wanted.contains_key(path) {
+                        self.expiring.insert(path.clone(), until);
+                    }
+                }
+            }
+        }
+        let again: Vec<PathBuf> = self
+            .wanted
+            .iter()
+            .filter(|(p, w)| !w.network && is_within(p, root))
+            .filter(|(p, _)| !self.running.contains_key(*p) && !self.dirty.contains_key(*p))
+            .filter(|(p, _)| {
+                self.cache
+                    .get(*p)
+                    .is_none_or(|c| if ok { !c.trusted } else { !c.is_fresh(now) })
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        self.queue.extend(again);
+    }
+
     /// `path` changed: its own entry, its folder and every ancestor become stale, running
     /// walks of those folders are told, and wanted ones wait for the debounce. A folder that
-    /// appears (`structural`: created, renamed, moved in) at a path with a kept total also
-    /// loses the totals kept below that path: they belong to whatever was there before, and
-    /// moving a tree in reports only its top folder.
-    fn invalidate_path(&mut self, path: &Path, structural: bool, now: Instant) -> bool {
-        let mut changed = false;
-        if structural && self.cache.contains_key(path) {
-            let before = self.cache.len();
-            self.cache.retain(|k, _| k == path || !is_within(k, path));
-            changed |= self.cache.len() != before;
+    /// appears ([`Change::Appeared`]) at a path with a kept total also loses the totals kept
+    /// below that path (see `purge`). O(depth): no cache scan.
+    /// Returns (what `get` shows changed, a worker must look: a new debounce or purge).
+    #[cfg(test)]
+    fn invalidate_path(&mut self, path: &Path, change: Change, now: Instant) -> (bool, bool) {
+        self.try_invalidate_path(path, change, true, now)
+            .unwrap_or_default()
+    }
+
+    /// [`State::invalidate_path`], except that it returns `None` instead for a modified path
+    /// that may be a folder a running walk has listed but not stored yet, unless `file`
+    /// (the caller checked that it is not a folder).
+    fn try_invalidate_path(
+        &mut self,
+        path: &Path,
+        change: Change,
+        file: bool,
+        now: Instant,
+    ) -> Option<(bool, bool)> {
+        let kept = self.cache.contains_key(path);
+        if change == Change::Modified {
+            if kept {
+                // A measured folder's own timestamps or attributes. NTFS reports them when
+                // our walks list folders that changed lately: taken as a change, measuring
+                // a folder would invalidate it again. A folder's own metadata says nothing
+                // about the sizes inside, whose changes arrive on their own paths.
+                return Some((false, false));
+            }
+            if !file && self.walk_covers(path) {
+                return None;
+            }
         }
+        let mut changed = false;
+        let mut wake = false;
+        if change == Change::Appeared && kept {
+            wake |= self.purge.insert(path.to_path_buf());
+        }
+        // Fast path: another change in (or of) the folder of the previous event, with nothing
+        // measured, started or wanted since. The ancestors are stale and the running walks
+        // told already (a walk records the folder: for the folders it reads, that is the
+        // same as the file); only the path's own entry and the debounce need updating.
+        let parent = path.parent();
+        if let Some(last) = &self.last_event
+            && last.generation == self.generation
+            && (Some(last.parent.as_path()) == parent || last.parent == path)
+            && (self.running.is_empty() || !self.running.contains_key(path))
+            && !self.wanted.contains_key(path)
+            && last.wanted.iter().all(|w| self.dirty.contains_key(w))
+        {
+            for w in &last.wanted {
+                if let Some(d) = self.dirty.get_mut(w) {
+                    d.last = now;
+                    d.events = d.events.saturating_add(1);
+                }
+            }
+            if let Some(c) = self.cache.get_mut(path) {
+                changed |= c.fresh;
+                c.fresh = false;
+                c.trusted = false;
+            }
+            return Some((changed, wake));
+        }
+        let mut wanted_above = Vec::new();
         let mut cur = Some(path);
         while let Some(p) = cur {
             if let Some(c) = self.cache.get_mut(p) {
@@ -556,17 +817,63 @@ impl State {
                 job.touch(path);
             }
             if self.wanted.contains_key(p) {
-                self.dirty
-                    .entry(p.to_path_buf())
-                    .and_modify(|d| d.last = now)
-                    .or_insert(Dirty {
-                        first: now,
-                        last: now,
-                    });
+                if p != path {
+                    wanted_above.push(p.to_path_buf());
+                }
+                match self.dirty.get_mut(p) {
+                    Some(d) => {
+                        d.last = now;
+                        d.events = d.events.saturating_add(1);
+                    }
+                    None => {
+                        self.dirty.insert(
+                            p.to_path_buf(),
+                            Dirty {
+                                first: now,
+                                last: now,
+                                events: 1,
+                            },
+                        );
+                        wake = true;
+                    }
+                }
             }
             cur = p.parent();
         }
-        changed
+        self.last_event = parent.map(|parent| LastEvent {
+            parent: parent.to_path_buf(),
+            generation: self.generation,
+            wanted: wanted_above,
+        });
+        Some((changed, wake))
+    }
+
+    /// Drops the totals kept below folders that appeared anew (see `invalidate_path`). One
+    /// pass over the cache, checking each entry's ancestors. Wanted folders that lose their
+    /// total are measured again.
+    fn run_purges(&mut self) -> bool {
+        if self.purge.is_empty() {
+            return false;
+        }
+        let purge = std::mem::take(&mut self.purge);
+        let mut removed = Vec::new();
+        self.cache.retain(|k, _| {
+            let gone = k.ancestors().skip(1).any(|a| purge.contains(a));
+            if gone {
+                removed.push(k.clone());
+            }
+            !gone
+        });
+        for path in &removed {
+            self.expiring.remove(path);
+            if self.wanted.contains_key(path)
+                && !self.running.contains_key(path)
+                && !self.dirty.contains_key(path)
+            {
+                self.queue.insert(path.clone());
+            }
+        }
+        !removed.is_empty()
     }
 
     /// `dir`, everything below and its ancestors become stale and untrusted; running walks
@@ -588,19 +895,22 @@ impl State {
         changed
     }
 
-    /// Moves wanted folders whose changes have settled into the queue. Returns when the next
-    /// waiting one will be due.
-    fn promote_due(&mut self, now: Instant, timing: &Timing) -> Option<Instant> {
+    /// Moves wanted folders whose changes have settled, and those whose unwatched total
+    /// expired, into the queue. Returns when the next waiting one will be due, and whether a
+    /// total expired (what `get` shows changed).
+    fn promote_due(&mut self, now: Instant, timing: &Timing) -> (Option<Instant>, bool) {
         let mut next: Option<Instant> = None;
         let mut due = Vec::new();
         for (path, d) in &self.dirty {
+            let gap = if d.events >= BUSY_EVENTS || self.under_drive_root(path) {
+                timing.busy_gap
+            } else {
+                timing.min_gap
+            };
             // Quiet for the debounce, or changing for a while already (a long copy)...
-            let settled = (d.last + timing.debounce).min(d.first + timing.min_gap);
+            let settled = (d.last + timing.debounce).min(d.first + gap);
             // ...and not measured within the last gap.
-            let spaced = self
-                .last_start
-                .get(path)
-                .map_or(now, |t| *t + timing.min_gap);
+            let spaced = self.last_start.get(path).map_or(now, |t| *t + gap);
             let at = settled.max(spaced);
             if at <= now {
                 due.push(path.clone());
@@ -612,25 +922,75 @@ impl State {
             self.dirty.remove(&path);
             self.queue.insert(path);
         }
-        next
+        let mut expired = Vec::new();
+        for (path, until) in &self.expiring {
+            if *until <= now {
+                expired.push(path.clone());
+            } else {
+                next = Some(next.map_or(*until, |n| n.min(*until)));
+            }
+        }
+        let any_expired = !expired.is_empty();
+        for path in expired {
+            self.expiring.remove(&path);
+            if !self.running.contains_key(&path) && !self.dirty.contains_key(&path) {
+                self.queue.insert(path);
+            }
+        }
+        (next, any_expired)
     }
 
     /// The queued folder to measure next: the first on screen whose previous walk has ended,
-    /// skipping network folders while the network slots are taken.
-    fn pick(&mut self) -> Option<(PathBuf, bool)> {
-        let (path, network) = self
-            .queue
-            .iter()
-            .filter(|p| !self.running.contains_key(*p))
-            .filter_map(|p| self.wanted.get(p).map(|w| (w, p)))
-            .filter(|(w, _)| !w.network || self.network_running < NETWORK_JOBS)
-            .min_by_key(|(w, _)| w.order)
-            .map(|(w, p)| (p.clone(), w.network))?;
+    /// skipping network folders while the network slots are taken, and local folders whose
+    /// watch is still being set up (for up to the grace period; `hold` gets when that ends).
+    fn pick(
+        &mut self,
+        now: Instant,
+        timing: &Timing,
+        hold: &mut Option<Instant>,
+    ) -> Option<(PathBuf, bool)> {
+        let mut best: Option<(usize, &PathBuf, bool)> = None;
+        for p in &self.queue {
+            if self.running.contains_key(p) {
+                continue;
+            }
+            let Some(w) = self.wanted.get(p) else {
+                continue;
+            };
+            if w.network && self.network_running >= NETWORK_JOBS {
+                continue;
+            }
+            if best.is_some_and(|(order, _, _)| order <= w.order) {
+                continue;
+            }
+            let held = if !w.network && !self.watched_cover(p) {
+                self.registering_since(p)
+                    .map(|since| since + timing.register_grace)
+                    .filter(|ready| now < *ready)
+            } else {
+                None
+            };
+            if let Some(ready) = held {
+                *hold = Some(hold.map_or(ready, |h| h.min(ready)));
+                continue;
+            }
+            best = Some((w.order, p, w.network));
+        }
+        let (path, network) = best.map(|(_, p, n)| (p.clone(), n))?;
         self.queue.remove(&path);
         Some((path, network))
     }
 
     fn insert(&mut self, path: PathBuf, cached: Cached) {
+        self.generation += 1;
+        match cached.until {
+            Some(until) if cached.fresh && self.wanted.contains_key(&path) => {
+                self.expiring.insert(path.clone(), until);
+            }
+            _ => {
+                self.expiring.remove(&path);
+            }
+        }
         self.cache.insert(path, cached);
         if self.cache.len() > self.cap {
             self.evict();
@@ -661,7 +1021,7 @@ impl State {
     }
 
     /// A walk of `path` ended.
-    fn finish(&mut self, path: PathBuf, result: forge_core::Result<DirTotals>) {
+    fn finish(&mut self, path: PathBuf, result: forge_core::Result<DirTotals>, timing: &Timing) {
         let Some(job) = self.running.remove(&path) else {
             return;
         };
@@ -684,20 +1044,28 @@ impl State {
             }
         };
         if let Some(totals) = totals {
-            let trusted = job.trusted && !tainted && self.watched_cover(&path);
+            let (fresh, trusted, until) =
+                self.classify(&path, job.network, job.trusted, tainted, now, timing);
             self.insert(
                 path.clone(),
                 Cached {
                     totals,
                     at: now,
-                    fresh: !tainted,
+                    fresh,
                     trusted,
+                    until,
                 },
             );
         }
-        // Cancelled, or changed while it ran, and still wanted: measure again.
-        let fresh = self.cache.get(&path).is_some_and(|c| c.fresh);
-        if self.wanted.contains_key(&path) && !fresh && !self.dirty.contains_key(&path) {
+        // Cancelled, changed while it ran, or started before its watch was up, and still
+        // wanted: measure again. While the watch is still being set up the registrar queues
+        // it once the watch is up (or failed), so it is not measured in a loop meanwhile.
+        let fresh = self.cache.get(&path).is_some_and(|c| c.is_fresh(now));
+        if self.wanted.contains_key(&path)
+            && !fresh
+            && !self.dirty.contains_key(&path)
+            && (job.network || self.watched_cover(&path) || self.registering_since(&path).is_none())
+        {
             self.queue.insert(path);
         }
     }
@@ -724,15 +1092,24 @@ impl SizeCache for Adapter<'_> {
             return;
         };
         let tainted = job.touched_within(dir);
-        let trusted = job.trusted && !tainted && st.watched_cover(dir);
+        let now = Instant::now();
+        let (fresh, trusted, until) = st.classify(
+            dir,
+            job.network,
+            job.trusted,
+            tainted,
+            now,
+            &self.shared.timing,
+        );
         let wanted = st.wanted.contains_key(dir);
         st.insert(
             dir.to_path_buf(),
             Cached {
                 totals: *totals,
-                at: Instant::now(),
-                fresh: !tainted,
+                at: now,
+                fresh,
                 trusted,
+                until,
             },
         );
         drop(st);
@@ -743,15 +1120,26 @@ impl SizeCache for Adapter<'_> {
 }
 
 fn worker(shared: Arc<Shared>) {
+    let timing = shared.timing;
     let mut st = shared.state.lock();
     loop {
         if st.shutdown {
             return;
         }
         let now = Instant::now();
-        let next_due = st.promote_due(now, &shared.timing);
-        let Some((path, network)) = st.pick() else {
-            match next_due {
+        let purged = st.run_purges();
+        let (next_due, expired) = st.promote_due(now, &timing);
+        if purged || expired {
+            shared.bump();
+            shared.ctx.request_repaint();
+        }
+        let mut hold = None;
+        let Some((path, network)) = st.pick(now, &timing, &mut hold) else {
+            let wake_at = match (next_due, hold) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            match wake_at {
                 Some(at) => {
                     shared.wake.wait_until(&mut st, at);
                 }
@@ -761,6 +1149,7 @@ fn worker(shared: Arc<Shared>) {
         };
         let cancel = CancelToken::new();
         let trusted = !network && st.watched_cover(&path);
+        st.generation += 1;
         st.running.insert(
             path.clone(),
             Job {
@@ -784,7 +1173,7 @@ fn worker(shared: Arc<Shared>) {
             (shared.walk)(&path, &adapter, threads, &cancel)
         });
         let cancelled = matches!(result, Err(CoreError::Cancelled));
-        st.finish(path, result);
+        st.finish(path, result, &timing);
         if !cancelled {
             shared.bump();
             shared.ctx.request_repaint();
@@ -795,21 +1184,44 @@ fn worker(shared: Arc<Shared>) {
     }
 }
 
-/// Marks `paths` changed (see [`State::invalidate_path`]) and wakes the workers so the
-/// debounce timer covers them.
-fn invalidate_paths(shared: &Shared, paths: &[PathBuf], structural: bool) {
+/// Marks `paths` changed (see [`State::invalidate_path`]) and wakes the workers when a
+/// debounce timer has to start. A steady stream of events on the same folders costs a few
+/// hash lookups each: no wake-ups, no repaints.
+fn invalidate_paths(shared: &Shared, paths: &[PathBuf], change: Change) {
     let now = Instant::now();
     let mut st = shared.state.lock();
     let mut changed = false;
+    let mut wake = false;
+    let mut unsure = Vec::new();
     for path in paths {
-        changed |= st.invalidate_path(path, structural, now);
+        match st.try_invalidate_path(path, change, false, now) {
+            Some((c, w)) => {
+                changed |= c;
+                wake |= w;
+            }
+            None => unsure.push(path),
+        }
     }
     drop(st);
+    if !unsure.is_empty() {
+        // Possibly a folder a running walk listed (see `try_invalidate_path`): one attribute
+        // read each, outside the lock. Only while a walk runs below the path, so rare.
+        unsure.retain(|p| !is_dir_entry(p));
+        let mut st = shared.state.lock();
+        for path in unsure {
+            if let Some((c, w)) = st.try_invalidate_path(path, change, true, now) {
+                changed |= c;
+                wake |= w;
+            }
+        }
+    }
     if changed {
         shared.bump();
         shared.ctx.request_repaint();
     }
-    shared.wake.notify_all();
+    if wake {
+        shared.wake.notify_all();
+    }
 }
 
 /// Events were lost (overflow, rescan, watch error): nothing below the roots containing
@@ -833,12 +1245,17 @@ fn invalidate_roots(shared: &Shared, paths: &[PathBuf]) {
             .cloned()
             .collect();
         for w in affected {
+            // Lost events mean a busy tree: use the busy gap.
             st.dirty
                 .entry(w)
-                .and_modify(|d| d.last = now)
+                .and_modify(|d| {
+                    d.last = now;
+                    d.events = d.events.max(BUSY_EVENTS);
+                })
                 .or_insert(Dirty {
                     first: now,
                     last: now,
+                    events: BUSY_EVENTS,
                 });
         }
     }
@@ -860,11 +1277,12 @@ fn on_event(shared: &Shared, res: notify::Result<notify::Event>) {
         Ok(ev) => {
             // notify reports `<watched root>\<relative name>`, so the paths share the
             // roots' (and the listings') spelling; no normalising needed.
-            let structural = matches!(
-                ev.kind,
-                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_))
-            );
-            invalidate_paths(shared, &ev.paths, structural);
+            let change = match ev.kind {
+                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_)) => Change::Appeared,
+                EventKind::Modify(_) => Change::Modified,
+                _ => Change::Content,
+            };
+            invalidate_paths(shared, &ev.paths, change);
         }
     }
 }
@@ -883,26 +1301,24 @@ fn registrar(shared: Arc<Shared>, rx: Receiver<Vec<PathBuf>>) {
             want = newer;
         }
         for root in &want {
-            if watched.contains(root) {
-                continue;
-            }
-            let ok = watcher
-                .as_mut()
-                .is_some_and(|w| w.watch(root, RecursiveMode::Recursive).is_ok());
-            if ok {
-                watched.insert(root.clone());
-            }
-            let mut st = shared.state.lock();
-            if let Some(state) = st.roots.get_mut(root) {
+            // Still watched from before (dropped and wanted again before this thread saw
+            // it): the watch never stopped.
+            let ok = watched.contains(root) || {
+                let ok = match shared.watch_hook.as_ref().and_then(|hook| hook(root)) {
+                    Some(ok) => ok,
+                    None => watcher
+                        .as_mut()
+                        .is_some_and(|w| w.watch(root, RecursiveMode::Recursive).is_ok()),
+                };
                 if ok {
-                    *state = RootState::Watched;
-                } else {
-                    *state = RootState::Failed;
-                    // Totals measured under an old watch were right until now; they just
-                    // cannot be relied on from here on.
-                    st.demote_uncovered(std::slice::from_ref(root), false);
+                    watched.insert(root.clone());
                 }
-            }
+                ok
+            };
+            let mut st = shared.state.lock();
+            st.set_root_state(root, ok, Instant::now(), &shared.timing);
+            drop(st);
+            shared.wake.notify_all();
         }
         let gone: Vec<PathBuf> = watched
             .iter()
@@ -916,6 +1332,20 @@ fn registrar(shared: Arc<Shared>, rx: Receiver<Vec<PathBuf>>) {
             watched.remove(&root);
         }
     }
+}
+
+/// Is `path` a folder? Reads the attributes its directory entry holds
+/// (`GetFileAttributesW`) without opening it: opening a file that was just written can make
+/// the virus scanner check it first, which on a busy volume costs more than everything else.
+fn is_dir_entry(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    };
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
+    let attrs = unsafe { GetFileAttributesW(windows::core::PCWSTR(wide.as_ptr())) };
+    attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0
 }
 
 /// Is `path` on a network location? UNC paths are lexical; a drive letter's answer is asked
@@ -968,7 +1398,10 @@ mod tests {
         Timing {
             debounce: Duration::from_millis(50),
             min_gap: Duration::from_millis(200),
+            busy_gap: Duration::from_millis(400),
             network_max_age: NETWORK_MAX_AGE,
+            unwatched_max_age: UNWATCHED_MAX_AGE,
+            register_grace: REGISTER_GRACE,
         }
     }
 
@@ -1098,7 +1531,8 @@ mod tests {
         let mut fs = real(Timing {
             debounce: Duration::from_secs(30),
             min_gap: Duration::from_secs(30),
-            network_max_age: NETWORK_MAX_AGE,
+            busy_gap: Duration::from_secs(30),
+            ..Timing::default()
         });
         fs.want(std::slice::from_ref(&a), &[]);
         assert!(wait_known_bytes(&fs, &a, 300));
@@ -1217,11 +1651,11 @@ mod tests {
             },
             quick(),
         );
-        // Watch first, so the first walk is already trusted.
-        fs.want(&[], std::slice::from_ref(&r));
-        assert!(fs.wait_watched(&r, LIMIT));
+        // The first walk waits for the watch, so it is already trusted.
         fs.want(std::slice::from_ref(&r), std::slice::from_ref(&r));
+        assert!(fs.wait_watched(&r, LIMIT));
         assert!(wait_known_bytes(&fs, &r, 350));
+        assert!(fs.shared.state.lock().cache[&r].trusted);
         assert!(skipped.lock().is_empty());
 
         write(&r.join("a").join("x"), 150);
@@ -1241,9 +1675,8 @@ mod tests {
         let r = root.path().to_path_buf();
         let a = r.join("a");
         let mut fs = real(quick());
-        fs.want(&[], std::slice::from_ref(&r));
-        assert!(fs.wait_watched(&r, LIMIT));
         fs.want(std::slice::from_ref(&a), std::slice::from_ref(&r));
+        assert!(fs.wait_watched(&r, LIMIT));
         assert!(wait_known_bytes(&fs, &a, 300));
         // Into a sub-folder: still covered, so still known.
         fs.want(&[a.join("b")], std::slice::from_ref(&a));
@@ -1265,6 +1698,7 @@ mod tests {
             at: base + Duration::from_secs(secs),
             fresh: true,
             trusted,
+            until: None,
         };
         st.wanted.insert(
             PathBuf::from("w"),
@@ -1300,11 +1734,17 @@ mod tests {
             at: Instant::now(),
             fresh: true,
             trusted: true,
+            until: None,
         };
         for p in [r"C:\r\x", r"C:\r\x\y", r"C:\r\xy", r"C:\r"] {
             st.insert(PathBuf::from(p), c);
         }
-        st.invalidate_path(Path::new(r"C:\r\x"), true, Instant::now());
+        st.invalidate_path(Path::new(r"C:\r\x"), Change::Appeared, Instant::now());
+        assert!(
+            st.cache.contains_key(Path::new(r"C:\r\x\y")),
+            "not per event"
+        );
+        assert!(st.run_purges());
         assert!(!st.cache.contains_key(Path::new(r"C:\r\x\y")));
         assert!(!st.cache[Path::new(r"C:\r\x")].fresh);
         assert!(!st.cache[Path::new(r"C:\r")].trusted);
@@ -1321,5 +1761,226 @@ mod tests {
         assert!(is_within(Path::new(r"C:\a"), Path::new(r"C:\")));
         assert!(!is_within(Path::new(r"C:\ab"), Path::new(r"C:\a")));
         assert!(!is_within(Path::new(r"C:\a"), Path::new(r"C:\a\b")));
+    }
+
+    fn counting(
+        calls: &Arc<AtomicUsize>,
+    ) -> impl Fn(&Path, &dyn SizeCache, usize, &CancelToken) -> forge_core::Result<DirTotals>
+    + Send
+    + Sync
+    + 'static {
+        let c = Arc::clone(calls);
+        move |dir, cache, threads, cancel| {
+            c.fetch_add(1, Ordering::SeqCst);
+            dir_size::dir_totals(dir, cache, threads, cancel)
+        }
+    }
+
+    #[test]
+    fn a_walk_done_before_its_watch_is_up_is_measured_again_under_it() {
+        let root = tree();
+        let r = root.path().to_path_buf();
+        let (gate_tx, gate_rx) = crossbeam_channel::bounded::<()>(1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut fs = FolderSizes::with_parts(
+            egui::Context::default(),
+            counting(&calls),
+            Timing {
+                register_grace: Duration::ZERO,
+                ..quick()
+            },
+            // A slow registration: the walk starts and ends before the watch is up.
+            Some(Box::new(move |_| {
+                let _ = gate_rx.recv_timeout(LIMIT);
+                None
+            })),
+        );
+        fs.want(std::slice::from_ref(&r), std::slice::from_ref(&r));
+        assert!(wait_for(LIMIT, || matches!(
+            fs.get(&r),
+            FolderSize::Pending { stale: Some(t) } if t.bytes == 350
+        )));
+        assert!(!fs.shared.state.lock().cache[&r].trusted);
+        // Not measured in a loop while the watch is coming.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(fs.get(&r), FolderSize::Pending { .. }));
+        // A change in the gap, which no event will ever report.
+        write(&r.join("c").join("gap.bin"), 1000);
+        gate_tx.send(()).unwrap();
+        assert!(fs.wait_watched(&r, LIMIT));
+        assert!(
+            wait_known_bytes(&fs, &r, 1350),
+            "measured again once watched"
+        );
+        assert!(fs.shared.state.lock().cache[&r].trusted);
+    }
+
+    #[test]
+    fn the_first_walk_waits_briefly_for_its_watch() {
+        let root = tree();
+        let r = root.path().to_path_buf();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut fs = FolderSizes::with_parts(
+            egui::Context::default(),
+            counting(&calls),
+            quick(),
+            Some(Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(150));
+                None
+            })),
+        );
+        fs.want(std::slice::from_ref(&r), std::slice::from_ref(&r));
+        assert!(wait_known_bytes(&fs, &r, 350));
+        assert!(fs.wait_idle(LIMIT));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "measured once, under the watch"
+        );
+        assert!(fs.shared.state.lock().cache[&r].trusted);
+    }
+
+    #[test]
+    fn a_root_whose_watch_failed_is_measured_again_after_a_while() {
+        let root = tree();
+        let r = root.path().to_path_buf();
+        let mut fs = FolderSizes::with_parts(
+            egui::Context::default(),
+            dir_size::dir_totals,
+            Timing {
+                unwatched_max_age: Duration::from_millis(300),
+                ..quick()
+            },
+            Some(Box::new(|_| Some(false))),
+        );
+        fs.want(std::slice::from_ref(&r), std::slice::from_ref(&r));
+        assert!(wait_known_bytes(&fs, &r, 350));
+        {
+            let st = fs.shared.state.lock();
+            assert_eq!(st.roots.get(&r), Some(&RootState::Failed));
+            assert!(!st.cache[&r].trusted);
+        }
+        write(&r.join("c").join("later.bin"), 1000);
+        // No event and no new `want`: the total expires and is measured again.
+        assert!(wait_known_bytes(&fs, &r, 1350));
+    }
+
+    #[test]
+    fn only_roots_with_wanted_folders_are_watched() {
+        let mut fs = FolderSizes::with_walk(
+            egui::Context::default(),
+            |_, _, _, _| Ok(DirTotals::default()),
+            quick(),
+        );
+        let pane = PathBuf::from(r"C:\fake\pane");
+        let other = PathBuf::from(r"C:\fake\other");
+        fs.want(&[], &[pane.clone(), other.clone()]);
+        assert!(
+            fs.shared.state.lock().roots.is_empty(),
+            "nothing to measure, no watch"
+        );
+        fs.want(&[pane.join("sub")], &[pane.clone(), other.clone()]);
+        let roots: Vec<PathBuf> = fs.shared.state.lock().roots.keys().cloned().collect();
+        assert_eq!(roots, vec![pane]);
+    }
+
+    #[test]
+    fn busy_folders_and_drive_roots_are_measured_less_often() {
+        let fs = real(quick());
+        let timing = Timing {
+            debounce: Duration::from_millis(10),
+            min_gap: Duration::from_millis(100),
+            busy_gap: Duration::from_secs(1),
+            ..Timing::default()
+        };
+        let mut st = fs.shared.state.lock();
+        st.roots.insert(PathBuf::from(r"C:\"), RootState::Watched);
+        let now = Instant::now();
+        for (p, events) in [(r"D:\quiet", 1), (r"D:\busy", BUSY_EVENTS), (r"C:\x", 1)] {
+            let p = PathBuf::from(p);
+            st.dirty.insert(
+                p.clone(),
+                Dirty {
+                    first: now,
+                    last: now,
+                    events,
+                },
+            );
+            st.last_start.insert(p, now);
+        }
+        st.promote_due(now + Duration::from_millis(150), &timing);
+        let queued = |st: &State, p: &str| st.queue.contains(Path::new(p));
+        assert!(queued(&st, r"D:\quiet"));
+        assert!(!queued(&st, r"D:\busy"));
+        assert!(!queued(&st, r"C:\x"), "below a watched drive root");
+        st.promote_due(now + Duration::from_millis(1050), &timing);
+        assert!(queued(&st, r"D:\busy") && queued(&st, r"C:\x"));
+    }
+
+    #[test]
+    fn repeated_events_on_a_folder_neither_wake_workers_nor_scan() {
+        let fs = real(quick());
+        let mut st = fs.shared.state.lock();
+        st.wanted.insert(
+            PathBuf::from(r"C:\r\w"),
+            Wanted {
+                order: 0,
+                network: false,
+            },
+        );
+        let now = Instant::now();
+        let f = Path::new(r"C:\r\w\deep\file.tmp");
+        assert_eq!(
+            st.invalidate_path(f, Change::Appeared, now),
+            (false, true),
+            "new debounce"
+        );
+        assert_eq!(st.invalidate_path(f, Change::Content, now), (false, false));
+        assert_eq!(st.dirty[Path::new(r"C:\r\w")].events, 2);
+        // A measured folder's own timestamps (our walk listed it) say nothing about sizes.
+        let deep = PathBuf::from(r"C:\r\w\deep");
+        st.insert(
+            deep.clone(),
+            Cached {
+                totals: DirTotals::default(),
+                at: now,
+                fresh: true,
+                trusted: true,
+                until: None,
+            },
+        );
+        assert_eq!(
+            st.invalidate_path(&deep, Change::Modified, now),
+            (false, false)
+        );
+        assert!(st.cache[&deep].trusted);
+        assert_eq!(st.dirty[Path::new(r"C:\r\w")].events, 2);
+        // A file's data changing does count.
+        st.invalidate_path(&deep.join("file.bin"), Change::Modified, now);
+        assert!(!st.cache[&deep].fresh);
+        // The next event in that folder takes the fast path, unless something was measured
+        // since: a fresh total of an ancestor must go stale again.
+        let w = PathBuf::from(r"C:\r\w");
+        st.insert(
+            w.clone(),
+            Cached {
+                totals: DirTotals::default(),
+                at: now,
+                fresh: true,
+                trusted: true,
+                until: None,
+            },
+        );
+        assert_eq!(
+            st.invalidate_path(&deep.join("other.bin"), Change::Content, now),
+            (true, false)
+        );
+        assert!(!st.cache[&w].fresh);
+        assert_eq!(st.dirty[&w].events, 4);
+        assert!(
+            st.purge.is_empty(),
+            "no total kept at the path: nothing to purge"
+        );
     }
 }
