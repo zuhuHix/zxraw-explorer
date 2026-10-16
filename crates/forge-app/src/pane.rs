@@ -172,8 +172,14 @@ pub struct Pane {
     /// Sticky selection: a plain click toggles an item in or out of the selection, as
     /// Ctrl+click does (`Cmd::ToggleStickySelection`; Esc turns it off).
     pub sticky: bool,
-    /// The folders of `visible`, cached against `listing_rev` (see [`Pane::listed_folders`]).
-    listed_folders: Option<(u64, Vec<PathBuf>)>,
+    /// The folders of `visible`, cached against `listing_rev` and the viewport bucket (see
+    /// [`Pane::listed_folders`]).
+    listed_folders: Option<((u64, (usize, usize)), Vec<PathBuf>)>,
+    /// Rows of `visible` the details view showed last, widened to whole
+    /// [`VIEWPORT_BUCKET`]s so scrolling within a bucket changes nothing.
+    viewport: (usize, usize),
+    /// Moves whenever `viewport` does (a global counter, like `listing_rev`).
+    viewport_rev: u64,
     /// `(sizes revision, listing revision)` after the last [`Pane::apply_folder_sizes`]: when
     /// both still match, there is nothing to apply.
     applied_sizes: Option<(u64, u64)>,
@@ -196,6 +202,10 @@ pub fn typing_filters(ctx: &egui::Context) -> bool {
 
 /// Source of listing revisions, shared by all panes so two panes never report the same one.
 static LISTING_REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Rows per step of the viewport kept for folder size priority: scrolling a few rows does not
+/// reorder anything.
+const VIEWPORT_BUCKET: usize = 16;
 
 fn next_listing_rev() -> u64 {
     LISTING_REV.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -241,6 +251,8 @@ impl Pane {
             listing_rev: 0,
             sticky: false,
             listed_folders: None,
+            viewport: (0, 0),
+            viewport_rev: 0,
             applied_sizes: None,
             last_size_apply: None,
             size_retry: false,
@@ -337,22 +349,47 @@ impl Pane {
     /// is asked to measure. Cached against [`Pane::listing_rev`], so the walk over a
     /// 50,000-entry listing happens once per change, not every frame.
     pub fn listed_folders(&mut self) -> &[PathBuf] {
-        let rev = self.listing_rev;
-        let cached = matches!(&self.listed_folders, Some((cached_rev, _)) if *cached_rev == rev);
+        let key = (self.listing_rev, self.viewport);
+        let cached = matches!(&self.listed_folders, Some((cached, _)) if *cached == key);
         if !cached {
-            let folders: Vec<PathBuf> = self
-                .visible
+            // The rows on screen first, so the sizes the user is looking at come first; then
+            // every other folder in display order (all are measured, for the size sort).
+            let (start, end) = self.viewport;
+            let end = end.min(self.visible.len());
+            let start = start.min(end);
+            let dir = |&i: &usize| {
+                let e = &self.entries[i];
+                (e.kind == EntryKind::Dir).then(|| e.path.clone())
+            };
+            let folders: Vec<PathBuf> = self.visible[start..end]
                 .iter()
-                .map(|&i| &self.entries[i])
-                .filter(|e| e.kind == EntryKind::Dir)
-                .map(|e| e.path.clone())
+                .filter_map(dir)
+                .chain(self.visible[..start].iter().filter_map(dir))
+                .chain(self.visible[end..].iter().filter_map(dir))
                 .collect();
-            self.listed_folders = Some((rev, folders));
+            self.listed_folders = Some((key, folders));
         }
         match &self.listed_folders {
             Some((_, folders)) => folders,
             None => &[],
         }
+    }
+
+    /// The details view painted rows `rows` of `visible` this frame. Called every frame; only
+    /// a move to another [`VIEWPORT_BUCKET`] changes [`Pane::viewport_rev`] (and so the order
+    /// in which folder sizes are measured).
+    pub fn note_viewport(&mut self, rows: std::ops::Range<usize>) {
+        let start = rows.start / VIEWPORT_BUCKET * VIEWPORT_BUCKET;
+        let end = rows.end.div_ceil(VIEWPORT_BUCKET) * VIEWPORT_BUCKET;
+        if (start, end) != self.viewport {
+            self.viewport = (start, end);
+            self.viewport_rev = next_listing_rev();
+        }
+    }
+
+    /// Changes when the rows on screen move to another bucket (see [`Pane::note_viewport`]).
+    pub fn viewport_rev(&self) -> u64 {
+        self.viewport_rev
     }
 
     /// Writes the folder totals of `sizes` into the sizes of the `Dir` entries, so the Size
@@ -2494,6 +2531,38 @@ mod tests {
 
         pane.set_filter("alp".into());
         assert_eq!(names(pane.listed_folders()), ["alpha"], "only visible rows count");
+    }
+
+    #[test]
+    fn the_folders_on_screen_are_listed_first_and_scrolling_within_a_bucket_reorders_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..100 {
+            std::fs::create_dir(root.path().join(format!("d{i:03}"))).unwrap();
+        }
+        let mut pane = Pane::new(root.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        let names = |pane: &mut Pane| -> Vec<String> {
+            let folders = pane.listed_folders();
+            folders.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect()
+        };
+        assert_eq!(names(&mut pane)[0], "d000", "nothing shown yet: display order");
+
+        // Scrolled to rows 60..70: the bucket 48..80 comes first, then the rest in order.
+        pane.note_viewport(60..70);
+        let rev = pane.viewport_rev();
+        let order = names(&mut pane);
+        assert_eq!(order.len(), 100, "every folder is still measured");
+        assert_eq!(order[0], "d048");
+        assert_eq!(order[31], "d079");
+        assert_eq!(order[32], "d000");
+        assert_eq!(order[79], "d047");
+        assert_eq!(order[80], "d080");
+
+        pane.note_viewport(62..73);
+        assert_eq!(pane.viewport_rev(), rev, "same bucket: no new priority");
+        pane.note_viewport(0..10);
+        assert_ne!(pane.viewport_rev(), rev);
+        assert_eq!(names(&mut pane)[0], "d000");
     }
 
     #[test]

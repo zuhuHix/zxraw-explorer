@@ -1951,6 +1951,36 @@ mod tests {
     }
 
     #[test]
+    fn folders_are_measured_in_the_order_they_are_wanted() {
+        // The pane lists the rows on screen first; the walks must start with them.
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&started);
+        let mut fs = FolderSizes::with_walk(
+            egui::Context::default(),
+            move |dir, _, _, _| {
+                log.lock().push(dir.to_path_buf());
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(DirTotals::default())
+            },
+            quick(),
+        );
+        let folders: Vec<PathBuf> =
+            (0..40).map(|i| PathBuf::from(format!(r"C:\fake\d{i:02}"))).collect();
+        // Rows 30..40 are on screen.
+        let wanted: Vec<PathBuf> = folders[30..].iter().chain(&folders[..30]).cloned().collect();
+        fs.want(&wanted, &[]);
+        assert!(fs.wait_idle(Duration::from_secs(10)));
+        let started = started.lock();
+        assert_eq!(started.len(), 40);
+        // Several workers run at once, so only the first batch's membership is exact.
+        let first: Vec<&PathBuf> = started.iter().take(10).collect();
+        assert!(
+            first.iter().all(|p| folders[30..].contains(p)),
+            "on-screen folders first: {first:?}"
+        );
+    }
+
+    #[test]
     fn want_at_skips_an_unchanged_generation_without_looking_at_the_folders() {
         let mut fs = FolderSizes::with_walk(
             egui::Context::default(),

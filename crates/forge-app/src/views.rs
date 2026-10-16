@@ -1397,7 +1397,9 @@ pub fn details(
     crate::testhook::note_view_rect(ui, background.rect);
     // A click on a folder's disclosure arrow, applied after the rows are drawn.
     let mut toggle_folder = None;
+    let mut shown_rows = None;
     let sa = scroll.show_rows(ui, row_h, n, |ui, range| {
+        shown_rows = Some(range.clone());
         for vis in range {
             let Some(&entry_index) = pane.visible.get(vis) else {
                 break;
@@ -1700,6 +1702,10 @@ pub fn details(
         }
     });
     ui.spacing_mut().item_spacing = previous_spacing;
+    // Folder sizes are measured for these rows first.
+    if let Some(rows) = shown_rows {
+        pane.note_viewport(rows);
+    }
     if let Some(vis) = toggle_folder {
         pane.toggle_expanded_at(vis);
     }
