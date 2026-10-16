@@ -56,8 +56,12 @@ const UNWATCHED_MAX_AGE: Duration = Duration::from_secs(30);
 /// Partial totals (a folder could not be read) count as fresh this long: a folder that becomes
 /// readable (its permissions fixed) sends no event to the watch, so it is simply read again.
 /// Only the folders on the way to the unreadable ones are listed again; complete branches
-/// are reused.
+/// are reused. A folder that stays unreadable (`C:\System Volume Information`) gives the same
+/// partial total each time: each repeat doubles this, up to [`PARTIAL_MAX_BACKOFF`], until a
+/// change event below the folder or a refresh (F5) starts over.
 const PARTIAL_MAX_AGE: Duration = Duration::from_secs(30);
+/// The longest a repeated, identical partial total stays fresh.
+const PARTIAL_MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 /// Walks below a root whose watch is being set up wait this long for it, so their result
 /// can be trusted instead of having to be measured twice.
 const REGISTER_GRACE: Duration = Duration::from_secs(1);
@@ -98,6 +102,7 @@ struct Timing {
     network_max_age: Duration,
     unwatched_max_age: Duration,
     partial_max_age: Duration,
+    partial_max_backoff: Duration,
     register_grace: Duration,
 }
 
@@ -110,6 +115,7 @@ impl Default for Timing {
             network_max_age: NETWORK_MAX_AGE,
             unwatched_max_age: UNWATCHED_MAX_AGE,
             partial_max_age: PARTIAL_MAX_AGE,
+            partial_max_backoff: PARTIAL_MAX_BACKOFF,
             register_grace: REGISTER_GRACE,
         }
     }
@@ -130,6 +136,9 @@ struct Cached {
     trusted: bool,
     /// No watch covers the folder: fresh only until then.
     until: Option<Instant>,
+    /// A partial total: how long it was fresh for (see [`PARTIAL_MAX_AGE`]); zero otherwise,
+    /// and reset to zero by a change below the folder or a refresh.
+    partial_delay: Duration,
 }
 
 impl Cached {
@@ -694,9 +703,9 @@ impl State {
             .any(|r| r.parent().is_none() && is_within(dir, r))
     }
 
-    /// How a total of `dir` from a walk that `tainted` or not, started `trusted` (under a
-    /// watch) or not, is kept: `(fresh, trusted, until)`. A `partial` total is never reused
-    /// by later walks and expires (see [`PARTIAL_MAX_AGE`]).
+    /// How `totals` of `dir` from a walk that `tainted` or not, started `trusted` (under a
+    /// watch) or not, is kept. A partial total is never reused by later walks and expires
+    /// (see [`PARTIAL_MAX_AGE`]); the same partial total as last time expires twice as late.
     #[allow(clippy::too_many_arguments)]
     fn classify(
         &self,
@@ -704,18 +713,43 @@ impl State {
         network: bool,
         trusted: bool,
         tainted: bool,
-        partial: bool,
+        totals: DirTotals,
         now: Instant,
         timing: &Timing,
-    ) -> (bool, bool, Option<Instant>) {
+    ) -> Cached {
         let (fresh, trusted, until) =
             self.classify_complete(dir, network, trusted, tainted, now, timing);
-        if partial && fresh {
-            let limit = now + timing.partial_max_age;
-            (true, false, Some(until.map_or(limit, |u| u.min(limit))))
-        } else {
-            (fresh, trusted, until)
+        let mut cached = Cached {
+            totals,
+            at: now,
+            fresh,
+            trusted,
+            until,
+            partial_delay: Duration::ZERO,
+        };
+        if totals.partial && fresh {
+            // The same folders unreadable again, nothing else changed: back off.
+            let repeat = self
+                .cache
+                .get(dir)
+                .filter(|c| c.totals == totals && !c.partial_delay.is_zero())
+                .map(|c| c.partial_delay);
+            let base = timing.partial_max_age;
+            cached.trusted = false;
+            cached.until = Some(match repeat {
+                Some(previous) => {
+                    let delay = (previous * 2).min(timing.partial_max_backoff).max(base);
+                    cached.partial_delay = delay;
+                    now + delay
+                }
+                None => {
+                    cached.partial_delay = base;
+                    let limit = now + base;
+                    until.map_or(limit, |u| u.min(limit))
+                }
+            });
         }
+        cached
     }
 
     fn classify_complete(
@@ -854,6 +888,7 @@ impl State {
                 changed |= c.fresh;
                 c.fresh = false;
                 c.trusted = false;
+                c.partial_delay = Duration::ZERO;
             }
             return Some((changed, wake));
         }
@@ -864,6 +899,7 @@ impl State {
                 changed |= c.fresh;
                 c.fresh = false;
                 c.trusted = false;
+                c.partial_delay = Duration::ZERO;
             }
             if let Some(job) = self.running.get_mut(p) {
                 job.touch(path);
@@ -937,6 +973,7 @@ impl State {
                 changed |= c.fresh;
                 c.fresh = false;
                 c.trusted = false;
+                c.partial_delay = Duration::ZERO;
             }
         }
         for (path, job) in &mut self.running {
@@ -1096,18 +1133,16 @@ impl State {
             }
         };
         if let Some(totals) = totals {
-            let (fresh, trusted, until) =
-                self.classify(&path, job.network, job.trusted, tainted, totals.partial, now, timing);
-            self.insert(
-                path.clone(),
-                Cached {
-                    totals,
-                    at: now,
-                    fresh,
-                    trusted,
-                    until,
-                },
+            let cached = self.classify(
+                &path,
+                job.network,
+                job.trusted,
+                tainted,
+                totals,
+                now,
+                timing,
             );
+            self.insert(path.clone(), cached);
         }
         // Cancelled, changed while it ran, or started before its watch was up, and still
         // wanted: measure again. While the watch is still being set up the registrar queues
@@ -1145,26 +1180,17 @@ impl SizeCache for Adapter<'_> {
         };
         let tainted = job.touched_within(dir);
         let now = Instant::now();
-        let (fresh, trusted, until) = st.classify(
+        let cached = st.classify(
             dir,
             job.network,
             job.trusted,
             tainted,
-            totals.partial,
+            *totals,
             now,
             &self.shared.timing,
         );
         let wanted = st.wanted.contains_key(dir);
-        st.insert(
-            dir.to_path_buf(),
-            Cached {
-                totals: *totals,
-                at: now,
-                fresh,
-                trusted,
-                until,
-            },
-        );
+        st.insert(dir.to_path_buf(), cached);
         drop(st);
         if wanted {
             self.shared.bump();
@@ -1455,6 +1481,7 @@ mod tests {
             network_max_age: NETWORK_MAX_AGE,
             unwatched_max_age: UNWATCHED_MAX_AGE,
             partial_max_age: PARTIAL_MAX_AGE,
+            partial_max_backoff: PARTIAL_MAX_BACKOFF,
             register_grace: REGISTER_GRACE,
         }
     }
@@ -1500,6 +1527,7 @@ mod tests {
                     files: 1,
                     dirs: 0,
                     partial: false,
+                    ..DirTotals::default()
                 })
             },
             quick(),
@@ -1753,6 +1781,7 @@ mod tests {
             fresh: true,
             trusted,
             until: None,
+            partial_delay: Duration::ZERO,
         };
         st.wanted.insert(
             PathBuf::from("w"),
@@ -1789,6 +1818,7 @@ mod tests {
             fresh: true,
             trusted: true,
             until: None,
+            partial_delay: Duration::ZERO,
         };
         for p in [r"C:\r\x", r"C:\r\x\y", r"C:\r\xy", r"C:\r"] {
             st.insert(PathBuf::from(p), c);
@@ -1948,7 +1978,13 @@ mod tests {
             egui::Context::default(),
             move |_, _, _, _| {
                 let first = counted.fetch_add(1, Ordering::SeqCst) == 0;
-                Ok(DirTotals { bytes: if first { 10 } else { 30 }, files: 1, dirs: 0, partial: first })
+                Ok(DirTotals {
+                    bytes: if first { 10 } else { 30 },
+                    files: 1,
+                    dirs: 0,
+                    partial: first,
+                    ..DirTotals::default()
+                })
             },
             Timing {
                 partial_max_age: Duration::from_millis(300),
@@ -1959,11 +1995,104 @@ mod tests {
         let root = PathBuf::from(r"C:\fake\locked");
         fs.want(std::slice::from_ref(&root), std::slice::from_ref(&root));
         assert!(wait_for(LIMIT, || known(&fs, &root).is_some_and(|t| t.partial)));
-        assert!(!fs.shared.state.lock().cache[&root].trusted, "later walks must read it again");
+        assert!(
+            !fs.shared.state.lock().cache[&root].trusted,
+            "later walks must read it again"
+        );
         // No event and no new `want`: the partial total expires and is measured again.
         assert!(wait_known_bytes(&fs, &root, 30));
         assert!(!known(&fs, &root).unwrap().partial);
-        assert!(fs.shared.state.lock().cache[&root].trusted, "a complete total under a watch");
+        assert!(
+            fs.shared.state.lock().cache[&root].trusted,
+            "a complete total under a watch"
+        );
+    }
+
+    #[test]
+    fn the_same_partial_total_is_measured_again_less_and_less_often() {
+        // A folder that stays unreadable (System Volume Information): the same "+" every time.
+        const SAME: DirTotals = DirTotals {
+            bytes: 10,
+            files: 1,
+            dirs: 1,
+            partial: true,
+            unreadable: 1,
+            unreadable_hash: 0x5eed,
+        };
+        let starts = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let recorded = Arc::clone(&starts);
+        let timing = Timing {
+            partial_max_age: Duration::from_millis(100),
+            partial_max_backoff: Duration::from_millis(800),
+            ..quick()
+        };
+        let mut fs = FolderSizes::with_parts(
+            egui::Context::default(),
+            move |_, _, _, _| {
+                recorded.lock().push(Instant::now());
+                Ok(SAME)
+            },
+            timing,
+            Some(Box::new(|_| Some(true))),
+        );
+        let root = PathBuf::from(r"C:\fake\volume");
+        let walks = |n: usize| {
+            assert!(
+                wait_for(LIMIT, || starts.lock().len() >= n),
+                "walk {n} never came"
+            );
+            starts.lock().clone()
+        };
+        let gap = |s: &[Instant], i: usize| s[i] - s[i - 1];
+        fs.want(std::slice::from_ref(&root), std::slice::from_ref(&root));
+        // Fresh for 100 ms, then 200 ms, then 400 ms (instead of 100 ms each time).
+        let s = walks(4);
+        assert!(gap(&s, 2) >= Duration::from_millis(180), "{:?}", gap(&s, 2));
+        assert!(gap(&s, 3) >= Duration::from_millis(380), "{:?}", gap(&s, 3));
+        // A refresh (F5) measures now and starts over at 100 ms (not 800 ms).
+        fs.invalidate_tree(&root);
+        let n = walks(5).len();
+        let s = walks(n + 1);
+        assert!(gap(&s, n) < Duration::from_millis(500), "{:?}", gap(&s, n));
+        // So does a change below the folder: after the debounce, again 100 ms.
+        let s = walks(n + 2);
+        assert!(
+            gap(&s, n + 1) >= Duration::from_millis(180),
+            "backing off again"
+        );
+        fs.invalidate(&root.join("changed.bin"));
+        let n = walks(s.len() + 1).len();
+        let s = walks(n + 1);
+        assert!(gap(&s, n) < Duration::from_millis(500), "{:?}", gap(&s, n));
+
+        // Another set of unreadable folders (or other bytes) starts over too.
+        let mut st = fs.shared.state.lock();
+        let now = Instant::now();
+        let kept = Cached {
+            totals: SAME,
+            at: now,
+            fresh: true,
+            trusted: false,
+            until: Some(now),
+            partial_delay: Duration::from_millis(400),
+        };
+        st.cache.insert(root.clone(), kept);
+        let delay = |st: &State, totals| {
+            st.classify(&root, false, true, false, totals, now, &timing)
+                .partial_delay
+        };
+        assert_eq!(delay(&st, SAME), Duration::from_millis(800));
+        let other = DirTotals {
+            unreadable_hash: 0xbeef,
+            ..SAME
+        };
+        assert_eq!(delay(&st, other), Duration::from_millis(100));
+        assert_eq!(
+            delay(&st, DirTotals { bytes: 11, ..SAME }),
+            Duration::from_millis(100)
+        );
+        st.cache.get_mut(&root).unwrap().partial_delay = Duration::from_millis(800);
+        assert_eq!(delay(&st, SAME), Duration::from_millis(800), "capped");
     }
 
     #[test]
@@ -2048,6 +2177,7 @@ mod tests {
                 fresh: true,
                 trusted: true,
                 until: None,
+                partial_delay: Duration::ZERO,
             },
         );
         assert_eq!(
@@ -2070,6 +2200,7 @@ mod tests {
                 fresh: true,
                 trusted: true,
                 until: None,
+                partial_delay: Duration::ZERO,
             },
         );
         assert_eq!(
