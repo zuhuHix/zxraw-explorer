@@ -39,6 +39,7 @@ Explorer is a file manager designed around that workflow:
 | Batch rename with a live preview and undo | — | ✅ |
 | Filters like `ext:cr3 rating:>=4 lens:35mm` | limited | ✅ |
 | Duplicate finder, folder compare, folder size analysis | — | ✅ |
+| Folder totals in the Size column | — | ✅ |
 | Command palette for every action | — | ✅ |
 | Rebind any keyboard shortcut | — | ✅ |
 | Collections (manual and smart) that never move your files | — | ✅ |
@@ -188,6 +189,13 @@ Explorer is a file manager designed around that workflow:
 - **Folders that open in place.** In details view, click the arrow beside a folder, or press
   <kbd>→</kbd> / <kbd>←</kbd>, to open it right where it sits. Its contents appear underneath,
   indented, and you can work with them as usual.
+- **Folder sizes at a glance.** The Size column shows the total size of everything inside each
+  folder, not just its own files. Totals are measured in the background (a `…` shows while one
+  is still being worked out) and update as files change; hovering shows how many files and
+  folders it holds. Sorting by size uses these totals. A `+` after a total means part of the
+  folder could not be counted (it could not be read, or it is a cloud folder whose contents are
+  not on this PC), so the total is a minimum. Folder sizes can be turned off in Settings ›
+  Browsing, and network drives are left out unless you tick *Also on network drives*.
 - **Pick the look.** Accent colours for the interface, and ten colours for the app icon itself.
 - **Notes on any file.** Type a note in the preview panel's *Note* box. It saves on its own a
   moment after you stop typing, and shows whether it is saved. Files with a note get a small ✎
@@ -267,8 +275,9 @@ given its own shortcut.
   the encoding and line endings are kept, and <kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes the replace.
 - **Fast name search.** The search window can also ask Everything or the Windows Search index,
   when they are available, instead of the app's own library index.
-- **Selection summary.** The status bar shows how many items are selected, their total size and
-  the total running time of selected videos and audio.
+- **Selection summary.** The status bar shows how many items are selected, their total size
+  (folders included, shown as "so far…" while they are still being measured) and the total
+  running time of selected videos and audio.
 
 ## Import from a card, safely
 

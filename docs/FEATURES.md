@@ -200,6 +200,25 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   200,000-file benchmark tree yields the expected 20 duplicate groups with zero errors.
 * ✅ Folder size analysis — `forge-core/src/disk_usage.rs` (`tree_totals_top_files_and_extensions`,
   `cancel_scan`). Not benchmarked.
+* ✅ Folder sizes in the Size column — `forge-core/src/dir_size.rs` (`nested_totals_count_bytes_files_and_folders`,
+  `junctions_are_not_followed_or_counted`, `cancellation_returns_cancelled`, `cache_lookup_replaces_a_subtree`,
+  `store_receives_every_completed_sub_folder`, `cloud_folder_not_on_this_pc_is_not_entered`,
+  `unreadable_sub_folder_makes_the_result_partial`), `forge-app/src/folder_sizes.rs`
+  (`pending_until_the_walk_answers_then_known`, `a_folder_no_longer_wanted_stops_its_walk`,
+  `a_change_below_a_watched_root_updates_its_total`, `remeasure_reuses_trusted_sub_totals`,
+  `network_folders_are_off_while_network_sizes_are_off`, `disabled_sizes_are_off_and_measure_nothing`),
+  `listing::tests::a_file_still_being_written_is_listed_with_its_live_size` (files still being written
+  show their live size instead of 0 B), e2e `browser::folder_totals_appear_in_the_size_column` and
+  `browser::a_large_folder_total_shows_quickly` (10,000 files). Folders in the details view show their
+  recursive total in the Size column, measured in the background (`…` while measuring, a `+` suffix when
+  part could not be read or is a cloud folder not on this PC, hover for file and folder counts). One
+  enumeration pass per folder (`FindFirstFileExW`), several threads, totals cached for every sub-folder,
+  work for folders no longer on screen cancelled, and a change watch that re-measures only the changed
+  branch. Symlinks and junctions are never followed; cloud placeholders are never downloaded; network
+  drives are off unless Settings › Browsing › *Also on network drives* is ticked; the whole feature can
+  be turned off with *Folder sizes in the Size column*. Sorting by Size uses the totals. Rough numbers
+  from one PC (release build, warm cache), not in [BENCHMARKS.md](BENCHMARKS.md): 327k files / 45k folders
+  in 0.47 s, 17k files in 14 ms.
 * ✅ Compare folders (engine) — `forge-core/src/compare.rs` (`compare_and_update_never_deletes`,
   `mirror_makes_identical`, `non_mirror_plan_with_deletes_is_refused`).
 * ✅ Two-way folder sync (engine) — `forge-core/src/compare.rs`: copies each side's new files
@@ -466,8 +485,10 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 
 ## Status bar
 
-* ✅ Selection summary: count and total size of the listed, selected entries
-  (`forge-app/src/app.rs::selection_summary_tests`), and the total running time of selected
+* ✅ Selection summary: count and total size of the listed, selected entries, including the
+  measured totals of selected folders (shown as "so far…" while still measuring)
+  (`forge-app/src/app.rs::selection_summary_tests`, including
+  `a_selected_folder_adds_its_measured_total_and_says_so_while_it_is_measured`), and the total running time of selected
   video and audio files, probed with `ffprobe` in the background and cached by path and
   modification time (`forge-app/src/media_durations.rs`; tests cover totals, the 500-file probe
   cap and the partial / unknown wording). Not run live here because FFmpeg is not installed.
