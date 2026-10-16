@@ -505,7 +505,7 @@ fn prepare_marquee(
             starting_selection: if mode == MarqueeMode::Replace {
                 HashSet::new()
             } else {
-                pane.selected.clone()
+                (*pane.selected).clone()
             },
             listing_rev: pane.listing_rev(),
             last_touched: None,
@@ -547,7 +547,7 @@ fn update_marquee_selection(
     if let Some(index) = last_touched {
         drag.last_touched = Some(index);
     }
-    pane.selected = marquee_selection(drag.mode, &drag.starting_selection, touched);
+    pane.selected.replace(marquee_selection(drag.mode, &drag.starting_selection, touched));
     if let Some(index) = drag.last_touched {
         pane.cursor = Some(index);
         pane.anchor = Some(index);
@@ -3099,6 +3099,8 @@ mod folder_size_tests {
         files: 12_345,
         dirs: 678,
         partial: false,
+        unreadable: 0,
+        unreadable_hash: 0,
     };
     const PARTIAL: DirTotals = DirTotals {
         partial: true,

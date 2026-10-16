@@ -180,7 +180,7 @@ struct SelectionSummary {
     /// Visible entry path → size, modification time, whether it's a video or audio file,
     /// and whether it's a folder.
     index: std::collections::HashMap<PathBuf, (u64, Option<std::time::SystemTime>, bool, bool)>,
-    selection: Option<(usize, u64)>,
+    selection: Option<u64>,
     count: usize,
     size: u64,
     /// Selected video and audio files, for the running-time total.
@@ -210,26 +210,15 @@ impl SelectionSummary {
             self.listing = Some(listing);
             self.selection = None;
         }
-        // Fingerprint the selection by its length and its first 64 paths in the set's own
-        // iteration order: the whole content for small selections (selecting another single
-        // file keeps the length), and for large ones a same-size swap to different files
-        // almost surely changes which paths come first. At most 64 hashes per frame.
-        let hasher = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
-        let fingerprint = p
-            .selected
-            .iter()
-            .take(64)
-            .enumerate()
-            .fold(0u64, |acc, (i, path)| {
-                acc.rotate_left(7) ^ std::hash::BuildHasher::hash_one(&hasher, (i, path))
-            });
-        let selection = (p.selected.len(), fingerprint);
+        // The selection's revision moves on every change to it, so one comparison per frame
+        // sees any change, whatever the selection's size.
+        let selection = p.selected.revision();
         if self.selection != Some(selection) {
             let mut count = 0;
             let mut size = 0u64;
             self.media.clear();
             self.folders.clear();
-            for path in &p.selected {
+            for path in p.selected.iter() {
                 if let Some(&(bytes, modified, media, dir)) = self.index.get(path) {
                     count += 1;
                     size = size.saturating_add(bytes);
@@ -1579,12 +1568,28 @@ mod selection_summary_tests {
         let refs: Vec<(&str, u64)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
         let mut p = pane(&refs);
         let mut summary = SelectionSummary::default();
-        p.selected = (0..300).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        p.selected.replace((0..300).map(|i| p.path.join(format!("f{i:03}.txt"))).collect());
         let first = summary.get(&p);
-        p.selected = (300..600).map(|i| p.path.join(format!("f{i:03}.txt"))).collect();
+        p.selected.replace((300..600).map(|i| p.path.join(format!("f{i:03}.txt"))).collect());
         let second = summary.get(&p);
         assert_eq!(first, (300, (0..300).sum()));
         assert_eq!(second, (300, (300..600).sum()));
+    }
+
+    #[test]
+    fn a_swap_past_the_first_64_of_a_large_selection_is_noticed() {
+        let names: Vec<(String, u64)> = (0..300).map(|i| (format!("f{i:03}.txt"), i)).collect();
+        let refs: Vec<(&str, u64)> = names.iter().map(|(n, s)| (n.as_str(), *s)).collect();
+        let mut p = pane(&refs);
+        let mut summary = SelectionSummary::default();
+        p.selected.replace((0..200).map(|i| p.path.join(format!("f{i:03}.txt"))).collect());
+        assert_eq!(summary.get(&p), (200, (0..200).sum()));
+        // Swap a selected file the set iterates past the first 64 for an unselected one.
+        let victim = p.selected.iter().nth(64).cloned().unwrap();
+        let victim_size = p.entries.iter().find(|e| e.path == victim).unwrap().size;
+        p.selected.remove(&victim);
+        p.selected.insert(p.path.join("f250.txt"));
+        assert_eq!(summary.get(&p), (200, (0..200).sum::<u64>() - victim_size + 250));
     }
 
     #[test]

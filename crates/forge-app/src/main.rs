@@ -39,6 +39,7 @@ mod platform;
 mod preview;
 mod replace_ui;
 mod search_ui;
+mod selection;
 mod tags_ui;
 mod watermark;
 mod terminal;

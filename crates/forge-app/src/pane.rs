@@ -15,6 +15,7 @@ use forge_core::query::Query;
 use forge_jobs::CancelToken;
 
 use crate::folder_sizes::{FolderSize, FolderSizes};
+use crate::selection::Selection;
 use crate::settings::ViewMode;
 
 /// Folder totals are written into the listing at most this often while more keep arriving:
@@ -146,7 +147,7 @@ pub struct Pane {
     pub filter_text: String,
     filter_query: Option<Query>,
     pub filter_error: Option<String>,
-    pub selected: HashSet<PathBuf>,
+    pub selected: Selection,
     /// Index into `visible` of the keyboard cursor / range-selection anchor.
     pub cursor: Option<usize>,
     pub anchor: Option<usize>,
@@ -222,7 +223,7 @@ impl Pane {
             filter_text: String::new(),
             filter_query: None,
             filter_error: None,
-            selected: HashSet::new(),
+            selected: Selection::default(),
             cursor: None,
             anchor: None,
             load: LoadState::Ready { errors: 0 },
@@ -816,11 +817,12 @@ impl Pane {
     }
 
     pub fn select_all(&mut self) {
-        self.selected = self
-            .visible
-            .iter()
-            .map(|&i| self.entries[i].path.clone())
-            .collect();
+        self.selected.replace(
+            self.visible
+                .iter()
+                .map(|&i| self.entries[i].path.clone())
+                .collect(),
+        );
     }
 
     pub fn clear_selection(&mut self) {
@@ -833,7 +835,8 @@ impl Pane {
             .iter()
             .map(|&i| self.entries[i].path.clone())
             .collect();
-        self.selected = all.difference(&self.selected).cloned().collect();
+        let inverted: HashSet<PathBuf> = all.difference(&self.selected).cloned().collect();
+        self.selected.replace(inverted);
     }
 
     /// A right-click on a row: the menu acts on the selection when the row is part of it
