@@ -1115,6 +1115,8 @@ pub struct FolderWants {
 struct WantKey {
     /// Listing revisions of the left and right pane (0 without a right pane).
     listings: (u64, u64),
+    /// Viewport revisions of both panes: the rows on screen are measured first.
+    viewports: (u64, u64),
     /// Which panes are in Details view, where the Size column shows folder totals.
     details: (bool, bool),
     right_focused: bool,
@@ -1139,6 +1141,10 @@ impl FolderWants {
             listings: (
                 tab.left.listing_rev(),
                 tab.right.as_ref().map_or(0, Pane::listing_rev),
+            ),
+            viewports: (
+                tab.left.viewport_rev(),
+                tab.right.as_ref().map_or(0, Pane::viewport_rev),
             ),
             details: (
                 tab.left.view == ViewMode::Details,
