@@ -462,6 +462,95 @@ fn delete_with_the_selection_filtered_out_touches_no_file() {
 }
 
 #[test]
+fn delete_selects_the_next_item_in_details_view() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         click-entry b.txt\nkey Delete\nwait-jobs 20\nwait-no-entry b.txt | 10\n\
+         assert-selection c.txt\nui browser assert-cursor c.txt\n\
+         # The next delete needs no click: the selection moved on with the cursor.\n\
+         key Delete\nwait-jobs 20\nwait-no-entry c.txt | 10\n\
+         assert-missing {c}\nassert-selection d.txt\nui browser assert-cursor d.txt\nexit\n",
+        work = shown(&work),
+        c = shown(&work.join("c.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn delete_selects_the_next_item_in_grid_view() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewGrid\nwait-frames 5\n\
+         # The last item has nothing after it: the one before it is selected.\n\
+         click-entry e.txt\nkey Delete\nwait-jobs 20\nwait-no-entry e.txt | 10\n\
+         assert-selection d.txt\nui browser assert-cursor d.txt\nexit\n",
+        work = shown(&work),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn deleting_several_items_selects_the_one_after_them() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         select b.txt, c.txt\nassert-selected 2\nkey Delete\nwait-jobs 20\n\
+         wait-no-entry b.txt | 10\nwait-no-entry c.txt | 10\n\
+         assert-selection d.txt\nassert-selected 1\nexit\n",
+        work = shown(&work),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn permanent_delete_selects_the_next_item_and_cancel_keeps_the_selection() {
+    let (temp, work, profile) = list_fixture(&["a.txt", "b.txt", "c.txt", "d.txt"]);
+    let script = format!(
+        "navigate {work}\ncmd ViewDetails\nwait-frames 5\n\
+         select b.txt\ncmd DeletePermanently\ncancel\nwait-frames 10\n\
+         # Cancelled: nothing is removed and the selection stays on b.txt.\n\
+         assert-selection b.txt\nassert-entry b.txt\n\
+         cmd DeletePermanently\naccept\nwait-jobs 20\nwait-no-entry b.txt | 10\n\
+         assert-missing {b}\nassert-selection c.txt\nexit\n",
+        work = shown(&work),
+        b = shown(&work.join("b.txt")),
+    );
+    let outcome = run_app(temp.path(), &profile, &script);
+    expect_ok(&outcome);
+}
+
+#[test]
+fn moving_items_away_selects_the_next_item() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let src = sandbox.path().join("src");
+    let dst = sandbox.path().join("dst");
+    for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+        write_file(&src.join(name), name.as_bytes());
+    }
+    fs::create_dir_all(&dst).unwrap();
+    let script = dual_pane_script(
+        &src,
+        &dst,
+        &[
+            "select b.txt",
+            "cmd MoveToOtherPane",
+            "wait-jobs 20",
+            "wait-no-entry b.txt | 10",
+            // Focus is on the source pane (left), so the selection read is its selection.
+            "assert-selection c.txt",
+        ],
+    );
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+    expect_ok(&outcome);
+    assert!(dst.join("b.txt").exists(), "the moved file must arrive");
+    assert!(!src.join("b.txt").exists(), "the source must be gone");
+}
+
+#[test]
 fn rename_with_the_selection_filtered_out_renames_nothing() {
     let (temp, work, profile) = list_fixture(&["apple.txt", "berry.txt", "cherry.txt"]);
     write_file(

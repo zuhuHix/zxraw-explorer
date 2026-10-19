@@ -670,6 +670,10 @@ fn start_transfer_with(
         .transfers()
         .set_serial(app.settings.transfer_queue);
     let disks = transfer_disks(&sources, &dest);
+    if kind == OpKind::Move {
+        // The sources leave their folders once the queued job runs.
+        app.expect_removal(&sources);
+    }
     // A move deletes its sources, so it must act on the items the user picked: what is
     // at a source path when the job starts must still be the same item. The identities are
     // read now, on a helper thread (one metadata query per source can stall on a network
@@ -1236,6 +1240,7 @@ fn finish_report(
 }
 
 pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
+    app.expect_removal(&targets);
     let n = targets.len();
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();

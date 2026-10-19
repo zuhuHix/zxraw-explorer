@@ -186,6 +186,9 @@ Explorer is a file manager designed around that workflow:
 - **Sticky selection.** <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> makes every click add or remove
   an item, so picking scattered files needs no <kbd>Ctrl</kbd>. The status bar shows 📌 while it is
   on; <kbd>Esc</kbd> turns it off.
+- **Delete, then keep going.** After you delete items or move them out of the folder, the next
+  item is selected, so the next <kbd>Delete</kbd>, rating or tag needs no click. If the delete is
+  cancelled or fails, the items stay selected.
 - **Folders that open in place.** In details view, click the arrow beside a folder, or press
   <kbd>→</kbd> / <kbd>←</kbd>, to open it right where it sits. Its contents appear underneath,
   indented, and you can work with them as usual.
