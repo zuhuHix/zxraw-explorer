@@ -124,6 +124,28 @@ pub enum LoadState {
 struct PendingRemoval {
     removed: HashSet<PathBuf>,
     candidates: Vec<PathBuf>,
+    /// The user's state when the record was taken or last polled: a change to any of it
+    /// drops the record (see `check_removal_still_wanted`).
+    selection_rev: u64,
+    cursor: Option<PathBuf>,
+    sort: SortSpec,
+    filter: String,
+    /// A listing finished since the record was taken.
+    listed: bool,
+    /// Folders whose latest listing had read errors or failed: it may leave out a removed
+    /// item that still exists, so the record waits until they list completely.
+    unsure: HashSet<PathBuf>,
+}
+
+impl PendingRemoval {
+    fn listing_done(&mut self, dir: &Path, complete: bool) {
+        self.listed = true;
+        if complete {
+            self.unsure.remove(dir);
+        } else {
+            self.unsure.insert(dir.to_path_buf());
+        }
+    }
 }
 
 pub struct Pane {
@@ -552,6 +574,13 @@ impl Pane {
 
     /// Drain listing messages. Returns true if anything changed (caller repaints).
     pub fn poll(&mut self) -> bool {
+        self.check_removal_still_wanted();
+        let changed = self.poll_listing();
+        self.finish_removal_poll();
+        changed
+    }
+
+    fn poll_listing(&mut self) -> bool {
         let mut changed = self.sync_tree_view();
         changed |= self.poll_children();
         let Some(rx) = &self.rx else {
@@ -620,6 +649,9 @@ impl Pane {
                 let fresh = if matches!(state, LoadState::Failed(_)) { Vec::new() } else { fresh };
                 let dir = self.path.clone();
                 self.reshape(false, |pane| pane.swap_children(&dir, fresh, complete));
+                if let Some(pending) = self.pending_removal.as_mut() {
+                    pending.listing_done(&dir, complete);
+                }
             }
             self.load = state;
             self.rx = None;
@@ -657,9 +689,6 @@ impl Pane {
             // By path: names repeat across open folders. An item that is gone leaves no cursor.
             if let Some(path) = self.pending_select_keep.take() {
                 self.cursor = self.row_of(&path);
-            }
-            if !self.children_loading() {
-                self.apply_pending_removal();
             }
         }
         changed
@@ -884,12 +913,57 @@ impl Pane {
             .map(|&i| self.entries[i].path.as_path())
             .collect();
         let candidates = removal_successors(&listed, &removed);
-        self.pending_removal =
-            (!candidates.is_empty()).then_some(PendingRemoval { removed, candidates });
+        self.pending_removal = (!candidates.is_empty()).then(|| PendingRemoval {
+            removed,
+            candidates,
+            selection_rev: self.selected.revision(),
+            cursor: self.cursor_entry().map(|e| e.path.clone()),
+            sort: self.sort,
+            filter: self.filter_text.clone(),
+            listed: false,
+            unsure: HashSet::new(),
+        });
     }
 
-    /// Selects the next item once the items of `expect_removal` have left the listing. A pick
-    /// the user made meanwhile, or nothing selected at all, drops the pending removal.
+    /// Anything the user did since the record was taken (or last polled) wins: the removal
+    /// is no longer waited for.
+    fn check_removal_still_wanted(&mut self) {
+        let Some(pending) = self.pending_removal.as_ref() else {
+            return;
+        };
+        let moved = pending.selection_rev != self.selected.revision()
+            || pending.cursor.as_deref() != self.cursor_entry().map(|e| e.path.as_path())
+            || pending.sort != self.sort
+            || pending.filter != self.filter_text;
+        if moved {
+            self.pending_removal = None;
+        }
+    }
+
+    /// Applies a removal once its listing is complete and every open folder is listed. The
+    /// poll's own pruning and refreshing are not user changes, so the baseline moves on.
+    fn finish_removal_poll(&mut self) {
+        let Some(pending) = self.pending_removal.as_ref() else {
+            return;
+        };
+        // A folder that is being removed, or is no longer open, cannot hide a removed item.
+        let unsure = pending.unsure.iter().any(|d| {
+            !d.ancestors().any(|a| pending.removed.contains(a))
+                && (*d == self.path || self.children.contains_key(d))
+        });
+        if pending.listed && !unsure && !self.is_loading() && !self.children_loading() {
+            self.apply_pending_removal();
+        }
+        let selection_rev = self.selected.revision();
+        let cursor = self.cursor_entry().map(|e| e.path.clone());
+        if let Some(pending) = self.pending_removal.as_mut() {
+            pending.selection_rev = selection_rev;
+            pending.cursor = cursor;
+        }
+    }
+
+    /// Selects the next item once the items of `expect_removal` have left the listing. A
+    /// listing that is not complete, or a removed item still listed, keeps it waiting.
     fn apply_pending_removal(&mut self) {
         let Some(pending) = self.pending_removal.as_ref() else {
             return;
@@ -1313,6 +1387,8 @@ impl Pane {
         let mut swaps = Vec::new();
         // Folders whose first listing just completed without read errors.
         let mut listed = Vec::new();
+        // Refreshes of open folders that finished, and whether each was complete.
+        let mut refreshed = Vec::new();
         for _ in 0..64 {
             let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
             let Some(load) = self.children.get_mut(&dir).filter(|l| l.id == id) else {
@@ -1325,6 +1401,7 @@ impl Pane {
                 }
                 ListMsg::Done { errors } if load.staged.is_some() => {
                     load.loading = false;
+                    refreshed.push((dir.clone(), errors == 0));
                     swaps.push((dir, load.staged.take().unwrap(), errors == 0));
                     continue;
                 }
@@ -1333,6 +1410,7 @@ impl Pane {
                     load.loading = false;
                     load.staged = None;
                     load.error = Some(e);
+                    refreshed.push((dir.clone(), false));
                     changed = true;
                     continue;
                 }
@@ -1376,6 +1454,11 @@ impl Pane {
                 }
             });
             changed = true;
+        }
+        if let Some(pending) = self.pending_removal.as_mut() {
+            for (dir, complete) in &refreshed {
+                pending.listing_done(dir, *complete);
+            }
         }
         changed
     }
@@ -2794,5 +2877,177 @@ mod tests {
 
         assert!(pane.selected.is_empty());
         assert!(pane.cursor.is_none());
+    }
+
+    #[test]
+    fn a_partial_listing_does_not_apply_the_removal() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+
+        // A refresh whose listing failed to read an item and left out b: b may still be there.
+        let listed: Vec<FileEntry> = pane
+            .entries
+            .iter()
+            .filter(|e| e.name != "b.txt")
+            .cloned()
+            .collect();
+        let (tx, rx) = unbounded();
+        pane.staged = Some(Vec::new());
+        pane.load = LoadState::Loading { since: Instant::now() };
+        pane.rx = Some(rx);
+        tx.send(ListMsg::Batch(listed)).unwrap();
+        tx.send(ListMsg::Done { errors: 1 }).unwrap();
+        pane.poll();
+
+        assert!(pane.selected.contains(&files[1]));
+        assert_ne!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+        assert!(pane.pending_removal.is_some());
+
+        std::fs::remove_file(&files[1]).unwrap();
+        pane.refresh();
+        settle(&mut pane);
+
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&files[2]));
+    }
+
+    #[test]
+    fn clearing_the_selection_drops_the_removal() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+        pane.clear_selection();
+        std::fs::remove_file(&files[1]).unwrap();
+
+        pane.refresh();
+        settle(&mut pane);
+
+        assert!(pane.selected.is_empty());
+        assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn moving_the_cursor_drops_the_removal() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+        pane.move_cursor(1, false, true);
+        std::fs::remove_file(&files[1]).unwrap();
+
+        pane.refresh();
+        pane.poll();
+        assert!(pane.pending_removal.is_none());
+        settle(&mut pane);
+
+        assert!(pane.selected.is_empty());
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+    }
+
+    #[test]
+    fn a_sort_change_drops_the_removal() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "c.txt"), false, false);
+        pane.expect_removal(&[files[2].clone()]);
+        pane.set_sort(SortKey::Name);
+        std::fs::remove_file(&files[2]).unwrap();
+
+        pane.refresh();
+        settle(&mut pane);
+
+        assert!(pane.selected.is_empty());
+        assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn a_removal_inside_an_open_folder_selects_the_next_item_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for name in ["x", "y", "z"] {
+            std::fs::write(sub.join(format!("{name}.txt")), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join("top.txt"), b"x").unwrap();
+        let mut pane = Pane::new(dir.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+
+        pane.click(row_of(&pane, "y.txt"), false, false);
+        pane.expect_removal(&[sub.join("y.txt")]);
+        std::fs::remove_file(sub.join("y.txt")).unwrap();
+        pane.reload_children(&sub);
+        settle(&mut pane);
+
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("z.txt"));
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&sub.join("z.txt")));
+    }
+
+    /// `dir` holds `sub/` (with `x.txt` and `y.txt`), `a.txt` and `z.txt`, with `sub` open.
+    fn open_sub_fixture() -> (tempfile::TempDir, Pane, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        for name in ["x", "y"] {
+            std::fs::write(sub.join(format!("{name}.txt")), b"x").unwrap();
+        }
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("z.txt"), b"z").unwrap();
+        let mut pane = Pane::new(dir.path().to_path_buf(), SortSpec::default(), ViewMode::Details);
+        settle(&mut pane);
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+        (dir, pane, sub)
+    }
+
+    #[test]
+    fn removing_an_open_folder_selects_the_next_item() {
+        let (dir, mut pane, sub) = open_sub_fixture();
+        // Folders first: the folder, its two children, then the files.
+        let names: Vec<&str> = pane.visible.iter().map(|&i| pane.entries[i].name.as_str()).collect();
+        assert_eq!(names, ["sub", "x.txt", "y.txt", "a.txt", "z.txt"]);
+
+        pane.click(row_of(&pane, "sub"), false, false);
+        pane.expect_removal(&[sub.clone()]);
+        std::fs::remove_dir_all(&sub).unwrap();
+
+        pane.refresh();
+        settle(&mut pane);
+
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("a.txt"));
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&dir.path().join("a.txt")));
+    }
+
+    #[test]
+    fn a_failed_open_folder_listing_holds_the_removal() {
+        let (_dir, mut pane, sub) = open_sub_fixture();
+        let x = sub.join("x.txt");
+        pane.click(row_of(&pane, "x.txt"), false, false);
+        pane.expect_removal(&[x.clone()]);
+
+        // A re-listing of `sub` that fails: its rows may still hold x.txt.
+        let id = pane.children[&sub].id;
+        {
+            let load = pane.children.get_mut(&sub).unwrap();
+            load.loading = true;
+            load.staged = Some(Vec::new());
+        }
+        pane.child_tx.send((id, sub.clone(), ListMsg::Failed("x".into()))).unwrap();
+        pane.poll();
+
+        assert!(pane.pending_removal.is_some());
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&x));
+
+        std::fs::remove_file(&x).unwrap();
+        pane.reload_children(&sub);
+        settle(&mut pane);
+
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("y.txt"));
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&sub.join("y.txt")));
     }
 }
