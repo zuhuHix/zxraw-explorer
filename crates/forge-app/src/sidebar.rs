@@ -30,6 +30,9 @@ pub struct Drive {
     pub label: String,
     pub kind: &'static str,
     pub total: u64,
+    /// Bytes free for the current user (GetDiskFreeSpaceExW's "available to caller", which is
+    /// what Explorer shows and what can actually be written; quotas can make it less than the
+    /// volume's free space).
     pub free: u64,
     pub available: bool,
     /// The share a mapped network drive points at, from Windows' table of connections
@@ -167,6 +170,17 @@ pub fn has_camera_folder(root: &Path) -> bool {
         .any(|name| crate::ingest_ui::find_child_directory(root, name).is_some())
 }
 
+/// Whether a fresh drive list differs from the cached one in anything the sidebar shows.
+fn drives_changed(old: &[Drive], new: &[Drive]) -> bool {
+    old.len() != new.len()
+        || old.iter().zip(new).any(|(a, b)| {
+            a.root != b.root
+                || a.available != b.available
+                || a.free != b.free
+                || a.total != b.total
+        })
+}
+
 impl SidebarState {
     pub fn new(ctx: egui::Context) -> Self {
         let drives: Arc<Mutex<Vec<Drive>>> = Arc::new(Mutex::new(Vec::new()));
@@ -184,10 +198,7 @@ impl SidebarState {
                     let any_hung = list.iter().any(|d| !d.available && d.kind == "Network");
                     let changed = {
                         let mut g = d.lock();
-                        let changed = g.len() != list.len()
-                            || g.iter().zip(&list).any(|(a, b)| {
-                                a.root != b.root || a.available != b.available || a.free != b.free
-                            });
+                        let changed = drives_changed(&g, &list);
                         *g = list;
                         changed
                     };
@@ -625,8 +636,9 @@ fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
     }
 }
 
-/// The small text under a drive's usage bar, e.g. "142 GB free of 476 GB". `None` when the
-/// drive reports no size.
+/// The small text under a drive's usage bar, e.g. "142 GB free of 476 GB": the space free
+/// for the current user (see [`Drive::free`]) and the volume's size. `None` when the drive
+/// reports no size.
 fn free_space_label(free: u64, total: u64) -> Option<String> {
     (total > 0).then(|| {
         format!(
@@ -1045,6 +1057,21 @@ mod free_space_tests {
             free_space_label(16 * GIB, 16 * GIB),
             Some("16.0 GB free of 16.0 GB".into())
         );
+    }
+
+    #[test]
+    fn a_change_in_total_alone_counts_as_a_change() {
+        let drive = |total| Drive {
+            root: PathBuf::from(r"E:\"),
+            label: "CARD".into(),
+            kind: "Removable",
+            total,
+            free: GIB,
+            available: true,
+            remote: None,
+        };
+        assert!(!drives_changed(&[drive(16 * GIB)], &[drive(16 * GIB)]));
+        assert!(drives_changed(&[drive(16 * GIB)], &[drive(32 * GIB)]));
     }
 
     #[test]
