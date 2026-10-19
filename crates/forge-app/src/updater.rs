@@ -447,7 +447,7 @@ fn start_check(app: &mut ZxrawApp, manual: bool) {
         .name("update-check".into())
         .spawn(move || {
             sweep_stale(&std::env::temp_dir());
-            let result = fetch_release(&url);
+            let result = fetch_release(&url, test_server());
             let _ = tx.send(Event::UpdateChecked(Checked { manual, result }));
             ctx.request_repaint();
         });
@@ -458,8 +458,7 @@ fn start_check(app: &mut ZxrawApp, manual: bool) {
 }
 
 /// The latest release from the API, or from the release page when the API is rate limited.
-fn fetch_release(url: &str) -> Result<Release, String> {
-    let test = test_server();
+fn fetch_release(url: &str, test: bool) -> Result<Release, String> {
     match fetch_release_api(url, test) {
         Err(Rejected::RateLimited) => {
             let (latest, tag_prefix, download_prefix) = release_page_urls(url, test);
@@ -1306,10 +1305,59 @@ mod tests {
 
         let err =
             fetch_release_page(&format!("{base}/api"), &tag_prefix, &download_prefix).unwrap_err();
-        assert!(err.contains("unexpected address"), "no redirect to a tag: {err}");
+        assert!(
+            err.contains("unexpected address"),
+            "no redirect to a tag: {err}"
+        );
         let err = fetch_release_page(&format!("{base}/nowhere"), &tag_prefix, &download_prefix)
             .unwrap_err();
         assert!(err.contains("unexpected address"), "{err}");
+    }
+
+    #[test]
+    fn only_a_rate_limited_api_uses_the_release_page() {
+        let answer = |status: &str| {
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes()
+        };
+        let redirect = b"HTTP/1.1 302 Found\r\nLocation: /releases/tag/v9.0.0\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        for status in ["403 Forbidden", "429 Too Many Requests"] {
+            let base = serve(vec![
+                ("/api", answer(status)),
+                ("/releases/latest", redirect.clone()),
+                ("/releases/tag/v9.0.0", b"<html></html>".to_vec()),
+            ]);
+            let release = fetch_release(&format!("{base}/api"), true).unwrap();
+            assert_eq!(release.tag_name, "v9.0.0", "{status}");
+            assert!(release.body.is_none(), "{status}: came from the page");
+        }
+
+        // A failed fallback reports the rate limit.
+        let base = serve(vec![("/api", answer("403 Forbidden"))]);
+        let err = fetch_release(&format!("{base}/api"), true).unwrap_err();
+        assert!(err.contains("limiting requests"), "{err}");
+
+        // Other errors don't fall back, even with a release page available.
+        for (status, expected) in [
+            ("404 Not Found", "no release has been published yet"),
+            ("500 Internal Server Error", "HTTP 500"),
+        ] {
+            let base = serve(vec![
+                ("/api", answer(status)),
+                ("/releases/latest", redirect.clone()),
+                ("/releases/tag/v9.0.0", b"<html></html>".to_vec()),
+            ]);
+            let err = fetch_release(&format!("{base}/api"), true).unwrap_err();
+            assert!(err.contains(expected), "{status}: {err}");
+        }
+
+        // The API's own answer wins when it works.
+        let base = serve(vec![("/api", FIXTURE.as_bytes().to_vec())]);
+        let release = fetch_release(&format!("{base}/api"), true).unwrap();
+        assert_eq!(release.tag_name, "v0.2.1");
+        assert!(release.body.is_some());
     }
 
     #[test]
