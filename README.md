@@ -307,7 +307,9 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
   connections:
   - **A daily update check.** Once a day it asks `api.github.com` for the latest release of
     ZXraw Explorer. It's a standard web request whose only app-specific detail is the version
-    in the User-Agent. It's on by default; turn it off in Settings › Updates.
+    in the User-Agent. If GitHub's API is busy (it allows 60 requests an hour per network), it
+    reads the public release page on `github.com` instead. It's on by default; turn it off in
+    Settings › Updates.
   - **Updates you click.** *Update now* downloads the installer from this project's GitHub
     releases and runs it only if its SHA-256 matches the release's `SHA256SUMS.txt`.
   - **The optional FFmpeg download.** It only runs when you click it and confirm, and is

@@ -6,10 +6,16 @@
 //! User-Agent; nothing about the PC, its files or its use is sent. A newer stable release
 //! shows a notice (see `notices.rs`) offering "Update now".
 //!
+//! The API allows 60 anonymous requests an hour per IP address, which a shared connection
+//! (an office, a VPN) can use up. When it answers "rate limited", the check falls back to
+//! the public `releases/latest` page: GitHub redirects it to the latest stable release's
+//! tag page, and the tag gives the installer and checksum URLs. Release notes and sizes
+//! are not known that way; the SHA-256 check below still applies.
+//!
 //! "Update now" downloads `SHA256SUMS.txt` and the release's
 //! `ZXraw-Explorer-<version>-Setup-x64.exe` into a fresh temporary folder, only from the
 //! project's GitHub release URLs (and GitHub's download CDN after redirects), and refuses
-//! the installer unless its size and SHA-256 match. It then starts the installer silently
+//! the installer unless its SHA-256 (and size, when the API gave one) match. It then starts the installer silently
 //! with `/RELAUNCH` and closes the app; the installer waits for the app to exit (the
 //! `AppMutex`), upgrades in place keeping the user's tasks, and starts the new version.
 //! A portable copy (no `unins000.exe` next to the exe) opens the release page instead.
@@ -40,6 +46,9 @@ pub const APP_MUTEX: &str = "ZXrawExplorerRunning";
 const API_URL: &str = "https://api.github.com/repos/zuhuHix/zxraw-explorer/releases/latest";
 const RELEASES_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/";
 const DOWNLOAD_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/download/";
+/// Redirects to the latest stable release's tag page; not subject to the API's rate limit.
+const LATEST_PAGE_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/latest";
+const TAG_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/tag/";
 /// Hosts GitHub redirects release downloads to.
 const DOWNLOAD_CDN_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
@@ -108,6 +117,7 @@ pub struct Release {
 pub struct Asset {
     pub name: String,
     pub browser_download_url: String,
+    /// Bytes, as the API reports them; 0 when unknown (the release-page fallback).
     pub size: u64,
 }
 
@@ -125,6 +135,34 @@ pub struct UpdateInfo {
     pub notes: String,
     pub installer: Option<Asset>,
     pub sums: Option<Asset>,
+}
+
+/// The release a `releases/latest` redirect landed on: `url` is `<tag_prefix><tag>` for a
+/// stable version tag. Its assets are the installer and checksum list under
+/// `<download_prefix><tag>/`, with unknown sizes; it has no notes. `None` for anything
+/// else (a sign-in page, an error page, a pre-release tag).
+pub fn release_from_tag_url(url: &str, tag_prefix: &str, download_prefix: &str) -> Option<Release> {
+    let tag = url.strip_prefix(tag_prefix)?;
+    let (major, minor, patch) = parse_version(tag)?;
+    if !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.') {
+        return None;
+    }
+    let asset = |name: String| Asset {
+        browser_download_url: format!("{download_prefix}{tag}/{name}"),
+        name,
+        size: 0,
+    };
+    Some(Release {
+        tag_name: tag.to_string(),
+        html_url: url.to_string(),
+        body: None,
+        draft: false,
+        prerelease: false,
+        assets: vec![
+            asset(installer_name(&format!("{major}.{minor}.{patch}"))),
+            asset(SUMS_NAME.to_string()),
+        ],
+    })
 }
 
 pub fn installer_name(version: &str) -> String {
@@ -419,8 +457,68 @@ fn start_check(app: &mut ZxrawApp, manual: bool) {
     }
 }
 
+/// The latest release from the API, or from the release page when the API is rate limited.
 fn fetch_release(url: &str) -> Result<Release, String> {
     let test = test_server();
+    match fetch_release_api(url, test) {
+        Err(Rejected::RateLimited) => {
+            let (latest, tag_prefix, download_prefix) = release_page_urls(url, test);
+            fetch_release_page(&latest, &tag_prefix, &download_prefix).map_err(|e| {
+                tracing::info!("update check: the release page fallback failed: {e}");
+                "GitHub is limiting requests right now; try again later".to_string()
+            })
+        }
+        Err(Rejected::Other(e)) => Err(e),
+        Ok(release) => Ok(release),
+    }
+}
+
+enum Rejected {
+    RateLimited,
+    Other(String),
+}
+
+/// The release page, tag prefix and download prefix that go with the API URL: GitHub's,
+/// or the same paths on the local test server.
+fn release_page_urls(api: &str, test: bool) -> (String, String, String) {
+    if test && is_test_url(api) {
+        let rest = &api["http://".len()..];
+        let origin = &api[.."http://".len() + rest.find('/').unwrap_or(rest.len())];
+        return (
+            format!("{origin}/releases/latest"),
+            format!("{origin}/releases/tag/"),
+            format!("{origin}/releases/download/"),
+        );
+    }
+    (LATEST_PAGE_URL.into(), TAG_URL.into(), DOWNLOAD_URL.into())
+}
+
+/// Follows the `releases/latest` redirect and reads the tag from where it lands. Only the
+/// final URL matters, so the transfer stops at the first chunk of the page.
+fn fetch_release_page(
+    latest: &str,
+    tag_prefix: &str,
+    download_prefix: &str,
+) -> Result<Release, String> {
+    let landed = std::cell::RefCell::new(None::<String>);
+    let final_ok = |u: &str| {
+        *landed.borrow_mut() = Some(u.to_string());
+        u.starts_with(tag_prefix)
+    };
+    let options = forge_win::http::Options {
+        headers: &[("Accept", "text/html")],
+        final_url: Some(&final_ok),
+    };
+    match forge_win::http::download_with(latest, &options, |_| ControlFlow::Break(())) {
+        Ok(_) | Err(forge_win::WinError::Aborted { .. }) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    let landed = landed.into_inner().unwrap_or_default();
+    release_from_tag_url(&landed, tag_prefix, download_prefix)
+        .ok_or_else(|| format!("the release page led to an unexpected address: {landed}"))
+}
+
+fn fetch_release_api(url: &str, test: bool) -> Result<Release, Rejected> {
     let final_ok = |u: &str| u.starts_with("https://api.github.com/") || (test && is_test_url(u));
     let options = forge_win::http::Options {
         headers: &[
@@ -440,16 +538,18 @@ fn fetch_release(url: &str) -> Result<Release, String> {
         ControlFlow::Continue(())
     });
     if too_large {
-        return Err("GitHub's answer was unexpectedly large".into());
+        return Err(Rejected::Other(
+            "GitHub's answer was unexpectedly large".into(),
+        ));
     }
     result.map_err(|e| match e.to_string() {
-        m if m.contains("HTTP 403") || m.contains("HTTP 429") => {
-            "GitHub is limiting requests right now; try again later".to_string()
+        m if m.contains("HTTP 403") || m.contains("HTTP 429") => Rejected::RateLimited,
+        m if m.contains("HTTP 404") => {
+            Rejected::Other("no release has been published yet".to_string())
         }
-        m if m.contains("HTTP 404") => "no release has been published yet".to_string(),
-        m => m,
+        m => Rejected::Other(m),
     })?;
-    parse_release(&body)
+    parse_release(&body).map_err(Rejected::Other)
 }
 
 /// A check finished (called from `actions::poll`).
@@ -643,7 +743,7 @@ pub fn download_verified(
     if installer.name.contains(['/', '\\', ':']) || !installer.name.ends_with(".exe") {
         return Err(format!("unexpected installer name {:?}", installer.name));
     }
-    if installer.size == 0 || installer.size > MAX_INSTALLER_BYTES {
+    if installer.size > MAX_INSTALLER_BYTES {
         return Err(format!(
             "unexpected installer size ({} bytes)",
             installer.size
@@ -667,7 +767,9 @@ pub fn download_verified(
             )
         })?;
 
-    job.progress.add_total_bytes(installer.size);
+    if installer.size > 0 {
+        job.progress.add_total_bytes(installer.size);
+    }
     job.progress
         .set_current(format!("Downloading {}", installer.name));
     let target = dir.join(&installer.name);
@@ -681,8 +783,8 @@ pub fn download_verified(
     }
     fs::rename(&part, &target).map_err(|e| format!("cannot save the installer: {e}"))?;
     job.log(format!(
-        "downloaded {} ({} bytes), SHA-256 {digest} verified",
-        installer.name, installer.size
+        "downloaded {}, SHA-256 {digest} verified",
+        installer.name
     ));
     cleanup.0 = None;
     Ok(target)
@@ -718,7 +820,8 @@ fn fetch_small(url: &str, limit: u64, test: bool, job: &JobHandle) -> Result<Vec
     }
 }
 
-/// Streams `asset` into `part`; returns its SHA-256 once exactly `asset.size` bytes came.
+/// Streams `asset` into `part`; returns its SHA-256 once exactly `asset.size` bytes came
+/// (any amount up to [`MAX_INSTALLER_BYTES`] when the size is unknown).
 fn fetch_to_file(
     asset: &Asset,
     part: &Path,
@@ -730,6 +833,11 @@ fn fetch_to_file(
     let mut hasher = Sha256::new();
     let mut received = 0u64;
     let mut stop = None;
+    let limit = if asset.size == 0 {
+        MAX_INSTALLER_BYTES
+    } else {
+        asset.size
+    };
     let final_ok = |u: &str| allowed_final_url(u, test);
     let result = forge_win::http::download_with(
         &asset.browser_download_url,
@@ -740,10 +848,9 @@ fn fetch_to_file(
                 return ControlFlow::Break(());
             }
             received += chunk.len() as u64;
-            if received > asset.size {
+            if received > limit {
                 stop = Some(format!(
-                    "the server sent more than the expected {} bytes; nothing was installed",
-                    asset.size
+                    "the server sent more than the expected {limit} bytes; nothing was installed"
                 ));
                 return ControlFlow::Break(());
             }
@@ -761,7 +868,7 @@ fn fetch_to_file(
         (None, Err(e)) => return Err(e.to_string()),
         (None, Ok(_)) => {}
     }
-    if received != asset.size {
+    if asset.size > 0 && received != asset.size {
         return Err(format!(
             "the download stopped early ({received} of {} bytes); try again",
             asset.size
@@ -991,7 +1098,8 @@ mod tests {
         assert!(check_due(Some(now + 2 * 60 * 60), now), "clock turned back");
     }
 
-    /// Serves each path's body; unknown paths get 404.
+    /// Serves each path's body (a body starting with `HTTP/1.1 ` is sent as the whole
+    /// response); unknown paths get 404.
     fn serve(routes: Vec<(&'static str, Vec<u8>)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1007,6 +1115,7 @@ mod tests {
                     .find(|(p, _)| *p == path)
                     .map(|(_, b)| b.clone());
                 let response = match body {
+                    Some(body) if body.starts_with(b"HTTP/1.1 ") => body,
                     Some(body) => {
                         let mut r = format!(
                             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1100,6 +1209,121 @@ mod tests {
             0,
             "failed downloads leave nothing behind"
         );
+    }
+
+    #[test]
+    fn the_release_page_redirect_gives_the_tag_and_asset_urls() {
+        let tag = "https://github.com/zuhuHix/zxraw-explorer/releases/tag/";
+        let release = release_from_tag_url(&format!("{tag}v0.5.2"), TAG_URL, DOWNLOAD_URL).unwrap();
+        assert_eq!(release.tag_name, "v0.5.2");
+        assert_eq!(release.html_url, format!("{tag}v0.5.2"));
+        let update = offered_update(&release, "0.5.1", false).unwrap();
+        assert_eq!(update.version, "0.5.2");
+        assert_eq!(update.page_url, format!("{tag}v0.5.2"));
+        assert!(update.notes.is_empty());
+        let installer = update.installer.unwrap();
+        assert_eq!(
+            installer.browser_download_url,
+            "https://github.com/zuhuHix/zxraw-explorer/releases/download/v0.5.2/\
+             ZXraw-Explorer-0.5.2-Setup-x64.exe"
+        );
+        assert_eq!(installer.size, 0, "unknown");
+        assert_eq!(
+            update.sums.unwrap().browser_download_url,
+            "https://github.com/zuhuHix/zxraw-explorer/releases/download/v0.5.2/SHA256SUMS.txt"
+        );
+        assert!(offered_update(&release, "0.5.2", false).is_none());
+
+        for landed in [
+            "https://github.com/login?return_to=x",
+            "https://github.com/zuhuHix/zxraw-explorer/releases",
+            "https://github.com/zuhuHix/zxraw-explorer/releases/tag/v0.6.0-beta.1",
+            "https://github.com/zuhuHix/zxraw-explorer/releases/tag/v0.6.0/../x",
+            "https://github.com/zuhuHix/zxraw-explorer/releases/tag/nightly",
+            "https://github.com/someone/zxraw-explorer/releases/tag/v9.0.0",
+            "",
+        ] {
+            assert!(
+                release_from_tag_url(landed, TAG_URL, DOWNLOAD_URL).is_none(),
+                "{landed}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_release_page_urls_follow_the_test_server() {
+        assert_eq!(
+            release_page_urls("http://127.0.0.1:4567/api", true),
+            (
+                "http://127.0.0.1:4567/releases/latest".to_string(),
+                "http://127.0.0.1:4567/releases/tag/".to_string(),
+                "http://127.0.0.1:4567/releases/download/".to_string(),
+            )
+        );
+        let github = (LATEST_PAGE_URL.into(), TAG_URL.into(), DOWNLOAD_URL.into());
+        assert_eq!(
+            release_page_urls("http://127.0.0.1:4567/api", false),
+            github
+        );
+        assert_eq!(release_page_urls(API_URL, true), github);
+    }
+
+    #[test]
+    fn a_rate_limited_check_falls_back_to_the_release_page() {
+        let good = b"MZ pretend installer".to_vec();
+        let base = serve(vec![
+            (
+                "/api",
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+            (
+                "/releases/latest",
+                b"HTTP/1.1 302 Found\r\nLocation: /releases/tag/v9.0.0\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            ),
+            (
+                "/releases/tag/v9.0.0",
+                b"<html>release page</html>".to_vec(),
+            ),
+            (
+                "/releases/download/v9.0.0/ZXraw-Explorer-9.0.0-Setup-x64.exe",
+                good.clone(),
+            ),
+            ("/releases/download/v9.0.0/SHA256SUMS.txt", sums_for(&good)),
+        ]);
+        let (latest, tag_prefix, download_prefix) = release_page_urls(&format!("{base}/api"), true);
+        let release = fetch_release_page(&latest, &tag_prefix, &download_prefix).unwrap();
+        assert_eq!(release.tag_name, "v9.0.0");
+        let update = offered_update(&release, "0.5.2", true).unwrap();
+
+        // The size is unknown, so only the checksum decides.
+        let tmp = tempfile::tempdir().unwrap();
+        let (installer, sums) = (update.installer.unwrap(), update.sums.unwrap());
+        let path = download_verified(&installer, &sums, tmp.path(), true, &job()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), good);
+
+        let err =
+            fetch_release_page(&format!("{base}/api"), &tag_prefix, &download_prefix).unwrap_err();
+        assert!(err.contains("unexpected address"), "no redirect to a tag: {err}");
+        let err = fetch_release_page(&format!("{base}/nowhere"), &tag_prefix, &download_prefix)
+            .unwrap_err();
+        assert!(err.contains("unexpected address"), "{err}");
+    }
+
+    #[test]
+    fn an_installer_of_unknown_size_still_needs_its_checksum() {
+        let good = b"MZ pretend installer".to_vec();
+        let mut tampered = good.clone();
+        tampered[3] ^= 1;
+        let base = serve(vec![("/setup.exe", tampered), ("/sums", sums_for(&good))]);
+        let (mut installer, sums) = assets(&base, &good);
+        installer.size = 0;
+        let tmp = tempfile::tempdir().unwrap();
+        let err = download_verified(&installer, &sums, tmp.path(), true, &job()).unwrap_err();
+        assert!(err.contains("SHA-256"), "{err}");
+        assert_eq!(leftovers(tmp.path()), 0);
     }
 
     #[test]

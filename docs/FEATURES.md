@@ -610,11 +610,15 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   All network code goes through `forge-win/src/http.rs` (WinHTTP). It is used by the daily update check (on by
   default; Settings › Updates), the user-clicked update download, and the user-confirmed FFmpeg download.
 * ✅ Update check and one-click update — `forge-app/src/updater.rs` asks the GitHub releases API at most once a
-  day and shows a notice for a newer stable release. *Update now* downloads `SHA256SUMS.txt` and the installer
-  only from the project's release URLs (and GitHub's download CDN after redirects), checks size and SHA-256,
+  day and shows a notice for a newer stable release. When the API answers "rate limited" (403/429), it follows
+  the public `releases/latest` redirect instead and takes the version from the tag page it lands on (no notes,
+  no sizes; only a stable `v<x.y.z>` tag under the project's releases is accepted). *Update now* downloads `SHA256SUMS.txt` and the installer
+  only from the project's release URLs (and GitHub's download CDN after redirects), checks SHA-256 (and the size
+  when the API gave one),
   then runs the installer silently with `/RELAUNCH` and closes the app. Portable copies open the release page
   instead. Unit tests cover version comparison, release parsing, asset selection, checksum lists, the URL
-  allow-list and the daily throttle; e2e scenarios (`tests/e2e/system.rs`) serve a fake release from a local
+  allow-list, the daily throttle and the release-page fallback (a local listener answering 403, then a redirect
+  to a tag); e2e scenarios (`tests/e2e/system.rs`) serve a fake release from a local
   listener and check that a matching installer is accepted and a tampered one refused (no installer is run).
 
 ## Recently hardened

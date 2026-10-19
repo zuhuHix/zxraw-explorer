@@ -192,8 +192,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   from its publisher at the user's request and installs its licence alongside it; ZXraw Explorer
   does not redistribute it.
 * The update check asks `api.github.com` once a day, unauthenticated. GitHub allows 60 such
-  requests an hour per IP address, so on a shared network the check can be refused; it then
-  stays silent and tries again the next day (**Check now** shows the error). The installer is
+  requests an hour per IP address, so on a shared network the API can refuse; the check then
+  reads the public `github.com/.../releases/latest` redirect instead, which gives the version
+  but no release notes. Only if that fails too does it stay silent and try again the next day
+  (**Check now** shows the error). The installer is
   checked against `SHA256SUMS.txt` from the same GitHub release, which protects against a
   corrupted or swapped download but not against someone who controls the release itself; the
   installer is not code-signed.
