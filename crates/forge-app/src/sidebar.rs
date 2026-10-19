@@ -595,7 +595,7 @@ fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
             continue;
         }
         nav_item(app, ui, icon, &label, &d.root, None);
-        if d.total > 0 {
+        if let Some(text) = free_space_label(d.free, d.total) {
             let used = 1.0 - d.free as f32 / d.total as f32;
             // A slim track with an accent gradient (red when nearly full).
             let (rect, bar) = ui.allocate_exact_size(
@@ -618,13 +618,23 @@ fn drives_section(app: &mut ZxrawApp, ui: &mut Ui) {
                 )
             };
             theme::paint_hgradient(&painter.with_clip_rect(filled), rect, from, to);
-            bar.on_hover_text(format!(
-                "{} free of {}",
-                forge_core::model::format_size(d.free),
-                forge_core::model::format_size(d.total)
-            ));
+            bar.on_hover_text(&text);
+            ui.add_space(-ui.spacing().item_spacing.y * 0.5);
+            ui.label(RichText::new(text).small().weak());
         }
     }
+}
+
+/// The small text under a drive's usage bar, e.g. "142 GB free of 476 GB". `None` when the
+/// drive reports no size.
+fn free_space_label(free: u64, total: u64) -> Option<String> {
+    (total > 0).then(|| {
+        format!(
+            "{} free of {}",
+            forge_core::model::format_size(free.min(total)),
+            forge_core::model::format_size(total)
+        )
+    })
 }
 
 /// A plain section header (no arrow, no button).
@@ -1006,6 +1016,43 @@ mod card_tests {
         finish_current(&mut watch, &f.root, true);
         watch.dismiss(&e.root);
         assert_eq!(roots(&watch.prompts), vec![f.root]);
+    }
+}
+
+#[cfg(test)]
+mod free_space_tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn no_size_gives_no_label() {
+        assert_eq!(free_space_label(0, 0), None);
+        assert_eq!(free_space_label(5, 0), None);
+    }
+
+    #[test]
+    fn formats_free_of_total() {
+        assert_eq!(
+            free_space_label(142 * GIB, 476 * GIB),
+            Some("142 GB free of 476 GB".into())
+        );
+    }
+
+    #[test]
+    fn empty_drive_reads_free_equals_total() {
+        assert_eq!(
+            free_space_label(16 * GIB, 16 * GIB),
+            Some("16.0 GB free of 16.0 GB".into())
+        );
+    }
+
+    #[test]
+    fn free_above_total_is_clamped() {
+        assert_eq!(
+            free_space_label(20 * GIB, 16 * GIB),
+            Some("16.0 GB free of 16.0 GB".into())
+        );
     }
 }
 

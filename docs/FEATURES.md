@@ -30,8 +30,10 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * 🟡 Tabs, dual panes, session restore, address/breadcrumb navigation, and drive sidebar —
   `forge-app/src/{app,pane,breadcrumb,sidebar}.rs`. Tabs restored after a restart and
   dual-pane copy/move are e2e-verified (`tabs_are_restored_on_the_next_start`,
-  `copy_to_other_pane_duplicates_files_byte_for_byte`). The address bar, breadcrumb UI, and
-  drive sidebar are not automated.
+  `copy_to_other_pane_duplicates_files_byte_for_byte`). Each drive shows a usage bar with its
+  free space in small text under it (`142 GB free of 476 GB`, unit-tested in
+  `sidebar::free_space_tests`). The address bar, breadcrumb UI, and drive sidebar are not
+  automated.
 * 🟡 Quick access pins for files and folders — `forge-app/src/sidebar.rs`. Pin with *Pin to Quick
   access* (file menu or palette), *Pin this folder to Quick access* (Ctrl+D) or by dragging onto the
   section. A pinned file opens with its default app, started in its own folder; a pinned folder
