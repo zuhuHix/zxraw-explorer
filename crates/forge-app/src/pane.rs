@@ -123,6 +123,9 @@ pub enum LoadState {
 /// [`Pane::expect_removal`]).
 struct PendingRemoval {
     removed: HashSet<PathBuf>,
+    /// What each removed item looked like when it was listed: an entry at its path that
+    /// differs is a new item (deleted, then created again), not the one being removed.
+    identity: HashMap<PathBuf, EntryIdentity>,
     candidates: Vec<PathBuf>,
     /// The user's state when the record was taken or last polled: a change to any of it
     /// drops the record (see `check_removal_still_wanted`).
@@ -132,9 +135,29 @@ struct PendingRemoval {
     filter: String,
     /// A listing finished since the record was taken.
     listed: bool,
-    /// Folders whose latest listing had read errors or failed: it may leave out a removed
-    /// item that still exists, so the record waits until they list completely.
+    /// Open folders (and the pane's own) whose latest listing had read errors or failed: it
+    /// may leave out a removed item that still exists, so the record waits until they list
+    /// completely. A folder leaves the set when it closes (see `drop_children`).
     unsure: HashSet<PathBuf>,
+}
+
+/// Tells an item from a new one created at the same path, from what the listing already
+/// read. A folder's modified time changes with its contents, so only its creation counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EntryIdentity {
+    size: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+}
+
+impl EntryIdentity {
+    fn of(e: &FileEntry) -> Self {
+        if e.kind == EntryKind::Dir {
+            Self { size: 0, modified: None, created: e.created }
+        } else {
+            Self { size: e.size, modified: e.modified, created: e.created }
+        }
+    }
 }
 
 impl PendingRemoval {
@@ -913,8 +936,15 @@ impl Pane {
             .map(|&i| self.entries[i].path.as_path())
             .collect();
         let candidates = removal_successors(&listed, &removed);
+        let identity = self
+            .entries
+            .iter()
+            .filter(|e| removed.contains(&e.path))
+            .map(|e| (e.path.clone(), EntryIdentity::of(e)))
+            .collect();
         self.pending_removal = (!candidates.is_empty()).then(|| PendingRemoval {
             removed,
+            identity,
             candidates,
             selection_rev: self.selected.revision(),
             cursor: self.cursor_entry().map(|e| e.path.clone()),
@@ -946,12 +976,7 @@ impl Pane {
         let Some(pending) = self.pending_removal.as_ref() else {
             return;
         };
-        // A folder that is being removed, or is no longer open, cannot hide a removed item.
-        let unsure = pending.unsure.iter().any(|d| {
-            !d.ancestors().any(|a| pending.removed.contains(a))
-                && (*d == self.path || self.children.contains_key(d))
-        });
-        if pending.listed && !unsure && !self.is_loading() && !self.children_loading() {
+        if pending.listed && pending.unsure.is_empty() && !self.is_loading() && !self.children_loading() {
             self.apply_pending_removal();
         }
         let selection_rev = self.selected.revision();
@@ -968,7 +993,24 @@ impl Pane {
         let Some(pending) = self.pending_removal.as_ref() else {
             return;
         };
-        let is_removed = |p: &Path| p.ancestors().any(|a| pending.removed.contains(a));
+        // A removed item listed with another identity was replaced by a new one: the old one
+        // is gone, and the new one (and anything inside it) is not the user's pick.
+        let replaced: HashSet<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| pending.identity.get(&e.path).is_some_and(|id| *id != EntryIdentity::of(e)))
+            .map(|e| e.path.clone())
+            .collect();
+        if !replaced.is_empty() {
+            self.selected.retain(|p| !p.ancestors().any(|a| replaced.contains(a)));
+        }
+        let Some(pending) = self.pending_removal.as_ref() else {
+            return;
+        };
+        let is_removed = |p: &Path| {
+            p.ancestors()
+                .any(|a| pending.removed.contains(a) && !replaced.contains(a))
+        };
         if self.selected.iter().any(|p| !is_removed(p)) {
             self.pending_removal = None;
             return;
@@ -1376,6 +1418,10 @@ impl Pane {
             }
             keep
         });
+        // A closed folder can no longer hide a removed item.
+        if let Some(pending) = self.pending_removal.as_mut() {
+            pending.unsure.retain(|p| !p.starts_with(dir));
+        }
         self.entries.retain(|e| !inside(&e.path));
         if deselect {
             self.selected.retain(|p| !inside(p));
@@ -1389,7 +1435,7 @@ impl Pane {
         let mut swaps = Vec::new();
         // Folders whose first listing just completed without read errors.
         let mut listed = Vec::new();
-        // Refreshes of open folders that finished, and whether each was complete.
+        // Listings of open folders that finished, and whether each was complete.
         let mut refreshed = Vec::new();
         for _ in 0..64 {
             let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
@@ -1432,10 +1478,12 @@ impl Pane {
                     if errors == 0 {
                         listed.push(dir.clone());
                     }
+                    refreshed.push((dir.clone(), errors == 0));
                 }
                 ListMsg::Failed(e) => {
                     load.loading = false;
                     load.error = Some(e);
+                    refreshed.push((dir.clone(), false));
                 }
                 // Only the pane's own listing sends this; a folder opened in place is a folder.
                 ListMsg::IsFile => load.loading = false,
@@ -1449,6 +1497,12 @@ impl Pane {
         for dir in listed {
             self.prune_hidden_selection(&dir);
         }
+        // Before the swaps: a swap closes the folders that are gone, and with them their entry.
+        if let Some(pending) = self.pending_removal.as_mut() {
+            for (dir, complete) in &refreshed {
+                pending.listing_done(dir, *complete);
+            }
+        }
         if !swaps.is_empty() {
             self.reshape(false, |pane| {
                 for (dir, fresh, complete) in swaps {
@@ -1456,11 +1510,6 @@ impl Pane {
                 }
             });
             changed = true;
-        }
-        if let Some(pending) = self.pending_removal.as_mut() {
-            for (dir, complete) in &refreshed {
-                pending.listing_done(dir, *complete);
-            }
         }
         changed
     }
@@ -3072,5 +3121,95 @@ mod tests {
         settle(&mut pane);
         assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
         assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn a_new_file_at_a_removed_path_is_not_kept_selected() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+
+        // Deleted, then created again under the same name: a different size and modified time.
+        std::fs::remove_file(&files[1]).unwrap();
+        std::fs::write(&files[1], vec![b'y'; 50]).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&files[1])
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        pane.refresh();
+        settle(&mut pane);
+
+        row_of(&pane, "b.txt");
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&files[2]));
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+        assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn closing_a_folder_forgets_its_failed_listing() {
+        let (dir, mut pane, sub) = open_sub_fixture();
+        let a = dir.path().join("a.txt");
+        pane.click(row_of(&pane, "a.txt"), false, false);
+        pane.expect_removal(&[a.clone()]);
+
+        // A re-listing of the open `sub` that fails: the record must wait for it.
+        let id = pane.children[&sub].id;
+        {
+            let load = pane.children.get_mut(&sub).unwrap();
+            load.loading = true;
+            load.staged = Some(Vec::new());
+        }
+        pane.child_tx.send((id, sub.clone(), ListMsg::Failed("x".into()))).unwrap();
+        pane.poll();
+        assert!(pane.pending_removal.as_ref().unwrap().unsure.contains(&sub));
+
+        // Closing the folder forgets it; reopening lists it afresh.
+        pane.set_expanded(&sub, false);
+        pane.poll();
+        assert!(pane.pending_removal.as_ref().unwrap().unsure.is_empty());
+        pane.set_expanded(&sub, true);
+        settle(&mut pane);
+
+        std::fs::remove_file(&a).unwrap();
+        pane.refresh();
+        settle(&mut pane);
+
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("z.txt"));
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn idle_polls_do_not_reapply_with_an_unsure_folder() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+        let root = pane.path.clone();
+        {
+            let pending = pane.pending_removal.as_mut().unwrap();
+            pending.unsure.insert(root.clone());
+            pending.listed = true;
+        }
+
+        std::fs::remove_file(&files[1]).unwrap();
+        pane.poll();
+        pane.poll();
+
+        let pending = pane.pending_removal.as_ref().expect("still pending");
+        assert!(pending.unsure.contains(&root));
+        assert!(pending.listed);
+        assert!(pane.selected.contains(&files[1]));
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("b.txt"));
+
+        pane.refresh();
+        settle(&mut pane);
+
+        assert!(pane.pending_removal.is_none());
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+        assert!(pane.selected.contains(&files[2]));
     }
 }
