@@ -969,14 +969,16 @@ impl Pane {
             return;
         };
         let is_removed = |p: &Path| p.ancestors().any(|a| pending.removed.contains(a));
-        let user_moved_on = self.selected.iter().any(|p| !is_removed(p));
-        // Still listed: the delete is running, failed or was cancelled; the items stay selected.
-        let still_listed = self.entries.iter().any(|e| is_removed(&e.path));
-        if user_moved_on {
+        if self.selected.iter().any(|p| !is_removed(p)) {
             self.pending_removal = None;
             return;
         }
-        if still_listed {
+        // Still listed: the delete is running, failed or was cancelled; the items stay selected.
+        // The next complete listing checks again (this scan must not run every frame).
+        if self.entries.iter().any(|e| is_removed(&e.path)) {
+            if let Some(pending) = self.pending_removal.as_mut() {
+                pending.listed = false;
+            }
             return;
         }
         let Some(pending) = self.pending_removal.take() else {
@@ -3049,5 +3051,26 @@ mod tests {
         assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("y.txt"));
         assert_eq!(pane.selected.len(), 1);
         assert!(pane.selected.contains(&sub.join("y.txt")));
+    }
+    #[test]
+    fn a_target_still_listed_is_checked_again_only_after_a_new_listing() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+
+        // The delete has not happened yet: the refresh still lists b.txt.
+        pane.refresh();
+        settle(&mut pane);
+        let pending = pane.pending_removal.as_ref().expect("still waiting for b.txt");
+        assert!(!pending.listed, "the check consumed the listing");
+        pane.poll();
+        assert!(!pane.pending_removal.as_ref().unwrap().listed);
+        assert!(pane.selected.contains(&files[1]));
+
+        std::fs::remove_file(&files[1]).unwrap();
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
+        assert!(pane.pending_removal.is_none());
     }
 }
