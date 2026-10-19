@@ -123,9 +123,9 @@ pub enum LoadState {
 /// [`Pane::expect_removal`]).
 struct PendingRemoval {
     removed: HashSet<PathBuf>,
-    /// What each removed item looked like when it was listed: an entry at its path that
-    /// differs is a new item (deleted, then created again), not the one being removed.
-    identity: HashMap<PathBuf, EntryIdentity>,
+    /// When each removed item was created, as listed: an entry at its path created at another
+    /// time is a new item (deleted, then created again), not the one being removed.
+    created: HashMap<PathBuf, std::time::SystemTime>,
     candidates: Vec<PathBuf>,
     /// The user's state when the record was taken or last polled: a change to any of it
     /// drops the record (see `check_removal_still_wanted`).
@@ -139,25 +139,6 @@ struct PendingRemoval {
     /// may leave out a removed item that still exists, so the record waits until they list
     /// completely. A folder leaves the set when it closes (see `drop_children`).
     unsure: HashSet<PathBuf>,
-}
-
-/// Tells an item from a new one created at the same path, from what the listing already
-/// read. A folder's modified time changes with its contents, so only its creation counts.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct EntryIdentity {
-    size: u64,
-    modified: Option<std::time::SystemTime>,
-    created: Option<std::time::SystemTime>,
-}
-
-impl EntryIdentity {
-    fn of(e: &FileEntry) -> Self {
-        if e.kind == EntryKind::Dir {
-            Self { size: 0, modified: None, created: e.created }
-        } else {
-            Self { size: e.size, modified: e.modified, created: e.created }
-        }
-    }
 }
 
 impl PendingRemoval {
@@ -936,15 +917,15 @@ impl Pane {
             .map(|&i| self.entries[i].path.as_path())
             .collect();
         let candidates = removal_successors(&listed, &removed);
-        let identity = self
+        let created = self
             .entries
             .iter()
             .filter(|e| removed.contains(&e.path))
-            .map(|e| (e.path.clone(), EntryIdentity::of(e)))
+            .filter_map(|e| Some((e.path.clone(), e.created?)))
             .collect();
         self.pending_removal = (!candidates.is_empty()).then(|| PendingRemoval {
             removed,
-            identity,
+            created,
             candidates,
             selection_rev: self.selected.revision(),
             cursor: self.cursor_entry().map(|e| e.path.clone()),
@@ -993,12 +974,23 @@ impl Pane {
         let Some(pending) = self.pending_removal.as_ref() else {
             return;
         };
-        // A removed item listed with another identity was replaced by a new one: the old one
-        // is gone, and the new one (and anything inside it) is not the user's pick.
+        // A removed item listed with another creation time was replaced by a new one: the old
+        // one is gone, and the new one (and anything inside it) is not the user's pick. Only
+        // two known, different creation times count. Size and modified time change while a
+        // file is written, saved or still being deleted, and a wrong guess here would move the
+        // selection off a file that exists; missing a replacement keeps it selected, as before
+        // this check. NTFS name tunneling keeps the creation time of a file that is quickly
+        // created again under the same name, so such replacements go unnoticed.
         let replaced: HashSet<PathBuf> = self
             .entries
             .iter()
-            .filter(|e| pending.identity.get(&e.path).is_some_and(|id| *id != EntryIdentity::of(e)))
+            .filter(|e| {
+                pending
+                    .created
+                    .get(&e.path)
+                    .zip(e.created)
+                    .is_some_and(|(was, now)| *was != now)
+            })
             .map(|e| e.path.clone())
             .collect();
         if !replaced.is_empty() {
@@ -3123,30 +3115,76 @@ mod tests {
         assert!(pane.pending_removal.is_none());
     }
 
+    /// A complete refresh that lists the pane's entries, with `b.txt` changed by `edit`.
+    fn relist_with_b(pane: &mut Pane, edit: impl Fn(&mut FileEntry)) {
+        let listed: Vec<FileEntry> = pane
+            .entries
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                if e.name == "b.txt" {
+                    edit(&mut e);
+                }
+                e
+            })
+            .collect();
+        let (tx, rx) = unbounded();
+        pane.staged = Some(Vec::new());
+        pane.load = LoadState::Loading { since: Instant::now() };
+        pane.rx = Some(rx);
+        tx.send(ListMsg::Batch(listed)).unwrap();
+        tx.send(ListMsg::Done { errors: 0 }).unwrap();
+        settle(pane);
+    }
+
     #[test]
     fn a_new_file_at_a_removed_path_is_not_kept_selected() {
         let (_dir, mut pane, files) = removal_fixture();
         pane.click(row_of(&pane, "b.txt"), false, false);
         pane.expect_removal(&[files[1].clone()]);
 
-        // Deleted, then created again under the same name: a different size and modified time.
-        std::fs::remove_file(&files[1]).unwrap();
-        std::fs::write(&files[1], vec![b'y'; 50]).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&files[1])
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
-            .unwrap();
-
-        pane.refresh();
-        settle(&mut pane);
+        // Deleted, then created again under the same name: another creation time.
+        relist_with_b(&mut pane, |e| {
+            e.created = e.created.map(|t| t + std::time::Duration::from_secs(3600));
+        });
 
         row_of(&pane, "b.txt");
         assert_eq!(pane.selected.len(), 1);
         assert!(pane.selected.contains(&files[2]));
         assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
         assert!(pane.pending_removal.is_none());
+    }
+
+    #[test]
+    fn a_file_written_to_during_the_removal_stays_selected() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        pane.expect_removal(&[files[1].clone()]);
+
+        // Still there, with a new size and modified time (written to, or saved by an editor).
+        relist_with_b(&mut pane, |e| {
+            e.size += 50;
+            e.modified = e.modified.map(|t| t + std::time::Duration::from_secs(3600));
+        });
+
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&files[1]));
+        assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("b.txt"));
+        assert!(pane.pending_removal.is_some());
+    }
+
+    #[test]
+    fn an_unknown_creation_time_is_not_a_replacement() {
+        let (_dir, mut pane, files) = removal_fixture();
+        pane.click(row_of(&pane, "b.txt"), false, false);
+        assert!(pane.cursor_entry().unwrap().created.is_some());
+        pane.expect_removal(&[files[1].clone()]);
+
+        relist_with_b(&mut pane, |e| e.created = None);
+
+        assert_eq!(pane.selected.len(), 1);
+        assert!(pane.selected.contains(&files[1]));
+        assert!(pane.pending_removal.is_some());
     }
 
     #[test]
