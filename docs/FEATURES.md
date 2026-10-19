@@ -145,6 +145,13 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Permanent delete asks for confirmation; cancelling keeps the file — e2e
   `permanent_delete_removes_the_file_after_confirmation` and
   `permanent_delete_cancelled_keeps_the_file`.
+* ✅ Deleting or moving items away selects the next item (the one before when the last is
+  removed); a cancelled or failed delete keeps the selection — unit `selection.rs::removal_*`,
+  `pane.rs::removal_selects_the_next_item_after_the_removed_ones`,
+  `a_failed_delete_keeps_the_next_item_pending`; e2e `delete_selects_the_next_item_in_details_view`,
+  `delete_selects_the_next_item_in_grid_view`, `deleting_several_items_selects_the_one_after_them`,
+  `permanent_delete_selects_the_next_item_and_cancel_keeps_the_selection` and
+  `moving_items_away_selects_the_next_item`.
 * ✅ Recycle Bin removal (engine) — `forge-win/src/shell.rs::recycle_removes_file_from_disk`
   and `recycle_missing_path_is_an_error` pass. The first test sends a temporary file to the
   real Recycle Bin on each run (see [LIMITATIONS.md](LIMITATIONS.md)). The e2e suite

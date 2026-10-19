@@ -1057,6 +1057,7 @@ fn paste_with(
 }
 
 pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
+    app.expect_removal(&targets);
     let n = targets.len();
     let dirs: Vec<PathBuf> = targets
         .iter()

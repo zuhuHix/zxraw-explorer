@@ -523,6 +523,16 @@ impl ZxrawApp {
         }
     }
 
+    /// `targets` are about to leave their folders (deleted or moved): each pane that has them
+    /// selected selects the next item once they are gone.
+    pub fn expect_removal(&mut self, targets: &[PathBuf]) {
+        for t in &mut self.tabs {
+            for pane in std::iter::once(&mut t.left).chain(t.right.as_mut()) {
+                pane.expect_removal(targets);
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Command dispatch
     // -----------------------------------------------------------------------
