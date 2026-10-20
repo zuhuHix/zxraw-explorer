@@ -49,21 +49,19 @@ pub enum Event {
     /// A job of the name lane finished. Sent after all its other events, so once the count of
     /// pending name jobs is back to zero, their undo records are already on the stack.
     NameJobDone,
-    /// Our Copy/Cut reached the Windows clipboard or failed (also after a cut's list was
-    /// updated: `Err` then if the clipboard was no longer ours).
-    ClipboardPublished {
-        generation: u64,
-        result: Result<Published, String>,
-    },
-    /// The cut watcher learned what the cut's items are (see [`crate::cut_watch`]).
+    /// The clipboard worker finished a request (see [`crate::clip_worker`]).
+    ClipboardDone(crate::clip_worker::Done),
+    /// The cut watcher learned what the cut's items are (`None`: could not be read).
     CutIdentities {
         generation: u64,
-        items: Vec<(PathBuf, crate::cut_watch::Identity)>,
+        revision: u64,
+        items: Vec<(PathBuf, Option<crate::cut_watch::Identity>)>,
     },
     /// These items of the cut left their folders (pasted in Explorer, moved or deleted some
     /// other way) or were replaced by a different item: they are no longer cut.
     CutItemsGone {
         generation: u64,
+        revision: u64,
         paths: Vec<PathBuf>,
     },
     /// Paste: the Windows clipboard as read off the UI thread.
@@ -72,10 +70,10 @@ pub enum Event {
         sequence: u32,
         /// The file list on the clipboard, `Ok(None)` if it holds no files.
         files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
-        /// Our token if the clipboard holds one of our publishes.
+        /// The owner token if the clipboard holds a publish of ours.
         owner: Option<forge_win::ClipboardToken>,
-        /// Items of the in-app cut that are now a different item than the one cut.
-        replaced: Vec<PathBuf>,
+        /// What is at the in-app cut's paths now, if there is a cut.
+        cut: Option<CutCheck>,
     },
     /// A clipboard-originated move finished (`ok` = everything moved, not cancelled).
     MoveFinished {
@@ -106,30 +104,32 @@ pub enum UndoEntry {
     TextReplace(Vec<forge_core::text_replace::ReplaceUndo>),
 }
 
-/// One publish of ours on the Windows clipboard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Published {
-    /// Marks the clipboard content as ours (a private format next to the file list).
-    token: forge_win::ClipboardToken,
-    /// The clipboard sequence read just after publishing. Only a fallback for when the
-    /// clipboard cannot be read: another app may have changed it in between.
-    sequence: u32,
-}
-
 /// In-app clipboard for files (Ctrl+C / Ctrl+X then Ctrl+V).
 pub struct FileClipboard {
     pub paths: Vec<PathBuf>,
-    /// What each cut item was when cut, once the cut watcher has read it (same order as
-    /// `paths`). Empty for a copy.
-    identities: Vec<Option<crate::cut_watch::Identity>>,
+    /// For a cut, what each item is (same order as `paths`); empty for a copy.
+    ids: Vec<crate::cut_watch::IdState>,
     pub cut: bool,
     generation: u64,
+    /// Bumped whenever the cut's items change; requests and reports carry it.
+    revision: u64,
     /// Windows clipboard sequence before we published (to detect later external copies).
     baseline_sequence: u32,
-    /// `None` while publishing; `Some(Ok(_))` once on the Windows clipboard.
-    published: Option<Result<Published, ()>>,
+    /// `None` while the clipboard worker is on it; `Some(Ok(token))` once our list is on
+    /// the Windows clipboard; `Some(Err(()))` if it could not be put there or is no longer
+    /// there.
+    published: Option<Result<forge_win::ClipboardToken, ()>>,
     /// Stops the cut watcher once this cut is replaced or cleared.
     _watch: Option<crate::cut_watch::WatchGuard>,
+}
+
+/// A cut checked for a paste, off the UI thread.
+pub struct CutCheck {
+    generation: u64,
+    revision: u64,
+    /// Some item's identity was still being read: nothing is checked.
+    pending: bool,
+    screened: crate::cut_watch::Screened,
 }
 
 impl FileClipboard {
@@ -175,12 +175,13 @@ fn choose_paste_source(
         };
     };
     let ours = match cb.published {
-        None => return PasteSource::InApp,
-        // Our token is on the clipboard. Unreadable, only the sequence can tell.
-        Some(Ok(p)) => {
-            owner == Some(p.token)
-                || (system == SystemFiles::Unreadable && system_sequence == p.sequence)
+        // Our publish has not landed yet: ours, unless another app has put something on
+        // the clipboard since the copy (anything of ours, older or newer, still counts).
+        None => {
+            system_sequence == cb.baseline_sequence
+                || owner.is_some_and(forge_win::ClipboardToken::is_from_this_process)
         }
+        Some(Ok(token)) => owner == Some(token),
         Some(Err(())) => system_sequence == cb.baseline_sequence,
     };
     if ours {
@@ -212,6 +213,10 @@ pub struct Actions {
     clipboard_generation: u64,
     /// Started with the first cut; see [`crate::cut_watch`].
     cut_watcher: Option<crate::cut_watch::CutWatcher>,
+    /// Started with the first copy or cut; see [`crate::clip_worker`].
+    clip_worker: Option<crate::clip_worker::ClipWorker>,
+    /// A paste into this folder waits for the cut's identities to be read.
+    paste_waiting: Option<PathBuf>,
     pub show_jobs: bool,
     pub delete_ui: crate::ops_ui::DeleteUi,
     pub batch_rename: Option<crate::batch_rename::BatchRename>,
@@ -283,6 +288,8 @@ impl Actions {
             clipboard: None,
             clipboard_generation: 0,
             cut_watcher: None,
+            clip_worker: None,
+            paste_waiting: None,
             show_jobs: false,
             delete_ui: Default::default(),
             batch_rename: None,
@@ -488,81 +495,42 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                     forge_win::ClipboardEffect::Copy
                 };
                 app.ops.clipboard_generation += 1;
+                app.ops.paste_waiting = None;
                 let generation = app.ops.clipboard_generation;
-                let (tx, ctx, p2) = (app.ops.tx.clone(), app.ops.ctx.clone(), paths.clone());
-                std::thread::spawn(move || {
-                    let result = forge_win::set_files(&p2, effect)
-                        .map(|token| Published {
-                            token,
-                            sequence: forge_win::clipboard_sequence(),
-                        })
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(Event::ClipboardPublished { generation, result });
-                    ctx.request_repaint();
-                });
+                let baseline_sequence = forge_win::clipboard_sequence();
+                let op = crate::clip_worker::Op::Publish {
+                    paths: paths.clone(),
+                    effect,
+                };
+                clip(app, generation, 0, op);
                 // A cut pasted elsewhere (Explorer, the desktop) is noticed by its items
                 // leaving their folders, as nothing tells the source app about that paste.
+                // The watcher reads what each item is right away; until then a paste here
+                // waits (see `paste_with`).
+                let ids = if cut {
+                    vec![crate::cut_watch::IdState::Pending; paths.len()]
+                } else {
+                    Vec::new()
+                };
                 let watch = cut.then(|| {
                     let watcher = cut_watcher(app);
-                    let items = paths.iter().map(|p| (p.clone(), None)).collect();
-                    watcher.watch(generation, items);
+                    let items = paths.iter().cloned().zip(ids.iter().copied()).collect();
+                    watcher.watch(generation, 0, items);
                     watcher.guard(generation)
                 });
                 app.ops.clipboard = Some(FileClipboard {
-                    identities: if cut { vec![None; paths.len()] } else { Vec::new() },
                     paths,
+                    ids,
                     cut,
                     generation,
-                    baseline_sequence: forge_win::clipboard_sequence(),
+                    revision: 0,
+                    baseline_sequence,
                     published: None,
                     _watch: watch,
                 });
             }
         }
-        Cmd::Paste => {
-            // Opening the Windows clipboard can block briefly (another app holding it), so
-            // read it off the UI thread; `paste_with` decides once the result arrives.
-            let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
-            // The cut items whose identity is known, to leave out any replaced since.
-            let cut_items: Vec<(PathBuf, crate::cut_watch::Identity)> = app
-                .ops
-                .clipboard
-                .as_ref()
-                .filter(|cb| cb.cut)
-                .map(|cb| {
-                    cb.paths
-                        .iter()
-                        .zip(&cb.identities)
-                        .filter_map(|(p, id)| Some((p.clone(), (*id)?)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            std::thread::spawn(move || {
-                let sequence = forge_win::clipboard_sequence();
-                let (files, owner) = match forge_win::get_files_and_owner() {
-                    Ok((files, owner)) => (Ok(files), owner),
-                    Err(e) => (Err(e.to_string()), None),
-                };
-                let replaced = cut_items
-                    .into_iter()
-                    .filter(|(path, then)| {
-                        matches!(
-                            crate::cut_watch::observe(path),
-                            crate::cut_watch::Observation::Present(now) if now != *then
-                        )
-                    })
-                    .map(|(path, _)| path)
-                    .collect();
-                let _ = tx.send(Event::PasteSystemRead {
-                    destination: dir,
-                    sequence,
-                    files,
-                    owner,
-                    replaced,
-                });
-                ctx.request_repaint();
-            });
-        }
+        Cmd::Paste => start_paste(app, dir),
         Cmd::CopyToOtherPane | Cmd::MoveToOtherPane => {
             let Some(other) = app.tab().other().map(|p| p.path.clone()) else {
                 app.toast("Open a second pane first (F3)");
@@ -1086,12 +1054,24 @@ fn cut_watcher(app: &mut ZxrawApp) -> &crate::cut_watch::CutWatcher {
     app.ops.cut_watcher.get_or_insert_with(|| {
         crate::cut_watch::CutWatcher::start(move |report| {
             let event = match report {
-                crate::cut_watch::Report::Identities { generation, items } => {
-                    Event::CutIdentities { generation, items }
-                }
-                crate::cut_watch::Report::Gone { generation, paths } => {
-                    Event::CutItemsGone { generation, paths }
-                }
+                crate::cut_watch::Report::Identities {
+                    generation,
+                    revision,
+                    items,
+                } => Event::CutIdentities {
+                    generation,
+                    revision,
+                    items,
+                },
+                crate::cut_watch::Report::Gone {
+                    generation,
+                    revision,
+                    paths,
+                } => Event::CutItemsGone {
+                    generation,
+                    revision,
+                    paths,
+                },
             };
             let _ = tx.send(event);
             ctx.request_repaint();
@@ -1099,10 +1079,80 @@ fn cut_watcher(app: &mut ZxrawApp) -> &crate::cut_watch::CutWatcher {
     })
 }
 
-/// Items of the cut `generation` are no longer cut (pasted elsewhere, moved by this app,
-/// replaced): drop them from the cut, as Explorer drops its own cut after a paste, and with
-/// `refresh` list the folders they left again. See [`republish_cut`] for the clipboard.
-fn drop_cut_items(app: &mut ZxrawApp, generation: u64, gone: &[PathBuf], refresh: bool) {
+/// Sends `op` to the app's one clipboard worker (started on first use), on behalf of the
+/// in-app clipboard `generation` at `revision`.
+fn clip(app: &mut ZxrawApp, generation: u64, revision: u64, op: crate::clip_worker::Op) {
+    let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+    app.ops
+        .clip_worker
+        .get_or_insert_with(|| {
+            crate::clip_worker::ClipWorker::start(move |done| {
+                let _ = tx.send(Event::ClipboardDone(done));
+                ctx.request_repaint();
+            })
+        })
+        .send(generation, revision, op);
+}
+
+/// Pastes into `dir`. Opening the Windows clipboard can block briefly (another app holding
+/// it), and checking the cut's items can block on a slow drive, so both happen off the UI
+/// thread; `paste_with` decides once the result arrives.
+fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
+    let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
+    let cut = app.ops.clipboard.as_ref().filter(|cb| cb.cut).map(|cb| {
+        let items: Vec<_> = cb.paths.iter().cloned().zip(cb.ids.iter().copied()).collect();
+        (cb.generation, cb.revision, items)
+    });
+    std::thread::spawn(move || {
+        let (files, owner, sequence) = match forge_win::get_files_and_owner() {
+            Ok(read) => (Ok(read.files), read.owner, read.sequence),
+            Err(e) => (Err(e.to_string()), None, forge_win::clipboard_sequence()),
+        };
+        let cut = cut.map(|(generation, revision, items)| check_cut(generation, revision, &items));
+        let _ = tx.send(Event::PasteSystemRead {
+            destination: dir,
+            sequence,
+            files,
+            owner,
+            cut,
+        });
+        ctx.request_repaint();
+    });
+}
+
+/// What is at the cut's paths now, for a paste. Runs off the UI thread; a check that takes
+/// longer than [`crate::cut_watch::PASS_TIMEOUT`] counts as "could not tell".
+fn check_cut(
+    generation: u64,
+    revision: u64,
+    items: &[(PathBuf, crate::cut_watch::IdState)],
+) -> CutCheck {
+    use crate::cut_watch::{IdState, PASS_TIMEOUT, observe_all_within, screen};
+    let pending = items.iter().any(|(_, id)| *id == IdState::Pending);
+    let screened = if pending {
+        Default::default()
+    } else {
+        let paths = items.iter().map(|(p, _)| p.clone()).collect();
+        screen(items, &observe_all_within(paths, PASS_TIMEOUT))
+    };
+    CutCheck {
+        generation,
+        revision,
+        pending,
+        screened,
+    }
+}
+
+/// The cut `generation` now has `items` (some used up, renamed, or replaced): a new
+/// revision. The Windows clipboard follows through the clipboard worker, which changes
+/// only our own content: cleared when nothing is left, else given the remaining items.
+/// `refresh` folders are listed again.
+fn set_cut_items(
+    app: &mut ZxrawApp,
+    generation: u64,
+    items: Vec<(PathBuf, crate::cut_watch::IdState)>,
+    refresh: Vec<PathBuf>,
+) {
     let Some(cb) = app
         .ops
         .clipboard
@@ -1111,115 +1161,75 @@ fn drop_cut_items(app: &mut ZxrawApp, generation: u64, gone: &[PathBuf], refresh
     else {
         return;
     };
-    let is_gone = |p: &PathBuf| gone.iter().any(|g| forge_core::paths::paths_equal(g, p));
-    let mut parents: Vec<PathBuf> = Vec::new();
-    for parent in cb.paths.iter().filter(|p| is_gone(p)).filter_map(|p| p.parent()) {
-        if !parents.iter().any(|seen| seen == parent) {
-            parents.push(parent.to_path_buf());
-        }
-    }
-    if parents.is_empty() {
-        return;
-    }
-    let (paths, identities) = cb
-        .paths
-        .drain(..)
-        .zip(cb.identities.drain(..))
-        .filter(|(p, _)| !is_gone(p))
-        .unzip();
-    cb.paths = paths;
-    cb.identities = identities;
-    republish_cut(app);
-    if refresh {
-        for parent in parents {
-            app.refresh_all_showing(&parent);
-        }
-    }
-}
-
-/// After the cut's items changed: clear the cut if none are left, and bring the Windows
-/// clipboard in line if it still holds our publish (emptied, or given the remaining
-/// items). Another app's clipboard content is never touched.
-fn republish_cut(app: &mut ZxrawApp) {
-    let Some(cb) = app.ops.clipboard.as_mut() else {
-        return;
-    };
-    let token = match cb.published {
-        Some(Ok(p)) => Some(p.token),
-        _ => None,
-    };
+    cb.revision += 1;
+    let revision = cb.revision;
+    (cb.paths, cb.ids) = items.iter().cloned().unzip();
     if cb.paths.is_empty() {
         app.ops.clipboard = None;
-        if let Some(token) = token {
-            std::thread::spawn(move || {
-                forge_win::clear_if_token(token);
-            });
-        }
-        return;
-    }
-    // Not ours on the clipboard, or our first publish still on its way: the in-app list
-    // is what a paste here uses either way.
-    let Some(token) = token else {
-        return;
-    };
-    cb.published = None;
-    let (tx, ctx, generation, paths) = (
-        app.ops.tx.clone(),
-        app.ops.ctx.clone(),
-        cb.generation,
-        cb.paths.clone(),
-    );
-    std::thread::spawn(move || {
+        clip(app, generation, revision, crate::clip_worker::Op::ClearOurs);
+    } else {
+        cb.published = None;
+        let paths = cb.paths.clone();
         let effect = forge_win::ClipboardEffect::Move;
-        let result = match forge_win::replace_files_if_token(&paths, effect, token) {
-            Ok(Some(token)) => Ok(Published {
-                token,
-                sequence: forge_win::clipboard_sequence(),
-            }),
-            Ok(None) => Err("the clipboard has changed since the cut".to_string()),
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = tx.send(Event::ClipboardPublished { generation, result });
-        ctx.request_repaint();
-    });
+        clip(app, generation, revision, crate::clip_worker::Op::Update { paths, effect });
+        if let Some(watcher) = app.ops.cut_watcher.as_ref() {
+            watcher.watch(generation, revision, items);
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for dir in refresh {
+        if !seen.contains(&dir) {
+            app.refresh_all_showing(&dir);
+            seen.push(dir);
+        }
+    }
 }
 
-/// This app moved or renamed `pairs`: a cut item renamed in place (or inside a renamed or
-/// moved folder) stays cut under its new path; one moved into another folder (a paste
-/// here) is used up.
-fn follow_cut(app: &mut ZxrawApp, pairs: &[(PathBuf, PathBuf)]) {
-    let Some(cb) = app.ops.clipboard.as_mut().filter(|cb| cb.cut) else {
+/// Items of the cut `generation` are no longer cut (pasted elsewhere, moved, deleted,
+/// replaced): dropped from it, as Explorer drops its own cut after a paste. The folders
+/// they left are listed again.
+fn drop_cut_items(app: &mut ZxrawApp, generation: u64, gone: &[PathBuf]) {
+    let Some(cb) = app
+        .ops
+        .clipboard
+        .as_ref()
+        .filter(|cb| cb.cut && cb.generation == generation)
+    else {
         return;
     };
-    let followed = crate::cut_watch::follow(&cb.paths, pairs);
-    if followed
-        .iter()
-        .zip(&cb.paths)
-        .all(|(new, old)| new.as_ref() == Some(old))
-    {
+    let is_gone = |p: &PathBuf| gone.iter().any(|g| forge_core::paths::paths_equal(g, p));
+    if !cb.paths.iter().any(is_gone) {
         return;
     }
-    let generation = cb.generation;
-    let mut used = Vec::new();
-    for (path, new) in cb.paths.iter_mut().zip(followed) {
-        match new {
-            Some(new) => *path = new,
-            None => used.push(path.clone()),
-        }
+    let refresh = cb
+        .paths
+        .iter()
+        .filter(|p| is_gone(p))
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
+    let items = cb
+        .paths
+        .iter()
+        .cloned()
+        .zip(cb.ids.iter().copied())
+        .filter(|(p, _)| !is_gone(p))
+        .collect();
+    set_cut_items(app, generation, items, refresh);
+}
+
+/// This app moved or renamed `pairs`: see [`crate::cut_watch::follow`]. A followed item's
+/// identity is read again, so a move to another volume does not look like a replacement.
+fn follow_cut(app: &mut ZxrawApp, pairs: &[(PathBuf, PathBuf)]) {
+    let Some(cb) = app.ops.clipboard.as_ref().filter(|cb| cb.cut) else {
+        return;
+    };
+    let items: Vec<_> = cb.paths.iter().cloned().zip(cb.ids.iter().copied()).collect();
+    let (kept, used) = crate::cut_watch::follow(&items, pairs);
+    if kept == items {
+        return;
     }
-    if used.is_empty() {
-        republish_cut(app);
-    } else {
-        // The move refreshes its own folders.
-        drop_cut_items(app, generation, &used, false);
-    }
-    // The watcher now checks the new paths, from scratch.
-    if let Some(cb) = app.ops.clipboard.as_ref().filter(|cb| cb.generation == generation)
-        && let Some(watcher) = app.ops.cut_watcher.as_ref()
-    {
-        let items = cb.paths.iter().cloned().zip(cb.identities.iter().copied());
-        watcher.watch(generation, items.collect());
-    }
+    let _ = used; // A move refreshes its own folders.
+    set_cut_items(app, cb.generation, kept, Vec::new());
 }
 
 fn paste_with(
@@ -1228,7 +1238,7 @@ fn paste_with(
     sequence: u32,
     owner: Option<forge_win::ClipboardToken>,
     files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
-    replaced: Vec<PathBuf>,
+    cut: Option<CutCheck>,
 ) {
     // Every way out of here either starts a transfer or says why it did not.
     let (files, read_error) = match files {
@@ -1260,33 +1270,65 @@ fn paste_with(
             }
         }
         PasteSource::InApp => {
-            // A cut item replaced by a different one since the cut is not what was cut:
-            // the replacement is never moved.
-            if !replaced.is_empty()
-                && let Some(generation) = app.ops.clipboard.as_ref().map(|cb| cb.generation)
-            {
-                drop_cut_items(app, generation, &replaced, true);
-                app.toast(format!(
-                    "Left out {} cut item(s): another item has taken the name since the cut",
-                    replaced.len()
-                ));
-            }
             let Some(cb) = app.ops.clipboard.as_ref() else {
                 app.toast("Nothing to paste: the clipboard has no files");
                 return;
             };
-            let (paths, cut, generation) = (cb.paths.clone(), cb.cut, cb.generation);
-            if cut {
-                // The cut leaves the Windows clipboard by our token once the move is done
-                // (see `Event::MoveFinished`), not by a sequence number.
-                if !crate::ops_ui::start_clipboard_move(app, paths, dest, Some(generation), None)
-                {
-                    app.toast("Nothing to move: the items are already in this folder");
-                }
-            } else {
+            if !cb.cut {
+                let paths = cb.paths.clone();
                 crate::ops_ui::start_transfer(app, paths, dest, OpKind::Copy);
+                return;
             }
+            paste_cut(app, dest, cut);
         }
+    }
+}
+
+/// Moves the in-app cut into `dest`, but only items still known to be the ones cut. Fails
+/// closed: an item that was replaced, whose identity was never read, or that could not be
+/// checked now is left out, and nothing moves while identities are still being read.
+fn paste_cut(app: &mut ZxrawApp, dest: PathBuf, check: Option<CutCheck>) {
+    let Some(cb) = app.ops.clipboard.as_ref() else {
+        return;
+    };
+    let generation = cb.generation;
+    let Some(check) = check.filter(|c| c.generation == generation && c.revision == cb.revision)
+    else {
+        app.toast("The cut has just changed. Paste again.");
+        return;
+    };
+    if check.pending {
+        // Right after the cut: the paste runs again once the watcher has read what the
+        // items are (within its check timeout). Nothing moves before that.
+        app.ops.paste_waiting = Some(dest);
+        return;
+    }
+    let s = check.screened;
+    let gone: Vec<PathBuf> = s.replaced.iter().chain(&s.missing).cloned().collect();
+    drop_cut_items(app, generation, &gone);
+    let mut left_out = Vec::new();
+    if !s.replaced.is_empty() {
+        left_out.push(format!(
+            "{} replaced by another item since the cut",
+            s.replaced.len()
+        ));
+    }
+    if !s.unverified.is_empty() {
+        left_out.push(format!("{} that could not be checked", s.unverified.len()));
+    }
+    if !left_out.is_empty() {
+        app.toast_err(format!("Left out {}", left_out.join(" and ")));
+    }
+    if s.keep.is_empty() {
+        if left_out.is_empty() {
+            app.toast("Nothing to paste: the cut items are gone");
+        }
+        return;
+    }
+    // Taking the cut off the Windows clipboard afterwards is the clipboard worker's job
+    // (see `Event::MoveFinished`), so no sequence number is passed on.
+    if !crate::ops_ui::start_clipboard_move(app, s.keep, dest, Some(generation), None) {
+        app.toast("Nothing to move: the items are already in this folder");
     }
 }
 
@@ -1484,43 +1526,65 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 }
             }
             Event::Conflict(q) => app.ops.conflicts.push_back(q),
-            Event::ClipboardPublished { generation, result } => {
-                if let Some(cb) = app
-                    .ops
-                    .clipboard
-                    .as_mut()
-                    .filter(|cb| cb.generation == generation)
-                {
-                    cb.published = Some(result.as_ref().copied().map_err(|_| ()));
+            Event::ClipboardDone(done) => {
+                use crate::clip_worker::Outcome;
+                if let Outcome::Failed(e) = &done.outcome {
+                    tracing::warn!("writing the Windows clipboard failed: {e}");
                 }
-                if let Err(e) = result {
-                    tracing::warn!("publishing files to the Windows clipboard failed: {e}");
-                }
-            }
-            Event::CutIdentities { generation, items } => {
-                if let Some(cb) = app
-                    .ops
-                    .clipboard
-                    .as_mut()
-                    .filter(|cb| cb.generation == generation)
-                {
-                    for (path, identity) in items {
-                        if let Some(i) = cb.paths.iter().position(|p| *p == path) {
-                            cb.identities[i] = Some(identity);
-                        }
+                if let Some(cb) = app.ops.clipboard.as_mut().filter(|cb| {
+                    cb.generation == done.generation && cb.revision == done.revision
+                }) {
+                    match done.outcome {
+                        Outcome::Published(token) => cb.published = Some(Ok(token)),
+                        Outcome::NotOurs | Outcome::Failed(_) => cb.published = Some(Err(())),
+                        Outcome::Cleared => {}
                     }
                 }
             }
-            Event::CutItemsGone { generation, paths } => {
-                drop_cut_items(app, generation, &paths, true);
+            Event::CutIdentities {
+                generation,
+                revision,
+                items,
+            } => {
+                if let Some(cb) = app.ops.clipboard.as_mut().filter(|cb| {
+                    cb.generation == generation && cb.revision == revision
+                }) {
+                    for (path, id) in items {
+                        if let Some(i) = cb.paths.iter().position(|p| *p == path) {
+                            cb.ids[i] = match id {
+                                Some(id) => crate::cut_watch::IdState::Known(id),
+                                None => crate::cut_watch::IdState::Unknown,
+                            };
+                        }
+                    }
+                    if !cb.ids.contains(&crate::cut_watch::IdState::Pending)
+                        && let Some(dest) = app.ops.paste_waiting.take()
+                    {
+                        start_paste(app, dest);
+                    }
+                }
+            }
+            Event::CutItemsGone {
+                generation,
+                revision,
+                paths,
+            } => {
+                if app
+                    .ops
+                    .clipboard
+                    .as_ref()
+                    .is_some_and(|cb| cb.revision == revision)
+                {
+                    drop_cut_items(app, generation, &paths);
+                }
             }
             Event::PasteSystemRead {
                 destination,
                 sequence,
                 files,
                 owner,
-                replaced,
-            } => paste_with(app, destination, sequence, owner, files, replaced),
+                cut,
+            } => paste_with(app, destination, sequence, owner, files, cut),
             Event::MoveFinished {
                 sources,
                 ok,
@@ -1530,19 +1594,21 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 // A cut is consumed only by a complete, successful move (like Explorer); a
                 // failed or cancelled move leaves it on the clipboard to retry.
                 if ok {
-                    if let Some(cb) = app.ops.clipboard.take_if(|cb| {
-                        clipboard_generation.is_some_and(|g| cb.generation == g)
-                    }) && let Some(Ok(p)) = cb.published
+                    if let Some(cb) = app
+                        .ops
+                        .clipboard
+                        .take_if(|cb| clipboard_generation.is_some_and(|g| cb.generation == g))
                     {
-                        std::thread::spawn(move || {
-                            forge_win::clear_if_token(p.token);
-                        });
+                        let revision = cb.revision + 1;
+                        clip(app, cb.generation, revision, crate::clip_worker::Op::ClearOurs);
                     }
                     // Another app's cut (Explorer's) pasted here: emptied, as Explorer does.
-                    if let Some(seq) = expected_sequence {
-                        std::thread::spawn(move || {
-                            forge_win::clear_if_owned_files(&sources, Some(seq));
-                        });
+                    if let Some(sequence) = expected_sequence {
+                        let op = crate::clip_worker::Op::ClearForeign {
+                            paths: sources,
+                            sequence,
+                        };
+                        clip(app, 0, 0, op);
                     }
                 }
             }
@@ -1909,18 +1975,18 @@ mod clipboard_tests {
     fn cb(published: Option<Result<u32, ()>>, baseline: u32) -> FileClipboard {
         FileClipboard {
             paths: vec![PathBuf::from(r"C:\a.jpg")],
-            identities: vec![None],
+            ids: vec![crate::cut_watch::IdState::Pending],
             cut: true,
             generation: 1,
+            revision: 0,
             baseline_sequence: baseline,
-            published: published.map(|r| {
-                r.map(|sequence| Published {
-                    token: forge_win::ClipboardToken::from_raw(u64::from(sequence)),
-                    sequence,
-                })
-            }),
+            published: published.map(|r| r.map(|seq| token(u64::from(seq)))),
             _watch: None,
         }
+    }
+
+    fn token(raw: u64) -> forge_win::ClipboardToken {
+        forge_win::ClipboardToken::from_raw(raw)
     }
 
     fn ours(sequence: u32) -> Option<forge_win::ClipboardToken> {
@@ -1938,7 +2004,8 @@ mod clipboard_tests {
             choose_paste_source(None, 5, None, SystemFiles::NoFiles),
             PasteSource::Empty
         );
-        // Our publish is still pending: never paste stale Explorer paths.
+        // Our publish is still pending and nothing else was copied since: ours, never the
+        // stale Explorer paths still on the clipboard.
         assert_eq!(
             choose_paste_source(Some(&cb(None, 4)), 4, None, SystemFiles::Files),
             PasteSource::InApp
@@ -2000,9 +2067,41 @@ mod clipboard_tests {
             choose_paste_source(Some(&cb(Some(Err(())), 4)), 6, None, unreadable),
             PasteSource::Unreadable
         );
-        // Unchanged since our copy: ours is still what the clipboard holds.
+        // Published, but our token cannot be read: fail closed rather than guess from a
+        // sequence number.
         assert_eq!(
             choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, None, unreadable),
+            PasteSource::Unreadable
+        );
+        // Still publishing and nothing changed since the copy: ours.
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 4, None, unreadable),
+            PasteSource::InApp
+        );
+    }
+
+    /// A pending publish is not ownership: if another app has put files on the clipboard
+    /// since the copy, those are newer.
+    #[test]
+    fn a_pending_publish_yields_to_files_copied_since() {
+        let mine = token((u64::from(std::process::id()) << 32) | 77);
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 6, None, SystemFiles::Files),
+            PasteSource::System
+        );
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 6, ours(3), SystemFiles::Files),
+            PasteSource::System,
+            "another process's token"
+        );
+        // Our own content (this publish just landed, or an older one of ours): ours.
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 6, Some(mine), SystemFiles::Files),
+            PasteSource::InApp
+        );
+        // Text copied since: nothing better to paste than ours.
+        assert_eq!(
+            choose_paste_source(Some(&cb(None, 4)), 6, None, SystemFiles::NoFiles),
             PasteSource::InApp
         );
     }
