@@ -1502,6 +1502,15 @@ fn finish_shell_delete(
         job.log(format!("NOT DELETED  {line}"));
     }
     other.extend(skipped);
+    // A cancel or abort that stopped inside a folder: not "left as it was".
+    for p in &report.partly_deleted {
+        let line = format!(
+            "{}: partly deleted, some of its contents may already be gone",
+            p.display()
+        );
+        job.log(format!("STOPPED  {line}"));
+        other.push(line);
+    }
     let n = report.done.len();
     job.log(format!(
         "{n} deleted, {} not deleted, {} not started{}",
@@ -2153,6 +2162,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(job.state(), JobState::Cancelled);
+    }
+
+    #[test]
+    fn a_cancel_inside_a_folder_reports_it_as_partly_deleted() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = jobs.spawn("delete", "Deleting 3 item(s)", move |job| {
+            let report = forge_win::DeleteReport {
+                done: vec![PathBuf::from(r"C:\x\a")],
+                partly_deleted: vec![PathBuf::from(r"C:\x\big")],
+                not_started: vec![PathBuf::from(r"C:\x\c")],
+                cancelled: true,
+                ..Default::default()
+            };
+            finish_shell_delete(job, &[], &report, false, Vec::new(), &tx);
+            Ok(())
+        });
+        let t0 = Instant::now();
+        while !job.state().is_finished() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lines = rx
+            .try_iter()
+            .find_map(|e| match e {
+                Event::Report { lines, .. } => Some(lines),
+                _ => None,
+            })
+            .expect("a report, not a toast");
+        let text = lines.join("\n");
+        assert!(text.contains(r"C:\x\big: partly deleted"), "{text}");
+        assert!(text.contains("Cancelled before 1 more item(s)"), "{text}");
+        assert!(!text.contains(r"C:\x\a"), "{text}");
     }
 
     #[test]

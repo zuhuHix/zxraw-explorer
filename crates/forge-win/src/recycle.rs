@@ -66,6 +66,9 @@ pub struct DeleteReport {
     pub failed: Vec<(PathBuf, DeleteFailure)>,
     /// Items not tried because the operation was cancelled.
     pub not_started: Vec<PathBuf>,
+    /// Items a cancel or abort stopped midway: they are still there, but some of their
+    /// contents may already be gone.
+    pub partly_deleted: Vec<PathBuf>,
     /// The caller or the user (in a shell dialog) cancelled.
     pub cancelled: bool,
 }
@@ -370,19 +373,24 @@ struct Pass<'a> {
     refusal: Refusal,
     /// The first error the shell reported for each item.
     errors: &'a [Option<u32>],
+    /// Whether the shell had deleted, or begun deleting, something inside each item.
+    started: &'a [bool],
     /// The caller cancelled, or the user did in a shell dialog.
     cancelled: bool,
-    /// `GetAnyOperationsAborted` after the pass.
+    /// What `GetAnyOperationsAborted` answered after the pass (`false` when the call
+    /// failed; its error is then in `run_error`).
     aborted: bool,
-    /// What `PerformOperations` returned, if it failed: the HRESULT and its message.
+    /// What `PerformOperations` (or the abort query) returned, if it failed: the HRESULT
+    /// and its message.
     run_error: Option<(u32, String)>,
 }
 
 /// Adds a pass's outcome to `report`. Returns the indices of the items to try again in a
 /// new pass: only after the sink refused a known item, and only the items not reached.
 ///
-/// A pass the shell reports as aborted, with items left that nothing explains (no refusal,
-/// no error for them, no other failure), was cancelled by the user or the system.
+/// A pass the shell reports as aborted, with items left, was cancelled by the user or the
+/// system when nothing else in the pass explains the abort: no refusal of ours, no error
+/// for any item, no failure of the call itself.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn settle_pass(
     pass: Pass<'_>,
@@ -407,17 +415,28 @@ fn settle_pass(
             left.push(i);
         }
     }
+    let item_errors = pass
+        .errors
+        .iter()
+        .flatten()
+        .any(|hr| !codes::is_cancel(*hr));
     let unexplained_abort = pass.aborted
         && pass.refusal == Refusal::None
+        && !item_errors
         && pass
             .run_error
             .as_ref()
             .is_none_or(|(hr, _)| codes::is_cancel(*hr));
     if pass.cancelled || (unexplained_abort && !left.is_empty()) {
         report.cancelled = true;
-        report
-            .not_started
-            .extend(left.iter().map(|&i| pass.items[i].clone()));
+        for &i in &left {
+            let item = pass.items[i].clone();
+            if pass.started[i] {
+                report.partly_deleted.push(item);
+            } else {
+                report.not_started.push(item);
+            }
+        }
         return Vec::new();
     }
     let why = match pass.refusal {
@@ -525,6 +544,9 @@ mod imp {
         expected: Vec<Option<ItemIdentity>>,
         /// Items whose identity was checked as the shell reached them.
         checked: Vec<Cell<bool>>,
+        /// Items the shell had deleted, or begun deleting, something inside of. A file, or
+        /// a folder sent to the Recycle Bin, goes in one step and is never marked.
+        started: Vec<Cell<bool>>,
     }
 
     impl PassItems {
@@ -534,11 +556,23 @@ mod imp {
                 .map(|p| p.to_string_lossy().to_lowercase())
                 .collect();
             let checked = items.iter().map(|_| Cell::new(false)).collect();
+            let started = items.iter().map(|_| Cell::new(false)).collect();
             Self {
                 items,
                 keys,
                 expected,
                 checked,
+                started,
+            }
+        }
+
+        /// Marks the item `path` lies strictly inside as started.
+        fn mark_inside(&self, path: Option<&str>) {
+            let Some(path) = path else { return };
+            if let Some(i) = item_of(&self.keys, path) {
+                if self.keys[i] != path.to_lowercase() {
+                    self.started[i].set(true);
+                }
             }
         }
 
@@ -665,6 +699,7 @@ mod imp {
                 }
                 return Err(cancel_hr());
             }
+            self.pass.mark_inside(path.as_deref());
             // Progress only from here: best effort when the state is busy.
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return Ok(());
@@ -680,6 +715,9 @@ mod imp {
             _: Ref<IShellItem>,
         ) -> windows::core::Result<()> {
             let path = path_of(item);
+            if hr.is_ok() {
+                self.pass.mark_inside(path.as_deref());
+            }
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return Ok(());
             };
@@ -802,6 +840,11 @@ mod imp {
             }
             let refusal = Rc::new(Cell::new(Refusal::None));
             let (run, aborted) = unsafe { perform(mode, &pass, &refusal, &state) };
+            let (aborted, run_error) = match aborted {
+                Ok(aborted) => (aborted, run.err()),
+                Err(e) => (false, run.err().or(Some(e))),
+            };
+            let started: Vec<bool> = pass.started.iter().map(Cell::get).collect();
             let refusal = refusal.get();
             let mut s = state.borrow_mut();
             let gone: Vec<bool> = items.iter().map(|p| is_gone(p)).collect();
@@ -817,9 +860,10 @@ mod imp {
                     gone: &gone,
                     refusal,
                     errors: &s.errors,
+                    started: &started,
                     cancelled,
                     aborted,
-                    run_error: run.err(),
+                    run_error,
                 },
                 |hr| windows::core::Error::from(HRESULT(hr as i32)).message(),
                 &mut report,
@@ -831,18 +875,18 @@ mod imp {
     }
 
     /// One `IFileOperation` pass. Returns how `PerformOperations` (or the setup before it)
-    /// ended, and whether the shell reports any operation aborted.
+    /// ended, and whether the shell reports any operation aborted (or why it could not say).
     unsafe fn perform(
         mode: Mode,
         pass: &Rc<PassItems>,
         refusal: &Rc<Cell<Refusal>>,
         state: &Rc<RefCell<State>>,
-    ) -> (Result<(), (u32, String)>, bool) {
+    ) -> (Result<(), (u32, String)>, Result<bool, (u32, String)>) {
         let err = |op: &str, e: windows::core::Error| (e.code().0 as u32, format!("{op}: {}", e.message()));
         unsafe {
             let op: IFileOperation = match CoCreateInstance(&FileOperation, None, CLSCTX_ALL) {
                 Ok(op) => op,
-                Err(e) => return (Err(err("IFileOperation", e)), false),
+                Err(e) => return (Err(err("IFileOperation", e)), Ok(false)),
             };
             let setup = (|| {
                 op.SetOperationFlags(flags(mode))
@@ -872,7 +916,7 @@ mod imp {
             })();
             let cookie = match setup {
                 Ok(cookie) => cookie,
-                Err(e) => return (Err(e), false),
+                Err(e) => return (Err(e), Ok(false)),
             };
             let result = op
                 .PerformOperations()
@@ -882,7 +926,7 @@ mod imp {
             let aborted = op
                 .GetAnyOperationsAborted()
                 .map(|b| b.as_bool())
-                .unwrap_or(true);
+                .map_err(|e| err("GetAnyOperationsAborted", e));
             let _ = op.Unadvise(cookie);
             (result, aborted)
         }
@@ -1231,6 +1275,20 @@ mod tests {
         aborted: bool,
         errors: &[Option<u32>],
     ) -> (DeleteReport, Vec<PathBuf>) {
+        settle_full(items, gone, refusal, cancelled, aborted, errors, &vec![false; items.len()], None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_full(
+        items: &[PathBuf],
+        gone: &[bool],
+        refusal: Refusal,
+        cancelled: bool,
+        aborted: bool,
+        errors: &[Option<u32>],
+        started: &[bool],
+        run_error: Option<(u32, String)>,
+    ) -> (DeleteReport, Vec<PathBuf>) {
         let mut report = DeleteReport::default();
         let retry = settle_pass(
             Pass {
@@ -1238,9 +1296,10 @@ mod tests {
                 gone,
                 refusal,
                 errors,
+                started,
                 cancelled,
                 aborted,
-                run_error: None,
+                run_error,
             },
             |_| String::new(),
             &mut report,
@@ -1410,5 +1469,80 @@ mod tests {
         assert_eq!(report.done, vec![a.clone(), c.clone()]);
         assert!(!a.exists() && b.exists() && !c.exists());
         assert!(!report.cancelled);
+    }
+
+    #[test]
+    fn an_abort_with_an_item_error_elsewhere_in_the_pass_is_not_a_cancel() {
+        let items: Vec<PathBuf> = ["a", "b"].iter().map(PathBuf::from).collect();
+        // a failed with an access error; b was never reached. The abort is the error's.
+        let (report, _) = settle_with(
+            &items,
+            &[false, false],
+            Refusal::None,
+            false,
+            true,
+            &[Some(codes::E_ACCESS_DENIED_SRC), None],
+        );
+        assert!(!report.cancelled);
+        assert_eq!(report.failed.len(), 2);
+        assert!(report.not_started.is_empty());
+    }
+
+    #[test]
+    fn a_failed_abort_query_is_an_error_not_a_cancel() {
+        let items: Vec<PathBuf> = ["a"].iter().map(PathBuf::from).collect();
+        let query = (0x8000_4005, "GetAnyOperationsAborted: failed".to_string());
+        let (report, _) = settle_full(
+            &items,
+            &[false],
+            Refusal::None,
+            false,
+            false,
+            &[None],
+            &[false],
+            Some(query),
+        );
+        assert!(!report.cancelled);
+        assert_eq!(
+            report.failed,
+            vec![(items[0].clone(), DeleteFailure::Other("GetAnyOperationsAborted: failed".into()))]
+        );
+    }
+
+    #[test]
+    fn a_cancel_reports_items_the_shell_had_started_on_as_partly_deleted() {
+        let items: Vec<PathBuf> = ["a", "b", "c"].iter().map(PathBuf::from).collect();
+        let (report, _) = settle_full(
+            &items,
+            &[true, false, false],
+            Refusal::None,
+            true,
+            false,
+            &[None, None, None],
+            &[true, true, false],
+            None,
+        );
+        assert!(report.cancelled);
+        assert_eq!(report.done, vec![items[0].clone()]);
+        assert_eq!(report.partly_deleted, vec![items[1].clone()]);
+        assert_eq!(report.not_started, vec![items[2].clone()]);
+    }
+
+    #[test]
+    fn a_cancelled_folder_delete_with_files_gone_is_partly_deleted() {
+        let d = tempfile::tempdir().unwrap();
+        let tree = d.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        for i in 0..20 {
+            std::fs::write(tree.join(format!("f{i:02}.txt")), b"x").unwrap();
+        }
+        // Stop once the shell has deleted a few files inside the folder.
+        let report = delete_items_permanently(
+            std::slice::from_ref(&tree),
+            Box::new(|p| p.work_done < 4),
+        );
+        assert!(report.cancelled);
+        assert!(tree.exists());
+        assert_eq!(report.partly_deleted, vec![tree.clone()], "{report:?}");
     }
 }

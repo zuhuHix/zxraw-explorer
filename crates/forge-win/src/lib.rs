@@ -64,7 +64,7 @@ pub use recycle::{
 };
 pub use restart::{file_locking_processes, processes_using};
 pub use shell::{
-    known_folders, open_default, open_folder_in_explorer, open_with_dialog, recycle,
+    known_folders, open_default, open_folder_in_explorer, open_with_dialog, recycle, recycle_result,
     recycle_sandbox_active, recycle_to_sandbox, reveal_in_explorer, set_recycle_sandbox,
     set_shortcut_icon, show_properties,
 };
