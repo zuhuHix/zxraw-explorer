@@ -78,8 +78,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   dragged out at once (each costs a shell parse on the UI thread); larger selections are
   refused with a message pointing to copy and paste.
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
-  tests in `forge-win/src/clipboard.rs`. Interoperability with Explorer, and paste into or out
-  of other applications, has not been checked.
+  tests in `forge-win/src/clipboard.rs`. Explorer's paste of ZXraw's copy or cut is tested
+  through the shell's paste verb. A cut pasted elsewhere is noticed only by its items leaving
+  their folders (checked every 0.75 s), so if they reappear (for example, undo in Explorer) the
+  cut is not restored. Paste into other applications has not been checked.
 * Opening a file (double-click, Enter, or **Open**) starts it in the file's own folder, as
   Explorer does. Scripts in a UNC folder (`\\server\share`) still run in the Windows folder,
   because `cmd.exe` cannot use a UNC path as its working directory; Explorer behaves the same.

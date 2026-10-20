@@ -757,6 +757,61 @@ mod tests {
         assert_eq!(stdout.trim(), paths[0].to_string_lossy());
     }
 
+    /// Explorer's own paste (the shell "paste" verb, as Ctrl+V in a folder window or on the
+    /// desktop runs it) moves a folder that `set_files` put on the clipboard as a cut.
+    #[test]
+    fn shell_paste_moves_a_cut() {
+        let _guard = ClipboardTestGuard::new();
+        let root = tempfile::tempdir().unwrap();
+        let (source, target) = (root.path().join("source"), root.path().join("target"));
+        let folder = source.join("Shoot A");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::write(folder.join("nested").join("a.txt"), b"folder a").unwrap();
+        std::fs::create_dir(&target).unwrap();
+        set_files(std::slice::from_ref(&folder), ClipboardEffect::Move).unwrap();
+
+        // The verb returns before the shell's background move ends; keep its process alive.
+        let script = format!(
+            "(New-Object -ComObject Shell.Application).NameSpace('{}').Self.InvokeVerb('paste'); \
+             $t = Join-Path '{}' 'Shoot A\\nested\\a.txt'; \
+             for ($i = 0; $i -lt 100 -and -not (Test-Path $t); $i++) {{ Start-Sleep -Milliseconds 100 }}; \
+             Start-Sleep -Milliseconds 500",
+            target.display(),
+            target.display()
+        );
+        let output = match Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-Command",
+                &script,
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("powershell.exe unavailable; shell paste check skipped");
+                return;
+            }
+            Err(error) => panic!("could not run the shell paste: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(target.join("Shoot A").join("nested").join("a.txt")).unwrap(),
+            b"folder a"
+        );
+        assert!(
+            !folder.exists(),
+            "the shell copied the cut instead of moving it"
+        );
+    }
+
     fn read_test_text() -> Result<Option<String>> {
         let _window = ClipboardOwnerWindow::new()?;
         let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;

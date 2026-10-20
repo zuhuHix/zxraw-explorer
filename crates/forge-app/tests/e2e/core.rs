@@ -1110,6 +1110,82 @@ fn in_app_cut_pastes_with_ctrl_v() {
     assert!(folders[1].is_dir(), "an item that was not cut stays");
 }
 
+/// The reported bug: a cut made in ZXraw and pasted in Explorer (here its real "paste" verb,
+/// as on the Desktop) moved the folder, but ZXraw kept showing "1 cut" and the stale cut
+/// stayed on the Windows clipboard. Explorer drops its own cut after such a paste.
+#[test]
+fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    // Explorer's paste verb runs in another process, so wait until the cut is on the
+    // clipboard, then paste it into `work` the way Explorer does.
+    let explorer = {
+        let cut = folders[0].clone();
+        let work = work.clone();
+        std::thread::spawn(move || -> bool {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            loop {
+                if let Ok(Some((paths, forge_win::ClipboardEffect::Move))) =
+                    forge_win::get_files()
+                {
+                    if paths == vec![cut.clone()] {
+                        break;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let verb = format!(
+                "$f=(New-Object -ComObject Shell.Application).NameSpace('{}'); \
+                 $f.Self.InvokeVerb('paste'); Start-Sleep 5",
+                work.display()
+            );
+            std::process::Command::new("powershell.exe")
+                .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-STA", "-Command"])
+                .arg(verb)
+                .status()
+                .is_ok()
+        })
+    };
+    let script = format!(
+        "navigate {desktop}\n\
+         select Shoot A\n\
+         key ctrl+X\n\
+         wait-missing {moved_away}\n\
+         wait-exists {arrived}\n\
+         ui system wait-no-cut\n\
+         wait-no-entry Shoot A\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+        moved_away = shown(&folders[0]),
+        arrived = shown(&work.join("Shoot A").join("a.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    let saw_cut = explorer.join().unwrap();
+    assert!(saw_cut, "the cut never reached the Windows clipboard");
+    assert!(!folders[0].exists(), "Shoot A was not moved away");
+    assert_eq!(
+        fs::read(work.join("Shoot A").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+    assert!(folders[1].is_dir(), "an item that was not cut stays");
+    assert_ne!(
+        forge_win::get_files()
+            .ok()
+            .flatten()
+            .map(|(paths, _)| paths),
+        Some(vec![folders[0].clone()]),
+        "the stale cut is still on the clipboard"
+    );
+}
+
 /// An older ZXraw copy must not shadow a newer cut from Explorer. Paste here is the
 /// command the background context menu runs.
 #[test]
