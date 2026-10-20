@@ -23,6 +23,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 mod clipboard;
+#[cfg(all(test, windows))]
+mod clipboard_test_support;
 pub mod desktop;
 pub mod dragout;
 pub mod drives;

@@ -928,62 +928,46 @@ mod tests {
 
     use super::*;
 
-    /// Serializes tests that use the real clipboard across processes too (the e2e suite,
-    /// other worktrees): a named mutex, the same one the e2e clipboard tests take.
-    struct ClipboardTestLock(windows::Win32::Foundation::HANDLE);
+    use crate::clipboard_test_support::{ClipboardLock, Snapshot};
 
-    impl ClipboardTestLock {
-        fn acquire() -> Self {
-            use windows::Win32::Foundation::WAIT_FAILED;
-            use windows::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
-            use windows::core::w;
-
-            let handle =
-                unsafe { CreateMutexW(None, false, w!("Local\\ZXrawExplorerClipboardTests")) }
-                    .expect("create the clipboard test mutex");
-            // WAIT_ABANDONED (a test process died holding it) also hands the mutex over.
-            let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-            assert_ne!(wait, WAIT_FAILED, "wait for the clipboard test mutex");
-            Self(handle)
-        }
-    }
-
-    impl Drop for ClipboardTestLock {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
-            }
-        }
-    }
-
+    /// The shared clipboard test lock plus the user's clipboard, put back when dropped (these
+    /// tests write the clipboard themselves within about a second, so the restore is
+    /// unconditional). `None`, and the test is skipped before it writes anything, when the
+    /// clipboard holds something that cannot be put back exactly (see [`Snapshot::save`]).
     struct ClipboardTestGuard {
-        _lock: ClipboardTestLock,
-        saved_text: Option<String>,
+        saved: Snapshot,
+        _lock: ClipboardLock,
     }
 
     impl ClipboardTestGuard {
-        fn new() -> Self {
-            let lock = ClipboardTestLock::acquire();
-            let saved_text = read_test_text().ok().flatten();
-            Self {
-                _lock: lock,
-                saved_text,
+        fn new() -> Option<Self> {
+            let lock = ClipboardLock::acquire();
+            match Snapshot::save() {
+                Ok(saved) => Some(Self { saved, _lock: lock }),
+                Err(why) => {
+                    eprintln!(
+                        "skipped: the clipboard holds {why}, which this test can't restore; \
+                         clear it or copy some text and rerun"
+                    );
+                    None
+                }
             }
         }
     }
 
     impl Drop for ClipboardTestGuard {
         fn drop(&mut self) {
-            if let Some(text) = &self.saved_text {
-                let _ = set_test_text(text);
+            if let Err(e) = self.saved.restore_if(|| true) {
+                eprintln!("warning: could not restore the clipboard: {e}");
             }
         }
     }
 
     #[test]
     fn files_round_trip_for_copy_and_move_including_long_unicode_paths() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let long_component = format!("{}-長い名前.txt", "x".repeat(280));
         let paths = vec![
             PathBuf::from(r"C:\ZXraw Explorer\日本語\résumé.txt"),
@@ -1008,14 +992,18 @@ mod tests {
 
     #[test]
     fn plain_text_has_no_file_list() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         set_test_text("plain clipboard text").unwrap();
         assert_eq!(get_files().unwrap(), None);
     }
 
     #[test]
     fn setting_files_increments_clipboard_sequence() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let before = clipboard_sequence();
         set_files(&[PathBuf::from(r"C:\sequence.txt")], ClipboardEffect::Copy).unwrap();
         assert_ne!(clipboard_sequence(), before);
@@ -1023,7 +1011,9 @@ mod tests {
 
     #[test]
     fn clear_if_owned_files_does_not_clear_a_changed_sequence() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let paths = vec![PathBuf::from(r"C:\owned.txt")];
         set_files(&paths, ClipboardEffect::Move).unwrap();
         let owned_sequence = clipboard_sequence();
@@ -1038,7 +1028,9 @@ mod tests {
 
     #[test]
     fn powershell_reads_file_drop_list() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let paths = vec![PathBuf::from(r"C:\ZXraw Explorer\PowerShell interop.txt")];
         set_files(&paths, ClipboardEffect::Copy).unwrap();
 
@@ -1073,7 +1065,9 @@ mod tests {
     /// desktop runs it) moves a folder that `set_files` put on the clipboard as a cut.
     #[test]
     fn shell_paste_moves_a_cut() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let root = tempfile::tempdir().unwrap();
         let (source, target) = (root.path().join("source"), root.path().join("target"));
         let folder = source.join("Shoot A");
@@ -1126,7 +1120,9 @@ mod tests {
 
     #[test]
     fn a_publish_waits_for_nothing_newer_from_another_app() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let ours = vec![PathBuf::from(r"C:\owner-a.txt")];
         let theirs = vec![PathBuf::from(r"C:\theirs.txt")];
         // Unchanged since the baseline, or changed only by us: written.
@@ -1152,7 +1148,9 @@ mod tests {
 
     #[test]
     fn owner_token_round_trips_and_differs_per_publish() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
         let first = set_files(&paths, ClipboardEffect::Copy).unwrap();
         let second = set_files(&paths, ClipboardEffect::Move).unwrap();
@@ -1171,7 +1169,9 @@ mod tests {
 
     #[test]
     fn another_apps_identical_list_is_not_ours() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
         let token = set_files(&paths, ClipboardEffect::Copy).unwrap();
         set_files_without_text(&paths, ClipboardEffect::Move).unwrap();
@@ -1190,7 +1190,9 @@ mod tests {
 
     #[test]
     fn clear_if_token_clears_only_our_publish() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
         let stale = set_files(&paths, ClipboardEffect::Copy).unwrap();
         let current = set_files(&paths, ClipboardEffect::Copy).unwrap();
@@ -1203,7 +1205,9 @@ mod tests {
 
     #[test]
     fn replace_files_if_token_updates_only_our_publish() {
-        let _guard = ClipboardTestGuard::new();
+        let Some(_guard) = ClipboardTestGuard::new() else {
+            return;
+        };
         let a = PathBuf::from(r"C:\owner-a.txt");
         let b = PathBuf::from(r"C:\owner-b.txt");
         let token = set_files(&[a.clone(), b.clone()], ClipboardEffect::Copy).unwrap();
