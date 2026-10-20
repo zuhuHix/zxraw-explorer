@@ -1271,7 +1271,8 @@ fn finish_report(
     if !report.undo.is_empty() {
         let _ = tx.send(Event::Undo(UndoEntry::Ops(report.undo.clone())));
     }
-    for l in report_log_lines(report) {
+    // Warnings are not repeated: the engine logs each one as it happens.
+    for l in report_lines(report) {
         job.log(l);
     }
     for _ in 0..report.failed.len() {
@@ -1311,13 +1312,6 @@ fn report_lines(report: &OpReport) -> Vec<String> {
     for s in &report.skipped {
         lines.push(format!("skipped {}: {}", s.path.display(), s.reason));
     }
-    lines
-}
-
-/// What the job writes to its log in the Operations window: the report and its warnings.
-fn report_log_lines(report: &OpReport) -> Vec<String> {
-    let mut lines = report_lines(report);
-    lines.extend(modal::warning_lines(&report.warnings));
     lines
 }
 
@@ -2595,9 +2589,6 @@ mod tests {
             }
             _ => panic!("warnings must open a report, not a toast"),
         }
-        let log = report_log_lines(&report).join("\n");
-        assert!(log.contains(r"warning C:\x\a.jpg: replaced"), "{log}");
-        assert!(log.contains(r"kept as C:\x\a.old.jpg"), "{log}");
 
         report.warnings.push(kept);
         report.failed.push(ops::OpIssue::new(r"C:\x\c.jpg", "denied"));

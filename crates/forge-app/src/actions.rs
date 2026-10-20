@@ -1624,30 +1624,24 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 app.refresh_all_showing(&d);
             }
             Event::Report { title, lines } => {
-                if app.ops.modal.is_none() {
-                    app.ops.modal = Some(Modal::Report {
-                        title,
-                        lines,
-                        warnings: Vec::new(),
-                    });
-                } else {
-                    app.toast_err(format!("{title} — see Operations panel"));
-                }
+                let report = Modal::Report {
+                    title,
+                    lines,
+                    warnings: Vec::new(),
+                };
+                show_report(app, report);
             }
             Event::ReportWithWarnings {
                 title,
                 lines,
                 warnings,
             } => {
-                if app.ops.modal.is_none() {
-                    app.ops.modal = Some(Modal::Report {
-                        title,
-                        lines,
-                        warnings,
-                    });
-                } else {
-                    app.toast_err(format!("{title} — see Operations panel"));
-                }
+                let report = Modal::Report {
+                    title,
+                    lines,
+                    warnings,
+                };
+                show_report(app, report);
             }
             Event::Conflict(q) => app.ops.conflicts.push_back(q),
             Event::ClipboardDone(done) => {
@@ -1781,6 +1775,27 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     }
     changed |= crate::ops_ui::show_pending_question(app);
     changed
+}
+
+/// Open a job report, unless another dialog is open: it would cover that dialog and take its
+/// focus, so a toast points to the Operations panel (the job log has the details) instead.
+fn show_report(app: &mut ZxrawApp, report: Modal) {
+    let other_dialog = app.ops.batch_rename.is_some() || !app.ops.conflicts.is_empty();
+    if let Some(title) = place_report(&mut app.ops.modal, other_dialog, report) {
+        app.toast_err(format!("{title} — see Operations panel"));
+    }
+}
+
+/// Put `report` in the free `modal` slot. Returns its title when a dialog is already showing.
+fn place_report(modal: &mut Option<Modal>, other_dialog: bool, report: Modal) -> Option<String> {
+    if modal.is_none() && !other_dialog {
+        *modal = Some(report);
+        return None;
+    }
+    match report {
+        Modal::Report { title, .. } => Some(title),
+        _ => Some(String::new()),
+    }
 }
 
 /// Opens the next conflict prompt that is waiting, if no dialog is open (`other_dialog`: the
@@ -2499,6 +2514,27 @@ mod name_job_tests {
         assert_eq!(slot.index_now(3, 1), 1);
         // Never past the end.
         assert_eq!(slot.index_now(1, 0), 1);
+    }
+
+    #[test]
+    fn a_report_never_covers_an_open_dialog() {
+        let report = |title: &str| Modal::Report {
+            title: title.into(),
+            lines: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut modal = None;
+        assert_eq!(
+            place_report(&mut modal, true, report("Copy — completed with warnings")),
+            Some("Copy — completed with warnings".to_string())
+        );
+        assert!(modal.is_none(), "batch rename or a conflict is showing");
+        assert_eq!(place_report(&mut modal, false, report("first")), None);
+        assert_eq!(
+            place_report(&mut modal, false, report("second")),
+            Some("second".to_string())
+        );
+        assert!(matches!(&modal, Some(Modal::Report { title, .. }) if title == "first"));
     }
 
     #[test]
