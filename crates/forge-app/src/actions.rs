@@ -700,6 +700,11 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Undo if app.ops.name_jobs_pending > 0 => {
             app.toast("Waiting for the rename to finish; try Undo again in a moment")
         }
+        // One undo job at a time: a cancelled one puts its rest back on the stack, and two
+        // putting back at once could swap the order of what is left.
+        Cmd::Undo if crate::ops_ui::undo_running(&app.ops.jobs) => {
+            app.toast("Undo already in progress; try again when it finishes")
+        }
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
             Some(UndoEntry::Ops(records)) => {
