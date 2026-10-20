@@ -166,7 +166,12 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `an_item_the_recycle_bin_refuses_stays_when_the_question_is_declined`). Protected folders
   get Windows' administrator prompt, owned by the main window so it opens in front; declining
   it reports "needs administrator permission". An in-app permanent delete that is denied
-  offers "Delete as administrator". Open files are reported as in use, with the programs
+  offers "Delete as administrator". Both questions delete an item only if it is still the
+  object the user was asked about: file ID, type and creation time (and, for files, size and
+  write time) are checked before the delete and again as Windows reaches each item; a moved
+  or replaced item is left and reported (`recycle::tests::a_confirmed_delete_skips_a_swapped_item_and_deletes_the_rest`,
+  `a_confirmed_item_swapped_before_the_shell_reaches_it_is_refused`). A delete cancelled in a
+  Windows dialog ends the job as cancelled. Open files are reported as in use, with the programs
   holding them (`an_open_file_is_reported_in_use`). Cancel and progress:
   `a_cancelled_permanent_delete_leaves_the_items`,
   `permanent_shell_delete_reports_progress_and_removes_the_tree`.

@@ -104,6 +104,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   jumps, because recycling a folder is a single rename. The programs named for a file in use
   come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
   services and kernel holders.
+* Where a file system has no stable file IDs (some network shares, index 0), "the same item"
+  rests on type and creation time (plus size and write time for files). A folder replaced by
+  another created at the very same instant would pass; no missing time ever counts as a match.
 
 * Online-only cloud files (OneDrive, Dropbox, Google Drive placeholders) are detected from
   their attributes and never read by background work, so they show a cloud badge and no

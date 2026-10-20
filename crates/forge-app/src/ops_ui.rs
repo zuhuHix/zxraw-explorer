@@ -1298,7 +1298,9 @@ fn is_access_denied(reason: &str) -> bool {
 /// replaced while the question was open is left alone.
 pub struct DeleteTarget {
     path: PathBuf,
-    identity: Option<SourceIdentity>,
+    /// `None` when it could not be read when the question was asked; such an item is
+    /// never deleted.
+    identity: Option<forge_win::ItemIdentity>,
 }
 
 impl DeleteTarget {
@@ -1307,35 +1309,53 @@ impl DeleteTarget {
             .iter()
             .map(|path| Self {
                 path: path.clone(),
-                identity: source_identity(path),
+                identity: forge_win::ItemIdentity::of(path),
             })
             .collect()
     }
 }
 
-/// Splits `targets` into the paths that are still the object the user was asked about, and
-/// report lines for the rest. An item whose identity could not be read then or now counts
-/// as changed.
-fn screen_delete_targets(
-    targets: Vec<DeleteTarget>,
-    current: impl Fn(&Path) -> Option<SourceIdentity>,
-) -> (Vec<PathBuf>, Vec<String>) {
+/// Splits `targets` into the items that are still the object the user was asked about
+/// (with that identity, for the shell to check again as it reaches each one), and report
+/// lines for the rest. An identity missing then or now never matches.
+fn screen_delete_targets<I: PartialEq>(
+    targets: Vec<(PathBuf, Option<I>)>,
+    current: impl Fn(&Path) -> Option<I>,
+) -> (Vec<(PathBuf, I)>, Vec<String>) {
     let mut same = Vec::new();
     let mut changed = Vec::new();
-    for t in targets {
-        match (&t.identity, current(&t.path)) {
-            (Some(then), Some(now)) if *then == now => same.push(t.path),
-            (_, None) if std::fs::symlink_metadata(&t.path).is_err() => changed.push(format!(
-                "{}: it no longer exists",
-                t.path.display()
+    for (path, then) in targets {
+        let now = current(&path);
+        match then {
+            Some(then) if now.as_ref() == Some(&then) => same.push((path, then)),
+            _ if std::fs::symlink_metadata(&path).is_err() => {
+                changed.push(format!("{}: it no longer exists", path.display()))
+            }
+            None => changed.push(format!(
+                "{}: it could not be identified when you were asked, so it was not deleted",
+                path.display()
             )),
-            _ => changed.push(format!(
-                "{}: it changed after you were asked (moved or replaced), so it was not deleted",
-                t.path.display()
+            Some(_) => changed.push(format!(
+                "{}: {}, so it was not deleted",
+                path.display(),
+                forge_win::DeleteFailure::Changed
             )),
         }
     }
     (same, changed)
+}
+
+/// The job's result for a shell delete. A cancelled one (by the user, in the app or in a
+/// Windows dialog, or by the system) ends as cancelled, not completed.
+fn delete_result(job: &JobHandle, report: &forge_win::DeleteReport, skipped: usize) -> Result<(), String> {
+    if report.cancelled {
+        job.cancel.cancel();
+        return Ok(());
+    }
+    match report.failed.len() + skipped {
+        0 => Ok(()),
+        n => Err(format!("{n} item(s) not deleted")),
+    }
 }
 
 /// Questions from finished deletes, and the progress popup's state.
@@ -1377,7 +1397,7 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
             let report = forge_win::recycle_items(&targets, shell_observer(job));
             finish_shell_delete(job, &targets, &report, true, Vec::new(), &tx);
             ctx.request_repaint();
-            delete_result(&report)
+            delete_result(job, &report, 0)
         });
 }
 
@@ -1393,28 +1413,20 @@ pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<DeleteTarget>) {
         "delete",
         format!("Permanently deleting {n} item(s)"),
         move |job| {
-            // Checked again right before deleting: the question may have been open a while.
-            let (same, changed) = screen_delete_targets(targets, source_identity);
+            // Checked here, before anything is deleted, and again by the shell as it reaches
+            // each item: the question may have been open a while, and a big batch takes time.
+            let targets = targets.into_iter().map(|t| (t.path, t.identity)).collect();
+            let (same, changed) = screen_delete_targets(targets, forge_win::ItemIdentity::of);
             for _ in &changed {
                 job.progress.add_error();
             }
-            let report = forge_win::delete_items_permanently(&same, shell_observer(job));
-            finish_shell_delete(job, &paths, &report, false, changed.clone(), &tx);
+            let skipped = changed.len();
+            let report = forge_win::delete_confirmed_items(&same, shell_observer(job));
+            finish_shell_delete(job, &paths, &report, false, changed, &tx);
             ctx.request_repaint();
-            if !changed.is_empty() && report.failed.is_empty() {
-                return Err(format!("{} item(s) not deleted", changed.len()));
-            }
-            ctx.request_repaint();
-            delete_result(&report)
+            delete_result(job, &report, skipped)
         },
     );
-}
-
-fn delete_result(report: &forge_win::DeleteReport) -> Result<(), String> {
-    match report.failed.len() {
-        0 => Ok(()),
-        n => Err(format!("{n} item(s) not deleted")),
-    }
 }
 
 /// Feeds a shell delete's progress into the job, and the job's pause and cancel back.
@@ -1453,6 +1465,7 @@ fn failure_text(path: &Path, why: &forge_win::DeleteFailure) -> String {
             names => format!("in use by {}; close it and try again", names.join(", ")),
         },
         F::Missing => "it no longer exists".into(),
+        F::Changed => format!("{why}, so it was not deleted"),
         F::Other(message) => message.clone(),
     }
 }
@@ -2095,10 +2108,6 @@ mod tests {
 
     #[test]
     fn a_permanent_delete_skips_items_changed_since_the_question() {
-        let id = |n: u64| SourceIdentity::Id {
-            kind: std::fs::symlink_metadata(".").unwrap().file_type(),
-            id: (7, n),
-        };
         let d = tempfile::tempdir().unwrap();
         let (same, replaced, unread, gone) = (
             d.path().join("same"),
@@ -2110,23 +2119,40 @@ mod tests {
             std::fs::write(p, b"x").unwrap();
         }
         let targets = vec![
-            DeleteTarget { path: same.clone(), identity: Some(id(1)) },
-            DeleteTarget { path: replaced.clone(), identity: Some(id(2)) },
-            DeleteTarget { path: unread.clone(), identity: None },
-            DeleteTarget { path: gone.clone(), identity: Some(id(4)) },
+            (same.clone(), Some(1)),
+            (replaced.clone(), Some(2)),
+            (unread.clone(), None),
+            (gone.clone(), Some(4)),
         ];
         let now = |p: &Path| match p.file_name()?.to_str()? {
-            "same" => Some(id(1)),
-            "replaced" => Some(id(9)),
-            "unread" => Some(id(3)),
+            "same" => Some(1),
+            "replaced" => Some(9),
+            "unread" => Some(3),
             _ => None,
         };
         let (keep, skipped) = screen_delete_targets(targets, now);
-        assert_eq!(keep, vec![same]);
+        assert_eq!(keep, vec![(same, 1)]);
         assert_eq!(skipped.len(), 3, "{skipped:?}");
         assert!(skipped[0].contains("replaced") && skipped[0].contains("changed after"));
-        assert!(skipped[1].contains("unread") && skipped[1].contains("changed after"));
+        assert!(skipped[1].contains("unread") && skipped[1].contains("could not be identified"));
         assert!(skipped[2].contains("gone") && skipped[2].contains("no longer exists"));
+    }
+
+    #[test]
+    fn a_shell_delete_cancelled_in_a_windows_dialog_ends_the_job_as_cancelled() {
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = jobs.spawn("delete", "test", |job| {
+            let report = forge_win::DeleteReport {
+                cancelled: true,
+                ..Default::default()
+            };
+            delete_result(job, &report, 0)
+        });
+        let t0 = Instant::now();
+        while !job.state().is_finished() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(job.state(), JobState::Cancelled);
     }
 
     #[test]

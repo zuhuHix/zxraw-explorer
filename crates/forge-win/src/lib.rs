@@ -59,8 +59,8 @@ pub use integration::{
 };
 pub use process::launch;
 pub use recycle::{
-    DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, delete_items_permanently,
-    recycle_items, set_dialog_owner,
+    DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, ItemIdentity,
+    delete_confirmed_items, delete_items_permanently, recycle_items, set_dialog_owner,
 };
 pub use restart::{file_locking_processes, processes_using};
 pub use shell::{
