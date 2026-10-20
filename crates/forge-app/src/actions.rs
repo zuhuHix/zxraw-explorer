@@ -123,6 +123,31 @@ pub struct FileClipboard {
     _watch: Option<crate::cut_watch::WatchGuard>,
 }
 
+/// A paste into `dest` of the cut `generation` at `revision`, waiting (since `since`) for
+/// the cut's identities. Anything newer (another paste, copy or cut, a change of the cut)
+/// drops it, and so does [`PASTE_WAIT`] going by: it never fires into an old destination.
+struct PasteWait {
+    dest: PathBuf,
+    generation: u64,
+    revision: u64,
+    since: std::time::Instant,
+}
+
+/// How long a paste waits for the cut's identities: longer than one check may take.
+const PASTE_WAIT: Duration = Duration::from_secs(8);
+
+impl PasteWait {
+    /// Whether this paste should run now that the cut `generation` at `revision` has its
+    /// identities: only for that very cut, and only in time.
+    fn fires_for(&self, generation: u64, revision: u64) -> bool {
+        self.generation == generation && self.revision == revision && !self.expired()
+    }
+
+    fn expired(&self) -> bool {
+        self.since.elapsed() >= PASTE_WAIT
+    }
+}
+
 /// A cut checked for a paste, off the UI thread.
 pub struct CutCheck {
     generation: u64,
@@ -147,6 +172,8 @@ enum PasteSource {
     Empty,
     /// The Windows clipboard changed since our copy and could not be read.
     Unreadable,
+    /// The clipboard holds an old list of ours that the app no longer has (a used-up cut).
+    Stale,
 }
 
 /// What reading the Windows clipboard found.
@@ -167,6 +194,16 @@ fn choose_paste_source(
     owner: Option<forge_win::ClipboardToken>,
     system: SystemFiles,
 ) -> PasteSource {
+    // Content this app put there is never pasted as another app's files: the in-app
+    // clipboard (whose items a paste checks first) is pasted instead, or, with none left (a
+    // used-up cut whose list could not be cleared), nothing is.
+    if owner.is_some_and(forge_win::ClipboardToken::is_from_this_process) {
+        return if in_app.is_some() {
+            PasteSource::InApp
+        } else {
+            PasteSource::Stale
+        };
+    }
     let Some(cb) = in_app else {
         return match system {
             SystemFiles::Files => PasteSource::System,
@@ -176,11 +213,8 @@ fn choose_paste_source(
     };
     let ours = match cb.published {
         // Our publish has not landed yet: ours, unless another app has put something on
-        // the clipboard since the copy (anything of ours, older or newer, still counts).
-        None => {
-            system_sequence == cb.baseline_sequence
-                || owner.is_some_and(forge_win::ClipboardToken::is_from_this_process)
-        }
+        // the clipboard since the copy.
+        None => system_sequence == cb.baseline_sequence,
         Some(Ok(token)) => owner == Some(token),
         Some(Err(())) => system_sequence == cb.baseline_sequence,
     };
@@ -215,8 +249,8 @@ pub struct Actions {
     cut_watcher: Option<crate::cut_watch::CutWatcher>,
     /// Started with the first copy or cut; see [`crate::clip_worker`].
     clip_worker: Option<crate::clip_worker::ClipWorker>,
-    /// A paste into this folder waits for the cut's identities to be read.
-    paste_waiting: Option<PathBuf>,
+    /// A paste waiting for the cut's identities to be read.
+    paste_waiting: Option<PasteWait>,
     pub show_jobs: bool,
     pub delete_ui: crate::ops_ui::DeleteUi,
     pub batch_rename: Option<crate::batch_rename::BatchRename>,
@@ -501,6 +535,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 let op = crate::clip_worker::Op::Publish {
                     paths: paths.clone(),
                     effect,
+                    baseline: baseline_sequence,
                 };
                 clip(app, generation, 0, op);
                 // A cut pasted elsewhere (Explorer, the desktop) is noticed by its items
@@ -1098,6 +1133,8 @@ fn clip(app: &mut ZxrawApp, generation: u64, revision: u64, op: crate::clip_work
 /// it), and checking the cut's items can block on a slow drive, so both happen off the UI
 /// thread; `paste_with` decides once the result arrives.
 fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
+    app.ops.paste_waiting = None;
+    let checker = app.ops.cut_watcher.as_ref().map(|w| w.checker());
     let (tx, ctx) = (app.ops.tx.clone(), app.ops.ctx.clone());
     let cut = app.ops.clipboard.as_ref().filter(|cb| cb.cut).map(|cb| {
         let items: Vec<_> = cb.paths.iter().cloned().zip(cb.ids.iter().copied()).collect();
@@ -1108,7 +1145,9 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
             Ok(read) => (Ok(read.files), read.owner, read.sequence),
             Err(e) => (Err(e.to_string()), None, forge_win::clipboard_sequence()),
         };
-        let cut = cut.map(|(generation, revision, items)| check_cut(generation, revision, &items));
+        let cut = cut.map(|(generation, revision, items)| {
+            check_cut(checker, generation, revision, &items)
+        });
         let _ = tx.send(Event::PasteSystemRead {
             destination: dir,
             sequence,
@@ -1123,17 +1162,22 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
 /// What is at the cut's paths now, for a paste. Runs off the UI thread; a check that takes
 /// longer than [`crate::cut_watch::PASS_TIMEOUT`] counts as "could not tell".
 fn check_cut(
+    checker: Option<crate::cut_watch::Checker>,
     generation: u64,
     revision: u64,
     items: &[(PathBuf, crate::cut_watch::IdState)],
 ) -> CutCheck {
-    use crate::cut_watch::{IdState, PASS_TIMEOUT, observe_all_within, screen};
+    use crate::cut_watch::{IdState, Observation, PASS_TIMEOUT, screen};
     let pending = items.iter().any(|(_, id)| *id == IdState::Pending);
     let screened = if pending {
         Default::default()
     } else {
-        let paths = items.iter().map(|(p, _)| p.clone()).collect();
-        screen(items, &observe_all_within(paths, PASS_TIMEOUT))
+        // Shares the watcher's check slots: one check per cut, a few in all.
+        let paths: Vec<PathBuf> = items.iter().map(|(p, _)| p.clone()).collect();
+        let seen = checker
+            .and_then(|c| c.check(generation, paths, PASS_TIMEOUT))
+            .unwrap_or_else(|| vec![Observation::Unknown; items.len()]);
+        screen(items, &seen)
     };
     CutCheck {
         generation,
@@ -1163,6 +1207,7 @@ fn set_cut_items(
     };
     cb.revision += 1;
     let revision = cb.revision;
+    app.ops.paste_waiting = None;
     (cb.paths, cb.ids) = items.iter().cloned().unzip();
     if cb.paths.is_empty() {
         app.ops.clipboard = None;
@@ -1252,6 +1297,7 @@ fn paste_with(
     };
     match choose_paste_source(app.ops.clipboard.as_ref(), sequence, owner, system) {
         PasteSource::Empty => app.toast("Nothing to paste: the clipboard has no files"),
+        PasteSource::Stale => app.toast("Nothing to paste: those items were moved already"),
         PasteSource::Unreadable => app.toast_err(format!(
             "Could not read the clipboard: {}",
             read_error.unwrap_or_default()
@@ -1298,9 +1344,21 @@ fn paste_cut(app: &mut ZxrawApp, dest: PathBuf, check: Option<CutCheck>) {
         return;
     };
     if check.pending {
-        // Right after the cut: the paste runs again once the watcher has read what the
-        // items are (within its check timeout). Nothing moves before that.
-        app.ops.paste_waiting = Some(dest);
+        // Right after the cut: nothing moves before the watcher has read what the items
+        // are. If it has by now, check again at once; else wait for it.
+        if !cb.ids.contains(&crate::cut_watch::IdState::Pending) {
+            start_paste(app, dest);
+            return;
+        }
+        app.ops.paste_waiting = Some(PasteWait {
+            dest,
+            generation,
+            revision: cb.revision,
+            since: std::time::Instant::now(),
+        });
+        app.ops
+            .ctx
+            .request_repaint_after(PASTE_WAIT + Duration::from_millis(100));
         return;
     }
     let s = check.screened;
@@ -1509,6 +1567,15 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     // A finished "Select originals/exports" match (computed off the UI thread).
     changed |= crate::export_assoc::poll(app);
+    if app
+        .ops
+        .paste_waiting
+        .take_if(|w| w.expired())
+        .is_some()
+    {
+        app.toast_err("Could not check the cut items in time, so nothing was pasted");
+        changed = true;
+    }
     while let Ok(ev) = app.ops.rx.try_recv() {
         changed = true;
         match ev {
@@ -1557,10 +1624,15 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                             };
                         }
                     }
-                    if !cb.ids.contains(&crate::cut_watch::IdState::Pending)
-                        && let Some(dest) = app.ops.paste_waiting.take()
+                    let ready = !cb.ids.contains(&crate::cut_watch::IdState::Pending);
+                    let (generation, revision) = (cb.generation, cb.revision);
+                    if ready
+                        && let Some(wait) = app
+                            .ops
+                            .paste_waiting
+                            .take_if(|w| w.fires_for(generation, revision))
                     {
-                        start_paste(app, dest);
+                        start_paste(app, wait.dest);
                     }
                 }
             }
@@ -2078,6 +2150,46 @@ mod clipboard_tests {
             choose_paste_source(Some(&cb(None, 4)), 4, None, unreadable),
             PasteSource::InApp
         );
+    }
+
+    /// A list this app put on the clipboard is never pasted as another app's files, even
+    /// when updating it failed (the in-app items, checked first, are pasted instead).
+    #[test]
+    fn our_own_content_never_takes_the_system_path() {
+        let mine = token((u64::from(std::process::id()) << 32) | 78);
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Err(())), 4)), 9, Some(mine), SystemFiles::Files),
+            PasteSource::InApp
+        );
+        assert_eq!(
+            choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 9, Some(mine), SystemFiles::Files),
+            PasteSource::InApp,
+            "an older publish of ours"
+        );
+        assert_eq!(
+            choose_paste_source(None, 9, Some(mine), SystemFiles::Files),
+            PasteSource::Stale,
+            "a used-up cut whose list is still there"
+        );
+    }
+
+    #[test]
+    fn a_waiting_paste_fires_only_for_its_cut_and_in_time() {
+        let wait = PasteWait {
+            dest: PathBuf::from(r"C:\dest"),
+            generation: 3,
+            revision: 1,
+            since: std::time::Instant::now(),
+        };
+        assert!(wait.fires_for(3, 1));
+        assert!(!wait.fires_for(3, 2), "the cut changed since");
+        assert!(!wait.fires_for(4, 1), "another cut");
+        let old = PasteWait {
+            since: std::time::Instant::now() - PASTE_WAIT,
+            ..wait
+        };
+        assert!(old.expired());
+        assert!(!old.fires_for(3, 1), "never fires into an old destination");
     }
 
     /// A pending publish is not ownership: if another app has put files on the clipboard

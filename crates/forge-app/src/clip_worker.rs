@@ -25,10 +25,13 @@ const BACKOFF: [Duration; 5] = [
 /// What to do with the clipboard.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// The user's Copy or Cut: a new publish, whatever the clipboard holds.
+    /// The user's Copy or Cut: a new publish. Skipped if another app has put something on
+    /// the clipboard since `baseline` (its sequence number at the Copy or Cut): that content
+    /// is newer, and a late or retried publish must not overwrite it.
     Publish {
         paths: Vec<PathBuf>,
         effect: ClipboardEffect,
+        baseline: u32,
     },
     /// The cut's list changed: replace our publish with it, if the clipboard still holds it.
     Update {
@@ -73,6 +76,9 @@ pub struct Done {
 
 /// The clipboard calls, replaceable in tests.
 pub trait Clipboard: Send + 'static {
+    /// Whether another app has put content on the clipboard since sequence `since` (our
+    /// own content, from this process, does not count).
+    fn taken_since(&mut self, since: u32) -> Result<bool, String>;
     fn publish(
         &mut self,
         paths: &[PathBuf],
@@ -92,6 +98,13 @@ pub trait Clipboard: Send + 'static {
 pub struct Windows;
 
 impl Clipboard for Windows {
+    fn taken_since(&mut self, since: u32) -> Result<bool, String> {
+        if forge_win::clipboard_sequence() == since {
+            return Ok(false);
+        }
+        let owner = forge_win::clipboard_owner().map_err(|e| e.to_string())?;
+        Ok(!owner.is_some_and(ClipboardToken::is_from_this_process))
+    }
     fn publish(
         &mut self,
         paths: &[PathBuf],
@@ -162,11 +175,16 @@ impl ClipWorker {
 /// of the same cut that never ran is a publish: the cut is not on the clipboard yet.
 fn supersede(queued: Request, next: Request) -> Request {
     match (&queued.op, next.op) {
-        (Op::Publish { .. }, Op::Update { paths, effect })
+        (Op::Publish { baseline, .. }, Op::Update { paths, effect })
             if queued.generation == next.generation =>
         {
+            let baseline = *baseline;
             Request {
-                op: Op::Publish { paths, effect },
+                op: Op::Publish {
+                    paths,
+                    effect,
+                    baseline,
+                },
                 ..next
             }
         }
@@ -244,7 +262,14 @@ impl<C: Clipboard> Worker<C> {
 
     fn attempt(&mut self, op: &Op) -> Result<Outcome, String> {
         match op {
-            Op::Publish { paths, effect } => {
+            Op::Publish {
+                paths,
+                effect,
+                baseline,
+            } => {
+                if self.clipboard.taken_since(*baseline)? {
+                    return Ok(Outcome::NotOurs);
+                }
                 let token = self.clipboard.publish(paths, *effect)?;
                 self.ours = Some(token);
                 Ok(Outcome::Published(token))
@@ -295,6 +320,8 @@ mod tests {
         fail: Arc<Mutex<usize>>,
         foreign: Arc<Mutex<bool>>,
         next: Arc<Mutex<u64>>,
+        /// Another app wrote the clipboard at this sequence number.
+        taken_after: Arc<Mutex<u32>>,
     }
 
     impl Fake {
@@ -318,6 +345,9 @@ mod tests {
     }
 
     impl Clipboard for Fake {
+        fn taken_since(&mut self, since: u32) -> Result<bool, String> {
+            Ok(*self.taken_after.lock().unwrap() > since)
+        }
         fn publish(
             &mut self,
             paths: &[PathBuf],
@@ -370,6 +400,7 @@ mod tests {
         Op::Publish {
             paths: vec![PathBuf::from("a"); n],
             effect: ClipboardEffect::Move,
+            baseline: 10,
         }
     }
 
@@ -408,6 +439,64 @@ mod tests {
         let fake = Fake::default();
         assert_eq!(worker(&fake).serve(req(0, 0, foreign), &rx), None);
         assert_eq!(fake.log(), vec!["clear-foreign 1 9"]);
+    }
+
+    #[test]
+    fn a_late_publish_never_overwrites_newer_content_of_another_app() {
+        let fake = Fake::default();
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        // The first try finds the clipboard busy; meanwhile another app copies something.
+        *fake.fail.lock().unwrap() = 1;
+        let taken = fake.taken_after.clone();
+        let mut w = Worker {
+            clipboard: Hook {
+                inner: fake.clone(),
+                after_failure: Box::new(move || *taken.lock().unwrap() = 11),
+            },
+            ours: None,
+            backoff: &NO_WAIT,
+        };
+        let done = w.serve(req(1, 0, publish(1)), &rx).unwrap();
+        assert_eq!(done.outcome, Outcome::NotOurs);
+        assert_eq!(fake.log(), vec!["publish 1"], "never retried over the newer content");
+        assert_eq!(w.ours, None);
+    }
+
+    /// Runs `after_failure` once the wrapped clipboard has failed a call.
+    struct Hook {
+        inner: Fake,
+        after_failure: Box<dyn FnMut() + Send>,
+    }
+
+    impl Clipboard for Hook {
+        fn taken_since(&mut self, since: u32) -> Result<bool, String> {
+            self.inner.taken_since(since)
+        }
+        fn publish(
+            &mut self,
+            paths: &[PathBuf],
+            effect: ClipboardEffect,
+        ) -> Result<ClipboardToken, String> {
+            let result = self.inner.publish(paths, effect);
+            if result.is_err() {
+                (self.after_failure)();
+            }
+            result
+        }
+        fn replace(
+            &mut self,
+            paths: &[PathBuf],
+            effect: ClipboardEffect,
+            token: ClipboardToken,
+        ) -> Result<Option<ClipboardToken>, String> {
+            self.inner.replace(paths, effect, token)
+        }
+        fn clear(&mut self, token: ClipboardToken) -> Result<bool, String> {
+            self.inner.clear(token)
+        }
+        fn clear_foreign(&mut self, paths: &[PathBuf], sequence: u32) {
+            self.inner.clear_foreign(paths, sequence);
+        }
     }
 
     #[test]
