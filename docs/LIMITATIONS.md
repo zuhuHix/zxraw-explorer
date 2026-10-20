@@ -89,6 +89,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   kind, size, creation and modified time together. An item whose identity cannot be read (or
   could not be checked again at paste time) is left out of a paste with a message, never moved
   unchecked. Without a file ID, editing a cut file counts as replacing it, so it leaves the cut.
+  The move itself checks each item against its identity from the cut once more when it
+  starts, so an item replaced while the move waited in the queue is not moved either.
 * All clipboard writes go through one worker, newest request first. ZXraw recognises its own
   clipboard content by a private "ZXraw Explorer Clipboard Owner" format and only ever replaces
   or empties that; another app's identical list is left alone.
