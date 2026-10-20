@@ -58,6 +58,8 @@ struct ClipboardMoveCompletion {
     /// For a paste of this app's cut: what each item was when it was cut. The job moves a
     /// source only if it is still that item (see [`screen_cut_sources`]).
     cut_ids: Option<Vec<(PathBuf, crate::cut_watch::Identity)>>,
+    /// Reads the sources' identities for that, bounded and sharing the cut watcher's slots.
+    checker: Option<crate::cut_watch::Checker>,
 }
 
 /// Start a copy or move of `sources` into `dest` as a background job, after asking first
@@ -180,6 +182,7 @@ fn clipboard_move(
         generation,
         expected_sequence,
         cut_ids,
+        checker: crate::actions::cut_checker(app),
     };
     start_transfer_with(
         app,
@@ -752,16 +755,29 @@ fn start_transfer_with(
         // A paste of this app's cut checks against the identity from the cut itself, not
         // only the one read when the move was queued (a replacement made before that would
         // otherwise pass).
-        let (sources, changed, unverified) =
-            match completion.as_ref().and_then(|c| c.cut_ids.as_deref()) {
-                Some(cut) => screen_cut_sources(
-                    sources,
-                    (changed, unverified),
-                    cut,
-                    crate::cut_watch::observe,
-                ),
-                None => (sources, changed, unverified),
-            };
+        let (sources, changed, unverified) = match completion.as_ref() {
+            Some(c) if c.cut_ids.is_some() => {
+                // Bounded, and given up on when the job is cancelled: an item that could not be
+                // checked in time is not moved.
+                let cut = c.cut_ids.as_deref().unwrap_or_default();
+                let seen = c
+                    .checker
+                    .zip(c.generation)
+                    .and_then(|(checker, generation)| {
+                        checker.check_unless(
+                            generation,
+                            sources.clone(),
+                            crate::cut_watch::PASS_TIMEOUT,
+                            || job.cancel.is_cancelled(),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        vec![crate::cut_watch::Observation::Unknown; sources.len()]
+                    });
+                screen_cut_sources(sources, (changed, unverified), cut, &seen)
+            }
+            _ => (sources, changed, unverified),
+        };
         let (sources, mut vanished): (Vec<PathBuf>, Vec<PathBuf>) = sources
             .into_iter()
             .partition(|s| forge_core::paths::exists_no_follow(s));
@@ -911,24 +927,26 @@ fn screen_queued_sources(
     (keep, changed, unverified)
 }
 
-/// Splits the sources of a cut-paste by the identity each item had when it was cut: kept if
-/// still that item (or gone, which the job reports as gone), changed if another item has
-/// taken the path, unverified if there is no cut identity or it cannot be read now. Adds to
-/// the `changed` and `unverified` lists from [`screen_queued_sources`].
+/// Splits the sources of a cut-paste by the identity each item had when it was cut, given
+/// what is at each source now (`seen`, in order): kept if still that item (or gone, which the
+/// job reports as gone), changed if another item has taken the path, unverified if there is
+/// no cut identity or it could not be read now. Adds to the `changed` and `unverified` lists
+/// from [`screen_queued_sources`].
 fn screen_cut_sources(
     sources: Vec<PathBuf>,
     (mut changed, mut unverified): (Vec<PathBuf>, Vec<PathBuf>),
     cut: &[(PathBuf, crate::cut_watch::Identity)],
-    observe: impl Fn(&Path) -> crate::cut_watch::Observation,
+    seen: &[crate::cut_watch::Observation],
 ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     use crate::cut_watch::Observation;
     let mut keep = Vec::new();
-    for source in sources {
+    for (i, source) in sources.into_iter().enumerate() {
         let then = cut
             .iter()
             .find(|(p, _)| forge_core::paths::paths_equal(p, &source))
             .map(|(_, id)| *id);
-        match (then, observe(&source)) {
+        let now = seen.get(i).copied().unwrap_or(Observation::Unknown);
+        match (then, now) {
             (Some(then), Observation::Present(now)) if now == then => keep.push(source),
             (Some(_), Observation::Present(_)) => changed.push(source),
             (_, Observation::Missing) => keep.push(source),
@@ -2371,7 +2389,8 @@ mod tests {
         .map(|n| p(r"C:\a").join(n))
         .to_vec();
         let earlier = (vec![p("x")], vec![p("y")]);
-        let (keep, changed, unverified) = screen_cut_sources(sources, earlier, &cut, now);
+        let seen: Vec<_> = sources.iter().map(|s| now(s)).collect();
+        let (keep, changed, unverified) = screen_cut_sources(sources, earlier, &cut, &seen);
         assert_eq!(keep, vec![p(r"C:\a\same.jpg"), p(r"C:\a\gone.jpg")]);
         assert_eq!(changed, vec![p("x"), p(r"C:\a\replaced.jpg")]);
         assert_eq!(

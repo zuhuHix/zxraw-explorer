@@ -60,6 +60,41 @@ pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<Clipboard
     Ok(token)
 }
 
+/// Like [`set_files`], unless another app has put something on the clipboard since sequence
+/// `baseline` (our own content, from this process, does not count): then nothing changes and
+/// the result is `Ok(None)`. Checked and written in one clipboard session, so nothing can
+/// land in between.
+#[cfg(windows)]
+pub fn set_files_if_unchanged(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    baseline: u32,
+) -> Result<Option<ClipboardToken>> {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+
+    let token = next_token();
+    let mut payloads = build_payloads(paths, effect, Some(token))?;
+    let window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(window.hwnd))?;
+    if clipboard_sequence() != baseline
+        && !read_owner_token_open()?.is_some_and(ClipboardToken::is_from_this_process)
+    {
+        return Ok(None);
+    }
+    unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
+    write_payloads(&mut payloads)?;
+    Ok(Some(token))
+}
+
+#[cfg(not(windows))]
+pub fn set_files_if_unchanged(
+    _paths: &[PathBuf],
+    _effect: ClipboardEffect,
+    _baseline: u32,
+) -> Result<Option<ClipboardToken>> {
+    Err(crate::WinError::Unsupported)
+}
+
 /// Places paths on the clipboard as Explorer's Copy and Cut do: `CF_HDROP` and the preferred
 /// drop effect, with no text. For tests that stand in for another app.
 #[cfg(windows)]
@@ -152,15 +187,27 @@ fn build_payloads(
     };
     let effect_bytes = drop_effect.to_ne_bytes();
 
-    let mut payloads = vec![
-        ClipboardPayload::new(CF_HDROP.0 as u32, "SetClipboardData(CF_HDROP)", &dropfiles)?,
-        ClipboardPayload::new(
-            preferred_format,
-            "SetClipboardData(Preferred DropEffect)",
-            &effect_bytes,
-        )?,
-    ];
+    // Our owner token goes first: a file list on the clipboard is never ours unmarked, even
+    // for a moment, or after a write that fails part way (see `write_payloads`).
+    let mut payloads = Vec::new();
     if let Some(token) = ours {
+        payloads.push(ClipboardPayload::new(
+            owner_format()?,
+            "SetClipboardData(ZXraw Explorer Clipboard Owner)",
+            &token.0.to_ne_bytes(),
+        )?);
+    }
+    payloads.push(ClipboardPayload::new(
+        CF_HDROP.0 as u32,
+        "SetClipboardData(CF_HDROP)",
+        &dropfiles,
+    )?);
+    payloads.push(ClipboardPayload::new(
+        preferred_format,
+        "SetClipboardData(Preferred DropEffect)",
+        &effect_bytes,
+    )?);
+    if ours.is_some() {
         let mut text_wide = Vec::new();
         for (index, path) in wide_paths.iter().enumerate() {
             if index != 0 {
@@ -174,20 +221,37 @@ fn build_payloads(
             "SetClipboardData(CF_UNICODETEXT)",
             u16s_as_bytes(&text_wide),
         )?);
-        payloads.push(ClipboardPayload::new(
-            owner_format()?,
-            "SetClipboardData(ZXraw Explorer Clipboard Owner)",
-            &token.0.to_ne_bytes(),
-        )?);
     }
     Ok(payloads)
 }
 
 /// Puts the payloads on an open, emptied clipboard. Handles transfer to Windows as they go.
+/// If one fails, the clipboard is emptied again before it is closed: half a publish (a file
+/// list without the rest) is never left behind.
 #[cfg(windows)]
 fn write_payloads(payloads: &mut [ClipboardPayload]) -> Result<()> {
-    for payload in payloads {
-        set_clipboard_data(payload.format, &mut payload.data, payload.op)?;
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+
+    write_all_or_empty(
+        payloads,
+        |payload| set_clipboard_data(payload.format, &mut payload.data, payload.op),
+        || {
+            let _ = unsafe { EmptyClipboard() };
+        },
+    )
+}
+
+/// Runs `write` on each item in order; on the first failure runs `empty` and returns it.
+fn write_all_or_empty<T>(
+    items: &mut [T],
+    mut write: impl FnMut(&mut T) -> Result<()>,
+    empty: impl FnOnce(),
+) -> Result<()> {
+    for item in items {
+        if let Err(e) = write(item) {
+            empty();
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -415,19 +479,6 @@ fn read_owner_token_open() -> Result<Option<ClipboardToken>> {
         Err(crate::WinError::Invalid(_)) => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-/// The owner token on the clipboard, if it holds a publish of ours (`Ok(None)` otherwise).
-#[cfg(windows)]
-pub fn clipboard_owner() -> Result<Option<ClipboardToken>> {
-    let window = ClipboardOwnerWindow::new()?;
-    let _clipboard = open_clipboard_retry(Some(window.hwnd))?;
-    read_owner_token_open()
-}
-
-#[cfg(not(windows))]
-pub fn clipboard_owner() -> Result<Option<ClipboardToken>> {
-    Err(crate::WinError::Unsupported)
 }
 
 /// Empties the clipboard if its owner token is `token`: `Ok(true)` when emptied, `Ok(false)`
@@ -1049,6 +1100,32 @@ mod tests {
     }
 
     #[test]
+    fn a_publish_waits_for_nothing_newer_from_another_app() {
+        let _guard = ClipboardTestGuard::new();
+        let ours = vec![PathBuf::from(r"C:\owner-a.txt")];
+        let theirs = vec![PathBuf::from(r"C:\theirs.txt")];
+        // Unchanged since the baseline, or changed only by us: written.
+        let baseline = clipboard_sequence();
+        assert!(
+            set_files_if_unchanged(&ours, ClipboardEffect::Move, baseline)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            set_files_if_unchanged(&ours, ClipboardEffect::Move, baseline)
+                .unwrap()
+                .is_some()
+        );
+        // Another app copied since: left alone.
+        set_files_without_text(&theirs, ClipboardEffect::Copy).unwrap();
+        assert_eq!(
+            set_files_if_unchanged(&ours, ClipboardEffect::Move, baseline).unwrap(),
+            None
+        );
+        assert_eq!(get_files().unwrap(), Some((theirs, ClipboardEffect::Copy)));
+    }
+
+    #[test]
     fn owner_token_round_trips_and_differs_per_publish() {
         let _guard = ClipboardTestGuard::new();
         let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
@@ -1160,6 +1237,36 @@ mod tests {
             .map_err(|e| crate::api_err("SetClipboardData(test text)", e))?;
         handle.transfer();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::write_all_or_empty;
+
+    #[test]
+    fn a_write_that_fails_part_way_empties_the_clipboard() {
+        let mut written = Vec::new();
+        let mut emptied = false;
+        let mut formats = ["owner", "files", "effect", "text"];
+        let result = write_all_or_empty(
+            &mut formats,
+            |f| {
+                if *f == "effect" {
+                    return Err(crate::WinError::Invalid("SetClipboardData failed".into()));
+                }
+                written.push(*f);
+                Ok(())
+            },
+            || emptied = true,
+        );
+        assert!(result.is_err());
+        assert!(emptied, "half a publish must not stay on the clipboard");
+        assert_eq!(written, ["owner", "files"], "the owner token goes first");
+
+        let mut emptied = false;
+        assert!(write_all_or_empty(&mut formats, |_| Ok(()), || emptied = true).is_ok());
+        assert!(!emptied);
     }
 }
 
