@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::{Duration, Instant};
 
 static DIALOG_OWNER: AtomicIsize = AtomicIsize::new(0);
 
@@ -73,9 +74,28 @@ pub struct DeleteReport {
     pub cancelled: bool,
 }
 
+/// What a shell delete is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeleteStage {
+    /// Nothing reported yet.
+    #[default]
+    Starting,
+    /// The shell is counting the files and folders inside the items (`found` so far).
+    /// For a big folder this is most of the wait before anything moves.
+    Counting,
+    /// Deleting: `work_done` of `work_total`, or the top-level counts.
+    Deleting,
+    /// The shell is moving a whole item into the Recycle Bin in one step. It reports
+    /// nothing until that step ends, which for a folder with many files takes a while.
+    MovingWhole,
+}
+
 /// Progress passed to the observer of [`recycle_items`] and [`delete_items_permanently`].
 #[derive(Debug, Clone, Default)]
 pub struct DeleteProgress {
+    pub stage: DeleteStage,
+    /// Files and folders the shell has found so far while counting.
+    pub found: u64,
     /// Top-level items finished so far, and how many there are.
     pub items_done: usize,
     pub items_total: usize,
@@ -87,8 +107,36 @@ pub struct DeleteProgress {
     pub current: Option<PathBuf>,
 }
 
-/// Called with progress; returning `false` cancels the operation.
+/// Called with progress; returning `false` cancels the operation. It hears about
+/// progress inside folders at most [`TELL_EVERY`] apart; a new stage, a finished item and
+/// the end of a pass always reach it.
 pub type DeleteObserver = Box<dyn FnMut(&DeleteProgress) -> bool>;
+
+/// The shortest gap between two progress reports that change only counts or the current
+/// item (20 a second). The shell reports every file of a big folder, and the observer has
+/// no need to hear about each one.
+pub const TELL_EVERY: Duration = Duration::from_millis(50);
+
+/// Lets a report through at most once per [`TELL_EVERY`], unless it is forced.
+#[derive(Debug, Default)]
+struct Throttle {
+    last: Option<Instant>,
+}
+
+impl Throttle {
+    /// Whether a report at `now` goes through; a forced one always does.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn due(&mut self, now: Instant, force: bool) -> bool {
+        let due = force
+            || self
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= TELL_EVERY);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+}
 
 /// What an item is, so a later check can tell whether its path still names the same
 /// object: type and creation time always, the file ID where the file system has a stable
@@ -177,6 +225,7 @@ fn recycle_into_sandbox(
 ) -> DeleteReport {
     let mut report = DeleteReport::default();
     let mut progress = DeleteProgress {
+        stage: DeleteStage::Deleting,
         items_total: paths.len(),
         ..Default::default()
     };
@@ -318,10 +367,15 @@ fn refuses_permanent_delete(mode: Mode, flags: u32) -> bool {
 
 /// Which of a pass's items (lowercase keys) `path` is, or lies inside. `None` when the path
 /// belongs to none of them.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(test)]
 fn item_of(keys: &[String], path: &str) -> Option<usize> {
-    let path = path.to_lowercase();
-    if let Some(i) = keys.iter().position(|k| *k == path) {
+    item_of_lower(keys, &path.to_lowercase())
+}
+
+/// [`item_of`] for a path already in lowercase.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn item_of_lower(keys: &[String], path: &str) -> Option<usize> {
+    if let Some(i) = keys.iter().position(|k| k == path) {
         return Some(i);
     }
     keys.iter()
@@ -472,8 +526,9 @@ mod imp {
     use windows::core::{HRESULT, PCWSTR, Ref, implement};
 
     use super::{
-        DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, ItemIdentity, Mode, Pass,
-        Refusal, codes, is_gone, item_of, refuses_permanent_delete, settle_pass,
+        DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, DeleteStage, ItemIdentity,
+        Mode, Pass, Refusal, Throttle, codes, is_gone, item_of_lower, refuses_permanent_delete,
+        settle_pass,
     };
 
     /// Progress and the observer. Only progress depends on it: every decision to refuse a
@@ -491,6 +546,7 @@ mod imp {
         /// Items finished in earlier passes.
         done_before: usize,
         observer: DeleteObserver,
+        throttle: Throttle,
     }
 
     impl State {
@@ -513,10 +569,26 @@ mod imp {
 
         /// Tells the observer; false when it asked to stop (now or before).
         fn tell(&mut self) -> bool {
-            if !self.stopped && !(self.observer)(&self.progress) {
+            self.tell_if(true)
+        }
+
+        /// Tells the observer when `force` is set or the throttle lets it through; false
+        /// when it asked to stop (now or before).
+        fn tell_if(&mut self, force: bool) -> bool {
+            if !self.stopped
+                && self.throttle.due(std::time::Instant::now(), force)
+                && !(self.observer)(&self.progress)
+            {
                 self.stopped = true;
             }
             !self.stopped
+        }
+
+        /// Moves to `stage`; true when that is a change.
+        fn enter(&mut self, stage: DeleteStage) -> bool {
+            let changed = self.progress.stage != stage;
+            self.progress.stage = stage;
+            changed
         }
     }
 
@@ -566,13 +638,16 @@ mod imp {
             }
         }
 
-        /// Marks the item `path` lies strictly inside as started.
-        fn mark_inside(&self, path: Option<&str>) {
-            let Some(path) = path else { return };
-            if let Some(i) = item_of(&self.keys, path) {
-                if self.keys[i] != path.to_lowercase() {
-                    self.started[i].set(true);
-                }
+        /// Which item a shell path is in, and whether it is that item itself.
+        fn locate(&self, path: Option<&str>) -> Option<(usize, bool)> {
+            let lower = path?.to_lowercase();
+            item_of_lower(&self.keys, &lower).map(|i| (i, self.keys[i] == lower))
+        }
+
+        /// Marks the item a path lies strictly inside (see [`Self::locate`]) as started.
+        fn mark_inside(&self, at: Option<(usize, bool)>) {
+            if let Some((i, false)) = at {
+                self.started[i].set(true);
             }
         }
 
@@ -603,9 +678,9 @@ mod imp {
     }
 
     impl Sink {
-        /// The refusal for a delete of `path` with `flags`, if it must be refused.
-        fn judge(&self, flags: u32, path: Option<&str>) -> Option<Refusal> {
-            let item = path.and_then(|p| item_of(&self.pass.keys, p));
+        /// The refusal for a delete with `flags` of something in `item` (`None`: in no
+        /// item of the pass), if it must be refused.
+        fn judge(&self, flags: u32, item: Option<usize>) -> Option<Refusal> {
             if refuses_permanent_delete(self.mode, flags) {
                 return Some(item.map_or(Refusal::Unknown, Refusal::Item));
             }
@@ -690,8 +765,9 @@ mod imp {
         }
         fn PreDeleteItem(&self, flags: u32, item: Ref<IShellItem>) -> windows::core::Result<()> {
             let path = path_of(item);
+            let at = self.pass.locate(path.as_deref());
             // Decided before the state is touched, so it holds even when the state is busy.
-            if let Some(refusal) = self.judge(flags, path.as_deref()) {
+            if let Some(refusal) = self.judge(flags, at.map(|(i, _)| i)) {
                 self.refusal.set(self.refusal.get().and(refusal));
                 if let Ok(mut s) = self.state.try_borrow_mut() {
                     // A cancel that came at the same time still counts.
@@ -699,13 +775,20 @@ mod imp {
                 }
                 return Err(cancel_hr());
             }
-            self.pass.mark_inside(path.as_deref());
+            self.pass.mark_inside(at);
             // Progress only from here: best effort when the state is busy.
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return Ok(());
             };
+            let top = at.is_some_and(|(_, top)| top);
+            // A top-level item recycled goes in one step (a folder with everything in it).
+            let changed = s.enter(if self.mode == Mode::Recycle && top {
+                DeleteStage::MovingWhole
+            } else {
+                DeleteStage::Deleting
+            });
             s.progress.current = path.map(PathBuf::from);
-            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
+            if s.tell_if(changed || top) { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PostDeleteItem(
             &self,
@@ -715,21 +798,22 @@ mod imp {
             _: Ref<IShellItem>,
         ) -> windows::core::Result<()> {
             let path = path_of(item);
+            let at = self.pass.locate(path.as_deref());
             if hr.is_ok() {
-                self.pass.mark_inside(path.as_deref());
+                self.pass.mark_inside(at);
             }
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return Ok(());
             };
-            let keys = &self.pass.keys;
-            let key = path.as_deref().map(str::to_lowercase);
-            let top = key.as_deref().and_then(|k| keys.iter().position(|x| x == k));
-            let item = path.as_deref().and_then(|p| item_of(keys, p));
-            s.record(item, hr, self.refusal.get() != Refusal::None);
-            if top.is_some() && hr.is_ok() && hr.0 as u32 != codes::S_NOT_HANDLED {
+            let top = at.is_some_and(|(_, top)| top);
+            s.record(at.map(|(i, _)| i), hr, self.refusal.get() != Refusal::None);
+            if top && hr.is_ok() && hr.0 as u32 != codes::S_NOT_HANDLED {
                 s.progress.items_done += 1;
             }
-            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
+            if top {
+                s.enter(DeleteStage::Deleting);
+            }
+            if s.tell_if(top) { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PreNewItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Ok(())
@@ -750,9 +834,19 @@ mod imp {
             let Ok(mut s) = self.state.try_borrow_mut() else {
                 return Ok(());
             };
+            let mut changed = false;
+            if total == 0 {
+                // While counting, the shell reports once for each file or folder it finds.
+                if matches!(s.progress.stage, DeleteStage::Starting | DeleteStage::Counting) {
+                    changed = s.enter(DeleteStage::Counting);
+                    s.progress.found += 1;
+                }
+            } else if matches!(s.progress.stage, DeleteStage::Starting | DeleteStage::Counting) {
+                changed = s.enter(DeleteStage::Deleting);
+            }
             s.progress.work_total = total.into();
             s.progress.work_done = done.into();
-            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
+            if s.tell_if(changed) { Ok(()) } else { Err(cancel_hr()) }
         }
         fn ResetTimer(&self) -> windows::core::Result<()> {
             Ok(())
@@ -787,6 +881,7 @@ mod imp {
             },
             done_before: done,
             observer,
+            throttle: Throttle::default(),
         }
     }
 
@@ -837,6 +932,8 @@ mod imp {
                 s.progress.items_done = s.done_before;
                 s.progress.work_done = 0;
                 s.progress.work_total = 0;
+                s.progress.stage = DeleteStage::Starting;
+                s.progress.found = 0;
             }
             let refusal = Rc::new(Cell::new(Refusal::None));
             let (run, aborted) = unsafe { perform(mode, &pass, &refusal, &state) };
@@ -944,7 +1041,16 @@ mod imp {
         }
 
         fn probe(mode: Mode, items: &[&Path], expected: Vec<Option<ItemIdentity>>) -> Probe {
-            let mut state = new_state(Box::new(|_| true), items.len(), 0);
+            probe_with(mode, items, expected, Box::new(|_| true))
+        }
+
+        fn probe_with(
+            mode: Mode,
+            items: &[&Path],
+            expected: Vec<Option<ItemIdentity>>,
+            observer: DeleteObserver,
+        ) -> Probe {
+            let mut state = new_state(observer, items.len(), 0);
             state.errors = vec![None; items.len()];
             let state = Rc::new(RefCell::new(state));
             let refusal = Rc::new(Cell::new(Refusal::None));
@@ -1014,6 +1120,85 @@ mod imp {
             let p = probe(Mode::Recycle, &[&a], Vec::new());
             assert!(unsafe { p.sink.PreDeleteItem(DESTROY, &shell_item(&other)) }.is_err());
             assert_eq!(p.refusal.get(), Refusal::Unknown);
+        }
+
+        /// What the observer heard: the stages in order and how many reports came.
+        fn listener() -> (DeleteObserver, Rc<RefCell<Vec<DeleteProgress>>>) {
+            let heard = Rc::new(RefCell::new(Vec::new()));
+            let log = heard.clone();
+            let observer: DeleteObserver = Box::new(move |p| {
+                log.borrow_mut().push(p.clone());
+                true
+            });
+            (observer, heard)
+        }
+
+        #[test]
+        fn counting_inside_a_folder_is_throttled_and_every_stage_is_reported() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let folder = d.path().join("big");
+            std::fs::create_dir(&folder).unwrap();
+            let (observer, heard) = listener();
+            let p = probe_with(Mode::Recycle, &[&folder], Vec::new(), observer);
+            let started = std::time::Instant::now();
+            // The shell reports each file it finds while counting.
+            for _ in 0..5_000 {
+                unsafe { p.sink.UpdateProgress(0, 0) }.unwrap();
+            }
+            let counting_reports = heard.borrow().len() as u128;
+            let bound = 2 + started.elapsed().as_millis() / super::super::TELL_EVERY.as_millis();
+            assert!(
+                counting_reports <= bound,
+                "{counting_reports} reports for 5000 files (at most {bound})"
+            );
+            assert_eq!(p.state.borrow().progress.found, 5_000);
+            unsafe { p.sink.UpdateProgress(5_000, 0) }.unwrap();
+            let item = shell_item(&folder);
+            unsafe { p.sink.PreDeleteItem(RECYCLE, &item) }.unwrap();
+            unsafe { p.sink.PostDeleteItem(RECYCLE, &item, HRESULT(0), &item) }.unwrap();
+            let heard = heard.borrow();
+            let mut stages: Vec<DeleteStage> = heard.iter().map(|p| p.stage).collect();
+            stages.dedup();
+            assert_eq!(
+                stages,
+                [
+                    DeleteStage::Counting,
+                    DeleteStage::Deleting,
+                    DeleteStage::MovingWhole,
+                    DeleteStage::Deleting
+                ]
+            );
+            let last = heard.last().unwrap();
+            assert_eq!((last.items_done, last.work_total), (1, 5_000));
+        }
+
+        #[test]
+        fn files_inside_a_permanently_deleted_folder_are_reported_at_most_20_times_a_second() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let folder = d.path().join("tree");
+            std::fs::create_dir(&folder).unwrap();
+            let file = folder.join("a.txt");
+            std::fs::write(&file, b"x").unwrap();
+            let (observer, heard) = listener();
+            let p = probe_with(Mode::Permanent, &[&folder], Vec::new(), observer);
+            let inner = shell_item(&file);
+            let started = std::time::Instant::now();
+            for done in 0..2_000 {
+                unsafe { p.sink.PreDeleteItem(DESTROY, &inner) }.unwrap();
+                unsafe { p.sink.PostDeleteItem(DESTROY, &inner, HRESULT(0), &inner) }.unwrap();
+                unsafe { p.sink.UpdateProgress(2_000, done + 1) }.unwrap();
+            }
+            let reports = heard.borrow().len() as u128;
+            // The first report is the stage change to Deleting.
+            let bound = 2 + started.elapsed().as_millis() / super::super::TELL_EVERY.as_millis();
+            assert!(reports <= bound, "{reports} reports for 2000 files (at most {bound})");
+            let s = p.state.borrow();
+            assert_eq!((s.progress.work_done, s.progress.work_total), (2_000, 2_000));
+            assert_eq!(s.progress.current.as_deref(), Some(file.as_path()));
+            // Inside an item, nothing counts as a finished top-level item.
+            assert_eq!(s.progress.items_done, 0);
         }
 
         #[test]
@@ -1253,6 +1438,55 @@ mod tests {
         assert!(refuses_permanent_delete(Mode::Recycle, 0x2));
         assert!(!refuses_permanent_delete(Mode::Recycle, 0x282));
         assert!(!refuses_permanent_delete(Mode::Permanent, 0x2));
+    }
+
+    #[test]
+    fn the_throttle_lets_one_report_through_per_interval_and_every_forced_one() {
+        let mut t = Throttle::default();
+        let t0 = Instant::now();
+        assert!(t.due(t0, false), "the first report always goes through");
+        assert!(!t.due(t0 + Duration::from_millis(10), false));
+        assert!(!t.due(t0 + TELL_EVERY - Duration::from_millis(1), false));
+        assert!(t.due(t0 + Duration::from_millis(5), true), "forced");
+        // A forced report restarts the interval.
+        assert!(!t.due(t0 + TELL_EVERY, false));
+        assert!(t.due(t0 + Duration::from_millis(5) + TELL_EVERY, false));
+        // A clock that goes backwards never lets reports through faster.
+        assert!(!t.due(t0, false));
+    }
+
+    #[test]
+    fn a_permanent_delete_reports_files_inside_the_folder_with_a_total() {
+        let d = tempfile::tempdir().unwrap();
+        let tree = d.path().join("tree");
+        for i in 0..400 {
+            let dir = tree.join(format!("d{}", i / 100));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let report = delete_items_permanently(
+            std::slice::from_ref(&tree),
+            Box::new(move |p| {
+                log.lock().unwrap().push(p.clone());
+                true
+            }),
+        );
+        assert_eq!(report.done, vec![tree.clone()]);
+        let seen = seen.lock().unwrap();
+        // The total counts the files and folders inside, not the one top-level item.
+        let total = seen.iter().map(|p| p.work_total).max().unwrap();
+        assert!(total >= 400, "work total {total}");
+        assert!(
+            seen.iter()
+                .filter_map(|p| p.current.as_deref())
+                .any(|c| c.starts_with(&tree) && c != tree),
+            "no file inside the folder was reported"
+        );
+        assert!(seen.len() < 400, "{} reports for 400 files", seen.len());
+        let last = seen.last().unwrap();
+        assert_eq!((last.items_done, last.items_total), (1, 1));
     }
 
     #[test]
@@ -1536,10 +1770,14 @@ mod tests {
         for i in 0..20 {
             std::fs::write(tree.join(format!("f{i:02}.txt")), b"x").unwrap();
         }
-        // Stop once the shell has deleted a few files inside the folder.
+        // Stop once the shell has deleted a few files inside the folder. The observer is
+        // slower than the throttle's interval, so it hears about every file.
         let report = delete_items_permanently(
             std::slice::from_ref(&tree),
-            Box::new(|p| p.work_done < 4),
+            Box::new(|p| {
+                std::thread::sleep(TELL_EVERY + Duration::from_millis(5));
+                p.work_done < 4
+            }),
         );
         assert!(report.cancelled);
         assert!(tree.exists());

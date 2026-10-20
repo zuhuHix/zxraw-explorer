@@ -113,9 +113,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   (`forge-win` `shell::tests`, run with `--ignored`) and manual use. The sandbox refuses items
   whose name starts with `not-recyclable`, standing in for the Recycle Bin's "too big" refusal.
 * The administrator prompt for deleting from protected folders is Windows' own dialog (then
-  UAC), not the app's styled one. It is owned by the main window so it opens in front. A
-  recycle's progress counts the shell's work units (about one per file or folder) and moves in
-  jumps, because recycling a folder is a single rename. The programs named for a file in use
+  UAC), not the app's styled one. It is owned by the main window so it opens in front.
+* Recycling a big folder takes as long as Windows needs, and its bar cannot measure most of
+  it. Windows first counts every file in the folder (the popup shows how many it has found),
+  then moves the folder in one step and does its own bookkeeping for each file, reporting
+  nothing until it ends (the bar slides). Measured with `forge-win`'s `recycle_bench` example
+  on 200,000 small files on an SSD: about 4 s counting and 12 s in that last step, the same
+  with or without ZXraw's progress sink and with `SHFileOperation`; the shell with its own
+  progress window (as Explorer runs it) took twice as long. The programs named for a file in use
   come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
   services and kernel holders.
 * Where a file system has no stable file IDs (some network shares, index 0), "the same item"

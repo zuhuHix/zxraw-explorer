@@ -1423,13 +1423,11 @@ fn delete_result(job: &JobHandle, report: &forge_win::DeleteReport, skipped: usi
     }
 }
 
-/// Questions from finished deletes, and the progress popup's state.
+/// Questions from finished deletes.
 #[derive(Default)]
 pub struct DeleteUi {
     /// Questions waiting for the open dialog to close.
     pending: std::collections::VecDeque<Confirm>,
-    /// Jobs whose progress popup the user hid.
-    hidden: std::collections::HashSet<forge_jobs::JobId>,
 }
 
 /// Queues a question from a job; it opens once no other dialog is open.
@@ -1458,7 +1456,7 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
     let ctx = app.ops.ctx.clone();
     app.ops
         .jobs
-        .spawn("delete", format!("Deleting {n} item(s)"), move |job| {
+        .spawn("delete", recycle_title(n), move |job| {
             let report = forge_win::recycle_items(&targets, shell_observer(job));
             finish_shell_delete(job, &targets, &report, true, Vec::new(), &tx);
             ctx.request_repaint();
@@ -1494,23 +1492,54 @@ pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<DeleteTarget>) {
     );
 }
 
+/// The title of a job that moves `n` items to the Recycle Bin.
+fn recycle_title(n: usize) -> String {
+    match n {
+        1 => "Moving to Recycle Bin".into(),
+        n => format!("Moving {n} items to Recycle Bin"),
+    }
+}
+
+/// Shows a shell delete's progress in the job's: the files and folders inside the items
+/// once the shell has counted them, otherwise the top-level items. While the shell counts,
+/// or moves a whole folder in one step, there is nothing to measure: the job gets a note
+/// and no counts, so its bar slides instead of standing at "0 of 1".
+fn show_delete_progress(progress: &forge_jobs::Progress, p: &forge_win::DeleteProgress) {
+    use crate::viewer::cull::format_count;
+    use forge_win::DeleteStage;
+    let (done, total, note) = match p.stage {
+        DeleteStage::Starting => (0, 0, "Getting ready…".to_string()),
+        DeleteStage::Counting => (
+            0,
+            0,
+            format!("Counting items… {} found", format_count(p.found as usize)),
+        ),
+        DeleteStage::MovingWhole if p.work_total > 1 => (
+            0,
+            0,
+            format!(
+                "Moving {} items to the Recycle Bin…",
+                format_count(p.work_total as usize)
+            ),
+        ),
+        DeleteStage::MovingWhole => (0, 0, "Moving to the Recycle Bin…".to_string()),
+        DeleteStage::Deleting if p.work_total > 0 => (p.work_done, p.work_total, String::new()),
+        DeleteStage::Deleting => (p.items_done as u64, p.items_total as u64, String::new()),
+    };
+    progress.items_total.store(total, Ordering::Relaxed);
+    progress.items_done.store(done.min(total), Ordering::Relaxed);
+    progress.set_note(note);
+    if let Some(current) = &p.current {
+        progress.set_current(current.display().to_string());
+    }
+}
+
 /// Feeds a shell delete's progress into the job, and the job's pause and cancel back.
 fn shell_observer(job: &JobHandle) -> forge_win::DeleteObserver {
     let progress = job.progress.clone();
     let cancel = job.cancel.clone();
     Box::new(move |p| {
-        // The shell's work units count the files and folders in the tree; until it has
-        // counted them, the top-level items stand in.
-        let (done, total) = if p.work_total > 0 {
-            (p.work_done, p.work_total)
-        } else {
-            (p.items_done as u64, p.items_total as u64)
-        };
-        progress.items_total.store(total, Ordering::Relaxed);
-        progress.items_done.store(done.min(total), Ordering::Relaxed);
-        if let Some(current) = &p.current {
-            progress.set_current(current.display().to_string());
-        }
+        show_delete_progress(&progress, p);
         while cancel.is_paused() && !cancel.is_cancelled() {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1545,6 +1574,7 @@ fn finish_shell_delete(
     skipped: Vec<String>,
     tx: &Sender<Event>,
 ) {
+    job.progress.set_note("");
     let mut seen = std::collections::HashSet::new();
     for d in targets.iter().filter_map(|p| p.parent()) {
         if seen.insert(d) {
@@ -1881,9 +1911,9 @@ fn popup_kind(kind: &str) -> bool {
 }
 
 /// A small window in front of the app with the progress of copies, moves and deletes that
-/// have run longer than [`POPUP_DELAY`]. It does not block the app. "Hide" closes it for
-/// those jobs; the Operations window still lists them. It is not shown while the
-/// Operations window is open.
+/// have run longer than [`POPUP_DELAY`]: per job its title, a thin bar, the item it is on,
+/// one line of counts, and Pause and Cancel. It does not block the app, and it is not
+/// shown while the Operations window (status bar) is open.
 pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
     let jobs: Vec<JobHandle> = app
         .ops
@@ -1893,15 +1923,11 @@ pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
         .filter(|j| popup_kind(&j.kind))
         .filter(|j| matches!(j.state(), JobState::Running | JobState::Paused))
         .collect();
-    let hidden = &mut app.ops.delete_ui.hidden;
-    hidden.retain(|id| jobs.iter().any(|j| j.id == *id));
-    let candidates: Vec<&JobHandle> = jobs.iter().filter(|j| !hidden.contains(&j.id)).collect();
-    if app.ops.show_jobs || candidates.is_empty() {
+    if app.ops.show_jobs || jobs.is_empty() {
         return;
     }
-    let (due, waiting): (Vec<&JobHandle>, Vec<&JobHandle>) = candidates
-        .into_iter()
-        .partition(|j| j.elapsed() >= POPUP_DELAY);
+    let (due, waiting): (Vec<&JobHandle>, Vec<&JobHandle>) =
+        jobs.iter().partition(|j| j.elapsed() >= POPUP_DELAY);
     if let Some(wait) = waiting.iter().map(|j| POPUP_DELAY.saturating_sub(j.elapsed())).min() {
         ctx.request_repaint_after(wait);
     }
@@ -1909,68 +1935,191 @@ pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
         return;
     }
     ctx.request_repaint_after(Duration::from_millis(100));
-    let title = match due.as_slice() {
-        [one] => one.title.to_string(),
-        many => format!("{} operations", many.len()),
-    };
-    let mut hide = false;
-    let mut details = false;
-    egui::Window::new(title)
+    let mut clicks = Vec::new();
+    egui::Window::new("Operation progress")
         .id(egui::Id::new("operation-progress-popup"))
+        .title_bar(false)
         .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -40.0])
         .collapsible(false)
         .resizable(false)
-        .default_width(380.0)
-        .show(ctx, |ui| {
-            ui.set_width(380.0);
-            for (i, j) in due.iter().take(POPUP_MAX_JOBS).enumerate() {
-                if i > 0 {
-                    ui.separator();
+        .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::symmetric(14, 12)))
+        .show(ctx, |ui| clicks = popup_contents(ui, &due));
+    for click in clicks {
+        match click {
+            PopupClick::Cancel(id) => {
+                if let Some(j) = due.iter().find(|j| j.id == id) {
+                    app.ops.jobs.cancel(j);
                 }
-                if due.len() > 1 {
-                    ui.label(RichText::new(j.title.as_ref()).strong());
+            }
+            PopupClick::Pause(id) => {
+                if let Some(j) = due.iter().find(|j| j.id == id) {
+                    j.cancel.set_paused(!j.cancel.is_paused_itself());
                 }
-                let snap = j.progress.snapshot();
-                let state = j.state();
-                job_progress(ui, j, &snap, state);
-                ui.horizontal(|ui| {
-                    let paused = j.cancel.is_paused_itself();
-                    if ui.small_button("Cancel").clicked() {
-                        app.ops.jobs.cancel(j);
-                    }
-                    if ui
-                        .small_button(if paused { "Resume" } else { "Pause" })
-                        .clicked()
-                    {
-                        j.cancel.set_paused(!paused);
-                    }
+            }
+        }
+    }
+}
+
+/// A button pressed in the progress popup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupClick {
+    Cancel(forge_jobs::JobId),
+    /// Pause, or Resume when paused.
+    Pause(forge_jobs::JobId),
+}
+
+/// Width of the progress popup's contents.
+const POPUP_WIDTH: f32 = 340.0;
+
+/// The progress popup's contents for `jobs` (the first [`POPUP_MAX_JOBS`]).
+fn popup_contents(ui: &mut Ui, jobs: &[&JobHandle]) -> Vec<PopupClick> {
+    let mut clicks = Vec::new();
+    ui.set_width(POPUP_WIDTH);
+    ui.spacing_mut().item_spacing.y = 6.0;
+    for (i, j) in jobs.iter().take(POPUP_MAX_JOBS).enumerate() {
+        if i > 0 {
+            ui.add_space(8.0);
+        }
+        let snap = j.progress.snapshot();
+        let paused = j.cancel.is_paused_itself();
+        ui.add(egui::Label::new(RichText::new(j.title.as_ref()).strong()).truncate());
+        thin_bar(ui, if snap.note.is_empty() { snap.fraction() } else { None }, paused);
+        // The name, which a long path would push out of sight; the path is on hover.
+        let name = Path::new(&snap.current)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| snap.current.clone());
+        let name = if name.is_empty() { " ".to_string() } else { name };
+        ui.add(egui::Label::new(RichText::new(name).small().weak()).truncate())
+            .on_hover_text(&snap.current);
+        let counts = if paused {
+            "Paused".to_string()
+        } else {
+            counts_text(&snap, j.elapsed())
+        };
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Cancel").clicked() {
+                    clicks.push(PopupClick::Cancel(j.id));
+                }
+                if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                    clicks.push(PopupClick::Pause(j.id));
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(counts).small()).truncate());
                 });
-            }
-            if due.len() > POPUP_MAX_JOBS {
-                ui.label(
-                    RichText::new(format!("and {} more", due.len() - POPUP_MAX_JOBS)).weak(),
-                );
-            }
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Details").clicked() {
-                    details = true;
-                }
-                if ui
-                    .button("Hide")
-                    .on_hover_text("The Operations window (status bar) still shows them")
-                    .clicked()
-                {
-                    hide = true;
-                }
             });
         });
-    if hide {
-        app.ops.delete_ui.hidden.extend(due.iter().map(|j| j.id));
     }
-    if details {
-        app.ops.show_jobs = true;
+    if jobs.len() > POPUP_MAX_JOBS {
+        ui.label(
+            RichText::new(format!("and {} more in Operations", jobs.len() - POPUP_MAX_JOBS))
+                .small()
+                .weak(),
+        );
     }
+    clicks
+}
+
+/// Height of the popup's progress bar.
+const BAR_HEIGHT: f32 = 4.0;
+
+/// A thin rounded bar in the accent colour, full width. `None` draws a short segment
+/// sliding along it, for work that cannot be measured yet. Paused, it is greyed and still.
+fn thin_bar(ui: &mut Ui, fraction: Option<f32>, paused: bool) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), BAR_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let radius = BAR_HEIGHT / 2.0;
+    let accent = if paused {
+        ui.visuals().weak_text_color()
+    } else {
+        crate::theme::accent(ui.ctx())
+    };
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, radius, accent.gamma_multiply(0.22));
+    let fill = match fraction {
+        Some(f) => {
+            let w = rect.width() * f.clamp(0.0, 1.0);
+            (w > 0.0).then(|| {
+                egui::Rect::from_min_size(rect.min, egui::vec2(w.max(BAR_HEIGHT), BAR_HEIGHT))
+            })
+        }
+        None => {
+            let seg = rect.width() * 0.3;
+            let t = if paused { 0.0 } else { ui.input(|i| i.time) };
+            if !paused {
+                ui.ctx().request_repaint();
+            }
+            // Slides from just off the left edge to just off the right one every 1.4 s.
+            let x = rect.left() - seg + (rect.width() + seg) * ((t / 1.4).fract() as f32);
+            Some(egui::Rect::from_min_size(
+                egui::pos2(x, rect.top()),
+                egui::vec2(seg, BAR_HEIGHT),
+            ))
+        }
+    };
+    if let Some(fill) = fill {
+        painter.rect_filled(fill.intersect(rect), radius, accent);
+    }
+}
+
+/// "45 s left" style estimate, or nothing when there is no sensible one.
+fn time_left(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.5 {
+        return String::new();
+    }
+    let secs = secs.round() as u64;
+    match secs {
+        0..60 => format!("{secs} s left"),
+        60..3600 => format!("{} min left", secs.div_ceil(60)),
+        _ => format!("{} h {} min left", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
+/// The counts line of a running job: its note when it has one ("Counting items…");
+/// otherwise done of total with the speed and the time left.
+fn counts_text(snap: &forge_jobs::ProgressSnapshot, elapsed: Duration) -> String {
+    use crate::viewer::cull::format_count;
+    if !snap.note.is_empty() {
+        return snap.note.clone();
+    }
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let mut parts = Vec::new();
+    let (done, total, rate) = if snap.bytes_total > 0 {
+        let rate = snap.bytes_done as f64 / secs;
+        parts.push(format!(
+            "{} of {}",
+            format_size(snap.bytes_done),
+            format_size(snap.bytes_total)
+        ));
+        if rate > 0.0 {
+            parts.push(format!("{}/s", format_size(rate as u64)));
+        }
+        (snap.bytes_done, snap.bytes_total, rate)
+    } else if snap.items_total > 0 {
+        let rate = snap.items_done as f64 / secs;
+        parts.push(format!(
+            "{} of {} items",
+            format_count(snap.items_done as usize),
+            format_count(snap.items_total as usize)
+        ));
+        if rate >= 1.0 && snap.items_total > 1 {
+            parts.push(format!("{}/s", format_count(rate as usize)));
+        }
+        (snap.items_done, snap.items_total, rate)
+    } else {
+        parts.push(format!("{} items", format_count(snap.items_done as usize)));
+        (0, 0, 0.0)
+    };
+    if rate > 0.0 && total > done {
+        let left = time_left(total.saturating_sub(done) as f64 / rate);
+        if !left.is_empty() {
+            parts.push(left);
+        }
+    }
+    parts.join(" · ")
 }
 
 /// Lets the close guard run in automation (scripts that test it turn it on).
@@ -2132,7 +2281,9 @@ fn job_progress(ui: &mut Ui, j: &JobHandle, snap: &forge_jobs::ProgressSnapshot,
     let frac = snap.fraction();
     let secs = j.elapsed().as_secs_f64().max(0.001);
     let rate = snap.bytes_done as f64 / secs;
-    let text = if snap.bytes_total > 0 {
+    let text = if !snap.note.is_empty() {
+        snap.note.clone()
+    } else if snap.bytes_total > 0 {
         let eta = if rate > 0.0 && !state.is_finished() {
             let remain = (snap.bytes_total.saturating_sub(snap.bytes_done)) as f64 / rate;
             format!(", ~{}s left", remain.round() as u64)
@@ -2268,6 +2419,124 @@ mod tests {
         let missing = std::io::Error::from_raw_os_error(2).to_string();
         assert!(!is_access_denied(&missing));
         assert!(!is_access_denied("(os error 50)"));
+    }
+
+    /// A delete job that runs until it is cancelled.
+    fn running_delete(jobs: &forge_jobs::JobRegistry) -> JobHandle {
+        jobs.spawn("delete", recycle_title(1), |job| {
+            while !job.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        })
+    }
+
+    /// The buttons the progress popup shows for `jobs`, by label.
+    fn popup_buttons(jobs: &[&JobHandle]) -> Vec<String> {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(600.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                popup_contents(ui, jobs);
+            },
+        );
+        output.textures_delta.clear();
+        let update = output.platform_output.accesskit_update.take().unwrap();
+        update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
+            .filter_map(|(_, n)| n.label().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn the_progress_popup_has_only_pause_and_cancel() {
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = running_delete(&jobs);
+        let mut buttons = popup_buttons(&[&job]);
+        buttons.sort();
+        assert_eq!(buttons, ["Cancel", "Pause"]);
+        job.cancel.set_paused(true);
+        let mut buttons = popup_buttons(&[&job]);
+        buttons.sort();
+        assert_eq!(buttons, ["Cancel", "Resume"]);
+        jobs.cancel(&job);
+    }
+
+    fn delete_progress(stage: forge_win::DeleteStage) -> forge_win::DeleteProgress {
+        forge_win::DeleteProgress {
+            stage,
+            items_total: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_big_folder_shows_what_happens_inside_it_instead_of_0_of_1() {
+        use forge_win::DeleteStage;
+        let progress = forge_jobs::Progress::new();
+        let mut p = delete_progress(DeleteStage::Counting);
+        p.found = 41_230;
+        show_delete_progress(&progress, &p);
+        let snap = progress.snapshot();
+        assert_eq!(snap.note, "Counting items… 41,230 found");
+        assert_eq!(snap.fraction(), None, "nothing to measure yet: the bar slides");
+
+        p.stage = DeleteStage::MovingWhole;
+        p.work_total = 100_405;
+        p.current = Some(PathBuf::from(r"C:\x\big"));
+        show_delete_progress(&progress, &p);
+        let snap = progress.snapshot();
+        assert_eq!(snap.note, "Moving 100,405 items to the Recycle Bin…");
+        assert_eq!(snap.fraction(), None);
+        assert_eq!(snap.current, r"C:\x\big");
+
+        // A permanent delete goes file by file: the files inside are counted.
+        let mut p = delete_progress(DeleteStage::Deleting);
+        p.work_done = 250;
+        p.work_total = 1_000;
+        p.current = Some(PathBuf::from(r"C:\x\big\in\f.txt"));
+        show_delete_progress(&progress, &p);
+        let snap = progress.snapshot();
+        assert_eq!(snap.note, "");
+        assert_eq!((snap.items_done, snap.items_total), (250, 1_000));
+        assert_eq!(snap.current, r"C:\x\big\in\f.txt");
+
+        // Without work units (the sandbox), the top-level items count.
+        let mut p = delete_progress(DeleteStage::Deleting);
+        p.items_done = 1;
+        p.items_total = 3;
+        show_delete_progress(&progress, &p);
+        assert_eq!(progress.snapshot().items_total, 3);
+    }
+
+    #[test]
+    fn the_counts_line_gives_progress_speed_and_time_left() {
+        let snap = forge_jobs::ProgressSnapshot {
+            items_done: 2_500,
+            items_total: 10_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            counts_text(&snap, Duration::from_secs(5)),
+            "2,500 of 10,000 items · 500/s · 15 s left"
+        );
+        let snap = forge_jobs::ProgressSnapshot {
+            note: "Counting items… 12 found".into(),
+            ..Default::default()
+        };
+        assert_eq!(counts_text(&snap, Duration::from_secs(5)), "Counting items… 12 found");
+        assert_eq!(time_left(0.2), "");
+        assert_eq!(time_left(150.0), "3 min left");
+        assert_eq!(time_left(3_700.0), "1 h 1 min left");
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub use integration::{
 };
 pub use process::launch;
 pub use recycle::{
-    DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, ItemIdentity,
+    DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, DeleteStage, ItemIdentity, TELL_EVERY,
     delete_confirmed_items, delete_items_permanently, recycle_items, set_dialog_owner,
 };
 pub use restart::{file_locking_processes, processes_using};
