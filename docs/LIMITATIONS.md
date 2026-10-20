@@ -123,8 +123,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   shell's own progress window as Explorer runs it. Pause and Cancel cannot interrupt that
   last step: pressed during it, the popup says "Pausing (or Stopping) after the current
   folder…" and they take effect when it ends. Undo pauses and stops between the changes it
-  undoes; a cancelled Undo puts the changes not undone back on the Undo stack. The programs named for a file in use
-  come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
+  undoes; a cancelled Undo puts the changes not undone back on the Undo stack. One Undo
+  runs at a time: pressing Undo while one runs only says so. The programs named for a file
+  in use come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
   services and kernel holders.
 * Where a file system has no stable file IDs (some network shares, index 0), "the same item"
   rests on type and creation time (plus size and write time for files). A folder replaced by

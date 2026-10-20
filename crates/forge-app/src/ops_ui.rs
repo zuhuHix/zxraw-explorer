@@ -1696,6 +1696,13 @@ pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>, slot: UndoSlo
     );
 }
 
+/// Whether an [`undo_ops`] job is still running (or paused).
+pub fn undo_running(jobs: &forge_jobs::JobRegistry) -> bool {
+    jobs.list()
+        .iter()
+        .any(|j| &*j.kind == "undo" && !j.state().is_finished())
+}
+
 /// The work of [`undo_ops`]'s job.
 fn undo_records(
     job: &JobHandle,
@@ -1722,7 +1729,11 @@ fn undo_records(
             break;
         }
         job.progress.set_current(r.describe());
-        match ops::undo(r) {
+        // One change is undone whole: Pause and Cancel wait for the next one.
+        job.progress.in_one_step.store(true, Ordering::Relaxed);
+        let undone = ops::undo(r);
+        job.progress.in_one_step.store(false, Ordering::Relaxed);
+        match undone {
             Ok(()) => {
                 // The undo moved the item back: its library rows follow it.
                 if let ops::UndoRecord::Renamed { from, to }
@@ -2045,7 +2056,8 @@ fn popup_contents(
         meter.sample(
             Instant::now(),
             measured,
-            !paused && !stopping && snap.note.is_empty(),
+            // A pause of the whole transfer queue counts too.
+            !j.cancel.is_paused() && !stopping && snap.note.is_empty(),
         );
         ui.add(egui::Label::new(RichText::new(j.title.as_ref()).strong()).truncate());
         let held = paused && !in_one_step;
@@ -2058,7 +2070,8 @@ fn popup_contents(
         let name = if name.is_empty() { " ".to_string() } else { name };
         ui.add(egui::Label::new(RichText::new(name).small().weak()).truncate())
             .on_hover_text(&snap.current);
-        let counts = status_text(&snap, meter.rate(), paused, stopping, in_one_step);
+        let step = if &*j.kind == "undo" { "change" } else { "folder" };
+        let counts = status_text(&snap, meter.rate(), paused, stopping, in_one_step, step);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // A cancel cannot be taken back: until the job ends both buttons rest.
@@ -2156,11 +2169,12 @@ fn status_text(
     paused: bool,
     stopping: bool,
     in_one_step: bool,
+    step: &str,
 ) -> String {
     match (stopping, paused, in_one_step) {
-        (true, _, true) => "Stopping after the current folder…".into(),
+        (true, _, true) => format!("Stopping after the current {step}…"),
         (true, _, false) => "Stopping…".into(),
-        (false, true, true) => "Pausing after the current folder…".into(),
+        (false, true, true) => format!("Pausing after the current {step}…"),
         (false, true, false) => "Paused".into(),
         (false, false, _) => counts_text(snap, rate),
     }
@@ -2603,15 +2617,15 @@ mod tests {
         assert!(buttons.iter().all(|(_, can)| !can), "{buttons:?}");
         let snap = forge_jobs::ProgressSnapshot::default();
         assert_eq!(
-            status_text(&snap, None, true, true, true),
+            status_text(&snap, None, true, true, true, "folder"),
             "Stopping after the current folder…"
         );
-        assert_eq!(status_text(&snap, None, false, true, false), "Stopping…");
+        assert_eq!(status_text(&snap, None, false, true, false, "folder"), "Stopping…");
         assert_eq!(
-            status_text(&snap, None, true, false, true),
-            "Pausing after the current folder…"
+            status_text(&snap, None, true, false, true, "change"),
+            "Pausing after the current change…"
         );
-        assert_eq!(status_text(&snap, None, true, false, false), "Paused");
+        assert_eq!(status_text(&snap, None, true, false, false, "folder"), "Paused");
         // Once the step ends the pause holds, and Resume is offered.
         let jobs = forge_jobs::JobRegistry::new();
         let job = running_delete(&jobs);
@@ -2684,6 +2698,47 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         let snap = job.progress.snapshot();
         assert_eq!((snap.items_done, snap.items_total), (3, 3));
+    }
+
+    #[test]
+    fn only_one_undo_runs_at_a_time() {
+        let jobs = forge_jobs::JobRegistry::new();
+        assert!(!undo_running(&jobs));
+        let (_root, records) = undo_folders(1);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let job = jobs.spawn("undo", "Undoing 1 change(s)", move |job| {
+            job.cancel.set_paused(true);
+            undo_records(job, &records, UndoSlot::default(), &tx);
+            Ok(())
+        });
+        // Running or paused, it blocks the next Undo.
+        assert!(undo_running(&jobs));
+        let other = running_delete(&jobs);
+        jobs.cancel(&job);
+        wait_finished(&job);
+        assert!(!undo_running(&jobs), "a delete is not an undo");
+        jobs.cancel(&other);
+    }
+
+    #[test]
+    fn a_change_being_undone_holds_a_pause_until_it_ends() {
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = jobs.spawn("undo", "Undoing 1 change(s)", |job| {
+            while !job.cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        });
+        // The worker is inside one change: Pause waits for it and cannot be taken back.
+        job.progress.in_one_step.store(true, Ordering::Relaxed);
+        job.cancel.set_paused(true);
+        let mut buttons = popup_button_states(&[&job]);
+        buttons.sort();
+        assert_eq!(
+            buttons,
+            [("Cancel".to_string(), true), ("Pausing…".to_string(), false)]
+        );
+        jobs.cancel(&job);
     }
 
     #[test]
