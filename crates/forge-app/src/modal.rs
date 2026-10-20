@@ -65,7 +65,8 @@ impl Prompt {
 pub enum ConfirmKind {
     DeletePermanently(Vec<PathBuf>),
     /// Permanent delete through Windows, which can ask for administrator permission.
-    DeleteWithWindows(Vec<PathBuf>),
+    /// Each item carries what it was when asked, so a replaced one is left alone.
+    DeleteWithWindows(Vec<crate::ops_ui::DeleteTarget>),
     Recycle(Vec<PathBuf>),
     /// Download and install FFmpeg (see `ffmpeg_setup`).
     DownloadFfmpeg,

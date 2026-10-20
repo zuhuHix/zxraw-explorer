@@ -148,7 +148,11 @@ fn recycle_into_sandbox(
         }
         progress.items_done = i + 1;
         progress.current = None;
-        observer(&progress);
+        if !observer(&progress) {
+            report.cancelled = true;
+            report.not_started.extend(paths[i + 1..].iter().cloned());
+            break;
+        }
     }
     report
 }
@@ -232,9 +236,114 @@ mod codes {
     }
 }
 
+/// `TSF_DELETE_RECYCLE_IF_POSSIBLE`: the shell sets it on a delete it will send to the
+/// Recycle Bin, and clears it for an item it is about to destroy.
+const RECYCLE_IF_POSSIBLE: u32 = 0x80;
+
+/// Whether the sink must refuse a delete with these flags: during a recycle, anything the
+/// shell would destroy instead of recycling. Decided from `mode` and `flags` alone, so it
+/// holds even when nothing else about the call can be checked.
+fn refuses_permanent_delete(mode: Mode, flags: u32) -> bool {
+    mode == Mode::Recycle && flags & RECYCLE_IF_POSSIBLE == 0
+}
+
+/// Which of a pass's items (lowercase keys) `path` is, or lies inside. `None` when the path
+/// belongs to none of them.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn item_of(keys: &[String], path: &str) -> Option<usize> {
+    let path = path.to_lowercase();
+    if let Some(i) = keys.iter().position(|k| *k == path) {
+        return Some(i);
+    }
+    keys.iter()
+        .enumerate()
+        .filter(|(_, k)| {
+            path.strip_prefix(k.trim_end_matches('\\'))
+                .is_some_and(|rest| rest.starts_with('\\'))
+        })
+        .max_by_key(|(_, k)| k.len())
+        .map(|(i, _)| i)
+}
+
+/// What the sink refused in a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum Refusal {
+    #[default]
+    None,
+    /// The permanent delete of this item (or of something inside it).
+    Item(usize),
+    /// A permanent delete the sink could not tie to an item.
+    Unknown,
+}
+
+/// Reason given for items left after a refusal the sink could not tie to an item.
+const UNKNOWN_REFUSAL: &str = "Windows was about to delete something permanently and ZXraw \
+     could not tell which item it was, so it stopped. Nothing more was deleted";
+
+/// How one shell pass ended, as seen after it returned.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Pass<'a> {
+    items: &'a [PathBuf],
+    /// Whether each item is gone from disk now.
+    gone: &'a [bool],
+    refusal: Refusal,
+    /// The first error the shell reported for each item.
+    errors: &'a [Option<u32>],
+    /// The caller or the user cancelled.
+    cancelled: bool,
+    /// What `PerformOperations` returned, if it failed.
+    run_error: Option<String>,
+}
+
+/// Adds a pass's outcome to `report`. Returns the items to try again in a new pass: only
+/// after the sink refused a known item, and only the items it had not reached.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn settle_pass(
+    pass: Pass<'_>,
+    message: impl Fn(u32) -> String,
+    report: &mut DeleteReport,
+) -> Vec<PathBuf> {
+    let mut left = Vec::new();
+    for (i, p) in pass.items.iter().enumerate() {
+        if pass.gone[i] {
+            report.done.push(p.clone());
+        } else if pass.refusal == Refusal::Item(i) {
+            report
+                .failed
+                .push((p.clone(), DeleteFailure::NotRecyclable));
+        } else if let Some(hr) = pass.errors[i].filter(|hr| !codes::is_cancel(*hr)) {
+            report
+                .failed
+                .push((p.clone(), codes::classify(hr, || message(hr))));
+        } else {
+            left.push(p.clone());
+        }
+    }
+    if pass.cancelled {
+        report.cancelled = true;
+        report.not_started.extend(left);
+        return Vec::new();
+    }
+    let why = match pass.refusal {
+        Refusal::Item(_) => return left,
+        Refusal::Unknown => DeleteFailure::Other(UNKNOWN_REFUSAL.into()),
+        Refusal::None => DeleteFailure::Other(
+            pass.run_error
+                .unwrap_or_else(|| "Windows did not delete it".into()),
+        ),
+    };
+    report
+        .failed
+        .extend(left.into_iter().map(|p| (p, why.clone())));
+    Vec::new()
+}
+
 #[cfg(windows)]
 mod imp {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    #[cfg(test)]
+    use std::path::Path;
     use std::path::PathBuf;
     use std::rc::Rc;
 
@@ -244,30 +353,26 @@ mod imp {
         FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
         FOFX_RECYCLEONDELETE, FOFX_SHOWELEVATIONPROMPT, FileOperation, IFileOperation,
         IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem,
-        SHCreateItemFromParsingName, SIGDN_FILESYSPATH, TSF_DELETE_RECYCLE_IF_POSSIBLE,
+        SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
     };
     use windows::core::{HRESULT, PCWSTR, Ref, implement};
 
     use super::{
-        DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, Mode, codes, is_gone,
+        DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, Mode, Pass, Refusal, codes,
+        is_gone, item_of, refuses_permanent_delete, settle_pass,
     };
 
     struct State {
-        mode: Mode,
-        /// The items of the current pass, and a lowercase key of each for matching the
-        /// shell's paths.
-        items: Vec<PathBuf>,
+        /// Lowercase keys of the current pass's items, for matching the shell's paths.
         keys: Vec<String>,
-        /// The item the shell is working on (children are reported under it).
-        current: Option<usize>,
         /// The first error the shell reported for each item (a cancel only when nothing
         /// more specific came).
         errors: Vec<Option<u32>>,
-        /// The item whose permanent delete the sink refused.
-        refused: Option<usize>,
+        refusal: Refusal,
         /// The observer asked to stop.
         stopped: bool,
-        /// The user cancelled in a shell dialog.
+        /// A cancel came from the shell that the sink did not cause (the user, in a
+        /// shell dialog).
         user_cancelled: bool,
         progress: DeleteProgress,
         /// Items finished in earlier passes.
@@ -276,21 +381,13 @@ mod imp {
     }
 
     impl State {
-        fn locate(&mut self, path: &str) -> Option<usize> {
-            let key = path.to_lowercase();
-            if let Some(i) = self.keys.iter().position(|k| *k == key) {
-                self.current = Some(i);
-            }
-            self.current
-        }
-
         fn record(&mut self, item: Option<usize>, hr: HRESULT) {
             let Some(i) = item else { return };
             let hr = hr.0 as u32;
             if hr & 0x8000_0000 == 0 {
                 return;
             }
-            if codes::is_cancel(hr) && self.refused != Some(i) && !self.stopped {
+            if codes::is_cancel(hr) && self.refusal == Refusal::None && !self.stopped {
                 self.user_cancelled = true;
             }
             let slot = &mut self.errors[i];
@@ -301,12 +398,9 @@ mod imp {
             }
         }
 
-        /// Tells the observer; false when it asked to stop.
+        /// Tells the observer; false when it asked to stop (now or before).
         fn tell(&mut self) -> bool {
-            if self.stopped {
-                return false;
-            }
-            if !(self.observer)(&self.progress) {
+            if !self.stopped && !(self.observer)(&self.progress) {
                 self.stopped = true;
             }
             !self.stopped
@@ -328,20 +422,14 @@ mod imp {
     }
 
     #[implement(IFileOperationProgressSink)]
-    struct Sink(Rc<RefCell<State>>);
-
-    impl Sink {
-        /// Runs `f` on the state unless it is already borrowed (a reentrant call during a
-        /// shell dialog), in which case the call is let through.
-        fn with(
-            &self,
-            f: impl FnOnce(&mut State) -> windows::core::Result<()>,
-        ) -> windows::core::Result<()> {
-            match self.0.try_borrow_mut() {
-                Ok(mut s) => f(&mut s),
-                Err(_) => Ok(()),
-            }
-        }
+    struct Sink {
+        /// Fixed for the sink's life and read without the state, so the recycle check in
+        /// `PreDeleteItem` never depends on the state being available.
+        mode: Mode,
+        /// Set when a permanent delete was refused while the state was busy (a reentrant
+        /// call), so the refusal could not be tied to an item.
+        unknown_refusal: Rc<Cell<bool>>,
+        state: Rc<RefCell<State>>,
     }
 
     #[allow(non_snake_case)]
@@ -411,19 +499,33 @@ mod imp {
             Ok(())
         }
         fn PreDeleteItem(&self, flags: u32, item: Ref<IShellItem>) -> windows::core::Result<()> {
+            // The shell clears the recycle flag for an item it is about to destroy (too big
+            // for the Recycle Bin, or no Recycle Bin on its drive). That is refused before
+            // anything else, from the mode alone: it must hold even when the state is busy.
+            let refuse = refuses_permanent_delete(self.mode, flags);
             let path = path_of(item);
-            self.with(|s| {
-                let i = path.as_deref().and_then(|p| s.locate(p));
-                // The shell drops the recycle flag for an item it is about to destroy (too
-                // big for the Recycle Bin, or no Recycle Bin on its drive). Refuse that; the
-                // whole pass stops and the items after it are tried again in a new one.
-                if s.mode == Mode::Recycle && flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
-                    s.refused = i.or(Some(0));
+            let Ok(mut s) = self.state.try_borrow_mut() else {
+                // A reentrant call (during a shell dialog): a refusal cannot be tied to an
+                // item. Other calls are let through; their recycle check passed above.
+                if refuse {
+                    self.unknown_refusal.set(true);
                     return Err(cancel_hr());
                 }
-                s.progress.current = path.map(PathBuf::from);
-                if s.tell() { Ok(()) } else { Err(cancel_hr()) }
-            })
+                return Ok(());
+            };
+            if refuse {
+                let item = path.as_deref().and_then(|p| item_of(&s.keys, p));
+                if s.refusal == Refusal::None {
+                    s.refusal = item.map_or(Refusal::Unknown, Refusal::Item);
+                } else if s.refusal != item.map_or(Refusal::Unknown, Refusal::Item) {
+                    s.refusal = Refusal::Unknown;
+                }
+                // A cancel that came at the same time still counts.
+                s.tell();
+                return Err(cancel_hr());
+            }
+            s.progress.current = path.map(PathBuf::from);
+            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PostDeleteItem(
             &self,
@@ -433,16 +535,18 @@ mod imp {
             _: Ref<IShellItem>,
         ) -> windows::core::Result<()> {
             let path = path_of(item);
-            self.with(|s| {
-                let key = path.as_deref().map(str::to_lowercase);
-                let top = key.and_then(|k| s.keys.iter().position(|x| *x == k));
-                let i = top.or(s.current);
-                s.record(i, hr);
-                if top.is_some() && hr.is_ok() && hr.0 as u32 != codes::S_NOT_HANDLED {
-                    s.progress.items_done += 1;
-                }
-                if s.tell() { Ok(()) } else { Err(cancel_hr()) }
-            })
+            // Progress only: best effort when the state is busy.
+            let Ok(mut s) = self.state.try_borrow_mut() else {
+                return Ok(());
+            };
+            let key = path.as_deref().map(str::to_lowercase);
+            let top = key.as_deref().and_then(|k| s.keys.iter().position(|x| x == k));
+            let item = path.as_deref().and_then(|p| item_of(&s.keys, p));
+            s.record(item, hr);
+            if top.is_some() && hr.is_ok() && hr.0 as u32 != codes::S_NOT_HANDLED {
+                s.progress.items_done += 1;
+            }
+            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PreNewItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Ok(())
@@ -460,11 +564,13 @@ mod imp {
             Ok(())
         }
         fn UpdateProgress(&self, total: u32, done: u32) -> windows::core::Result<()> {
-            self.with(|s| {
-                s.progress.work_total = total.into();
-                s.progress.work_done = done.into();
-                if s.tell() { Ok(()) } else { Err(cancel_hr()) }
-            })
+            // Progress only: best effort when the state is busy.
+            let Ok(mut s) = self.state.try_borrow_mut() else {
+                return Ok(());
+            };
+            s.progress.work_total = total.into();
+            s.progress.work_done = done.into();
+            if s.tell() { Ok(()) } else { Err(cancel_hr()) }
         }
         fn ResetTimer(&self) -> windows::core::Result<()> {
             Ok(())
@@ -487,6 +593,23 @@ mod imp {
         }
     }
 
+    fn new_state(observer: DeleteObserver, items_total: usize, done: usize) -> State {
+        State {
+            keys: Vec::new(),
+            errors: Vec::new(),
+            refusal: Refusal::None,
+            stopped: false,
+            user_cancelled: false,
+            progress: DeleteProgress {
+                items_total,
+                items_done: done,
+                ..Default::default()
+            },
+            done_before: done,
+            observer,
+        }
+    }
+
     pub(super) fn run(paths: &[PathBuf], mode: Mode, observer: DeleteObserver) -> DeleteReport {
         let mut report = DeleteReport::default();
         let mut pending = Vec::new();
@@ -497,23 +620,11 @@ mod imp {
                 pending.push(p.clone());
             }
         }
-        let state = Rc::new(RefCell::new(State {
-            mode,
-            items: Vec::new(),
-            keys: Vec::new(),
-            current: None,
-            errors: Vec::new(),
-            refused: None,
-            stopped: false,
-            user_cancelled: false,
-            progress: DeleteProgress {
-                items_total: paths.len(),
-                items_done: report.failed.len(),
-                ..Default::default()
-            },
-            done_before: report.failed.len(),
+        let state = Rc::new(RefCell::new(new_state(
             observer,
-        }));
+            paths.len(),
+            report.failed.len(),
+        )));
         let _com = match crate::shell::com::ComGuard::apartment_threaded() {
             Ok(g) => g,
             Err(e) => {
@@ -532,60 +643,38 @@ mod imp {
                     .map(|p| p.to_string_lossy().to_lowercase())
                     .collect();
                 s.errors = vec![None; pending.len()];
-                s.items = pending.clone();
-                s.current = None;
-                s.refused = None;
+                s.refusal = Refusal::None;
                 s.progress.items_done = s.done_before;
                 s.progress.work_done = 0;
                 s.progress.work_total = 0;
             }
-            let run = unsafe { perform(&pending, mode, &state) };
+            let unknown_refusal = Rc::new(Cell::new(false));
+            let run = unsafe { perform(&pending, mode, &state, &unknown_refusal) };
             let mut s = state.borrow_mut();
-            let mut left = Vec::new();
-            for (i, p) in pending.iter().enumerate() {
-                if is_gone(p) {
-                    report.done.push(p.clone());
-                    s.done_before += 1;
-                } else if s.refused == Some(i) {
-                    report
-                        .failed
-                        .push((p.clone(), DeleteFailure::NotRecyclable));
-                    s.done_before += 1;
-                } else if let Some(hr) = s.errors[i].filter(|hr| !codes::is_cancel(*hr)) {
-                    let why = codes::classify(hr, || {
-                        windows::core::Error::from(HRESULT(hr as i32)).message()
-                    });
-                    report.failed.push((p.clone(), why));
-                    s.done_before += 1;
-                } else {
-                    left.push(p.clone());
-                }
+            if unknown_refusal.get() {
+                s.refusal = Refusal::Unknown;
             }
-            // The shell's per-item reports are not reliable for counting; the disk is.
-            s.progress.items_done = s.done_before;
+            let gone: Vec<bool> = pending.iter().map(|p| is_gone(p)).collect();
+            s.progress.items_done = s.done_before + gone.iter().filter(|g| **g).count();
             s.progress.current = None;
-            if !s.stopped {
-                let progress = s.progress.clone();
-                (s.observer)(&progress);
-            }
-            if s.stopped || s.user_cancelled {
-                report.cancelled = true;
-                report.not_started = left;
-                break;
-            }
-            if s.refused.is_some() {
-                // The pass stopped at the refused item; the rest get a pass of their own.
-                pending = left;
-                continue;
-            }
-            let why = match run {
-                Err(e) => DeleteFailure::Other(e),
-                Ok(()) => DeleteFailure::Other("Windows did not delete it".into()),
-            };
-            report
-                .failed
-                .extend(left.into_iter().map(|p| (p, why.clone())));
-            break;
+            // The last word on cancelling: a cancel at the end of the pass counts too.
+            s.tell();
+            let cancelled = s.stopped || (s.user_cancelled && s.refusal == Refusal::None);
+            let before = report.done.len() + report.failed.len();
+            let retry = settle_pass(
+                Pass {
+                    items: &pending,
+                    gone: &gone,
+                    refusal: s.refusal,
+                    errors: &s.errors,
+                    cancelled,
+                    run_error: run.err(),
+                },
+                |hr| windows::core::Error::from(HRESULT(hr as i32)).message(),
+                &mut report,
+            );
+            s.done_before += report.done.len() + report.failed.len() - before;
+            pending = retry;
         }
         report
     }
@@ -595,6 +684,7 @@ mod imp {
         items: &[PathBuf],
         mode: Mode,
         state: &Rc<RefCell<State>>,
+        unknown_refusal: &Rc<Cell<bool>>,
     ) -> Result<(), String> {
         let err = |op: &str, e: windows::core::Error| format!("{op}: {}", e.message());
         unsafe {
@@ -607,7 +697,12 @@ mod imp {
                 // A stale handle only costs the owner; the dialog still shows.
                 let _ = op.SetOwnerWindow(HWND(owner as *mut _));
             }
-            let sink: IFileOperationProgressSink = Sink(state.clone()).into();
+            let sink: IFileOperationProgressSink = Sink {
+                mode,
+                unknown_refusal: unknown_refusal.clone(),
+                state: state.clone(),
+            }
+            .into();
             let cookie = op.Advise(&sink).map_err(|e| err("Advise", e))?;
             for p in items {
                 let wide = crate::to_wide(p);
@@ -619,6 +714,101 @@ mod imp {
             let result = op.PerformOperations();
             let _ = op.Unadvise(cookie);
             result.map_err(|e| e.message())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sink(mode: Mode, keys: &[&Path]) -> (IFileOperationProgressSink, Rc<RefCell<State>>, Rc<Cell<bool>>) {
+            let mut state = new_state(Box::new(|_| true), keys.len(), 0);
+            state.keys = keys.iter().map(|p| p.to_string_lossy().to_lowercase()).collect();
+            state.errors = vec![None; keys.len()];
+            let state = Rc::new(RefCell::new(state));
+            let unknown = Rc::new(Cell::new(false));
+            let sink = Sink {
+                mode,
+                unknown_refusal: unknown.clone(),
+                state: state.clone(),
+            }
+            .into();
+            (sink, state, unknown)
+        }
+
+        fn shell_item(path: &Path) -> IShellItem {
+            let wide = crate::to_wide(path);
+            unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).unwrap() }
+        }
+
+        const RECYCLE: u32 = 0x282;
+        const DESTROY: u32 = 0x202;
+
+        #[test]
+        fn a_permanent_delete_is_refused_even_while_the_state_is_busy() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let f = d.path().join("a.txt");
+            std::fs::write(&f, b"x").unwrap();
+            let (sink, state, unknown) = sink(Mode::Recycle, &[&f]);
+            let item = shell_item(&f);
+            let busy = state.borrow_mut();
+            assert!(unsafe { sink.PreDeleteItem(DESTROY, &item) }.is_err());
+            assert!(unknown.get(), "a refusal while busy is an unknown refusal");
+            // A recycle while busy goes through: its check needs no state.
+            assert!(unsafe { sink.PreDeleteItem(RECYCLE, &item) }.is_ok());
+            drop(busy);
+        }
+
+        #[test]
+        fn a_refusal_names_the_item_it_belongs_to() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let (a, b) = (d.path().join("a"), d.path().join("b"));
+            std::fs::create_dir_all(b.join("sub")).unwrap();
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::write(b.join("sub").join("f.txt"), b"x").unwrap();
+            let (sink, state, unknown) = sink(Mode::Recycle, &[&a, &b]);
+            let child = shell_item(&b.join("sub").join("f.txt"));
+            assert!(unsafe { sink.PreDeleteItem(DESTROY, &child) }.is_err());
+            assert_eq!(state.borrow().refusal, Refusal::Item(1));
+            assert!(!unknown.get());
+        }
+
+        #[test]
+        fn a_refusal_of_an_item_outside_the_pass_is_unknown_not_item_zero() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let (a, other) = (d.path().join("a.txt"), d.path().join("other.txt"));
+            std::fs::write(&a, b"x").unwrap();
+            std::fs::write(&other, b"x").unwrap();
+            let (sink, state, _) = sink(Mode::Recycle, &[&a]);
+            assert!(unsafe { sink.PreDeleteItem(DESTROY, &shell_item(&other)) }.is_err());
+            assert_eq!(state.borrow().refusal, Refusal::Unknown);
+        }
+
+        #[test]
+        fn a_permanent_delete_is_never_refused() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let f = d.path().join("a.txt");
+            std::fs::write(&f, b"x").unwrap();
+            let (sink, state, unknown) = sink(Mode::Permanent, &[&f]);
+            assert!(unsafe { sink.PreDeleteItem(2, &shell_item(&f)) }.is_ok());
+            assert_eq!(state.borrow().refusal, Refusal::None);
+            assert!(!unknown.get());
+        }
+
+        #[test]
+        fn a_cancel_at_the_moment_of_a_refusal_counts() {
+            let _com = crate::shell::com::ComGuard::apartment_threaded().unwrap();
+            let d = tempfile::tempdir().unwrap();
+            let f = d.path().join("a.txt");
+            std::fs::write(&f, b"x").unwrap();
+            let (sink, state, _) = sink(Mode::Recycle, &[&f]);
+            state.borrow_mut().observer = Box::new(|_| false);
+            assert!(unsafe { sink.PreDeleteItem(DESTROY, &shell_item(&f)) }.is_err());
+            assert!(state.borrow().stopped);
         }
     }
 }
@@ -795,5 +985,101 @@ mod tests {
             codes::classify(0x8000_4005, other),
             DeleteFailure::Other("x".into())
         );
+    }
+    #[test]
+    fn only_a_recycle_refuses_and_only_without_the_recycle_flag() {
+        assert!(refuses_permanent_delete(Mode::Recycle, 0x202));
+        assert!(refuses_permanent_delete(Mode::Recycle, 0x2));
+        assert!(!refuses_permanent_delete(Mode::Recycle, 0x282));
+        assert!(!refuses_permanent_delete(Mode::Permanent, 0x2));
+    }
+
+    #[test]
+    fn shell_paths_map_to_the_item_they_are_in() {
+        let keys = vec![r"c:\a\big".to_string(), r"c:\a\big two".to_string(), r"c:\a\big\in".to_string()];
+        assert_eq!(item_of(&keys, r"C:\A\Big"), Some(0));
+        assert_eq!(item_of(&keys, r"C:\a\big\x\y.bin"), Some(0));
+        assert_eq!(item_of(&keys, r"C:\a\big two\y.bin"), Some(1));
+        // The deepest item wins when items nest.
+        assert_eq!(item_of(&keys, r"C:\a\big\in\z"), Some(2));
+        assert_eq!(item_of(&keys, r"C:\a\bigger"), None);
+        assert_eq!(item_of(&keys, r"D:\elsewhere"), None);
+    }
+
+    fn settle(
+        items: &[PathBuf],
+        gone: &[bool],
+        refusal: Refusal,
+        cancelled: bool,
+    ) -> (DeleteReport, Vec<PathBuf>) {
+        let mut report = DeleteReport::default();
+        let errors = vec![None; items.len()];
+        let retry = settle_pass(
+            Pass {
+                items,
+                gone,
+                refusal,
+                errors: &errors,
+                cancelled,
+                run_error: None,
+            },
+            |_| String::new(),
+            &mut report,
+        );
+        (report, retry)
+    }
+
+    #[test]
+    fn a_known_refusal_offers_that_item_and_retries_the_rest() {
+        let items: Vec<PathBuf> = ["a", "b", "c"].iter().map(PathBuf::from).collect();
+        let (report, retry) = settle(&items, &[true, false, false], Refusal::Item(1), false);
+        assert_eq!(report.done, vec![items[0].clone()]);
+        assert_eq!(report.failed, vec![(items[1].clone(), DeleteFailure::NotRecyclable)]);
+        assert_eq!(retry, vec![items[2].clone()]);
+    }
+
+    #[test]
+    fn an_unknown_refusal_offers_nothing_and_retries_nothing() {
+        let items: Vec<PathBuf> = ["a", "b"].iter().map(PathBuf::from).collect();
+        let (report, retry) = settle(&items, &[false, false], Refusal::Unknown, false);
+        assert!(retry.is_empty());
+        assert_eq!(report.failed.len(), 2);
+        assert!(
+            report
+                .failed
+                .iter()
+                .all(|(_, why)| matches!(why, DeleteFailure::Other(m) if m == UNKNOWN_REFUSAL)),
+            "{:?}",
+            report.failed
+        );
+    }
+
+    #[test]
+    fn a_cancel_at_a_refusal_stops_without_retrying() {
+        let items: Vec<PathBuf> = ["a", "b"].iter().map(PathBuf::from).collect();
+        let (report, retry) = settle(&items, &[false, false], Refusal::Item(0), true);
+        assert!(report.cancelled && retry.is_empty());
+        assert_eq!(report.failed, vec![(items[0].clone(), DeleteFailure::NotRecyclable)]);
+        assert_eq!(report.not_started, vec![items[1].clone()]);
+    }
+
+    #[test]
+    fn a_cancel_after_the_last_sandbox_item_is_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let big = d.path().join(format!("{SANDBOX_NOT_RECYCLABLE_PREFIX}-big"));
+        std::fs::write(&big, b"x").unwrap();
+        let calls = std::cell::Cell::new(0);
+        let calls = std::rc::Rc::new(calls);
+        let seen = calls.clone();
+        let report = recycle_into_sandbox(
+            &d.path().join("bin"),
+            std::slice::from_ref(&big),
+            Box::new(move |_| {
+                seen.set(seen.get() + 1);
+                seen.get() < 2
+            }),
+        );
+        assert!(report.cancelled, "the cancel after the refusal was lost");
+        assert_eq!(report.failed, vec![(big, DeleteFailure::NotRecyclable)]);
     }
 }
