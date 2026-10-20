@@ -50,5 +50,9 @@ ab_glyph = "0.2"
 [dev-dependencies]
 tempfile.workspace = true
 
+# e2e: a stand-in for the Desktop's paste (OLE clipboard + IFileOperation).
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_System_DataExchange", "Win32_System_Memory"] }
+
 [build-dependencies]
 embed-resource = "3.0.12"

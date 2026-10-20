@@ -1420,3 +1420,365 @@ fn ctrl_shift_v_does_not_paste_files() {
     expect_ok(&outcome);
     assert_eq!(fs::read(work.join("loose.txt")).unwrap(), b"loose");
 }
+
+/// The files of the folder tree that the cut-to-Desktop scenarios cut, relative to it.
+const TREE_FILES: [&str; 4] = ["one.txt", "two.bin", "sub/three.txt", "sub/deeper/four.txt"];
+
+/// `<sandbox>/source` with `Shoot C` (files and nested subfolders, see [`TREE_FILES`]) and
+/// `Shoot D`, and empty `<sandbox>/Desktop` and `<sandbox>/elsewhere` folders. The
+/// "Desktop" is a temp folder, never the real one.
+fn tree_fixture(sandbox: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let source = sandbox.join("source");
+    for (i, file) in TREE_FILES.iter().enumerate() {
+        write_file(&source.join("Shoot C").join(file), &noise(4096, i as u32));
+    }
+    write_file(&source.join("Shoot D").join("keep.txt"), b"not cut");
+    let desktop = sandbox.join("Desktop");
+    let elsewhere = sandbox.join("elsewhere");
+    fs::create_dir_all(&desktop).unwrap();
+    fs::create_dir_all(&elsewhere).unwrap();
+    (source, desktop, elsewhere)
+}
+
+/// `Shoot C` left `source` and arrived in `dest` byte for byte; `Shoot D` stayed,
+/// `elsewhere` is still empty and the clipboard no longer holds the cut.
+fn assert_tree_moved(source: &Path, dest: &Path, elsewhere: &Path) {
+    assert!(
+        !source.join("Shoot C").exists(),
+        "Shoot C was not moved away"
+    );
+    for (i, file) in TREE_FILES.iter().enumerate() {
+        assert_eq!(
+            fs::read(dest.join("Shoot C").join(file)).ok(),
+            Some(noise(4096, i as u32)),
+            "{file} did not arrive intact"
+        );
+    }
+    assert_eq!(
+        fs::read(source.join("Shoot D").join("keep.txt")).unwrap(),
+        b"not cut",
+        "an item that was not cut stays"
+    );
+    assert_eq!(
+        fs::read_dir(elsewhere).unwrap().count(),
+        0,
+        "the later Ctrl+V pasted something"
+    );
+    let clip = forge_win::get_files()
+        .ok()
+        .flatten()
+        .map(|(paths, _)| paths);
+    assert!(
+        !clip.is_some_and(|paths| paths.contains(&source.join("Shoot C"))),
+        "the stale cut is still on the clipboard"
+    );
+}
+
+/// After the cut was used up: a later Ctrl+V in `elsewhere` must paste nothing and show
+/// no error ("Left out", a failed move), only that there is nothing to paste.
+fn later_ctrl_v_steps(elsewhere: &Path) -> String {
+    format!(
+        "navigate {elsewhere}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         wait-frames 20\n\
+         sleep 1500\n\
+         wait-jobs 20\n\
+         assert-toast Nothing to paste\n\
+         assert-no-error-toast\n",
+        elsewhere = shown(elsewhere),
+    )
+}
+
+/// What the Desktop does with a cut on Ctrl+V, from another thread with its own OLE
+/// apartment: it reads `CF_HDROP` and "Preferred DropEffect" through the OLE clipboard,
+/// moves the items with `IFileOperation` (a rename on the same volume), reports "Performed DropEffect" and "Paste
+/// Succeeded" back to the data object, and (with `clear`) empties the clipboard if it
+/// still holds that cut.
+mod desktop {
+    use std::path::Path;
+
+    use windows::Win32::Foundation::{GlobalFree, HGLOBAL};
+    use windows::Win32::System::Com::{
+        CLSCTX_ALL, CoCreateInstance, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM,
+        STGMEDIUM_0, TYMED_HGLOBAL,
+    };
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+    use windows::Win32::System::Ole::{
+        DROPEFFECT_MOVE, OleGetClipboard, OleInitialize, OleSetClipboard, OleUninitialize,
+        ReleaseStgMedium,
+    };
+    use windows::Win32::UI::Shell::{
+        DragQueryFileW, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
+        FileOperation, HDROP, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+    };
+    use windows::core::{HSTRING, PCWSTR, w};
+
+    fn format(name: PCWSTR) -> FORMATETC {
+        format_id(unsafe { RegisterClipboardFormatW(name) } as u16)
+    }
+
+    fn format_id(id: u16) -> FORMATETC {
+        FORMATETC {
+            cfFormat: id,
+            ptd: std::ptr::null_mut(),
+            dwAspect: DVASPECT_CONTENT.0,
+            lindex: -1,
+            tymed: TYMED_HGLOBAL.0 as u32,
+        }
+    }
+
+    fn read_dword(data: &IDataObject, name: PCWSTR) -> windows::core::Result<u32> {
+        unsafe {
+            let mut medium = data.GetData(&format(name))?;
+            let ptr = GlobalLock(medium.u.hGlobal) as *const u32;
+            let value = if ptr.is_null() {
+                0
+            } else {
+                ptr.read_unaligned()
+            };
+            let _ = GlobalUnlock(medium.u.hGlobal);
+            ReleaseStgMedium(&mut medium);
+            Ok(value)
+        }
+    }
+
+    /// The paths in `CF_HDROP`. ZXraw puts no "Shell IDList Array" on the clipboard, so the
+    /// shell's paste works from this list.
+    fn read_hdrop(data: &IDataObject) -> windows::core::Result<Vec<std::path::PathBuf>> {
+        const CF_HDROP: u16 = 15;
+        unsafe {
+            let mut medium = data.GetData(&format_id(CF_HDROP))?;
+            let drop = HDROP(medium.u.hGlobal.0);
+            let count = DragQueryFileW(drop, u32::MAX, None);
+            let paths = (0..count)
+                .map(|i| {
+                    let mut buf = vec![0u16; DragQueryFileW(drop, i, None) as usize + 1];
+                    let len = DragQueryFileW(drop, i, Some(&mut buf)) as usize;
+                    std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len]))
+                })
+                .collect();
+            ReleaseStgMedium(&mut medium);
+            Ok(paths)
+        }
+    }
+
+    fn write_dword(data: &IDataObject, name: PCWSTR, value: u32) -> windows::core::Result<()> {
+        unsafe {
+            let handle: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, 4)?;
+            let ptr = GlobalLock(handle) as *mut u32;
+            ptr.write_unaligned(value);
+            let _ = GlobalUnlock(handle);
+            let medium = STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: handle },
+                pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            };
+            let result = data.SetData(&format(name), &medium, true);
+            if result.is_err() {
+                // The data object takes the memory only when it accepts it.
+                let _ = GlobalFree(Some(handle));
+            }
+            result
+        }
+    }
+
+    /// Returns what it did, for the test output.
+    pub fn paste(dest: &Path, clear: bool) -> Result<String, String> {
+        unsafe {
+            OleInitialize(None).map_err(|e| format!("OleInitialize: {e}"))?;
+            let result = paste_in_apartment(dest, clear);
+            OleUninitialize();
+            result
+        }
+    }
+
+    unsafe fn paste_in_apartment(dest: &Path, clear: bool) -> Result<String, String> {
+        unsafe {
+            // ZXraw's clipboard worker may hold the clipboard open for a moment.
+            let mut tries = 0;
+            let data = loop {
+                match OleGetClipboard() {
+                    Ok(data) => break data,
+                    Err(e) if tries >= 50 => return Err(format!("OleGetClipboard: {e}")),
+                    Err(_) => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            };
+            let sequence = forge_win::clipboard_sequence();
+            let effect = read_dword(&data, w!("Preferred DropEffect"))
+                .map_err(|e| format!("Preferred DropEffect: {e}"))?;
+            if effect & DROPEFFECT_MOVE.0 == 0 {
+                return Err(format!("Preferred DropEffect is {effect}, not a move"));
+            }
+            let paths = read_hdrop(&data).map_err(|e| format!("CF_HDROP: {e}"))?;
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+                .map_err(|e| format!("IFileOperation: {e}"))?;
+            op.SetOperationFlags(
+                FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR,
+            )
+            .map_err(|e| format!("SetOperationFlags: {e}"))?;
+            let target: IShellItem =
+                SHCreateItemFromParsingName(&HSTRING::from(dest.as_os_str()), None)
+                    .map_err(|e| format!("destination: {e}"))?;
+            for path in &paths {
+                let item: IShellItem =
+                    SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                op.MoveItem(&item, &target, PCWSTR::null(), None)
+                    .map_err(|e| format!("MoveItem: {e}"))?;
+            }
+            op.PerformOperations()
+                .map_err(|e| format!("PerformOperations: {e}"))?;
+            if op.GetAnyOperationsAborted().is_ok_and(|b| b.as_bool()) {
+                return Err("the move was aborted".into());
+            }
+            // ZXraw's cut is plain clipboard data rather than a live data object, so these
+            // may be refused; the shell carries on either way.
+            let performed = write_dword(&data, w!("Performed DropEffect"), DROPEFFECT_MOVE.0);
+            let succeeded = write_dword(&data, w!("Paste Succeeded"), DROPEFFECT_MOVE.0);
+            let cleared = clear
+                && forge_win::clipboard_sequence() == sequence
+                && OleSetClipboard(None::<&IDataObject>).is_ok();
+            Ok(format!(
+                "moved {paths:?}; Performed DropEffect: {performed:?}; Paste Succeeded: {succeeded:?}; \
+                 cleared: {cleared}"
+            ))
+        }
+    }
+}
+
+/// Cut a folder tree in ZXraw, let `paste` paste it into the "Desktop" folder once the cut
+/// is on the clipboard, then press Ctrl+V in ZXraw somewhere else.
+fn cut_pasted_on_the_desktop(paste: impl FnOnce(&Path) -> Result<String, String> + Send + 'static) {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (source, desktop, elsewhere) = tree_fixture(sandbox.path());
+    let shell = {
+        let cut = source.join("Shoot C");
+        let desktop = desktop.clone();
+        std::thread::spawn(move || -> Result<String, String> {
+            if !wait_for_move_cut(vec![cut]) {
+                return Err("the cut never reached the Windows clipboard".into());
+            }
+            paste(&desktop)
+        })
+    };
+    let script = format!(
+        "navigate {source}\n\
+         select Shoot C\n\
+         key ctrl+X\n\
+         wait-missing {moved_away}\n\
+         wait-exists {arrived}\n\
+         ui system wait-no-cut\n\
+         wait-no-entry Shoot C\n\
+         wait-entry Shoot D\n\
+         assert-no-error-toast\n\
+         {later}\
+         exit\n",
+        source = shown(&source),
+        moved_away = shown(&source.join("Shoot C")),
+        arrived = shown(&desktop.join("Shoot C").join(TREE_FILES[3])),
+        later = later_ctrl_v_steps(&elsewhere),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    let pasted = shell.join().unwrap();
+    eprintln!("desktop paste: {pasted:?}");
+    expect_ok(&outcome);
+    assert!(pasted.is_ok(), "the Desktop paste failed");
+    assert_tree_moved(&source, &desktop, &elsewhere);
+}
+
+/// The user's report: Ctrl+X on a folder in ZXraw, paste on the Desktop. Here the Desktop
+/// leaves the clipboard alone, so ZXraw must notice by itself that its cut was used up.
+#[test]
+fn a_folder_cut_in_zxraw_pastes_on_the_desktop() {
+    cut_pasted_on_the_desktop(|dest| desktop::paste(dest, false));
+}
+
+/// The same when the shell empties the clipboard after the paste.
+#[test]
+fn a_folder_cut_in_zxraw_pastes_on_a_desktop_that_clears_the_clipboard() {
+    cut_pasted_on_the_desktop(|dest| desktop::paste(dest, true));
+}
+
+/// The same with a real Explorer window: it opens on the temp "Desktop" folder, its view
+/// pastes (inside explorer.exe), and the window is closed again. Ignored because it shows
+/// a window on the user's desktop; run it by name with `--ignored`.
+#[test]
+#[ignore = "opens a visible Explorer window"]
+fn a_folder_cut_in_zxraw_pastes_in_a_real_explorer_window() {
+    cut_pasted_on_the_desktop(|dest| {
+        let script = format!(
+            "$dir = '{dir}'\n\
+             $shell = New-Object -ComObject Shell.Application\n\
+             $before = @($shell.Windows() | ForEach-Object {{ $_.HWND }})\n\
+             Start-Process explorer.exe -ArgumentList ('\"' + $dir + '\"')\n\
+             $w = $null\n\
+             for ($i = 0; $i -lt 100 -and -not $w; $i++) {{\n\
+               Start-Sleep -Milliseconds 200\n\
+               $w = $shell.Windows() | Where-Object {{\n\
+                 $before -notcontains $_.HWND -and $_.Document.Folder.Self.Path -eq $dir\n\
+               }} | Select-Object -First 1\n\
+             }}\n\
+             if (-not $w) {{ exit 2 }}\n\
+             try {{ $w.Document.Folder.Self.InvokeVerb('paste'); Start-Sleep 5 }}\n\
+             finally {{ $w.Quit() }}\n",
+            dir = dest.display()
+        );
+        let status = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-STA",
+                "-Command",
+            ])
+            .arg(script)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok("pasted in an Explorer window".into())
+        } else {
+            Err(format!("the Explorer window script failed: {status}"))
+        }
+    });
+}
+
+/// The same tree cut and pasted inside ZXraw; a later Ctrl+V pastes nothing.
+#[test]
+fn a_folder_tree_cut_in_zxraw_pastes_once_in_zxraw() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (source, desktop, elsewhere) = tree_fixture(sandbox.path());
+    let script = format!(
+        "navigate {source}\n\
+         select Shoot C\n\
+         key ctrl+X\n\
+         ui system wait-cut 1\n\
+         navigate {desktop}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         wait-exists {arrived}\n\
+         wait-jobs 20\n\
+         ui system wait-no-cut\n\
+         wait-entry Shoot C\n\
+         assert-no-error-toast\n\
+         {later}\
+         exit\n",
+        source = shown(&source),
+        desktop = shown(&desktop),
+        arrived = shown(&desktop.join("Shoot C").join(TREE_FILES[3])),
+        later = later_ctrl_v_steps(&elsewhere),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_tree_moved(&source, &desktop, &elsewhere);
+}
