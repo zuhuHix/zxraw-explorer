@@ -8,6 +8,7 @@ mod batch_rename;
 mod breadcrumb;
 mod collections_ui;
 mod commands;
+mod cut_watch;
 mod crash;
 mod default_app;
 mod delivery_meta;

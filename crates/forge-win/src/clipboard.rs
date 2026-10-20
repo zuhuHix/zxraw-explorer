@@ -11,17 +11,50 @@ pub enum ClipboardEffect {
     Move,
 }
 
-/// Places paths on the Windows clipboard in formats understood by Explorer and text editors.
+/// The clipboard file list with its effect, and the owner token of our publish if present.
+pub type FilesAndOwner = (
+    Option<(Vec<PathBuf>, ClipboardEffect)>,
+    Option<ClipboardToken>,
+);
+
+/// Marks one publish of ours: stored in a private clipboard format next to the file list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipboardToken(u64);
+
+impl ClipboardToken {
+    /// A token with this value, for tests that never touch the clipboard.
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+}
+
+/// Counter for [`ClipboardToken`]s. Starts at 1 so a token is never zero in its low half.
 #[cfg(windows)]
-pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
-    set_files_impl(paths, effect, true)
+static NEXT_TOKEN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// A token unique per publish, and across processes: process id in the high half.
+#[cfg(windows)]
+fn next_token() -> ClipboardToken {
+    use std::sync::atomic::Ordering;
+
+    let counter = NEXT_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
+    ClipboardToken((u64::from(std::process::id()) << 32) | u64::from(counter))
+}
+
+/// Places paths on the Windows clipboard in formats understood by Explorer and text editors,
+/// marked with a fresh owner token so that [`get_files_and_owner`] reports it as ours.
+#[cfg(windows)]
+pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<ClipboardToken> {
+    let token = next_token();
+    set_files_impl(paths, effect, Some(token))?;
+    Ok(token)
 }
 
 /// Places paths on the clipboard as Explorer's Copy and Cut do: `CF_HDROP` and the preferred
 /// drop effect, with no text. For tests that stand in for another app.
 #[cfg(windows)]
 pub fn set_files_without_text(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
-    set_files_impl(paths, effect, false)
+    set_files_impl(paths, effect, None)
 }
 
 #[cfg(not(windows))]
@@ -29,11 +62,52 @@ pub fn set_files_without_text(_paths: &[PathBuf], _effect: ClipboardEffect) -> R
     Err(crate::WinError::Unsupported)
 }
 
+/// Writes a publish. `ours` is `Some` for our own publishes (text and owner marker included);
+/// `None` is what Explorer's Copy and Cut put on the clipboard.
 #[cfg(windows)]
-fn set_files_impl(paths: &[PathBuf], effect: ClipboardEffect, with_text: bool) -> Result<()> {
+fn set_files_impl(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    ours: Option<ClipboardToken>,
+) -> Result<()> {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+
+    // Allocate everything before replacing the current clipboard.
+    let mut payloads = build_payloads(paths, effect, ours)?;
+    let _window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
+    unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
+    write_payloads(&mut payloads)
+}
+
+/// One clipboard format of a publish, with its data already allocated.
+#[cfg(windows)]
+struct ClipboardPayload {
+    format: u32,
+    op: &'static str,
+    data: GlobalMem,
+}
+
+#[cfg(windows)]
+impl ClipboardPayload {
+    fn new(format: u32, op: &'static str, bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            format,
+            op,
+            data: GlobalMem::new(bytes)?,
+        })
+    }
+}
+
+/// Builds every format of a publish, validating `paths` first. Does not touch the clipboard.
+#[cfg(windows)]
+fn build_payloads(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    ours: Option<ClipboardToken>,
+) -> Result<Vec<ClipboardPayload>> {
     use std::os::windows::ffi::OsStrExt;
 
-    use windows::Win32::System::DataExchange::{EmptyClipboard, RegisterClipboardFormatW};
     use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
     use windows::core::w;
 
@@ -58,74 +132,109 @@ fn set_files_impl(paths: &[PathBuf], effect: ClipboardEffect, with_text: bool) -
         .collect::<Result<Vec<_>>>()?;
 
     let dropfiles = encode_dropfiles(&wide_paths)?;
-    let preferred_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
-    if preferred_format == 0 {
-        return Err(crate::api_err(
-            "RegisterClipboardFormatW(Preferred DropEffect)",
-            windows::core::Error::from_thread(),
-        ));
-    }
+    let preferred_format = register_format(
+        w!("Preferred DropEffect"),
+        "RegisterClipboardFormatW(Preferred DropEffect)",
+    )?;
     let drop_effect: u32 = match effect {
         ClipboardEffect::Copy => 1,
         ClipboardEffect::Move => 2,
     };
-    let effect_bytes = drop_effect.to_ne_bytes().to_vec();
-    let mut text_wide = Vec::new();
-    for (index, path) in wide_paths.iter().enumerate() {
-        if index != 0 {
-            text_wide.extend_from_slice(&[b'\r' as u16, b'\n' as u16]);
+    let effect_bytes = drop_effect.to_ne_bytes();
+
+    let mut payloads = vec![
+        ClipboardPayload::new(CF_HDROP.0 as u32, "SetClipboardData(CF_HDROP)", &dropfiles)?,
+        ClipboardPayload::new(
+            preferred_format,
+            "SetClipboardData(Preferred DropEffect)",
+            &effect_bytes,
+        )?,
+    ];
+    if let Some(token) = ours {
+        let mut text_wide = Vec::new();
+        for (index, path) in wide_paths.iter().enumerate() {
+            if index != 0 {
+                text_wide.extend_from_slice(&[b'\r' as u16, b'\n' as u16]);
+            }
+            text_wide.extend_from_slice(path);
         }
-        text_wide.extend_from_slice(path);
-    }
-    text_wide.push(0);
-    let text_bytes = u16s_as_bytes(&text_wide);
-
-    // Allocate everything before replacing the current clipboard. Each handle is freed
-    // locally unless SetClipboardData succeeds and transfers ownership to Windows.
-    let mut drop_handle = GlobalMem::new(&dropfiles)?;
-    let mut effect_handle = GlobalMem::new(&effect_bytes)?;
-    let mut text_handle = GlobalMem::new(text_bytes)?;
-
-    let _window = ClipboardOwnerWindow::new()?;
-    let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
-    unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
-
-    set_clipboard_data(
-        CF_HDROP.0 as u32,
-        &mut drop_handle,
-        "SetClipboardData(CF_HDROP)",
-    )?;
-    set_clipboard_data(
-        preferred_format,
-        &mut effect_handle,
-        "SetClipboardData(Preferred DropEffect)",
-    )?;
-    if with_text {
-        set_clipboard_data(
+        text_wide.push(0);
+        payloads.push(ClipboardPayload::new(
             CF_UNICODETEXT.0 as u32,
-            &mut text_handle,
             "SetClipboardData(CF_UNICODETEXT)",
-        )?;
+            u16s_as_bytes(&text_wide),
+        )?);
+        payloads.push(ClipboardPayload::new(
+            owner_format()?,
+            "SetClipboardData(ZXraw Explorer Clipboard Owner)",
+            &token.0.to_ne_bytes(),
+        )?);
+    }
+    Ok(payloads)
+}
+
+/// Puts the payloads on an open, emptied clipboard. Handles transfer to Windows as they go.
+#[cfg(windows)]
+fn write_payloads(payloads: &mut [ClipboardPayload]) -> Result<()> {
+    for payload in payloads {
+        set_clipboard_data(payload.format, &mut payload.data, payload.op)?;
     }
     Ok(())
 }
 
+/// Registers a named clipboard format, or returns the existing id.
+#[cfg(windows)]
+fn register_format(name: windows::core::PCWSTR, op: &'static str) -> Result<u32> {
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+
+    let format = unsafe { RegisterClipboardFormatW(name) };
+    if format == 0 {
+        return Err(crate::api_err(op, windows::core::Error::from_thread()));
+    }
+    Ok(format)
+}
+
+/// The private format that holds a [`ClipboardToken`] next to our file list.
+#[cfg(windows)]
+fn owner_format() -> Result<u32> {
+    use windows::core::w;
+
+    register_format(
+        w!("ZXraw Explorer Clipboard Owner"),
+        "RegisterClipboardFormatW(ZXraw Explorer Clipboard Owner)",
+    )
+}
+
 #[cfg(not(windows))]
-pub fn set_files(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<()> {
+pub fn set_files(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<ClipboardToken> {
     Err(crate::WinError::Unsupported)
 }
 
 /// Retrieves the clipboard file list and preferred effect, if `CF_HDROP` is available.
 #[cfg(windows)]
 pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
+    get_files_and_owner().map(|(files, _)| files)
+}
+
+/// Like [`get_files`], and also returns the owner token of our own publish, if one is present.
+/// Both are read in one clipboard session.
+#[cfg(windows)]
+pub fn get_files_and_owner() -> Result<FilesAndOwner> {
+    let _window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
+    let files = read_files_open()?;
+    Ok((files, read_owner_token_open()))
+}
+
+/// Reads the file list and preferred effect from an open clipboard.
+#[cfg(windows)]
+fn read_files_open() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
     use windows::Win32::System::DataExchange::{
         GetClipboardData, IsClipboardFormatAvailable, RegisterClipboardFormatW,
     };
     use windows::Win32::System::Ole::CF_HDROP;
     use windows::core::w;
 
-    let _window = ClipboardOwnerWindow::new()?;
-    let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
     if unsafe { IsClipboardFormatAvailable(CF_HDROP.0 as u32) }.is_err() {
         return Ok(None);
     }
@@ -155,6 +264,11 @@ pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
 
 #[cfg(not(windows))]
 pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
+    Err(crate::WinError::Unsupported)
+}
+
+#[cfg(not(windows))]
+pub fn get_files_and_owner() -> Result<FilesAndOwner> {
     Err(crate::WinError::Unsupported)
 }
 
@@ -268,6 +382,81 @@ pub fn clear_if_owned_files(paths: &[PathBuf], expected_sequence: Option<u32>) -
 #[cfg(not(windows))]
 pub fn clear_if_owned_files(_paths: &[PathBuf], _expected_sequence: Option<u32>) -> Option<u32> {
     None
+}
+
+/// Reads the owner token from an open clipboard. A missing or short value reads as `None`.
+#[cfg(windows)]
+fn read_owner_token_open() -> Option<ClipboardToken> {
+    use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
+
+    let format = owner_format().ok()?;
+    if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
+        return None;
+    }
+    let handle = unsafe { GetClipboardData(format) }.ok()?;
+    read_global_u64(handle, "GlobalLock(ZXraw Explorer Clipboard Owner)")
+        .ok()
+        .map(ClipboardToken)
+}
+
+/// Empties the clipboard if its owner token is `token`. Returns false when it is not, or on
+/// any clipboard error.
+#[cfg(windows)]
+pub fn clear_if_token(token: ClipboardToken) -> bool {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+
+    let Ok(window) = ClipboardOwnerWindow::new() else {
+        return false;
+    };
+    let Ok(_clipboard) = open_clipboard_retry(Some(window.hwnd)) else {
+        return false;
+    };
+    read_owner_token_open() == Some(token) && unsafe { EmptyClipboard() }.is_ok()
+}
+
+#[cfg(not(windows))]
+pub fn clear_if_token(_token: ClipboardToken) -> bool {
+    false
+}
+
+/// If the owner token is `token`, replaces the clipboard with `paths` as a new publish of ours
+/// and returns the new token. Empty `paths` clears the clipboard instead. If the token differs
+/// (another app took the clipboard), nothing changes and the result is `Ok(None)`.
+#[cfg(windows)]
+pub fn replace_files_if_token(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    token: ClipboardToken,
+) -> Result<Option<ClipboardToken>> {
+    use windows::Win32::System::DataExchange::EmptyClipboard;
+
+    let new_token = next_token();
+    // Allocate before opening, so a bad path or allocation failure leaves the clipboard alone.
+    let mut payloads = if paths.is_empty() {
+        Vec::new()
+    } else {
+        build_payloads(paths, effect, Some(new_token))?
+    };
+    let _window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
+    if read_owner_token_open() != Some(token) {
+        return Ok(None);
+    }
+    unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    write_payloads(&mut payloads)?;
+    Ok(Some(new_token))
+}
+
+#[cfg(not(windows))]
+pub fn replace_files_if_token(
+    _paths: &[PathBuf],
+    _effect: ClipboardEffect,
+    _token: ClipboardToken,
+) -> Result<Option<ClipboardToken>> {
+    Err(crate::WinError::Unsupported)
 }
 
 #[cfg(windows)]
@@ -577,26 +766,41 @@ fn has_double_nul_bytes(bytes: &[u8]) -> bool {
 
 #[cfg(windows)]
 fn read_global_dword(handle: windows::Win32::Foundation::HANDLE, op: &'static str) -> Result<u32> {
+    read_global_bytes::<4>(handle, op).map(u32::from_ne_bytes)
+}
+
+#[cfg(windows)]
+fn read_global_u64(handle: windows::Win32::Foundation::HANDLE, op: &'static str) -> Result<u64> {
+    read_global_bytes::<8>(handle, op).map(u64::from_ne_bytes)
+}
+
+/// Copies the first `N` bytes of a global handle. Fails if the handle is shorter.
+#[cfg(windows)]
+fn read_global_bytes<const N: usize>(
+    handle: windows::Win32::Foundation::HANDLE,
+    op: &'static str,
+) -> Result<[u8; N]> {
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 
     let hglobal = HGLOBAL(handle.0);
     let size = unsafe { GlobalSize(hglobal) };
-    if size < std::mem::size_of::<u32>() {
-        return Err(crate::WinError::Invalid(
-            "clipboard DWORD is shorter than four bytes".to_string(),
-        ));
+    if size < N {
+        return Err(crate::WinError::Invalid(format!(
+            "clipboard value is shorter than {N} bytes"
+        )));
     }
     let ptr = unsafe { GlobalLock(hglobal) };
     if ptr.is_null() {
         return Err(crate::api_err(op, windows::core::Error::from_thread()));
     }
-    let value = unsafe { std::ptr::read_unaligned(ptr.cast::<u32>()) };
+    let mut bytes = [0_u8; N];
     unsafe {
+        std::ptr::copy_nonoverlapping(ptr.cast::<u8>(), bytes.as_mut_ptr(), N);
         // A zero return is normal when the final lock is released.
         let _ = GlobalUnlock(hglobal);
     }
-    Ok(value)
+    Ok(bytes)
 }
 
 #[cfg(all(windows, test))]
@@ -810,6 +1014,87 @@ mod tests {
             !folder.exists(),
             "the shell copied the cut instead of moving it"
         );
+    }
+
+    #[test]
+    fn owner_token_round_trips_and_differs_per_publish() {
+        let _guard = ClipboardTestGuard::new();
+        let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
+        let first = set_files(&paths, ClipboardEffect::Copy).unwrap();
+        let second = set_files(&paths, ClipboardEffect::Move).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            get_files_and_owner().unwrap(),
+            (Some((paths.clone(), ClipboardEffect::Move)), Some(second))
+        );
+    }
+
+    #[test]
+    fn another_apps_identical_list_is_not_ours() {
+        let _guard = ClipboardTestGuard::new();
+        let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
+        let token = set_files(&paths, ClipboardEffect::Copy).unwrap();
+        set_files_without_text(&paths, ClipboardEffect::Move).unwrap();
+
+        assert_eq!(
+            get_files_and_owner().unwrap(),
+            (Some((paths.clone(), ClipboardEffect::Move)), None)
+        );
+        assert!(!clear_if_token(token));
+        assert_eq!(
+            get_files().unwrap(),
+            Some((paths.clone(), ClipboardEffect::Move))
+        );
+    }
+
+    #[test]
+    fn clear_if_token_clears_only_our_publish() {
+        let _guard = ClipboardTestGuard::new();
+        let paths = vec![PathBuf::from(r"C:\owner-a.txt")];
+        let stale = set_files(&paths, ClipboardEffect::Copy).unwrap();
+        let current = set_files(&paths, ClipboardEffect::Copy).unwrap();
+
+        assert!(!clear_if_token(stale));
+        assert!(get_files().unwrap().is_some());
+        assert!(clear_if_token(current));
+        assert_eq!(get_files().unwrap(), None);
+    }
+
+    #[test]
+    fn replace_files_if_token_updates_only_our_publish() {
+        let _guard = ClipboardTestGuard::new();
+        let a = PathBuf::from(r"C:\owner-a.txt");
+        let b = PathBuf::from(r"C:\owner-b.txt");
+        let token = set_files(&[a.clone(), b.clone()], ClipboardEffect::Copy).unwrap();
+
+        let replaced =
+            replace_files_if_token(std::slice::from_ref(&b), ClipboardEffect::Move, token).unwrap();
+        let new_token = replaced.expect("our publish is replaced");
+        assert_ne!(new_token, token);
+        assert_eq!(
+            get_files_and_owner().unwrap(),
+            (
+                Some((vec![b.clone()], ClipboardEffect::Move)),
+                Some(new_token)
+            )
+        );
+
+        // The old token no longer matches, so another replace changes nothing.
+        assert_eq!(
+            replace_files_if_token(std::slice::from_ref(&a), ClipboardEffect::Move, token).unwrap(),
+            None
+        );
+        assert_eq!(
+            get_files().unwrap(),
+            Some((vec![b.clone()], ClipboardEffect::Move))
+        );
+
+        // Empty paths clear the clipboard.
+        assert_eq!(
+            replace_files_if_token(&[], ClipboardEffect::Move, new_token).unwrap(),
+            None
+        );
+        assert_eq!(get_files().unwrap(), None);
     }
 
     fn read_test_text() -> Result<Option<String>> {

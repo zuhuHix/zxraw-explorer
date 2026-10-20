@@ -31,6 +31,9 @@
 //!   the app's own copy or cut to finish publishing, so it does not overwrite this.
 //! - `wait-no-cut`: wait (up to 30 s) until the app no longer holds a cut, e.g. after
 //!   Explorer pasted it.
+//! - `wait-cut <n>`: wait (up to 30 s) until the app holds a cut of exactly n items; `0`
+//!   means no cut, as `wait-no-cut`.
+//! - `assert-cut-path <path>`: require that the app's cut contains this path.
 //!
 //! Closing with transfers pending:
 //! - `request-close`: arm the close guard for automation and ask the window to close.
@@ -126,6 +129,36 @@ pub(super) fn step(
                 Err("the cut was still pending after 30 s".into())
             } else {
                 Ok(Flow::Wait("waiting for the cut to be used up".into()))
+            }
+        }
+        "wait-cut" => {
+            let want = position(args, "an item count")?;
+            let have = cut_count(app);
+            if have == want {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= WAIT_LIMIT {
+                Err(format!("the cut has {have} item(s), expected {want}"))
+            } else {
+                Ok(Flow::Wait(format!("waiting for a cut of {want} item(s)")))
+            }
+        }
+        "assert-cut-path" => {
+            let requested = args.trim();
+            if requested.is_empty() {
+                return Err("expected a path".into());
+            }
+            let path = super::sandboxed_entry(Path::new(requested))?;
+            let cut = app
+                .ops
+                .clipboard
+                .as_ref()
+                .filter(|cb| cb.cut)
+                .map(|cb| cb.paths.as_slice())
+                .unwrap_or_default();
+            if cut.contains(&path) {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("the cut does not hold {}: {cut:?}", path.display()))
             }
         }
         "request-close" => {
@@ -336,6 +369,15 @@ fn queue_action(app: &mut ZxrawApp, verb: &str, args: &str) -> Result<Flow, Stri
     } else {
         Err(format!("{verb} {k} had no effect (the transfer cannot move or is gone)"))
     }
+}
+
+/// How many items the app holds as a cut (0 when there is no cut).
+fn cut_count(app: &ZxrawApp) -> usize {
+    app.ops
+        .clipboard
+        .as_ref()
+        .filter(|cb| cb.cut)
+        .map_or(0, |cb| cb.paths.len())
 }
 
 /// A non-negative integer argument such as a count or a 1-based queue position.
