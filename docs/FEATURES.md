@@ -188,6 +188,13 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   the files inside as they go (`recycle::tests::a_permanent_delete_reports_files_inside_the_folder_with_a_total`).
   The shell's per-file callbacks reach the app at most 20 times a second
   (`recycle::imp::tests::counting_inside_a_folder_is_throttled_and_every_stage_is_reported`).
+* ✅ Job warnings are shown — something that went wrong without failing an item (a Replace
+  that kept the previous version aside because it could not be deleted) is counted in the
+  result ("12 done (…), 0 skipped, 0 failed, 1 warning") and opens the job report instead of
+  a toast. The report lists each warning's path and reason in the warning colour with a "Show
+  in folder" button, Copy report includes them, and the Operations window job log has them.
+  Folder sync results count them the same way
+  (`ops_ui::warnings_are_counted_and_reported_not_toasted`, `tools_ui::sync_summary_counts_warnings`).
 * ✅ Duplicates re-verified on disk before recycling — `forge-app/src/tools_ui.rs::recycle_reverifies_against_disk`
   and `duplicate_selection_safety_refuses_to_remove_the_last_copy`.
 * 🟡 Open files, Open With, Properties, and reveal in Explorer — `forge-win/src/shell.rs`.

@@ -4,15 +4,20 @@
 use std::path::PathBuf;
 
 use egui::{Key, RichText};
-use forge_core::ops::OpKind;
+use forge_core::ops::{OpIssue, OpKind};
 
 pub enum Modal {
     /// Single-line text prompt (new folder, rename).
     Prompt(Prompt),
     /// Yes/No confirmation for destructive actions.
     Confirm(Confirm),
-    /// Informational report (job results, errors).
-    Report { title: String, lines: Vec<String> },
+    /// Informational report (job results, errors). `warnings` went wrong without failing an
+    /// item (see `OpReport::warnings`); each is listed with "Show in folder".
+    Report {
+        title: String,
+        lines: Vec<String>,
+        warnings: Vec<OpIssue>,
+    },
 }
 
 pub enum PromptKind {
@@ -104,6 +109,8 @@ pub enum Outcome {
     None,
     Cancel,
     Accept,
+    /// Show this path in Explorer; the dialog stays open.
+    Reveal(PathBuf),
 }
 
 pub fn show(modal: &mut Modal, ctx: &egui::Context) -> Outcome {
@@ -176,7 +183,11 @@ pub fn show(modal: &mut Modal, ctx: &egui::Context) -> Outcome {
                 }
             });
         }
-        Modal::Report { title, lines } => {
+        Modal::Report {
+            title,
+            lines,
+            warnings,
+        } => {
             ui.set_width(560.0);
             ui.heading(title.as_str());
             ui.add_space(6.0);
@@ -186,11 +197,29 @@ pub fn show(modal: &mut Modal, ctx: &egui::Context) -> Outcome {
                     for l in lines.iter() {
                         ui.label(RichText::new(l).monospace().small());
                     }
+                    let warn = ui.visuals().warn_fg_color;
+                    for w in warnings.iter() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(w.path.display().to_string())
+                                    .monospace()
+                                    .small()
+                                    .color(warn),
+                            );
+                            if ui.small_button("Show in folder").clicked() {
+                                out = Outcome::Reveal(w.path.clone());
+                            }
+                        });
+                        ui.label(RichText::new(&w.reason).small().weak());
+                    }
                 });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Copy report").clicked() {
-                    ui.ctx().copy_text(lines.join("\r\n"));
+                    let mut text = lines.clone();
+                    text.extend(warning_lines(warnings));
+                    ui.ctx().copy_text(text.join("\r\n"));
                 }
                 if ui.button("Close").clicked() || esc || enter {
                     out = Outcome::Cancel;
@@ -202,6 +231,14 @@ pub fn show(modal: &mut Modal, ctx: &egui::Context) -> Outcome {
         out = Outcome::Cancel;
     }
     out
+}
+
+/// Warnings as report text ("warning <path>: <reason>"), as logged and copied.
+pub fn warning_lines(warnings: &[OpIssue]) -> Vec<String> {
+    warnings
+        .iter()
+        .map(|w| format!("warning {}: {}", w.path.display(), w.reason))
+        .collect()
 }
 
 /// Summarise a list of paths for a confirmation dialog ("3 items: a.jpg, b.jpg, c.jpg").

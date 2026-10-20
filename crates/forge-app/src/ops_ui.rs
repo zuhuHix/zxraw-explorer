@@ -1271,36 +1271,72 @@ fn finish_report(
     if !report.undo.is_empty() {
         let _ = tx.send(Event::Undo(UndoEntry::Ops(report.undo.clone())));
     }
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "{} done ({}), {} skipped, {} failed{}",
+    for l in report_log_lines(report) {
+        job.log(l);
+    }
+    for _ in 0..report.failed.len() {
+        job.progress.add_error();
+    }
+    let _ = tx.send(report_event(&job.title, report));
+}
+
+/// One-line result of a copy/move/delete: "12 done (3 MB), 0 skipped, 0 failed, 1 warning".
+fn report_summary(report: &OpReport) -> String {
+    format!(
+        "{} done ({}), {} skipped, {} failed{}{}",
         report.done.len(),
         format_size(report.bytes),
         report.skipped.len(),
         report.failed.len(),
+        warnings_suffix(report.warnings.len()),
         if report.cancelled { ", cancelled" } else { "" }
-    ));
+    )
+}
+
+/// ", 1 warning" / ", 3 warnings" after a result summary; empty without warnings.
+pub(crate) fn warnings_suffix(n: usize) -> String {
+    match n {
+        0 => String::new(),
+        1 => ", 1 warning".into(),
+        n => format!(", {n} warnings"),
+    }
+}
+
+/// The summary, then each failed and skipped item.
+fn report_lines(report: &OpReport) -> Vec<String> {
+    let mut lines = vec![report_summary(report)];
     for f in &report.failed {
         lines.push(format!("FAILED  {}: {}", f.path.display(), f.reason));
     }
     for s in &report.skipped {
         lines.push(format!("skipped {}: {}", s.path.display(), s.reason));
     }
-    for l in &lines {
-        job.log(l.clone());
-    }
-    for _ in 0..report.failed.len() {
-        job.progress.add_error();
-    }
-    if !report.failed.is_empty() {
-        let _ = tx.send(Event::Report {
-            title: format!("{} — completed with errors", job.title),
-            lines,
-        });
+    lines
+}
+
+/// What the job writes to its log in the Operations window: the report and its warnings.
+fn report_log_lines(report: &OpReport) -> Vec<String> {
+    let mut lines = report_lines(report);
+    lines.extend(modal::warning_lines(&report.warnings));
+    lines
+}
+
+/// How a finished job tells the user: a toast when all went well, otherwise a report that
+/// lists failures and warnings (a warning is not an error, but the user must learn of it).
+fn report_event(title: &str, report: &OpReport) -> Event {
+    let heading = if !report.failed.is_empty() {
+        "completed with errors"
+    } else if !report.warnings.is_empty() {
+        "completed with warnings"
     } else if report.cancelled {
-        let _ = tx.send(Event::Toast(format!("{} — cancelled", job.title)));
+        return Event::Toast(format!("{title} — cancelled"));
     } else {
-        let _ = tx.send(Event::Toast(lines.remove(0)));
+        return Event::Toast(report_summary(report));
+    };
+    Event::ReportWithWarnings {
+        title: format!("{title} — {heading}"),
+        lines: report_lines(report),
+        warnings: report.warnings.clone(),
     }
 }
 
@@ -2529,6 +2565,66 @@ mod tests {
         assert!(text.contains(r"C:\x\big: partly deleted"), "{text}");
         assert!(text.contains("Cancelled before 1 more item(s)"), "{text}");
         assert!(!text.contains(r"C:\x\a"), "{text}");
+    }
+
+    #[test]
+    fn warnings_are_counted_and_reported_not_toasted() {
+        let kept = ops::OpIssue::new(
+            r"C:\x\a.jpg",
+            r"replaced, but the previous version could not be deleted; it was kept as C:\x\a.old.jpg",
+        );
+        let mut report = OpReport {
+            done: vec![PathBuf::from(r"C:\x\a.jpg"), PathBuf::from(r"C:\x\b.jpg")],
+            warnings: vec![kept.clone()],
+            ..Default::default()
+        };
+        let zero = format_size(0);
+        assert_eq!(
+            report_summary(&report),
+            format!("2 done ({zero}), 0 skipped, 0 failed, 1 warning")
+        );
+        match report_event("Copying 2 item(s)", &report) {
+            Event::ReportWithWarnings {
+                title,
+                lines,
+                warnings,
+            } => {
+                assert_eq!(title, "Copying 2 item(s) — completed with warnings");
+                assert_eq!(lines, vec![report_summary(&report)]);
+                assert_eq!(warnings, vec![kept.clone()]);
+            }
+            _ => panic!("warnings must open a report, not a toast"),
+        }
+        let log = report_log_lines(&report).join("\n");
+        assert!(log.contains(r"warning C:\x\a.jpg: replaced"), "{log}");
+        assert!(log.contains(r"kept as C:\x\a.old.jpg"), "{log}");
+
+        report.warnings.push(kept);
+        report.failed.push(ops::OpIssue::new(r"C:\x\c.jpg", "denied"));
+        assert!(report_summary(&report).ends_with("1 failed, 2 warnings"));
+        assert!(matches!(
+            report_event("Copy", &report),
+            Event::ReportWithWarnings { title, warnings, .. }
+                if title == "Copy — completed with errors" && warnings.len() == 2
+        ));
+
+        let clean = OpReport {
+            done: vec![PathBuf::from(r"C:\x\a.jpg")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            report_event("Copy", &clean),
+            Event::Toast(t) if t == format!("1 done ({zero}), 0 skipped, 0 failed")
+        ));
+        let cancelled = OpReport {
+            cancelled: true,
+            warnings: vec![ops::OpIssue::new(r"C:\x\a.jpg", "kept as x")],
+            ..Default::default()
+        };
+        assert!(matches!(
+            report_event("Copy", &cancelled),
+            Event::ReportWithWarnings { lines, .. } if lines[0].ends_with("1 warning, cancelled")
+        ));
     }
 
     #[test]

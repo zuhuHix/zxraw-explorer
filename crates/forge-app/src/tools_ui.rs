@@ -488,15 +488,7 @@ impl ToolWindow {
                     }
                 }
                 ToolPayload::Synced(report) => {
-                    self.notice = Some(if report.failed.is_empty() {
-                        format!(
-                            "Sync complete: {} item(s), {}",
-                            report.done.len(),
-                            format_size(report.bytes)
-                        )
-                    } else {
-                        format!("Sync finished with {} error(s)", report.failed.len())
-                    });
+                    self.notice = Some(sync_summary(&report));
                     if let ToolState::Compare(state) = &mut self.state {
                         state.last_sync = Some(report);
                         state.plan = None;
@@ -976,6 +968,20 @@ fn automation_compare_execute_plan(app: &mut ZxrawApp, mode: SyncMode) -> Result
         DeferredAction::ExecuteSync(plan),
     );
     Ok(())
+}
+
+/// One-line result of a folder sync, warnings counted after the items.
+fn sync_summary(report: &OpReport) -> String {
+    let warnings = crate::ops_ui::warnings_suffix(report.warnings.len());
+    if report.failed.is_empty() {
+        format!(
+            "Sync complete: {} item(s), {}{warnings}",
+            report.done.len(),
+            format_size(report.bytes)
+        )
+    } else {
+        format!("Sync finished with {} error(s){warnings}", report.failed.len())
+    }
 }
 
 pub(crate) fn automation_compare_sync_result(app: &mut ZxrawApp) -> Option<OpReport> {
@@ -1592,16 +1598,18 @@ fn launch_action(
                     .iter()
                     .map(|issue| format!("FAILED  {}: {}", issue.path.display(), issue.reason))
                     .collect();
-                if lines.is_empty() {
-                    let _ = tx.send(Event::Toast(format!(
-                        "Sync complete: {} item(s), {}",
-                        report.done.len(),
-                        format_size(report.bytes)
-                    )));
+                let warnings = crate::modal::warning_lines(&report.warnings);
+                for line in lines.iter().chain(&warnings) {
+                    job.log(line.clone());
+                }
+                if lines.is_empty() && warnings.is_empty() {
+                    let _ = tx.send(Event::Toast(sync_summary(&report)));
                 } else {
-                    let _ = tx.send(Event::Report {
-                        title: "Folder sync completed with errors".into(),
+                    let heading = if lines.is_empty() { "warnings" } else { "errors" };
+                    let _ = tx.send(Event::ReportWithWarnings {
+                        title: format!("Folder sync completed with {heading}"),
                         lines,
+                        warnings: report.warnings.clone(),
                     });
                 }
                 for _ in &report.failed {
@@ -3630,6 +3638,22 @@ fn write_report_file(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_summary_counts_warnings() {
+        let mut report = OpReport {
+            done: vec![PathBuf::from("a.jpg")],
+            warnings: vec![forge_core::ops::OpIssue::new("a.jpg", "kept as a.old.jpg")],
+            ..Default::default()
+        };
+        assert_eq!(
+            sync_summary(&report),
+            format!("Sync complete: 1 item(s), {}, 1 warning", format_size(0))
+        );
+        report.failed.push(forge_core::ops::OpIssue::new("b.jpg", "denied"));
+        report.warnings.push(forge_core::ops::OpIssue::new("c.jpg", "kept"));
+        assert_eq!(sync_summary(&report), "Sync finished with 1 error(s), 2 warnings");
+    }
 
     #[test]
     fn verify_filter_chips_show_their_statuses() {
