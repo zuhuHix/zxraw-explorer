@@ -120,7 +120,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   nothing until it ends (the bar slides). Measured with `forge-win`'s `recycle_bench` example
   on 200,000 small files on an SSD: about 4 s counting and 11 s in that last step, 15-16 s in
   all, the same with or without ZXraw's progress sink, with `SHFileOperation`, and with the
-  shell's own progress window as Explorer runs it. The programs named for a file in use
+  shell's own progress window as Explorer runs it. Pause and Cancel cannot interrupt that
+  last step: pressed during it, the popup says "Pausing (or Stopping) after the current
+  folder…" and they take effect when it ends. Undo pauses and stops between the changes it
+  undoes; a cancelled Undo puts the changes not undone back on the Undo stack. The programs named for a file in use
   come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
   services and kernel holders.
 * Where a file system has no stable file IDs (some network shares, index 0), "the same item"
