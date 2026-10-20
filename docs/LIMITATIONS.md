@@ -80,8 +80,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Explorer's paste of ZXraw's copy or cut is tested
   through the shell's paste verb. A cut pasted elsewhere is noticed only by its items leaving
-  their folders (checked every 0.75 s), so if they reappear (for example, undo in Explorer) the
-  cut is not restored. Paste into other applications has not been checked.
+  their folders: one thread checks the newest cut every 0.75 s, and an item counts as gone
+  when it is missing twice in a row while the folder above it can be read, or when a
+  different item has taken its name. An item that comes back later (for example, undo in
+  Explorer) is not cut again. While a drive or share cannot be reached, its items stay cut,
+  and a slow drive delays the checks. Our own clipboard content is recognised by a private
+  "ZXraw Explorer Clipboard Owner" format, so another app's identical list is never
+  cleared. Paste into other applications has not been checked.
 * Opening a file (double-click, Enter, or **Open**) starts it in the file's own folder, as
   Explorer does. Scripts in a UNC folder (`\\server\share`) still run in the Windows folder,
   because `cmd.exe` cannot use a UNC path as its working directory; Explorer behaves the same.

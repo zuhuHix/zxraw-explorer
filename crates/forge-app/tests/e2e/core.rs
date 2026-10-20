@@ -1128,10 +1128,9 @@ fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
             loop {
                 if let Ok(Some((paths, forge_win::ClipboardEffect::Move))) =
                     forge_win::get_files()
+                    && paths == vec![cut.clone()]
                 {
-                    if paths == vec![cut.clone()] {
-                        break;
-                    }
+                    break;
                 }
                 if std::time::Instant::now() >= deadline {
                     return false;
@@ -1183,6 +1182,172 @@ fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
             .map(|(paths, _)| paths),
         Some(vec![folders[0].clone()]),
         "the stale cut is still on the clipboard"
+    );
+}
+
+/// Waits (up to 60 s) until the Windows clipboard holds a cut of exactly `paths`.
+fn wait_for_move_cut(paths: Vec<PathBuf>) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(Some((found, forge_win::ClipboardEffect::Move))) = forge_win::get_files()
+            && found == paths
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Explorer moves one of two cut folders away: ZXraw drops it from the cut and the clipboard
+/// keeps only the item that is still there.
+#[test]
+fn an_item_moved_away_leaves_the_rest_of_the_cut() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    let mover = {
+        let folders = folders.clone();
+        let work = work.clone();
+        std::thread::spawn(move || -> bool {
+            if !wait_for_move_cut(folders.to_vec()) {
+                return false;
+            }
+            fs::rename(&folders[0], work.join("Shoot A")).is_ok()
+        })
+    };
+    let script = format!(
+        "navigate {desktop}\n\
+         select Shoot A, Shoot B\n\
+         key ctrl+X\n\
+         ui system wait-cut 1\n\
+         wait-no-entry Shoot A\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(
+        mover.join().unwrap(),
+        "the cut never reached the clipboard or Shoot A did not move"
+    );
+    assert_eq!(
+        forge_win::get_files().unwrap(),
+        Some((vec![folders[1].clone()], forge_win::ClipboardEffect::Move)),
+        "the clipboard should keep only the item that is still there"
+    );
+    let _ = forge_win::clear_if_owned_files(&[folders[1].clone()], None);
+}
+
+/// Explorer replaces a cut folder with a different one of the same name (a new file ID). The
+/// cut must drop it rather than move the replacement.
+#[test]
+fn a_replaced_cut_item_is_never_moved() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    let replacer = {
+        let folders = folders.clone();
+        let desktop = desktop.clone();
+        std::thread::spawn(move || -> bool {
+            if !wait_for_move_cut(vec![folders[0].clone()]) {
+                return false;
+            }
+            // Give the cut watcher time to record the original folder first.
+            std::thread::sleep(Duration::from_secs(2));
+            if fs::rename(&folders[0], desktop.join("Shoot A old")).is_err() {
+                return false;
+            }
+            write_file(&folders[0].join("new.txt"), b"replacement");
+            true
+        })
+    };
+    let script = format!(
+        "navigate {desktop}\n\
+         select Shoot A\n\
+         key ctrl+X\n\
+         ui system wait-cut 0\n\
+         navigate {work}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         sleep 1500\n\
+         wait-jobs 20\n\
+         exit\n",
+        desktop = shown(&desktop),
+        work = shown(&work),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert!(replacer.join().unwrap(), "the replacement was not made");
+    assert_eq!(
+        fs::read(folders[0].join("new.txt")).unwrap(),
+        b"replacement",
+        "the replacement folder was moved"
+    );
+    assert!(
+        !work.join("Shoot A").exists(),
+        "the replacement was pasted into work"
+    );
+    assert_eq!(
+        fs::read(desktop.join("Shoot A old").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+}
+
+/// Renaming a cut item in ZXraw (F2) keeps the cut on the new name, so a later paste moves it.
+#[test]
+fn renaming_a_cut_item_in_zxraw_keeps_it_cut() {
+    let _clipboard = clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let (desktop, work, folders) = clipboard_fixture(sandbox.path());
+    let renamed = desktop.join("Shoot Renamed");
+    let script = format!(
+        "navigate {desktop}\n\
+         select Shoot A\n\
+         key ctrl+X\n\
+         ui system wait-cut 1\n\
+         sleep 1000\n\
+         key F2\n\
+         type Shoot Renamed\n\
+         accept\n\
+         wait-exists {renamed}\n\
+         sleep 2500\n\
+         ui system wait-cut 1\n\
+         ui system assert-cut-path {renamed}\n\
+         navigate {work}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         wait-exists {moved}\n\
+         wait-jobs 20\n\
+         ui system wait-no-cut\n\
+         assert-no-error-toast\n\
+         exit\n",
+        desktop = shown(&desktop),
+        work = shown(&work),
+        renamed = shown(&renamed),
+        moved = shown(&work.join("Shoot Renamed").join("a.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_eq!(
+        fs::read(work.join("Shoot Renamed").join("a.txt")).unwrap(),
+        b"folder a"
+    );
+    assert!(!renamed.exists(), "the renamed folder was left in the Desktop");
+    assert!(folders[1].is_dir(), "an item that was not cut stays");
+    let clip = forge_win::get_files().ok().flatten().map(|(paths, _)| paths);
+    assert!(
+        !clip.is_some_and(|paths| paths.contains(&renamed)),
+        "the clipboard still holds the renamed cut"
     );
 }
 

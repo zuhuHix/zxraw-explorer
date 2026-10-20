@@ -198,8 +198,12 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   Explorer to paste. A cut pasted through Explorer's own paste verb moves the items, and ZXraw
   then drops the cut, takes it off the Windows clipboard and lists the source folder again:
   `a_cut_pasted_in_explorer_is_used_up_in_zxraw` (`forge-app/tests/e2e/core.rs`) and `forge-win`
-  `clipboard::tests::shell_paste_moves_a_cut`. Pressing Ctrl+V in a real Explorer window or on
-  the desktop was checked by hand, not in the suite.
+  `clipboard::tests::shell_paste_moves_a_cut`. Only the items moved away leave the cut
+  (`an_item_moved_away_leaves_the_rest_of_the_cut`), an item replaced by another under the
+  same name is never moved (`a_replaced_cut_item_is_never_moved`), and a cut item renamed in
+  ZXraw stays cut (`renaming_a_cut_item_in_zxraw_keeps_it_cut`); the checks themselves are in
+  `cut_watch::tests`. Pressing Ctrl+V in a real Explorer window or on the desktop was checked
+  by hand, not in the suite.
 * ✅ Copy line: copies and moves run one at a time in a queue (Settings › File operations,
   "Run copies and moves": queue by default, or all at once). Queued jobs wait as "Queued" in
   the Operations panel in run order, with buttons to move a job up or down, start it now,
