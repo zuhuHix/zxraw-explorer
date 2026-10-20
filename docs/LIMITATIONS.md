@@ -118,9 +118,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   it. Windows first counts every file in the folder (the popup shows how many it has found),
   then moves the folder in one step and does its own bookkeeping for each file, reporting
   nothing until it ends (the bar slides). Measured with `forge-win`'s `recycle_bench` example
-  on 200,000 small files on an SSD: about 4 s counting and 12 s in that last step, the same
-  with or without ZXraw's progress sink and with `SHFileOperation`; the shell with its own
-  progress window (as Explorer runs it) took twice as long. The programs named for a file in use
+  on 200,000 small files on an SSD: about 4 s counting and 11 s in that last step, 15-16 s in
+  all, the same with or without ZXraw's progress sink, with `SHFileOperation`, and with the
+  shell's own progress window as Explorer runs it. The programs named for a file in use
   come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
   services and kernel holders.
 * Where a file system has no stable file IDs (some network shares, index 0), "the same item"
