@@ -25,11 +25,17 @@ fn recycle_sandbox() -> Option<PathBuf> {
 }
 
 /// Sends each path to the Recycle Bin (or the sandbox set by [`set_recycle_sandbox`]),
-/// without progress. Never deletes permanently. Fails with [`WinError::NotDeleted`] when
-/// any item stays, and [`WinError::Aborted`] when the user cancelled in a shell dialog. See
-/// [`crate::recycle_items`] for a per-item report.
+/// without progress. Never deletes permanently. See [`crate::recycle_items`] for a per-item
+/// report, and [`recycle_result`] for the errors.
 pub fn recycle(paths: &[PathBuf]) -> Result<()> {
-    let report = crate::recycle::recycle_items(paths, Box::new(|_| true));
+    recycle_result(&crate::recycle::recycle_items(paths, Box::new(|_| true)))
+}
+
+/// A recycle's report as one result. [`WinError::NotDeleted`] when any item stays, naming
+/// the first and saying whether the rest was cancelled; [`WinError::Aborted`] when it was
+/// only cancelled.
+pub fn recycle_result(report: &crate::DeleteReport) -> Result<()> {
+    let mut parts = Vec::new();
     if let Some((path, why)) = report.failed.first() {
         let more = report.failed.len() - 1;
         let more = if more > 0 {
@@ -37,15 +43,26 @@ pub fn recycle(paths: &[PathBuf]) -> Result<()> {
         } else {
             String::new()
         };
-        return Err(WinError::NotDeleted(format!(
-            "{}: {why}{more}",
+        parts.push(format!("{}: {why}{more}", path.display()));
+    }
+    if let Some(path) = report.partly_deleted.first() {
+        parts.push(format!(
+            "{}: partly deleted, some of its contents may already be gone",
             path.display()
-        )));
+        ));
     }
     if report.cancelled {
-        return Err(WinError::Aborted { op: "recycle" });
+        if parts.is_empty() {
+            return Err(WinError::Aborted { op: "recycle" });
+        }
+        let left = report.not_started.len();
+        parts.push(format!("cancelled; {left} more item(s) left as they were"));
     }
-    Ok(())
+    if parts.is_empty() {
+        Ok(())
+    } else {
+        Err(WinError::NotDeleted(parts.join("; ")))
+    }
 }
 
 pub(crate) fn recycle_sandbox_dir() -> Option<PathBuf> {
@@ -513,6 +530,31 @@ mod tests {
         std::fs::write(&f, b"bin me").unwrap();
         recycle(std::slice::from_ref(&f)).unwrap();
         assert!(!f.exists(), "file still present after recycle");
+    }
+
+    #[test]
+    fn a_recycle_result_keeps_failures_and_the_cancel() {
+        let report = crate::DeleteReport {
+            failed: vec![(PathBuf::from("a"), crate::DeleteFailure::InUse)],
+            not_started: vec![PathBuf::from("b")],
+            cancelled: true,
+            ..Default::default()
+        };
+        match recycle_result(&report) {
+            Err(WinError::NotDeleted(m)) => {
+                assert!(m.contains("in use") && m.contains("cancelled"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let only_cancelled = crate::DeleteReport {
+            cancelled: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            recycle_result(&only_cancelled),
+            Err(WinError::Aborted { .. })
+        ));
+        assert!(recycle_result(&crate::DeleteReport::default()).is_ok());
     }
 
     #[test]

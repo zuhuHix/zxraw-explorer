@@ -107,6 +107,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Where a file system has no stable file IDs (some network shares, index 0), "the same item"
   rests on type and creation time (plus size and write time for files). A folder replaced by
   another created at the very same instant would pass; no missing time ever counts as a match.
+* Accepted risk: on drives without stable file IDs (FAT and exFAT USB sticks and cards, some
+  network shares), a folder deleted and recreated under the same name while the "Delete
+  permanently?" question is open can look identical to the one the user was asked about.
+  Windows' file-system tunnelling gives the new folder the old one's creation time, and a
+  folder's identity there is only its type and creation time. Confirming the question would
+  then delete the new folder.
 
 * Online-only cloud files (OneDrive, Dropbox, Google Drive placeholders) are detected from
   their attributes and never read by background work, so they show a cloud badge and no
