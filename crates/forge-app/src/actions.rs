@@ -1159,6 +1159,11 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
     });
 }
 
+/// Bounded identity checks that share the cut watcher's slots, if it is running.
+pub fn cut_checker(app: &ZxrawApp) -> Option<crate::cut_watch::Checker> {
+    app.ops.cut_watcher.as_ref().map(|w| w.checker())
+}
+
 /// The known identities of the cut `generation`'s items (empty if that cut is gone). A
 /// paste of the cut moves only these items, and only while they are still these.
 pub fn cut_identities(

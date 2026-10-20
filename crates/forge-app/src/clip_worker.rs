@@ -76,14 +76,15 @@ pub struct Done {
 
 /// The clipboard calls, replaceable in tests.
 pub trait Clipboard: Send + 'static {
-    /// Whether another app has put content on the clipboard since sequence `since` (our
-    /// own content, from this process, does not count).
-    fn taken_since(&mut self, since: u32) -> Result<bool, String>;
+    /// Publishes `paths`, unless another app has put content on the clipboard since sequence
+    /// `baseline` (`Ok(None)`; our own content, from this process, does not count). Checked
+    /// and written in one clipboard session.
     fn publish(
         &mut self,
         paths: &[PathBuf],
         effect: ClipboardEffect,
-    ) -> Result<ClipboardToken, String>;
+        baseline: u32,
+    ) -> Result<Option<ClipboardToken>, String>;
     fn replace(
         &mut self,
         paths: &[PathBuf],
@@ -98,19 +99,13 @@ pub trait Clipboard: Send + 'static {
 pub struct Windows;
 
 impl Clipboard for Windows {
-    fn taken_since(&mut self, since: u32) -> Result<bool, String> {
-        if forge_win::clipboard_sequence() == since {
-            return Ok(false);
-        }
-        let owner = forge_win::clipboard_owner().map_err(|e| e.to_string())?;
-        Ok(!owner.is_some_and(ClipboardToken::is_from_this_process))
-    }
     fn publish(
         &mut self,
         paths: &[PathBuf],
         effect: ClipboardEffect,
-    ) -> Result<ClipboardToken, String> {
-        forge_win::set_files(paths, effect).map_err(|e| e.to_string())
+        baseline: u32,
+    ) -> Result<Option<ClipboardToken>, String> {
+        forge_win::set_files_if_unchanged(paths, effect, baseline).map_err(|e| e.to_string())
     }
     fn replace(
         &mut self,
@@ -267,10 +262,9 @@ impl<C: Clipboard> Worker<C> {
                 effect,
                 baseline,
             } => {
-                if self.clipboard.taken_since(*baseline)? {
+                let Some(token) = self.clipboard.publish(paths, *effect, *baseline)? else {
                     return Ok(Outcome::NotOurs);
-                }
-                let token = self.clipboard.publish(paths, *effect)?;
+                };
                 self.ours = Some(token);
                 Ok(Outcome::Published(token))
             }
@@ -345,16 +339,17 @@ mod tests {
     }
 
     impl Clipboard for Fake {
-        fn taken_since(&mut self, since: u32) -> Result<bool, String> {
-            Ok(*self.taken_after.lock().unwrap() > since)
-        }
         fn publish(
             &mut self,
             paths: &[PathBuf],
             _: ClipboardEffect,
-        ) -> Result<ClipboardToken, String> {
+            baseline: u32,
+        ) -> Result<Option<ClipboardToken>, String> {
             self.call(format!("publish {}", paths.len()))?;
-            Ok(self.token())
+            if *self.taken_after.lock().unwrap() > baseline {
+                return Ok(None);
+            }
+            Ok(Some(self.token()))
         }
         fn replace(
             &mut self,
@@ -457,9 +452,13 @@ mod tests {
             backoff: &NO_WAIT,
         };
         let done = w.serve(req(1, 0, publish(1)), &rx).unwrap();
-        assert_eq!(done.outcome, Outcome::NotOurs);
-        assert_eq!(fake.log(), vec!["publish 1"], "never retried over the newer content");
-        assert_eq!(w.ours, None);
+        assert_eq!(
+            done.outcome,
+            Outcome::NotOurs,
+            "the retry found newer content"
+        );
+        assert_eq!(fake.log(), vec!["publish 1", "publish 1"]);
+        assert_eq!(w.ours, None, "nothing of ours was written");
     }
 
     /// Runs `after_failure` once the wrapped clipboard has failed a call.
@@ -469,15 +468,13 @@ mod tests {
     }
 
     impl Clipboard for Hook {
-        fn taken_since(&mut self, since: u32) -> Result<bool, String> {
-            self.inner.taken_since(since)
-        }
         fn publish(
             &mut self,
             paths: &[PathBuf],
             effect: ClipboardEffect,
-        ) -> Result<ClipboardToken, String> {
-            let result = self.inner.publish(paths, effect);
+            baseline: u32,
+        ) -> Result<Option<ClipboardToken>, String> {
+            let result = self.inner.publish(paths, effect, baseline);
             if result.is_err() {
                 (self.after_failure)();
             }

@@ -160,6 +160,17 @@ impl Checker {
         paths: Vec<PathBuf>,
         timeout: Duration,
     ) -> Option<Vec<Observation>> {
+        self.check_unless(generation, paths, timeout, || false)
+    }
+
+    /// [`Checker::check`] that also gives up (`None`) as soon as `cancelled` says so.
+    pub fn check_unless(
+        &self,
+        generation: u64,
+        paths: Vec<PathBuf>,
+        timeout: Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Option<Vec<Observation>> {
         let deadline = Instant::now() + timeout;
         let (tx, rx) = crossbeam_channel::bounded(1);
         loop {
@@ -167,16 +178,27 @@ impl Checker {
             let send = move |seen| {
                 let _ = tx.send(seen);
             };
-            if spawn_check((self.watcher, generation), paths.clone(), self.observe, send) {
+            if spawn_check(
+                (self.watcher, generation),
+                paths.clone(),
+                self.observe,
+                send,
+            ) {
                 break;
             }
-            if Instant::now() >= deadline {
+            if Instant::now() >= deadline || cancelled() {
                 return None;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .ok()
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+                Ok(seen) => return Some(seen),
+                Err(_) if left.is_zero() || cancelled() => return None,
+                Err(_) => {}
+            }
+        }
     }
 }
 
@@ -708,12 +730,20 @@ mod tests {
         // A check of cut 1 hangs on a share: a second one for cut 1 waits for its slot and
         // gives up in time; another cut is checked meanwhile.
         let hung = std::thread::spawn(move || {
-            checker.check(1, vec![PathBuf::from(r"B:\block\p")], Duration::from_millis(300))
+            checker.check(
+                1,
+                vec![PathBuf::from(r"B:\block\p")],
+                Duration::from_millis(300),
+            )
         });
         std::thread::sleep(Duration::from_millis(100));
         let started = Instant::now();
         assert_eq!(
-            checker.check(1, vec![PathBuf::from(r"W:\paste")], Duration::from_millis(300)),
+            checker.check(
+                1,
+                vec![PathBuf::from(r"W:\paste")],
+                Duration::from_millis(300)
+            ),
             None
         );
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -722,6 +752,16 @@ mod tests {
             Some(vec![Observation::Present(A)])
         );
         assert_eq!(hung.join().unwrap(), None, "the hung check itself gave up");
+        // Cancelled: given up at once, long before the timeout.
+        let started = Instant::now();
+        let cancelled = checker.check_unless(
+            3,
+            vec![PathBuf::from(r"B:\block\q")],
+            Duration::from_secs(30),
+            || started.elapsed() > Duration::from_millis(200),
+        );
+        assert_eq!(cancelled, None);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     static SCRIPT: Mutex<Vec<(PathBuf, Observation)>> = Mutex::new(Vec::new());
