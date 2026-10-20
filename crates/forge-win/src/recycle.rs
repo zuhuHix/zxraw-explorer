@@ -787,8 +787,10 @@ mod imp {
             } else {
                 DeleteStage::Deleting
             });
+            // The first item of a pass is reported at once; later ones are throttled.
+            let first = s.progress.current.is_none();
             s.progress.current = path.map(PathBuf::from);
-            if s.tell_if(changed || top) { Ok(()) } else { Err(cancel_hr()) }
+            if s.tell_if(changed || first) { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PostDeleteItem(
             &self,
@@ -810,10 +812,10 @@ mod imp {
             if top && hr.is_ok() && hr.0 as u32 != codes::S_NOT_HANDLED {
                 s.progress.items_done += 1;
             }
-            if top {
-                s.enter(DeleteStage::Deleting);
-            }
-            if s.tell_if(top) { Ok(()) } else { Err(cancel_hr()) }
+            // A finished item is throttled like any count; the end of the pass reports
+            // the last one.
+            let changed = top && s.enter(DeleteStage::Deleting);
+            if s.tell_if(changed) { Ok(()) } else { Err(cancel_hr()) }
         }
         fn PreNewItem(&self, _: u32, _: Ref<IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
             Ok(())
