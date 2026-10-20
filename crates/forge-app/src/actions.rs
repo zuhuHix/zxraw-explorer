@@ -700,20 +700,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::Undo if app.ops.name_jobs_pending > 0 => {
             app.toast("Waiting for the rename to finish; try Undo again in a moment")
         }
-        // One undo job at a time: a cancelled one puts its rest back on the stack, and two
-        // putting back at once could swap the order of what is left.
+        // One undo at a time, of any kind: each must act on the state the one before left.
         Cmd::Undo if crate::ops_ui::undo_running(&app.ops.jobs) => {
             app.toast("Undo already in progress; try again when it finishes")
         }
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
-            Some(UndoEntry::Ops(records)) => {
-                let slot = UndoSlot {
-                    index: app.ops.undo.len(),
-                    trimmed: app.ops.undo_trimmed,
-                };
-                crate::ops_ui::undo_ops(app, records, slot)
-            }
+            Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
             Some(UndoEntry::TextReplace(records)) => crate::replace_ui::undo(app, records),
             Some(UndoEntry::Rename(pairs)) => {
                 let slot = UndoSlot {
@@ -879,7 +872,7 @@ fn lane_key(path: &Path) -> String {
 
 /// Where an undo record sat on the stack when Undo took it: `index` from the bottom, at a time
 /// when the size cap had removed `trimmed` records. Records pushed meanwhile stay above it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UndoSlot {
     index: usize,
     trimmed: u64,

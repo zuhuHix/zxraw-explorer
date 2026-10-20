@@ -1,6 +1,7 @@
 //! Times sending a big test tree to the Recycle Bin: the plain shell (no progress sink)
-//! against [`forge_win::recycle_items`]. Builds its own tree under %TEMP%, and removes what
-//! it put in the Recycle Bin afterwards.
+//! against [`forge_win::recycle_items`]. Builds its own trees in a new uniquely named folder
+//! under %TEMP%, and afterwards removes from the Recycle Bin only the entries whose original
+//! path is one of those trees.
 //!
 //! `cargo run -p forge-win --example recycle_bench --release -- [files] [runs]`
 
@@ -11,9 +12,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let files: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(50_000);
     let runs: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(1);
-    let root = std::env::temp_dir().join("zx-recycle-bench");
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    // Created new (never an existing folder), with a random suffix; removed when dropped.
+    let dir = tempfile::Builder::new()
+        .prefix("zx-recycle-bench-")
+        .tempdir()
+        .unwrap();
+    let root = dir.path().to_path_buf();
 
     for run in 0..runs {
         let only = args.get(3).cloned();
@@ -61,10 +65,10 @@ fn main() {
                 "{mode:14} {files} files: {secs:7.2}s  gone={}  {info}",
                 !tree.exists()
             );
-            purge_bin();
+            purge_bin(&tree);
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
+    drop(dir);
 }
 
 #[cfg(windows)]
@@ -184,10 +188,31 @@ fn zx(tree: &std::path::Path) -> String {
     )
 }
 
-/// Removes from the Recycle Bin everything this bench put there.
+/// The original path stored in a Recycle Bin `$I` file (format 1 or 2).
 #[cfg(windows)]
-fn purge_bin() {
-    let drive = std::env::temp_dir()
+fn original_path(info: &[u8]) -> Option<String> {
+    let version = u64::from_le_bytes(info.get(..8)?.try_into().ok()?);
+    let utf16 = match version {
+        1 => info.get(24..24 + 520)?,
+        2 => {
+            let chars = u32::from_le_bytes(info.get(24..28)?.try_into().ok()?) as usize;
+            info.get(28..28 + 2 * chars)?
+        }
+        _ => return None,
+    };
+    let units: Vec<u16> = utf16
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
+/// Removes from the Recycle Bin the entry whose original path is exactly `tree`.
+#[cfg(windows)]
+fn purge_bin(tree: &std::path::Path) {
+    let want = tree.to_string_lossy().to_lowercase();
+    let drive = tree
         .components()
         .next()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
@@ -200,13 +225,7 @@ fn purge_bin() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(rest) = name.strip_prefix("$I") else { continue };
             let Ok(bytes) = std::fs::read(e.path()) else { continue };
-            let text = String::from_utf16_lossy(
-                &bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect::<Vec<_>>(),
-            );
-            if text.contains("zx-recycle-bench") {
+            if original_path(&bytes).is_some_and(|p| p.to_lowercase() == want) {
                 let r = sid.path().join(format!("$R{rest}"));
                 let _ = std::fs::remove_dir_all(&r);
                 let _ = std::fs::remove_file(&r);
