@@ -229,7 +229,10 @@ as automated at startup and then:
 * answer native file dialogs from the script (`dialog <path>` / `dialog cancel`, queued before the
   click that opens the dialog). An unexpected dialog fails the script instead of blocking;
 * send Recycle Bin operations to `<profile>/data/recycle-sandbox` (`forge_win::set_recycle_sandbox`).
-  Recycle commands in a script are refused unless that sandbox is active;
+  Recycle commands in a script are refused unless that sandbox is active. The sandbox refuses
+  items whose name starts with `not-recyclable` (`forge_win::recycle::SANDBOX_NOT_RECYCLABLE_PREFIX`),
+  as the Recycle Bin refuses items too big for it, so scripts can reach the "Delete permanently
+  instead?" dialog;
 * turn off egui animations so frame counts are deterministic;
 * skip the first-run welcome unless `ZXRAW_FIRST_RUN=1`;
 * never check for updates, unless `ZXRAW_UPDATE_API` points the check at a test server

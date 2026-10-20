@@ -96,7 +96,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   or empty data. Open With, Properties, and Explorer reveal are not tested by any automated test.
 * Automated runs (UI test hook, e2e suite) use a throwaway profile and recycle into a sandbox
   folder inside it. The real Recycle Bin is only exercised by an opt-in unit test
-  (`forge-win` `shell::tests`, run with `--ignored`) and manual use.
+  (`forge-win` `shell::tests`, run with `--ignored`) and manual use. The sandbox refuses items
+  whose name starts with `not-recyclable`, standing in for the Recycle Bin's "too big" refusal.
+* The administrator prompt for deleting from protected folders is Windows' own dialog (then
+  UAC), not the app's styled one. It is owned by the main window so it opens in front. A
+  recycle's progress counts the shell's work units (about one per file or folder) and moves in
+  jumps, because recycling a folder is a single rename. The programs named for a file in use
+  come from Restart Manager, which looks at the first 5,000 files of a folder and can miss
+  services and kernel holders.
 
 * Online-only cloud files (OneDrive, Dropbox, Google Drive placeholders) are detected from
   their attributes and never read by background work, so they show a cloud badge and no

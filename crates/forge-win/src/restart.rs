@@ -11,6 +11,49 @@ use crate::{Result, WinError};
 /// Returns `(pid, application name)` for each process currently using `path`.
 #[cfg(windows)]
 pub fn file_locking_processes(path: &Path) -> Result<Vec<(u32, String)>> {
+    locking_processes(std::slice::from_ref(&path))
+}
+
+/// The names of the programs using `path` or, for a folder, any of the first `max_files`
+/// files inside it. Sorted, without duplicates; empty when none are found or the lookup
+/// fails.
+pub fn processes_using(path: &Path, max_files: usize) -> Vec<String> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs = vec![path.to_path_buf()];
+    if !path.is_dir() {
+        files.push(path.to_path_buf());
+        dirs.clear();
+    }
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if files.len() >= max_files {
+                break;
+            }
+            match e.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(e.path()),
+                Ok(_) => files.push(e.path()),
+                Err(_) => {}
+            }
+        }
+    }
+    let mut names: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    for chunk in files.chunks(500) {
+        let refs: Vec<&Path> = chunk.iter().map(|p| p.as_path()).collect();
+        if let Ok(found) = locking_processes(&refs) {
+            names.extend(found.into_iter().map(|(_, name)| name));
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[cfg(windows)]
+fn locking_processes(paths: &[&Path]) -> Result<Vec<(u32, String)>> {
     use windows::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS, WIN32_ERROR};
     use windows::Win32::System::RestartManager::{
         CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
@@ -35,8 +78,8 @@ pub fn file_locking_processes(path: &Path) -> Result<Vec<(u32, String)>> {
 
     // Always end the session, whatever happens below.
     let result = (|| {
-        let wide = crate::to_wide(path);
-        let files = [PCWSTR(wide.as_ptr())];
+        let wide: Vec<Vec<u16>> = paths.iter().map(crate::to_wide).collect();
+        let files: Vec<PCWSTR> = wide.iter().map(|w| PCWSTR(w.as_ptr())).collect();
         let rc = unsafe { RmRegisterResources(session, Some(&files), None, None) };
         if rc != ERROR_SUCCESS {
             return Err(rm_err("RmRegisterResources", rc));

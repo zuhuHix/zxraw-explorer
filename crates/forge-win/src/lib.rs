@@ -23,16 +23,17 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 mod clipboard;
-mod file_types;
-mod integration;
 pub mod desktop;
 pub mod dragout;
 pub mod drives;
 pub mod ext_search;
+mod file_types;
 pub mod files;
 pub mod http;
+mod integration;
 pub mod network;
 pub mod process;
+pub mod recycle;
 pub mod restart;
 pub mod shell;
 mod user_choice;
@@ -57,7 +58,11 @@ pub use integration::{
     unregister_context_menu, unregister_default_folder_handler,
 };
 pub use process::launch;
-pub use restart::file_locking_processes;
+pub use recycle::{
+    DeleteFailure, DeleteObserver, DeleteProgress, DeleteReport, delete_items_permanently,
+    recycle_items, set_dialog_owner,
+};
+pub use restart::{file_locking_processes, processes_using};
 pub use shell::{
     known_folders, open_default, open_folder_in_explorer, open_with_dialog, recycle,
     recycle_sandbox_active, recycle_to_sandbox, reveal_in_explorer, set_recycle_sandbox,
@@ -93,6 +98,9 @@ pub enum WinError {
     /// The shell reported that the user or system aborted part of the operation.
     #[error("{op}: the operation was aborted or only partly completed")]
     Aborted { op: &'static str },
+    /// Some items were not deleted; the message names the first and why.
+    #[error("not deleted: {0}")]
+    NotDeleted(String),
     /// The argument is not usable for this operation.
     #[error("invalid argument: {0}")]
     Invalid(String),

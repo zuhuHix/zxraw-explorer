@@ -24,12 +24,32 @@ fn recycle_sandbox() -> Option<PathBuf> {
         .clone()
 }
 
-/// Sends each path to the Recycle Bin (or the sandbox set by [`set_recycle_sandbox`]).
+/// Sends each path to the Recycle Bin (or the sandbox set by [`set_recycle_sandbox`]),
+/// without progress. Never deletes permanently. Fails with [`WinError::NotDeleted`] when
+/// any item stays, and [`WinError::Aborted`] when the user cancelled in a shell dialog. See
+/// [`crate::recycle_items`] for a per-item report.
 pub fn recycle(paths: &[PathBuf]) -> Result<()> {
-    match recycle_sandbox() {
-        Some(dir) => recycle_to_sandbox(&dir, paths),
-        None => recycle_shell(paths),
+    let report = crate::recycle::recycle_items(paths, Box::new(|_| true));
+    if let Some((path, why)) = report.failed.first() {
+        let more = report.failed.len() - 1;
+        let more = if more > 0 {
+            format!(" (and {more} more)")
+        } else {
+            String::new()
+        };
+        return Err(WinError::NotDeleted(format!(
+            "{}: {why}{more}",
+            path.display()
+        )));
     }
+    if report.cancelled {
+        return Err(WinError::Aborted { op: "recycle" });
+    }
+    Ok(())
+}
+
+pub(crate) fn recycle_sandbox_dir() -> Option<PathBuf> {
+    recycle_sandbox()
 }
 
 /// Sandbox "Recycle Bin": every item is renamed into a fresh, newly created numbered
@@ -61,70 +81,6 @@ pub fn recycle_to_sandbox(dir: &Path, paths: &[PathBuf]) -> Result<()> {
         std::fs::rename(p, slot.join(name)).map_err(io("recycle (sandbox)", p))?;
     }
     Ok(())
-}
-
-/// Sends each path to the Recycle Bin with `IFileOperation`.
-///
-/// Runs on the calling thread, which gets its own apartment-threaded COM initialisation
-/// (the call is safe from any background thread). No confirmation or error UI is shown,
-/// except the shell's own warning when an item cannot be recycled and would be destroyed;
-/// failures come back as errors. If the shell aborted any item, returns
-/// [`WinError::Aborted`].
-#[cfg(windows)]
-fn recycle_shell(paths: &[PathBuf]) -> Result<()> {
-    use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-    use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
-        FOFX_RECYCLEONDELETE, FileOperation, IFileOperation, IShellItem,
-        SHCreateItemFromParsingName,
-    };
-    use windows::core::PCWSTR;
-
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let _com = com::ComGuard::apartment_threaded()?;
-
-    unsafe {
-        let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
-            .map_err(|e| crate::api_err("CoCreateInstance(IFileOperation)", e))?;
-        op.SetOperationFlags(
-            // FOF_WANTNUKEWARNING overrides FOF_NOCONFIRMATION for items that cannot be
-            // recycled (network shares, most removable media, oversized files): the shell asks
-            // before destroying them instead of silently deleting permanently.
-            FOF_ALLOWUNDO
-                | FOFX_RECYCLEONDELETE
-                | FOF_NOCONFIRMATION
-                | FOF_WANTNUKEWARNING
-                | FOF_SILENT
-                | FOF_NOERRORUI,
-        )
-        .map_err(|e| crate::api_err("IFileOperation::SetOperationFlags", e))?;
-
-        for p in paths {
-            let wide = crate::to_wide(p);
-            // Creating every item first means a bad path aborts before anything is queued.
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None)
-                .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
-            op.DeleteItem(&item, None)
-                .map_err(|e| crate::api_err("IFileOperation::DeleteItem", e))?;
-        }
-
-        op.PerformOperations()
-            .map_err(|e| crate::api_err("IFileOperation::PerformOperations", e))?;
-        let aborted = op
-            .GetAnyOperationsAborted()
-            .map_err(|e| crate::api_err("IFileOperation::GetAnyOperationsAborted", e))?;
-        if aborted.as_bool() {
-            return Err(WinError::Aborted { op: "recycle" });
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn recycle_shell(_paths: &[PathBuf]) -> Result<()> {
-    Err(WinError::Unsupported)
 }
 
 /// Opens files with their registered handler. Existing directories are always sent directly to

@@ -70,6 +70,9 @@ pub enum Event {
     },
     /// "Download FFmpeg" finished; the folder holds ffmpeg.exe and ffprobe.exe.
     FfmpegInstalled(PathBuf),
+    /// A finished job asks something (a delete that could not use the Recycle Bin, for
+    /// example). Shown once no other dialog is open.
+    AskConfirm(crate::modal::Confirm),
     /// An update check finished.
     UpdateChecked(crate::updater::Checked),
     /// "Update now" downloaded and verified the installer, or failed.
@@ -172,6 +175,7 @@ pub struct Actions {
     pub clipboard: Option<FileClipboard>,
     clipboard_generation: u64,
     pub show_jobs: bool,
+    pub delete_ui: crate::ops_ui::DeleteUi,
     pub batch_rename: Option<crate::batch_rename::BatchRename>,
     pub text_preview: TextPreview,
     pub meta: media_meta::MetaLoader,
@@ -241,6 +245,7 @@ impl Actions {
             clipboard: None,
             clipboard_generation: 0,
             show_jobs: false,
+            delete_ui: Default::default(),
             batch_rename: None,
             text_preview: TextPreview::default(),
             meta: Default::default(),
@@ -1057,37 +1062,7 @@ fn paste_with(
 }
 
 pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
-    app.expect_removal(&targets);
-    let n = targets.len();
-    let dirs: Vec<PathBuf> = targets
-        .iter()
-        .filter_map(|p| p.parent().map(Path::to_path_buf))
-        .collect();
-    let tx = app.ops.tx.clone();
-    let ctx = app.ops.ctx.clone();
-    app.ops
-        .jobs
-        .spawn("delete", format!("Deleting {n} item(s)"), move |h| {
-            h.progress.add_total_items(n as u64);
-            let r = forge_win::recycle(&targets);
-            h.progress.add_items(n as u64);
-            let mut seen = std::collections::HashSet::new();
-            for d in dirs {
-                if seen.insert(d.clone()) {
-                    let _ = tx.send(Event::Changed(d));
-                }
-            }
-            let msg = match &r {
-                Ok(()) => Event::Toast(format!("Moved {n} item(s) to the Recycle Bin")),
-                Err(forge_win::WinError::Aborted { .. }) => {
-                    Event::Toast("Delete was cancelled; some items were not deleted".into())
-                }
-                Err(e) => Event::Error(format!("Delete failed: {e}")),
-            };
-            let _ = tx.send(msg);
-            ctx.request_repaint();
-            r.map_err(|e| e.to_string())
-        });
+    crate::ops_ui::recycle(app, targets);
 }
 
 pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
@@ -1326,6 +1301,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 app.save_all();
                 app.toast("FFmpeg installed: video thumbnails and clip metadata are on");
             }
+            Event::AskConfirm(confirm) => crate::ops_ui::ask(app, confirm),
             Event::UpdateChecked(checked) => crate::updater::checked(app, checked),
             Event::UpdateDownloaded(result) => crate::updater::downloaded(app, result),
             Event::Undo(u) => {
@@ -1357,6 +1333,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     if show_pending_prompt(&mut ops.modal, ops.batch_rename.is_some(), &mut ops.pending_prompts) {
         changed = true;
     }
+    changed |= crate::ops_ui::show_pending_question(app);
     changed
 }
 
@@ -1464,6 +1441,7 @@ pub fn shutdown(app: &mut ZxrawApp) {
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::sidebar::network::dialog(app, ui.ctx());
     crate::ops_ui::jobs_window(app, ui.ctx());
+    crate::ops_ui::progress_popup(app, ui.ctx());
     crate::search_ui::window(app, ui.ctx());
     crate::ingest_ui::window(app, ui.ctx());
     crate::tags_ui::window(app, ui.ctx());
@@ -1568,6 +1546,7 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
             match c.kind {
                 ConfirmKind::Recycle(t) => recycle(app, t),
                 ConfirmKind::DeletePermanently(t) => delete_permanently(app, t),
+                ConfirmKind::DeleteWithWindows(t) => crate::ops_ui::delete_with_windows(app, t),
                 ConfirmKind::DownloadFfmpeg => crate::ffmpeg_setup::start(app),
                 ConfirmKind::DownloadCloudFiles {
                     sources,

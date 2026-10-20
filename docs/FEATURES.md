@@ -156,6 +156,24 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   and `recycle_missing_path_is_an_error` pass. The first test sends a temporary file to the
   real Recycle Bin on each run (see [LIMITATIONS.md](LIMITATIONS.md)). The e2e suite
   deliberately does not use the Recycle Bin.
+* ✅ Deletes report why an item stayed, and never delete permanently without asking —
+  `forge-win/src/recycle.rs`: the shell's progress window is hidden and its progress comes back
+  through `IFileOperationProgressSink`. An item the Recycle Bin refuses (too big, or no
+  Recycle Bin on its drive) is refused by the sink before anything is destroyed, and the app
+  asks "Delete permanently instead?" in its own dialog
+  (`recycle::tests::folders_too_big_for_the_recycle_bin_are_kept_and_reported` uses an 8 TB
+  sparse file; e2e `an_item_the_recycle_bin_refuses_is_deleted_only_after_asking` and
+  `an_item_the_recycle_bin_refuses_stays_when_the_question_is_declined`). Protected folders
+  get Windows' administrator prompt, owned by the main window so it opens in front; declining
+  it reports "needs administrator permission". An in-app permanent delete that is denied
+  offers "Delete as administrator". Open files are reported as in use, with the programs
+  holding them (`an_open_file_is_reported_in_use`). Cancel and progress:
+  `a_cancelled_permanent_delete_leaves_the_items`,
+  `permanent_shell_delete_reports_progress_and_removes_the_tree`.
+* 🟡 Progress popup — copies, moves, deletes and undos running longer than 0.7 s show a small,
+  non-blocking window (bottom right) with progress, the current item, Cancel, Pause, Details
+  and Hide (`ops_ui::progress_popup`). Checked by a screenshot during development; no
+  automated test looks at it.
 * ✅ Duplicates re-verified on disk before recycling — `forge-app/src/tools_ui.rs::recycle_reverifies_against_disk`
   and `duplicate_selection_safety_refuses_to_remove_the_last_copy`.
 * 🟡 Open files, Open With, Properties, and reveal in Explorer — `forge-win/src/shell.rs`.
