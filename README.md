@@ -237,6 +237,13 @@ Explorer is a file manager designed around that workflow:
   isn't slowed down by the next one. In the Operations panel you can reorder waiting jobs,
   start one now, cancel it, or pause the whole queue. Transfers between different drives still
   run side by side. Prefer everything at once? Settings › File operations.
+- **Progress in front, in the app's own look.** A copy, move or delete that takes longer than
+  a moment shows a small progress window with the current item, Cancel and Pause. Hide it and
+  the Operations panel still has it.
+- **Deletes that say why.** Something too big for the Recycle Bin is never deleted
+  permanently behind your back: ZXraw asks first, in its own dialog. Folders in protected
+  places such as `C:\Program Files` get Windows' administrator prompt in front of the app, not
+  behind it. If a program holds a file open, the message names the program.
 - **Works with Explorer's clipboard.** Cut or copy files in Windows Explorer or on the desktop,
   then press <kbd>Ctrl</kbd>+<kbd>V</kbd> in ZXraw Explorer, and the other way round.
 - **Cloud files stay in the cloud.** OneDrive, Dropbox and other online-only files are never

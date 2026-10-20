@@ -50,6 +50,15 @@ pub fn maximize_hidden(cc: &eframe::CreationContext<'_>) {
     }
 }
 
+/// Makes the main window the owner of the shell dialogs ZXraw still shows (the
+/// administrator permission prompt of a delete), so they open in front of it.
+pub fn register_dialog_owner(cc: &eframe::CreationContext<'_>) {
+    match cc.window_handle().map(|handle| handle.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => forge_win::set_dialog_owner(handle.hwnd.get()),
+        _ => tracing::warn!("no Win32 window handle; shell dialogs will open without an owner"),
+    }
+}
+
 fn maximize_through_egui(cc: &eframe::CreationContext<'_>) {
     cc.egui_ctx
         .send_viewport_cmd(egui::ViewportCommand::Maximized(true));

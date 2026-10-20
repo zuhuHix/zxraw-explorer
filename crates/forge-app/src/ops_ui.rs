@@ -16,7 +16,7 @@ use forge_jobs::{CancelToken, JobHandle, JobState};
 
 use crate::actions::{Event, UndoEntry};
 use crate::app::ZxrawApp;
-use crate::modal::{Confirm, ConfirmKind, Modal};
+use crate::modal::{self, Confirm, ConfirmKind, Modal};
 use crate::views;
 
 /// Online-only sources at or above this count, or this total size, ask before a transfer
@@ -1254,10 +1254,233 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
                 .filter_map(|t| t.parent().map(Path::to_path_buf))
                 .collect();
             finish_report(job, &report, &tx, &[], parents);
+            // Protected folders (C:\Program Files and the like) refuse an in-app delete.
+            // Windows can do it after asking for administrator permission.
+            let denied: Vec<PathBuf> = targets
+                .iter()
+                .filter(|t| {
+                    report
+                        .failed
+                        .iter()
+                        .any(|f| f.path.starts_with(t) && is_access_denied(&f.reason))
+                })
+                .cloned()
+                .collect();
+            if !denied.is_empty() {
+                let _ = tx.send(Event::AskConfirm(Confirm {
+                    title: "Administrator permission needed".into(),
+                    body: format!(
+                        "Access was denied to {} item(s):\n\n{}\n\nThey are probably in a \
+                         protected folder. Windows can delete them after asking for \
+                         administrator permission.",
+                        denied.len(),
+                        modal::describe_items(&denied)
+                    ),
+                    kind: ConfirmKind::DeleteWithWindows(denied),
+                    confirm_label: "Delete as administrator".into(),
+                    danger: true,
+                }));
+            }
             ctx.request_repaint();
             Ok(())
         },
     );
+}
+
+/// Whether an in-app delete failed because access was denied (ERROR_ACCESS_DENIED). The
+/// system message is localised; its "(os error 5)" suffix is not.
+fn is_access_denied(reason: &str) -> bool {
+    reason.contains("(os error 5)")
+}
+
+/// Questions from finished deletes, and the progress popup's state.
+#[derive(Default)]
+pub struct DeleteUi {
+    /// Questions waiting for the open dialog to close.
+    pending: std::collections::VecDeque<Confirm>,
+    /// Jobs whose progress popup the user hid.
+    hidden: std::collections::HashSet<forge_jobs::JobId>,
+}
+
+/// Queues a question from a job; it opens once no other dialog is open.
+pub fn ask(app: &mut ZxrawApp, confirm: Confirm) {
+    app.ops.delete_ui.pending.push_back(confirm);
+}
+
+/// Opens the next waiting question if no dialog is open. Returns whether one opened.
+pub fn show_pending_question(app: &mut ZxrawApp) -> bool {
+    if app.ops.modal.is_some() || app.ops.batch_rename.is_some() {
+        return false;
+    }
+    let Some(confirm) = app.ops.delete_ui.pending.pop_front() else {
+        return false;
+    };
+    app.ops.modal = Some(Modal::Confirm(confirm));
+    true
+}
+
+/// Moves `targets` to the Recycle Bin. Never deletes permanently: items that cannot be
+/// recycled stay, and the app asks whether to delete them permanently instead.
+pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
+    app.expect_removal(&targets);
+    let n = targets.len();
+    let tx = app.ops.tx.clone();
+    let ctx = app.ops.ctx.clone();
+    app.ops
+        .jobs
+        .spawn("delete", format!("Deleting {n} item(s)"), move |job| {
+            let report = forge_win::recycle_items(&targets, shell_observer(job));
+            finish_shell_delete(job, &targets, &report, true, &tx);
+            ctx.request_repaint();
+            delete_result(&report)
+        });
+}
+
+/// Deletes `targets` permanently through Windows, which can ask for administrator
+/// permission (the in-app delete cannot).
+pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
+    app.expect_removal(&targets);
+    let n = targets.len();
+    let tx = app.ops.tx.clone();
+    let ctx = app.ops.ctx.clone();
+    app.ops.jobs.spawn(
+        "delete",
+        format!("Permanently deleting {n} item(s)"),
+        move |job| {
+            let report = forge_win::delete_items_permanently(&targets, shell_observer(job));
+            finish_shell_delete(job, &targets, &report, false, &tx);
+            ctx.request_repaint();
+            delete_result(&report)
+        },
+    );
+}
+
+fn delete_result(report: &forge_win::DeleteReport) -> Result<(), String> {
+    match report.failed.len() {
+        0 => Ok(()),
+        n => Err(format!("{n} item(s) not deleted")),
+    }
+}
+
+/// Feeds a shell delete's progress into the job, and the job's pause and cancel back.
+fn shell_observer(job: &JobHandle) -> forge_win::DeleteObserver {
+    let progress = job.progress.clone();
+    let cancel = job.cancel.clone();
+    Box::new(move |p| {
+        // The shell's work units count the files and folders in the tree; until it has
+        // counted them, the top-level items stand in.
+        let (done, total) = if p.work_total > 0 {
+            (p.work_done, p.work_total)
+        } else {
+            (p.items_done as u64, p.items_total as u64)
+        };
+        progress.items_total.store(total, Ordering::Relaxed);
+        progress.items_done.store(done.min(total), Ordering::Relaxed);
+        if let Some(current) = &p.current {
+            progress.set_current(current.display().to_string());
+        }
+        while cancel.is_paused() && !cancel.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        !cancel.is_cancelled()
+    })
+}
+
+/// Why an item was not deleted, for people. Names the programs holding it open when they
+/// can be found.
+fn failure_text(path: &Path, why: &forge_win::DeleteFailure) -> String {
+    use forge_win::DeleteFailure as F;
+    match why {
+        F::NotRecyclable => "too big for the Recycle Bin, or its drive has no Recycle Bin".into(),
+        F::NeedsAdmin => "access denied: needs administrator permission".into(),
+        F::InUse => match forge_win::processes_using(path, 5_000).as_slice() {
+            [] => "in use by another program; close it and try again".into(),
+            names => format!("in use by {}; close it and try again", names.join(", ")),
+        },
+        F::Missing => "it no longer exists".into(),
+        F::Other(message) => message.clone(),
+    }
+}
+
+/// Reports a shell delete: refreshes the folders, logs every item that stayed, and tells the
+/// user. Items that cannot be recycled lead to the "delete permanently instead?" question.
+fn finish_shell_delete(
+    job: &JobHandle,
+    targets: &[PathBuf],
+    report: &forge_win::DeleteReport,
+    recycled: bool,
+    tx: &Sender<Event>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    for d in targets.iter().filter_map(|p| p.parent()) {
+        if seen.insert(d) {
+            let _ = tx.send(Event::Changed(d.to_path_buf()));
+        }
+    }
+    let not_recyclable: Vec<PathBuf> = report
+        .failed
+        .iter()
+        .filter(|(_, why)| *why == forge_win::DeleteFailure::NotRecyclable)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let other: Vec<String> = report
+        .failed
+        .iter()
+        .filter(|(_, why)| *why != forge_win::DeleteFailure::NotRecyclable)
+        .map(|(p, why)| format!("{}: {}", p.display(), failure_text(p, why)))
+        .collect();
+    let n = report.done.len();
+    job.log(format!(
+        "{n} deleted, {} not deleted, {} not started{}",
+        report.failed.len(),
+        report.not_started.len(),
+        if report.cancelled { ", cancelled" } else { "" }
+    ));
+    for (p, why) in &report.failed {
+        job.log(format!("NOT DELETED  {}: {why}", p.display()));
+        job.progress.add_error();
+    }
+    if !not_recyclable.is_empty() {
+        let mut body = format!(
+            "{} item(s) cannot go to the Recycle Bin: they are too big for it, or their drive \
+             has no Recycle Bin. Nothing in them was deleted.\n\n{}\n\nDelete them \
+             permanently instead? This cannot be undone.",
+            not_recyclable.len(),
+            modal::describe_items(&not_recyclable)
+        );
+        if !other.is_empty() {
+            body.push_str(&format!("\n\nAlso not deleted:\n{}", other.join("\n")));
+        }
+        let _ = tx.send(Event::AskConfirm(Confirm {
+            title: "Too big for the Recycle Bin".into(),
+            body,
+            kind: ConfirmKind::DeleteWithWindows(not_recyclable),
+            confirm_label: "Delete permanently".into(),
+            danger: true,
+        }));
+    } else if !other.is_empty() {
+        let mut lines = vec![format!("{n} deleted, {} not deleted.", other.len())];
+        lines.extend(other);
+        if report.cancelled && !report.not_started.is_empty() {
+            lines.push(format!(
+                "Cancelled before {} more item(s).",
+                report.not_started.len()
+            ));
+        }
+        let _ = tx.send(Event::Report {
+            title: format!("{} — {} item(s) not deleted", job.title, report.failed.len()),
+            lines,
+        });
+    } else if report.cancelled {
+        let _ = tx.send(Event::Toast(format!(
+            "Delete cancelled: {n} item(s) deleted, {} left as they were",
+            report.not_started.len()
+        )));
+    } else if recycled {
+        let _ = tx.send(Event::Toast(format!("Moved {n} item(s) to the Recycle Bin")));
+    } else {
+        let _ = tx.send(Event::Toast(format!("Permanently deleted {n} item(s)")));
+    }
 }
 
 pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
@@ -1489,6 +1712,109 @@ pub fn jobs_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     app.ops.show_jobs = open;
 }
 
+/// How long a copy, move or delete runs before its progress popup appears.
+const POPUP_DELAY: Duration = Duration::from_millis(700);
+/// The popup lists at most this many jobs.
+const POPUP_MAX_JOBS: usize = 3;
+
+/// Whether a job of this kind gets the progress popup: the ones that change files.
+fn popup_kind(kind: &str) -> bool {
+    matches!(kind, "delete" | "transfer" | "undo")
+}
+
+/// A small window in front of the app with the progress of copies, moves and deletes that
+/// have run longer than [`POPUP_DELAY`]. It does not block the app. "Hide" closes it for
+/// those jobs; the Operations window still lists them. It is not shown while the
+/// Operations window is open.
+pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let jobs: Vec<JobHandle> = app
+        .ops
+        .jobs
+        .list()
+        .into_iter()
+        .filter(|j| popup_kind(&j.kind))
+        .filter(|j| matches!(j.state(), JobState::Running | JobState::Paused))
+        .collect();
+    let hidden = &mut app.ops.delete_ui.hidden;
+    hidden.retain(|id| jobs.iter().any(|j| j.id == *id));
+    let candidates: Vec<&JobHandle> = jobs.iter().filter(|j| !hidden.contains(&j.id)).collect();
+    if app.ops.show_jobs || candidates.is_empty() {
+        return;
+    }
+    let (due, waiting): (Vec<&JobHandle>, Vec<&JobHandle>) = candidates
+        .into_iter()
+        .partition(|j| j.elapsed() >= POPUP_DELAY);
+    if let Some(wait) = waiting.iter().map(|j| POPUP_DELAY.saturating_sub(j.elapsed())).min() {
+        ctx.request_repaint_after(wait);
+    }
+    if due.is_empty() {
+        return;
+    }
+    ctx.request_repaint_after(Duration::from_millis(100));
+    let title = match due.as_slice() {
+        [one] => one.title.to_string(),
+        many => format!("{} operations", many.len()),
+    };
+    let mut hide = false;
+    let mut details = false;
+    egui::Window::new(title)
+        .id(egui::Id::new("operation-progress-popup"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -40.0])
+        .collapsible(false)
+        .resizable(false)
+        .default_width(380.0)
+        .show(ctx, |ui| {
+            ui.set_width(380.0);
+            for (i, j) in due.iter().take(POPUP_MAX_JOBS).enumerate() {
+                if i > 0 {
+                    ui.separator();
+                }
+                if due.len() > 1 {
+                    ui.label(RichText::new(j.title.as_ref()).strong());
+                }
+                let snap = j.progress.snapshot();
+                let state = j.state();
+                job_progress(ui, j, &snap, state);
+                ui.horizontal(|ui| {
+                    let paused = j.cancel.is_paused_itself();
+                    if ui.small_button("Cancel").clicked() {
+                        app.ops.jobs.cancel(j);
+                    }
+                    if ui
+                        .small_button(if paused { "Resume" } else { "Pause" })
+                        .clicked()
+                    {
+                        j.cancel.set_paused(!paused);
+                    }
+                });
+            }
+            if due.len() > POPUP_MAX_JOBS {
+                ui.label(
+                    RichText::new(format!("and {} more", due.len() - POPUP_MAX_JOBS)).weak(),
+                );
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Details").clicked() {
+                    details = true;
+                }
+                if ui
+                    .button("Hide")
+                    .on_hover_text("The Operations window (status bar) still shows them")
+                    .clicked()
+                {
+                    hide = true;
+                }
+            });
+        });
+    if hide {
+        app.ops.delete_ui.hidden.extend(due.iter().map(|j| j.id));
+    }
+    if details {
+        app.ops.show_jobs = true;
+    }
+}
+
 /// Lets the close guard run in automation (scripts that test it turn it on).
 pub static CLOSE_GUARD_IN_AUTOMATION: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1626,6 +1952,25 @@ fn job_row(
         );
         return action;
     }
+    job_progress(ui, j, &snap, state);
+    if snap.errors > 0 {
+        ui.label(
+            RichText::new(format!("{} error(s)", snap.errors)).color(ui.visuals().error_fg_color),
+        );
+    }
+    let log = j.log_lines();
+    if !log.is_empty() {
+        ui.collapsing(format!("Report ({} lines)", log.len()), |ui| {
+            for l in log.iter().take(500) {
+                ui.label(RichText::new(l).small().monospace());
+            }
+        });
+    }
+    action
+}
+
+/// A job's progress bar (or spinner) with its counts, and the item it is working on.
+fn job_progress(ui: &mut Ui, j: &JobHandle, snap: &forge_jobs::ProgressSnapshot, state: JobState) {
     let frac = snap.fraction();
     let secs = j.elapsed().as_secs_f64().max(0.001);
     let rate = snap.bytes_done as f64 / secs;
@@ -1662,22 +2007,8 @@ fn job_row(
         }
     }
     if !snap.current.is_empty() && !state.is_finished() {
-        ui.label(RichText::new(&snap.current).small().weak());
+        ui.add(egui::Label::new(RichText::new(&snap.current).small().weak()).truncate());
     }
-    if snap.errors > 0 {
-        ui.label(
-            RichText::new(format!("{} error(s)", snap.errors)).color(ui.visuals().error_fg_color),
-        );
-    }
-    let log = j.log_lines();
-    if !log.is_empty() {
-        ui.collapsing(format!("Report ({} lines)", log.len()), |ui| {
-            for l in log.iter().take(500) {
-                ui.label(RichText::new(l).small().monospace());
-            }
-        });
-    }
-    action
 }
 
 #[cfg(test)]
@@ -1688,6 +2019,25 @@ mod tests {
         OpReport {
             done: done.iter().map(|p| p.to_path_buf()).collect(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn access_denied_is_recognised_in_any_language() {
+        let denied = std::io::Error::from_raw_os_error(5).to_string();
+        assert!(is_access_denied(&format!("D:/x: {denied}")));
+        let missing = std::io::Error::from_raw_os_error(2).to_string();
+        assert!(!is_access_denied(&missing));
+        assert!(!is_access_denied("(os error 50)"));
+    }
+
+    #[test]
+    fn the_progress_popup_is_for_jobs_that_change_files() {
+        for kind in ["delete", "transfer", "undo"] {
+            assert!(popup_kind(kind), "{kind}");
+        }
+        for kind in ["index", "checksums", "update", "folder-size"] {
+            assert!(!popup_kind(kind), "{kind}");
         }
     }
 

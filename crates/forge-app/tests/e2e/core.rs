@@ -698,6 +698,75 @@ fn delete_key_recycles_into_the_sandbox_not_the_real_recycle_bin() {
 }
 
 #[test]
+fn an_item_the_recycle_bin_refuses_is_deleted_only_after_asking() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    // The recycle sandbox refuses names starting with "not-recyclable", as the real Recycle
+    // Bin refuses items too big for it.
+    write_file(&dir.join("not-recyclable-big.bin"), b"too big");
+    write_file(&dir.join("binned.txt"), b"recycle me");
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        "navigate {dir}
+select not-recyclable-big.bin, binned.txt
+key Delete
+wait-jobs 20
+         wait-missing {binned}
+assert-exists {big}
+         accept
+wait-jobs 20
+wait-missing {big}
+wait-no-entry not-recyclable-big.bin | 10
+         assert-toast Permanently deleted 1 item
+assert-no-error-toast
+exit
+",
+        dir = shown(&dir),
+        binned = shown(&dir.join("binned.txt")),
+        big = shown(&dir.join("not-recyclable-big.bin")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    let bin = recycle_sandbox(&profile);
+    assert_eq!(
+        fs::read(bin.join("0").join("binned.txt")).unwrap(),
+        b"recycle me",
+        "the recyclable item must be in the sandbox"
+    );
+    assert!(
+        !bin.join("1").exists(),
+        "the refused item was deleted permanently, not recycled"
+    );
+}
+
+#[test]
+fn an_item_the_recycle_bin_refuses_stays_when_the_question_is_declined() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let dir = sandbox.path().join("work");
+    write_file(&dir.join("not-recyclable-big.bin"), b"too big");
+    let profile = sandbox.path().join("profile");
+    let script = format!(
+        "navigate {dir}
+select not-recyclable-big.bin
+key Delete
+wait-jobs 20
+         cancel
+wait-jobs 5
+wait-entry not-recyclable-big.bin | 10
+exit
+",
+        dir = shown(&dir),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_eq!(fs::read(dir.join("not-recyclable-big.bin")).unwrap(), b"too big");
+}
+
+#[test]
 fn keyboard_shortcut_runs_through_real_input() {
     let sandbox = tempfile::tempdir().unwrap();
     let dir = sandbox.path().join("work");

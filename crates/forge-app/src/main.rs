@@ -247,6 +247,7 @@ fn main() -> eframe::Result {
                 if maximize.load(std::sync::atomic::Ordering::Relaxed) {
                     startup::maximize_hidden(cc);
                 }
+                startup::register_dialog_owner(cc);
                 let (paths, pending_crash) = app_args
                     .borrow_mut()
                     .take()

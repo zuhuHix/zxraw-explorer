@@ -64,6 +64,8 @@ impl Prompt {
 
 pub enum ConfirmKind {
     DeletePermanently(Vec<PathBuf>),
+    /// Permanent delete through Windows, which can ask for administrator permission.
+    DeleteWithWindows(Vec<PathBuf>),
     Recycle(Vec<PathBuf>),
     /// Download and install FFmpeg (see `ffmpeg_setup`).
     DownloadFfmpeg,
