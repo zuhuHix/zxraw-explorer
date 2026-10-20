@@ -235,7 +235,7 @@ pub fn get_files_and_owner() -> Result<ClipboardRead> {
     // Nobody else can change the clipboard while it is open, so these three agree.
     Ok(ClipboardRead {
         files: read_files_open()?,
-        owner: read_owner_token_open(),
+        owner: read_owner_token_open()?,
         sequence: clipboard_sequence(),
     })
 }
@@ -398,19 +398,36 @@ pub fn clear_if_owned_files(_paths: &[PathBuf], _expected_sequence: Option<u32>)
     None
 }
 
-/// Reads the owner token from an open clipboard. A missing or short value reads as `None`.
+/// Reads the owner token from an open clipboard: `Ok(None)` when there is none (or a value
+/// too short to be one). `Err` is a failure to read it, which says nothing about the owner.
 #[cfg(windows)]
-fn read_owner_token_open() -> Option<ClipboardToken> {
+fn read_owner_token_open() -> Result<Option<ClipboardToken>> {
     use windows::Win32::System::DataExchange::{GetClipboardData, IsClipboardFormatAvailable};
 
-    let format = owner_format().ok()?;
+    let format = owner_format()?;
     if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
-        return None;
+        return Ok(None);
     }
-    let handle = unsafe { GetClipboardData(format) }.ok()?;
-    read_global_u64(handle, "GlobalLock(ZXraw Explorer Clipboard Owner)")
-        .ok()
-        .map(ClipboardToken)
+    let handle = unsafe { GetClipboardData(format) }
+        .map_err(|e| crate::api_err("GetClipboardData(ZXraw Explorer Clipboard Owner)", e))?;
+    match read_global_u64(handle, "GlobalLock(ZXraw Explorer Clipboard Owner)") {
+        Ok(value) => Ok(Some(ClipboardToken(value))),
+        Err(crate::WinError::Invalid(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The owner token on the clipboard, if it holds a publish of ours (`Ok(None)` otherwise).
+#[cfg(windows)]
+pub fn clipboard_owner() -> Result<Option<ClipboardToken>> {
+    let window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(window.hwnd))?;
+    read_owner_token_open()
+}
+
+#[cfg(not(windows))]
+pub fn clipboard_owner() -> Result<Option<ClipboardToken>> {
+    Err(crate::WinError::Unsupported)
 }
 
 /// Empties the clipboard if its owner token is `token`: `Ok(true)` when emptied, `Ok(false)`
@@ -422,7 +439,7 @@ pub fn clear_if_token(token: ClipboardToken) -> Result<bool> {
 
     let window = ClipboardOwnerWindow::new()?;
     let _clipboard = open_clipboard_retry(Some(window.hwnd))?;
-    if read_owner_token_open() != Some(token) {
+    if read_owner_token_open()? != Some(token) {
         return Ok(false);
     }
     unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
@@ -454,7 +471,7 @@ pub fn replace_files_if_token(
     };
     let _window = ClipboardOwnerWindow::new()?;
     let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
-    if read_owner_token_open() != Some(token) {
+    if read_owner_token_open()? != Some(token) {
         return Ok(None);
     }
     unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;

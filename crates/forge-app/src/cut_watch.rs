@@ -2,17 +2,17 @@
 //! desktop, moved by another app, or replaced by a different item under the same name.
 //! Nothing tells the app that cut from about such a paste, so the items are checked.
 //!
-//! One thread serves the whole app and watches only the newest cut. Each check pass runs on a
-//! helper thread that the watcher gives up on after [`PASS_TIMEOUT`] (a dead share can block
-//! a file system call for a long time): the pass then counts as "could not tell". A cut has at
-//! most one helper out at a time, and there are at most [`MAX_HELPERS`] in all, so blocked
-//! helpers never pile up and a newer cut is still watched.
+//! One thread serves the whole app and watches only the newest cut. Each check runs on a
+//! helper thread that is given up on after [`PASS_TIMEOUT`] (a dead share can block a file
+//! system call for a long time). A cut has at most one check out at a time, the watcher's or a
+//! paste's, and there are at most [`MAX_HELPERS`] in all, so blocked helpers never pile up and
+//! a newer cut is still watched. A check that was skipped or given up on changes nothing.
 //!
 //! Everything fails closed: an item whose identity could not be read is never moved by a
 //! paste (see [`screen`]), and an item that could not be checked stays cut.
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -106,19 +106,77 @@ fn meta_identity(
     })
 }
 
-/// Observes every path on a helper thread, waiting at most `timeout`: everything is
-/// [`Observation::Unknown`] if it takes longer (the helper is left to finish on its own).
-pub fn observe_all_within(paths: Vec<PathBuf>, timeout: Duration) -> Vec<Observation> {
-    let n = paths.len();
-    let (tx, rx) = crossbeam_channel::bounded(1);
+/// Cuts with a check running, the watcher's or a paste's: `(watcher, generation)`.
+static CHECKS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Starts `observe` over `paths` on a helper thread for the cut `key`, unless that cut
+/// already has a check running or [`MAX_HELPERS`] are running in all. The helper calls
+/// `done` with the result, after freeing its slot.
+fn spawn_check(
+    key: (u64, u64),
+    paths: Vec<PathBuf>,
+    observe: fn(&Path) -> Observation,
+    done: impl FnOnce(Vec<Observation>) + Send + 'static,
+) -> bool {
+    {
+        let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        if checks.contains(&key) || checks.len() >= MAX_HELPERS {
+            return false;
+        }
+        checks.push(key);
+    }
+    let free = move || {
+        let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        checks.retain(|k| *k != key);
+    };
     let spawned = std::thread::Builder::new()
         .name("forge-cut-check".into())
         .spawn(move || {
-            let _ = tx.send(paths.iter().map(|p| observe(p)).collect::<Vec<_>>());
+            let seen = paths.iter().map(|p| observe(p)).collect();
+            free();
+            done(seen);
         });
-    match spawned.ok().and_then(|_| rx.recv_timeout(timeout).ok()) {
-        Some(seen) => seen,
-        None => vec![Observation::Unknown; n],
+    if spawned.is_err() {
+        let mut checks = CHECKS.lock().unwrap_or_else(|e| e.into_inner());
+        checks.retain(|k| *k != key);
+        return false;
+    }
+    true
+}
+
+/// Checks a cut's items for a paste, off the UI thread, sharing the watcher's slots: it
+/// waits for the cut's running check to end, and gives up after `timeout` in all. `None` if
+/// no check could be done in time.
+#[derive(Clone, Copy)]
+pub struct Checker {
+    watcher: u64,
+    observe: fn(&Path) -> Observation,
+}
+
+impl Checker {
+    pub fn check(
+        &self,
+        generation: u64,
+        paths: Vec<PathBuf>,
+        timeout: Duration,
+    ) -> Option<Vec<Observation>> {
+        let deadline = Instant::now() + timeout;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        loop {
+            let tx = tx.clone();
+            let send = move |seen| {
+                let _ = tx.send(seen);
+            };
+            if spawn_check((self.watcher, generation), paths.clone(), self.observe, send) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
     }
 }
 
@@ -223,12 +281,6 @@ impl Job {
         }
     }
 
-    /// Applies a pass that could not tell anything.
-    fn apply_unknown(&mut self, report: &dyn Fn(Report)) {
-        let seen = vec![Observation::Unknown; self.items.len()];
-        self.apply(&seen, report);
-    }
-
     fn done(&self) -> bool {
         self.items.iter().all(|item| item.gone)
     }
@@ -248,6 +300,7 @@ enum Msg {
 /// Handle to the watcher thread. Dropping it (and every [`WatchGuard`]) ends the thread.
 pub struct CutWatcher {
     tx: Sender<Msg>,
+    checker: Checker,
 }
 
 /// Timings and the check itself, replaceable in tests.
@@ -271,12 +324,22 @@ impl CutWatcher {
     }
 
     fn start_with(config: Config, report: impl Fn(Report) + Send + 'static) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let checker = Checker {
+            watcher: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            observe: config.observe,
+        };
         let (tx, rx) = crossbeam_channel::unbounded();
         std::thread::Builder::new()
             .name("forge-cut-watch".into())
-            .spawn(move || run(&rx, config, &report))
+            .spawn(move || run(&rx, config, checker, &report))
             .expect("spawn the cut watcher");
-        Self { tx }
+        Self { tx, checker }
+    }
+
+    /// Checks for pastes, sharing this watcher's slots.
+    pub fn checker(&self) -> Checker {
+        self.checker
     }
 
     /// Watches the cut `generation` at `revision` instead of whatever was watched before,
@@ -316,11 +379,10 @@ impl Drop for WatchGuard {
 /// A pass's result from its helper: `(generation, revision, observations)`.
 type PassResult = (u64, u64, Vec<Observation>);
 
-fn run(rx: &Receiver<Msg>, config: Config, report: &dyn Fn(Report)) {
+fn run(rx: &Receiver<Msg>, config: Config, checker: Checker, report: &dyn Fn(Report)) {
     let (done_tx, done_rx) = crossbeam_channel::unbounded::<PassResult>();
     let mut job: Option<Job> = None;
-    // Generations with a helper still running (in time or not), and the pass waited for.
-    let mut busy: HashSet<u64> = HashSet::new();
+    // The pass waited for, until its deadline.
     let mut in_time: Option<(u64, u64, Instant)> = None;
     let mut next_pass = Instant::now();
     loop {
@@ -353,7 +415,6 @@ fn run(rx: &Receiver<Msg>, config: Config, report: &dyn Fn(Report)) {
             },
             recv(done_rx) -> result => {
                 let Ok((generation, revision, seen)) = result else { continue };
-                busy.remove(&generation);
                 if in_time.is_some_and(|(g, r, _)| g == generation && r == revision) {
                     in_time = None;
                     if let Some(j) = job.as_mut().filter(|j| j.revision == revision) {
@@ -364,41 +425,26 @@ fn run(rx: &Receiver<Msg>, config: Config, report: &dyn Fn(Report)) {
             },
             default(timeout) => {
                 let now = Instant::now();
-                if let Some((generation, revision, deadline)) = in_time {
+                if let Some((_, _, deadline)) = in_time {
                     if now >= deadline {
-                        // Given up on: the helper stays counted in `busy` until it ends.
+                        // Given up on: nothing was learned, so nothing changes. The helper
+                        // keeps its slot until it ends, so this cut gets no second one.
                         in_time = None;
-                        if let Some(j) = job
-                            .as_mut()
-                            .filter(|j| j.generation == generation && j.revision == revision)
-                        {
-                            j.apply_unknown(report);
-                        }
                         next_pass = now + config.poll;
                     }
-                } else if let Some(j) = job.as_mut().filter(|_| now >= next_pass) {
-                    if busy.contains(&j.generation) || busy.len() >= MAX_HELPERS {
-                        // A blocked check is still out: this pass could not tell.
-                        j.apply_unknown(report);
-                        next_pass = now + config.poll;
+                } else if let Some(j) = job.as_ref().filter(|_| now >= next_pass) {
+                    let (generation, revision) = (j.generation, j.revision);
+                    let paths = j.items.iter().map(|item| item.path.clone()).collect();
+                    let tx = done_tx.clone();
+                    let send = move |seen| {
+                        let _ = tx.send((generation, revision, seen));
+                    };
+                    if spawn_check((checker.watcher, generation), paths, config.observe, send) {
+                        in_time = Some((generation, revision, now + config.timeout));
                     } else {
-                        let (generation, revision) = (j.generation, j.revision);
-                        let paths: Vec<PathBuf> =
-                            j.items.iter().map(|item| item.path.clone()).collect();
-                        let (tx, observe) = (done_tx.clone(), config.observe);
-                        let spawned = std::thread::Builder::new()
-                            .name("forge-cut-check".into())
-                            .spawn(move || {
-                                let seen = paths.iter().map(|p| observe(p)).collect();
-                                let _ = tx.send((generation, revision, seen));
-                            });
-                        if spawned.is_ok() {
-                            busy.insert(generation);
-                            in_time = Some((generation, revision, now + config.timeout));
-                        } else {
-                            j.apply_unknown(report);
-                            next_pass = now + config.poll;
-                        }
+                        // A check of this cut is still out (or too many are): skipped, and
+                        // tried again next time. Nothing changes.
+                        next_pass = now + config.poll;
                     }
                 }
             },
@@ -432,7 +478,9 @@ pub fn follow(
                     continue 'items;
                 }
                 path = to.clone();
-            } else if let Ok(rest) = path.strip_prefix(from) {
+            } else if forge_core::paths::is_strictly_within(from, &path) {
+                // Component-wise and case-insensitive, as Windows compares paths.
+                let rest: PathBuf = path.components().skip(from.components().count()).collect();
                 path = to.join(rest);
             }
         }
@@ -592,9 +640,12 @@ mod tests {
         let cut = [
             (p(r"C:\a\x.jpg"), k),
             (p(r"C:\a\y.jpg"), k),
-            (p(r"C:\b\sub\z.jpg"), k),
+            (p(r"c:\B\sub\z.jpg"), k),
             (p(r"C:\c\w.jpg"), k),
+            (p(r"C:\bb\v.jpg"), k),
         ];
+        // Windows paths compare without case, and by whole components (`C:\b` does not
+        // hold `C:\bb`).
         let pairs = [
             (p(r"C:\a\x.jpg"), p(r"C:\a\x2.jpg")),
             (p(r"C:\a\y.jpg"), p(r"D:\pasted\y.jpg")),
@@ -607,6 +658,7 @@ mod tests {
                     (p(r"C:\a\x2.jpg"), IdState::Pending),
                     (p(r"E:\b\sub\z.jpg"), IdState::Pending),
                     (p(r"C:\c\w.jpg"), k),
+                    (p(r"C:\bb\v.jpg"), k),
                 ],
                 vec![p(r"C:\a\y.jpg")]
             )
@@ -643,18 +695,33 @@ mod tests {
     }
 
     #[test]
-    fn observing_within_a_timeout_gives_up_on_a_slow_check() {
-        let d = tempfile::tempdir().unwrap();
-        let file = d.path().join("a.txt");
-        std::fs::write(&file, b"a").unwrap();
-        assert!(matches!(
-            observe_all_within(vec![file], Duration::from_secs(10))[..],
-            [Observation::Present(_)]
-        ));
+    fn a_paste_check_shares_the_cuts_slot_and_gives_up_in_time() {
+        set(r"W:\paste", Observation::Present(A));
+        let checker = Checker {
+            watcher: 9_000,
+            observe: scripted,
+        };
         assert_eq!(
-            observe_all_within(vec![d.path().join("x"); 2], Duration::ZERO),
-            vec![Observation::Unknown; 2]
+            checker.check(1, vec![PathBuf::from(r"W:\paste")], Duration::from_secs(10)),
+            Some(vec![Observation::Present(A)])
         );
+        // A check of cut 1 hangs on a share: a second one for cut 1 waits for its slot and
+        // gives up in time; another cut is checked meanwhile.
+        let hung = std::thread::spawn(move || {
+            checker.check(1, vec![PathBuf::from(r"B:\block\p")], Duration::from_millis(300))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        assert_eq!(
+            checker.check(1, vec![PathBuf::from(r"W:\paste")], Duration::from_millis(300)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(
+            checker.check(2, vec![PathBuf::from(r"W:\paste")], Duration::from_secs(2)),
+            Some(vec![Observation::Present(A)])
+        );
+        assert_eq!(hung.join().unwrap(), None, "the hung check itself gave up");
     }
 
     static SCRIPT: Mutex<Vec<(PathBuf, Observation)>> = Mutex::new(Vec::new());
@@ -727,15 +794,14 @@ mod tests {
             },
         );
 
-        // A cut on a share that hangs: its identity cannot be read in time.
+        // A cut on a share that hangs: its check is given up on, which teaches nothing, so
+        // the item stays pending (it is not taken as "could not be read").
         watcher.watch(2, 0, vec![(p(r"B:\block\x"), IdState::Pending)]);
-        wait_for(
-            &rx,
-            &Report::Identities {
-                generation: 2,
-                revision: 0,
-                items: vec![(p(r"B:\block\x"), None)],
-            },
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            rx.try_iter()
+                .all(|r| !matches!(r, Report::Identities { generation: 2, .. })),
+            "a check that never finished must not decide anything"
         );
         // A newer cut is still watched while that check hangs.
         set(r"W:\three", Observation::Present(B));
