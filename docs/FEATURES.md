@@ -195,7 +195,11 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `explorer_cut_of_two_folders_pastes_with_ctrl_v`, `explorer_copy_pastes_with_shift_insert_without_a_click`,
   `explorer_cut_after_an_in_app_copy_pastes_the_explorer_items` and `ctrl_shift_v_does_not_paste_files`
   (`forge-app/tests/e2e/core.rs`). Copy/cut in ZXraw Explorer publishes the same formats for
-  Explorer to paste, but pasting into Explorer itself is not automated.
+  Explorer to paste. A cut pasted through Explorer's own paste verb moves the items, and ZXraw
+  then drops the cut, takes it off the Windows clipboard and lists the source folder again:
+  `a_cut_pasted_in_explorer_is_used_up_in_zxraw` (`forge-app/tests/e2e/core.rs`) and `forge-win`
+  `clipboard::tests::shell_paste_moves_a_cut`. Pressing Ctrl+V in a real Explorer window or on
+  the desktop was checked by hand, not in the suite.
 * ✅ Copy line: copies and moves run one at a time in a queue (Settings › File operations,
   "Run copies and moves": queue by default, or all at once). Queued jobs wait as "Queued" in
   the Operations panel in run order, with buttons to move a job up or down, start it now,

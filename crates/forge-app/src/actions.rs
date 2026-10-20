@@ -54,6 +54,9 @@ pub enum Event {
         generation: u64,
         result: Result<u32, String>,
     },
+    /// Every item of the cut with this generation has left its folder (pasted in Explorer,
+    /// or moved or deleted some other way): the cut is used up.
+    CutConsumed { generation: u64 },
     /// Paste: the Windows clipboard as read off the UI thread.
     PasteSystemRead {
         destination: PathBuf,
@@ -99,6 +102,16 @@ pub struct FileClipboard {
     baseline_sequence: u32,
     /// `None` while publishing; `Some(Ok(seq))` once on the Windows clipboard.
     published: Option<Result<u32, ()>>,
+    /// Stops the cut's [`watch_cut`] thread once this clipboard is replaced or cleared.
+    watch_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for FileClipboard {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.watch_stop {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl FileClipboard {
@@ -458,12 +471,27 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                     let _ = tx.send(Event::ClipboardPublished { generation, result });
                     ctx.request_repaint();
                 });
+                // A cut pasted elsewhere (Explorer, the Desktop) is noticed by its items
+                // leaving their folders, as nothing tells the source app about that paste.
+                let watch_stop = cut.then(|| {
+                    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let (tx, ctx, p3) = (app.ops.tx.clone(), app.ops.ctx.clone(), paths.clone());
+                    let stop2 = stop.clone();
+                    std::thread::spawn(move || {
+                        if watch_cut(&p3, &stop2, CUT_POLL) {
+                            let _ = tx.send(Event::CutConsumed { generation });
+                            ctx.request_repaint();
+                        }
+                    });
+                    stop
+                });
                 app.ops.clipboard = Some(FileClipboard {
                     paths,
                     cut,
                     generation,
                     baseline_sequence: forge_win::clipboard_sequence(),
                     published: None,
+                    watch_stop,
                 });
             }
         }
@@ -999,6 +1027,69 @@ fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
     app.ops.library.annotate(targets, change);
 }
 
+/// How often a pending cut checks whether its items are still there.
+const CUT_POLL: Duration = Duration::from_millis(750);
+
+/// Waits until every item in `paths` is gone, checking every `poll`. Returns `true` once
+/// they have been missing on two checks in a row (a file saved by replacing it can be
+/// absent for a moment), `false` if `stop` was set first. Only "not found" counts as
+/// gone: an unreachable drive or a denied folder keeps the cut.
+fn watch_cut(paths: &[PathBuf], stop: &std::sync::atomic::AtomicBool, poll: Duration) -> bool {
+    watch_cut_with(paths, stop, || std::thread::sleep(poll))
+}
+
+/// [`watch_cut`] with `wait` run before each check.
+fn watch_cut_with(
+    paths: &[PathBuf],
+    stop: &std::sync::atomic::AtomicBool,
+    mut wait: impl FnMut(),
+) -> bool {
+    use std::sync::atomic::Ordering;
+    let gone = |p: &PathBuf| {
+        std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    let mut missing_before = false;
+    loop {
+        wait();
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let missing = paths.iter().all(gone);
+        if missing && missing_before {
+            return true;
+        }
+        missing_before = missing;
+    }
+}
+
+/// The cut `generation` was pasted elsewhere: drop it (as Explorer drops its own cut after
+/// a paste), take it off the Windows clipboard if it is still what we put there, and list
+/// the folders it left again.
+fn cut_consumed(app: &mut ZxrawApp, generation: u64) {
+    let Some(cb) = app
+        .ops
+        .clipboard
+        .take_if(|cb| cb.cut && cb.generation == generation)
+    else {
+        return;
+    };
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for parent in cb.paths.iter().filter_map(|p| p.parent()) {
+        if !parents.iter().any(|seen| seen == parent) {
+            parents.push(parent.to_path_buf());
+        }
+    }
+    if let Some(Ok(sequence)) = cb.published {
+        let sources = cb.paths.clone();
+        std::thread::spawn(move || {
+            forge_win::clear_if_owned_files(&sources, Some(sequence));
+        });
+    }
+    for parent in parents {
+        app.refresh_all_showing(&parent);
+    }
+}
+
 fn paste_with(
     app: &mut ZxrawApp,
     dest: PathBuf,
@@ -1268,6 +1359,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                     tracing::warn!("publishing files to the Windows clipboard failed: {e}");
                 }
             }
+            Event::CutConsumed { generation } => cut_consumed(app, generation),
             Event::PasteSystemRead {
                 destination,
                 sequence,
@@ -1661,6 +1753,7 @@ mod clipboard_tests {
             generation: 1,
             baseline_sequence: baseline,
             published,
+            watch_stop: None,
         }
     }
 
@@ -1727,6 +1820,62 @@ mod clipboard_tests {
             choose_paste_source(Some(&cb(Some(Ok(7)), 4)), 7, unreadable),
             PasteSource::InApp
         );
+    }
+}
+
+#[cfg(test)]
+mod cut_watch_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[test]
+    fn a_cut_is_consumed_once_all_its_items_are_gone_on_two_checks() {
+        let d = tempfile::tempdir().unwrap();
+        let (file, folder) = (d.path().join("a.txt"), d.path().join("Shoot"));
+        std::fs::write(&file, b"a").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut checks = 0;
+        let consumed = watch_cut_with(&[file.clone(), folder.clone()], &stop, || {
+            checks += 1;
+            match checks {
+                // One item left is still a cut.
+                1 => std::fs::remove_file(&file).unwrap(),
+                4 => std::fs::remove_dir(&folder).unwrap(),
+                9 => stop.store(true, Ordering::Relaxed),
+                _ => {}
+            }
+        });
+        assert!(consumed);
+        assert_eq!(checks, 5, "consumed on the second check with everything gone");
+    }
+
+    #[test]
+    fn stopping_ends_the_watch_without_consuming() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("a.txt");
+        std::fs::write(&file, b"a").unwrap();
+        let stop = AtomicBool::new(true);
+        assert!(!watch_cut(&[file], &stop, Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn an_item_missing_on_one_check_only_is_not_consumed() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("a.txt");
+        let stop = AtomicBool::new(false);
+        let mut checks = 0;
+        // Missing at the first check, back at the second: a save that replaces the file.
+        let consumed = watch_cut_with(std::slice::from_ref(&file), &stop, || {
+            checks += 1;
+            match checks {
+                2 => std::fs::write(&file, b"a").unwrap(),
+                4 => stop.store(true, Ordering::Relaxed),
+                _ => {}
+            }
+        });
+        assert!(!consumed, "a file that came back was taken as consumed");
     }
 }
 

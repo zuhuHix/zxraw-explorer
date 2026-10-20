@@ -29,6 +29,8 @@
 //! - `clipboard-files cut|copy <path>, <path>, …`: put the files on the clipboard as another
 //!   app (Explorer) does: `CF_HDROP` and the preferred drop effect, no text. Waits first for
 //!   the app's own copy or cut to finish publishing, so it does not overwrite this.
+//! - `wait-no-cut`: wait (up to 30 s) until the app no longer holds a cut, e.g. after
+//!   Explorer pasted it.
 //!
 //! Closing with transfers pending:
 //! - `request-close`: arm the close guard for automation and ask the window to close.
@@ -116,6 +118,15 @@ pub(super) fn step(
             forge_win::set_files_without_text(&paths, effect)
                 .map_err(|e| format!("could not set the clipboard: {e}"))?;
             Ok(Flow::Done)
+        }
+        "wait-no-cut" => {
+            if app.ops.clipboard.as_ref().is_none_or(|cb| !cb.cut) {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= WAIT_LIMIT {
+                Err("the cut was still pending after 30 s".into())
+            } else {
+                Ok(Flow::Wait("waiting for the cut to be used up".into()))
+            }
         }
         "request-close" => {
             ops_ui::CLOSE_GUARD_IN_AUTOMATION.store(true, Ordering::SeqCst);
