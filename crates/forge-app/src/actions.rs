@@ -29,6 +29,12 @@ pub enum Event {
         title: String,
         lines: Vec<String>,
     },
+    /// A report that also lists warnings, each with "Show in folder" (see `Modal::Report`).
+    ReportWithWarnings {
+        title: String,
+        lines: Vec<String>,
+        warnings: Vec<forge_core::ops::OpIssue>,
+    },
     Conflict(crate::ops_ui::ConflictQuestion),
     Undo(UndoEntry),
     /// Files or folders were moved (`from` -> `to`) outside an undo record, or an undo moved
@@ -1619,7 +1625,26 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             }
             Event::Report { title, lines } => {
                 if app.ops.modal.is_none() {
-                    app.ops.modal = Some(Modal::Report { title, lines });
+                    app.ops.modal = Some(Modal::Report {
+                        title,
+                        lines,
+                        warnings: Vec::new(),
+                    });
+                } else {
+                    app.toast_err(format!("{title} — see Operations panel"));
+                }
+            }
+            Event::ReportWithWarnings {
+                title,
+                lines,
+                warnings,
+            } => {
+                if app.ops.modal.is_none() {
+                    app.ops.modal = Some(Modal::Report {
+                        title,
+                        lines,
+                        warnings,
+                    });
                 } else {
                     app.toast_err(format!("{title} — see Operations panel"));
                 }
@@ -1901,6 +1926,7 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
                 app.ops.modal = Some(Modal::Report {
                     title: "Batch rename".into(),
                     lines: report,
+                    warnings: Vec::new(),
                 });
             }
         }
@@ -1911,6 +1937,12 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     match modal::show(&mut m, ui.ctx()) {
         Outcome::None => app.ops.modal = Some(m),
         Outcome::Cancel => {}
+        Outcome::Reveal(path) => {
+            app.ops.modal = Some(m);
+            app.ops.spawn_shell("Show in Explorer", move || {
+                forge_win::reveal_in_explorer(&path)
+            });
+        }
         Outcome::Accept => {
             if let Some(m) = accept(app, m) {
                 app.ops.modal = Some(m);
@@ -2484,6 +2516,7 @@ mod name_job_tests {
         let mut modal = Some(Modal::Report {
             title: "Busy".into(),
             lines: Vec::new(),
+            warnings: Vec::new(),
         });
         assert!(!show_pending_prompt(&mut modal, false, &mut pending));
         assert_eq!(pending.len(), 2);
