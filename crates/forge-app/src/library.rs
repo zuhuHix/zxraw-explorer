@@ -1523,14 +1523,9 @@ mod tests {
     fn unresolved_annotation_path_reports_error_and_reverts_optimistic_cache() {
         let db = Arc::new(Db::open_in_memory().unwrap());
         let mut library = library_with_test_writer(db);
-        let path = std::env::temp_dir().join(format!(
-            "zxraw-does-not-exist-{}-{}.jpg",
-            std::process::id(),
-            forge_db::latest_version()
-        ));
-        let _ = std::fs::remove_file(&path);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("does-not-exist.jpg");
         let sidecar = path.with_extension("xmp");
-        let _ = std::fs::remove_file(&sidecar);
         library.xmp_sync = true;
 
         library.annotate(

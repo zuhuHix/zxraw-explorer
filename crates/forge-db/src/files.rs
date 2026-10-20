@@ -1500,15 +1500,10 @@ mod tests {
     #[test]
     fn relink_marks_existing_destination_present() {
         let db = Db::open_in_memory().unwrap();
-        let root = std::env::temp_dir().join(format!(
-            "zxraw-relink-present-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let destination = root.join("photo.jpg");
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("photo.jpg");
         std::fs::write(&destination, b"photo").unwrap();
-        let source = root.join("offline.jpg");
+        let source = root.path().join("offline.jpg");
         let source_id = db
             .upsert_files(&[NewFile {
                 path: source.clone(),
@@ -1526,7 +1521,6 @@ mod tests {
         assert_eq!(moved.path, destination);
         assert!(moved.present);
         assert_eq!(report.moved, 1);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
