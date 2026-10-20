@@ -11,6 +11,10 @@
 - E2E runs up to `ZXRAW_E2E_JOBS` app windows at once (default `min(3, cores / 2)`, at least 1).
   `ZXRAW_E2E_JOBS=1` restores one at a time. Timing tests (`perf::` and
   `browser::two_thousand_small_images_record_grouping_frame_times`) always run alone.
+- Tests that use the real Windows clipboard (forge-win's clipboard unit tests and the e2e
+  clipboard scenarios in `core`) take the named mutex `Local\ZXrawExplorerClipboardTests`,
+  so they run one at a time across test binaries and worktrees. The e2e ones save the
+  clipboard first and put it back afterwards, unless something other than the test changed it.
 - To run one area, name it after `--`: `cargo test -p forge-app --test e2e -- library::`.
   Several areas can be listed. The areas are browser, core, ingest, library, media, perf,
   related, sidebar, system, tools and viewer.

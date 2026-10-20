@@ -919,7 +919,7 @@ fn u16_payload_to_string(handle: windows::Win32::Foundation::HANDLE) -> Result<S
 
 #[cfg(all(test, windows))]
 mod tests {
-    use std::{path::PathBuf, process::Command, sync::Mutex};
+    use std::{path::PathBuf, process::Command};
 
     use windows::Win32::System::DataExchange::{
         EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, SetClipboardData,
@@ -928,18 +928,43 @@ mod tests {
 
     use super::*;
 
-    static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// Serializes tests that use the real clipboard across processes too (the e2e suite,
+    /// other worktrees): a named mutex, the same one the e2e clipboard tests take.
+    struct ClipboardTestLock(windows::Win32::Foundation::HANDLE);
+
+    impl ClipboardTestLock {
+        fn acquire() -> Self {
+            use windows::Win32::Foundation::WAIT_FAILED;
+            use windows::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
+            use windows::core::w;
+
+            let handle =
+                unsafe { CreateMutexW(None, false, w!("Local\\ZXrawExplorerClipboardTests")) }
+                    .expect("create the clipboard test mutex");
+            // WAIT_ABANDONED (a test process died holding it) also hands the mutex over.
+            let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+            assert_ne!(wait, WAIT_FAILED, "wait for the clipboard test mutex");
+            Self(handle)
+        }
+    }
+
+    impl Drop for ClipboardTestLock {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+                let _ = windows::Win32::Foundation::CloseHandle(self.0);
+            }
+        }
+    }
 
     struct ClipboardTestGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: ClipboardTestLock,
         saved_text: Option<String>,
     }
 
     impl ClipboardTestGuard {
         fn new() -> Self {
-            let lock = CLIPBOARD_TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = ClipboardTestLock::acquire();
             let saved_text = read_test_text().ok().flatten();
             Self {
                 _lock: lock,
