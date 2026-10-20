@@ -319,3 +319,8 @@ A failing scenario that exposes a real application bug stays in the suite and is
 Recycle Bin, so it is `#[ignore]`d by default. Run it explicitly with
 `cargo test -p forge-win -- --ignored recycle_removes_file_from_disk`.
 All other tests (including the e2e suite) use temporary directories and isolated profiles.
+
+`cargo run -p forge-win --example recycle_bench --release -- [files] [runs] [mode]` times
+recycling a generated tree under `%TEMP%` with the plain shell, the shell with its progress
+window, `SHFileOperation` and `forge_win::recycle_items`. It uses the real Recycle Bin and
+removes what it put there afterwards.

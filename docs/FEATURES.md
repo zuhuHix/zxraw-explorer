@@ -175,10 +175,18 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   holding them (`an_open_file_is_reported_in_use`). Cancel and progress:
   `a_cancelled_permanent_delete_leaves_the_items`,
   `permanent_shell_delete_reports_progress_and_removes_the_tree`.
-* 🟡 Progress popup — copies, moves, deletes and undos running longer than 0.7 s show a small,
-  non-blocking window (bottom right) with progress, the current item, Cancel, Pause, Details
-  and Hide (`ops_ui::progress_popup`). Checked by a screenshot during development; no
-  automated test looks at it.
+* ✅ Progress popup — copies, moves, deletes and undos running longer than 0.7 s show a small,
+  non-blocking window (bottom right) with the job's title, a thin bar in the accent colour,
+  the current item, one line of counts with speed and time left, and only Pause and Cancel
+  (`ops_ui::progress_popup`; `the_progress_popup_has_only_pause_and_cancel` reads its buttons
+  through AccessKit, `the_counts_line_gives_progress_speed_and_time_left`). The Operations
+  window (status bar) still lists every job. A Recycle Bin delete of a big folder shows what
+  the shell is doing inside it: "Counting items… N found" while Windows counts, then
+  "Moving N items to the Recycle Bin…" with a sliding bar, instead of "0 of 1"
+  (`a_big_folder_shows_what_happens_inside_it_instead_of_0_of_1`); a permanent delete counts
+  the files inside as they go (`recycle::tests::a_permanent_delete_reports_files_inside_the_folder_with_a_total`).
+  The shell's per-file callbacks reach the app at most 20 times a second
+  (`recycle::imp::tests::counting_inside_a_folder_is_throttled_and_every_stage_is_reported`).
 * ✅ Duplicates re-verified on disk before recycling — `forge-app/src/tools_ui.rs::recycle_reverifies_against_disk`
   and `duplicate_selection_safety_refuses_to_remove_the_last_copy`.
 * 🟡 Open files, Open With, Properties, and reveal in Explorer — `forge-win/src/shell.rs`.

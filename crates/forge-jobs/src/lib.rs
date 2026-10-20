@@ -120,6 +120,7 @@ pub struct Progress {
     pub bytes_total: AtomicU64,
     pub errors: AtomicU64,
     current: Mutex<String>,
+    note: Mutex<String>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -130,6 +131,9 @@ pub struct ProgressSnapshot {
     pub bytes_total: u64,
     pub errors: u64,
     pub current: String,
+    /// What the job is doing when its counts say nothing yet ("Counting items"), shown instead
+    /// of them. Empty otherwise.
+    pub note: String,
 }
 
 impl ProgressSnapshot {
@@ -151,6 +155,10 @@ impl Progress {
     }
     pub fn set_current(&self, s: impl Into<String>) {
         *self.current.lock() = s.into();
+    }
+    /// Sets the note shown instead of the counts (empty: show the counts).
+    pub fn set_note(&self, s: impl Into<String>) {
+        *self.note.lock() = s.into();
     }
     pub fn add_items(&self, n: u64) {
         self.items_done.fetch_add(n, Ordering::Relaxed);
@@ -175,6 +183,7 @@ impl Progress {
             bytes_total: self.bytes_total.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             current: self.current.lock().clone(),
+            note: self.note.lock().clone(),
         }
     }
 }
