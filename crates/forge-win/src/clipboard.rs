@@ -11,11 +11,16 @@ pub enum ClipboardEffect {
     Move,
 }
 
-/// The clipboard file list with its effect, and the owner token of our publish if present.
-pub type FilesAndOwner = (
-    Option<(Vec<PathBuf>, ClipboardEffect)>,
-    Option<ClipboardToken>,
-);
+/// What one look at the clipboard found, all read while it was held open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardRead {
+    /// The file list and its effect, `None` if there are no files.
+    pub files: Option<(Vec<PathBuf>, ClipboardEffect)>,
+    /// The owner token, if the content is a publish of ours.
+    pub owner: Option<ClipboardToken>,
+    /// The clipboard sequence number of this content.
+    pub sequence: u32,
+}
 
 /// Marks one publish of ours: stored in a private clipboard format next to the file list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +30,11 @@ impl ClipboardToken {
     /// A token with this value, for tests that never touch the clipboard.
     pub const fn from_raw(value: u64) -> Self {
         Self(value)
+    }
+
+    /// Whether this process made the publish (any of its publishes, not only the latest).
+    pub fn is_from_this_process(self) -> bool {
+        self.0 >> 32 == u64::from(std::process::id())
     }
 }
 
@@ -213,17 +223,21 @@ pub fn set_files(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<Clipboa
 /// Retrieves the clipboard file list and preferred effect, if `CF_HDROP` is available.
 #[cfg(windows)]
 pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
-    get_files_and_owner().map(|(files, _)| files)
+    get_files_and_owner().map(|read| read.files)
 }
 
 /// Like [`get_files`], and also returns the owner token of our own publish, if one is present.
 /// Both are read in one clipboard session.
 #[cfg(windows)]
-pub fn get_files_and_owner() -> Result<FilesAndOwner> {
+pub fn get_files_and_owner() -> Result<ClipboardRead> {
     let _window = ClipboardOwnerWindow::new()?;
     let _clipboard = open_clipboard_retry(Some(_window.hwnd))?;
-    let files = read_files_open()?;
-    Ok((files, read_owner_token_open()))
+    // Nobody else can change the clipboard while it is open, so these three agree.
+    Ok(ClipboardRead {
+        files: read_files_open()?,
+        owner: read_owner_token_open(),
+        sequence: clipboard_sequence(),
+    })
 }
 
 /// Reads the file list and preferred effect from an open clipboard.
@@ -268,7 +282,7 @@ pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
 }
 
 #[cfg(not(windows))]
-pub fn get_files_and_owner() -> Result<FilesAndOwner> {
+pub fn get_files_and_owner() -> Result<ClipboardRead> {
     Err(crate::WinError::Unsupported)
 }
 
@@ -399,24 +413,25 @@ fn read_owner_token_open() -> Option<ClipboardToken> {
         .map(ClipboardToken)
 }
 
-/// Empties the clipboard if its owner token is `token`. Returns false when it is not, or on
-/// any clipboard error.
+/// Empties the clipboard if its owner token is `token`: `Ok(true)` when emptied, `Ok(false)`
+/// when the clipboard holds something else (not ours any more). `Err` is a clipboard
+/// failure (another app holding it open, say) and worth trying again.
 #[cfg(windows)]
-pub fn clear_if_token(token: ClipboardToken) -> bool {
+pub fn clear_if_token(token: ClipboardToken) -> Result<bool> {
     use windows::Win32::System::DataExchange::EmptyClipboard;
 
-    let Ok(window) = ClipboardOwnerWindow::new() else {
-        return false;
-    };
-    let Ok(_clipboard) = open_clipboard_retry(Some(window.hwnd)) else {
-        return false;
-    };
-    read_owner_token_open() == Some(token) && unsafe { EmptyClipboard() }.is_ok()
+    let window = ClipboardOwnerWindow::new()?;
+    let _clipboard = open_clipboard_retry(Some(window.hwnd))?;
+    if read_owner_token_open() != Some(token) {
+        return Ok(false);
+    }
+    unsafe { EmptyClipboard() }.map_err(|e| crate::api_err("EmptyClipboard", e))?;
+    Ok(true)
 }
 
 #[cfg(not(windows))]
-pub fn clear_if_token(_token: ClipboardToken) -> bool {
-    false
+pub fn clear_if_token(_token: ClipboardToken) -> Result<bool> {
+    Err(crate::WinError::Unsupported)
 }
 
 /// If the owner token is `token`, replaces the clipboard with `paths` as a new publish of ours
@@ -1023,9 +1038,15 @@ mod tests {
         let first = set_files(&paths, ClipboardEffect::Copy).unwrap();
         let second = set_files(&paths, ClipboardEffect::Move).unwrap();
         assert_ne!(first, second);
+        let read = get_files_and_owner().unwrap();
         assert_eq!(
-            get_files_and_owner().unwrap(),
+            (read.files, read.owner),
             (Some((paths.clone(), ClipboardEffect::Move)), Some(second))
+        );
+        assert!(second.is_from_this_process());
+        assert!(
+            !ClipboardToken::from_raw(u64::from(std::process::id() ^ 1) << 32 | 5)
+                .is_from_this_process()
         );
     }
 
@@ -1036,11 +1057,12 @@ mod tests {
         let token = set_files(&paths, ClipboardEffect::Copy).unwrap();
         set_files_without_text(&paths, ClipboardEffect::Move).unwrap();
 
+        let read = get_files_and_owner().unwrap();
         assert_eq!(
-            get_files_and_owner().unwrap(),
+            (read.files, read.owner),
             (Some((paths.clone(), ClipboardEffect::Move)), None)
         );
-        assert!(!clear_if_token(token));
+        assert!(!clear_if_token(token).unwrap());
         assert_eq!(
             get_files().unwrap(),
             Some((paths.clone(), ClipboardEffect::Move))
@@ -1054,9 +1076,9 @@ mod tests {
         let stale = set_files(&paths, ClipboardEffect::Copy).unwrap();
         let current = set_files(&paths, ClipboardEffect::Copy).unwrap();
 
-        assert!(!clear_if_token(stale));
+        assert!(!clear_if_token(stale).unwrap());
         assert!(get_files().unwrap().is_some());
-        assert!(clear_if_token(current));
+        assert!(clear_if_token(current).unwrap());
         assert_eq!(get_files().unwrap(), None);
     }
 
@@ -1071,8 +1093,9 @@ mod tests {
             replace_files_if_token(std::slice::from_ref(&b), ClipboardEffect::Move, token).unwrap();
         let new_token = replaced.expect("our publish is replaced");
         assert_ne!(new_token, token);
+        let read = get_files_and_owner().unwrap();
         assert_eq!(
-            get_files_and_owner().unwrap(),
+            (read.files, read.owner),
             (
                 Some((vec![b.clone()], ClipboardEffect::Move)),
                 Some(new_token)

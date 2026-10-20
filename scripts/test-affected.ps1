@@ -54,6 +54,7 @@ $E2EMap = @(
     @('crates/forge-app/src/settings_ui.rs', 'core,related'),
     @('crates/forge-app/src/actions.rs', 'core'),
     @('crates/forge-app/src/cut_watch.rs', 'core'),
+    @('crates/forge-app/src/clip_worker.rs', 'core'),
     @('crates/forge-app/src/modal.rs', 'core'),
     @('crates/forge-app/src/palette.rs', 'core'),
     @('crates/forge-app/src/dialogs.rs', 'core'),

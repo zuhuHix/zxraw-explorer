@@ -7,6 +7,7 @@ mod batch_export;
 mod batch_rename;
 mod breadcrumb;
 mod collections_ui;
+mod clip_worker;
 mod commands;
 mod cut_watch;
 mod crash;

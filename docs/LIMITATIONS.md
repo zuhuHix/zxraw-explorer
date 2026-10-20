@@ -79,14 +79,19 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   refused with a message pointing to copy and paste.
 * The Windows file clipboard (`CF_HDROP`, preferred drop effect, text paths) passes its engine
   tests in `forge-win/src/clipboard.rs`. Explorer's paste of ZXraw's copy or cut is tested
-  through the shell's paste verb. A cut pasted elsewhere is noticed only by its items leaving
-  their folders: one thread checks the newest cut every 0.75 s, and an item counts as gone
-  when it is missing twice in a row while the folder above it can be read, or when a
-  different item has taken its name. An item that comes back later (for example, undo in
-  Explorer) is not cut again. While a drive or share cannot be reached, its items stay cut,
-  and a slow drive delays the checks. Our own clipboard content is recognised by a private
-  "ZXraw Explorer Clipboard Owner" format, so another app's identical list is never
-  cleared. Paste into other applications has not been checked.
+  through the shell's paste verb. Paste into other applications has not been checked.
+* A cut pasted elsewhere is noticed only by its items leaving their folders. One thread checks
+  the newest cut every 0.75 s; a check that takes longer than 5 s (a share that hangs) counts
+  as "could not tell", and its items stay cut. An item counts as gone when it is missing twice
+  in a row while the folder above it can be read, or when a different item has taken its name.
+  An item that comes back later (for example, undo in Explorer) is not cut again.
+* A cut item is identified by its Windows file ID, or, where the file system has none, by its
+  kind, size, creation and modified time together. An item whose identity cannot be read (or
+  could not be checked again at paste time) is left out of a paste with a message, never moved
+  unchecked. Without a file ID, editing a cut file counts as replacing it, so it leaves the cut.
+* All clipboard writes go through one worker, newest request first. ZXraw recognises its own
+  clipboard content by a private "ZXraw Explorer Clipboard Owner" format and only ever replaces
+  or empties that; another app's identical list is left alone.
 * Opening a file (double-click, Enter, or **Open**) starts it in the file's own folder, as
   Explorer does. Scripts in a UNC folder (`\\server\share`) still run in the Windows folder,
   because `cmd.exe` cannot use a UNC path as its working directory; Explorer behaves the same.
