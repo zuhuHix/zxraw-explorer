@@ -977,324 +977,118 @@ fn dragging_a_marquee_selects_virtual_rows_and_grid_tiles() {
     );
 }
 
+#[path = "../../../forge-win/src/clipboard_test_support.rs"]
+mod clipboard_test_support;
+
+use clipboard_test_support::{ClipboardLock, Snapshot};
+
 /// Scenarios that use the real Windows clipboard run one at a time, also against other
-/// test processes (forge-win's clipboard unit tests, e2e runs in other worktrees): a named
-/// mutex, the same one forge-win's tests take. It is recursive for the thread holding it.
+/// test processes (forge-win's clipboard unit tests, e2e runs in other worktrees): see
+/// [`ClipboardLock`].
 fn clipboard_lock() -> ClipboardLock {
-    use windows::Win32::Foundation::WAIT_FAILED;
-    use windows::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
-    use windows::core::w;
-
-    let handle = unsafe { CreateMutexW(None, false, w!("Local\\ZXrawExplorerClipboardTests")) }
-        .expect("create the clipboard test mutex");
-    // WAIT_ABANDONED (a test process died holding it) also hands the mutex over.
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    assert_ne!(wait, WAIT_FAILED, "wait for the clipboard test mutex");
-    ClipboardLock(handle)
+    ClipboardLock::acquire()
 }
 
-struct ClipboardLock(windows::Win32::Foundation::HANDLE);
-
-impl Drop for ClipboardLock {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
-            let _ = windows::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
-
-/// [`clipboard_lock`] plus the user's clipboard: every format held in global memory (text,
-/// file drops, DIB images, HTML, ...) is saved when the test starts and put back when it
-/// ends. A watcher notes every clipboard change during the test; the clipboard is put back
-/// only if each one was the test's own (empty, or files inside `sandbox` only) and the
-/// clipboard still is. If the user copied something meanwhile, nothing is restored.
+/// [`clipboard_lock`] plus the user's clipboard, saved now and put back when the guard drops.
 ///
-/// Not restored, with a warning at the start: a saved cut (replaying it could later move
-/// the user's files again) and formats that are not global memory (`CF_BITMAP`, metafiles;
-/// a DIB, which most image sources also offer, is saved). Remaining window: a user change
-/// that is replaced by the test within one watcher poll (50 ms), or a user emptying the
-/// clipboard, looks like the test's own.
-fn clipboard_guard(sandbox: &Path) -> ClipboardGuard {
+/// Fails closed: `None` (the caller skips the test, before writing to the clipboard) when
+/// the clipboard holds something that cannot be put back exactly (see [`Snapshot::save`]).
+///
+/// A watcher, started from the snapshot's own clipboard sequence, checks every change; the
+/// clipboard is put back only if each one was the test's own (empty, or files inside
+/// `sandbox` only) and, checked in the same clipboard open as the restore, it still is. So a
+/// copy the user makes during the test is kept, and nothing is restored. Remaining window: a
+/// user copy that lands between two of the test's own clipboard writes less than one
+/// watcher poll (50 ms) apart, or a user emptying the clipboard, looks like the test's own.
+fn clipboard_guard(sandbox: &Path) -> Option<ClipboardGuard> {
     let lock = clipboard_lock();
-    let saved = saved_clipboard::save();
-    match &saved {
-        None => eprintln!("warning: could not read the clipboard; it will not be restored"),
-        Some(s) if s.is_cut => {
-            eprintln!("warning: the clipboard holds a cut; it will not be restored")
+    let saved = match Snapshot::save() {
+        Ok(saved) => saved,
+        Err(why) => {
+            eprintln!(
+                "skipped: the clipboard holds {why}, which this test can't restore; \
+                 clear it or copy some text and rerun"
+            );
+            return None;
         }
-        Some(s) if !s.lost.is_empty() => eprintln!(
-            "warning: clipboard formats {:?} cannot be saved and will not be restored",
-            s.lost
-        ),
-        Some(_) => {}
-    }
+    };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher = {
         let stop = stop.clone();
         let sandbox = sandbox.to_path_buf();
-        std::thread::spawn(move || saved_clipboard::watch(&sandbox, &stop))
+        let start = saved.sequence;
+        std::thread::spawn(move || watch_clipboard(&sandbox, start, &stop))
     };
-    ClipboardGuard {
-        saved: saved.filter(|s| !s.is_cut),
+    Some(ClipboardGuard {
+        saved,
         sandbox: sandbox.to_path_buf(),
         stop,
         watcher: Some(watcher),
         _lock: lock,
+    })
+}
+
+/// Checks every clipboard change after sequence `start` until `stop`. Returns whether one
+/// was not the test's, and the last sequence seen that was.
+fn watch_clipboard(
+    sandbox: &Path,
+    start: u32,
+    stop: &std::sync::atomic::AtomicBool,
+) -> (bool, u32) {
+    let mut seen = start;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(50));
+        if clipboard_test_support::sequence() == seen {
+            continue;
+        }
+        match clipboard_test_support::check_files_in(sandbox) {
+            Some((sequence, true)) => seen = sequence,
+            Some((_, false)) => return (true, seen),
+            None => {} // busy: look again next time
+        }
     }
+    (false, seen)
 }
 
 struct ClipboardGuard {
-    saved: Option<saved_clipboard::Snapshot>,
+    saved: Snapshot,
     sandbox: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Returns whether it saw a clipboard that was not the test's.
-    watcher: Option<std::thread::JoinHandle<bool>>,
+    watcher: Option<std::thread::JoinHandle<(bool, u32)>>,
     _lock: ClipboardLock,
 }
 
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let saw_foreign = self.watcher.take().is_none_or(|w| w.join().unwrap_or(true));
-        let Some(saved) = &self.saved else {
+        let (foreign, seen) = self
+            .watcher
+            .take()
+            .map_or((true, 0), |w| w.join().unwrap_or((true, 0)));
+        if foreign {
+            eprintln!("warning: something other than the test changed the clipboard; not restored");
             return;
-        };
-        if saw_foreign || !saved_clipboard::is_test_owned(&self.sandbox) {
-            eprintln!(
-                "warning: the clipboard was changed by something other than the test; \
-                 not restored"
-            );
-        } else if let Err(e) = saved_clipboard::replace(&saved.formats) {
-            eprintln!("warning: could not restore the clipboard: {e}");
+        }
+        let unchanged = std::cell::Cell::new(false);
+        let restored = self.saved.restore_if(|| {
+            let now = clipboard_test_support::sequence();
+            unchanged.set(now == self.saved.sequence);
+            !unchanged.get()
+                && (now == seen || clipboard_test_support::holds_only_files_in(&self.sandbox))
+        });
+        match restored {
+            Ok(false) if !unchanged.get() => eprintln!(
+                "warning: something other than the test changed the clipboard; not restored"
+            ),
+            Err(e) => eprintln!("warning: could not restore the clipboard: {e}"),
+            _ => {}
         }
     }
 }
 
-mod saved_clipboard {
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-    use windows::Win32::System::DataExchange::{
-        CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
-        GetClipboardData, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
-    };
-    use windows::Win32::System::Memory::{
-        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
-    };
-    use windows::core::w;
-
-    pub const CF_UNICODETEXT: u32 = 13;
-    const CF_DIB: u32 = 8;
-    const CF_DIBV5: u32 = 17;
-    /// `CF_BITMAP` and `CF_PALETTE`: the system makes them from a DIB again.
-    const FROM_DIB: [u32; 2] = [2, 9];
-    /// Formats whose handle is not global memory.
-    const NOT_GLOBAL: [u32; 8] = [2, 3, 9, 14, 0x80, 0x82, 0x83, 0x8E];
-
-    pub struct Snapshot {
-        pub formats: Vec<(u32, Vec<u8>)>,
-        /// Formats that were there but could not be saved.
-        pub lost: Vec<u32>,
-        /// A cut: "Preferred DropEffect" says move.
-        pub is_cut: bool,
-    }
-
-    /// Opens the clipboard for `owner`, retrying while another process holds it.
-    fn open(owner: Option<HWND>) -> bool {
-        for _ in 0..50 {
-            if unsafe { OpenClipboard(owner) }.is_ok() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
-    /// `None` if the clipboard could not be opened.
-    pub fn save() -> Option<Snapshot> {
-        if !open(None) {
-            return None;
-        }
-        let preferred = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
-        let mut formats = Vec::new();
-        let mut skipped = Vec::new();
-        unsafe {
-            let mut format = EnumClipboardFormats(0);
-            while format != 0 {
-                let bytes = (!NOT_GLOBAL.contains(&format))
-                    .then(|| GetClipboardData(format).ok())
-                    .flatten()
-                    .and_then(|handle| {
-                        let global = HGLOBAL(handle.0);
-                        let size = GlobalSize(global);
-                        let ptr = GlobalLock(global) as *const u8;
-                        if ptr.is_null() {
-                            return None;
-                        }
-                        let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
-                        let _ = GlobalUnlock(global);
-                        Some(bytes)
-                    });
-                match bytes {
-                    Some(bytes) => formats.push((format, bytes)),
-                    None => skipped.push(format),
-                }
-                format = EnumClipboardFormats(format);
-            }
-            let _ = CloseClipboard();
-        }
-        let has_dib = formats.iter().any(|(f, _)| *f == CF_DIB || *f == CF_DIBV5);
-        let lost = skipped
-            .into_iter()
-            .filter(|f| !(has_dib && FROM_DIB.contains(f)))
-            .collect();
-        let is_cut = formats
-            .iter()
-            .any(|(f, bytes)| *f == preferred && bytes.len() >= 4 && bytes[0] & 2 != 0);
-        Some(Snapshot {
-            formats,
-            lost,
-            is_cut,
-        })
-    }
-
-    fn inside(path: &Path, sandbox: &Path) -> bool {
-        let lower = |p: &Path| p.to_string_lossy().to_lowercase();
-        Path::new(&lower(path)).starts_with(lower(sandbox))
-    }
-
-    /// Whether the clipboard is empty or holds only files inside `sandbox`; `None` while it
-    /// cannot be read.
-    fn test_owned(sandbox: &Path) -> Option<bool> {
-        if unsafe { CountClipboardFormats() } == 0 {
-            return Some(true);
-        }
-        match forge_win::get_files() {
-            Ok(Some((paths, _))) => {
-                Some(!paths.is_empty() && paths.iter().all(|p| inside(p, sandbox)))
-            }
-            Ok(None) => Some(false),
-            Err(_) => None,
-        }
-    }
-
-    /// [`test_owned`], retrying while the clipboard is busy (not owned if it stays busy).
-    pub fn is_test_owned(sandbox: &Path) -> bool {
-        for _ in 0..50 {
-            if let Some(owned) = test_owned(sandbox) {
-                return owned;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
-    /// Checks every clipboard change until `stop`; returns whether one was not the test's.
-    pub fn watch(sandbox: &Path, stop: &AtomicBool) -> bool {
-        let mut seen = forge_win::clipboard_sequence();
-        while !stop.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let sequence = forge_win::clipboard_sequence();
-            if sequence == seen {
-                continue;
-            }
-            match test_owned(sandbox) {
-                Some(true) => seen = sequence,
-                Some(false) => return true,
-                None => {} // busy: look again next time
-            }
-        }
-        false
-    }
-
-    /// Replaces the clipboard with `formats`. The clipboard is opened for a hidden
-    /// message-only window: with no owner, `SetClipboardData` fails after `EmptyClipboard`.
-    pub fn replace(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
-        let owner = unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("STATIC"),
-                w!("ZXraw e2e clipboard restore"),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                Some(HWND_MESSAGE),
-                None,
-                None,
-                None,
-            )
-        }
-        .map_err(|e| format!("owner window: {e}"))?;
-        let result = if open(Some(owner)) {
-            let result = unsafe { set_all(formats) };
-            let _ = unsafe { CloseClipboard() };
-            result
-        } else {
-            Err("could not open the clipboard".into())
-        };
-        let _ = unsafe { DestroyWindow(owner) };
-        result
-    }
-
-    unsafe fn set_all(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
-        unsafe {
-            EmptyClipboard().map_err(|e| format!("EmptyClipboard: {e}"))?;
-            let mut failed = Vec::new();
-            for (format, bytes) in formats {
-                let Ok(global) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) else {
-                    failed.push(*format);
-                    continue;
-                };
-                let ptr = GlobalLock(global) as *mut u8;
-                if ptr.is_null() {
-                    let _ = GlobalFree(Some(global));
-                    failed.push(*format);
-                    continue;
-                }
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-                let _ = GlobalUnlock(global);
-                // The clipboard owns the memory only when it accepts it.
-                if SetClipboardData(*format, Some(HANDLE(global.0))).is_err() {
-                    let _ = GlobalFree(Some(global));
-                    failed.push(*format);
-                }
-            }
-            if failed.is_empty() {
-                Ok(())
-            } else {
-                Err(format!("formats {failed:?} were not restored"))
-            }
-        }
-    }
-
-    /// The clipboard's Unicode text, if it has some.
-    pub fn text() -> Option<String> {
-        let saved = save()?;
-        let (_, bytes) = saved.formats.iter().find(|(f, _)| *f == CF_UNICODETEXT)?;
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&u| u != 0)
-            .collect();
-        Some(String::from_utf16_lossy(&units))
-    }
-
-    /// `text` as `CF_UNICODETEXT` bytes for [`replace`].
-    pub fn text_format(text: &str) -> (u32, Vec<u8>) {
-        let bytes = text
-            .encode_utf16()
-            .chain([0])
-            .flat_map(u16::to_le_bytes)
-            .collect();
-        (CF_UNICODETEXT, bytes)
-    }
+/// The current clipboard text (empty if it has none), or `None` if it cannot be saved.
+fn clipboard_text() -> Option<String> {
+    Snapshot::save().ok().map(|s| s.text().unwrap_or_default())
 }
 
 /// The guard puts the user's clipboard back after a test that left its own cut there.
@@ -1303,26 +1097,23 @@ fn clipboard_guard_restores_the_clipboard_after_a_test_cut() {
     let sandbox = tempfile::tempdir().unwrap();
     let cut = sandbox.path().join("cut.txt");
     write_file(&cut, b"cut");
-    // Held across the whole test (the guard below takes it again on this thread). The
-    // user's clipboard is saved here and put back at the end.
+    // Held across the whole test (the guard takes it again on this thread). The user's
+    // clipboard is saved here and put back at the end.
     let _lock = clipboard_lock();
-    let user = saved_clipboard::save();
+    let Ok(user) = Snapshot::save() else {
+        eprintln!("skipped: the clipboard holds something this test can't restore");
+        return;
+    };
     let probe = "ZXraw clipboard guard probe";
-    let replaced = saved_clipboard::replace(&[saved_clipboard::text_format(probe)]);
-    let restored = replaced.as_ref().ok().map(|()| {
-        let guard = clipboard_guard(sandbox.path());
-        forge_win::set_files(std::slice::from_ref(&cut), forge_win::ClipboardEffect::Move).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        drop(guard);
-        saved_clipboard::text()
-    });
-    if let Some(user) = user.filter(|u| !u.is_cut)
-        && saved_clipboard::text().as_deref() == Some(probe)
-    {
-        let _ = saved_clipboard::replace(&user.formats);
-    }
-    replaced.unwrap();
-    assert_eq!(restored.flatten().as_deref(), Some(probe));
+    Snapshot::of_text(probe).restore_if(|| true).unwrap();
+    let guard = clipboard_guard(sandbox.path()).expect("plain text can be saved");
+    forge_win::set_files(std::slice::from_ref(&cut), forge_win::ClipboardEffect::Move).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(guard);
+    let after = clipboard_test_support::sequence();
+    let text = clipboard_text();
+    let _ = user.restore_if(|| clipboard_test_support::sequence() == after);
+    assert_eq!(text.as_deref(), Some(probe));
 }
 
 /// It leaves alone a clipboard that something else changed during the test.
@@ -1330,22 +1121,43 @@ fn clipboard_guard_restores_the_clipboard_after_a_test_cut() {
 fn clipboard_guard_keeps_a_newer_clipboard() {
     let sandbox = tempfile::tempdir().unwrap();
     let _lock = clipboard_lock();
-    let user = saved_clipboard::save();
-    let replaced = saved_clipboard::replace(&[saved_clipboard::text_format("old")]);
-    let kept = replaced.as_ref().ok().map(|()| {
-        let guard = clipboard_guard(sandbox.path());
-        saved_clipboard::replace(&[saved_clipboard::text_format("newer")]).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        drop(guard);
-        saved_clipboard::text()
-    });
-    if let Some(user) = user.filter(|u| !u.is_cut)
-        && saved_clipboard::text().as_deref() == Some("newer")
-    {
-        let _ = saved_clipboard::replace(&user.formats);
-    }
-    replaced.unwrap();
-    assert_eq!(kept.flatten().as_deref(), Some("newer"));
+    let Ok(user) = Snapshot::save() else {
+        eprintln!("skipped: the clipboard holds something this test can't restore");
+        return;
+    };
+    Snapshot::of_text("old").restore_if(|| true).unwrap();
+    let guard = clipboard_guard(sandbox.path()).expect("plain text can be saved");
+    Snapshot::of_text("newer").restore_if(|| true).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(guard);
+    let after = clipboard_test_support::sequence();
+    let text = clipboard_text();
+    let _ = user.restore_if(|| clipboard_test_support::sequence() == after);
+    assert_eq!(text.as_deref(), Some("newer"));
+}
+
+/// A clipboard holding files is never overwritten: the guard refuses to start.
+#[test]
+fn clipboard_guard_refuses_a_clipboard_holding_files() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let file = sandbox.path().join("copied.txt");
+    write_file(&file, b"copied");
+    let _lock = clipboard_lock();
+    let Ok(user) = Snapshot::save() else {
+        eprintln!("skipped: the clipboard holds something this test can't restore");
+        return;
+    };
+    forge_win::set_files(
+        std::slice::from_ref(&file),
+        forge_win::ClipboardEffect::Copy,
+    )
+    .unwrap();
+    let after = clipboard_test_support::sequence();
+    let guard = clipboard_guard(sandbox.path());
+    let unchanged = clipboard_test_support::sequence() == after;
+    let _ = user.restore_if(|| clipboard_test_support::sequence() == after);
+    assert!(guard.is_none(), "the guard took a clipboard holding files");
+    assert!(unchanged, "the guard wrote to the clipboard");
 }
 /// Two folders with a file each under `<sandbox>/Desktop`, and an empty `<sandbox>/work`.
 fn clipboard_fixture(sandbox: &Path) -> (PathBuf, PathBuf, [PathBuf; 2]) {
@@ -1381,7 +1193,9 @@ fn assert_folders_moved(work: &Path, folders: &[PathBuf; 2]) {
 #[test]
 fn explorer_cut_of_two_folders_pastes_with_ctrl_v() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (_, work, folders) = clipboard_fixture(sandbox.path());
     let script = format!(
         "navigate {work}\n\
@@ -1409,7 +1223,9 @@ fn explorer_cut_of_two_folders_pastes_with_ctrl_v() {
 #[test]
 fn explorer_copy_pastes_with_shift_insert_without_a_click() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (_, work, folders) = clipboard_fixture(sandbox.path());
     let script = format!(
         "navigate {work}\n\
@@ -1443,7 +1259,9 @@ fn explorer_copy_pastes_with_shift_insert_without_a_click() {
 #[test]
 fn in_app_cut_pastes_with_ctrl_v() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     write_file(&desktop.join("loose.txt"), b"loose");
     let script = format!(
@@ -1480,7 +1298,9 @@ fn in_app_cut_pastes_with_ctrl_v() {
 #[test]
 fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     // Explorer's paste verb runs in another process, so wait until the cut is on the
     // clipboard, then paste it into `work` the way Explorer does.
@@ -1570,7 +1390,9 @@ fn wait_for_move_cut(paths: Vec<PathBuf>) -> bool {
 #[test]
 fn an_item_moved_away_leaves_the_rest_of_the_cut() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     let mover = {
         let folders = folders.clone();
@@ -1613,7 +1435,9 @@ fn an_item_moved_away_leaves_the_rest_of_the_cut() {
 #[test]
 fn a_replaced_cut_item_is_never_moved() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     let replacer = {
         let folders = folders.clone();
@@ -1669,7 +1493,9 @@ fn a_replaced_cut_item_is_never_moved() {
 #[test]
 fn renaming_a_cut_item_in_zxraw_keeps_it_cut() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     let renamed = desktop.join("Shoot Renamed");
     let script = format!(
@@ -1720,7 +1546,9 @@ fn renaming_a_cut_item_in_zxraw_keeps_it_cut() {
 #[test]
 fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, folders) = clipboard_fixture(sandbox.path());
     write_file(&desktop.join("stale.txt"), b"stale");
     let script = format!(
@@ -1756,7 +1584,9 @@ fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
 #[test]
 fn ctrl_shift_v_does_not_paste_files() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (desktop, work, _) = clipboard_fixture(sandbox.path());
     write_file(&desktop.join("loose.txt"), b"loose");
     let script = format!(
@@ -2068,7 +1898,9 @@ fn cut_pasted_on_the_desktop(
     paste: impl FnOnce(&Path, &[PathBuf]) -> Result<String, String> + Send + 'static,
 ) {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (source, desktop, elsewhere) = tree_fixture(sandbox.path());
     let shell = {
         let cut = vec![source.join("Shoot C")];
@@ -2124,7 +1956,9 @@ fn a_folder_cut_in_zxraw_pastes_on_a_desktop_that_clears_the_clipboard() {
 #[test]
 fn a_folder_tree_cut_in_zxraw_pastes_once_in_zxraw() {
     let sandbox = tempfile::tempdir().unwrap();
-    let _clipboard = clipboard_guard(sandbox.path());
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let (source, desktop, elsewhere) = tree_fixture(sandbox.path());
     let script = format!(
         "navigate {source}\n\
