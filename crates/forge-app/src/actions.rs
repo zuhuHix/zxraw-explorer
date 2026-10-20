@@ -1159,6 +1159,29 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
     });
 }
 
+/// The known identities of the cut `generation`'s items (empty if that cut is gone). A
+/// paste of the cut moves only these items, and only while they are still these.
+pub fn cut_identities(
+    app: &ZxrawApp,
+    generation: u64,
+) -> Vec<(PathBuf, crate::cut_watch::Identity)> {
+    app.ops
+        .clipboard
+        .as_ref()
+        .filter(|cb| cb.cut && cb.generation == generation)
+        .map(|cb| {
+            cb.paths
+                .iter()
+                .zip(&cb.ids)
+                .filter_map(|(p, id)| match id {
+                    crate::cut_watch::IdState::Known(id) => Some((p.clone(), *id)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What is at the cut's paths now, for a paste. Runs off the UI thread; a check that takes
 /// longer than [`crate::cut_watch::PASS_TIMEOUT`] counts as "could not tell".
 fn check_cut(
