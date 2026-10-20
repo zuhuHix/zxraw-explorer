@@ -702,7 +702,13 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         }
         Cmd::Undo => match app.ops.undo.pop() {
             None => app.toast("Nothing to undo"),
-            Some(UndoEntry::Ops(records)) => crate::ops_ui::undo_ops(app, records),
+            Some(UndoEntry::Ops(records)) => {
+                let slot = UndoSlot {
+                    index: app.ops.undo.len(),
+                    trimmed: app.ops.undo_trimmed,
+                };
+                crate::ops_ui::undo_ops(app, records, slot)
+            }
             Some(UndoEntry::TextReplace(records)) => crate::replace_ui::undo(app, records),
             Some(UndoEntry::Rename(pairs)) => {
                 let slot = UndoSlot {
@@ -868,7 +874,7 @@ fn lane_key(path: &Path) -> String {
 
 /// Where an undo record sat on the stack when Undo took it: `index` from the bottom, at a time
 /// when the size cap had removed `trimmed` records. Records pushed meanwhile stay above it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UndoSlot {
     index: usize,
     trimmed: u64,

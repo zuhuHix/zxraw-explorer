@@ -14,7 +14,7 @@ use forge_core::ops::{
 };
 use forge_jobs::{CancelToken, JobHandle, JobState};
 
-use crate::actions::{Event, UndoEntry};
+use crate::actions::{Event, UndoEntry, UndoSlot};
 use crate::app::ZxrawApp;
 use crate::modal::{self, Confirm, ConfirmKind, Modal};
 use crate::views;
@@ -1423,11 +1423,13 @@ fn delete_result(job: &JobHandle, report: &forge_win::DeleteReport, skipped: usi
     }
 }
 
-/// Questions from finished deletes.
+/// Questions from finished deletes, and the progress popup's speed meters.
 #[derive(Default)]
 pub struct DeleteUi {
     /// Questions waiting for the open dialog to close.
     pending: std::collections::VecDeque<Confirm>,
+    /// Speed of each job the popup shows.
+    meters: std::collections::HashMap<forge_jobs::JobId, RateMeter>,
 }
 
 /// Queues a question from a job; it opens once no other dialog is open.
@@ -1529,6 +1531,10 @@ fn show_delete_progress(progress: &forge_jobs::Progress, p: &forge_win::DeletePr
     progress.items_total.store(total, Ordering::Relaxed);
     progress.items_done.store(done.min(total), Ordering::Relaxed);
     progress.set_note(note);
+    // No callbacks come until that step ends, so nothing can stop or pause it.
+    progress
+        .in_one_step
+        .store(p.stage == DeleteStage::MovingWhole, Ordering::Relaxed);
     if let Some(current) = &p.current {
         progress.set_current(current.display().to_string());
     }
@@ -1575,6 +1581,7 @@ fn finish_shell_delete(
     tx: &Sender<Event>,
 ) {
     job.progress.set_note("");
+    job.progress.in_one_step.store(false, Ordering::Relaxed);
     let mut seen = std::collections::HashSet::new();
     for d in targets.iter().filter_map(|p| p.parent()) {
         if seen.insert(d) {
@@ -1671,7 +1678,10 @@ fn finish_shell_delete(
     }
 }
 
-pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
+/// Undoes `records` (taken from `slot` on the Undo stack) in a job, last first. Pause and
+/// Cancel take effect between records; a cancel puts the records not undone yet back at
+/// `slot`, so Undo can finish them later.
+pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>, slot: UndoSlot) {
     crate::tags_ui::save_note_now(app);
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -1679,48 +1689,83 @@ pub fn undo_ops(app: &mut ZxrawApp, records: Vec<ops::UndoRecord>) {
         "undo",
         format!("Undoing {} change(s)", records.len()),
         move |job| {
-            let mut errors = Vec::new();
-            for r in records.iter().rev() {
-                match ops::undo(r) {
-                    Ok(()) => {
-                        // The undo moved the item back: its library rows follow it.
-                        if let ops::UndoRecord::Renamed { from, to }
-                        | ops::UndoRecord::Moved { from, to } = r
-                        {
-                            let _ = tx.send(Event::FilesMoved(vec![(to.clone(), from.clone())]));
-                        }
-                    }
-                    Err(e) => {
-                        errors.push(format!("{}: {e}", r.describe()));
-                        job.progress.add_error();
-                    }
-                }
-                let touched: Vec<PathBuf> = match r {
-                    ops::UndoRecord::Renamed { from, to } | ops::UndoRecord::Moved { from, to } => {
-                        vec![from.clone(), to.clone()]
-                    }
-                    ops::UndoRecord::CreatedFolder { path }
-                    | ops::UndoRecord::CreatedFile { path }
-                    | ops::UndoRecord::Copied { path, .. } => vec![path.clone()],
-                };
-                for p in touched {
-                    if let Some(d) = p.parent() {
-                        let _ = tx.send(Event::Changed(d.to_path_buf()));
-                    }
-                }
-            }
-            if errors.is_empty() {
-                let _ = tx.send(Event::Toast(format!("Undid {} change(s)", records.len())));
-            } else {
-                let _ = tx.send(Event::Report {
-                    title: "Undo was incomplete".into(),
-                    lines: errors,
-                });
-            }
+            undo_records(job, &records, slot, &tx);
             ctx.request_repaint();
             Ok(())
         },
     );
+}
+
+/// The work of [`undo_ops`]'s job.
+fn undo_records(
+    job: &JobHandle,
+    records: &[ops::UndoRecord],
+    slot: UndoSlot,
+    tx: &Sender<Event>,
+) {
+    job.progress
+        .items_total
+        .store(records.len() as u64, Ordering::Relaxed);
+    let mut errors = Vec::new();
+    for (i, r) in records.iter().enumerate().rev() {
+        // Between records: a pause waits here; a cancel keeps the rest for later.
+        if job.cancel.check().is_err() {
+            let rest = records[..=i].to_vec();
+            let _ = tx.send(Event::UndoRestore {
+                slot,
+                entry: UndoEntry::Ops(rest),
+            });
+            errors.push(format!(
+                "Cancelled: {} change(s) not undone. Undo again to undo them.",
+                i + 1
+            ));
+            break;
+        }
+        job.progress.set_current(r.describe());
+        match ops::undo(r) {
+            Ok(()) => {
+                // The undo moved the item back: its library rows follow it.
+                if let ops::UndoRecord::Renamed { from, to }
+                | ops::UndoRecord::Moved { from, to } = r
+                {
+                    let _ = tx.send(Event::FilesMoved(vec![(to.clone(), from.clone())]));
+                }
+            }
+            Err(e) => {
+                errors.push(format!("{}: {e}", r.describe()));
+                job.progress.add_error();
+            }
+        }
+        let touched: Vec<PathBuf> = match r {
+            ops::UndoRecord::Renamed { from, to } | ops::UndoRecord::Moved { from, to } => {
+                vec![from.clone(), to.clone()]
+            }
+            ops::UndoRecord::CreatedFolder { path }
+            | ops::UndoRecord::CreatedFile { path }
+            | ops::UndoRecord::Copied { path, .. } => vec![path.clone()],
+        };
+        for p in touched {
+            if let Some(d) = p.parent() {
+                let _ = tx.send(Event::Changed(d.to_path_buf()));
+            }
+        }
+        job.progress
+            .items_done
+            .store((records.len() - i) as u64, Ordering::Relaxed);
+    }
+    if errors.is_empty() {
+        let _ = tx.send(Event::Toast(format!("Undid {} change(s)", records.len())));
+    } else {
+        let title = if job.cancel.is_cancelled() {
+            "Undo cancelled"
+        } else {
+            "Undo was incomplete"
+        };
+        let _ = tx.send(Event::Report {
+            title: title.into(),
+            lines: errors,
+        });
+    }
 }
 
 /// Conflict dialog. Returns true while a question is being shown.
@@ -1935,6 +1980,8 @@ pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
         return;
     }
     ctx.request_repaint_after(Duration::from_millis(100));
+    let meters = &mut app.ops.delete_ui.meters;
+    meters.retain(|id, _| due.iter().any(|j| j.id == *id));
     let mut clicks = Vec::new();
     egui::Window::new("Operation progress")
         .id(egui::Id::new("operation-progress-popup"))
@@ -1943,7 +1990,7 @@ pub fn progress_popup(app: &mut ZxrawApp, ctx: &egui::Context) {
         .collapsible(false)
         .resizable(false)
         .frame(egui::Frame::window(&ctx.global_style()).inner_margin(egui::Margin::symmetric(14, 12)))
-        .show(ctx, |ui| clicks = popup_contents(ui, &due));
+        .show(ctx, |ui| clicks = popup_contents(ui, &due, meters));
     for click in clicks {
         match click {
             PopupClick::Cancel(id) => {
@@ -1972,7 +2019,11 @@ enum PopupClick {
 const POPUP_WIDTH: f32 = 340.0;
 
 /// The progress popup's contents for `jobs` (the first [`POPUP_MAX_JOBS`]).
-fn popup_contents(ui: &mut Ui, jobs: &[&JobHandle]) -> Vec<PopupClick> {
+fn popup_contents(
+    ui: &mut Ui,
+    jobs: &[&JobHandle],
+    meters: &mut std::collections::HashMap<forge_jobs::JobId, RateMeter>,
+) -> Vec<PopupClick> {
     let mut clicks = Vec::new();
     ui.set_width(POPUP_WIDTH);
     ui.spacing_mut().item_spacing.y = 6.0;
@@ -1982,8 +2033,23 @@ fn popup_contents(ui: &mut Ui, jobs: &[&JobHandle]) -> Vec<PopupClick> {
         }
         let snap = j.progress.snapshot();
         let paused = j.cancel.is_paused_itself();
+        let stopping = j.cancel.is_cancelled();
+        // Pause and Cancel wait for a step that reports nothing until it ends.
+        let in_one_step = j.progress.in_one_step.load(Ordering::Relaxed);
+        let meter = meters.entry(j.id).or_default();
+        let measured = if snap.bytes_total > 0 {
+            snap.bytes_done
+        } else {
+            snap.items_done
+        };
+        meter.sample(
+            Instant::now(),
+            measured,
+            !paused && !stopping && snap.note.is_empty(),
+        );
         ui.add(egui::Label::new(RichText::new(j.title.as_ref()).strong()).truncate());
-        thin_bar(ui, if snap.note.is_empty() { snap.fraction() } else { None }, paused);
+        let held = paused && !in_one_step;
+        thin_bar(ui, if snap.note.is_empty() { snap.fraction() } else { None }, held);
         // The name, which a long path would push out of sight; the path is on hover.
         let name = Path::new(&snap.current)
             .file_name()
@@ -1992,17 +2058,21 @@ fn popup_contents(ui: &mut Ui, jobs: &[&JobHandle]) -> Vec<PopupClick> {
         let name = if name.is_empty() { " ".to_string() } else { name };
         ui.add(egui::Label::new(RichText::new(name).small().weak()).truncate())
             .on_hover_text(&snap.current);
-        let counts = if paused {
-            "Paused".to_string()
-        } else {
-            counts_text(&snap, j.elapsed())
-        };
+        let counts = status_text(&snap, meter.rate(), paused, stopping, in_one_step);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Cancel").clicked() {
+                // A cancel cannot be taken back: until the job ends both buttons rest.
+                if ui.add_enabled(!stopping, egui::Button::new("Cancel")).clicked() {
                     clicks.push(PopupClick::Cancel(j.id));
                 }
-                if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                // A pause still waiting for the step to end rests as "Pausing…".
+                let label = match (paused, in_one_step) {
+                    (false, _) => "Pause",
+                    (true, false) => "Resume",
+                    (true, true) => "Pausing…",
+                };
+                let can = !stopping && !(paused && in_one_step);
+                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
                     clicks.push(PopupClick::Pause(j.id));
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -2078,17 +2148,69 @@ fn time_left(secs: f64) -> String {
     }
 }
 
+/// The popup's line under the bar: what a pending Pause or Cancel waits for, "Paused", or
+/// the counts.
+fn status_text(
+    snap: &forge_jobs::ProgressSnapshot,
+    rate: Option<f64>,
+    paused: bool,
+    stopping: bool,
+    in_one_step: bool,
+) -> String {
+    match (stopping, paused, in_one_step) {
+        (true, _, true) => "Stopping after the current folder…".into(),
+        (true, _, false) => "Stopping…".into(),
+        (false, true, true) => "Pausing after the current folder…".into(),
+        (false, true, false) => "Paused".into(),
+        (false, false, _) => counts_text(snap, rate),
+    }
+}
+
+/// How fast a job goes, counting only time it was running and measurably moving: not
+/// while paused or counting, nor across a counter that started over (a new pass).
+#[derive(Debug, Default)]
+struct RateMeter {
+    last: Option<(Instant, u64)>,
+    active: Duration,
+    gained: u64,
+}
+
+impl RateMeter {
+    /// The shortest running time a speed is given for.
+    const SETTLE: Duration = Duration::from_millis(500);
+
+    /// Takes a reading of the counter at `now`. Time while not `running` does not count.
+    fn sample(&mut self, now: Instant, done: u64, running: bool) {
+        if !running {
+            self.last = None;
+            return;
+        }
+        if let Some((then, before)) = self.last
+            && done >= before
+        {
+            self.active += now.saturating_duration_since(then);
+            self.gained += done - before;
+        }
+        self.last = Some((now, done));
+    }
+
+    /// Units per second while running, once there has been enough of it.
+    fn rate(&self) -> Option<f64> {
+        (self.active >= Self::SETTLE && self.gained > 0)
+            .then(|| self.gained as f64 / self.active.as_secs_f64())
+    }
+}
+
 /// The counts line of a running job: its note when it has one ("Counting items…");
-/// otherwise done of total with the speed and the time left.
-fn counts_text(snap: &forge_jobs::ProgressSnapshot, elapsed: Duration) -> String {
+/// otherwise done of total with the speed (`rate`, in the unit counted) and the time left.
+fn counts_text(snap: &forge_jobs::ProgressSnapshot, rate: Option<f64>) -> String {
     use crate::viewer::cull::format_count;
     if !snap.note.is_empty() {
         return snap.note.clone();
     }
-    let secs = elapsed.as_secs_f64().max(0.001);
+    let rate = rate.unwrap_or(0.0);
     let mut parts = Vec::new();
-    let (done, total, rate) = if snap.bytes_total > 0 {
-        let rate = snap.bytes_done as f64 / secs;
+    let (done, total) = if snap.bytes_total > 0 {
         parts.push(format!(
             "{} of {}",
             format_size(snap.bytes_done),
@@ -2097,9 +2219,8 @@ fn counts_text(snap: &forge_jobs::ProgressSnapshot, elapsed: Duration) -> String
         if rate > 0.0 {
             parts.push(format!("{}/s", format_size(rate as u64)));
         }
-        (snap.bytes_done, snap.bytes_total, rate)
+        (snap.bytes_done, snap.bytes_total)
     } else if snap.items_total > 0 {
-        let rate = snap.items_done as f64 / secs;
         parts.push(format!(
             "{} of {} items",
             format_count(snap.items_done as usize),
@@ -2108,10 +2229,10 @@ fn counts_text(snap: &forge_jobs::ProgressSnapshot, elapsed: Duration) -> String
         if rate >= 1.0 && snap.items_total > 1 {
             parts.push(format!("{}/s", format_count(rate as usize)));
         }
-        (snap.items_done, snap.items_total, rate)
+        (snap.items_done, snap.items_total)
     } else {
         parts.push(format!("{} items", format_count(snap.items_done as usize)));
-        (0, 0, 0.0)
+        (0, 0)
     };
     if rate > 0.0 && total > done {
         let left = time_left(total.saturating_sub(done) as f64 / rate);
@@ -2433,6 +2554,14 @@ mod tests {
 
     /// The buttons the progress popup shows for `jobs`, by label.
     fn popup_buttons(jobs: &[&JobHandle]) -> Vec<String> {
+        popup_button_states(jobs)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    /// The progress popup's buttons for `jobs`: label and whether it can be pressed.
+    fn popup_button_states(jobs: &[&JobHandle]) -> Vec<(String, bool)> {
         let context = egui::Context::default();
         context.enable_accesskit();
         let mut output = context.run_ui(
@@ -2444,7 +2573,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                popup_contents(ui, jobs);
+                popup_contents(ui, jobs, &mut Default::default());
             },
         );
         output.textures_delta.clear();
@@ -2453,8 +2582,140 @@ mod tests {
             .nodes
             .iter()
             .filter(|(_, n)| n.role() == egui::accesskit::Role::Button)
-            .filter_map(|(_, n)| n.label().map(str::to_string))
+            .filter_map(|(_, n)| n.label().map(|l| (l.to_string(), !n.is_disabled())))
             .collect()
+    }
+
+    #[test]
+    fn a_pause_or_cancel_that_waits_for_a_folder_move_says_so_and_rests() {
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = running_delete(&jobs);
+        job.progress.in_one_step.store(true, Ordering::Relaxed);
+        job.cancel.set_paused(true);
+        let mut buttons = popup_button_states(&[&job]);
+        buttons.sort();
+        assert_eq!(
+            buttons,
+            [("Cancel".to_string(), true), ("Pausing…".to_string(), false)]
+        );
+        job.cancel.cancel();
+        let buttons = popup_button_states(&[&job]);
+        assert!(buttons.iter().all(|(_, can)| !can), "{buttons:?}");
+        let snap = forge_jobs::ProgressSnapshot::default();
+        assert_eq!(
+            status_text(&snap, None, true, true, true),
+            "Stopping after the current folder…"
+        );
+        assert_eq!(status_text(&snap, None, false, true, false), "Stopping…");
+        assert_eq!(
+            status_text(&snap, None, true, false, true),
+            "Pausing after the current folder…"
+        );
+        assert_eq!(status_text(&snap, None, true, false, false), "Paused");
+        // Once the step ends the pause holds, and Resume is offered.
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = running_delete(&jobs);
+        job.cancel.set_paused(true);
+        let mut buttons = popup_button_states(&[&job]);
+        buttons.sort();
+        assert_eq!(
+            buttons,
+            [("Cancel".to_string(), true), ("Resume".to_string(), true)]
+        );
+        jobs.cancel(&job);
+    }
+
+    #[test]
+    fn speed_counts_only_running_time_and_survives_a_new_pass() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut m = RateMeter::default();
+        m.sample(at(0), 0, true);
+        m.sample(at(1_000), 100, true);
+        assert_eq!(m.rate(), Some(100.0));
+        // A minute paused: neither the time nor a jump across it counts.
+        m.sample(at(1_500), 150, false);
+        m.sample(at(61_000), 150, true);
+        m.sample(at(62_000), 250, true);
+        assert_eq!(m.rate(), Some(100.0));
+        // A new pass starts its counter over; the speed carries on from there.
+        m.sample(at(63_000), 10, true);
+        m.sample(at(64_000), 110, true);
+        assert_eq!(m.rate(), Some(100.0));
+        assert_eq!(RateMeter::default().rate(), None);
+    }
+
+    fn undo_folders(n: usize) -> (tempfile::TempDir, Vec<ops::UndoRecord>) {
+        let root = tempfile::tempdir().unwrap();
+        let records = (0..n)
+            .map(|i| {
+                let path = root.path().join(format!("new{i}"));
+                std::fs::create_dir(&path).unwrap();
+                ops::UndoRecord::CreatedFolder { path }
+            })
+            .collect();
+        (root, records)
+    }
+
+    fn wait_finished(job: &JobHandle) {
+        let t0 = Instant::now();
+        while !job.state().is_finished() && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn undo_reports_progress_and_waits_while_paused() {
+        let (root, records) = undo_folders(3);
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let jobs = forge_jobs::JobRegistry::new();
+        let job = jobs.spawn("undo", "Undoing 3 change(s)", move |job| {
+            job.cancel.set_paused(true);
+            undo_records(job, &records, UndoSlot::default(), &tx);
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // Paused before the first record: nothing undone yet.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3);
+        assert_eq!(job.progress.snapshot().items_total, 3);
+        job.cancel.set_paused(false);
+        wait_finished(&job);
+        assert_eq!(job.state(), JobState::Completed);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let snap = job.progress.snapshot();
+        assert_eq!((snap.items_done, snap.items_total), (3, 3));
+    }
+
+    #[test]
+    fn a_cancelled_undo_keeps_the_changes_not_undone_for_later() {
+        let (root, records) = undo_folders(3);
+        let kept = records.clone();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let jobs = forge_jobs::JobRegistry::new();
+        let slot = UndoSlot::default();
+        let job = jobs.spawn("undo", "Undoing 3 change(s)", move |job| {
+            job.cancel.set_paused(true);
+            undo_records(job, &records, slot, &tx);
+            Ok(())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        jobs.cancel(&job);
+        wait_finished(&job);
+        assert_eq!(job.state(), JobState::Cancelled);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 3, "nothing undone");
+        let events: Vec<Event> = rx.try_iter().collect();
+        let restored = events.iter().find_map(|e| match e {
+            Event::UndoRestore {
+                slot: s,
+                entry: UndoEntry::Ops(rest),
+            } => Some((*s, rest.clone())),
+            _ => None,
+        });
+        assert_eq!(restored, Some((slot, kept)));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Report { title, .. } if title == "Undo cancelled"
+        )));
     }
 
     #[test]
@@ -2526,14 +2787,15 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            counts_text(&snap, Duration::from_secs(5)),
+            counts_text(&snap, Some(500.0)),
             "2,500 of 10,000 items · 500/s · 15 s left"
         );
+        assert_eq!(counts_text(&snap, None), "2,500 of 10,000 items");
         let snap = forge_jobs::ProgressSnapshot {
             note: "Counting items… 12 found".into(),
             ..Default::default()
         };
-        assert_eq!(counts_text(&snap, Duration::from_secs(5)), "Counting items… 12 found");
+        assert_eq!(counts_text(&snap, Some(5.0)), "Counting items… 12 found");
         assert_eq!(time_left(0.2), "");
         assert_eq!(time_left(150.0), "3 min left");
         assert_eq!(time_left(3_700.0), "1 h 1 min left");

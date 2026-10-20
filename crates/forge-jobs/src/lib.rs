@@ -119,6 +119,9 @@ pub struct Progress {
     pub bytes_done: AtomicU64,
     pub bytes_total: AtomicU64,
     pub errors: AtomicU64,
+    /// The job is inside one step it cannot interrupt (a folder going to the Recycle Bin
+    /// in one move): Pause and Cancel take effect only once that step ends.
+    pub in_one_step: AtomicBool,
     current: Mutex<String>,
     note: Mutex<String>,
 }
