@@ -1266,7 +1266,7 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
                 })
                 .cloned()
                 .collect();
-            if !denied.is_empty() {
+            if !denied.is_empty() && !report.cancelled {
                 let _ = tx.send(Event::AskConfirm(Confirm {
                     title: "Administrator permission needed".into(),
                     body: format!(
@@ -1276,7 +1276,7 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
                         denied.len(),
                         modal::describe_items(&denied)
                     ),
-                    kind: ConfirmKind::DeleteWithWindows(denied),
+                    kind: ConfirmKind::DeleteWithWindows(DeleteTarget::capture_all(&denied)),
                     confirm_label: "Delete as administrator".into(),
                     danger: true,
                 }));
@@ -1291,6 +1291,51 @@ pub fn delete_permanently(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
 /// system message is localised; its "(os error 5)" suffix is not.
 fn is_access_denied(reason: &str) -> bool {
     reason.contains("(os error 5)")
+}
+
+/// An item the user is asked to delete permanently, with what it was when the question was
+/// asked. The delete acts on it only if it is still the same object: an item moved away or
+/// replaced while the question was open is left alone.
+pub struct DeleteTarget {
+    path: PathBuf,
+    identity: Option<SourceIdentity>,
+}
+
+impl DeleteTarget {
+    fn capture_all(paths: &[PathBuf]) -> Vec<Self> {
+        paths
+            .iter()
+            .map(|path| Self {
+                path: path.clone(),
+                identity: source_identity(path),
+            })
+            .collect()
+    }
+}
+
+/// Splits `targets` into the paths that are still the object the user was asked about, and
+/// report lines for the rest. An item whose identity could not be read then or now counts
+/// as changed.
+fn screen_delete_targets(
+    targets: Vec<DeleteTarget>,
+    current: impl Fn(&Path) -> Option<SourceIdentity>,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut same = Vec::new();
+    let mut changed = Vec::new();
+    for t in targets {
+        match (&t.identity, current(&t.path)) {
+            (Some(then), Some(now)) if *then == now => same.push(t.path),
+            (_, None) if std::fs::symlink_metadata(&t.path).is_err() => changed.push(format!(
+                "{}: it no longer exists",
+                t.path.display()
+            )),
+            _ => changed.push(format!(
+                "{}: it changed after you were asked (moved or replaced), so it was not deleted",
+                t.path.display()
+            )),
+        }
+    }
+    (same, changed)
 }
 
 /// Questions from finished deletes, and the progress popup's state.
@@ -1330,7 +1375,7 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
         .jobs
         .spawn("delete", format!("Deleting {n} item(s)"), move |job| {
             let report = forge_win::recycle_items(&targets, shell_observer(job));
-            finish_shell_delete(job, &targets, &report, true, &tx);
+            finish_shell_delete(job, &targets, &report, true, Vec::new(), &tx);
             ctx.request_repaint();
             delete_result(&report)
         });
@@ -1338,8 +1383,9 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
 
 /// Deletes `targets` permanently through Windows, which can ask for administrator
 /// permission (the in-app delete cannot).
-pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
-    app.expect_removal(&targets);
+pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<DeleteTarget>) {
+    let paths: Vec<PathBuf> = targets.iter().map(|t| t.path.clone()).collect();
+    app.expect_removal(&paths);
     let n = targets.len();
     let tx = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -1347,8 +1393,17 @@ pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
         "delete",
         format!("Permanently deleting {n} item(s)"),
         move |job| {
-            let report = forge_win::delete_items_permanently(&targets, shell_observer(job));
-            finish_shell_delete(job, &targets, &report, false, &tx);
+            // Checked again right before deleting: the question may have been open a while.
+            let (same, changed) = screen_delete_targets(targets, source_identity);
+            for _ in &changed {
+                job.progress.add_error();
+            }
+            let report = forge_win::delete_items_permanently(&same, shell_observer(job));
+            finish_shell_delete(job, &paths, &report, false, changed.clone(), &tx);
+            ctx.request_repaint();
+            if !changed.is_empty() && report.failed.is_empty() {
+                return Err(format!("{} item(s) not deleted", changed.len()));
+            }
             ctx.request_repaint();
             delete_result(&report)
         },
@@ -1409,6 +1464,7 @@ fn finish_shell_delete(
     targets: &[PathBuf],
     report: &forge_win::DeleteReport,
     recycled: bool,
+    skipped: Vec<String>,
     tx: &Sender<Event>,
 ) {
     let mut seen = std::collections::HashSet::new();
@@ -1423,12 +1479,16 @@ fn finish_shell_delete(
         .filter(|(_, why)| *why == forge_win::DeleteFailure::NotRecyclable)
         .map(|(p, _)| p.clone())
         .collect();
-    let other: Vec<String> = report
+    let mut other: Vec<String> = report
         .failed
         .iter()
         .filter(|(_, why)| *why != forge_win::DeleteFailure::NotRecyclable)
         .map(|(p, why)| format!("{}: {}", p.display(), failure_text(p, why)))
         .collect();
+    for line in &skipped {
+        job.log(format!("NOT DELETED  {line}"));
+    }
+    other.extend(skipped);
     let n = report.done.len();
     job.log(format!(
         "{n} deleted, {} not deleted, {} not started{}",
@@ -1440,7 +1500,14 @@ fn finish_shell_delete(
         job.log(format!("NOT DELETED  {}: {why}", p.display()));
         job.progress.add_error();
     }
-    if !not_recyclable.is_empty() {
+    if report.cancelled {
+        // No question after a cancel: the items that could not be recycled are listed.
+        other.extend(not_recyclable.iter().map(|p| {
+            let why = failure_text(p, &forge_win::DeleteFailure::NotRecyclable);
+            format!("{}: {why}", p.display())
+        }));
+    }
+    if !not_recyclable.is_empty() && !report.cancelled {
         let mut body = format!(
             "{} item(s) cannot go to the Recycle Bin: they are too big for it, or their drive \
              has no Recycle Bin. Nothing in them was deleted.\n\n{}\n\nDelete them \
@@ -1454,12 +1521,16 @@ fn finish_shell_delete(
         let _ = tx.send(Event::AskConfirm(Confirm {
             title: "Too big for the Recycle Bin".into(),
             body,
-            kind: ConfirmKind::DeleteWithWindows(not_recyclable),
+            kind: ConfirmKind::DeleteWithWindows(DeleteTarget::capture_all(&not_recyclable)),
             confirm_label: "Delete permanently".into(),
             danger: true,
         }));
     } else if !other.is_empty() {
-        let mut lines = vec![format!("{n} deleted, {} not deleted.", other.len())];
+        let left = other.len();
+        let mut lines = vec![format!("{n} deleted, {left} not deleted.")];
+        if report.cancelled {
+            lines.push("Cancelled.".into());
+        }
         lines.extend(other);
         if report.cancelled && !report.not_started.is_empty() {
             lines.push(format!(
@@ -1468,7 +1539,7 @@ fn finish_shell_delete(
             ));
         }
         let _ = tx.send(Event::Report {
-            title: format!("{} — {} item(s) not deleted", job.title, report.failed.len()),
+            title: format!("{} — {left} item(s) not deleted", job.title),
             lines,
         });
     } else if report.cancelled {
@@ -2020,6 +2091,42 @@ mod tests {
             done: done.iter().map(|p| p.to_path_buf()).collect(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_permanent_delete_skips_items_changed_since_the_question() {
+        let id = |n: u64| SourceIdentity::Id {
+            kind: std::fs::symlink_metadata(".").unwrap().file_type(),
+            id: (7, n),
+        };
+        let d = tempfile::tempdir().unwrap();
+        let (same, replaced, unread, gone) = (
+            d.path().join("same"),
+            d.path().join("replaced"),
+            d.path().join("unread"),
+            d.path().join("gone"),
+        );
+        for p in [&same, &replaced, &unread] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let targets = vec![
+            DeleteTarget { path: same.clone(), identity: Some(id(1)) },
+            DeleteTarget { path: replaced.clone(), identity: Some(id(2)) },
+            DeleteTarget { path: unread.clone(), identity: None },
+            DeleteTarget { path: gone.clone(), identity: Some(id(4)) },
+        ];
+        let now = |p: &Path| match p.file_name()?.to_str()? {
+            "same" => Some(id(1)),
+            "replaced" => Some(id(9)),
+            "unread" => Some(id(3)),
+            _ => None,
+        };
+        let (keep, skipped) = screen_delete_targets(targets, now);
+        assert_eq!(keep, vec![same]);
+        assert_eq!(skipped.len(), 3, "{skipped:?}");
+        assert!(skipped[0].contains("replaced") && skipped[0].contains("changed after"));
+        assert!(skipped[1].contains("unread") && skipped[1].contains("changed after"));
+        assert!(skipped[2].contains("gone") && skipped[2].contains("no longer exists"));
     }
 
     #[test]
