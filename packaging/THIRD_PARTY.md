@@ -100,13 +100,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.5.6 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.5.7 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
