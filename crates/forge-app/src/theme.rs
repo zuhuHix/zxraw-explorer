@@ -275,6 +275,19 @@ pub fn card<R>(
         .inner
 }
 
+/// Lays out `add_contents` in exactly the available width. Anything wider is clipped
+/// instead of widening `ui`: in a side panel that would grow the panel past its size and
+/// slide it under the listing.
+pub fn clip_to_width<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let rect = ui.available_rect_before_wrap();
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
+    child.shrink_clip_rect(rect);
+    let r = add_contents(&mut child);
+    let bottom = child.min_rect().bottom().min(rect.bottom());
+    ui.advance_cursor_after_rect(egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), bottom)));
+    r
+}
+
 /// A toolbar toggle: a ghost icon button that becomes an accent-tinted pill when `selected`.
 pub fn pill_toggle(ui: &mut egui::Ui, selected: bool, icon: &str) -> egui::Response {
     let p = palette(ui.ctx());

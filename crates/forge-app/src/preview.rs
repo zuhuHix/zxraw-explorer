@@ -78,7 +78,8 @@ pub fn info_grid(ui: &mut Ui, e: &FileEntry) {
         .show(ui, |ui| {
             let row = |ui: &mut Ui, k: &str, v: String| {
                 ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
-                ui.label(v);
+                // Wrap: a long folder path must not make the panel wider than it is.
+                ui.add(egui::Label::new(v).wrap());
                 ui.end_row();
             };
             row(ui, "Type", views::type_label(e));
