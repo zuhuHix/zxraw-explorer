@@ -67,7 +67,7 @@ impl MetaLoader {
 fn kv(ui: &mut Ui, k: &str, v: Option<String>) {
     if let Some(v) = v.filter(|v| !v.is_empty()) {
         ui.label(RichText::new(k).color(ui.visuals().weak_text_color()));
-        ui.label(v);
+        ui.add(egui::Label::new(v).wrap());
         ui.end_row();
     }
 }
@@ -146,7 +146,7 @@ pub fn image_grid(ui: &mut Ui, m: &forge_media::ImageMetadata) {
                                 .small()
                                 .color(ui.visuals().weak_text_color()),
                         );
-                        ui.label(RichText::new(&t.value).small());
+                        ui.add(egui::Label::new(RichText::new(&t.value).small()).wrap());
                         ui.end_row();
                     }
                 });

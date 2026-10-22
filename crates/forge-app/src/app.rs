@@ -981,6 +981,17 @@ impl ZxrawApp {
                     self.run(Cmd::TogglePreview, &ctx);
                 }
                 ui.add_space(6.0);
+                // With the preview open, the filter starts where the preview card does (last
+                // frame's panel edge), so the address bar ends in line with the listing.
+                let preview_left = self
+                    .show_preview
+                    .then(|| egui::PanelState::load(&ctx, egui::Id::new("preview")))
+                    .flatten()
+                    .map(|s| s.outer_rect.left());
+                let (filter_width, gap) = match preview_left {
+                    Some(left) => ((ui.available_rect_before_wrap().right() - left).max(100.0), 8.0),
+                    None => (240.0, 4.0),
+                };
                 // Filter box: a rounded pill with a search icon.
                 let mut filter = self.pane().filter_text.clone();
                 let err = self.pane().filter_error.clone();
@@ -993,11 +1004,11 @@ impl ZxrawApp {
                                 .hint_text("Filter  (e.g. ext:cr3 size:>20mb)")
                                 .background_color(theme::palette(ui.ctx()).field)
                                 .margin(egui::Margin::symmetric(10, 4))
-                                .desired_width(240.0),
+                                .desired_width(filter_width),
                         )
                     })
                     .inner;
-                ui.add_space(4.0);
+                ui.add_space(gap);
                 let fr = match &err {
                     Some(e) => fr.on_hover_text(format!("Query error — using plain text match:\n{e}")),
                     None => fr,
@@ -1305,7 +1316,11 @@ impl eframe::App for ZxrawApp {
                 .resizable(true)
                 .default_size(340.0)
                 .size_range(220.0..=900.0)
-                .show(ui, |ui| theme::card(ui, false, |ui| crate::actions::preview_panel(self, ui)));
+                .show(ui, |ui| {
+                    theme::card(ui, false, |ui| {
+                        theme::clip_to_width(ui, |ui| crate::actions::preview_panel(self, ui))
+                    })
+                });
         }
         egui::CentralPanel::default().frame(theme::content_frame(&ctx)).show(ui, |ui| {
             if self.tab().right.is_some() {
