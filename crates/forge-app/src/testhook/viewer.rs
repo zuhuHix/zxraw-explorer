@@ -14,6 +14,8 @@
 //!   selected video preview reports missing FFmpeg tools.
 //! - `thumbs-idle [secs]`: wait for thumbnail queues, workers, results and uploads to drain
 //!   (default 30 s).
+//! - `wait-thumbs-in-flight <n> [secs]`: wait until at least n thumbnail jobs are queued or
+//!   running in the service (default 30 s).
 //! - `assert-thumbs-pending <n>`: require at least n queued/running results or pending uploads.
 //! - `assert-thumbs-cancelled <n>`: require at least n thumbnail jobs to have been cancelled.
 //! - `assert-keys-free`: require that no command palette is open and no text field has
@@ -197,6 +199,26 @@ pub(super) fn step(
                     "{} thumbnail result(s)/upload(s) pending",
                     app.ops.thumbs.pending_count()
                 )))
+            }
+        }
+        "wait-thumbs-in-flight" => {
+            let mut parts = args.split_whitespace();
+            let expected = parts
+                .next()
+                .ok_or("expected a minimum in-flight count")?
+                .parse::<usize>()
+                .map_err(|_| "in-flight count must be a non-negative integer")?;
+            let timeout = timeout_arg(&parts.collect::<Vec<_>>().join(" "), WAIT_LIMIT)?;
+            let found = app.ops.thumbs.service().in_flight();
+            if found >= expected {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= timeout {
+                Err(format!(
+                    "expected at least {expected} thumbnail job(s) in flight within {} s, found {found}",
+                    timeout.as_secs()
+                ))
+            } else {
+                Ok(Flow::Wait(format!("{found} thumbnail job(s) in flight")))
             }
         }
         "assert-thumbs-pending" => {

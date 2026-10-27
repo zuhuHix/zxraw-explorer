@@ -443,6 +443,9 @@ fn thumbnail_work_is_cancelled_when_the_user_leaves_and_the_cache_stays_valid() 
         "cmd ThumbsBigger".into(),
         "pointer 500 400".into(),
         "scroll 4000".into(),
+        // Make sure thumbnail work has actually started: on a busy machine the listing can
+        // be left before any job is queued, and then there is nothing to cancel.
+        "ui viewer wait-thumbs-in-flight 8".into(),
         // Leave the folder while its thumbnails are still being generated.
         format!("navigate {}", shown(&other)),
         "wait-entry o-00.jpg".into(),
