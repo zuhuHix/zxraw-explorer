@@ -977,6 +977,109 @@ fn dragging_a_marquee_selects_virtual_rows_and_grid_tiles() {
     );
 }
 
+/// Runs a drag-and-drop script in its own sandbox profile; the caller checks the outcome.
+fn drop_script_run(sandbox: &Path, script: &str) -> Outcome {
+    let options = RunOpts {
+        limit: Some(Duration::from_secs(120)),
+        ..RunOpts::default()
+    };
+    run_app_with(sandbox, &sandbox.join("profile"), script, &options)
+}
+
+/// A folder `list` with a `Target` folder, and `outside/a.txt` on the same volume.
+fn drop_sandbox(sandbox: &Path) -> (PathBuf, PathBuf) {
+    let list = sandbox.join("list");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(list.join("Target")).unwrap();
+    write_file(&outside.join("a.txt"), b"dropped");
+    (list, outside)
+}
+
+#[test]
+fn external_drop_onto_a_folder_row_moves_the_file() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-files Target | {file}\nwait-exists {moved}\nwait-jobs\n\
+         assert-missing {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        moved = shown(&list.join("Target").join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+#[test]
+fn external_drop_with_ctrl_copies() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-files Target | {file} | ctrl\nwait-exists {copied}\nwait-jobs\n\
+         assert-exists {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        copied = shown(&list.join("Target").join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+#[test]
+fn external_drop_on_empty_area_goes_to_the_pane_folder() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-files bg | {file}\nwait-exists {moved}\nwait-jobs\n\
+         assert-missing {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        moved = shown(&list.join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+/// Opens `list/Sub` in place (its child `inner.txt` is listed after the expansion).
+fn expanded_sub_script(list: &Path) -> String {
+    format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Sub\nwait-frames 5\n\
+         select Sub\nkey ArrowRight\nwait-entry inner.txt\nwait-frames 5\n",
+        list = shown(list),
+    )
+}
+
+#[test]
+fn internal_drop_onto_a_child_of_an_expanded_folder_lands_in_that_folder() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let list = sandbox.path().join("list");
+    write_file(&list.join("Sub").join("inner.txt"), b"inner");
+    write_file(&list.join("top.txt"), b"top");
+    let script = format!(
+        "{}drag top.txt Sub/inner.txt\nwait-exists {moved}\nwait-jobs\n\
+         assert-missing {top}\nassert-no-error-toast\nexit\n",
+        expanded_sub_script(&list),
+        moved = shown(&list.join("Sub").join("top.txt")),
+        top = shown(&list.join("top.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+#[test]
+fn dropping_a_folder_onto_its_own_child_does_nothing() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let list = sandbox.path().join("list");
+    write_file(&list.join("Sub").join("inner.txt"), b"inner");
+    let script = format!(
+        "{}drag Sub Sub/inner.txt\nwait-frames 30\nwait-jobs\n\
+         assert-exists {inner}\nassert-exists {folder}\nassert-no-error-toast\nexit\n",
+        expanded_sub_script(&list),
+        inner = shown(&list.join("Sub").join("inner.txt")),
+        folder = shown(&list.join("Sub")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
 #[path = "../../../forge-win/src/clipboard_test_support.rs"]
 mod clipboard_test_support;
 

@@ -1182,9 +1182,10 @@ impl ZxrawApp {
 }
 
 impl eframe::App for ZxrawApp {
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         crate::testhook::raw_input(self, raw_input);
         crate::paste_key::restore_dropped(raw_input);
+        crate::dnd::external::raw_input(ctx, raw_input, !self.testhook.active());
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1264,11 +1265,10 @@ impl eframe::App for ZxrawApp {
             }
         }
 
-        // Files dropped from other applications go into the focused pane's folder.
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if !dropped.is_empty() {
-            let target = self.pane().path.clone();
-            crate::actions::transfer(self, dropped, target, true);
+        // Files dragged in from other applications drop into the folder under the pointer
+        // (`views::handle_drop`); frames keep coming while they hover so the target lights up.
+        if crate::dnd::external::active(&ctx) {
+            ctx.request_repaint();
         }
 
         self.handle_keys(&ctx);
@@ -1280,6 +1280,7 @@ impl eframe::App for ZxrawApp {
             // so if it were not shown it could never be closed.
             self.palette_ui(&ctx);
             self.toasts_ui(&ctx);
+            self.unclaimed_external_drop(&ctx);
             crate::testhook::tick(self, &ctx);
             return;
         }
@@ -1348,6 +1349,7 @@ impl eframe::App for ZxrawApp {
         crate::notices::show(self, &ctx);
         self.palette_ui(&ctx);
         self.toasts_ui(&ctx);
+        self.unclaimed_external_drop(&ctx);
         crate::testhook::tick(self, &ctx);
     }
 
@@ -1362,6 +1364,22 @@ impl eframe::App for ZxrawApp {
 }
 
 impl ZxrawApp {
+    /// Files from another application dropped where no file list took them (the viewer, the
+    /// toolbar, a dialog) go into the focused pane's folder.
+    fn unclaimed_external_drop(&mut self, ctx: &egui::Context) {
+        let Some(drop) = crate::dnd::external::take(ctx) else {
+            return;
+        };
+        let target = self.pane().path.clone();
+        let paths = crate::dnd::drop_sources(&drop.paths, &target);
+        if paths.is_empty() {
+            return;
+        }
+        let (ctrl, shift) = drop.keys(ctx);
+        let copy = crate::dnd::drop_is_copy(&paths, &target, ctrl, shift);
+        crate::actions::transfer(self, paths, target, copy);
+    }
+
     fn palette_ui(&mut self, ctx: &egui::Context) {
         if let Some(mut pal) = self.palette.take() {
             if let Some(cmd) = pal.show(ctx, &self.settings.keybindings) {

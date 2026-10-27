@@ -255,10 +255,14 @@ fn nav_item(
         app.run(crate::commands::Cmd::NewTab, &ui.ctx().clone());
         app.navigate(path.clone());
     }
-    // Sidebar entries accept drops (copy/move into that folder).
+    // Sidebar entries accept drops (copy/move into that folder, by `dnd::drop_is_copy`).
     if let Some(p) = r.dnd_release_payload::<DragPaths>() {
-        let copy = ui.input(|i| i.modifiers.command);
-        crate::actions::transfer(app, p.0.clone(), path.clone(), copy);
+        let paths = crate::dnd::drop_sources(&p.0, path);
+        if !paths.is_empty() {
+            let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
+            let copy = crate::dnd::drop_is_copy(&paths, path, ctrl, shift);
+            crate::actions::transfer(app, paths, path.clone(), copy);
+        }
     }
     r
 }
