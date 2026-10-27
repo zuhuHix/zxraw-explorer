@@ -29,7 +29,10 @@ pub fn folder_drop(resp: &egui::Response, target: &Path) -> (bool, Option<(Vec<P
         None
     };
     let transfer = dropped.and_then(|(paths, (ctrl, shift))| {
-        let paths = drop_sources(&paths, target);
+        let (paths, refused) = drop_sources(&paths, target);
+        if refused > 0 {
+            note_refused(&resp.ctx, refused);
+        }
         if paths.is_empty() {
             return None;
         }
@@ -100,22 +103,41 @@ fn drop_is_copy_with(
     })
 }
 
-/// The dropped items that actually go somewhere: an item dropped onto itself or into the
-/// folder it is already in is left alone, and a folder is never moved or copied into itself
-/// or one of its own subfolders. Paths compare as Windows does (case, `/` and `\`, trailing
-/// separators, `\\?\` prefixes). A link or junction is also kept out of the folder it points
-/// to (that would make a link loop); a link that cannot be resolved is let through.
-pub fn drop_sources(paths: &[PathBuf], target: &Path) -> Vec<PathBuf> {
-    drop_sources_with(paths, target, &mut link_target)
+/// The dropped items that actually go somewhere, and how many links were refused. An item
+/// dropped onto itself or into the folder it is already in is left alone, and a folder is
+/// never moved or copied into itself or one of its own subfolders. Paths compare as Windows
+/// does (case, `/` and `\`, trailing separators, `\\?\` prefixes).
+///
+/// A link or junction is also kept out of the folder it points to (that would make a link
+/// loop). Its target is read one hop with `read_link`; only a purely local link is resolved
+/// further. A link that lives on, points to, or is dropped onto a network location is
+/// refused (counted in the second value), so a drop never walks a share to decide. A local
+/// link that cannot be read is let through.
+pub fn drop_sources(paths: &[PathBuf], target: &Path) -> (Vec<PathBuf>, usize) {
+    drop_sources_with(paths, target, &mut read_link_once)
+}
+
+/// What a dropped item is, as far as the link guard needs to know.
+#[derive(Debug)]
+enum LinkProbe {
+    /// Not a link (or its kind could not be read).
+    Plain,
+    /// A link or junction whose target is this, as stored (one hop, maybe relative).
+    To(PathBuf),
+    /// A link or junction whose target could not be read.
+    Unreadable,
 }
 
 fn drop_sources_with(
     paths: &[PathBuf],
     target: &Path,
-    link: &mut dyn FnMut(&Path) -> Option<PathBuf>,
-) -> Vec<PathBuf> {
+    probe: &mut dyn FnMut(&Path) -> LinkProbe,
+) -> (Vec<PathBuf>, usize) {
+    let is_network = |p: &Path| forge_win::files::network_root(p).is_some();
+    let target_on_network = is_network(target);
     let mut real_target = None;
-    paths
+    let mut refused = 0;
+    let kept = paths
         .iter()
         .filter(|source| {
             let in_place = source
@@ -124,9 +146,30 @@ fn drop_sources_with(
             if in_place || is_within(source, target) {
                 return false;
             }
-            let Some(points_to) = link(source) else {
-                return true;
+            let raw = match probe(source) {
+                LinkProbe::Plain => return true,
+                LinkProbe::Unreadable if !target_on_network && !is_network(source) => {
+                    return true;
+                }
+                LinkProbe::Unreadable => None,
+                LinkProbe::To(raw) => Some(raw),
             };
+            // A relative link target is relative to the link's folder.
+            let raw = raw.map(|raw| match source.parent() {
+                Some(folder) if raw.is_relative() => folder.join(raw),
+                _ => raw,
+            });
+            if target_on_network || is_network(source) || raw.as_deref().is_none_or(is_network) {
+                tracing::warn!(
+                    "drop refused: link {} involves a network location",
+                    source.display()
+                );
+                refused += 1;
+                return false;
+            }
+            let raw = raw.unwrap_or_default();
+            // Everything here is local, so resolving further cannot wait on a share.
+            let points_to = std::fs::canonicalize(&raw).unwrap_or(raw);
             let real = real_target
                 .get_or_insert_with(|| std::fs::canonicalize(target).ok())
                 .as_deref()
@@ -134,20 +177,45 @@ fn drop_sources_with(
             !is_within(&points_to, target) && !is_within(&points_to, real)
         })
         .cloned()
-        .collect()
+        .collect();
+    (kept, refused)
 }
 
-/// Where a symbolic link or junction points, resolved to the end; `None` for anything else.
-/// Network paths are not looked at, so a drop never waits on a share.
-fn link_target(path: &Path) -> Option<PathBuf> {
-    if forge_win::files::network_root(path).is_some() {
-        return None;
-    }
-    let meta = std::fs::symlink_metadata(path).ok()?;
+/// Reads whether `path` is a link or junction and, if so, its stored target (one hop; no
+/// further resolution, so a link to a share is not followed onto the network).
+fn read_link_once(path: &Path) -> LinkProbe {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return LinkProbe::Plain;
+    };
     if !meta.file_type().is_symlink() {
-        return None;
+        return LinkProbe::Plain;
     }
-    std::fs::canonicalize(path).ok()
+    match std::fs::read_link(path) {
+        Ok(target) => LinkProbe::To(target),
+        Err(_) => LinkProbe::Unreadable,
+    }
+}
+
+/// The message for links refused by `drop_sources`.
+pub fn refused_message(count: usize) -> String {
+    if count == 1 {
+        "A link to or on a network location was not moved or copied".into()
+    } else {
+        format!("{count} links to or on network locations were not moved or copied")
+    }
+}
+
+fn refused_id() -> egui::Id {
+    egui::Id::new("dnd_refused_links")
+}
+
+fn note_refused(ctx: &egui::Context, count: usize) {
+    ctx.data_mut(|d| *d.get_temp_mut_or_default::<usize>(refused_id()) += count);
+}
+
+/// Links refused by a drop this frame (see `refused_message`), once.
+pub fn take_refused(ctx: &egui::Context) -> usize {
+    ctx.data_mut(|d| d.remove_temp::<usize>(refused_id()).unwrap_or(0))
 }
 
 /// The folder a details/grid row drops into: a folder row is its own target; a file row
@@ -187,6 +255,10 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    fn kept(paths: &[PathBuf], target: &Path) -> Vec<PathBuf> {
+        drop_sources(paths, target).0
     }
 
     /// A stand-in for the disk: `C:\Mount` holds another volume, X: cannot be identified,
@@ -292,54 +364,113 @@ mod tests {
     fn drop_sources_skips_no_op_and_self_drops() {
         let target = p(r"C:\dst");
         // Onto itself.
-        assert!(drop_sources(&[p(r"C:\dst")], &target).is_empty());
+        assert!(kept(&[p(r"C:\dst")], &target).is_empty());
         // Into its own parent (already there), with different case and slashes.
-        assert!(drop_sources(&[p(r"C:\Dst\file.txt")], &p("c:/dst/")).is_empty());
-        assert!(drop_sources(&[p("C:/Dst/file.txt")], &target).is_empty());
+        assert!(kept(&[p(r"C:\Dst\file.txt")], &p("c:/dst/")).is_empty());
+        assert!(kept(&[p("C:/Dst/file.txt")], &target).is_empty());
         // Folder into its own descendant.
-        assert!(drop_sources(&[p(r"C:\a")], &p(r"C:\a\sub\deep")).is_empty());
+        assert!(kept(&[p(r"C:\a")], &p(r"C:\a\sub\deep")).is_empty());
         // Sibling with a shared name prefix is not a descendant.
-        assert_eq!(
-            drop_sources(&[p(r"C:\a\b")], &p(r"C:\a\bc")),
-            vec![p(r"C:\a\b")]
-        );
+        assert_eq!(kept(&[p(r"C:\a\b")], &p(r"C:\a\bc")), vec![p(r"C:\a\b")]);
         // Normal item is kept.
         let keep = vec![p(r"C:\src\x.txt")];
-        assert_eq!(drop_sources(&keep, &target), keep);
+        assert_eq!(kept(&keep, &target), keep);
     }
 
     #[test]
     fn drop_sources_sees_through_verbatim_prefixes() {
         // Onto itself, own parent and own descendant, with `\\?\` on either side.
-        assert!(drop_sources(&[p(r"\\?\C:\dst")], &p(r"C:\dst")).is_empty());
-        assert!(drop_sources(&[p(r"C:\dst\a.txt")], &p(r"\\?\C:\dst")).is_empty());
-        assert!(drop_sources(&[p(r"\\?\C:\a")], &p(r"C:\a\sub")).is_empty());
-        assert!(drop_sources(&[p(r"\\srv\share\a")], &p(r"\\?\UNC\srv\share\a\sub")).is_empty());
-        assert!(drop_sources(&[p(r"\\?\UNC\SRV\share\d\x.txt")], &p(r"\\srv\share\d")).is_empty());
+        assert!(kept(&[p(r"\\?\C:\dst")], &p(r"C:\dst")).is_empty());
+        assert!(kept(&[p(r"C:\dst\a.txt")], &p(r"\\?\C:\dst")).is_empty());
+        assert!(kept(&[p(r"\\?\C:\a")], &p(r"C:\a\sub")).is_empty());
+        assert!(kept(&[p(r"\\srv\share\a")], &p(r"\\?\UNC\srv\share\a\sub")).is_empty());
+        assert!(kept(&[p(r"\\?\UNC\SRV\share\d\x.txt")], &p(r"\\srv\share\d")).is_empty());
         // Another folder is still a real drop.
         assert_eq!(
-            drop_sources(&[p(r"\\?\C:\a\x.txt")], &p(r"C:\b")),
+            kept(&[p(r"\\?\C:\a\x.txt")], &p(r"C:\b")),
             vec![p(r"\\?\C:\a\x.txt")]
         );
     }
 
+    /// `C:\zx-dnd-test\Junction` points to `C:\zx-dnd-test\Data`; `\\srv\share\Link` to
+    /// `\\srv\share\Data`; `C:\zx-dnd-test\ToShare` to `\\srv\share\Data`;
+    /// `C:\zx-dnd-test\Broken` cannot be read.
+    fn fake_link(path: &Path) -> LinkProbe {
+        let is = |s: &str| paths_equal(path, &p(s));
+        if is(r"C:\zx-dnd-test\Junction") {
+            LinkProbe::To(p(r"\\?\C:\zx-dnd-test\Data"))
+        } else if is(r"\\srv\share\Link") {
+            LinkProbe::To(p(r"\\srv\share\Data"))
+        } else if is(r"C:\zx-dnd-test\ToShare") {
+            LinkProbe::To(p(r"\\?\UNC\srv\share\Data"))
+        } else if is(r"C:\zx-dnd-test\Broken") {
+            LinkProbe::Unreadable
+        } else {
+            LinkProbe::Plain
+        }
+    }
+
+    fn with_links(paths: &[&str], target: &str) -> (Vec<PathBuf>, usize) {
+        let paths: Vec<PathBuf> = paths.iter().map(|s| p(s)).collect();
+        drop_sources_with(&paths, &p(target), &mut fake_link)
+    }
+
     #[test]
-    fn a_link_is_not_dropped_into_the_folder_it_points_to() {
-        // `C:\Junction` points to `C:\Data`.
-        let mut link =
-            |path: &Path| paths_equal(path, &p(r"C:\Junction")).then(|| p(r"\\?\C:\Data"));
-        let junction = vec![p(r"C:\Junction")];
-        assert!(drop_sources_with(&junction, &p(r"C:\Data\sub"), &mut link).is_empty());
-        assert!(drop_sources_with(&junction, &p(r"C:\Data"), &mut link).is_empty());
+    fn a_local_link_is_not_dropped_into_the_folder_it_points_to() {
+        let junction = r"C:\zx-dnd-test\Junction";
         assert_eq!(
-            drop_sources_with(&junction, &p(r"C:\Other"), &mut link),
-            junction
+            with_links(&[junction], r"C:\zx-dnd-test\Data\sub"),
+            (vec![], 0)
         );
-        // A link that cannot be resolved is let through.
-        let mut unresolved = |_: &Path| None;
+        assert_eq!(with_links(&[junction], r"C:\zx-dnd-test\Data"), (vec![], 0));
         assert_eq!(
-            drop_sources_with(&junction, &p(r"C:\Data\sub"), &mut unresolved),
-            junction
+            with_links(&[junction], r"C:\zx-dnd-test\Other"),
+            (vec![p(junction)], 0)
+        );
+        // A local link that cannot be read is let through.
+        let broken = r"C:\zx-dnd-test\Broken";
+        assert_eq!(
+            with_links(&[broken], r"C:\zx-dnd-test\Data"),
+            (vec![p(broken)], 0)
+        );
+    }
+
+    #[test]
+    fn links_that_involve_a_network_location_are_refused() {
+        // A local link to a share.
+        assert_eq!(
+            with_links(&[r"C:\zx-dnd-test\ToShare"], r"C:\zx-dnd-test\Other"),
+            (vec![], 1)
+        );
+        // A link on a share, into its own target and elsewhere.
+        assert_eq!(
+            with_links(&[r"\\srv\share\Link"], r"\\srv\share\Data\sub"),
+            (vec![], 1)
+        );
+        assert_eq!(
+            with_links(&[r"\\srv\share\Link"], r"C:\zx-dnd-test\Other"),
+            (vec![], 1)
+        );
+        // A local link dropped onto a share, also as `\\?\UNC`.
+        let junction = r"C:\zx-dnd-test\Junction";
+        assert_eq!(with_links(&[junction], r"\\srv\share\x"), (vec![], 1));
+        assert_eq!(with_links(&[junction], r"\\?\UNC\srv\share\x"), (vec![], 1));
+        // An unreadable link with a share involved is refused too.
+        assert_eq!(
+            with_links(&[r"C:\zx-dnd-test\Broken"], r"\\srv\share\x"),
+            (vec![], 1)
+        );
+        // Plain items on shares are not affected, and only the link is held back.
+        assert_eq!(
+            with_links(
+                &[r"\\srv\share\a.txt", r"\\srv\share\Link"],
+                r"\\srv\share\b"
+            ),
+            (vec![p(r"\\srv\share\a.txt")], 1)
+        );
+        assert_eq!(
+            refused_message(1),
+            "A link to or on a network location was not moved or copied"
         );
     }
 
@@ -360,13 +491,10 @@ mod tests {
             eprintln!("skipped: could not create a junction here");
             return;
         }
-        assert!(drop_sources(&[junction.clone()], &sub).is_empty());
+        assert!(kept(&[junction.clone()], &sub).is_empty());
         let elsewhere = dir.path().join("Elsewhere");
         std::fs::create_dir(&elsewhere).unwrap();
-        assert_eq!(
-            drop_sources(&[junction.clone()], &elsewhere),
-            vec![junction]
-        );
+        assert_eq!(kept(&[junction.clone()], &elsewhere), vec![junction]);
     }
 
     #[test]

@@ -77,7 +77,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   cursor shows the copy badge even when the drop will move; changing that would need ZXraw's own
   `IDropTarget`. Volumes are compared by drive letter or share first, so a drop between two
   names of one volume (a disk mounted in a folder and its own drive letter, or a `subst`
-  drive) copies instead of moving, which is the safe side. During the drag the pointer position is read from Windows each frame; e2e
+  drive) copies instead of moving, which is the safe side. A link or junction that lives on,
+  points to, or is dropped onto a network location is refused with a message, so a drop
+  never follows a link onto a share; network paths are recognised without a network call,
+  but `GetDriveTypeW` on a disconnected mapped drive is not guaranteed to answer at once.
+  During the drag the pointer position is read from Windows each frame; e2e
   tests simulate the drop through the automation hook, not a real OLE drag. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another
