@@ -1366,12 +1366,23 @@ impl eframe::App for ZxrawApp {
 impl ZxrawApp {
     /// Files from another application dropped where no file list took them (the viewer, the
     /// toolbar, a dialog) go into the focused pane's folder.
+    /// Also reports links that any drop this frame refused.
     fn unclaimed_external_drop(&mut self, ctx: &egui::Context) {
-        let Some(drop) = crate::dnd::external::take(ctx) else {
+        let mut refused = crate::dnd::take_refused(ctx);
+        let drop = crate::dnd::external::take(ctx);
+        let mut transfer = None;
+        if let Some(drop) = drop {
+            let target = self.pane().path.clone();
+            let (paths, links) = crate::dnd::drop_sources(&drop.paths, &target);
+            refused += links;
+            transfer = Some((drop, target, paths));
+        }
+        if refused > 0 {
+            self.toast_err(crate::dnd::refused_message(refused));
+        }
+        let Some((drop, target, paths)) = transfer else {
             return;
         };
-        let target = self.pane().path.clone();
-        let paths = crate::dnd::drop_sources(&drop.paths, &target);
         if paths.is_empty() {
             return;
         }
