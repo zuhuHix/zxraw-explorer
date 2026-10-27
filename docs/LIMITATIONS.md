@@ -75,7 +75,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   Shift moves), like a drag inside the app. winit's drop target always answers the source with
   "copy", so the source never deletes the originals (ZXraw does the move itself), but the drag
   cursor shows the copy badge even when the drop will move; changing that would need ZXraw's own
-  `IDropTarget`. During the drag the pointer position is read from Windows each frame; e2e
+  `IDropTarget`. Volumes are compared by drive letter or share first, so a drop between two
+  names of one volume (a disk mounted in a folder and its own drive letter, or a `subst`
+  drive) copies instead of moving, which is the safe side. During the drag the pointer position is read from Windows each frame; e2e
   tests simulate the drop through the automation hook, not a real OLE drag. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another

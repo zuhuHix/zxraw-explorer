@@ -103,18 +103,51 @@ fn drop_is_copy_with(
 /// The dropped items that actually go somewhere: an item dropped onto itself or into the
 /// folder it is already in is left alone, and a folder is never moved or copied into itself
 /// or one of its own subfolders. Paths compare as Windows does (case, `/` and `\`, trailing
-/// separators, `\\?\` prefixes).
+/// separators, `\\?\` prefixes). A link or junction is also kept out of the folder it points
+/// to (that would make a link loop); a link that cannot be resolved is let through.
 pub fn drop_sources(paths: &[PathBuf], target: &Path) -> Vec<PathBuf> {
+    drop_sources_with(paths, target, &mut link_target)
+}
+
+fn drop_sources_with(
+    paths: &[PathBuf],
+    target: &Path,
+    link: &mut dyn FnMut(&Path) -> Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut real_target = None;
     paths
         .iter()
         .filter(|source| {
             let in_place = source
                 .parent()
                 .is_some_and(|parent| paths_equal(parent, target));
-            !in_place && !is_within(source, target)
+            if in_place || is_within(source, target) {
+                return false;
+            }
+            let Some(points_to) = link(source) else {
+                return true;
+            };
+            let real = real_target
+                .get_or_insert_with(|| std::fs::canonicalize(target).ok())
+                .as_deref()
+                .unwrap_or(target);
+            !is_within(&points_to, target) && !is_within(&points_to, real)
         })
         .cloned()
         .collect()
+}
+
+/// Where a symbolic link or junction points, resolved to the end; `None` for anything else.
+/// Network paths are not looked at, so a drop never waits on a share.
+fn link_target(path: &Path) -> Option<PathBuf> {
+    if forge_win::files::network_root(path).is_some() {
+        return None;
+    }
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_symlink() {
+        return None;
+    }
+    std::fs::canonicalize(path).ok()
 }
 
 /// The folder a details/grid row drops into: a folder row is its own target; a file row
@@ -287,6 +320,52 @@ mod tests {
         assert_eq!(
             drop_sources(&[p(r"\\?\C:\a\x.txt")], &p(r"C:\b")),
             vec![p(r"\\?\C:\a\x.txt")]
+        );
+    }
+
+    #[test]
+    fn a_link_is_not_dropped_into_the_folder_it_points_to() {
+        // `C:\Junction` points to `C:\Data`.
+        let mut link =
+            |path: &Path| paths_equal(path, &p(r"C:\Junction")).then(|| p(r"\\?\C:\Data"));
+        let junction = vec![p(r"C:\Junction")];
+        assert!(drop_sources_with(&junction, &p(r"C:\Data\sub"), &mut link).is_empty());
+        assert!(drop_sources_with(&junction, &p(r"C:\Data"), &mut link).is_empty());
+        assert_eq!(
+            drop_sources_with(&junction, &p(r"C:\Other"), &mut link),
+            junction
+        );
+        // A link that cannot be resolved is let through.
+        let mut unresolved = |_: &Path| None;
+        assert_eq!(
+            drop_sources_with(&junction, &p(r"C:\Data\sub"), &mut unresolved),
+            junction
+        );
+    }
+
+    #[test]
+    fn a_real_junction_is_not_dropped_into_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Data");
+        let sub = data.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let junction = dir.path().join("Junction");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&data)
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !made {
+            eprintln!("skipped: could not create a junction here");
+            return;
+        }
+        assert!(drop_sources(&[junction.clone()], &sub).is_empty());
+        let elsewhere = dir.path().join("Elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        assert_eq!(
+            drop_sources(&[junction.clone()], &elsewhere),
+            vec![junction]
         );
     }
 

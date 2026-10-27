@@ -87,9 +87,46 @@ pub fn file_id(_path: &Path) -> Result<(u32, u64)> {
     Err(WinError::Unsupported)
 }
 
+/// The lowercased `\\server\share` or `x:` a network path starts with, without touching the
+/// network: UNC paths (also `\\?\UNC\…`) and drive letters that Windows reports as remote
+/// (a mapped drive; `GetDriveTypeW` answers from the drive table). `None` for local paths.
+#[cfg(windows)]
+pub fn network_root(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::PCWSTR;
+    const DRIVE_REMOTE: u32 = 4;
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(
+            format!(
+                r"\\{}\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            )
+            .to_lowercase(),
+        ),
+        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+            let root = crate::to_wide(format!(r"{}:\", d as char));
+            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            (kind == DRIVE_REMOTE).then(|| format!("{}:", d as char).to_lowercase())
+        }
+        _ => None,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn network_root(_path: &Path) -> Option<String> {
+    None
+}
+
 /// Identity of the volume that holds `path`, following folder mount points (a disk mounted
-/// at `C:\Mount` is not `C:`): the volume GUID name for local volumes, or the lowercased
-/// `\\server\share\` root for network shares.
+/// at `C:\Mount` is not `C:`): the volume GUID name for local volumes. Network paths are
+/// identified by their share or mapped drive letter (`network_root`) without a network
+/// call, so a slow or offline share cannot stall the caller.
 #[cfg(windows)]
 pub fn volume_identity(path: &Path) -> Result<String> {
     use windows::Win32::Storage::FileSystem::{
@@ -97,14 +134,13 @@ pub fn volume_identity(path: &Path) -> Result<String> {
     };
     use windows::core::PCWSTR;
 
+    if let Some(root) = network_root(path) {
+        return Ok(root);
+    }
     // A verbatim path's root would come back verbatim: ask with the plain form instead
-    // (`\\?\UNC\srv\share` as `\\srv\share`, `\\?\C:` as `C:`).
+    // (`\\?\C:` as `C:`).
     let text = path.to_string_lossy();
-    let plain = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-    };
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
     let wide = crate::to_wide(&plain);
     let mut root = vec![0u16; wide.len().max(261) + 1];
     unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut root) }
@@ -292,6 +328,24 @@ mod tests {
         assert_eq!(volume_identity(&sub).unwrap(), a);
         let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", sub.display()));
         assert_eq!(volume_identity(&verbatim).unwrap(), a);
+        assert_eq!(network_root(d.path()), None);
+    }
+
+    #[test]
+    fn network_paths_are_identified_without_the_network() {
+        // An unreachable server answers at once: no lookup is made.
+        let started = std::time::Instant::now();
+        let plain = std::path::Path::new(r"\\no-such-host.invalid\Share\a\b.txt");
+        let verbatim = std::path::Path::new(r"\\?\UNC\NO-SUCH-HOST.invalid\share\c");
+        assert_eq!(
+            volume_identity(plain).unwrap(),
+            r"\\no-such-host.invalid\share"
+        );
+        assert_eq!(
+            volume_identity(verbatim).unwrap(),
+            r"\\no-such-host.invalid\share"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
