@@ -298,7 +298,9 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 ///                            (the empty area of the list); names may be relative paths
 ///                            such as `Sub/inner.txt` (children of an expanded folder)
 /// drop-files <target> | <path>[, <path>…] [| ctrl|shift] files dropped from another app
-///                            onto an entry or `bg`; the drop is delivered to the frame
+///                            onto an entry, `bg`, or `pin:<label>` (a sidebar pin row whose
+///                            shown label or folder name matches, ignoring case; `drag` takes
+///                            the same targets); the drop is delivered to the frame
 ///                            after the pointer has settled over the target
 /// scroll <dy>                mouse wheel at the pointer; positive scrolls content down
 /// dialog <path> | cancel     queue the answer for the next native file/folder dialog
@@ -400,12 +402,13 @@ enum Step {
     },
 }
 
-/// Where a `drag` or `drop-files` step lets go: a listed entry's row or tile, or `bg`
-/// (a point in the empty area of the list).
+/// Where a `drag` or `drop-files` step lets go: a listed entry's row or tile, `bg`
+/// (a point in the empty area of the list), or a sidebar pin row by its label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DropTarget {
     Entry(String),
     Background,
+    Pin(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -967,12 +970,17 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
 }
 
 impl DropTarget {
-    /// `bg` is the empty area of the list (also when an entry is called `bg`).
+    /// `bg` is the empty area of the list (also when an entry is called `bg`); `pin:<label>`
+    /// is a sidebar pin (an entry called `pin:x` can't be targeted).
     fn parse(text: &str) -> Result<Self, String> {
         match text {
-            "" => Err("expected an entry name or `bg`".into()),
+            "" => Err("expected an entry name, `bg` or `pin:<label>`".into()),
             "bg" => Ok(Self::Background),
-            name => Ok(Self::Entry(name.to_string())),
+            _ => match text.strip_prefix("pin:").map(str::trim) {
+                Some("") => Err("expected a pin label after `pin:`".into()),
+                Some(label) => Ok(Self::Pin(label.to_string())),
+                None => Ok(Self::Entry(text.to_string())),
+            },
         }
     }
 }
@@ -1237,6 +1245,10 @@ fn view_rect_id() -> egui::Id {
     egui::Id::new("testhook-view-rect")
 }
 
+fn pin_rect_id(path: &Path) -> egui::Id {
+    egui::Id::new(("testhook-pin-rect", path))
+}
+
 fn note_rect(ui: &egui::Ui, id: egui::Id, rect: egui::Rect) {
     if !RECORD_RECTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
@@ -1270,6 +1282,11 @@ fn control_rect_id(name: &str) -> egui::Id {
 
 fn arrow_rect_id(path: &Path) -> egui::Id {
     egui::Id::new(("testhook-arrow-rect", path))
+}
+
+/// Records where a sidebar pin row was drawn, for `drop-files pin:<label>` and `drag`.
+pub(crate) fn note_pin_rect(ui: &egui::Ui, path: &Path, rect: egui::Rect) {
+    note_rect(ui, pin_rect_id(path), rect);
 }
 
 /// Records the file list's area (where a click on empty space lands).
@@ -1417,6 +1434,20 @@ fn target_point(
         DropTarget::Entry(name) => {
             let path = listed_entry(app.pane(), name)?;
             Ok(drawn_rect(ctx, entry_rect_id(&path)).map(|rect| rect.center()))
+        }
+        DropTarget::Pin(label) => {
+            let wanted = label.to_lowercase();
+            let pin = app.settings.pins.iter().find(|pin| {
+                crate::sidebar::pin_label(pin).to_lowercase() == wanted
+                    || pin
+                        .path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().to_lowercase() == wanted)
+            });
+            let Some(pin) = pin else {
+                return Err(format!("no sidebar pin named `{label}`"));
+            };
+            Ok(drawn_rect(ctx, pin_rect_id(&pin.path)).map(|rect| rect.center()))
         }
         DropTarget::Background => {
             let Some(view) = drawn_rect(ctx, view_rect_id()) else {
@@ -2279,6 +2310,16 @@ mod tests {
             Ok(Step::DropFiles { target: DropTarget::Entry(t), paths, modifiers })
                 if t == "Target" && paths == [in_temp("a.txt")] && modifiers == egui::Modifiers::NONE
         ));
+        assert!(matches!(
+            one("drop-files pin:Pinned Folder | a.txt | shift"),
+            Ok(Step::DropFiles { target: DropTarget::Pin(p), paths, modifiers })
+                if p == "Pinned Folder" && paths == [in_temp("a.txt")] && modifiers.shift
+        ));
+        assert!(matches!(
+            one("drag a.txt pin:docs"),
+            Ok(Step::Drag { to: DropTarget::Pin(p), .. }) if p == "docs"
+        ));
+        assert!(one("drop-files pin: | a.txt").is_err());
         assert!(one("drop-files Target").is_err());
         assert!(one("drop-files Target |").is_err());
         assert!(one("drop-files | a.txt").is_err());

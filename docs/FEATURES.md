@@ -125,12 +125,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   in a nested open folder appears).
 * ✅ Drag and drop lands in the folder under the pointer, from inside the app and from other
   applications (Desktop, Explorer): a folder row, the open folder that a nested row belongs to
-  (the whole open folder lights up), or the pane under the pointer. Same volume moves, another
-  volume copies, Ctrl copies, Shift moves; dropping onto itself or its own folder, or a folder
+  (the whole open folder lights up), a sidebar folder or pin, or the pane under the pointer.
+  Same volume moves, another volume copies (a disk mounted in a folder counts as another volume,
+  and a volume that cannot be identified copies), Ctrl copies, Shift moves; dropping onto itself or its own folder, or a folder
   into itself or a subfolder, does nothing. Drops nobody takes (viewer, toolbar) go to the
-  focused pane's folder — `dnd.rs` (`same_volume_compares_roots`,
-  `drop_is_copy_follows_explorer_rule`, `drop_sources_skips_no_op_and_self_drops`,
-  `row_drop_target_by_kind_and_depth`), e2e `external_drop_onto_a_folder_row_moves_the_file`,
+  focused pane's folder — `dnd.rs` (`same_volume_compares_roots_then_asks_the_disk`,
+  `same_volume_on_the_real_disk`, `drop_is_copy_follows_explorer_rule`,
+  `drop_is_copy_respects_mount_points_and_unknown_volumes`,
+  `drop_sources_skips_no_op_and_self_drops`, `drop_sources_sees_through_verbatim_prefixes`,
+  `row_drop_target_by_kind_and_depth`), `forge-win/src/files.rs`
+  (`volume_identity_is_shared_within_a_volume`), e2e
+  `external_drop_onto_a_sidebar_pin_moves_into_that_folder`, `external_drop_onto_a_folder_row_moves_the_file`,
   `external_drop_with_ctrl_copies`, `external_drop_on_empty_area_goes_to_the_pane_folder`,
   `internal_drop_onto_a_child_of_an_expanded_folder_lands_in_that_folder`,
   `dropping_a_folder_onto_its_own_child_does_nothing`.

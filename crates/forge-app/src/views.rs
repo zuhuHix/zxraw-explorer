@@ -278,33 +278,17 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], network: bool, out: &mut Vec<V
 }
 
 /// Drag-and-drop handling shared by both views, for in-app drags and for files dragged in
-/// from other applications. `target_dir` is the folder an item drops into (the row's folder,
-/// or the pane's folder for the background). Returns whether something is held over `resp`.
+/// from other applications (see `dnd::folder_drop`). `target_dir` is the folder an item
+/// drops into (the row's folder, or the pane's folder for the background). Returns whether
+/// something is held over `resp`.
 fn handle_drop(resp: &egui::Response, target_dir: &Path, out: &mut Vec<ViewEvent>) -> bool {
-    let external = resp.contains_pointer() && crate::dnd::external::active(&resp.ctx);
-    let hovering = external || resp.dnd_hover_payload::<DragPaths>().is_some();
-    let dropped = if let Some(p) = resp.dnd_release_payload::<DragPaths>() {
-        let keys = resp.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
-        Some((p.0.clone(), keys))
-    } else if external {
-        crate::dnd::external::take(&resp.ctx).map(|drop| {
-            let keys = drop.keys(&resp.ctx);
-            (drop.paths, keys)
-        })
-    } else {
-        None
-    };
-    if let Some((paths, (ctrl, shift))) = dropped {
-        // Dropping an item onto itself or its own parent, or a folder into itself, is a no-op.
-        let paths = crate::dnd::drop_sources(&paths, target_dir);
-        if !paths.is_empty() {
-            let copy = crate::dnd::drop_is_copy(&paths, target_dir, ctrl, shift);
-            out.push(ViewEvent::Drop {
-                paths,
-                target: target_dir.to_path_buf(),
-                copy,
-            });
-        }
+    let (hovering, transfer) = crate::dnd::folder_drop(resp, target_dir);
+    if let Some((paths, copy)) = transfer {
+        out.push(ViewEvent::Drop {
+            paths,
+            target: target_dir.to_path_buf(),
+            copy,
+        });
     }
     hovering
 }

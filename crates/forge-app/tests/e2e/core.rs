@@ -1011,6 +1011,27 @@ fn external_drop_onto_a_folder_row_moves_the_file() {
 }
 
 #[test]
+fn external_drop_onto_a_sidebar_pin_moves_into_that_folder() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let pinned = sandbox.path().join("pinned");
+    fs::create_dir_all(&pinned).unwrap();
+    write_file(&list.join("other.txt"), b"other");
+    let script = format!(
+        "limit 120\nnavigate {pinned}\ncmd BookmarkFolder\nui sidebar pins pinned\n\
+         navigate {list}\ncmd ViewDetails\nwait-entry other.txt\nwait-frames 5\n\
+         drop-files pin:pinned | {file}\nwait-exists {moved}\nwait-jobs\n\
+         assert-missing {file}\nassert-missing {in_list}\nassert-no-error-toast\nexit\n",
+        pinned = shown(&pinned),
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        moved = shown(&pinned.join("a.txt")),
+        in_list = shown(&list.join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+#[test]
 fn external_drop_with_ctrl_copies() {
     let sandbox = tempfile::tempdir().unwrap();
     let (list, outside) = drop_sandbox(sandbox.path());
