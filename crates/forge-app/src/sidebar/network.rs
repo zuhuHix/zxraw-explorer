@@ -359,6 +359,10 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
         let status = status_of(app, &entry.path);
         let connecting = is_connecting(app, entry);
         let r = row(ui, entry, &status, connecting, paths_equal(&current, &entry.path));
+        // A location the last check found online takes drops like the other sidebar folders.
+        if matches!(status, NetStatus::Online) {
+            super::folder_drop(app, ui, &r, &entry.path);
+        }
         if r.clicked() {
             edit = Some(Edit::Open(i));
         }
