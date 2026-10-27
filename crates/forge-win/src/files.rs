@@ -87,6 +87,45 @@ pub fn file_id(_path: &Path) -> Result<(u32, u64)> {
     Err(WinError::Unsupported)
 }
 
+/// Identity of the volume that holds `path`, following folder mount points (a disk mounted
+/// at `C:\Mount` is not `C:`): the volume GUID name for local volumes, or the lowercased
+/// `\\server\share\` root for network shares.
+#[cfg(windows)]
+pub fn volume_identity(path: &Path) -> Result<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+    use windows::core::PCWSTR;
+
+    // A verbatim path's root would come back verbatim: ask with the plain form instead
+    // (`\\?\UNC\srv\share` as `\\srv\share`, `\\?\C:` as `C:`).
+    let text = path.to_string_lossy();
+    let plain = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    };
+    let wide = crate::to_wide(&plain);
+    let mut root = vec![0u16; wide.len().max(261) + 1];
+    unsafe { GetVolumePathNameW(PCWSTR(wide.as_ptr()), &mut root) }
+        .map_err(|e| crate::api_err("GetVolumePathNameW", e))?;
+    let len = root.iter().position(|&c| c == 0).unwrap_or(root.len());
+    let root_text = String::from_utf16_lossy(&root[..len]);
+    if root_text.starts_with(r"\\") && !root_text.starts_with(r"\\?\") {
+        return Ok(root_text.to_lowercase());
+    }
+    let mut name = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(root.as_ptr()), &mut name) }
+        .map_err(|e| crate::api_err("GetVolumeNameForVolumeMountPointW", e))?;
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    Ok(String::from_utf16_lossy(&name[..len]).to_lowercase())
+}
+
+#[cfg(not(windows))]
+pub fn volume_identity(_path: &Path) -> Result<String> {
+    Err(WinError::Unsupported)
+}
+
 /// True if the volume holding `path` is removable (USB stick, SD card). UNC paths and
 /// anything without a drive letter return `false`.
 #[cfg(windows)]
@@ -242,6 +281,18 @@ pub fn set_attributes(_path: &Path, _readonly: bool, _hidden: bool) -> Result<()
 mod tests {
     use super::*;
     use std::os::windows::fs::MetadataExt;
+
+    #[test]
+    fn volume_identity_is_shared_within_a_volume() {
+        let d = tempfile::tempdir().unwrap();
+        let sub = d.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let a = volume_identity(d.path()).unwrap();
+        assert!(a.starts_with(r"\\?\volume{"), "{a}");
+        assert_eq!(volume_identity(&sub).unwrap(), a);
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", sub.display()));
+        assert_eq!(volume_identity(&verbatim).unwrap(), a);
+    }
 
     #[test]
     fn hard_link_count_of_new_file_is_one() {

@@ -246,7 +246,7 @@ Explorer is a file manager designed around that workflow:
   behind it. If a program holds a file open, the message names the program.
 - **Drag and drop like Explorer.** Drop files from the desktop, Explorer or another app, or
   drag them within ZXraw: they land in the folder under the pointer (a folder row, an open
-  folder in the tree, or the folder the pane shows) and the target lights up while you hover.
+  folder in the tree, a sidebar folder, or the folder the pane shows) and the target lights up while you hover.
   Within one drive they move, across drives they copy; hold <kbd>Ctrl</kbd> to copy or
   <kbd>Shift</kbd> to move.
 - **Works with Explorer's clipboard.** Cut or copy files in Windows Explorer or on the desktop,

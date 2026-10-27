@@ -42,3 +42,6 @@ pub(crate) fn note_view_rect(_ui: &egui::Ui, _rect: egui::Rect) {}
 
 #[inline(always)]
 pub(crate) fn note_menu_rect(_ui: &egui::Ui, _label: &str, _rect: egui::Rect) {}
+
+#[inline(always)]
+pub(crate) fn note_pin_rect(_ui: &egui::Ui, _path: &std::path::Path, _rect: egui::Rect) {}

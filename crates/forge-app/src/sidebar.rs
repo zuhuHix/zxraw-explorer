@@ -255,16 +255,26 @@ fn nav_item(
         app.run(crate::commands::Cmd::NewTab, &ui.ctx().clone());
         app.navigate(path.clone());
     }
-    // Sidebar entries accept drops (copy/move into that folder, by `dnd::drop_is_copy`).
-    if let Some(p) = r.dnd_release_payload::<DragPaths>() {
-        let paths = crate::dnd::drop_sources(&p.0, path);
-        if !paths.is_empty() {
-            let (ctrl, shift) = ui.input(|i| (i.modifiers.command, i.modifiers.shift));
-            let copy = crate::dnd::drop_is_copy(&paths, path, ctrl, shift);
-            crate::actions::transfer(app, paths, path.clone(), copy);
-        }
-    }
+    // Sidebar entries accept drops, from the app and from other applications.
+    folder_drop(app, ui, &r, path);
     r
+}
+
+/// A sidebar folder as a drop target (`dnd::folder_drop`): items move within a volume and
+/// copy across volumes, and the row is outlined while something is held over it.
+fn folder_drop(app: &mut ZxrawApp, ui: &Ui, r: &egui::Response, folder: &Path) {
+    let (hovering, transfer) = crate::dnd::folder_drop(r, folder);
+    if hovering {
+        ui.painter().rect_stroke(
+            r.rect,
+            4.0,
+            egui::Stroke::new(1.5, theme::accent(ui.ctx())),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if let Some((paths, copy)) = transfer {
+        crate::actions::transfer(app, paths, folder.to_path_buf(), copy);
+    }
 }
 
 pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
@@ -343,6 +353,7 @@ fn pins_list(app: &mut ZxrawApp, ui: &mut Ui) {
         let missing = status == PinStatus::Missing;
         let is_current = !pin.file && paths_equal(&current, &pin.path);
         let r = pin_row(ui, i, pin, status, is_current);
+        crate::testhook::note_pin_rect(ui, &pin.path, r.rect);
 
         if r.clicked() {
             activate_pin(app, i);
@@ -353,10 +364,7 @@ fn pins_list(app: &mut ZxrawApp, ui: &mut Ui) {
         }
         // Folder pins take drops like the known folders (copy or move into that folder).
         if !pin.file && !missing {
-            if let Some(p) = r.dnd_release_payload::<DragPaths>() {
-                let copy = ui.input(|i| i.modifiers.command);
-                crate::actions::transfer(app, p.0.clone(), pin.path.clone(), copy);
-            }
+            folder_drop(app, ui, &r, &pin.path);
         }
         if let Some(p) = r.dnd_release_payload::<PinDrag>() {
             edit = Some(PinEdit::Move(p.0, i));
