@@ -62,6 +62,22 @@ pub(crate) struct InputQueue {
     pub pointer: Option<egui::Pos2>,
     /// Modifier state held across scripted pointer steps.
     pub modifiers: egui::Modifiers,
+    /// Files a `drop-files` step queued; the next `raw_input` hands them to egui.
+    pub dropped_files: Vec<PathBuf>,
+}
+
+/// A file dropped from another application, as egui hands it to the app.
+#[derive(Debug)]
+struct HookDroppedFile(PathBuf);
+
+impl egui::DroppedFile for HookDroppedFile {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
 }
 
 /// Per-step limit for steps that wait (listings, dialogs, jobs unless given explicitly).
@@ -173,6 +189,11 @@ pub fn raw_input(app: &mut ZxrawApp, raw: &mut egui::RawInput) {
         raw.hovered_files.clear();
         raw.dropped_files.clear();
     }
+    // After the hidden-window filter above: a scripted drop is what the script asked for.
+    for path in std::mem::take(&mut hook.input.dropped_files) {
+        raw.dropped_files
+            .push(std::sync::Arc::new(HookDroppedFile(path)));
+    }
     if !hook.input.pending.is_empty() {
         raw.events.append(&mut hook.input.pending);
         hook.input.delivered_frames = 0;
@@ -273,6 +294,12 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// click <x> <y>              press and release the primary button there (over two frames)
 /// marquee <from> <to> [ctrl|shift] drag from empty space below the view to two drawn entries
 /// release-pointer            release the primary button after a `marquee` step
+/// drag <name> <target> [ctrl|shift] drag a listed entry onto another entry, or onto `bg`
+///                            (the empty area of the list); names may be relative paths
+///                            such as `Sub/inner.txt` (children of an expanded folder)
+/// drop-files <target> | <path>[, <path>…] [| ctrl|shift] files dropped from another app
+///                            onto an entry or `bg`; the drop is delivered to the frame
+///                            after the pointer has settled over the target
 /// scroll <dy>                mouse wheel at the pointer; positive scrolls content down
 /// dialog <path> | cancel     queue the answer for the next native file/folder dialog
 /// wait-exists <path> [| s]   wait until the path exists (default 30 s)
@@ -331,6 +358,18 @@ enum Step {
         modifiers: egui::Modifiers,
     },
     ReleasePointer,
+    /// In-app drag of a listed entry onto an entry or the empty area.
+    Drag {
+        from: String,
+        to: DropTarget,
+        modifiers: egui::Modifiers,
+    },
+    /// Files from another application dropped onto an entry or the empty area.
+    DropFiles {
+        target: DropTarget,
+        paths: Vec<PathBuf>,
+        modifiers: egui::Modifiers,
+    },
     /// Real pointer clicks on a listed entry's row or tile (`double` = two clicks,
     /// `secondary` = one right-click).
     ClickEntry {
@@ -359,6 +398,14 @@ enum Step {
         verb: String,
         args: String,
     },
+}
+
+/// Where a `drag` or `drop-files` step lets go: a listed entry's row or tile, or `bg`
+/// (a point in the empty area of the list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DropTarget {
+    Entry(String),
+    Background,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -799,6 +846,48 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
             }
             Step::ReleasePointer
         }
+        "drag" => {
+            let (from, to, modifiers) = {
+                let mut args: Vec<&str> = rest.split_whitespace().collect();
+                let modifiers = match args.last().copied() {
+                    Some(m @ ("ctrl" | "shift")) => {
+                        args.pop();
+                        drop_modifiers(Some(m))?
+                    }
+                    _ => egui::Modifiers::NONE,
+                };
+                match args.as_slice() {
+                    [from, to] => (from.to_string(), DropTarget::parse(to)?, modifiers),
+                    _ => return Err("expected `<name> <target> [ctrl|shift]`".into()),
+                }
+            };
+            Step::Drag {
+                from,
+                to,
+                modifiers,
+            }
+        }
+        "drop-files" => {
+            let parts: Vec<&str> = rest.split(" | ").map(str::trim).collect();
+            if !(2..=3).contains(&parts.len()) {
+                return Err("expected `<target> | <path>[, <path>…] [| ctrl|shift]`".into());
+            }
+            let target = DropTarget::parse(parts[0])?;
+            let paths = parts[1]
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| inside(Path::new(p)))
+                .collect::<Result<Vec<_>, _>>()?;
+            if paths.is_empty() {
+                return Err("expected at least one path".into());
+            }
+            Step::DropFiles {
+                target,
+                paths,
+                modifiers: drop_modifiers(parts.get(2).copied())?,
+            }
+        }
         "click-entry" | "double-click-entry" | "right-click-entry" => Step::ClickEntry {
             name: non_empty(rest)?,
             double: verb == "double-click-entry",
@@ -874,6 +963,34 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
             }
         }
         other => return Err(format!("unknown step `{other}`")),
+    })
+}
+
+impl DropTarget {
+    /// `bg` is the empty area of the list (also when an entry is called `bg`).
+    fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "" => Err("expected an entry name or `bg`".into()),
+            "bg" => Ok(Self::Background),
+            name => Ok(Self::Entry(name.to_string())),
+        }
+    }
+}
+
+/// The optional `ctrl` / `shift` argument of `drag` and `drop-files`.
+fn drop_modifiers(arg: Option<&str>) -> Result<egui::Modifiers, String> {
+    Ok(match arg {
+        None => egui::Modifiers::NONE,
+        Some("ctrl") => egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..egui::Modifiers::NONE
+        },
+        Some("shift") => egui::Modifiers {
+            shift: true,
+            ..egui::Modifiers::NONE
+        },
+        Some(other) => return Err(format!("expected `ctrl` or `shift`, got `{other}`")),
     })
 }
 
@@ -1289,6 +1406,251 @@ fn marquee_drag(
     }
 }
 
+/// Where a pointer step puts the mouse for a `drag` or `drop-files` target. `Ok(None)` while
+/// the target is not drawn yet.
+fn target_point(
+    app: &ZxrawApp,
+    ctx: &egui::Context,
+    target: &DropTarget,
+) -> Result<Option<egui::Pos2>, String> {
+    match target {
+        DropTarget::Entry(name) => {
+            let path = listed_entry(app.pane(), name)?;
+            Ok(drawn_rect(ctx, entry_rect_id(&path)).map(|rect| rect.center()))
+        }
+        DropTarget::Background => {
+            let Some(view) = drawn_rect(ctx, view_rect_id()) else {
+                return Ok(None);
+            };
+            // The same spot a marquee starts from: below the rows, at the left edge.
+            let point = egui::pos2(view.left() + 8.0, view.bottom() - 6.0);
+            let covered = app.pane().entries.iter().any(|entry| {
+                drawn_rect(ctx, entry_rect_id(&entry.path)).is_some_and(|rect| rect.contains(point))
+            });
+            if covered {
+                return Err("the list has no empty area below its rows or tiles".into());
+            }
+            Ok(Some(point))
+        }
+    }
+}
+
+/// The focused pane's entry for a script name. A name with a `/` or `\` is a path relative to
+/// the pane's folder (`Sub/inner.txt`, a child of an expanded folder). A plain name matches
+/// exactly first, then ignoring case; a top-level entry wins over a same-named child.
+fn listed_entry(pane: &Pane, name: &str) -> Result<PathBuf, String> {
+    let not_listed = || format!("`{name}` is not listed");
+    if name.contains(['/', '\\']) {
+        let wanted = name.replace('\\', "/");
+        return pane
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.path.strip_prefix(&pane.path).is_ok_and(|rel| {
+                    rel.to_string_lossy()
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&wanted)
+                })
+            })
+            .map(|entry| entry.path.clone())
+            .ok_or_else(not_listed);
+    }
+    let named = |exact: bool| -> Vec<PathBuf> {
+        pane.entries
+            .iter()
+            .filter(|entry| {
+                if exact {
+                    entry.name == name
+                } else {
+                    entry.name.eq_ignore_ascii_case(name)
+                }
+            })
+            .map(|entry| entry.path.clone())
+            .collect()
+    };
+    let mut found = named(true);
+    if found.is_empty() {
+        found = named(false);
+    }
+    if found.len() > 1 {
+        let top: Vec<PathBuf> = found
+            .iter()
+            .filter(|path| path.parent() == Some(pane.path.as_path()))
+            .cloned()
+            .collect();
+        if top.len() == 1 {
+            found = top;
+        }
+    }
+    match found.len() {
+        0 => Err(not_listed()),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!(
+            "`{name}` matches several entries; write it as a path such as `Folder/{name}`"
+        )),
+    }
+}
+
+/// Where a `drag` step is in its frames: the pointer start and end, and the held modifiers.
+#[derive(Clone, Copy)]
+struct DragPlan {
+    start: egui::Pos2,
+    end: egui::Pos2,
+    modifiers: egui::Modifiers,
+}
+
+/// `drag`: press on the source row, move a little so egui starts the drag, move to the target
+/// and let the hover settle, then release with the modifiers still held (the drop reads them),
+/// and let go of the modifiers on the following frame.
+fn drag_entry(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+    from: &str,
+    to: &DropTarget,
+    modifiers: egui::Modifiers,
+) -> Result<Flow, String> {
+    if st.data.is_none() {
+        let from_path = listed_entry(app.pane(), from)?;
+        let Some(from_rect) = drawn_rect(ctx, entry_rect_id(&from_path)) else {
+            return Ok(Flow::Wait(format!("`{from}` is not on screen")));
+        };
+        let Some(end) = target_point(app, ctx, to)? else {
+            return Ok(Flow::Wait("the drop target is not on screen".into()));
+        };
+        st.data = Some(Box::new(DragPlan {
+            start: from_rect.center(),
+            end,
+            modifiers,
+        }));
+    }
+    let plan = *st
+        .data
+        .as_ref()
+        .unwrap()
+        .downcast_ref::<DragPlan>()
+        .unwrap();
+    let held = plan.modifiers != egui::Modifiers::NONE;
+    // The last frame: the modifiers are released once the drop has been handled.
+    let last = if held { 5 } else { 4 };
+    let pointer = match st.frames {
+        0 => plan.start,
+        1 => plan.start + egui::vec2(12.0, 0.0),
+        _ => plan.end,
+    };
+    app.testhook.input.pointer = Some(pointer);
+    let mut events = Vec::new();
+    match st.frames {
+        0 => {
+            events.push(egui::Event::PointerMoved(pointer));
+            if held {
+                events.push(egui::Event::ModifiersChanged(plan.modifiers));
+                app.testhook.input.modifiers = plan.modifiers;
+            }
+            events.push(egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: plan.modifiers,
+            });
+        }
+        1 | 2 | 3 => events.push(egui::Event::PointerMoved(pointer)),
+        4 => events.push(egui::Event::PointerButton {
+            pos: pointer,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: plan.modifiers,
+        }),
+        _ => {
+            app.testhook.input.modifiers = egui::Modifiers::NONE;
+            events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        }
+    }
+    match inject(app, st, &events) {
+        Flow::Done if st.frames >= last => Ok(Flow::Done),
+        Flow::Done => {
+            st.frames += 1;
+            st.phase = 0;
+            Ok(Flow::Wait("dragging".into()))
+        }
+        other => Ok(other),
+    }
+}
+
+/// Where a `drop-files` step is in its frames: the pointer spot and the held modifiers.
+#[derive(Clone, Copy)]
+struct DropPlan {
+    point: egui::Pos2,
+    modifiers: egui::Modifiers,
+}
+
+/// `drop-files`: hover the target for two frames, queue the files for the next frame's raw
+/// input (where egui gets its dropped files), and release the modifiers once that frame has
+/// taken them.
+fn drop_files(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+    target: &DropTarget,
+    paths: &[PathBuf],
+    modifiers: egui::Modifiers,
+) -> Result<Flow, String> {
+    if st.data.is_none() {
+        let Some(point) = target_point(app, ctx, target)? else {
+            return Ok(Flow::Wait("the drop target is not on screen".into()));
+        };
+        st.data = Some(Box::new(DropPlan { point, modifiers }));
+    }
+    let plan = *st
+        .data
+        .as_ref()
+        .unwrap()
+        .downcast_ref::<DropPlan>()
+        .unwrap();
+    match st.frames {
+        0 | 1 => {
+            app.testhook.input.pointer = Some(plan.point);
+            let mut events = vec![egui::Event::PointerMoved(plan.point)];
+            if st.frames == 0 && plan.modifiers != egui::Modifiers::NONE {
+                events.push(egui::Event::ModifiersChanged(plan.modifiers));
+                app.testhook.input.modifiers = plan.modifiers;
+            }
+            match inject(app, st, &events) {
+                Flow::Done => {
+                    st.frames += 1;
+                    st.phase = 0;
+                    Ok(Flow::Wait("hovering the drop target".into()))
+                }
+                other => Ok(other),
+            }
+        }
+        2 => {
+            // Picked up by `raw_input` at the start of the next frame.
+            app.testhook.input.dropped_files = paths.to_vec();
+            st.frames = 3;
+            Ok(Flow::Wait("files dropped".into()))
+        }
+        _ => {
+            if !app.testhook.input.dropped_files.is_empty() {
+                return Ok(Flow::Wait("the dropped files are not delivered yet".into()));
+            }
+            if st.phase == 0 && app.testhook.input.modifiers != egui::Modifiers::NONE {
+                app.testhook.input.modifiers = egui::Modifiers::NONE;
+                return Ok(inject(
+                    app,
+                    st,
+                    &[egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+                ));
+            }
+            if st.phase == 0 {
+                return Ok(Flow::Done);
+            }
+            // The release is queued: finish once egui has taken it.
+            Ok(inject(app, st, &[]))
+        }
+    }
+}
+
 pub(crate) fn inject(app: &mut ZxrawApp, st: &mut StepState, events: &[egui::Event]) -> Flow {
     let input = &mut app.testhook.input;
     if st.phase == 0 {
@@ -1621,6 +1983,16 @@ fn exec(
             to,
             modifiers,
         } => marquee_drag(app, ctx, st, from, to, *modifiers),
+        Step::Drag {
+            from,
+            to,
+            modifiers,
+        } => drag_entry(app, ctx, st, from, to, *modifiers),
+        Step::DropFiles {
+            target,
+            paths,
+            modifiers,
+        } => drop_files(app, ctx, st, target, paths, *modifiers),
         Step::ReleasePointer => {
             let Some(pos) = app.testhook.input.pointer else {
                 return Err("there is no pointer position to release".into());
@@ -1879,6 +2251,39 @@ mod tests {
         );
         assert!(one("marquee 01.txt 02.txt ctrl shift").is_err());
         assert!(matches!(one("release-pointer"), Ok(Step::ReleasePointer)));
+        assert!(matches!(
+            one("drag 01.txt Target"),
+            Ok(Step::Drag { from, to: DropTarget::Entry(to), modifiers })
+                if from == "01.txt" && to == "Target" && modifiers == egui::Modifiers::NONE
+        ));
+        assert!(matches!(
+            one("drag Sub/inner.txt bg shift"),
+            Ok(Step::Drag { from, to: DropTarget::Background, modifiers })
+                if from == "Sub/inner.txt" && modifiers.shift && !modifiers.command
+        ));
+        assert!(matches!(
+            one("drag a.txt Sub\\inner.txt ctrl"),
+            Ok(Step::Drag { to: DropTarget::Entry(to), modifiers, .. })
+                if to == "Sub\\inner.txt" && modifiers.ctrl && modifiers.command
+        ));
+        assert!(one("drag a.txt").is_err());
+        assert!(one("drag a.txt b.txt c.txt").is_err());
+        assert!(one("drag a.txt b.txt alt").is_err());
+        assert!(matches!(
+            one("drop-files bg | a.txt, b.txt | shift"),
+            Ok(Step::DropFiles { target: DropTarget::Background, paths, modifiers })
+                if paths == [in_temp("a.txt"), in_temp("b.txt")] && modifiers.shift
+        ));
+        assert!(matches!(
+            one("drop-files Target | a.txt"),
+            Ok(Step::DropFiles { target: DropTarget::Entry(t), paths, modifiers })
+                if t == "Target" && paths == [in_temp("a.txt")] && modifiers == egui::Modifiers::NONE
+        ));
+        assert!(one("drop-files Target").is_err());
+        assert!(one("drop-files Target |").is_err());
+        assert!(one("drop-files | a.txt").is_err());
+        assert!(one("drop-files Target | a.txt | alt").is_err());
+        assert!(one(r"drop-files Target | ..\escape.txt").is_err());
         assert!(
             matches!(one("assert-selection a.txt, b.txt"), Ok(Step::AssertSelection(names)) if names == ["a.txt", "b.txt"])
         );

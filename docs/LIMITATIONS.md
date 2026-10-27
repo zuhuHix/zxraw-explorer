@@ -70,7 +70,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   one name at a time without following links. A hard-linked tracked file whose time changed
   counts as modified (it is never read). The symlink-to-share tests need developer mode and
   were skipped on the development PC; junctions are tested.
-* Files and folders can be dropped into the app. Dragging files past the window edge starts a
+* Files and folders can be dropped into the app from other applications. The drop goes to the
+  folder under the pointer and moves within one volume (copies across volumes, Ctrl copies,
+  Shift moves), like a drag inside the app. winit's drop target always answers the source with
+  "copy", so the source never deletes the originals (ZXraw does the move itself), but the drag
+  cursor shows the copy badge even when the drop will move; changing that would need ZXraw's own
+  `IDropTarget`. During the drag the pointer position is read from Windows each frame; e2e
+  tests simulate the drop through the automation hook, not a real OLE drag. Dragging files past the window edge starts a
   Windows shell drag (`forge-win/src/dragout.rs`) that offers copy and link only, never move.
   The data object and the trigger are unit tested, but a drop into Explorer or another
   application has not been verified: it is modal and cannot be automated here. The drag starts

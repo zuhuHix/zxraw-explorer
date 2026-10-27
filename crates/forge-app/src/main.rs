@@ -15,6 +15,7 @@ mod default_app;
 mod delivery_meta;
 mod delivery_presets;
 mod dialogs;
+mod dnd;
 mod dragout;
 mod export_assoc;
 mod extra_tools_ui;

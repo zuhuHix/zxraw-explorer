@@ -244,6 +244,11 @@ Explorer is a file manager designed around that workflow:
   permanently behind your back: ZXraw asks first, in its own dialog. Folders in protected
   places such as `C:\Program Files` get Windows' administrator prompt in front of the app, not
   behind it. If a program holds a file open, the message names the program.
+- **Drag and drop like Explorer.** Drop files from the desktop, Explorer or another app, or
+  drag them within ZXraw: they land in the folder under the pointer (a folder row, an open
+  folder in the tree, or the folder the pane shows) and the target lights up while you hover.
+  Within one drive they move, across drives they copy; hold <kbd>Ctrl</kbd> to copy or
+  <kbd>Shift</kbd> to move.
 - **Works with Explorer's clipboard.** Cut or copy files in Windows Explorer or on the desktop,
   then press <kbd>Ctrl</kbd>+<kbd>V</kbd> in ZXraw Explorer, and the other way round.
 - **Cloud files stay in the cloud.** OneDrive, Dropbox and other online-only files are never

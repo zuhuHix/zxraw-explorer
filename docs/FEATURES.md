@@ -123,6 +123,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   click, Right/Left, select-all across levels, filter, Recycle a nested file, double-click a
   nested folder, expanded state remembered after navigating back, a file created outside the app
   in a nested open folder appears).
+* ✅ Drag and drop lands in the folder under the pointer, from inside the app and from other
+  applications (Desktop, Explorer): a folder row, the open folder that a nested row belongs to
+  (the whole open folder lights up), or the pane under the pointer. Same volume moves, another
+  volume copies, Ctrl copies, Shift moves; dropping onto itself or its own folder, or a folder
+  into itself or a subfolder, does nothing. Drops nobody takes (viewer, toolbar) go to the
+  focused pane's folder — `dnd.rs` (`same_volume_compares_roots`,
+  `drop_is_copy_follows_explorer_rule`, `drop_sources_skips_no_op_and_self_drops`,
+  `row_drop_target_by_kind_and_depth`), e2e `external_drop_onto_a_folder_row_moves_the_file`,
+  `external_drop_with_ctrl_copies`, `external_drop_on_empty_area_goes_to_the_pane_folder`,
+  `internal_drop_onto_a_child_of_an_expanded_folder_lands_in_that_folder`,
+  `dropping_a_folder_onto_its_own_child_does_nothing`.
 * ✅ Arrow keys, Page Up/Down, Home and End always move the file cursor unless a text field has
   focus, including after a toolbar or sidebar button was clicked, at the edges of the grid and
   the first row of the list, and with the preview panel open; egui no longer moves focus between

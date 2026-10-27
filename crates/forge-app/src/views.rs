@@ -35,7 +35,7 @@ pub enum ViewEvent {
     /// Double-click / Enter on an entry (index into `visible`).
     Activate(usize),
     Command(Cmd),
-    /// Paths dropped onto `target` folder. `copy` when Ctrl was held or cross-volume.
+    /// Paths dropped onto `target` folder. `copy` follows `dnd::drop_is_copy`.
     Drop {
         paths: Vec<PathBuf>,
         target: PathBuf,
@@ -277,28 +277,32 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], network: bool, out: &mut Vec<V
     }
 }
 
-/// Drag-and-drop handling shared by both views. `target_dir` is the folder an item drops
-/// into (the row's folder, or the pane's folder for the background).
+/// Drag-and-drop handling shared by both views, for in-app drags and for files dragged in
+/// from other applications. `target_dir` is the folder an item drops into (the row's folder,
+/// or the pane's folder for the background). Returns whether something is held over `resp`.
 fn handle_drop(resp: &egui::Response, target_dir: &Path, out: &mut Vec<ViewEvent>) -> bool {
-    let hovering = resp.dnd_hover_payload::<DragPaths>().is_some();
-    if let Some(p) = resp.dnd_release_payload::<DragPaths>() {
-        // Dropping an item onto itself or its own parent is a no-op.
-        let paths: Vec<PathBuf> =
-            p.0.iter()
-                .filter(|s| s.as_path() != target_dir && s.parent() != Some(target_dir))
-                .cloned()
-                .collect();
+    let external = resp.contains_pointer() && crate::dnd::external::active(&resp.ctx);
+    let hovering = external || resp.dnd_hover_payload::<DragPaths>().is_some();
+    let dropped = if let Some(p) = resp.dnd_release_payload::<DragPaths>() {
+        let keys = resp.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
+        Some((p.0.clone(), keys))
+    } else if external {
+        crate::dnd::external::take(&resp.ctx).map(|drop| {
+            let keys = drop.keys(&resp.ctx);
+            (drop.paths, keys)
+        })
+    } else {
+        None
+    };
+    if let Some((paths, (ctrl, shift))) = dropped {
+        // Dropping an item onto itself or its own parent, or a folder into itself, is a no-op.
+        let paths = crate::dnd::drop_sources(&paths, target_dir);
         if !paths.is_empty() {
-            let ctrl = resp.ctx.input(|i| i.modifiers.command);
-            let same_volume = paths
-                .first()
-                .and_then(|s| s.components().next())
-                .zip(target_dir.components().next())
-                .is_some_and(|(a, b)| a == b);
+            let copy = crate::dnd::drop_is_copy(&paths, target_dir, ctrl, shift);
             out.push(ViewEvent::Drop {
                 paths,
                 target: target_dir.to_path_buf(),
-                copy: ctrl || !same_volume,
+                copy,
             });
         }
     }
@@ -1398,8 +1402,14 @@ pub fn details(
     // A click on a folder's disclosure arrow, applied after the rows are drawn.
     let mut toggle_folder = None;
     let mut shown_rows = None;
+    // An expanded folder under a drop lights up with its visible children as one target. The
+    // group is found while the rows are drawn, so it is painted from the previous frame's.
+    let group_key = id.with("drop-group");
+    let drop_group = ui.ctx().data(|d| d.get_temp::<Option<PathBuf>>(group_key)).flatten();
+    let mut next_group = None;
     let sa = scroll.show_rows(ui, row_h, n, |ui, range| {
         shown_rows = Some(range.clone());
+        let mut group_rect: Option<Rect> = None;
         for vis in range {
             let Some(&entry_index) = pane.visible.get(vis) else {
                 break;
@@ -1412,21 +1422,35 @@ pub fn details(
             crate::testhook::note_entry_rect(ui, &entry.path, rect);
             let response = response.on_hover_cursor(egui::CursorIcon::Default);
             let painter = ui.painter_at(rect);
-            let drop_hover = if entry.kind != EntryKind::File {
-                handle_drop(&response, &entry.path, &mut out)
-            } else {
-                false
-            };
+            // A folder row drops into itself, a file inside an expanded folder into that
+            // folder, and a top-level file row into the pane's folder (the background).
+            let drop_target = crate::dnd::row_drop_target(
+                &entry.path,
+                entry.kind != EntryKind::File,
+                pane.depth_at(vis),
+            );
+            let drop_hover = drop_target
+                .as_ref()
+                .is_some_and(|target| handle_drop(&response, target, &mut out));
+            if drop_hover {
+                next_group = drop_target.filter(|target| pane.is_expanded(target));
+            }
+            let in_group = drop_group
+                .as_ref()
+                .is_some_and(|group| entry.path.starts_with(group));
+            if in_group {
+                group_rect = Some(group_rect.map_or(rect, |r: Rect| r.union(rect)));
+            }
             // Selected and hovered rows are rounded pills inset from the card edge.
             let pill = rect.shrink2(vec2(2.0, 1.0));
             if selected {
                 painter.rect_filled(pill, 6.0, ui.visuals().selection.bg_fill);
-            } else if response.hovered() || drop_hover {
+            } else if response.hovered() || drop_hover || in_group {
                 painter.rect_filled(pill, 6.0, theme::palette(ui.ctx()).hover);
             } else if vis % 2 == 1 {
                 painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color.gamma_multiply(0.5));
             }
-            if drop_hover {
+            if drop_hover && !in_group {
                 painter.rect_stroke(
                     pill,
                     6.0,
@@ -1700,7 +1724,16 @@ pub fn details(
             let network = forge_core::netpath::is_unc(&pane.path);
             response.context_menu(|menu| menu_items(menu, CONTEXT_FILE, network, &mut out));
         }
+        if let Some(group) = group_rect {
+            ui.painter().rect_stroke(
+                group.shrink2(vec2(2.0, 1.0)),
+                6.0,
+                Stroke::new(1.5, theme::accent(ui.ctx())),
+                egui::StrokeKind::Inside,
+            );
+        }
     });
+    ui.ctx().data_mut(|d| d.insert_temp(group_key, next_group));
     ui.spacing_mut().item_spacing = previous_spacing;
     // Folder sizes are measured for these rows first.
     if let Some(rows) = shown_rows {
