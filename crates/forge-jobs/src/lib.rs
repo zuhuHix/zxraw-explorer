@@ -118,6 +118,9 @@ pub struct Progress {
     pub items_total: AtomicU64,
     pub bytes_done: AtomicU64,
     pub bytes_total: AtomicU64,
+    /// Bytes written, for jobs whose output differs in size from their input (an archive
+    /// being compressed): the UI shows input → output and the ratio when this is non-zero.
+    pub bytes_out: AtomicU64,
     pub errors: AtomicU64,
     /// The job is inside one step it cannot interrupt (a folder going to the Recycle Bin
     /// in one move): Pause and Cancel take effect only once that step ends.
@@ -132,6 +135,7 @@ pub struct ProgressSnapshot {
     pub items_total: u64,
     pub bytes_done: u64,
     pub bytes_total: u64,
+    pub bytes_out: u64,
     pub errors: u64,
     pub current: String,
     /// What the job is doing when its counts say nothing yet ("Counting items"), shown instead
@@ -169,6 +173,9 @@ impl Progress {
     pub fn add_bytes(&self, n: u64) {
         self.bytes_done.fetch_add(n, Ordering::Relaxed);
     }
+    pub fn add_bytes_out(&self, n: u64) {
+        self.bytes_out.fetch_add(n, Ordering::Relaxed);
+    }
     pub fn add_total_items(&self, n: u64) {
         self.items_total.fetch_add(n, Ordering::Relaxed);
     }
@@ -184,6 +191,7 @@ impl Progress {
             items_total: self.items_total.load(Ordering::Relaxed),
             bytes_done: self.bytes_done.load(Ordering::Relaxed),
             bytes_total: self.bytes_total.load(Ordering::Relaxed),
+            bytes_out: self.bytes_out.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
             current: self.current.lock().clone(),
             note: self.note.lock().clone(),
