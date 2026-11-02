@@ -818,3 +818,88 @@ fn a_wrong_password_that_decodes_a_prefix_is_not_accepted() {
     }
     assert_eq!(list(&out).unwrap().entries.len(), l.entries.len());
 }
+
+// ---------------------------------------------------------------------------
+// Review round 2: the format comes from the content, not the extension
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renamed_archives_are_read_and_edited_as_what_they_are() {
+    let d = tempfile::tempdir().unwrap();
+    let src = sample_tree(d.path());
+    let extra = d.path().join("extra.txt");
+    fs::write(&extra, b"added later").unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    // (made as, renamed to, format it must stay)
+    let cases = [
+        (
+            "made.7z",
+            "looks-like.zip",
+            ArchiveFormat::SevenZip,
+            &b"7z\xBC\xAF\x27\x1C"[..],
+        ),
+        (
+            "made.zip",
+            "looks-like.7z",
+            ArchiveFormat::Zip,
+            &b"PK\x03\x04"[..],
+        ),
+    ];
+    for (made, renamed, format, magic) in cases {
+        let made = d.path().join(made);
+        create(
+            std::slice::from_ref(&src),
+            &made,
+            &CreateOptions::default(),
+            &ctx,
+        )
+        .unwrap();
+        let renamed = d.path().join(renamed);
+        fs::rename(&made, &renamed).unwrap();
+        let l = list(&renamed).unwrap();
+        assert_eq!(l.format, format, "{}", renamed.display());
+        assert!(index_cached(&renamed).is_ok());
+        let x = d.path().join(format!("x-{format:?}"));
+        let r = extract_all(&renamed, &x, None);
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert_eq!(tree_files(&x.join("src")), tree_files(&src));
+        let t = test_archive(&renamed, None, &ExtractLimits::default(), &ctx).unwrap();
+        assert!(t.is_ok(), "{t:?}");
+        // An edit keeps the real format under the same name.
+        let edit = ArchiveEdit {
+            add: vec![(extra.clone(), String::new())],
+            delete: vec!["src/a.txt".into()],
+        };
+        update(&renamed, &edit, &CreateOptions::default(), &ctx).unwrap();
+        assert!(fs::read(&renamed).unwrap().starts_with(magic), "{format:?}");
+        let l = list(&renamed).unwrap();
+        assert_eq!(l.format, format);
+        let names: Vec<&str> = l.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"extra.txt") && !names.contains(&"src/a.txt"),
+            "{names:?}"
+        );
+    }
+}
+
+#[test]
+fn a_zip_behind_a_stub_is_found_by_its_end_record() {
+    let d = tempfile::tempdir().unwrap();
+    let src = sample_tree(d.path());
+    let zip = d.path().join("a.zip");
+    let (c, p) = ctx_parts();
+    create(
+        std::slice::from_ref(&src),
+        &zip,
+        &CreateOptions::default(),
+        &JobCtx::new(&c, &p),
+    )
+    .unwrap();
+    // A self-extractor's stub in front, under a name that says nothing.
+    let mut bytes = b"MZ fake self-extractor stub".to_vec();
+    bytes.extend(fs::read(&zip).unwrap());
+    let sfx = d.path().join("setup.bin");
+    fs::write(&sfx, &bytes).unwrap();
+    assert_eq!(backend_for_file(&sfx).unwrap().format(), ArchiveFormat::Zip);
+}

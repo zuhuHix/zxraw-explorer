@@ -306,19 +306,28 @@ pub fn is_archive_name(path: &Path) -> bool {
     backend_for_name(path).is_some()
 }
 
-/// The backend for an archive file: by extension, else by its first bytes.
+/// The backend for an archive file, by what it holds: its signature (a 7z renamed `.zip`
+/// is still read as 7z, and edited as 7z), then a ZIP end record near its end (a zip behind
+/// a self-extractor stub), then its extension.
 pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
-    if let Some(b) = backend_for_name(path) {
+    let mut file = fs::File::open(path).map_err(|e| CoreError::io(path, e))?;
+    let mut head = [0u8; 16];
+    let mut n = 0;
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(CoreError::io(path, e)),
+        }
+    }
+    if let Some(b) = BACKENDS.iter().copied().find(|b| b.sniff(&head[..n])) {
         return Ok(b);
     }
-    let mut head = [0u8; 16];
-    let n = fs::File::open(path)
-        .and_then(|mut f| f.read(&mut head))
-        .map_err(|e| CoreError::io(path, e))?;
-    BACKENDS
-        .iter()
-        .copied()
-        .find(|b| b.sniff(&head[..n]))
+    if zip_backend::has_end_record(&mut file) {
+        return Ok(&zip_backend::ZIP);
+    }
+    backend_for_name(path)
         .ok_or_else(|| CoreError::Invalid(format!("{}: not a supported archive", path.display())))
 }
 
