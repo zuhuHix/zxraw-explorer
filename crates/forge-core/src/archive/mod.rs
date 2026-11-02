@@ -134,7 +134,10 @@ pub enum EntryEncryption {
 impl EntryEncryption {
     /// Whether a data error of an entry encrypted this way may be a wrong password.
     pub fn ambiguous_errors(self) -> bool {
-        matches!(self, EntryEncryption::ZipCrypto | EntryEncryption::SevenZipAes)
+        matches!(
+            self,
+            EntryEncryption::ZipCrypto | EntryEncryption::SevenZipAes
+        )
     }
 }
 
@@ -792,7 +795,9 @@ fn data_error(entry: &ArchiveEntry, e: CoreError) -> String {
         return e.to_string();
     }
     let text = e.to_string();
-    if entry.encryption.is_some_and(EntryEncryption::ambiguous_errors)
+    if entry
+        .encryption
+        .is_some_and(EntryEncryption::ambiguous_errors)
         && !matches!(e, CoreError::Io { .. })
     {
         // ZipCrypto's password check is one byte: a wrong password passes it 1 time in 256

@@ -17,9 +17,13 @@ pub(super) fn seven_zip() -> Option<PathBuf> {
 /// Run 7-Zip with `args` in `dir`; panics with its output when it fails.
 pub(super) fn run_7z(dir: &Path, args: &[&str]) -> String {
     let seven = seven_zip().expect("7-Zip");
-    let out = Command::new(seven).current_dir(dir).args(args).output().unwrap();
-    let text = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let out = Command::new(seven)
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "7z {args:?}: {text}");
     text
 }
@@ -29,7 +33,9 @@ pub(super) fn run_7z(dir: &Path, args: &[&str]) -> String {
 pub(super) fn sample_tree(root: &Path) -> PathBuf {
     let src = root.join("src");
     fs::create_dir_all(src.join("sub/empty")).unwrap();
-    let text: String = (0..4000).map(|i| format!("line {i} of some text\n")).collect();
+    let text: String = (0..4000)
+        .map(|i| format!("line {i} of some text\n"))
+        .collect();
     fs::write(src.join("a.txt"), &text).unwrap();
     fs::write(src.join("sub/b.log"), text.repeat(3)).unwrap();
     let exe: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -54,7 +60,11 @@ pub(super) fn tree_files(root: &Path) -> Vec<(String, Vec<u8>)> {
             if p.is_dir() {
                 stack.push(p);
             } else {
-                let rel = p.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 out.push((rel, fs::read(&p).unwrap()));
             }
         }
@@ -105,8 +115,8 @@ fn round_trip_matrix() {
                 .unwrap();
                 assert_eq!(rep.files, 6, "{preset:?}");
                 assert!(rep.bytes_out > 0 && rep.bytes_out < rep.bytes_in);
-                let listing = list_with_password(&out, password.map(Password::new).as_ref())
-                    .unwrap();
+                let listing =
+                    list_with_password(&out, password.map(Password::new).as_ref()).unwrap();
                 assert_eq!(listing.format, ArchiveFormat::SevenZip);
                 assert_eq!(listing.any_encrypted(), password.is_some());
                 if names {
@@ -120,7 +130,10 @@ fn round_trip_matrix() {
                 if let Some(seven) = seven_zip() {
                     let pw = format!("-p{}", password.unwrap_or(""));
                     let out_s = out.to_string_lossy().into_owned();
-                    let o = Command::new(seven).args(["t", &out_s, &pw]).output().unwrap();
+                    let o = Command::new(seven)
+                        .args(["t", &out_s, &pw])
+                        .output()
+                        .unwrap();
                     assert!(o.status.success(), "7-Zip test of {preset:?} solid={solid}");
                 }
             }
@@ -180,7 +193,10 @@ fn wrong_and_missing_passwords_are_told_apart_from_damage() {
             };
             let e = extract(&out, &x, &opts, None, &ctx).unwrap_err();
             if expect_wrong {
-                assert!(matches!(e, CoreError::WrongPassword(_)), "{pw:?} {names}: {e}");
+                assert!(
+                    matches!(e, CoreError::WrongPassword(_)),
+                    "{pw:?} {names}: {e}"
+                );
             } else {
                 assert!(matches!(e, CoreError::PasswordRequired(_)), "{names}: {e}");
             }
@@ -214,7 +230,8 @@ fn wrong_and_missing_passwords_are_told_apart_from_damage() {
     let t = test_archive(&out, None, &ExtractLimits::default(), &ctx).unwrap();
     assert!(!t.is_ok());
     assert!(
-        t.failures().all(|f| !f.error.as_deref().unwrap().contains("password")),
+        t.failures()
+            .all(|f| !f.error.as_deref().unwrap().contains("password")),
         "{t:?}"
     );
 }
@@ -232,7 +249,12 @@ fn reads_archives_made_by_7zip() {
         ("bzip2.7z", &["-m0=bzip2"]),
         ("deflate.7z", &["-m0=deflate"]),
         ("copy.7z", &["-m0=copy"]),
-        ("bcj2.7z", &["-m0=bcj2", "-m1=lzma", "-m2=lzma", "-m3=lzma", "-mb0:1", "-mb0s1:2", "-mb0s2:3"]),
+        (
+            "bcj2.7z",
+            &[
+                "-m0=bcj2", "-m1=lzma", "-m2=lzma", "-m3=lzma", "-mb0:1", "-mb0s1:2", "-mb0s2:3",
+            ],
+        ),
         ("arm64.7z", &["-m0=arm64", "-m1=lzma2"]),
         ("delta.7z", &["-m0=delta:4", "-m1=lzma2"]),
         ("aes.7z", &["-m0=lzma2", "-psecret"]),
@@ -259,7 +281,11 @@ fn selected_entries_of_a_solid_block_decode_it_once() {
     let src = d.path().join("many");
     fs::create_dir_all(&src).unwrap();
     for i in 0..40 {
-        fs::write(src.join(format!("f{i:02}.txt")), format!("{i} ").repeat(2000)).unwrap();
+        fs::write(
+            src.join(format!("f{i:02}.txt")),
+            format!("{i} ").repeat(2000),
+        )
+        .unwrap();
     }
     let out = d.path().join("m.7z");
     let (c, p) = ctx_parts();
@@ -296,7 +322,10 @@ fn selected_entries_of_a_solid_block_decode_it_once() {
     let sel = Selection::new("many/", vec!["many/f20.txt".into(), "many/f21.txt".into()]);
     let r = extract(&out, &x, &ExtractOptions::default(), Some(&sel), &ctx).unwrap();
     assert_eq!(r.extracted.len(), 2, "{r:?}");
-    assert_eq!(fs::read_to_string(x.join("f21.txt")).unwrap(), "21 ".repeat(2000));
+    assert_eq!(
+        fs::read_to_string(x.join("f21.txt")).unwrap(),
+        "21 ".repeat(2000)
+    );
 }
 
 static SEVEN_ZIP_FOR_TESTS: &dyn ArchiveBackend = &sevenz_backend::SEVEN_ZIP;
@@ -351,7 +380,10 @@ fn edit_keeps_untouched_blocks_and_recompresses_touched_ones() {
         let x = d.path().join(format!("ex{}", password.is_some()));
         let r = extract_all(&out, &x, password);
         assert!(r.failed.is_empty(), "{r:?}");
-        assert_eq!(fs::read(x.join("src/sub/extra.txt")).unwrap(), b"added later");
+        assert_eq!(
+            fs::read(x.join("src/sub/extra.txt")).unwrap(),
+            b"added later"
+        );
         assert_eq!(
             fs::read(x.join("src/sub/b.log")).unwrap(),
             fs::read(src.join("sub/b.log")).unwrap()
@@ -428,7 +460,10 @@ fn file_header(pack: u64, id: &[u8], props: &[u8], unpack: u64) -> Vec<u8> {
     h.push(0x00); // end of streams info
     h.push(0x05);
     h.extend(num(1));
-    let name: Vec<u8> = "f.txt\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    let name: Vec<u8> = "f.txt\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
     h.push(0x11);
     h.extend(num(name.len() as u64 + 1));
     h.push(0);
@@ -457,7 +492,10 @@ fn hand_built_plain_header_lists_and_extracts() {
     let p = write_raw(
         d.path(),
         "ok.7z",
-        &raw_7z(data, &file_header(data.len() as u64, &[0x00], &[], data.len() as u64)),
+        &raw_7z(
+            data,
+            &file_header(data.len() as u64, &[0x00], &[], data.len() as u64),
+        ),
     );
     let l = list(&p).unwrap();
     assert_eq!(l.entries.len(), 1);
@@ -475,25 +513,37 @@ fn header_bombs_are_refused_before_allocating() {
     let mut h = vec![0x01, 0x05];
     h.extend(num(1_000_000_000));
     h.extend([0x00, 0x00]);
-    assert_refused(&write_raw(d.path(), "files.7z", &raw_7z(&[], &h)), "entries");
+    assert_refused(
+        &write_raw(d.path(), "files.7z", &raw_7z(&[], &h)),
+        "entries",
+    );
     // 100 coders in one folder.
     let mut h = vec![0x01, 0x04, 0x07, 0x0B];
     h.extend(num(1));
     h.push(0);
     h.extend(num(100));
     h.extend([0x00; 64]);
-    assert_refused(&write_raw(d.path(), "coders.7z", &raw_7z(&[], &h)), "coders");
+    assert_refused(
+        &write_raw(d.path(), "coders.7z", &raw_7z(&[], &h)),
+        "coders",
+    );
     // A billion folders.
     let mut h = vec![0x01, 0x04, 0x07, 0x0B];
     h.extend(num(1_000_000_000));
     h.extend([0x00; 16]);
-    assert_refused(&write_raw(d.path(), "folders.7z", &raw_7z(&[], &h)), "folders");
+    assert_refused(
+        &write_raw(d.path(), "folders.7z", &raw_7z(&[], &h)),
+        "folders",
+    );
     // A next header bigger than the file, and one bigger than allowed.
     let mut bytes = raw_7z(&[], &[0x01, 0x00]);
     bytes[20..28].copy_from_slice(&(1u64 << 40).to_le_bytes());
     let start_crc = crc32fast::hash(&bytes[12..32]);
     bytes[8..12].copy_from_slice(&start_crc.to_le_bytes());
-    assert_refused(&write_raw(d.path(), "past.7z", &bytes), "larger than allowed");
+    assert_refused(
+        &write_raw(d.path(), "past.7z", &bytes),
+        "larger than allowed",
+    );
     let mut bytes = raw_7z(&[], &[0x01, 0x00]);
     bytes[20..28].copy_from_slice(&(1u64 << 20).to_le_bytes());
     let start_crc = crc32fast::hash(&bytes[12..32]);
@@ -507,7 +557,12 @@ fn encoded_header_bombs_are_refused_before_decoding() {
     let packed = [0u8; 32];
     // LZMA with a 4 GiB dictionary.
     let mut h = vec![0x17];
-    h.extend(one_folder(32, &[0x03, 0x01, 0x01], &[0x5D, 0xFF, 0xFF, 0xFF, 0xFF], 100));
+    h.extend(one_folder(
+        32,
+        &[0x03, 0x01, 0x01],
+        &[0x5D, 0xFF, 0xFF, 0xFF, 0xFF],
+        100,
+    ));
     h.push(0x00);
     assert_refused(
         &write_raw(d.path(), "dict.7z", &raw_7z(&packed, &h)),
@@ -515,7 +570,12 @@ fn encoded_header_bombs_are_refused_before_decoding() {
     );
     // A header that would expand to a terabyte.
     let mut h = vec![0x17];
-    h.extend(one_folder(32, &[0x03, 0x01, 0x01], &[0x5D, 0, 0, 1, 0], 1 << 40));
+    h.extend(one_folder(
+        32,
+        &[0x03, 0x01, 0x01],
+        &[0x5D, 0, 0, 1, 0],
+        1 << 40,
+    ));
     h.push(0x00);
     assert_refused(
         &write_raw(d.path(), "huge.7z", &raw_7z(&packed, &h)),
@@ -553,7 +613,14 @@ fn data_block_with_a_huge_dictionary_is_refused_before_writing() {
     let x = d.path().join("x");
     fs::create_dir_all(&x).unwrap();
     let (c, pr) = ctx_parts();
-    let e = extract(&p, &x, &ExtractOptions::default(), None, &JobCtx::new(&c, &pr)).unwrap_err();
+    let e = extract(
+        &p,
+        &x,
+        &ExtractOptions::default(),
+        None,
+        &JobCtx::new(&c, &pr),
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("decoder memory"), "{e}");
     assert_eq!(fs::read_dir(&x).unwrap().count(), 0);
     // PPMd asking for 4 GiB of model memory, the same.
@@ -565,7 +632,14 @@ fn data_block_with_a_huge_dictionary_is_refused_before_writing() {
             &file_header(16, &[0x03, 0x04, 0x01], &[6, 0xFF, 0xFF, 0xFF, 0xFF], 1000),
         ),
     );
-    let e = extract(&p, &x, &ExtractOptions::default(), None, &JobCtx::new(&c, &pr)).unwrap_err();
+    let e = extract(
+        &p,
+        &x,
+        &ExtractOptions::default(),
+        None,
+        &JobCtx::new(&c, &pr),
+    )
+    .unwrap_err();
     assert!(e.to_string().contains("decoder memory"), "{e}");
 }
 
