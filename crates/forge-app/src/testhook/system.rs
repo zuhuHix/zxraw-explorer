@@ -26,6 +26,14 @@
 //!   `Copying N item(s) to <folder>`, so match on the item count, e.g. `2 item(s), 1 item(s)`.
 //!
 //! Clipboard (the real Windows clipboard, shared with the rest of the session):
+//! - `shell-paste <folder>`: paste the archive items this app put on the clipboard into a
+//!   sandboxed folder as Explorer's Paste does (the folder's own shell drop target, the
+//!   preferred effect; the app's data object itself, see `shell_paste_into`). Returns at once: the
+//!   shell copies on its threads while the script keeps running, so wait for the files.
+//! - `touch <path>`: set a sandboxed file's modified time one hour ahead (an archive changed
+//!   after it was copied, for instance).
+//! - `wait-toast <text>`: wait (30 s) until a toast, error or not, containing `<text>` was
+//!   raised. Checks what was raised since the start, like `assert-toast`.
 //! - `clipboard-files cut|copy <path>, <path>, …`: put the files on the clipboard as another
 //!   app (Explorer) does: `CF_HDROP` and the preferred drop effect, no text. Waits first for
 //!   the app's own copy or cut to finish publishing, so it does not overwrite this.
@@ -44,7 +52,7 @@
 
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::{Flow, StepState};
 use crate::app::ZxrawApp;
@@ -103,6 +111,50 @@ pub(super) fn step(
                 Ok(Flow::Done)
             } else {
                 Err(format!("queue is {titles:?}, expected {expected:?}"))
+            }
+        }
+        "shell-paste" => {
+            let folder = super::sandboxed(Path::new(args.trim()))?;
+            let data = app
+                .ops
+                .archive
+                .out
+                .clipboard_object()
+                .ok_or("the clipboard holds no archive items of this app")?;
+            data.shell_paste_into(&folder).map_err(|e| {
+                format!(
+                    "could not paste the clipboard into {}: {e}",
+                    folder.display()
+                )
+            })?;
+            Ok(Flow::Done)
+        }
+        "touch" => {
+            let path = super::sandboxed(Path::new(args.trim()))?;
+            let later = SystemTime::now() + Duration::from_secs(3600);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(later))
+                .map_err(|e| format!("could not change {}: {e}", path.display()))?;
+            Ok(Flow::Done)
+        }
+        "wait-toast" => {
+            let text = args.trim();
+            if text.is_empty() {
+                return Err("expected the text of a toast".into());
+            }
+            if app
+                .testhook
+                .toast_log
+                .iter()
+                .any(|(shown, _)| shown.contains(text))
+            {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= WAIT_LIMIT {
+                Err(format!("no toast containing `{text}` within 30 s"))
+            } else {
+                Ok(Flow::Wait(format!("waiting for a toast `{text}`")))
             }
         }
         "clipboard-files" => {

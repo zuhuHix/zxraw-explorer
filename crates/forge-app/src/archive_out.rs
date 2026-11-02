@@ -88,6 +88,14 @@ impl OutState {
             .is_some_and(|(_, data)| data.is_on_clipboard())
     }
 
+    /// The archive items this app put on the clipboard, while they are still there.
+    pub fn clipboard_object(&self) -> Option<&VirtualDataObject> {
+        self.clipboard
+            .as_ref()
+            .map(|(_, data)| data)
+            .filter(|data| data.is_on_clipboard())
+    }
+
     /// For extraction jobs: report an in-app move that extracted everything.
     pub fn sender(&self) -> OutSender {
         OutSender(self.tx.clone())

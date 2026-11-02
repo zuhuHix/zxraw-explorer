@@ -19,6 +19,9 @@
 //! - `click-arrow <name>`: real pointer click on a folder's disclosure arrow (details view).
 //!   Waits until the arrow is on screen.
 //! - `assert-no-dialog`: no dialog (prompt, confirmation, report) is open.
+//! - `wait-dialog <title> [| seconds]`: waits (30 s default, 300 s maximum) until a
+//!   confirmation with exactly this title, or a report whose title contains it, is open
+//!   (e.g. `Finish the move`). Fails on timeout.
 //! - `assert-prompt-error <text>`: a name prompt is open and its error contains `<text>`.
 //! - `hold-name-lane <path> | <ms>`: keep the rename/new-item lane of `<path>` busy for
 //!   `<ms>` milliseconds, as a rename stuck on an unresponsive share would.
@@ -406,6 +409,28 @@ pub(super) fn step(
                     _ => "a dialog".to_string(),
                 };
                 Err(format!("{what} is open"))
+            }
+        }
+        "wait-dialog" => {
+            let (title, secs) = match args.split_once('|') {
+                Some((t, s)) => (t.trim(), s.trim()),
+                None => (args.trim(), ""),
+            };
+            if title.is_empty() {
+                return Err("expected `<dialog title> [| seconds]`".into());
+            }
+            let limit = timeout(secs)?;
+            let started = *st.started.get_or_insert_with(Instant::now);
+            match &app.ops.modal {
+                Some(crate::modal::Modal::Confirm(c)) if c.title == title => Ok(Flow::Done),
+                Some(crate::modal::Modal::Report { title: shown, .. }) if shown.contains(title) => {
+                    Ok(Flow::Done)
+                }
+                _ if started.elapsed() >= limit => Err(format!(
+                    "no confirmation titled `{title}` (or report containing it) opened within {} s",
+                    limit.as_secs()
+                )),
+                _ => Ok(Flow::Wait(format!("waiting for `{title}`"))),
             }
         }
         "hold-name-lane" => {

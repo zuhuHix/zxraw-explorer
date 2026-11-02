@@ -101,7 +101,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   pass it. A file whose only checksum is its solid 7z block's is handed over only once the
   whole block was decoded and matched. Encrypted files without any checksum, under a
   password nothing could prove, are refused there (extract them in ZXraw to choose "Extract
-  them anyway").
+  them anyway"). If the archive file changed since its pane listed it, every file is refused
+  (the pane's listing no longer describes it): open it again and copy again.
 * Archive items on the clipboard can't be pasted after ZXraw closes: their data comes from the
   running app, so the clipboard is emptied on exit rather than flushed.
 * A move out of an archive (Ctrl+X, Shift-drag, F6) removes the items only when the target
