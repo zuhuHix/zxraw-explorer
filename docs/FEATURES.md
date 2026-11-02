@@ -561,10 +561,25 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 
 ## Archives and extra tools
 
-* ✅ ZIP create, list, and extract (engine) — `forge-core/src/archive.rs`: `create_list_extract_roundtrip`,
+* ✅ ZIP create, list, and extract (engine) — `forge-core/src/archive/tests.rs`: `create_list_extract_roundtrip`,
   `listing_stops_at_the_entry_cap`, `zip_slip_is_rejected_before_writing`, `zip_bomb_limits`,
   `symlink_entries_skipped`.
-* ✅ Extract selected ZIP entries only — `archive.rs::selected_extraction_writes_only_requested_entries_and_checks_all_names`.
+* ✅ Extract selected ZIP entries only — `archive/tests.rs::selected_extraction_writes_only_requested_entries_and_checks_all_names`.
+* ✅ ZIP codecs: write Stored, Deflate (zlib-rs; Zopfli for Max), Zstandard, bzip2 and XZ, read
+  them back, presets and auto-stored precompressed files, bounded parallel compression —
+  `archive/tests_codecs.rs`. Deflate64, LZMA and PPMd are read by the `zip` crate; no fixture
+  covers them here.
+* ✅ Encrypted ZIPs: AES-256 (AE-2) and legacy ZipCrypto, missing and wrong passwords told apart
+  from damaged data, passwords redacted in logs — `archive/tests_codecs.rs`.
+* ✅ Integrity test (per-entry CRC report), opening one entry into a temp folder —
+  `archive/tests_codecs.rs`.
+* ✅ Hostile archives: overlapping entries, ratio/size/count/decoder-memory limits, lying sizes,
+  local/central header mismatches, CP437 and Unicode-path names, malicious names, case collisions,
+  links, planted junctions, Mark-of-the-Web propagation — `archive/tests_hostile.rs`,
+  `archive/safety.rs`.
+* ✅ Smart extraction (no double nesting), extract to `<name>\`, cancel cleanup, and editing
+  (add, replace, delete; unchanged entries raw-copied; a cancelled or failed update leaves the
+  original byte-identical) — `archive/tests_edit.rs`.
 * ✅ Contact sheets: pagination, bounded layout, and captions with system fonts —
   `forge-app/src/extra_tools_ui.rs` (`contact_sheet_pagination_uses_rows_times_columns`,
   `contact_sheet_page_loader_holds_at_most_one_page_of_thumbnails`,
@@ -665,7 +680,7 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `ops_ui::cloud_warning_tests`. Real placeholders cannot be created in tests, so they are
   simulated; the badge has not been checked against a live OneDrive folder.
 * ✅ Copies stage to a temporary name and are cleaned up on cancel — `ops.rs::cancel_mid_copy_leaves_no_partial_files`.
-* ✅ ZIP extraction rejects unsafe paths before writing — `archive.rs::zip_slip_is_rejected_before_writing`.
+* ✅ ZIP extraction rejects unsafe paths before writing — `archive/tests.rs::zip_slip_is_rejected_before_writing`.
 * ✅ SQLite migrations, WAL and integrity, and corrupt-database recovery — `forge-db/src/lib.rs`
   (`migrations_are_idempotent`, `corrupt_file_is_moved_aside_and_recreated`,
   `damaged_header_of_real_database_is_recovered`) and `forge-db/tests/indexer.rs`.
