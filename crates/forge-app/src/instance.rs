@@ -10,29 +10,37 @@
 //! * `--new-window`, the setting "Open folders and files in a new tab of the running window"
 //!   turned off, automated runs, and the installer switches (handled before this) always
 //!   open their own window.
+//! * A menu command (`--extract-here <archives>` and the others in `shell_actions`, or the
+//!   Explorer menu's COM activation, which `main` turns into the same [`Launch`]) runs in
+//!   the running window, exactly once, with the whole selection; on a cold start it runs in
+//!   the new window.
 //! * Installed, development and test builds use different pipes (see [`tag`]), so a
 //!   development run never hands its paths to the installed copy or takes the installed
 //!   copy's launches.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use forge_win::single_instance::{self as si, Inbox, Startup};
+use forge_win::MenuVerb;
+use forge_win::single_instance::{self as si, Handoff, Inbox, Startup};
 
 /// Forces a separate window; removed from the arguments before they are read as paths.
 pub const NEW_WINDOW: &str = "--new-window";
 
 /// The command line, without the program name and without [`NEW_WINDOW`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Launch {
     pub paths: Vec<OsString>,
     pub new_window: bool,
+    /// A menu command to run on the paths (`--extract-here` …, the first argument).
+    pub action: Option<MenuVerb>,
 }
 
 impl Launch {
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Self {
         let mut new_window = false;
-        let paths = args
+        let mut paths: Vec<OsString> = args
             .into_iter()
             .filter(|a| {
                 let switch = a == NEW_WINDOW;
@@ -40,7 +48,15 @@ impl Launch {
                 !switch
             })
             .collect();
-        Self { paths, new_window }
+        let action = paths.first().and_then(|a| crate::shell_actions::verb_of_switch(a));
+        if action.is_some() {
+            paths.remove(0);
+        }
+        Self {
+            paths,
+            new_window,
+            action,
+        }
     }
 
     pub fn from_env() -> Self {
@@ -48,9 +64,43 @@ impl Launch {
     }
 }
 
-/// The path a cold start opens: the first one on the command line.
-pub fn launch_path() -> Option<OsString> {
-    Launch::from_env().paths.into_iter().next()
+/// This process's launch, set once by `main` (from the command line, or from what the
+/// Explorer menu dropped on its COM server).
+static STARTUP: OnceLock<Launch> = OnceLock::new();
+
+pub fn set_startup_launch(launch: Launch) {
+    let _ = STARTUP.set(launch);
+}
+
+/// This process's launch ([`set_startup_launch`], else the command line).
+pub fn startup_launch() -> Launch {
+    STARTUP.get().cloned().unwrap_or_else(Launch::from_env)
+}
+
+/// Menu commands this window runs on its next frame: a cold start's own command waits
+/// here until the window is up (a folder picker before the first frame would block it).
+static QUEUED: Mutex<Vec<(MenuVerb, Vec<PathBuf>)>> = Mutex::new(Vec::new());
+
+/// What a cold start does with its own launch: queues a menu command for the first frame,
+/// or opens the first path at once.
+pub fn open_startup_launch(app: &mut crate::app::ZxrawApp, ctx: &egui::Context) {
+    let launch = startup_launch();
+    match launch.action {
+        Some(verb) => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let paths = launch.paths.iter().map(|p| cwd.join(p)).collect();
+            QUEUED
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((verb, paths));
+            ctx.request_repaint();
+        }
+        None => {
+            if let Some(arg) = launch.paths.first() {
+                app.open_launch_path(ctx, arg);
+            }
+        }
+    }
 }
 
 /// What `main` does after [`startup`].
@@ -118,7 +168,9 @@ pub fn startup(launch: &Launch, settings: &crate::settings::Settings) -> Decisio
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     let paths: Vec<PathBuf> = launch.paths.iter().map(PathBuf::from).collect();
-    let request = match si::encode_request(&cwd, &paths) {
+    // A command without items has nothing to run: it only brings the window forward.
+    let action = launch.action.filter(|_| !paths.is_empty()).map(MenuVerb::name);
+    let request = match si::encode_action_request(&cwd, &paths, action) {
         Ok(request) => request,
         Err(e) => {
             tracing::warn!("this launch cannot be handed to a running window ({e})");
@@ -160,14 +212,25 @@ pub fn attach(cc: &eframe::CreationContext<'_>, inbox: &Inbox, hidden: bool) {
     }
 }
 
-/// Opens the launches other processes handed over since the last frame.
+/// Runs this window's queued menu commands and opens or runs the launches other processes
+/// handed over since the last frame.
 pub fn tick(app: &mut crate::app::ZxrawApp, ctx: &egui::Context) {
+    let queued = std::mem::take(&mut *QUEUED.lock().unwrap_or_else(|p| p.into_inner()));
+    for (verb, paths) in queued {
+        crate::shell_actions::run(app, ctx, verb, paths);
+    }
     let Some(inbox) = app.instance.clone() else {
         return;
     };
-    for paths in inbox.take() {
-        for path in paths {
-            app.open_launch_path(ctx, path.as_os_str());
+    for Handoff { action, paths } in inbox.take_handoffs() {
+        match action.as_deref().map(MenuVerb::from_name) {
+            None => {
+                for path in paths {
+                    app.open_launch_path(ctx, path.as_os_str());
+                }
+            }
+            Some(Some(verb)) => crate::shell_actions::run(app, ctx, verb, paths),
+            Some(None) => tracing::warn!("ignored an unknown action {action:?}"),
         }
     }
 }
@@ -191,7 +254,26 @@ mod tests {
         let launch = Launch::parse([r"C:\Photos".into(), "x".into()]);
         assert!(!launch.new_window);
         assert_eq!(launch.paths.len(), 2);
+        assert_eq!(launch.action, None);
     }
+
+    #[test]
+    fn a_leading_menu_switch_is_the_action_and_the_rest_are_its_items() {
+        let launch = Launch::parse([
+            "--add-zip".into(),
+            r"C:\a.jpg".into(),
+            "--new-window".into(),
+            r"C:\b".into(),
+        ]);
+        assert_eq!(launch.action, Some(MenuVerb::AddZip));
+        assert!(launch.new_window);
+        assert_eq!(launch.paths, [OsString::from(r"C:\a.jpg"), OsString::from(r"C:\b")]);
+        // Only the first argument names an action: a later one is a (strange) path.
+        let launch = Launch::parse([r"C:\a.zip".into(), "--extract-here".into()]);
+        assert_eq!(launch.action, None);
+        assert_eq!(launch.paths.len(), 2);
+    }
+
 
     #[test]
     fn automated_runs_take_part_only_with_their_own_name() {

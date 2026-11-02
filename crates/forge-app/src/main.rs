@@ -53,6 +53,7 @@ mod tags_ui;
 mod watermark;
 mod terminal;
 mod settings;
+mod shell_actions;
 mod shell_sync;
 mod settings_ui;
 mod sidebar;
@@ -99,8 +100,51 @@ fn run_switch(argument: &std::ffi::OsStr) -> Option<anyhow::Result<&'static str>
         "--unregister-file-types" => forge_win::unregister_file_types()
             .map_err(Into::into)
             .map(|()| "Photo file types removed."),
+        "--register-archive-types" => exe()
+            .and_then(|exe| {
+                forge_win::register_archive_types(exe, &default_app::archive_file_types())
+                    .map_err(Into::into)
+            })
+            .map(|()| "Archive file types registered; confirm the default in Settings > Default apps."),
+        "--unregister-archive-types" => forge_win::unregister_archive_types()
+            .map_err(Into::into)
+            .map(|()| "Archive file types removed."),
+        "--register-archive-menu" => exe()
+            .and_then(|exe| {
+                forge_win::register_archive_menu(exe, &default_app::archive_extensions())
+                    .map_err(Into::into)
+            })
+            .map(|()| "ZXraw menu added to Explorer's right-click menu."),
+        "--unregister-archive-menu" => forge_win::unregister_archive_menu()
+            .map_err(Into::into)
+            .map(|()| "ZXraw menu removed from Explorer's right-click menu."),
         _ => return None,
     })
+}
+
+/// How long a process started by the Explorer menu waits for Explorer to drop the selection.
+const MENU_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The launch this process handles: the command line, or for a process COM started for the
+/// Explorer menu (`--shell-verb <name> -Embedding`), the menu command on the items Explorer
+/// dropped on it. `None`: the menu started it but nothing came, so there is nothing to do.
+fn read_launch() -> Option<instance::Launch> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let Some(verb) = forge_win::shell_verb_server::verb_of_activation(&args) else {
+        return Some(instance::Launch::from_env());
+    };
+    match forge_win::shell_verb_server::serve_drop(verb, MENU_DROP_WAIT) {
+        Ok(paths) if !paths.is_empty() => Some(instance::Launch {
+            paths: paths.into_iter().map(Into::into).collect(),
+            new_window: false,
+            action: Some(verb),
+        }),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::warn!("the Explorer menu command {} failed: {error}", verb.name());
+            None
+        }
+    }
 }
 
 fn main() -> eframe::Result {
@@ -133,9 +177,14 @@ fn main() -> eframe::Result {
     // Read early: it decides whether this launch goes to a running window, and the window
     // opens with the chosen icon instead of switching after.
     let startup = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"));
+    let Some(launch) = read_launch() else {
+        drop(log_guard);
+        return Ok(());
+    };
+    instance::set_startup_launch(launch.clone());
     // A launch while ZXraw Explorer is running opens in that window (see `instance`). Before
     // anything else touches the registry or the profile, so a handed-over launch is quick.
-    let (inbox, _instance_server) = match instance::startup(&instance::Launch::from_env(), &startup) {
+    let (inbox, _instance_server) = match instance::startup(&launch, &startup) {
         instance::Decision::Exit(code) => {
             drop(log_guard);
             if code == 0 {
@@ -167,6 +216,8 @@ fn main() -> eframe::Result {
             }
         }
         default_app::refresh_registration();
+        default_app::refresh_archive_registration();
+
         match std::env::current_exe() {
             Ok(current_exe) => match forge_win::refresh_default_folder_handler(&current_exe) {
                 Ok(true) => tracing::info!("refreshed the default-folder command path"),

@@ -333,9 +333,7 @@ impl ZxrawApp {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
             crate::app_icon::apply_to_shortcuts(*app.settings.app_icon);
         }
-        if let Some(arg) = crate::instance::launch_path() {
-            app.open_launch_path(&cc.egui_ctx, &arg);
-        }
+        crate::instance::open_startup_launch(&mut app, &cc.egui_ctx);
         app
     }
 
@@ -364,7 +362,10 @@ impl ZxrawApp {
         } else {
             p.is_file()
         };
+        // An archive (a double-click on a .zip, "Open in ZXraw") opens as a folder.
+        let is_file = is_file && !forge_core::archive::is_archive_name(&p);
         let folder = if is_file { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
+
         if let Some(folder) = folder.filter(|folder| network || folder.exists()) {
             // Reuse a restored tab already showing this folder instead of piling up tabs.
             let existing = self

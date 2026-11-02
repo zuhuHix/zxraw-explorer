@@ -2,6 +2,11 @@
 //! first-run welcome and Settings > Default app. After the user's explicit click, the Windows
 //! integration registers photo types and writes per-user `UserChoice` values, then applies the
 //! reversible `Directory` and `Drive` shell verbs when selected.
+//!
+//! Settings > Default app also has the archive integration: the archive types (offered in
+//! "Open with" and on ZXraw Explorer's Windows Settings page, where the user confirms the
+//! default: archive `UserChoice` values are never written), and the "ZXraw" menu in
+//! Explorer's right-click menu (`forge_win::archive_menu`). Each applies when toggled.
 
 use std::time::{Duration, Instant};
 
@@ -31,6 +36,49 @@ pub fn file_types() -> Vec<forge_win::FileType> {
         .collect()
 }
 
+/// Archive extensions ZXraw Explorer registers for, without the dot. `.tar.gz` and the other
+/// compressed tars are covered by their last extension (`.gz` …).
+pub const ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "rar", "tar", "tgz", "tbz2", "tbz", "txz", "tzst", "tlz4", "gz", "bz2", "xz",
+    "zst", "lz4", "br",
+];
+
+pub fn archive_extensions() -> Vec<&'static str> {
+    ARCHIVE_EXTENSIONS.to_vec()
+}
+
+/// The archive types offered, each with its Explorer type name.
+pub fn archive_file_types() -> Vec<forge_win::FileType> {
+    ARCHIVE_EXTENSIONS
+        .iter()
+        .map(|&extension| forge_win::FileType {
+            extension: extension.to_string(),
+            description: describe_archive(extension).to_string(),
+        })
+        .collect()
+}
+
+fn describe_archive(extension: &str) -> &'static str {
+    match extension {
+        "zip" => "ZIP archive",
+        "7z" => "7z archive",
+        "rar" => "RAR archive",
+        "tar" => "Tar archive",
+        "tgz" => "Gzip-compressed tar archive",
+        "tbz2" | "tbz" => "Bzip2-compressed tar archive",
+        "txz" => "XZ-compressed tar archive",
+        "tzst" => "Zstandard-compressed tar archive",
+        "tlz4" => "LZ4-compressed tar archive",
+        "gz" => "Gzip-compressed file",
+        "bz2" => "Bzip2-compressed file",
+        "xz" => "XZ-compressed file",
+        "zst" => "Zstandard-compressed file",
+        "lz4" => "LZ4-compressed file",
+        "br" => "Brotli-compressed file",
+        _ => "Archive",
+    }
+}
+
 fn describe(extension: &str) -> String {
     match extension {
         "jpg" | "jpeg" | "jpe" | "jfif" => "JPEG image".into(),
@@ -52,27 +100,43 @@ pub struct Status {
     pub folders: bool,
     /// `(extension, app name)`, and whether that app is ZXraw Explorer.
     pub types: Vec<(String, Option<String>, bool)>,
+    /// ZXraw Explorer is registered for the archive types.
+    pub archives_registered: bool,
+    /// As `types`, for the archive types.
+    pub archive_types: Vec<(String, Option<String>, bool)>,
+    /// The ZXraw menu is in Explorer's right-click menu.
+    pub archive_menu: bool,
+}
+
+fn handlers(types: Vec<forge_win::FileType>) -> Vec<(String, Option<String>, bool)> {
+    types
+        .into_iter()
+        .map(|file_type| {
+            let app = forge_win::default_app(&file_type.extension);
+            let ours = app.as_ref().is_some_and(|app| app.is_zxraw);
+            (file_type.extension, app.map(|app| app.name), ours)
+        })
+        .collect()
 }
 
 impl Status {
     fn check() -> Self {
-        let types = file_types()
-            .into_iter()
-            .map(|file_type| {
-                let app = forge_win::default_app(&file_type.extension);
-                let ours = app.as_ref().is_some_and(|app| app.is_zxraw);
-                (file_type.extension, app.map(|app| app.name), ours)
-            })
-            .collect();
         Self {
             registered: forge_win::file_types_registered().unwrap_or(false),
             folders: forge_win::default_folder_handler_enabled().unwrap_or(false),
-            types,
+            types: handlers(file_types()),
+            archives_registered: forge_win::archive_types_registered().unwrap_or(false),
+            archive_types: handlers(archive_file_types()),
+            archive_menu: forge_win::archive_menu_registered().unwrap_or(false),
         }
     }
 
     pub fn ours(&self) -> usize {
         self.types.iter().filter(|(_, _, ours)| *ours).count()
+    }
+
+    pub fn archives_ours(&self) -> usize {
+        self.archive_types.iter().filter(|(_, _, ours)| *ours).count()
     }
 }
 
@@ -133,6 +197,12 @@ pub enum Action {
     Apply { photos: bool, folders: bool },
     OpenWindowsSettings,
     RestorePreviousApps,
+    /// Register (true) or remove the archive types.
+    ArchiveTypes(bool),
+    /// Register the archive types if needed and open Windows Settings to confirm them.
+    ArchiveDefaults,
+    /// Add (true) or remove the ZXraw menu in Explorer's right-click menu.
+    ArchiveMenu(bool),
 }
 
 /// Status line plus buttons. `compact` (the welcome) leaves out the per-type list and
@@ -205,15 +275,71 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
         return;
     }
     ui.add_space(6.0);
-    egui::CollapsingHeader::new(format!("Photo types ({total})"))
-        .id_salt("default-app-types")
+    type_list(ui, "Photo types", "default-app-types", &status.types);
+    archive_controls(ui, status, action);
+}
+
+/// The archive part of Settings > Default app.
+fn archive_controls(ui: &mut egui::Ui, status: &Status, action: &mut Option<Action>) {
+    ui.add_space(14.0);
+    ui.label(RichText::new("Archives").strong());
+    let mut offered = status.archives_registered;
+    if ui
+        .checkbox(
+            &mut offered,
+            "Offer ZXraw Explorer for archives (.zip, .7z, .rar, .tar, .gz and more)",
+        )
+        .on_hover_text(
+            "Adds ZXraw Explorer to \"Open with\" and to its page in Windows Settings > Default apps. An archive opened with it opens as a folder in a tab of the running window.",
+        )
+        .changed()
+    {
+        *action = Some(Action::ArchiveTypes(offered));
+    }
+    let total = status.archive_types.len();
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "Archives: {}/{} types open in ZXraw Explorer",
+            status.archives_ours(),
+            total
+        ));
+        if ui
+            .button("Make ZXraw Explorer the default for archives…")
+            .on_hover_text(
+                "Windows asks you to confirm archive defaults yourself: on the ZXraw Explorer page that opens in Settings, choose it for each archive type.",
+            )
+            .clicked()
+        {
+            *action = Some(Action::ArchiveDefaults);
+        }
+    });
+    let mut menu = status.archive_menu;
+    if ui
+        .checkbox(
+            &mut menu,
+            "Show the ZXraw menu when right-clicking archives, files and folders",
+        )
+        .on_hover_text(
+            "Open in ZXraw, Extract here, Extract to…, Add to archive…, Add to .zip or .7z. On Windows 11 it is under \"Show more options\".",
+        )
+        .changed()
+    {
+        *action = Some(Action::ArchiveMenu(menu));
+    }
+    ui.add_space(6.0);
+    type_list(ui, "Archive types", "default-app-archive-types", &status.archive_types);
+}
+
+fn type_list(ui: &mut egui::Ui, title: &str, id: &str, types: &[(String, Option<String>, bool)]) {
+    egui::CollapsingHeader::new(format!("{title} ({})", types.len()))
+        .id_salt(id)
         .show(ui, |ui| {
-            egui::Grid::new("default-app-type-grid")
+            egui::Grid::new(format!("{id}-grid"))
                 .num_columns(2)
                 .spacing([16.0, 2.0])
                 .striped(true)
                 .show(ui, |ui| {
-                    for (extension, app, ours) in &status.types {
+                    for (extension, app, ours) in types {
                         ui.label(RichText::new(format!(".{extension}")).monospace());
                         let app = app.as_deref().unwrap_or("No app");
                         if *ours {
@@ -237,6 +363,9 @@ pub fn run(app: &mut ZxrawApp, action: Action) {
         Action::Apply { photos, folders } => apply_selected(app, photos, folders),
         Action::OpenWindowsSettings => open_windows_settings(app),
         Action::RestorePreviousApps => restore_previous_apps(app),
+        Action::ArchiveTypes(on) => set_archive_types(app, on),
+        Action::ArchiveDefaults => archive_defaults(app),
+        Action::ArchiveMenu(on) => set_archive_menu(app, on),
     }
     app.ops.settings_ui.default_app.invalidate();
 }
@@ -369,6 +498,84 @@ fn open_windows_settings(app: &mut ZxrawApp) {
         )),
     }
 }
+fn register_archives() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    forge_win::register_archive_types(exe, &archive_file_types()).map_err(|error| error.to_string())
+}
+
+fn set_archive_types(app: &mut ZxrawApp, on: bool) {
+    let result = if on {
+        register_archives()
+    } else {
+        forge_win::unregister_archive_types().map_err(|error| error.to_string())
+    };
+    match result {
+        Ok(()) if on => app.toast("ZXraw Explorer is offered for archives in \"Open with\" and in Settings"),
+        Ok(()) => app.toast("Archive types removed; their previous apps are back"),
+        Err(error) => {
+            tracing::warn!("archive type registration failed: {error}");
+            app.toast_err(brief_error(&[format!("Could not change the archive types: {error}")]));
+        }
+    }
+}
+
+fn archive_defaults(app: &mut ZxrawApp) {
+    if let Err(error) = register_archives() {
+        tracing::warn!("archive type registration failed: {error}");
+        app.toast_err(brief_error(&[format!("Could not register the archive types: {error}")]));
+        return;
+    }
+    match forge_win::open_default_apps_settings() {
+        Ok(()) => app.toast("In Windows Settings, choose ZXraw Explorer for .zip, .7z and the other archive types"),
+        Err(error) => app.toast_err(format!(
+            "Could not open Windows Settings ({error}). Open Settings > Apps > Default apps > ZXraw Explorer."
+        )),
+    }
+}
+
+fn set_archive_menu(app: &mut ZxrawApp, on: bool) {
+    let result = if on {
+        std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| {
+                forge_win::register_archive_menu(exe, ARCHIVE_EXTENSIONS)
+                    .map_err(|error| error.to_string())
+            })
+    } else {
+        forge_win::unregister_archive_menu().map_err(|error| error.to_string())
+    };
+    match result {
+        Ok(()) if on => app.toast("ZXraw menu added to Explorer's right-click menu"),
+        Ok(()) => app.toast("ZXraw menu removed from Explorer's right-click menu"),
+        Err(error) => {
+            tracing::warn!("archive menu registration failed: {error}");
+            app.toast_err(brief_error(&[format!("Could not change the Explorer menu: {error}")]));
+        }
+    }
+}
+
+/// Re-points the archive types and the ZXraw menu at this executable after it moved or was
+/// updated, for whichever the user turned on.
+pub fn refresh_archive_registration() {
+    let current_exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            tracing::warn!("could not determine the executable path for archives: {error}");
+            return;
+        }
+    };
+    match forge_win::refresh_archive_types_if_registered(&current_exe, &archive_file_types()) {
+        Ok(true) => tracing::info!("refreshed the archive file-type registration"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("could not refresh the archive file-type registration: {error}"),
+    }
+    match forge_win::refresh_archive_menu_if_registered(&current_exe, ARCHIVE_EXTENSIONS) {
+        Ok(true) => tracing::info!("refreshed the Explorer archive menu"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!("could not refresh the Explorer archive menu: {error}"),
+    }
+}
+
 /// Re-points the registration at this executable after it moved, if the user opted in.
 pub fn refresh_registration() {
     let current_exe = match std::env::current_exe() {
@@ -409,4 +616,18 @@ mod tests {
         assert_eq!(description("png").as_deref(), Some("PNG image"));
         assert_eq!(description("cr3").as_deref(), Some("CR3 raw image"));
     }
+
+    #[test]
+    fn every_archive_type_is_described_and_opens_as_an_archive() {
+        for file_type in archive_file_types() {
+            assert_ne!(file_type.description, "Archive", "{}", file_type.extension);
+            let name = std::path::PathBuf::from(format!("x.{}", file_type.extension));
+            // .rar opens once the RAR backend is in; every other type opens today.
+            if file_type.extension != "rar" {
+                assert!(forge_core::archive::is_archive_name(&name), "{}", file_type.extension);
+            }
+        }
+        assert!(!archive_extensions().iter().any(|e| file_types().iter().any(|t| t.extension == *e)));
+    }
+
 }

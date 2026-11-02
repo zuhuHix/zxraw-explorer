@@ -640,6 +640,35 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   * ✅ Dictionary size checked against the decoder-memory limit (1 GiB default) before extracting.
   * ✅ Read only: in-archive delete, add and cut are refused with a message, and a move out
     copies; copy and drag out work (`tools::rar_pane_browses_and_copies_out_but_is_never_edited`).
+* 🟡 Archive file types in Windows (per user, no admin) — `forge-win/src/file_types.rs`: 16
+  extensions (`.zip`, `.7z`, `.rar`, `.tar`, `.tgz`, `.tbz2`, `.tbz`, `.txz`, `.tzst`, `.tlz4`, `.gz`,
+  `.bz2`, `.xz`, `.zst`, `.lz4`, `.br`) each get a `ZXrawExplorer.Archive.<ext>` ProgID with a friendly
+  type name and the compressed-folder icon, and appear in *Open with* and Default apps. Settings ›
+  Default app has the *Offer ZXraw Explorer for archives* checkbox, the *Archives: n/m types open in
+  ZXraw Explorer* status with its per-type list, and the button that opens Windows Settings. ZXraw
+  never writes archive `UserChoice` values. Photo and archive registrations are independent. Unit
+  tests cover the registration; the Windows Settings flow and a real double-click were not checked.
+* 🟡 ZXraw right-click submenu (classic static verbs, per user) — `forge-win/src/archive_menu.rs`,
+  `shell_verb_server.rs`: each command is a DropTarget verb served by a per-user
+  COM local server (`MultiSelectModel=Player`), so Explorer starts one process for a whole selection.
+  On archives: Open in ZXraw, Extract here, Extract to a folder named after the archive, Extract to…;
+  on other files and folders: Add to archive…, Add to `"<name>.zip"`, Add to `"<name>.7z"`. Unit tests
+  cover the menu entries (in an isolated registry root) and the drop handling; the e2e test
+  `system::a_menu_command_on_a_multi_selection_makes_one_archive` plays Explorer (starts the COM
+  server process and drops three files on its class) and checks that the running window makes one
+  ZIP. No test clicks Explorer's real menu.
+* 🟡 Archive command line and installer tasks — `forge-app/src/main.rs`, `forge-app/src/shell_actions.rs`,
+  `packaging/zxraw.iss`: `--extract-here`, `--extract-to`, `--extract-dialog`, `--open-archive`,
+  `--add-dialog`, `--add-zip`, `--add-7z`, and the `--register-`/`--unregister-archive-types` and
+  `--register-`/`--unregister-archive-menu` switches. Both installer tasks are opt-in and unchecked by
+  default; the uninstaller removes both. Unit tests cover the argument handling and naming; e2e tests
+  run `--extract-here` on a cold start (smart folder) and a forwarded `--add-zip` of three items (one
+  ZIP). The installer script was not compiled in this change.
+
+* 🟡 Exactly-once hand-off for menu commands (pipe protocol v3) — `forge-win/src/single_instance.rs`,
+  `forge-app/src/instance.rs`: the window runs a command only after the sender confirms it read
+  "accepted"; a sender that gave up runs it in its own window and the window drops it. Unit tests cover
+  the commit step; a sender stalled for 60 s between reading the answer and confirming can still lose it.
 
 ## Status bar
 

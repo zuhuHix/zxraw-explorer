@@ -440,3 +440,261 @@ fn a_second_launch_opens_its_folder_in_a_new_tab_of_the_running_window() {
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
+
+/// A ZIP with `entries` (name, contents), written with the app's own zip crate.
+fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
+    use std::io::Write as _;
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    for (name, data) in entries {
+        zip.start_file(*name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(data).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
+/// Archive files directly in `dir` with `extension`, sorted.
+fn archives_in(dir: &Path, extension: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case(extension)))
+        .collect();
+    found.sort();
+    found
+}
+
+/// `zxraw.exe --extract-here <archive>` on a cold start: the new window extracts with the
+/// in-app smart rule (two top-level files go into a folder named after the archive).
+#[test]
+fn a_cold_start_with_extract_here_extracts_with_the_smart_rule() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let media = sandbox.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let archive = media.join("pack.zip");
+    write_zip(&archive, &[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+    let script = format!(
+        "dismiss-notices\nwait-exists {} | 60\nwait-exists {} | 60\nassert-no-error-toast\nexit\n",
+        shown(&media.join("pack").join("a.txt")),
+        shown(&media.join("pack").join("b.txt")),
+    );
+    let opts = RunOpts {
+        args: vec!["--extract-here".into(), archive.clone().into()],
+        ..Default::default()
+    };
+    let outcome = run_app_with(sandbox.path(), &profile, &script, &opts);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read(media.join("pack").join("b.txt")).unwrap(), b"beta");
+    assert!(!media.join("a.txt").exists(), "the smart rule never spills two items next to the archive");
+}
+
+/// Starts a window that owns the instance pipe `tag`, runs `script`, and returns once it owns
+/// the pipe (with the thread that runs it).
+#[cfg(windows)]
+fn owner_window(
+    sandbox: &Path,
+    profile: &Path,
+    tag: &str,
+    script: String,
+) -> std::thread::JoinHandle<Outcome> {
+    let channel = forge_win::single_instance::Channel::current(tag).unwrap();
+    assert!(!channel.is_owned());
+    let opts = RunOpts {
+        env: vec![("ZXRAW_INSTANCE_NAME".into(), tag.to_string())],
+        ..Default::default()
+    };
+    let (work, profile) = (sandbox.to_path_buf(), profile.to_path_buf());
+    let first = std::thread::spawn(move || run_app_with(&work, &profile, &script, &opts));
+    let started = Instant::now();
+    while !channel.is_owned() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60) && !first.is_finished(),
+            "the first window never took the instance pipe"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    first
+}
+
+#[cfg(windows)]
+fn unique_tag(name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    format!("e2e-{name}-{}-{nanos}", std::process::id())
+}
+
+/// A second process that must hand its launch over (`ZXRAW_FORWARD_ONLY`) and never opens a
+/// window of its own.
+#[cfg(windows)]
+fn forwarding_launch(sandbox: &Path, tag: &str, args: &[&std::ffi::OsStr]) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_zxraw"))
+        .args(args)
+        .current_dir(sandbox)
+        .env("ZXRAW_INSTANCE_NAME", tag)
+        .env("ZXRAW_FORWARD_ONLY", "1")
+        .env("ZXRAW_PROFILE_DIR", sandbox.join("second-profile"))
+        .env_remove("ZXRAW_SCRIPT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the second zxraw")
+}
+
+#[cfg(windows)]
+fn wait_exit(mut child: std::process::Child, limit: Duration) -> ExitStatus {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            panic!("the second launch did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `zxraw.exe --add-zip a b c` while a window runs: the window makes one ZIP of all three,
+/// named after their folder, and the launch exits without a window.
+#[cfg(windows)]
+#[test]
+fn a_forwarded_add_zip_makes_one_archive_of_every_item() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let shoot = sandbox.path().join("Shoot");
+    std::fs::create_dir_all(shoot.join("raw")).unwrap();
+    for name in ["a.txt", "b.txt", "raw\\c.txt"] {
+        write_file(&shoot.join(name), name.as_bytes());
+    }
+    let zip = shoot.join("Shoot.zip");
+    let tag = unique_tag("addzip");
+    let script = format!(
+        "dismiss-notices\nwait-exists {} | 60\nwait-jobs 60\nsleep 1500\nassert-no-error-toast\nexit\n",
+        shown(&zip)
+    );
+    let first = owner_window(sandbox.path(), &profile, &tag, script);
+    let status = wait_exit(
+        forwarding_launch(
+            &shoot,
+            &tag,
+            &["--add-zip".as_ref(), "a.txt".as_ref(), "b.txt".as_ref(), "raw".as_ref()],
+        ),
+        Duration::from_secs(20),
+    );
+    assert_eq!(status.code(), Some(0), "the command was not handed over");
+    let outcome = first.join().unwrap();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(archives_in(&shoot, "zip"), [zip.clone()], "exactly one archive");
+    let mut names: Vec<String> = forge_core::archive::list(&zip)
+        .unwrap()
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b.txt", "raw/c.txt"]);
+}
+
+/// What Explorer does for a ZXraw menu command on a multi-selection: COM starts
+/// `zxraw.exe --shell-verb add-zip -Embedding`, and Explorer drops the whole selection on
+/// the class it registers. Here the test plays Explorer (no registry entries are written:
+/// COM finds the class the process registered). The command reaches the running window
+/// once: three files make one ZIP.
+#[cfg(windows)]
+#[test]
+fn a_menu_command_on_a_multi_selection_makes_one_archive() {
+    use windows::Win32::Foundation::POINTL;
+    use windows::Win32::System::Com::{
+        CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        CoTaskMemFree, CoUninitialize, IDataObject,
+    };
+    use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropTarget};
+    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        BHID_DataObject, IShellItemArray, SHCreateShellItemArrayFromIDLists, SHParseDisplayName,
+    };
+    use windows::core::{GUID, HSTRING};
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let folder = sandbox.path().join("Selection");
+    std::fs::create_dir_all(&folder).unwrap();
+    let files: Vec<PathBuf> = (1..=3)
+        .map(|i| {
+            let path = folder.join(format!("photo {i}.jpg"));
+            write_file(&path, format!("photo {i}").as_bytes());
+            path
+        })
+        .collect();
+    let zip = folder.join("Selection.zip");
+    let tag = unique_tag("menu");
+    let script = format!(
+        "dismiss-notices\nwait-exists {} | 60\nwait-jobs 60\nsleep 1500\nassert-no-error-toast\nexit\n",
+        shown(&zip)
+    );
+    let first = owner_window(sandbox.path(), &profile, &tag, script);
+
+    let verb = forge_win::MenuVerb::AddZip;
+    let server = forwarding_launch(
+        sandbox.path(),
+        &tag,
+        &["--shell-verb".as_ref(), verb.name().as_ref(), "-Embedding".as_ref()],
+    );
+    let clsid = GUID::try_from(verb.clsid().trim_matches(['{', '}'])).unwrap();
+    unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok().unwrap();
+    let target: IDropTarget = {
+        let started = Instant::now();
+        loop {
+            match unsafe { CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER) } {
+                Ok(target) => break target,
+                Err(_) if started.elapsed() < Duration::from_secs(30) => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("the menu process never registered its class: {e}"),
+            }
+        }
+    };
+    let mut pidls = Vec::new();
+    for file in &files {
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(&HSTRING::from(file.as_os_str()), None, &mut pidl, 0, None) }
+            .unwrap();
+        pidls.push(pidl as *const ITEMIDLIST);
+    }
+    {
+        let items: IShellItemArray = unsafe { SHCreateShellItemArrayFromIDLists(&pidls) }.unwrap();
+        let data: IDataObject = unsafe { items.BindToHandler(None, &BHID_DataObject) }.unwrap();
+        let mut effect = DROPEFFECT_COPY;
+        unsafe {
+            target
+                .DragEnter(&data, MODIFIERKEYS_FLAGS(0), POINTL::default(), &mut effect)
+                .unwrap();
+            target
+                .Drop(&data, MODIFIERKEYS_FLAGS(0), POINTL::default(), &mut effect)
+                .unwrap();
+        }
+    }
+    drop(target);
+    for pidl in pidls {
+        unsafe { CoTaskMemFree(Some(pidl as *const std::ffi::c_void)) };
+    }
+    unsafe { CoUninitialize() };
+
+    let status = wait_exit(server, Duration::from_secs(30));
+    assert_eq!(status.code(), Some(0), "the menu command was not handed to the window");
+    let outcome = first.join().unwrap();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(archives_in(&folder, "zip"), [zip.clone()], "one archive for the whole selection");
+    let entries = forge_core::archive::list(&zip).unwrap().entries;
+    assert_eq!(entries.iter().filter(|e| !e.is_dir).count(), 3);
+}
