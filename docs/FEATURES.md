@@ -646,7 +646,9 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   type name and the compressed-folder icon, and appear in *Open with* and Default apps. Settings ›
   Default app has the *Offer ZXraw Explorer for archives* checkbox, the *Archives: n/m types open in
   ZXraw Explorer* status with its per-type list, and the button that opens Windows Settings. ZXraw
-  never writes archive `UserChoice` values. Photo and archive registrations are independent. Unit
+  never writes archive `UserChoice` values, and leaves each extension's class default alone (`.zip`
+  stays `CompressedFolder` until the user picks ZXraw in Settings); it adds only `OpenWithProgids`
+  and the Default apps entries. Photo and archive registrations are independent. Unit
   tests cover the registration; the Windows Settings flow and a real double-click were not checked.
 * 🟡 ZXraw right-click submenu (classic static verbs, per user) — `forge-win/src/archive_menu.rs`,
   `shell_verb_server.rs`: each command is a DropTarget verb served by a per-user
@@ -669,6 +671,10 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `forge-app/src/instance.rs`: the window runs a command only after the sender confirms it read
   "accepted"; a sender that gave up runs it in its own window and the window drops it. Unit tests cover
   the commit step; a sender stalled for 60 s between reading the answer and confirming can still lose it.
+  A sender that cannot tell whether its confirmation arrived shows an error and does not run the command
+  itself, so it never runs twice. A command whose selection holds an item without a file system path,
+  an item that vanished, or (for the extract commands) a non-archive is refused whole with a message
+  naming the items; it never runs on part of the selection.
 
 ## Status bar
 

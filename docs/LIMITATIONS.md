@@ -361,7 +361,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Static menu verbs cannot show the selected item's name, so the menu says `Add to "<name>.zip"`
   literally and *Extract to a folder named after the archive* instead of the actual names.
 * Archive defaults must be confirmed by the user in Windows Settings; ZXraw cannot set them itself
-  (Windows protects the `UserChoice` of archive types and ZXraw does not forge it).
+  (Windows protects the `UserChoice` of archive types and ZXraw does not forge it). Registering the
+  types does not change their class default either, so a double-click keeps opening the previous app
+  (for `.zip`, Windows' compressed folders) until then.
+* A menu command runs on the whole selection or not at all: an item without a file system path (a
+  library entry, a phone, *This PC*), an item that vanished, or a non-archive given to an extract
+  command refuses the command with a message naming the items.
 * `.rar` is registered for the menu and file types, but the extract commands open it only once
   ZXraw reads RAR (extract only: no creating `.rar`). Until then they report it as not an archive.
 * A selection of more than 8192 items, or over 4 MiB of paths, cannot be handed to the running window
@@ -394,7 +399,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   its answer arrived after the new process stopped waiting) the launch opens both as a tab and in a
   window of its own. This extra window is accepted for folder and file launches, which have no commit
   step. Explorer menu commands do have one (protocol v3), so they run once, except that a sender stalled
-  for 60 s between reading the answer and confirming can lose one.
+  for 60 s between reading the answer and confirming can lose one. When the sender cannot tell
+  whether its confirmation arrived, it shows an error ("check the ZXraw Explorer window") instead of
+  running the command itself: a missed command is preferred over a command run twice.
+
 * The protocol version is part of the pipe name. While an update overlaps (the old version's window
   still open, the new version launched), launches of the new version open their own window.
 * A handed-over path that no longer exists when the running window gets to it is treated like a cold

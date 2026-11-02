@@ -27,10 +27,49 @@ pub fn verb_of_activation(args: &[std::ffi::OsString]) -> Option<MenuVerb> {
     (embedding.eq_ignore_ascii_case("Embedding") && args.next().is_none()).then_some(verb)
 }
 
+/// Shows `text` in a modal error box titled "ZXraw Explorer", for a menu process that has no
+/// window of its own. Returns when the user closes it.
+pub fn show_error(text: &str) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MB_TOPMOST, MessageBoxW,
+        };
+        use windows::core::HSTRING;
+        // SAFETY: plain call with owned strings and no owner window.
+        unsafe {
+            MessageBoxW(
+                None,
+                &HSTRING::from(text),
+                &HSTRING::from("ZXraw Explorer"),
+                MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TOPMOST,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = text;
+}
+
+/// What Explorer dropped on a menu command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Dropped {
+    /// The selected items' file system paths.
+    pub paths: Vec<PathBuf>,
+    /// Display names of selected items that have no file system path (a library, a phone,
+    /// "This PC"). The command must not run on the rest alone.
+    pub unresolved: Vec<String>,
+}
+
+impl Dropped {
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.unresolved.is_empty()
+    }
+}
+
 /// Serves `verb`'s class until Explorer dropped the selection on it, at most `wait`.
-/// Returns the dropped paths (empty when nothing came). Initializes COM on this thread for
+/// Returns what was dropped (empty when nothing came). Initializes COM on this thread for
 /// the duration and leaves it uninitialized again.
-pub fn serve_drop(verb: MenuVerb, wait: Duration) -> Result<Vec<PathBuf>> {
+pub fn serve_drop(verb: MenuVerb, wait: Duration) -> Result<Dropped> {
     #[cfg(windows)]
     {
         imp::serve(verb, wait)
@@ -60,18 +99,20 @@ mod imp {
     };
     use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, IDropTarget, IDropTarget_Impl};
     use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
-    use windows::Win32::UI::Shell::{IShellItemArray, SHCreateShellItemArrayFromDataObject, SIGDN_FILESYSPATH};
+    use windows::Win32::UI::Shell::{
+        IShellItemArray, SHCreateShellItemArrayFromDataObject, SIGDN_FILESYSPATH, SIGDN_NORMALDISPLAY,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
         TranslateMessage,
     };
     use windows::core::{BOOL, GUID, IUnknown, Interface, Ref, implement};
 
-    use super::{MenuVerb, Result, WinError};
+    use super::{Dropped, MenuVerb, Result, WinError};
 
     #[derive(Default)]
     struct State {
-        paths: Vec<PathBuf>,
+        items: Dropped,
         dropped: bool,
         /// The event `serve` waits on, as a raw handle value.
         wake: isize,
@@ -139,9 +180,9 @@ mod imp {
             effect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
             if let Some(data) = data.as_ref() {
-                let paths = read_paths(data);
-                if !paths.is_empty() {
-                    lock(&self.shared).paths = paths;
+                let items = read_items(data);
+                if !items.is_empty() {
+                    lock(&self.shared).items = items;
                 }
             }
             answer_copy(effect);
@@ -169,10 +210,10 @@ mod imp {
             _pt: &POINTL,
             effect: *mut DROPEFFECT,
         ) -> windows::core::Result<()> {
-            let paths = data.as_ref().map(read_paths).unwrap_or_default();
+            let items = data.as_ref().map(read_items).unwrap_or_default();
             let mut state = lock(&self.shared);
-            if !paths.is_empty() {
-                state.paths = paths;
+            if !items.is_empty() {
+                state.items = items;
             }
             state.dropped = true;
             let wake = state.wake;
@@ -188,31 +229,45 @@ mod imp {
         }
     }
 
-    /// The file system paths a data object carries: through its shell items (covers search
-    /// results and libraries), else its `CF_HDROP` list.
-    fn read_paths(data: &IDataObject) -> Vec<PathBuf> {
-        let from_items = (|| -> windows::core::Result<Vec<PathBuf>> {
+    /// A shell item's display name of kind `sigdn`.
+    fn display_name(
+        item: &windows::Win32::UI::Shell::IShellItem,
+        sigdn: windows::Win32::UI::Shell::SIGDN,
+    ) -> Option<String> {
+        // SAFETY: a live shell item; the returned CoTaskMem string is freed here.
+        let name = unsafe { item.GetDisplayName(sigdn) }.ok()?;
+        let text = unsafe { name.to_string() };
+        unsafe { CoTaskMemFree(Some(name.0 as *const c_void)) };
+        text.ok().filter(|t| !t.is_empty())
+    }
+
+    /// The items a data object carries: through its shell items (covers search results and
+    /// libraries), else its `CF_HDROP` list. An item without a file system path is listed in
+    /// `unresolved`, never skipped silently.
+    pub(super) fn read_items(data: &IDataObject) -> Dropped {
+        let from_items = (|| -> windows::core::Result<Dropped> {
             // SAFETY: plain COM calls on a live data object.
             let items: IShellItemArray = unsafe { SHCreateShellItemArrayFromDataObject(data) }?;
             let count = unsafe { items.GetCount() }?;
-            let mut out = Vec::with_capacity(count as usize);
+            let mut out = Dropped::default();
             for i in 0..count {
                 let item = unsafe { items.GetItemAt(i) }?;
-                let Ok(name) = (unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }) else {
-                    continue;
-                };
-                // SAFETY: GetDisplayName returns a CoTaskMem string we now own.
-                let text = unsafe { name.to_string() };
-                unsafe { CoTaskMemFree(Some(name.0 as *const c_void)) };
-                if let Ok(text) = text {
-                    out.push(PathBuf::from(text));
+                match display_name(&item, SIGDN_FILESYSPATH) {
+                    Some(path) => out.paths.push(PathBuf::from(path)),
+                    None => out.unresolved.push(
+                        display_name(&item, SIGDN_NORMALDISPLAY)
+                            .unwrap_or_else(|| format!("item {}", i + 1)),
+                    ),
                 }
             }
             Ok(out)
         })();
         match from_items {
-            Ok(paths) if !paths.is_empty() => paths,
-            _ => read_hdrop(data),
+            Ok(items) if !items.is_empty() => items,
+            _ => Dropped {
+                paths: read_hdrop(data),
+                unresolved: Vec::new(),
+            },
         }
     }
 
@@ -240,7 +295,7 @@ mod imp {
         }
     }
 
-    pub(super) fn serve(verb: MenuVerb, wait: Duration) -> Result<Vec<PathBuf>> {
+    pub(super) fn serve(verb: MenuVerb, wait: Duration) -> Result<Dropped> {
         let clsid = GUID::try_from(verb.clsid().trim_matches(['{', '}']))
             .map_err(|_| WinError::Invalid(format!("bad class id {}", verb.clsid())))?;
         // SAFETY: once per thread, balanced by `Com`.
@@ -298,8 +353,8 @@ mod imp {
         drop(unknown);
         drop(factory);
         drop(event);
-        let paths = std::mem::take(&mut lock(&shared).paths);
-        Ok(paths)
+        let items = std::mem::take(&mut lock(&shared).items);
+        Ok(items)
     }
 }
 
@@ -337,8 +392,9 @@ mod tests {
     #[test]
     fn serving_without_a_drop_returns_no_paths_after_the_wait() {
         let started = std::time::Instant::now();
-        let paths = serve_drop(MenuVerb::Open, Duration::from_millis(300)).unwrap();
-        assert!(paths.is_empty());
+        let dropped = serve_drop(MenuVerb::Open, Duration::from_millis(300)).unwrap();
+        assert!(dropped.is_empty());
+
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -415,10 +471,50 @@ mod tests {
         }
         unsafe { CoUninitialize() };
         let got = server.join().unwrap().unwrap();
+        assert!(got.unresolved.is_empty());
         let name = |p: &PathBuf| p.file_name().unwrap().to_owned();
         assert_eq!(
-            got.iter().map(name).collect::<Vec<_>>(),
+            got.paths.iter().map(name).collect::<Vec<_>>(),
             files.iter().map(name).collect::<Vec<_>>()
         );
+    }
+
+    /// An item without a file system path ("This PC") is reported by name, not skipped.
+    #[cfg(windows)]
+    #[test]
+    fn an_item_without_a_file_system_path_is_reported_not_skipped() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize, IDataObject,
+        };
+        use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+        use windows::Win32::UI::Shell::{
+            BHID_DataObject, IShellItemArray, SHCreateShellItemArrayFromIDLists,
+            SHParseDisplayName,
+        };
+        use windows::core::HSTRING;
+
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().unwrap();
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        unsafe {
+            SHParseDisplayName(
+                &HSTRING::from("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+                None,
+                &mut pidl,
+                0,
+                None,
+            )
+        }
+        .unwrap();
+        let dropped = {
+            let items: IShellItemArray =
+                unsafe { SHCreateShellItemArrayFromIDLists(&[pidl as *const ITEMIDLIST]) }.unwrap();
+            let data: IDataObject = unsafe { items.BindToHandler(None, &BHID_DataObject) }.unwrap();
+            imp::read_items(&data)
+        };
+        unsafe { CoTaskMemFree(Some(pidl as *const std::ffi::c_void)) };
+        unsafe { CoUninitialize() };
+        assert!(dropped.paths.is_empty(), "{dropped:?}");
+        assert_eq!(dropped.unresolved.len(), 1, "{dropped:?}");
+        assert!(!dropped.unresolved[0].is_empty());
     }
 }

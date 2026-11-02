@@ -134,12 +134,19 @@ fn read_launch() -> Option<instance::Launch> {
         return Some(instance::Launch::from_env());
     };
     match forge_win::shell_verb_server::serve_drop(verb, MENU_DROP_WAIT) {
-        Ok(paths) if !paths.is_empty() => Some(instance::Launch {
-            paths: paths.into_iter().map(Into::into).collect(),
+        Ok(dropped) if !dropped.unresolved.is_empty() => {
+            // Running on the other items alone would quietly make, say, an archive of only
+            // part of the selection.
+            instance::report_error(&shell_actions::unresolved_message(verb, &dropped.unresolved));
+            None
+        }
+        Ok(dropped) if !dropped.paths.is_empty() => Some(instance::Launch {
+            paths: dropped.paths.into_iter().map(Into::into).collect(),
             new_window: false,
             action: Some(verb),
         }),
         Ok(_) => None,
+
         Err(error) => {
             tracing::warn!("the Explorer menu command {} failed: {error}", verb.name());
             None
