@@ -334,6 +334,10 @@ pub fn start_extract(app: &mut ZxrawApp, request: ExtractRequest) {
     let out = app.ops.archive.out.sender();
     app.ops.jobs.spawn(EXTRACT_KIND, title, move |job| {
         let job_ctx = JobCtx::from_job(job);
+        // The first half of a move: which archive file the items are read from.
+        if let Some(moved) = &request.then_remove {
+            moved.record_identity();
+        }
         let result = match run_extract(&request, password, &job_ctx) {
             Ok(Outcome::Asked(ask)) => {
                 let _ = msgs.send(Msg::Conflicts(ask));

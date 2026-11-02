@@ -68,6 +68,9 @@ impl StagePlan {
     /// The exact entry names a confirmed move of every planned file removes: each file, and
     /// each folder entry nothing left out sits under. Names carry no trailing `/`, so an
     /// archive edit deletes just that entry, never a folder with whatever it holds by then.
+    ///
+    /// Check them with [`unambiguous_names`] against the archive before deleting: a name
+    /// another entry shares (`A.txt` next to `a.txt`) would delete that one too.
     pub fn move_names(&self) -> Vec<String> {
         let left_out: Vec<String> = self.left_out.iter().map(|n| n.to_lowercase()).collect();
         let mut names: Vec<String> = self
@@ -87,6 +90,36 @@ impl StagePlan {
     pub fn any_encrypted(&self) -> bool {
         self.files.iter().any(|e| e.encrypted)
     }
+}
+
+/// `names` (to delete) without those more than one entry of `listing` answers to under an
+/// archive edit's rule: a name without a trailing `/` deletes every entry with that name,
+/// ignoring case, a file or a folder. Returns the rest, and how many were dropped. Works
+/// for any backend: it reads the listing only.
+pub fn unambiguous_names(listing: &ArchiveListing, names: &[String]) -> (Vec<String>, usize) {
+    let mut count: HashMap<String, usize> = HashMap::new();
+    for e in &listing.entries {
+        *count
+            .entry(e.name.trim_end_matches('/').to_lowercase())
+            .or_default() += 1;
+    }
+    let (keep, dropped): (Vec<&String>, Vec<&String>) = names.iter().partition(|n| {
+        count
+            .get(&n.trim_end_matches('/').to_lowercase())
+            .is_none_or(|&c| c <= 1)
+    });
+    (keep.into_iter().cloned().collect(), dropped.len())
+}
+
+/// Whether two entries of `listing` share a name ignoring case and a trailing `/` (`A.txt`
+/// and `a.txt`, a file `docs` and a folder `docs/`). Rewriting such an archive keeps only the
+/// first of them, so a move's removal refuses it (see `move_names`).
+pub fn has_shared_names(listing: &ArchiveListing) -> bool {
+    let mut seen = HashSet::new();
+    !listing
+        .entries
+        .iter()
+        .all(|e| seen.insert(e.name.trim_end_matches('/').to_lowercase()))
 }
 
 /// Why [`plan`] (and [`extract`]) leave out a link entry.
@@ -1134,6 +1167,36 @@ mod tests {
         let mut names = staged.move_names();
         names.sort();
         assert_eq!(names, ["docs", "docs/a.txt", "docs/empty"]);
+    }
+
+    #[test]
+    fn names_another_entry_shares_are_not_deleted() {
+        let entry = |name: &str| ArchiveEntry {
+            name: name.into(),
+            is_dir: name.ends_with('/'),
+            ..Default::default()
+        };
+        let listing = ArchiveListing {
+            format: crate::archive::ArchiveFormat::Zip,
+            entries: ["A.txt", "a.txt", "docs", "docs/", "docs/in.txt", "solo.txt"]
+                .into_iter()
+                .map(entry)
+                .collect(),
+            comment: String::new(),
+        };
+        let names: Vec<String> = ["A.txt", "docs", "docs/in.txt", "solo.txt", "gone.txt"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let (keep, dropped) = unambiguous_names(&listing, &names);
+        assert_eq!(keep, ["docs/in.txt", "solo.txt", "gone.txt"]);
+        assert_eq!(dropped, 2);
+        assert!(has_shared_names(&listing));
+        let plain = ArchiveListing {
+            entries: ["a.txt", "b/", "b/a.txt"].into_iter().map(entry).collect(),
+            ..listing
+        };
+        assert!(!has_shared_names(&plain));
     }
 
     #[test]

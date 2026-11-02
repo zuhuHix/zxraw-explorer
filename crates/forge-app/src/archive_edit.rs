@@ -57,14 +57,77 @@ pub struct UpdateRequest {
     /// files' password is typed twice, as for a new encrypted archive.
     pub confirm_password: bool,
     pub title: String,
-    /// The archive version (`archive_ui::archive_version`) the edit was decided on: checked
-    /// in the job under the edit lock, right before the rebuild, and nothing is changed if
-    /// the archive differs (the end of a move out of it).
-    pub expect_version: Option<u64>,
+    /// The end of a move out of the archive: the archive file the items were read from. In
+    /// the job, under the edit lock, the archive is held open against writers and checked to
+    /// be that file, unchanged, and the names to delete are checked against it again (see
+    /// [`removal_update`]); otherwise nothing is changed.
+    pub expect: Option<crate::archive_identity::ArchiveIdentity>,
 }
 
-/// Why a move's removal did nothing: the archive changed after the items left it.
-pub const CHANGED_NOTHING_REMOVED: &str = "the archive changed; nothing was removed";
+/// How long the removal of moved items waits for another program writing to the archive.
+const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The archive edit of `request`; for the end of a move (`request.expect`), only on the very
+/// archive file the items were read from, unchanged:
+///
+/// * The archive is opened once, sharing only reading and deleting, and kept open until the
+///   edit has replaced it: from the check on, no other program can write to it (one already
+///   writing is waited for, then the removal is refused).
+/// * An archive holding names that differ only in case is refused: its rewrite would keep
+///   only the first of each.
+/// * On that handle, its identity (file id, size, write time, directory hash) must be the
+///   one recorded when the items were read.
+/// * It is listed again, and a name that more than one entry answers to (names are matched
+///   ignoring case, a file and a folder alike) is not deleted.
+/// * Right before the edit opens the path, the path must still name the held file (nothing
+///   renamed over it). After the edit, the held file must be the one it replaced.
+fn removal_update(
+    request: &UpdateRequest,
+    password: Option<&archive::Password>,
+    opts: &CreateOptions,
+    ctx: &JobCtx<'_>,
+) -> forge_core::Result<CreateReport> {
+    let Some(expected) = &request.expect else {
+        return archive::update(&request.archive, &request.edit, opts, ctx);
+    };
+    let refuse = |why: String| CoreError::Invalid(format!("{why}; nothing was removed"));
+    let held = crate::archive_identity::hold_unchanged(&request.archive, expected, WRITER_WAIT)
+        .map_err(|why| refuse(format!("the archive {why}")))?;
+    let listing = archive::list_with_password(&request.archive, password)?;
+    // Rewriting an archive keeps only the first of entries whose names differ just in case:
+    // removing anything from it would lose the others too.
+    if archive::stage::has_shared_names(&listing) {
+        return Err(refuse(
+            "the archive holds names that differ only in case, which an edit would merge".into(),
+        ));
+    }
+    let (delete, ambiguous) =
+        archive::stage::unambiguous_names(&listing, &request.edit.delete);
+    if delete.is_empty() {
+        return Err(refuse(
+            "every name moved is shared by another entry of the archive".into(),
+        ));
+    }
+    let edit = ArchiveEdit {
+        add: request.edit.add.clone(),
+        delete,
+    };
+    held.still_at(&request.archive)
+        .map_err(|why| refuse(format!("the archive changed: {why}")))?;
+    let mut report = archive::update(&request.archive, &edit, opts, ctx)?;
+    if ambiguous > 0 {
+        report.warnings.push(format!(
+            "{} kept in the archive: another entry has the same name",
+            items(ambiguous)
+        ));
+    }
+    if !held.replaced() {
+        report.warnings.push(
+            "the archive file was moved or replaced while it was edited: check it".into(),
+        );
+    }
+    Ok(report)
+}
 
 /// Whether adding to an archive needs a password, and whether it must be typed twice: only
 /// folders are encrypted, so there is no file to check it against.
@@ -379,7 +442,7 @@ fn add_into(
         },
         encrypted: lock.0,
         confirm_password: lock.1,
-        expect_version: None,
+        expect: None,
     };
     if existing.is_empty() {
         return start_update(app, request);
@@ -440,7 +503,7 @@ pub fn ask_delete(app: &mut ZxrawApp) {
             // Kept entries are copied as stored: deleting needs no password.
             encrypted: false,
             confirm_password: false,
-            expect_version: None,
+            expect: None,
         }),
         title: "Delete from archive".into(),
         confirm_label: "Delete".into(),
@@ -486,6 +549,8 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
     let title = request.title.clone();
     app.ops.jobs.spawn(UPDATE_KIND, title, move |job| {
         let job_ctx = JobCtx::from_job(job);
+        // Encrypted 7z names need it to list the archive again.
+        let list_password = password.clone();
         let opts = CreateOptions {
             encryption: password.map_or(Encryption::None, Encryption::Aes256),
             ..CreateOptions::default()
@@ -495,14 +560,7 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
             job.progress.set_note("Waiting for another archive edit…");
             let _one = UPDATING.lock().unwrap_or_else(|p| p.into_inner());
             job.progress.set_note("");
-            let changed = request
-                .expect_version
-                .is_some_and(|v| crate::archive_ui::archive_version(&request.archive) != v);
-            if changed {
-                Err(CoreError::Invalid(CHANGED_NOTHING_REMOVED.into()))
-            } else {
-                archive::update(&request.archive, &request.edit, &opts, &job_ctx)
-            }
+            removal_update(&request, list_password.as_ref(), &opts, &job_ctx)
         };
         let outcome = match result {
             Ok(report) => {
@@ -599,6 +657,120 @@ mod tests {
                 comment: String::new(),
             })),
         }
+    }
+
+    /// A zip of `entries` (a name ending with `/` is a folder).
+    fn zip_of(path: &Path, entries: &[&str]) {
+        use std::io::Write;
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        for name in entries {
+            if name.ends_with('/') {
+                zw.add_directory(*name, options).unwrap();
+            } else {
+                zw.start_file(*name, options).unwrap();
+                zw.write_all(name.as_bytes()).unwrap();
+            }
+        }
+        zw.finish().unwrap();
+    }
+
+    fn removal(zip: &Path, delete: &[&str]) -> forge_core::Result<CreateReport> {
+        let request = UpdateRequest {
+            archive: zip.to_path_buf(),
+            edit: ArchiveEdit {
+                add: Vec::new(),
+                delete: delete.iter().map(|s| s.to_string()).collect(),
+            },
+            encrypted: false,
+            confirm_password: false,
+            title: "Removing".into(),
+            expect: Some(crate::archive_identity::read(zip).unwrap()),
+        };
+        let (cancel, progress) = (forge_jobs::CancelToken::new(), forge_jobs::Progress::default());
+        removal_update(
+            &request,
+            None,
+            &CreateOptions::default(),
+            &JobCtx::new(&cancel, &progress),
+        )
+    }
+
+    fn names_in(zip: &Path) -> Vec<String> {
+        let mut names: Vec<String> = archive::list(zip)
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_removal_keeps_names_another_entry_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["A.txt", "a.txt", "top.txt"]);
+        assert_eq!(names_in(&zip), ["A.txt", "a.txt", "top.txt"], "as written");
+        // "A.txt" would delete "a.txt" too, and a rewrite would keep only one of them:
+        // nothing is removed at all.
+        for delete in [&["A.txt", "top.txt"][..], &["top.txt"][..]] {
+            let error = removal(&zip, delete).unwrap_err().to_string();
+            assert!(error.contains("nothing was removed"), "{error}");
+            assert_eq!(names_in(&zip), ["A.txt", "a.txt", "top.txt"]);
+        }
+    }
+
+    #[test]
+    fn a_folder_moved_out_keeps_a_file_of_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["docs", "docs/", "docs/in.txt"]);
+        // The folder entry's name is also the file's: the file must stay, so nothing goes.
+        let error = removal(&zip, &["docs", "docs/in.txt"]).unwrap_err().to_string();
+        assert!(error.contains("nothing was removed"), "{error}");
+        assert_eq!(names_in(&zip), ["docs", "docs/", "docs/in.txt"]);
+    }
+
+    #[test]
+    fn a_removal_refuses_an_archive_rewritten_with_its_size_and_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt", "top.txt"]);
+        let request_identity = crate::archive_identity::read(&zip).unwrap();
+        let modified = std::fs::metadata(&zip).unwrap().modified().unwrap();
+        let other = dir.path().join("b.zip");
+        zip_of(&other, &["two.txt", "top.txt"]);
+        std::fs::write(&zip, std::fs::read(&other).unwrap()).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&zip)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let request = UpdateRequest {
+            archive: zip.clone(),
+            edit: ArchiveEdit {
+                add: Vec::new(),
+                delete: vec!["top.txt".into()],
+            },
+            encrypted: false,
+            confirm_password: false,
+            title: "Removing".into(),
+            expect: Some(request_identity),
+        };
+        let (cancel, progress) = (forge_jobs::CancelToken::new(), forge_jobs::Progress::default());
+        let error = removal_update(
+            &request,
+            None,
+            &CreateOptions::default(),
+            &JobCtx::new(&cancel, &progress),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("nothing was removed"), "{error}");
+        assert_eq!(names_in(&zip), ["top.txt", "two.txt"]);
     }
 
     #[test]

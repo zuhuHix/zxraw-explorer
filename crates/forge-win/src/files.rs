@@ -49,6 +49,88 @@ fn handle_info(
     Ok(info)
 }
 
+/// Who an open file is: what [`handle_identity`] reads from a handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HandleIdentity {
+    /// The 64-bit volume serial number (`FILE_ID_INFO`).
+    pub volume: u64,
+    /// The 128-bit file id (`FILE_ID_INFO`): a file replaced by another of the same name
+    /// gets a different one.
+    pub file_id: u128,
+    /// Hard links to it: 0 once its last name was removed (it was deleted or replaced while
+    /// the handle stayed open).
+    pub links: u32,
+    pub size: u64,
+    /// Last write time, FILETIME ticks.
+    pub last_write: u64,
+}
+
+/// The identity of the file `file` has open (see [`HandleIdentity`]).
+#[cfg(windows)]
+pub fn handle_identity(file: &std::fs::File) -> Result<HandleIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+
+    let handle = HANDLE(file.as_raw_handle());
+    let mut id = FILE_ID_INFO::default();
+    // SAFETY: `id` is a FILE_ID_INFO of the size passed; the handle is open.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&mut id as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    }
+    .map_err(|e| crate::api_err("GetFileInformationByHandleEx(FileIdInfo)", e))?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: as above.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|e| crate::api_err("GetFileInformationByHandle", e))?;
+    Ok(HandleIdentity {
+        volume: id.VolumeSerialNumber,
+        file_id: u128::from_le_bytes(id.FileId.Identifier),
+        links: info.nNumberOfLinks,
+        size: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+        last_write: (u64::from(info.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(info.ftLastWriteTime.dwLowDateTime),
+    })
+}
+
+#[cfg(not(windows))]
+pub fn handle_identity(_file: &std::fs::File) -> Result<HandleIdentity> {
+    Err(WinError::Unsupported)
+}
+
+/// The identity of the file at `path` (not following a link at the end), read through an
+/// attribute-only handle that shares everything.
+#[cfg(windows)]
+pub fn path_identity(path: &Path) -> Result<HandleIdentity> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(consts::FILE_READ_ATTRIBUTES)
+        .share_mode(consts::FILE_SHARE_ALL)
+        .custom_flags(consts::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| WinError::Io {
+            op: "open for an identity query",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    handle_identity(&file)
+}
+
+#[cfg(not(windows))]
+pub fn path_identity(_path: &Path) -> Result<HandleIdentity> {
+    Err(WinError::Unsupported)
+}
+
 /// Number of hard links to the file (1 for a normal file). Directories report their
 /// link count too.
 #[cfg(windows)]

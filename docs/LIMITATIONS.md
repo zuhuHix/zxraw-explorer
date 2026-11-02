@@ -106,14 +106,27 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Archive items on the clipboard can't be pasted after ZXraw closes: their data comes from the
   running app, so the clipboard is emptied on exit rather than flushed.
 * A move out of an archive (Ctrl+X, Shift-drag, F6) removes the items only when the target
-  reported a successful move *and* read every file to its end, the archive is unchanged since
-  it was listed (checked again inside the removal job, just before the archive is rewritten),
-  and you confirm. Once the target copies asynchronously, only the end of its operation counts:
+  reported a successful move *and* read every file to its end, the archive is the same file,
+  unchanged, as when the items began to be read, and you confirm. "The same file, unchanged"
+  is its volume and 128-bit file id, size, write time and a hash of its directory region
+  (a zip's end records and central directory, a 7z's headers, else its first and last
+  64 KiB). The removal job opens the archive once, sharing only reading and deleting, checks
+  that identity on the handle and keeps it open until the rebuilt archive replaced it: no
+  other program can write to the archive meanwhile (one already writing is waited for, up to
+  10 s, then the removal is refused). Deleting stays shared, as the rebuild renames its result
+  over the file: the job checks that the path still names the held file right before the edit
+  opens it, which leaves a window of microseconds in which another program could rename a
+  different file into place unnoticed beforehand (it is reported afterwards, as the held file
+  then isn't the one replaced). Once the target copies asynchronously, only the end of its operation counts:
   a failed end cancels the move whatever it said before. Anything less (a copy, a skipped
   file, an error) leaves the archive as it was. A target that never reports the result (some
   apps don't) leaves it as a copy. Exactly the entries that were handed out are removed, never
   a folder with whatever it holds: links and names that clash on Windows are not handed out,
-  so they stay, and so does the folder holding them (the confirmation says how many).
+  so they stay, and so does the folder holding them (the confirmation says how many). A name
+  another entry also answers to is never deleted. An archive holding names that differ only
+  in case (`A.txt` and `a.txt`, or a file `docs` next to a folder `docs/`) is never edited by
+  a move at all: rewriting a zip keeps only the first of such entries. Delete and adding files
+  rewrite it the same way, so they also drop the later of two such entries today.
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
   caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
   "damaged data or wrong password". AES archives always tell the two apart.

@@ -1791,6 +1791,84 @@ fn an_archive_changed_while_the_move_prompt_is_open_keeps_every_entry() {
 }
 
 #[test]
+fn an_archive_replaced_by_an_identical_copy_while_the_move_prompt_is_open_keeps_every_entry() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         select top.txt\n\
+         cmd Cut\n\
+         ui system shell-paste {dest}\n\
+         ui browser wait-dialog Finish the move | 60\n\
+         ui system replace-with-copy {zip}\n\
+         accept\n\
+         wait-jobs 30\n\
+         ui system wait-toast nothing was removed\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), owned_tree(&[("top.txt", b"top of the archive")]));
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
+        "same bytes, size and time, but another file: nothing is removed from it"
+    );
+}
+
+#[test]
+fn names_differing_only_in_case_are_copied_out_and_nothing_is_removed() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = sandbox.path().join("zips").join("a.zip");
+    write_file(
+        &zip,
+        &raw_zip(&[
+            ("A.txt", b"upper"),
+            ("a.txt", b"lower"),
+            ("top.txt", b"top"),
+        ]),
+    );
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry top.txt\n\
+         select-all\n\
+         cmd Cut\n\
+         ui system shell-paste {dest}\n\
+         ui system wait-toast couldn't be removed\n\
+         ui browser assert-no-dialog\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(dest.join("top.txt").exists());
+    // A rewrite would keep only one of A.txt and a.txt: nothing is removed at all.
+    assert_eq!(zip_names(&zip), ["A.txt", "a.txt", "top.txt"]);
+}
+
+#[test]
 fn archive_cut_then_archive_changed_shell_paste_gives_out_and_removes_nothing() {
     let sandbox = tempfile::tempdir().unwrap();
     let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {

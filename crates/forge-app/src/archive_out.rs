@@ -19,7 +19,10 @@ use forge_core::archive::stage::{Stage, StageEvent};
 use forge_core::archive::{self, ExtractLimits, ExtractReport};
 use forge_win::virtual_source::{VirtualDataObject, VirtualItem, VirtualOffer, VirtualProvider};
 
+use parking_lot::Mutex;
+
 use crate::app::ZxrawApp;
+use crate::archive_identity::ArchiveIdentity;
 use crate::archive_edit::{UpdateRequest, items};
 use crate::archive_ui::ArchiveView;
 use crate::modal::{Confirm, ConfirmKind, Modal};
@@ -32,23 +35,53 @@ pub struct MoveOut {
     /// from an archive that changed since.
     pub version: u64,
     /// The exact entry names the move removes (see `StagePlan::move_names`): no trailing
-    /// `/`, so nothing is deleted with a folder that wasn't moved itself.
+    /// `/`, so nothing is deleted with a folder that wasn't moved itself, and none another
+    /// entry shares ignoring case (`stage::unambiguous_names`).
     pub names: Vec<String>,
-    /// Covered entries that were not moved (links, names that clash on Windows): they stay.
+    /// Covered entries that are not removed (links, names that clash on Windows or with
+    /// another entry): they stay.
     pub left_out: usize,
+    /// The archive file the items were read from, recorded when reading them began: the
+    /// removal happens only on that file, unchanged (see `archive_identity`).
+    identity: Arc<Mutex<Option<ArchiveIdentity>>>,
     /// The data object it came from, if any (taken off the clipboard after the move).
     offer: Option<u64>,
 }
 
 impl MoveOut {
     fn of_plan(view: &ArchiveView, plan: &archive::stage::StagePlan, offer: Option<u64>) -> Self {
+        let listing = &view.index.listing;
+        let (names, shared) = if archive::stage::has_shared_names(listing) {
+            // Its rewrite would merge names that differ only in case: nothing is removed.
+            (Vec::new(), plan.move_names().len())
+        } else {
+            archive::stage::unambiguous_names(listing, &plan.move_names())
+        };
         Self {
             archive: view.archive.clone(),
             version: view.version,
-            names: plan.move_names(),
-            left_out: plan.left_out.len(),
+            names,
+            left_out: plan.left_out.len() + shared,
+            identity: Arc::default(),
             offer,
         }
+    }
+
+    /// Records the archive's identity as its items begin to be read (off the UI thread),
+    /// once: false when it can't be read or the archive changed since it was listed.
+    pub fn record_identity(&self) -> bool {
+        if crate::archive_ui::archive_version(&self.archive) != self.version {
+            return false;
+        }
+        let mut slot = self.identity.lock();
+        if slot.is_none() {
+            *slot = crate::archive_identity::read(&self.archive).ok();
+        }
+        slot.is_some()
+    }
+
+    fn recorded(&self) -> Option<ArchiveIdentity> {
+        *self.identity.lock()
     }
 
     /// The move of `selection` out of the archive `view` shows, done inside this app by an
@@ -234,18 +267,18 @@ fn offer(
     let files = plan.items.iter().map(|item| item.file).collect();
     let ctx = app.ops.ctx.clone();
     let tx = app.ops.archive.out.tx.clone();
-    let (archive_path, version) = (view.archive.clone(), view.version);
+    let archive_path = view.archive.clone();
     let dir = archive::temp_root().join(format!("out-{}-{id}", std::process::id()));
     let stage = {
         let (tx, ctx, archive) = (tx.clone(), ctx.clone(), archive_path.clone());
-        let still = archive_path.clone();
+        let reading = moved.clone();
         Stage::new(
             archive_path.clone(),
             plan.files,
             password,
             limits,
             dir,
-            move || crate::archive_ui::archive_version(&still) == version,
+            move || reading.record_identity(),
             move |event| {
                 let _ = tx.send(OutMsg::Stage {
                     archive: archive.clone(),
@@ -377,8 +410,9 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 let tx = app.ops.archive.out.tx.clone();
                 let ctx = app.ops.ctx.clone();
                 std::thread::spawn(move || {
-                    let unchanged =
-                        crate::archive_ui::archive_version(&moved.archive) == moved.version;
+                    let unchanged = moved.recorded().is_some_and(|recorded| {
+                        crate::archive_identity::read(&moved.archive).ok() == Some(recorded)
+                    });
                     let _ = tx.send(OutMsg::Checked { moved, unchanged });
                     ctx.request_repaint();
                 });
@@ -408,6 +442,13 @@ fn finish_move(app: &mut ZxrawApp, moved: MoveOut, unchanged: bool) {
         return;
     }
     if moved.names.is_empty() {
+        if moved.left_out > 0 {
+            app.toast(format!(
+                "The items were copied; {} couldn't be removed from {name} (links, or names \
+                 another entry shares) and stay in it",
+                items(moved.left_out)
+            ));
+        }
         return;
     }
     app.ops.modal = Some(Modal::Confirm(Confirm {
@@ -417,13 +458,13 @@ fn finish_move(app: &mut ZxrawApp, moved: MoveOut, unchanged: bool) {
             title: format!("Removing {} from {name}", items(moved.names.len())),
             edit: archive::ArchiveEdit {
                 add: Vec::new(),
-                delete: moved.names,
+                delete: moved.names.clone(),
             },
             // Kept entries are copied as stored: deleting needs no password.
             encrypted: false,
             confirm_password: false,
-            // Checked again in the job, under the edit lock, right before the rebuild.
-            expect_version: Some(moved.version),
+            // Held and checked again in the job, under the edit lock, through the rebuild.
+            expect: moved.recorded(),
         }),
         title: "Finish the move".into(),
         confirm_label: "Remove".into(),
