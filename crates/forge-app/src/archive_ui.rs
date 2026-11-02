@@ -485,6 +485,7 @@ pub(crate) enum Retry {
     Open(OpenRequest),
     Extract(crate::archive_extract::ExtractRequest),
     Test(crate::archive_extract::TestRequest),
+    Update(crate::archive_edit::UpdateRequest),
 }
 
 impl Retry {
@@ -493,6 +494,7 @@ impl Retry {
             Retry::Open(r) => &r.archive,
             Retry::Extract(r) => &r.archive,
             Retry::Test(r) => &r.archive,
+            Retry::Update(r) => &r.archive,
         }
     }
 
@@ -502,6 +504,9 @@ impl Retry {
         match self {
             Retry::Open(r) => format!("{} in {archive} is encrypted.", r.name),
             Retry::Extract(_) | Retry::Test(_) => format!("{archive} is encrypted."),
+            Retry::Update(_) => format!(
+                "{archive} is encrypted. Its password is needed to change it (new files are                  encrypted with it)."
+            ),
         }
     }
 }
@@ -701,7 +706,13 @@ fn run_retry(app: &mut ZxrawApp, retry: Retry) {
         Retry::Open(r) => start_open(app, r),
         Retry::Extract(r) => crate::archive_extract::start_extract(app, r),
         Retry::Test(r) => crate::archive_extract::start_test(app, r),
+        Retry::Update(r) => crate::archive_edit::start_update(app, r),
     }
+}
+
+/// Ask for an archive's password before running `retry` (queued behind other prompts).
+pub(crate) fn ask_password(app: &mut ZxrawApp, retry: Retry, wrong: bool) {
+    let _ = app.ops.archive.tx.send(Msg::NeedPassword { retry, wrong });
 }
 
 /// Overwrite the typed password before its memory is freed.
