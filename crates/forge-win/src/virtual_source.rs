@@ -85,8 +85,10 @@ pub fn own_paths(bytes: &[u8]) -> Option<Vec<PathBuf>> {
         return None;
     }
     let units: Vec<u16> = bytes[4..]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let paths: Vec<PathBuf> = units
         .split(|&u| u == 0)
