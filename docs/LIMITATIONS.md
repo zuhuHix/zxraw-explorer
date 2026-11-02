@@ -351,9 +351,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Apps that launch a specific program themselves (for example an **Open in Photos** button) are not
   affected. Applications that ask the Windows shell to open a photo or filesystem folder use the
   selected defaults.
-* Passing a folder or drive to ZXraw opens it in a tab in that process. ZXraw has no single-instance
-  IPC, so opening it from another app can start another window. Each double-clicked photo also starts
-  a new window.
+* A launch with a path is handed to the running window (see [FEATURES.md](FEATURES.md)). Elevated
+  (administrator) and normal windows are separate groups, so a launch from the other level opens its
+  own window. If the running window is hung or closing, the launch waits about 2.5 s and then opens its
+  own window (logged). Bringing the window to the front relies on Windows' foreground rules
+  (`AllowSetForegroundWindow`), which no automated test covers.
 
 ## Installer, packaging, and licences
 

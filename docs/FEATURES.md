@@ -744,6 +744,19 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   and `Drive` shell defaults, leaving `Folder` untouched. An ignored Windows test verified that both associations
   resolve to the built ZXraw executable, then restored the real HKCU values and confirmed the original defaults,
   verb entries, and backup state were restored.
+* 🟡 Single window and hand-off — `forge-app/src/instance.rs`, `forge-win/src/single_instance.rs`. While
+  ZXraw Explorer runs, a launch with a path (the default folder handler, *Open in ZXraw Explorer*, a
+  registered photo, a shortcut, or `zxraw.exe <path>`) hands it to the running window and exits. Folders
+  open in a new tab, or switch to a tab already showing them; files open their folder with the file
+  selected, and photos also open in the viewer. A launch with no path only brings the window forward.
+  The hand-off pipe is per user and session, with an owner-only ACL, and both ends check user, session
+  and integrity level, so administrator and normal windows never exchange launches. `zxraw.exe
+  --new-window [path]` and Shift+right-click *Open in new ZXraw window* always open a separate window.
+  Settings › Browsing › *Open folders and files in a new tab of the running window* (on by default)
+  turns hand-off off. Unit and IPC tests are in `forge-win` `single_instance`
+  (`cargo test -p forge-win single_instance`); e2e `system::a_second_launch_opens_its_folder_in_a_new_tab_of_the_running_window`.
+  Both passed in the full `cargo test --workspace` run of 2026-11-02. Bringing the window to the front
+  relies on Windows' foreground rules and is not automated, hence 🟡.
 * 🟡 Packaging — `packaging/build-release.ps1`, `packaging/zxraw.iss`, `packaging/generate_icon.py`,
   `packaging/generate-third-party.ps1`, and the VERSIONINFO resource in `crates/forge-app/build.rs`.
   Commit `e3bfbd2` records a release zip that was built and whose executable launched; that build is not

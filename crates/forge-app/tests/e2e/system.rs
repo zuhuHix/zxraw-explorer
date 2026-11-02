@@ -360,3 +360,83 @@ fn folder_context_menu_opens_a_terminal_in_that_folder() {
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
+
+/// A second `zxraw.exe <folder>` hands the folder to the running window, which opens it in a
+/// new tab, and exits 0 without a window; a launch without a path only brings the running
+/// window forward. Both use a pipe name of their own, never the installed copy's.
+#[cfg(windows)]
+#[test]
+fn a_second_launch_opens_its_folder_in_a_new_tab_of_the_running_window() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let target = sandbox.path().join("Forwarded folder");
+    std::fs::create_dir_all(&target).unwrap();
+    write_file(&target.join("marker.txt"), b"forwarded");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let tag = format!("e2e-{}-{nanos}", std::process::id());
+    let channel = forge_win::single_instance::Channel::current(&tag).unwrap();
+    assert!(!channel.is_owned());
+
+    let script = format!(
+        "dismiss-notices\nui system wait-tabs 2 | 30\nassert-path {}\n\
+         wait-entry marker.txt\nsleep 500\nassert-tabs 2\nexit\n",
+        shown(&target)
+    );
+    let opts = RunOpts {
+        env: vec![("ZXRAW_INSTANCE_NAME".into(), tag.clone())],
+        ..Default::default()
+    };
+    let work = sandbox.path().to_path_buf();
+    let first = {
+        let (work, profile) = (work.clone(), profile.clone());
+        std::thread::spawn(move || run_app_with(&work, &profile, &script, &opts))
+    };
+
+    let started = Instant::now();
+    while !channel.is_owned() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60) && !first.is_finished(),
+            "the first window never took the instance pipe"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A launch must hand over or fail (ZXRAW_FORWARD_ONLY): it never opens a window here.
+    let launch = |args: &[&std::ffi::OsStr]| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_zxraw"))
+            .args(args)
+            .current_dir(sandbox.path())
+            .env("ZXRAW_INSTANCE_NAME", &tag)
+            .env("ZXRAW_FORWARD_ONLY", "1")
+            .env("ZXRAW_PROFILE_DIR", sandbox.path().join("second-profile"))
+            .env_remove("ZXRAW_SCRIPT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the second zxraw");
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return (status, started.elapsed());
+            }
+            if started.elapsed() > Duration::from_secs(20) {
+                let _ = child.kill();
+                panic!("the second launch did not exit");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let (status, _) = launch(&[]);
+    assert_eq!(status.code(), Some(0), "a launch without a path is handed over too");
+    // Relative to the second process's working directory, as from a terminal.
+    let (status, took) = launch(&["Forwarded folder".as_ref()]);
+    assert_eq!(status.code(), Some(0), "the folder launch was not handed over");
+    assert!(took < Duration::from_secs(10), "handing over took {took:?}");
+
+    let outcome = first.join().unwrap();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}

@@ -589,6 +589,13 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
         "Reopen the last session's tabs at startup",
     );
     ui.checkbox(
+        &mut settings.open_in_running_window,
+        "Open folders and files in a new tab of the running window",
+    )
+    .on_hover_text(
+        "Off: every folder or file opened from Explorer, a shortcut or the context menu          opens its own window. Shift+right-click a folder for \"Open in new ZXraw window\".",
+    );
+    ui.checkbox(
         &mut settings.confirm_recycle,
         "Confirm before moving items to the Recycle Bin",
     );

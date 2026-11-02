@@ -237,6 +237,10 @@ pub struct Settings {
     /// Reopen the previous session's tabs at startup (the behaviour before this was a
     /// setting, so it defaults to on).
     pub restore_session: bool,
+    /// A folder or file opened while ZXraw Explorer is running (double-click with ZXraw as the
+    /// default, the context menu, a photo, a shortcut) opens in a new tab of the running
+    /// window instead of a new window (see `instance`). On by default.
+    pub open_in_running_window: bool,
     /// What typing in the file list does: jump to a name (default) or filter the list.
     pub list_typing: Lenient<ListTyping>,
     /// The terminal "Open terminal here" starts (see `terminal`).
@@ -294,6 +298,7 @@ impl Default for Settings {
             layouts: Vec::new(),
             network_locations: Vec::new(),
             restore_session: true,
+            open_in_running_window: true,
             list_typing: ListTyping::Jump.into(),
             terminal: Default::default(),
             git_badges: true,
@@ -585,6 +590,9 @@ mod tests {
         assert!(settings.pins.is_empty());
         assert!(settings.layouts.is_empty());
         assert!(settings.restore_session, "session restore stays on for existing users");
+        assert!(settings.open_in_running_window, "single-window launches are on for existing users");
+        let settings: Settings = serde_json::from_str(r#"{"open_in_running_window":false}"#).unwrap();
+        assert!(!settings.open_in_running_window);
     }
 
     #[test]

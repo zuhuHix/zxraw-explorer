@@ -174,6 +174,10 @@ Explorer is a file manager designed around that workflow:
   your open tabs, split panes, views and sorting, so a culling or delivery workspace is one click
   away from the sidebar's Layouts section. Layouts and Collections fold away while they're empty;
   the small ⋯ next to each heading explains the feature and holds its actions (save, new, manage).
+- **One window, many folders.** Opening a folder, a photo or a file from Explorer, a shortcut or a
+  terminal (`zxraw <path>`) adds a tab to the window that is already running and brings it to the
+  front. Shift+right-click a folder for *Open in new ZXraw window*, or run `zxraw --new-window`, for
+  a separate window. Settings › Browsing turns this off.
 - **Your NAS in the sidebar.** Save shares like `\\nas\photos` to the Network section, next to
   your mapped drives. A status dot shows which are online, and an offline NAS never freezes the
   window. If a share needs a password, *Connect…* lets Windows ask for it: ZXraw Explorer never
@@ -448,7 +452,7 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 Requirements: Windows 10 or 11 (64-bit).
 
 - **Installer:** `ZXraw-Explorer-<version>-Setup-x64.exe`. Installs for your user only, so no
-  admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus.
+  admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus, with *Open in new ZXraw window* on Shift+right-click.
 - **Portable:** `ZXraw-Explorer-<version>-x64.zip`. Unzip anywhere and run `zxraw.exe`.
 
 Builds will be published on the [Releases](../../releases) page. The app isn't code-signed yet,

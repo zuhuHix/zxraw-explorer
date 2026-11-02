@@ -1,0 +1,1453 @@
+//! One window per user session: a second launch hands its paths to the running window.
+//!
+//! The running window owns a named pipe, `\\.\pipe\ZXrawExplorer-<SID>-<session>-<IL>-<tag>`:
+//! the user's SID, the Terminal Services session, the integrity level (RID) and a tag that
+//! separates installed, development and test builds. A launch first tries to create that pipe
+//! with `FILE_FLAG_FIRST_PIPE_INSTANCE`; Windows lets exactly one process do that, so this is
+//! the first-instance test, with no window search and no separate mutex. The loser connects
+//! as a client, sends an [encoded request](encode_request) and waits for the answer.
+//!
+//! Why a pipe rather than `WM_COPYDATA` to a found window: the pipe exists from the first
+//! moments of startup (before the window), so requests that arrive while the first instance
+//! is still starting are queued instead of finding no window; the receiver can ask who sent
+//! a message (`GetNamedPipeClientProcessId`) and check that process's user, session and
+//! integrity level; the sender can check the same of the receiver, so a pipe squatted by
+//! another user is never trusted; and every step has a timeout. A window message needs a
+//! uniquely findable window and a hook in the window procedure, and says nothing about the
+//! sender.
+//!
+//! Security: the pipe's DACL grants access to the current user only, its mandatory label is
+//! the owner's integrity level (no write-up from lower levels), remote clients are refused,
+//! and both ends compare user SID, session and integrity level with their own and drop the
+//! connection on any difference. Elevated and normal windows therefore never exchange
+//! requests (the integrity level is in the name as well): each forms its own group. The
+//! payload is untrusted: it is size-limited, versioned, must be valid UTF-16 without NULs,
+//! and can only carry absolute local or UNC paths, which the app only navigates to.
+//!
+//! Races: the pipe always has a listening instance while the owner runs (the next one is
+//! created before a connected one is handled), so a second launch never sees "no owner"
+//! while one exists. Requests that arrive before the window takes its first batch are
+//! queued and acknowledged. After that, a request the window does not take within
+//! [`UI_WAIT`] is withdrawn and answered "busy", so a hung window makes the sender fall back
+//! to a window of its own instead of losing the request; [`Inbox::close`] makes a closing
+//! window answer "closing" at once. The sender gives up after its timeout in every case.
+
+use std::collections::VecDeque;
+use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
+
+#[cfg(not(windows))]
+use crate::Result;
+use crate::WinError;
+
+/// Payload format version. A receiver refuses any other version.
+pub const PROTOCOL_VERSION: u32 = 1;
+/// Largest accepted request, in bytes.
+pub const MAX_PAYLOAD: usize = 64 * 1024;
+/// Most paths in one request.
+pub const MAX_PATHS: usize = 64;
+/// Longest accepted path or working directory, in UTF-16 units (the Win32 maximum).
+pub const MAX_PATH_UNITS: usize = 32_767;
+/// How long the receiver waits for a ready window to take a request before answering busy.
+pub const UI_WAIT: Duration = Duration::from_millis(1500);
+/// How long a sender waits in total before starting a window of its own.
+pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2500);
+
+const REQUEST_MAGIC: [u8; 4] = *b"ZXOR";
+const REPLY_MAGIC: [u8; 4] = *b"ZXRP";
+
+/// Why a request payload was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadError {
+    TooLarge(usize),
+    BadMagic,
+    WrongVersion(u32),
+    Truncated,
+    TrailingBytes,
+    TooManyPaths(usize),
+    StringTooLong(usize),
+    InvalidUtf16,
+    ContainsNul,
+    /// A relative path came without an absolute working directory to resolve it against.
+    NoWorkingDirectory,
+    /// Not an absolute drive or UNC path after resolving (e.g. `C:foo`, `\\.\pipe\x`).
+    NotAbsolute(String),
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge(n) => write!(f, "request of {n} bytes is over the {MAX_PAYLOAD}-byte limit"),
+            Self::BadMagic => f.write_str("not an open request"),
+            Self::WrongVersion(v) => write!(f, "request version {v}, expected {PROTOCOL_VERSION}"),
+            Self::Truncated => f.write_str("request ends early"),
+            Self::TrailingBytes => f.write_str("request has trailing bytes"),
+            Self::TooManyPaths(n) => write!(f, "{n} paths, at most {MAX_PATHS}"),
+            Self::StringTooLong(n) => write!(f, "a path of {n} UTF-16 units"),
+            Self::InvalidUtf16 => f.write_str("a path is not valid UTF-16"),
+            Self::ContainsNul => f.write_str("a path contains NUL"),
+            Self::NoWorkingDirectory => f.write_str("a relative path without a working directory"),
+            Self::NotAbsolute(p) => write!(f, "not an absolute drive or network path: {p}"),
+        }
+    }
+}
+
+impl std::error::Error for PayloadError {}
+
+/// Encodes an open request: the sender's working directory (for relative paths) and the
+/// paths as given on its command line. No paths means "just bring the window forward".
+///
+/// Layout, little-endian: magic `ZXOR`, `u32` version, the working directory, a `u32` path
+/// count, then each path. A string is a `u32` count of UTF-16 units followed by the units.
+pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<u8>, PayloadError> {
+    if paths.len() > MAX_PATHS {
+        return Err(PayloadError::TooManyPaths(paths.len()));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&REQUEST_MAGIC);
+    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    put_string(&mut out, cwd.as_os_str())?;
+    out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+    for path in paths {
+        put_string(&mut out, path.as_os_str())?;
+    }
+    if out.len() > MAX_PAYLOAD {
+        return Err(PayloadError::TooLarge(out.len()));
+    }
+    Ok(out)
+}
+
+fn put_string(out: &mut Vec<u8>, s: &std::ffi::OsStr) -> std::result::Result<(), PayloadError> {
+    let units = wide_units(s);
+    if units.len() > MAX_PATH_UNITS {
+        return Err(PayloadError::StringTooLong(units.len()));
+    }
+    out.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wide_units(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().collect()
+}
+
+#[cfg(not(windows))]
+fn wide_units(s: &std::ffi::OsStr) -> Vec<u16> {
+    s.to_string_lossy().encode_utf16().collect()
+}
+
+/// Decodes and validates a request into the absolute paths to open (empty: only bring the
+/// window forward). Relative paths are resolved against the sender's working directory.
+pub fn decode_request(bytes: &[u8]) -> std::result::Result<Vec<PathBuf>, PayloadError> {
+    if bytes.len() > MAX_PAYLOAD {
+        return Err(PayloadError::TooLarge(bytes.len()));
+    }
+    let mut r = Reader(bytes);
+    if r.take(4)? != REQUEST_MAGIC {
+        return Err(PayloadError::BadMagic);
+    }
+    let version = r.u32()?;
+    if version != PROTOCOL_VERSION {
+        return Err(PayloadError::WrongVersion(version));
+    }
+    let cwd = r.string()?;
+    let count = r.u32()? as usize;
+    if count > MAX_PATHS {
+        return Err(PayloadError::TooManyPaths(count));
+    }
+    let mut raw = Vec::with_capacity(count);
+    for _ in 0..count {
+        raw.push(r.string()?);
+    }
+    if !r.0.is_empty() {
+        return Err(PayloadError::TrailingBytes);
+    }
+    let cwd = (!cwd.is_empty()).then(|| PathBuf::from(cwd));
+    if let Some(cwd) = &cwd
+        && !is_plain_absolute(cwd)
+    {
+        return Err(PayloadError::NotAbsolute(cwd.display().to_string()));
+    }
+    raw.into_iter()
+        .map(|p| resolve(cwd.as_deref(), &p))
+        .collect()
+}
+
+/// `path` as an absolute path: kept if it already is one, else joined to `cwd`.
+fn resolve(cwd: Option<&Path>, path: &str) -> std::result::Result<PathBuf, PayloadError> {
+    let path = Path::new(path);
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        // `\foo` keeps cwd's drive; `C:foo` (drive-relative) replaces cwd and stays relative,
+        // so it is refused below.
+        cwd.ok_or(PayloadError::NoWorkingDirectory)?.join(path)
+    };
+    if is_plain_absolute(&resolved) {
+        Ok(resolved)
+    } else {
+        Err(PayloadError::NotAbsolute(path.display().to_string()))
+    }
+}
+
+/// An absolute drive (`C:\`) or UNC (`\\server\share`) path, also in their `\\?\` forms.
+/// Device paths (`\\.\…`, `\\?\GLOBALROOT\…`) are refused: they name no folder to open.
+fn is_plain_absolute(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => matches!(
+            prefix.kind(),
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(..) | Prefix::VerbatimUNC(..)
+        ),
+        // Only reachable off Windows, where `/` paths are absolute (unit tests).
+        _ => !cfg!(windows),
+    }
+}
+
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> std::result::Result<&'a [u8], PayloadError> {
+        if self.0.len() < n {
+            return Err(PayloadError::Truncated);
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn u32(&mut self) -> std::result::Result<u32, PayloadError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn string(&mut self) -> std::result::Result<String, PayloadError> {
+        let units = self.u32()? as usize;
+        if units > MAX_PATH_UNITS {
+            return Err(PayloadError::StringTooLong(units));
+        }
+        let bytes = self.take(units * 2)?;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        if wide.contains(&0) {
+            return Err(PayloadError::ContainsNul);
+        }
+        String::from_utf16(&wide).map_err(|_| PayloadError::InvalidUtf16)
+    }
+}
+
+/// The receiver's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    /// Queued for the window (taken, or held until the starting window is ready).
+    Accepted,
+    /// The window did not take it in time (hung or blocked); it was withdrawn.
+    Busy,
+    /// The window is closing.
+    Closing,
+    /// The payload was invalid.
+    Rejected,
+}
+
+impl Reply {
+    fn encode(self) -> [u8; 8] {
+        let code: u32 = match self {
+            Self::Accepted => 0,
+            Self::Busy => 1,
+            Self::Closing => 2,
+            Self::Rejected => 3,
+        };
+        let mut out = [0; 8];
+        out[..4].copy_from_slice(&REPLY_MAGIC);
+        out[4..].copy_from_slice(&code.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 8 || bytes[..4] != REPLY_MAGIC {
+            return None;
+        }
+        match u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) {
+            0 => Some(Self::Accepted),
+            1 => Some(Self::Busy),
+            2 => Some(Self::Closing),
+            3 => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+type Waker = Box<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct InboxState {
+    queue: VecDeque<(u64, Vec<PathBuf>)>,
+    next_id: u64,
+    /// The window has taken requests at least once: from then on, an untaken request means
+    /// the window is not responding.
+    ready: bool,
+    closing: bool,
+}
+
+/// Requests received for the window, in arrival order. The pipe threads add to it; the
+/// window takes from it every frame ([`Inbox::take`]).
+#[derive(Default)]
+pub struct Inbox {
+    state: Mutex<InboxState>,
+    taken: Condvar,
+    waker: Mutex<Option<Waker>>,
+    /// The window to restore and bring to the front, as an `HWND` value; 0 = none yet.
+    window: std::sync::atomic::AtomicIsize,
+}
+
+impl Inbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Called when a request arrives, from a pipe thread (e.g. to request a repaint).
+    pub fn set_waker(&self, waker: impl Fn() + Send + Sync + 'static) {
+        *self.waker.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(waker));
+    }
+
+    /// The window that each request restores and brings to the front.
+    pub fn set_window(&self, hwnd: isize) {
+        self.window.store(hwnd, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Takes every waiting request (each a list of paths; empty = focus only) and marks the
+    /// window ready.
+    pub fn take(&self) -> Vec<Vec<PathBuf>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.ready = true;
+        let taken: Vec<_> = state.queue.drain(..).map(|(_, paths)| paths).collect();
+        drop(state);
+        self.taken.notify_all();
+        taken
+    }
+
+    /// From now on, requests are answered [`Reply::Closing`] so their senders start their
+    /// own window. Requests already queued stay (the window may still take them).
+    pub fn close(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closing = true;
+        self.taken.notify_all();
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closing
+    }
+
+    /// Queues `paths` and answers for the window: see [`Reply`].
+    pub fn deliver(&self, paths: Vec<PathBuf>, ui_wait: Duration) -> Reply {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closing {
+            return Reply::Closing;
+        }
+        let id = state.next_id;
+        state.next_id += 1;
+        state.queue.push_back((id, paths));
+        let ready = state.ready;
+        drop(state);
+        if let Some(wake) = &*self.waker.lock().unwrap_or_else(|p| p.into_inner()) {
+            wake();
+        }
+        self.bring_to_front();
+        if !ready {
+            // Still starting: held until the window takes its first batch.
+            return Reply::Accepted;
+        }
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut state, _) = self
+            .taken
+            .wait_timeout_while(state, ui_wait, |s| {
+                !s.closing && s.queue.iter().any(|(queued, _)| *queued == id)
+            })
+            .unwrap_or_else(|p| p.into_inner());
+        match state.queue.iter().position(|(queued, _)| *queued == id) {
+            None => Reply::Accepted,
+            Some(i) => {
+                state.queue.remove(i);
+                if state.closing { Reply::Closing } else { Reply::Busy }
+            }
+        }
+    }
+
+    /// Restores the window if minimized and brings it to the front. Asynchronous, so a hung
+    /// window cannot block the pipe thread. The sender called `AllowSetForegroundWindow`
+    /// for this process first, so Windows lets it take the foreground.
+    fn bring_to_front(&self) {
+        let hwnd = self.window.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(windows)]
+        if hwnd != 0 {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+            };
+            let hwnd = HWND(hwnd as *mut core::ffi::c_void);
+            unsafe {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                }
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = hwnd;
+    }
+}
+
+/// The result of [`claim_or_forward`].
+pub enum Startup {
+    /// This process owns the pipe and should open its window.
+    Primary(Server),
+    /// The running window took the request; this process should exit.
+    Forwarded,
+    /// Open a window of its own; the text says why forwarding did not happen.
+    Standalone(String),
+}
+
+/// Why forwarding failed.
+#[derive(Debug)]
+pub enum ForwardError {
+    /// No process owns the pipe (it may have just exited).
+    NoServer,
+    /// The owner is another user, session or integrity level.
+    Untrusted(String),
+    TimedOut(&'static str),
+    Refused(Reply),
+    Failed(WinError),
+}
+
+impl std::fmt::Display for ForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoServer => f.write_str("no running window"),
+            Self::Untrusted(why) => write!(f, "the pipe's owner is not trusted: {why}"),
+            Self::TimedOut(step) => write!(f, "the running window did not answer in time ({step})"),
+            Self::Refused(Reply::Busy) => f.write_str("the running window is not responding"),
+            Self::Refused(Reply::Closing) => f.write_str("the running window is closing"),
+            Self::Refused(reply) => write!(f, "the running window refused the request ({reply:?})"),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Becomes the pipe's owner, or hands `request` (from [`encode_request`]) to the owner.
+/// Retries while the owner seems to have just exited, up to `timeout` in total.
+pub fn claim_or_forward(
+    channel: &Channel,
+    inbox: std::sync::Arc<Inbox>,
+    request: &[u8],
+    timeout: Duration,
+) -> Startup {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match Server::claim(channel, inbox.clone()) {
+            Ok(Some(server)) => return Startup::Primary(server),
+            Ok(None) => {}
+            Err(e) => return Startup::Standalone(format!("could not create the instance pipe: {e}")),
+        }
+        match forward(channel, request, deadline) {
+            Ok(()) => return Startup::Forwarded,
+            Err(ForwardError::NoServer) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Startup::Standalone(e.to_string()),
+        }
+    }
+}
+
+/// Keeps trying to become the pipe's owner in the background (e.g. after the previous owner
+/// was closing), for up to `for_how_long`, then serves until `inbox` is closed.
+pub fn claim_later(channel: Channel, inbox: std::sync::Arc<Inbox>, for_how_long: Duration) {
+    let spawned = std::thread::Builder::new()
+        .name("instance-claim".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + for_how_long;
+            while std::time::Instant::now() < deadline && !inbox.is_closing() {
+                match Server::claim(&channel, inbox.clone()) {
+                    Ok(Some(server)) => {
+                        tracing::info!("now receiving launches from other instances");
+                        while !inbox.is_closing() {
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        drop(server);
+                        return;
+                    }
+                    Ok(None) => std::thread::sleep(Duration::from_secs(1)),
+                    Err(e) => {
+                        tracing::warn!("could not create the instance pipe: {e}");
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("could not start the instance claim thread: {e}");
+    }
+}
+
+#[cfg(windows)]
+pub use imp::{Channel, Server, forward};
+
+#[cfg(windows)]
+mod imp {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
+        ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
+        GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
+    };
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSECURITY_DESCRIPTOR,
+        SECURITY_ATTRIBUTES, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
+        TokenUser,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT, WriteFile,
+    };
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+    use windows::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
+        GetNamedPipeServerProcessId, PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, SetNamedPipeHandleState,
+        WaitNamedPipeW,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::{
+        CreateEventW, GetCurrentProcessId, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION, SetEvent, WaitForMultipleObjects,
+        WaitForSingleObject,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+    use windows::core::{HRESULT, PCWSTR, PWSTR};
+
+    use super::{ForwardError, Inbox, MAX_PAYLOAD, Reply, UI_WAIT, decode_request};
+    use crate::{Result, WinError};
+
+    /// How long the receiver waits for a connected client's request, and for its own reply
+    /// to be read.
+    const READ_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Connections handled at once; more are dropped (their senders fall back).
+    const MAX_HANDLERS: usize = 16;
+
+    fn is(e: &windows::core::Error, code: windows::Win32::Foundation::WIN32_ERROR) -> bool {
+        e.code() == HRESULT::from_win32(code.0)
+    }
+
+    /// A kernel handle closed on drop.
+    struct Owned(HANDLE);
+    // A kernel handle may be used and closed from any thread.
+    unsafe impl Send for Owned {}
+    unsafe impl Sync for Owned {}
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    /// Who a process runs as: compared on both ends of the pipe.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Identity {
+        sid: String,
+        session: u32,
+        /// Mandatory integrity level RID (0x2000 medium, 0x3000 high).
+        integrity: u32,
+    }
+
+    fn identity_of(pid: u32) -> Result<Identity> {
+        unsafe {
+            let process = Owned(
+                OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                    .map_err(|e| crate::api_err("OpenProcess", e))?,
+            );
+            let mut token = HANDLE::default();
+            OpenProcessToken(process.0, TOKEN_QUERY, &mut token)
+                .map_err(|e| crate::api_err("OpenProcessToken", e))?;
+            let token = Owned(token);
+            let user = token_info(token.0, TokenUser)?;
+            let user = &*(user.as_ptr() as *const TOKEN_USER);
+            let mut text = PWSTR::null();
+            ConvertSidToStringSidW(user.User.Sid, &mut text)
+                .map_err(|e| crate::api_err("ConvertSidToStringSidW", e))?;
+            let sid = text.to_string().unwrap_or_default();
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            let label = token_info(token.0, TokenIntegrityLevel)?;
+            let label = &*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+            let count = *GetSidSubAuthorityCount(label.Label.Sid);
+            let integrity = *GetSidSubAuthority(label.Label.Sid, u32::from(count.saturating_sub(1)));
+            let mut session = 0;
+            ProcessIdToSessionId(pid, &mut session)
+                .map_err(|e| crate::api_err("ProcessIdToSessionId", e))?;
+            Ok(Identity { sid, session, integrity })
+        }
+    }
+
+    /// A token information block, in a buffer aligned for the structure it holds.
+    unsafe fn token_info(
+        token: HANDLE,
+        class: windows::Win32::Security::TOKEN_INFORMATION_CLASS,
+    ) -> Result<Vec<u64>> {
+        let mut len = 0;
+        let _ = unsafe { GetTokenInformation(token, class, None, 0, &mut len) };
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        unsafe {
+            GetTokenInformation(token, class, Some(buf.as_mut_ptr().cast()), len, &mut len)
+        }
+        .map_err(|e| crate::api_err("GetTokenInformation", e))?;
+        Ok(buf)
+    }
+
+    /// The pipe for one user, session, integrity level and tag.
+    #[derive(Debug, Clone)]
+    pub struct Channel {
+        name: Vec<u16>,
+        display: String,
+        me: Identity,
+    }
+
+    impl Channel {
+        /// The channel of the current process. `tag` separates builds (installed, dev,
+        /// tests): 1 to 48 characters from `A-Z a-z 0-9 . _ -`.
+        pub fn current(tag: &str) -> Result<Self> {
+            if tag.is_empty()
+                || tag.len() > 48
+                || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(WinError::Invalid(format!("instance tag {tag:?}")));
+            }
+            let me = identity_of(unsafe { GetCurrentProcessId() })?;
+            let display = format!(
+                r"\\.\pipe\ZXrawExplorer-{}-{}-{:x}-{tag}",
+                me.sid, me.session, me.integrity
+            );
+            Ok(Self { name: crate::to_wide(&display), display, me })
+        }
+
+        pub fn pipe_name(&self) -> &str {
+            &self.display
+        }
+
+        /// Whether some process owns the pipe and has an instance free, without connecting.
+        pub fn is_owned(&self) -> bool {
+            unsafe { WaitNamedPipeW(PCWSTR(self.name.as_ptr()), 1) }.as_bool()
+        }
+
+        /// The other end is this user, in this session, at this integrity level.
+        fn check(&self, pid: u32) -> std::result::Result<(), String> {
+            let them = identity_of(pid).map_err(|e| format!("process {pid}: {e}"))?;
+            if them.sid != self.me.sid {
+                Err(format!("process {pid} runs as another user"))
+            } else if them.session != self.me.session {
+                Err(format!("process {pid} is in session {}", them.session))
+            } else if them.integrity != self.me.integrity {
+                Err(format!(
+                    "process {pid} runs at integrity level {:#x}, this one at {:#x}",
+                    them.integrity, self.me.integrity
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Owner-only DACL; the mandatory label is this process's level, so lower levels
+        /// cannot write to the pipe.
+        fn security_descriptor(&self, labelled: bool) -> Result<SecurityDescriptor> {
+            let mut sddl = format!("D:P(A;;GA;;;{})", self.me.sid);
+            if labelled {
+                sddl.push_str(&format!("S:(ML;;NW;;;S-1-16-{})", self.me.integrity));
+            }
+            let wide = crate::to_wide(&sddl);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    PCWSTR(wide.as_ptr()),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    None,
+                )
+            }
+            .map_err(|e| crate::api_err("ConvertStringSecurityDescriptorToSecurityDescriptorW", e))?;
+            Ok(SecurityDescriptor(sd))
+        }
+    }
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    // Read-only after creation; freed once.
+    unsafe impl Send for SecurityDescriptor {}
+    unsafe impl Sync for SecurityDescriptor {}
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(self.0.0)));
+            }
+        }
+    }
+
+    /// Creates one instance of the pipe. `Ok(None)`: `first` was asked and another process
+    /// owns the name.
+    fn create_instance(
+        channel: &Channel,
+        sd: &SecurityDescriptor,
+        first: bool,
+    ) -> Result<Option<Owned>> {
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0.0,
+            bInheritHandle: false.into(),
+        };
+        let mut open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+        if first {
+            open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+        }
+        let handle = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(channel.name.as_ptr()),
+                open_mode,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_UNLIMITED_INSTANCES,
+                4096,
+                MAX_PAYLOAD as u32,
+                0,
+                Some(&attributes),
+            )
+        };
+        if handle.is_invalid() {
+            let error = unsafe { GetLastError() };
+            // Another process created the first instance (or squats the name).
+            if first && (error == ERROR_ACCESS_DENIED || error == ERROR_PIPE_BUSY) {
+                return Ok(None);
+            }
+            return Err(WinError::Api {
+                op: "CreateNamedPipeW",
+                code: error.0,
+                message: windows::core::Error::from(error).message(),
+            });
+        }
+        Ok(Some(Owned(handle)))
+    }
+
+    /// The pipe's owner: accepts connections on a background thread until dropped.
+    pub struct Server {
+        stop: Arc<Owned>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        name: String,
+    }
+
+    impl Server {
+        /// Creates the pipe's first instance and starts accepting, or returns `None` when
+        /// another process already owns the pipe.
+        pub fn claim(channel: &Channel, inbox: Arc<Inbox>) -> Result<Option<Server>> {
+            // A label above what the process may set fails; the DACL and the identity
+            // checks still hold without it.
+            let (sd, first) = match channel.security_descriptor(true).and_then(|sd| {
+                create_instance(channel, &sd, true).map(|first| (sd, first))
+            }) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::debug!("instance pipe with a label failed ({e}); trying without");
+                    let sd = channel.security_descriptor(false)?;
+                    let first = create_instance(channel, &sd, true)?;
+                    (sd, first)
+                }
+            };
+            let Some(first) = first else {
+                return Ok(None);
+            };
+            let stop = Arc::new(Owned(
+                unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+                    .map_err(|e| crate::api_err("CreateEventW", e))?,
+            ));
+            let thread = {
+                let stop = stop.clone();
+                let channel = channel.clone();
+                std::thread::Builder::new()
+                    .name("instance-pipe".into())
+                    .spawn(move || accept_loop(channel, sd, first, stop, inbox))
+                    .map_err(|e| WinError::Invalid(format!("could not start the pipe thread: {e}")))?
+            };
+            Ok(Some(Server {
+                stop,
+                thread: Some(thread),
+                name: channel.display.clone(),
+            }))
+        }
+
+        pub fn pipe_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = SetEvent(self.stop.0);
+            }
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn accept_loop(
+        channel: Channel,
+        sd: SecurityDescriptor,
+        mut current: Owned,
+        stop: Arc<Owned>,
+        inbox: Arc<Inbox>,
+    ) {
+        let handlers = Arc::new(AtomicUsize::new(0));
+        loop {
+            match connect(&current, &stop) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    tracing::warn!("instance pipe: waiting for a connection failed: {e}");
+                    return;
+                }
+            }
+            // The next instance exists before this one is handled, so a launch never finds
+            // the pipe missing while this process owns it.
+            let next = loop {
+                match create_instance(&channel, &sd, false) {
+                    Ok(Some(next)) => break next,
+                    Ok(None) => unreachable!("only the first instance can be refused"),
+                    Err(e) => {
+                        tracing::warn!("instance pipe: creating the next instance failed: {e}");
+                        if unsafe { WaitForSingleObject(stop.0, 500) } == WAIT_OBJECT_0 {
+                            return;
+                        }
+                    }
+                }
+            };
+            let connected = std::mem::replace(&mut current, next);
+            if handlers.fetch_add(1, Ordering::SeqCst) >= MAX_HANDLERS {
+                handlers.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!("instance pipe: too many connections at once; dropping one");
+                continue;
+            }
+            let (channel, inbox, handlers) = (channel.clone(), inbox.clone(), handlers.clone());
+            let spawned = std::thread::Builder::new()
+                .name("instance-request".into())
+                .spawn(move || {
+                    handle(&channel, connected, &inbox);
+                    handlers.fetch_sub(1, Ordering::SeqCst);
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("instance pipe: could not start a handler: {e}");
+            }
+        }
+    }
+
+    /// Waits for a client on `pipe`. `Ok(false)`: `stop` was signalled.
+    fn connect(pipe: &Owned, stop: &Owned) -> Result<bool> {
+        let event = Owned(
+            unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+                .map_err(|e| crate::api_err("CreateEventW", e))?,
+        );
+        let mut ov = OVERLAPPED { hEvent: event.0, ..Default::default() };
+        match unsafe { ConnectNamedPipe(pipe.0, Some(&mut ov)) } {
+            Ok(()) => return Ok(true),
+            Err(e) if is(&e, ERROR_PIPE_CONNECTED) => return Ok(true),
+            Err(e) if is(&e, ERROR_IO_PENDING) => {}
+            Err(e) => return Err(crate::api_err("ConnectNamedPipe", e)),
+        }
+        let wait = unsafe { WaitForMultipleObjects(&[event.0, stop.0], false, u32::MAX) };
+        if wait == WAIT_OBJECT_0 {
+            let mut n = 0;
+            unsafe { GetOverlappedResult(pipe.0, &ov, &mut n, false) }
+                .map_err(|e| crate::api_err("ConnectNamedPipe", e))?;
+            Ok(true)
+        } else {
+            unsafe {
+                let _ = CancelIoEx(pipe.0, Some(&ov));
+                let mut n = 0;
+                let _ = GetOverlappedResult(pipe.0, &ov, &mut n, true);
+            }
+            Ok(false)
+        }
+    }
+
+    enum IoError {
+        TimedOut,
+        MoreData,
+        Os(windows::core::Error),
+    }
+
+    /// Runs one overlapped read or write on `handle`, cancelling it after `timeout`.
+    fn overlapped(
+        handle: HANDLE,
+        timeout: Duration,
+        start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+    ) -> std::result::Result<u32, IoError> {
+        let event = Owned(unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(IoError::Os)?);
+        let mut ov = OVERLAPPED { hEvent: event.0, ..Default::default() };
+        match start(&mut ov) {
+            Ok(()) => {}
+            Err(e) if is(&e, ERROR_IO_PENDING) => {}
+            Err(e) if is(&e, ERROR_MORE_DATA) => return Err(IoError::MoreData),
+            Err(e) => return Err(IoError::Os(e)),
+        }
+        let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        if unsafe { WaitForSingleObject(event.0, ms) } != WAIT_OBJECT_0 {
+            unsafe {
+                let _ = CancelIoEx(handle, Some(&ov));
+                let mut n = 0;
+                let _ = GetOverlappedResult(handle, &ov, &mut n, true);
+            }
+            return Err(IoError::TimedOut);
+        }
+        let mut n = 0;
+        match unsafe { GetOverlappedResult(handle, &ov, &mut n, false) } {
+            Ok(()) => Ok(n),
+            Err(e) if is(&e, ERROR_MORE_DATA) => Err(IoError::MoreData),
+            Err(e) => Err(IoError::Os(e)),
+        }
+    }
+
+    fn read_message(handle: HANDLE, max: usize, timeout: Duration) -> std::result::Result<Vec<u8>, IoError> {
+        let mut buf = vec![0u8; max];
+        let n = overlapped(handle, timeout, |ov| unsafe {
+            ReadFile(handle, Some(&mut buf), None, Some(ov))
+        })?;
+        buf.truncate(n as usize);
+        Ok(buf)
+    }
+
+    fn write_message(handle: HANDLE, bytes: &[u8], timeout: Duration) -> std::result::Result<(), IoError> {
+        let n = overlapped(handle, timeout, |ov| unsafe {
+            WriteFile(handle, Some(bytes), None, Some(ov))
+        })?;
+        if n as usize == bytes.len() {
+            Ok(())
+        } else {
+            Err(IoError::Os(windows::core::Error::from(ERROR_BROKEN_PIPE)))
+        }
+    }
+
+    /// One connection: check the sender, read and validate its request, hand it to the
+    /// window and answer.
+    fn handle(channel: &Channel, pipe: Owned, inbox: &Inbox) {
+        let mut pid = 0;
+        if let Err(e) = unsafe { GetNamedPipeClientProcessId(pipe.0, &mut pid) } {
+            tracing::warn!("instance pipe: unknown sender: {e}");
+            return;
+        }
+        if let Err(why) = channel.check(pid) {
+            tracing::warn!("instance pipe: refused a request: {why}");
+            return;
+        }
+        let reply = match read_message(pipe.0, MAX_PAYLOAD, READ_TIMEOUT) {
+            Ok(bytes) => match decode_request(&bytes) {
+                Ok(paths) => {
+                    tracing::info!("received a launch with {} path(s) from process {pid}", paths.len());
+                    inbox.deliver(paths, UI_WAIT)
+                }
+                Err(e) => {
+                    tracing::warn!("instance pipe: invalid request from process {pid}: {e}");
+                    Reply::Rejected
+                }
+            },
+            Err(IoError::MoreData) => {
+                tracing::warn!("instance pipe: request from process {pid} is too large");
+                Reply::Rejected
+            }
+            Err(IoError::TimedOut) => {
+                tracing::warn!("instance pipe: process {pid} sent nothing");
+                return;
+            }
+            Err(IoError::Os(e)) => {
+                tracing::warn!("instance pipe: reading from process {pid} failed: {e}");
+                return;
+            }
+        };
+        if write_message(pipe.0, &reply.encode(), READ_TIMEOUT).is_err() {
+            tracing::warn!("instance pipe: could not answer process {pid}");
+            return;
+        }
+        // Closing before the sender has read the answer could discard it: wait until the
+        // sender closes its end (the read then fails with a broken pipe).
+        let _ = read_message(pipe.0, 16, READ_TIMEOUT);
+    }
+
+    /// Sends `request` to the pipe's owner and waits for its answer, until `deadline`.
+    pub fn forward(
+        channel: &Channel,
+        request: &[u8],
+        deadline: Instant,
+    ) -> std::result::Result<(), ForwardError> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let pipe = loop {
+            let opened = unsafe {
+                CreateFileW(
+                    PCWSTR(channel.name.as_ptr()),
+                    (GENERIC_READ | GENERIC_WRITE).0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    // The owner may only identify this process, never act as it.
+                    FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                    None,
+                )
+            };
+            match opened {
+                Ok(handle) => break Owned(handle),
+                Err(e) if is(&e, ERROR_FILE_NOT_FOUND) => return Err(ForwardError::NoServer),
+                Err(e) if is(&e, ERROR_PIPE_BUSY) => {
+                    let ms = remaining().as_millis().min(u128::from(u32::MAX - 1)) as u32;
+                    if ms == 0 {
+                        return Err(ForwardError::TimedOut("connecting"));
+                    }
+                    // Returns early when an instance is free, or false on timeout or when
+                    // the pipe vanished; the next CreateFileW tells which.
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(channel.name.as_ptr()), ms.min(250)) };
+                }
+                Err(e) => return Err(ForwardError::Failed(crate::api_err("CreateFileW", e))),
+            }
+        };
+        let mode = PIPE_READMODE_MESSAGE;
+        unsafe { SetNamedPipeHandleState(pipe.0, Some(&mode), None, None) }
+            .map_err(|e| ForwardError::Failed(crate::api_err("SetNamedPipeHandleState", e)))?;
+        let mut server_pid = 0;
+        unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) }
+            .map_err(|e| ForwardError::Failed(crate::api_err("GetNamedPipeServerProcessId", e)))?;
+        channel.check(server_pid).map_err(ForwardError::Untrusted)?;
+        // This process was just started by the user, so it may hand the foreground on.
+        if let Err(e) = unsafe { AllowSetForegroundWindow(server_pid) } {
+            tracing::debug!("AllowSetForegroundWindow({server_pid}) failed: {e}");
+        }
+        let io = |e: IoError, step: &'static str| match e {
+            IoError::TimedOut => ForwardError::TimedOut(step),
+            IoError::MoreData => ForwardError::Failed(WinError::Invalid("oversized reply".into())),
+            IoError::Os(e) => ForwardError::Failed(crate::api_err("pipe I/O", e)),
+        };
+        write_message(pipe.0, request, remaining()).map_err(|e| io(e, "sending"))?;
+        let answer = read_message(pipe.0, 64, remaining()).map_err(|e| io(e, "waiting for the answer"))?;
+        match Reply::decode(&answer) {
+            Some(Reply::Accepted) => Ok(()),
+            Some(reply) => Err(ForwardError::Refused(reply)),
+            None => Err(ForwardError::Failed(WinError::Invalid("unreadable answer".into()))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_integrity() -> u32 {
+        identity_of(unsafe { GetCurrentProcessId() }).unwrap().integrity
+    }
+
+    #[cfg(test)]
+    pub(super) fn raw_send(channel: &Channel, bytes: &[u8]) -> Option<Reply> {
+        let pipe = unsafe {
+            CreateFileW(
+                PCWSTR(channel.name.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                None,
+            )
+        }
+        .ok()
+        .map(Owned)?;
+        let mode = PIPE_READMODE_MESSAGE;
+        unsafe { SetNamedPipeHandleState(pipe.0, Some(&mode), None, None) }.ok()?;
+        write_message(pipe.0, bytes, Duration::from_secs(2)).ok()?;
+        Reply::decode(&read_message(pipe.0, 64, Duration::from_secs(3)).ok()?)
+    }
+}
+
+/// Off Windows there is no instance pipe: every launch opens its own window.
+#[cfg(not(windows))]
+mod imp_stub {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    pub struct Channel;
+
+    impl Channel {
+        pub fn current(_tag: &str) -> Result<Self> {
+            Err(WinError::Unsupported)
+        }
+        pub fn pipe_name(&self) -> &str {
+            ""
+        }
+        pub fn is_owned(&self) -> bool {
+            false
+        }
+    }
+
+    pub struct Server;
+
+    impl Server {
+        pub fn claim(_channel: &Channel, _inbox: std::sync::Arc<Inbox>) -> Result<Option<Server>> {
+            Err(WinError::Unsupported)
+        }
+        pub fn pipe_name(&self) -> &str {
+            ""
+        }
+    }
+
+    pub fn forward(
+        _channel: &Channel,
+        _request: &[u8],
+        _deadline: std::time::Instant,
+    ) -> std::result::Result<(), ForwardError> {
+        Err(ForwardError::Failed(WinError::Unsupported))
+    }
+}
+
+#[cfg(not(windows))]
+pub use imp_stub::{Channel, Server, forward};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn units(s: &str) -> Vec<u8> {
+        let mut out = (s.encode_utf16().count() as u32).to_le_bytes().to_vec();
+        for u in s.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out
+    }
+
+    fn raw(version: u32, cwd: &[u8], paths: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = REQUEST_MAGIC.to_vec();
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(cwd);
+        out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+        for p in paths {
+            out.extend_from_slice(p);
+        }
+        out
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn round_trip_keeps_absolute_paths_and_resolves_relative_ones() {
+        let bytes = encode_request(
+            Path::new(r"C:\Users\me\Desktop"),
+            &[
+                PathBuf::from(r"D:\Photos"),
+                PathBuf::from("Trip"),
+                PathBuf::from(r"..\Other\a.jpg"),
+                PathBuf::from(r"\Root"),
+                PathBuf::from(r"\\server\share\x"),
+                PathBuf::from("Ünïcödé 📷"),
+            ],
+        )
+        .unwrap();
+        let paths = decode_request(&bytes).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"D:\Photos"),
+                PathBuf::from(r"C:\Users\me\Desktop\Trip"),
+                PathBuf::from(r"C:\Users\me\Desktop\..\Other\a.jpg"),
+                PathBuf::from(r"C:\Root"),
+                PathBuf::from(r"\\server\share\x"),
+                PathBuf::from(r"C:\Users\me\Desktop\Ünïcödé 📷"),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_paths_means_focus_only() {
+        let bytes = encode_request(Path::new(""), &[]).unwrap();
+        assert_eq!(decode_request(&bytes).unwrap(), Vec::<PathBuf>::new());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn relative_paths_need_an_absolute_working_directory() {
+        let bytes = raw(1, &units(""), &[units("Trip")]);
+        assert_eq!(decode_request(&bytes), Err(PayloadError::NoWorkingDirectory));
+        let bytes = raw(1, &units("relative"), &[units(r"C:\x")]);
+        assert!(matches!(decode_request(&bytes), Err(PayloadError::NotAbsolute(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_and_device_paths_are_refused() {
+        for bad in [r"C:foo", r"\\.\pipe\other", r"\\?\GLOBALROOT\Device\HarddiskVolume1"] {
+            let bytes = raw(1, &units(r"D:\work"), &[units(bad)]);
+            assert!(
+                matches!(decode_request(&bytes), Err(PayloadError::NotAbsolute(_))),
+                "{bad} was accepted"
+            );
+        }
+        let bytes = raw(1, &units(r"D:\work"), &[units(r"\\?\C:\long\path")]);
+        assert_eq!(decode_request(&bytes).unwrap(), vec![PathBuf::from(r"\\?\C:\long\path")]);
+    }
+
+    #[test]
+    fn wrong_version_and_magic_are_refused() {
+        assert_eq!(
+            decode_request(&raw(2, &units(""), &[])),
+            Err(PayloadError::WrongVersion(2))
+        );
+        let mut bytes = raw(1, &units(""), &[]);
+        bytes[0] = b'X';
+        assert_eq!(decode_request(&bytes), Err(PayloadError::BadMagic));
+        assert_eq!(decode_request(b"ZX"), Err(PayloadError::Truncated));
+    }
+
+    #[test]
+    fn oversized_requests_are_refused_on_both_ends() {
+        let long = PathBuf::from(format!(r"C:\{}", "a".repeat(30_000)));
+        assert!(matches!(
+            encode_request(Path::new(r"C:\"), &[long.clone(), long.clone(), long]),
+            Err(PayloadError::TooLarge(_))
+        ));
+        let many = vec![PathBuf::from(r"C:\x"); MAX_PATHS + 1];
+        assert_eq!(
+            encode_request(Path::new(r"C:\"), &many),
+            Err(PayloadError::TooManyPaths(MAX_PATHS + 1))
+        );
+        assert!(matches!(
+            decode_request(&vec![0u8; MAX_PAYLOAD + 1]),
+            Err(PayloadError::TooLarge(_))
+        ));
+        let mut huge_count = raw(1, &units(""), &[]);
+        let at = huge_count.len() - 4;
+        huge_count[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            decode_request(&huge_count),
+            Err(PayloadError::TooManyPaths(u32::MAX as usize))
+        );
+        // A string length past the data is caught, not trusted.
+        let bytes = raw(1, &(u32::MAX).to_le_bytes(), &[]);
+        assert!(matches!(decode_request(&bytes), Err(PayloadError::StringTooLong(_))));
+        let bytes = raw(1, &1000u32.to_le_bytes(), &[]);
+        assert_eq!(decode_request(&bytes), Err(PayloadError::Truncated));
+    }
+
+    #[test]
+    fn junk_utf16_nul_and_trailing_bytes_are_refused() {
+        // A lone high surrogate.
+        let mut lone = 1u32.to_le_bytes().to_vec();
+        lone.extend_from_slice(&0xD800u16.to_le_bytes());
+        assert_eq!(
+            decode_request(&raw(1, &units(r"C:\"), &[lone])),
+            Err(PayloadError::InvalidUtf16)
+        );
+        assert_eq!(
+            decode_request(&raw(1, &units(r"C:\"), &[units("C:\\a\0b")])),
+            Err(PayloadError::ContainsNul)
+        );
+        let mut bytes = raw(1, &units(""), &[]);
+        bytes.push(0);
+        assert_eq!(decode_request(&bytes), Err(PayloadError::TrailingBytes));
+        // An odd byte count cannot hold the units it announces.
+        let mut odd = 1u32.to_le_bytes().to_vec();
+        odd.push(b'C');
+        assert_eq!(decode_request(&raw(1, &odd, &[])), Err(PayloadError::Truncated));
+    }
+
+    #[test]
+    fn replies_round_trip_and_junk_is_unreadable() {
+        for r in [Reply::Accepted, Reply::Busy, Reply::Closing, Reply::Rejected] {
+            assert_eq!(Reply::decode(&r.encode()), Some(r));
+        }
+        assert_eq!(Reply::decode(b"ZXRP\x09\0\0\0"), None);
+        assert_eq!(Reply::decode(b"nope"), None);
+    }
+
+    #[test]
+    fn inbox_holds_requests_until_the_window_is_ready() {
+        let inbox = Inbox::new();
+        assert_eq!(inbox.deliver(vec![PathBuf::from("a")], Duration::ZERO), Reply::Accepted);
+        assert_eq!(inbox.deliver(vec![PathBuf::from("b")], Duration::ZERO), Reply::Accepted);
+        assert_eq!(inbox.take(), vec![vec![PathBuf::from("a")], vec![PathBuf::from("b")]]);
+    }
+
+    #[test]
+    fn a_ready_window_that_never_takes_a_request_gets_busy_and_the_request_is_withdrawn() {
+        let inbox = Inbox::new();
+        inbox.take();
+        assert_eq!(inbox.deliver(vec![PathBuf::from("a")], Duration::from_millis(50)), Reply::Busy);
+        assert!(inbox.take().is_empty(), "a withdrawn request must not open later as well");
+        inbox.close();
+        assert_eq!(inbox.deliver(vec![], Duration::ZERO), Reply::Closing);
+    }
+
+    #[cfg(windows)]
+    mod pipe {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use super::super::*;
+
+        fn unique_tag(name: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            format!("test-{name}-{}-{nanos}", std::process::id())
+        }
+
+        /// Takes requests like a window would, until stopped.
+        fn window(inbox: Arc<Inbox>) -> (Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<Vec<Vec<PathBuf>>>) {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    all.extend(inbox.take());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                all.extend(inbox.take());
+                all
+            });
+            (stop, thread)
+        }
+
+        #[test]
+        fn a_second_launch_forwards_its_paths_to_the_owner() {
+            let channel = Channel::current(&unique_tag("fwd")).unwrap();
+            assert!(channel.pipe_name().contains(&format!("{:x}", imp::current_integrity())));
+            let owner_inbox = Arc::new(Inbox::new());
+            let Startup::Primary(server) =
+                claim_or_forward(&channel, owner_inbox.clone(), &[], FORWARD_TIMEOUT)
+            else {
+                panic!("the first claim must own the pipe");
+            };
+            let (stop, window) = window(owner_inbox.clone());
+            let request = encode_request(Path::new(r"C:\Users"), &[PathBuf::from("Public")]).unwrap();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Forwarded => {}
+                Startup::Primary(_) => panic!("a second owner was allowed"),
+                Startup::Standalone(why) => panic!("not forwarded: {why}"),
+            }
+            assert!(started.elapsed() < FORWARD_TIMEOUT);
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(window.join().unwrap(), vec![vec![PathBuf::from(r"C:\Users\Public")]]);
+            drop(server);
+            // Once the owner is gone, the next launch owns the pipe.
+            assert!(matches!(
+                claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT),
+                Startup::Primary(_)
+            ));
+        }
+
+        #[test]
+        fn an_unresponsive_owner_makes_the_sender_fall_back_in_time() {
+            let channel = Channel::current(&unique_tag("hung")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            // The window took one batch, then stopped taking: hung.
+            inbox.take();
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Windows")]).unwrap();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Standalone(why) => assert!(why.contains("not responding"), "{why}"),
+                _ => panic!("a hung owner must not take the request"),
+            }
+            assert!(started.elapsed() < FORWARD_TIMEOUT + Duration::from_millis(500));
+            assert!(inbox.take().is_empty(), "the withdrawn request must not open later");
+            // A closing owner answers at once.
+            inbox.close();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Standalone(why) => assert!(why.contains("closing"), "{why}"),
+                _ => panic!("a closing owner must not take the request"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn requests_sent_while_the_owner_is_starting_are_queued_not_dropped() {
+            let channel = Channel::current(&unique_tag("start")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            // The window has not taken anything yet (still starting), for longer than UI_WAIT.
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
+            assert!(forward(&channel, &request, Instant::now() + FORWARD_TIMEOUT).is_ok());
+            std::thread::sleep(UI_WAIT + Duration::from_millis(100));
+            assert_eq!(inbox.take(), vec![vec![PathBuf::from(r"C:\Users")]]);
+        }
+
+        #[test]
+        fn simultaneous_launches_are_all_delivered_to_one_owner() {
+            let channel = Channel::current(&unique_tag("race")).unwrap();
+            let senders = 6;
+            let barrier = Arc::new(std::sync::Barrier::new(senders));
+            let inboxes: Vec<_> = (0..senders).map(|_| Arc::new(Inbox::new())).collect();
+            let threads: Vec<_> = (0..senders)
+                .map(|i| {
+                    let (channel, barrier, inbox) = (channel.clone(), barrier.clone(), inboxes[i].clone());
+                    std::thread::spawn(move || {
+                        let request = encode_request(
+                            Path::new(r"C:\"),
+                            &[PathBuf::from(format!(r"C:\folder{i}"))],
+                        )
+                        .unwrap();
+                        barrier.wait();
+                        match claim_or_forward(&channel, inbox, &request, FORWARD_TIMEOUT) {
+                            Startup::Primary(server) => Some(server),
+                            Startup::Forwarded => None,
+                            Startup::Standalone(why) => panic!("sender {i} fell back: {why}"),
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            let owners: Vec<usize> = (0..senders).filter(|&i| results[i].is_some()).collect();
+            assert_eq!(owners.len(), 1, "exactly one launch owns the pipe");
+            let owner = owners[0];
+            let mut received: Vec<PathBuf> = inboxes[owner].take().into_iter().flatten().collect();
+            received.sort();
+            let mut expected: Vec<PathBuf> = (0..senders)
+                .filter(|&i| i != owner)
+                .map(|i| PathBuf::from(format!(r"C:\folder{i}")))
+                .collect();
+            expected.sort();
+            assert_eq!(received, expected, "every forwarded path arrives exactly once");
+        }
+
+        #[test]
+        fn invalid_payloads_are_rejected_and_never_queued() {
+            let channel = Channel::current(&unique_tag("junk")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            assert_eq!(imp::raw_send(&channel, b"definitely not a request"), Some(Reply::Rejected));
+            let mut wrong = encode_request(Path::new(r"C:\"), &[]).unwrap();
+            wrong[4] = 9;
+            assert_eq!(imp::raw_send(&channel, &wrong), Some(Reply::Rejected));
+            // Over the pipe's message limit: the receiver sees more data than it accepts.
+            assert_eq!(imp::raw_send(&channel, &vec![b'x'; MAX_PAYLOAD + 10]), Some(Reply::Rejected));
+            assert!(inbox.take().is_empty());
+        }
+
+        #[test]
+        fn bad_tags_are_refused() {
+            for tag in ["", "a/b", "has space", &"x".repeat(49)] {
+                assert!(Channel::current(tag).is_err(), "{tag:?}");
+            }
+        }
+    }
+}

@@ -30,6 +30,7 @@ mod fonts;
 mod git_status;
 mod gps_ui;
 mod ingest_ui;
+mod instance;
 mod layouts;
 mod library;
 mod media_durations;
@@ -122,12 +123,28 @@ fn main() -> eframe::Result {
 
     // Rolling daily log file; file paths are only logged at debug level.
     let file = tracing_appender::rolling::daily(&paths.logs, "zxraw.log");
-    let (writer, _guard) = tracing_appender::non_blocking(file);
+    let (writer, log_guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_env("ZXRAW_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
         .with(fmt::layer().with_writer(writer).with_ansi(false))
         .with(fmt::layer().with_writer(std::io::stderr))
         .init();
+
+    // Read early: it decides whether this launch goes to a running window, and the window
+    // opens with the chosen icon instead of switching after.
+    let startup = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"));
+    // A launch while ZXraw Explorer is running opens in that window (see `instance`). Before
+    // anything else touches the registry or the profile, so a handed-over launch is quick.
+    let (inbox, _instance_server) = match instance::startup(&instance::Launch::from_env(), &startup) {
+        instance::Decision::Exit(code) => {
+            drop(log_guard);
+            if code == 0 {
+                return Ok(());
+            }
+            std::process::exit(code);
+        }
+        instance::Decision::Run { inbox, server } => (inbox, server),
+    };
 
     #[cfg(windows)]
     if !testhook::env_requests_automation() {
@@ -194,8 +211,6 @@ fn main() -> eframe::Result {
         );
     }
 
-    // Read early so the window opens with the chosen icon instead of switching after.
-    let startup = settings::load_json::<settings::Settings>(&paths.config.join("settings.json"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("ZXraw Explorer")
         .with_inner_size([1360.0, 840.0])
@@ -249,6 +264,7 @@ fn main() -> eframe::Result {
             ..Default::default()
         };
         let app_args = app_args.clone();
+        let inbox = inbox.clone();
         eframe::run_native(
             "ZXraw Explorer",
             options,
@@ -264,6 +280,10 @@ fn main() -> eframe::Result {
                     .expect("the app is created once per run");
                 let mut app = app::ZxrawApp::new(cc, paths, pending_crash);
                 app.os_drop.handle = startup::register_drop_target(cc);
+                if let Some(inbox) = &inbox {
+                    instance::attach(cc, inbox, hidden);
+                }
+                app.instance = inbox.clone();
                 Ok(Box::new(app))
             }),
         )

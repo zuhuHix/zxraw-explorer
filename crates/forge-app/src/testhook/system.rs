@@ -12,6 +12,8 @@
 //! - `click-menu <label>`: real click on the open context menu's item `label`.
 //! - `wait-terminal <folder> [| seconds]`: wait until "Open terminal here" has (in automated
 //!   runs, only recorded) a terminal launch for `folder`.
+//! - `wait-tabs <n> [| seconds]`: wait until the window has exactly n tabs, e.g. after another
+//!   process handed it a launch (see `instance`).
 //!
 //! Copy and move queue (the transfer queue; "waiting" means queued, not running):
 //! - `pause-queue` / `resume-queue`: hold or release the queue. Waiting transfers stay queued
@@ -340,6 +342,18 @@ pub(super) fn step(
                     last.map(|l| l.cwd)
                 )),
                 _ => Ok(Flow::Wait(format!("waiting for a terminal in `{folder}`"))),
+            }
+        }
+        "wait-tabs" => {
+            let (count, timeout) = filename_and_timeout(args)?;
+            let want: usize = count.parse().map_err(|_| "expected a tab count")?;
+            let have = app.tabs.len();
+            if have == want {
+                Ok(Flow::Done)
+            } else if elapsed(st) >= timeout {
+                Err(format!("{have} tab(s), expected {want}"))
+            } else {
+                Ok(Flow::Wait(format!("waiting for {want} tab(s)")))
             }
         }
         _ => Err(format!("unknown `ui system` verb `{verb}`")),
