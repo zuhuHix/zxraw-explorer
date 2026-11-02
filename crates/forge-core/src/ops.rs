@@ -238,14 +238,28 @@ pub(crate) fn random_hex() -> String {
     format!("{:016x}", xxhash_rust::xxh3::xxh3_64(&seed))
 }
 
-/// A fresh temp file name: `.forge-partial-<random>`.
+/// Extension of our temp files (see [`partial_name`]).
+const PARTIAL_SUFFIX: &str = ".tmp";
+
+/// A fresh temp file name: `.forge-partial-<32 lowercase hex>.tmp`. The exact shape is what
+/// [`is_partial_name`] recognises, so a user's `.forge-partial-notes.txt` is never taken
+/// for one.
 pub fn partial_name() -> String {
-    format!("{PARTIAL_PREFIX}{}", random_hex())
+    format!(
+        "{PARTIAL_PREFIX}{}{}{PARTIAL_SUFFIX}",
+        random_hex(),
+        random_hex()
+    )
 }
 
-/// Is `name` one of our in-flight temp files?
+/// Is `name` exactly one of our temp file names (`.forge-partial-<32 lowercase hex>.tmp`)?
+/// Strict, because cleanup deletes what it matches.
 pub fn is_partial_name(name: &str) -> bool {
-    name.starts_with(PARTIAL_PREFIX)
+    name.strip_prefix(PARTIAL_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PARTIAL_SUFFIX))
+        .is_some_and(|hex| {
+            hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
 }
 
 #[cfg(windows)]
