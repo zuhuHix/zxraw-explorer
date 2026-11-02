@@ -752,6 +752,7 @@ mod tests {
             crc32: 0,
             method: String::new(),
             safe_name: true,
+            ..Default::default()
         }
     }
 
