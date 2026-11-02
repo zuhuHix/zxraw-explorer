@@ -12,8 +12,15 @@ const ITEM_NOTICES_MAX: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellChange {
-    Renamed { from: PathBuf, to: PathBuf, is_dir: bool },
-    Created { path: PathBuf, is_dir: bool },
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+        is_dir: bool,
+    },
+    Created {
+        path: PathBuf,
+        is_dir: bool,
+    },
     FolderUpdated(PathBuf),
 }
 
@@ -47,7 +54,10 @@ pub fn changes(report: &OpReport, folders: &[PathBuf]) -> Vec<ShellChange> {
     }
     let mut seen: Vec<&Path> = Vec::new();
     for folder in folders {
-        if !seen.iter().any(|s| forge_core::paths::paths_equal(s, folder)) {
+        if !seen
+            .iter()
+            .any(|s| forge_core::paths::paths_equal(s, folder))
+        {
             seen.push(folder);
             out.push(ShellChange::FolderUpdated(folder.clone()));
         }

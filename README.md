@@ -248,9 +248,13 @@ Explorer is a file manager designed around that workflow:
   drag them within ZXraw: they land in the folder under the pointer (a folder row, an open
   folder in the tree, a sidebar folder, or the folder the pane shows) and the target lights up while you hover.
   Within one drive they move, across drives they copy; hold <kbd>Ctrl</kbd> to copy or
-  <kbd>Shift</kbd> to move.
+  <kbd>Shift</kbd> to move. The cursor shows which one happens, and a move off the desktop
+  disappears from the desktop at once.
 - **Works with Explorer's clipboard.** Cut or copy files in Windows Explorer or on the desktop,
   then press <kbd>Ctrl</kbd>+<kbd>V</kbd> in ZXraw Explorer, and the other way round.
+- **Straight out of zip files.** Open a zip in Explorer, select files or folders and copy or
+  drag them into ZXraw Explorer: they are extracted into the folder, with their folders and
+  dates. The same works for other apps that hand out files this way, such as mail attachments.
 - **Cloud files stay in the cloud.** OneDrive, Dropbox and other online-only files are never
   downloaded in the background: thumbnails, checksums, video tools and scans skip them. Before a
   copy that would download many of them, you're told how many files and how much data, and

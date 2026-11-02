@@ -1320,15 +1320,19 @@ fn follow_cut(app: &mut ZxrawApp, pairs: &[(PathBuf, PathBuf)]) {
     set_cut_items(app, cb.generation, kept, Vec::new());
 }
 
+/// What a paste read from the Windows clipboard: its file list (`Ok(None)` without one),
+/// and whether it offers virtual files.
+type SystemClipboard = (
+    Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
+    bool,
+);
+
 fn paste_with(
     app: &mut ZxrawApp,
     dest: PathBuf,
     sequence: u32,
     owner: Option<forge_win::ClipboardToken>,
-    (files, virtual_files): (
-        Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
-        bool,
-    ),
+    (files, virtual_files): SystemClipboard,
     cut: Option<CutCheck>,
 ) {
     // Every way out of here either starts a transfer or says why it did not.

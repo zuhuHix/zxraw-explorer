@@ -139,6 +139,29 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `external_drop_with_ctrl_copies`, `external_drop_on_empty_area_goes_to_the_pane_folder`,
   `internal_drop_onto_a_child_of_an_expanded_folder_lands_in_that_folder`,
   `dropping_a_folder_onto_its_own_child_does_nothing`.
+* ✅ The window has its own OLE drop target (`forge-win/src/drop_target.rs`, in place of
+  winit's). Its answer to the drag source follows the drop rules above, so the cursor shows
+  move, copy or "no drop". A move is ours alone: the source is told it was an optimized move
+  (`DROPEFFECT_NONE` returned, "Performed DropEffect" none), so it never deletes anything
+  itself. After every copy, move and delete, Explorer and the Desktop are told what changed
+  (`SHChangeNotify`: renames, creations, folder updates), so an item moved off the Desktop
+  leaves it at once instead of when the Desktop's own watcher catches up —
+  `drop_target` unit tests (real shell data objects), `shell_sync` tests
+  (`a_move_by_rename_is_announced_as_a_rename_and_both_folders`), e2e
+  `a_file_dropped_through_the_drop_target_moves_as_an_optimized_move`,
+  `a_file_dropped_through_the_drop_target_with_ctrl_copies`,
+  `a_file_dropped_into_its_own_folder_is_refused_to_the_source`. The e2e drops call the drop
+  target's own methods with the shell's data object; no test drives a real mouse drag from
+  Explorer, and no test watches the real Desktop refresh.
+* ✅ Virtual files (`FileGroupDescriptorW` + `FileContents`, as Explorer's zip folders and mail
+  clients offer them) paste and drop: they are streamed into a hidden staging folder in the
+  destination and then moved into place like any paste (same conflict questions, report, undo
+  deletes the copies). It is always a copy. Names from the other app are checked like zip entry
+  names (no `..`, absolute or drive paths, `:` streams or device names) —
+  `forge-win/src/file_descriptor.rs` and `virtual_files.rs` tests (a real zip folder data
+  object), `virtual_copy` tests (`names_that_would_leave_the_destination_are_refused`), e2e
+  `items_copied_in_an_explorer_zip_folder_paste_into_the_folder`,
+  `items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row`.
 * ✅ Arrow keys, Page Up/Down, Home and End always move the file cursor unless a text field has
   focus, including after a toolbar or sidebar button was clicked, at the edges of the grid and
   the first row of the list, and with the preview panel open; egui no longer moves focus between

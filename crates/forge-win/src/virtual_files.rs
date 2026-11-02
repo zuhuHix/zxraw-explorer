@@ -486,7 +486,10 @@ fn set_hglobal(
         let ptr = GlobalLock(global);
         if ptr.is_null() {
             let _ = GlobalFree(Some(global));
-            return Err(crate::api_err("GlobalLock", windows::core::Error::from_thread()));
+            return Err(crate::api_err(
+                "GlobalLock",
+                windows::core::Error::from_thread(),
+            ));
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
         let _ = GlobalUnlock(global);
