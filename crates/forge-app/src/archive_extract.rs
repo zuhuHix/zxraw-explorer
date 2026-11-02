@@ -66,6 +66,8 @@ pub struct UncheckedAsk {
     request: ExtractRequest,
     count: usize,
     example: String,
+    /// The folder the first pass made and left empty: removed when the user declines.
+    remove_if_declined: Option<PathBuf>,
 }
 
 /// The extraction of only the files `report` held back for lack of a checksum, into the
@@ -304,7 +306,8 @@ fn selection_dest(place: Place, count: usize) -> SelectionDest {
 }
 
 enum Outcome {
-    Done(ExtractReport),
+    /// The report, and whether the extraction made its destination folder.
+    Done(ExtractReport, bool),
     Asked(ConflictAsk),
 }
 
@@ -322,14 +325,10 @@ pub fn start_extract(app: &mut ZxrawApp, request: ExtractRequest) {
                 let _ = msgs.send(Msg::Conflicts(ask));
                 Ok(())
             }
-            Ok(Outcome::Done(report)) => {
+            Ok(Outcome::Done(report, created)) => {
                 finish_extract(job, &request, &report, &events);
-                if let Some(example) = report.unchecked.first() {
-                    let _ = msgs.send(Msg::Unchecked(UncheckedAsk {
-                        request: unchecked_rerun(&request, &report),
-                        count: report.unchecked.len(),
-                        example: example.clone(),
-                    }));
+                if let Some(ask) = unchecked_ask(&request, &report, created) {
+                    let _ = msgs.send(Msg::Unchecked(ask));
                 }
                 Ok(())
             }
@@ -379,10 +378,25 @@ fn run_extract(
         ..ExtractOptions::default()
     };
     let (archive, parent) = (&r.archive, &r.parent);
+    // "Extract them anyway" goes where the first pass went; that folder may be gone (a
+    // first pass that wrote nothing can remove the folder it made).
+    let mut remade = false;
+    if r.allow_unchecked && r.place == Place::Into {
+        match fs::create_dir(parent) {
+            Ok(()) => remade = true,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(CoreError::io(parent, e)),
+        }
+    }
+    let named = parent.join(archive::archive_stem(archive));
+    let named_existed = fs::symlink_metadata(&named).is_ok();
+    let mut created = false;
     let report = match &r.selection {
         None => match r.place {
-            Place::Smart => archive::extract_to(archive, parent, ExtractTarget::Smart, &opts, ctx),
+            Place::Smart => archive::extract_to(archive, parent, ExtractTarget::Smart, &opts, ctx)
+                .inspect(|rep| created = rep.dest != *parent),
             Place::Named => {
+                created = !named_existed;
                 archive::extract_to(archive, parent, ExtractTarget::NamedFolder, &opts, ctx)
             }
             Place::Into => archive::extract(archive, parent, &opts, None, ctx),
@@ -395,10 +409,12 @@ fn run_extract(
                     fs::symlink_metadata(p).is_ok()
                 });
                 fs::create_dir(&dest).map_err(|e| CoreError::io(&dest, e))?;
+                created = true;
                 let result = archive::extract(archive, &dest, &opts, Some(sel), ctx);
+                // Kept for "Extract them anyway" when files were held back.
                 let empty = match &result {
                     Err(_) => true,
-                    Ok(r) => r.extracted.is_empty(),
+                    Ok(r) => r.extracted.is_empty() && r.unchecked.is_empty(),
                 };
                 if empty {
                     // Only if nothing is in it.
@@ -407,9 +423,9 @@ fn run_extract(
                 result
             }
             SelectionDest::Named => {
-                let dest = parent.join(archive::archive_stem(archive));
+                let dest = named.clone();
                 match fs::create_dir(&dest) {
-                    Ok(()) => {}
+                    Ok(()) => created = true,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dest.is_dir() => {}
                     Err(e) => return Err(CoreError::io(&dest, e)),
                 }
@@ -417,7 +433,34 @@ fn run_extract(
             }
         },
     }?;
-    Ok(Outcome::Done(report))
+    if remade && report.extracted.is_empty() {
+        let _ = fs::remove_dir(parent); // only if nothing is in it
+    }
+    Ok(Outcome::Done(report, created))
+}
+
+/// The question to ask when `report` held back encrypted files without a checksum. When
+/// the extraction made its folder and wrote nothing, declining removes that folder (if
+/// still empty).
+fn unchecked_ask(
+    request: &ExtractRequest,
+    report: &ExtractReport,
+    created: bool,
+) -> Option<UncheckedAsk> {
+    let example = report.unchecked.first()?.clone();
+    Some(UncheckedAsk {
+        request: unchecked_rerun(request, report),
+        count: report.unchecked.len(),
+        example,
+        remove_if_declined: (created && report.extracted.is_empty()).then(|| report.dest.clone()),
+    })
+}
+
+/// "Leave them": nothing more is extracted, and an empty folder the extraction made goes.
+fn decline_unchecked(ask: &UncheckedAsk) {
+    if let Some(dir) = &ask.remove_if_declined {
+        let _ = fs::remove_dir(dir); // only if nothing is in it
+    }
 }
 
 /// The folder an extraction writes its entries into, when files there could already
@@ -709,6 +752,8 @@ fn unchecked_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
             .expect("front exists");
         if go {
             start_extract(app, q.request);
+        } else {
+            decline_unchecked(&q);
         }
     }
 }
@@ -1033,5 +1078,100 @@ mod tests {
             text.starts_with("“a.txt” and 1 more encrypted file in secret.7z"),
             "{text}"
         );
+    }
+    /// A 7z with two files in one AES block and no CRC anywhere: any password "opens" it.
+    fn unchecked_7z(path: &Path) {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in data {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let names: Vec<u8> = "a.txt\0b.txt\0"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut h = vec![
+            0x01, 0x04, // header, main streams
+            0x06, 0x00, 0x01, 0x09, 0x10, 0x00, // pack info: one 16-byte stream
+            0x07, 0x0B, 0x01, 0x00, // one folder
+            0x01, 0x24, 0x06, 0xF1, 0x07, 0x01, 0x01, 0x01, // AES, one round, no salt/IV
+            0x0C, 0x10, 0x00, // 16 bytes out
+            0x08, 0x0D, 0x02, 0x09, 0x08, 0x00, // two files: 8 + 8
+            0x00, // end of streams
+            0x05, 0x02, 0x11, // files info: 2, names
+        ];
+        h.push(names.len() as u8 + 1);
+        h.push(0);
+        h.extend(names);
+        h.extend([0x00, 0x00]);
+        let packed = [0x42u8; 16];
+        let mut start = Vec::new();
+        start.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        start.extend_from_slice(&(h.len() as u64).to_le_bytes());
+        start.extend_from_slice(&crc32(&h).to_le_bytes());
+        let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+        out.extend_from_slice(&crc32(&start).to_le_bytes());
+        out.extend_from_slice(&start);
+        out.extend_from_slice(&packed);
+        out.extend_from_slice(&h);
+        fs::write(path, out).unwrap();
+    }
+
+    #[test]
+    fn extract_them_anyway_lands_where_the_first_pass_meant_and_declining_leaves_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let archive = d.path().join("secret.7z");
+        unchecked_7z(&archive);
+        let (cancel, progress) = (
+            forge_jobs::CancelToken::new(),
+            forge_jobs::Progress::default(),
+        );
+        let ctx = JobCtx::new(&cancel, &progress);
+        let pw = || Some(Password::new("whatever"));
+        for place in [Place::Smart, Place::Named] {
+            let request = ExtractRequest {
+                archive: archive.clone(),
+                parent: d.path().to_path_buf(),
+                place,
+                selection: None,
+                policy: Some(ConflictPolicy::Skip),
+                allow_unchecked: false,
+            };
+            let folder = d.path().join("secret");
+            // Declined: the folder the extraction made goes.
+            let Ok(Outcome::Done(report, created)) = run_extract(&request, pw(), &ctx) else {
+                panic!("{place:?}: no report");
+            };
+            assert!(
+                report.extracted.is_empty() && report.unchecked.len() == 2,
+                "{report:?}"
+            );
+            assert_eq!(report.dest, folder);
+            let ask = unchecked_ask(&request, &report, created).unwrap();
+            decline_unchecked(&ask);
+            assert!(!folder.exists(), "{place:?}: an empty folder was left");
+            // Accepted: the files land in that folder, even after it was removed.
+            let Ok(Outcome::Done(report, created)) = run_extract(&request, pw(), &ctx) else {
+                panic!("{place:?}: no report");
+            };
+            let ask = unchecked_ask(&request, &report, created).unwrap();
+            let _ = fs::remove_dir(&folder);
+            let Ok(Outcome::Done(again, _)) = run_extract(&ask.request, pw(), &ctx) else {
+                panic!("{place:?}: the rerun failed");
+            };
+            assert_eq!(again.extracted.len(), 2, "{again:?}");
+            assert_eq!(fs::read(folder.join("a.txt")).unwrap().len(), 8);
+            assert_eq!(fs::read(folder.join("b.txt")).unwrap().len(), 8);
+            fs::remove_dir_all(&folder).unwrap();
+        }
     }
 }
