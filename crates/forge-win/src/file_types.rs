@@ -1,4 +1,11 @@
-//! Opt-in, reversible, per-user registration of ZXraw Explorer as a handler for photo types.
+//! Opt-in, reversible, per-user registration of ZXraw Explorer as a handler for photo and
+//! archive types.
+//!
+//! Two independent groups share the app's `Capabilities` entry: photos (ProgIDs
+//! `ZXrawExplorer.<ext>`) and archives (`ZXrawExplorer.Archive.<ext>`). Registering or removing
+//! one group never touches the other; the shared `Capabilities` and `RegisteredApplications`
+//! entries go only when neither group is left. Archive defaults are never written to
+//! `UserChoice`: the user confirms them on ZXraw Explorer's Settings > Default apps page.
 //!
 //! Per-user photo type registration. This module registers the shell ProgIDs and Settings
 //! capabilities; [`crate::user_choice`] separately writes the currently observed legacy
@@ -24,8 +31,40 @@ use crate::{Result, WinError};
 #[cfg(any(windows, test))]
 const APP_NAME: &str = "ZXraw Explorer";
 #[cfg(windows)]
-const APP_DESCRIPTION: &str = "A fast file manager and viewer for photos, RAW files and video.";
+const APP_DESCRIPTION: &str =
+    "A fast file manager and viewer for photos, RAW files, video and archives.";
 const PROG_ID_PREFIX: &str = "ZXrawExplorer.";
+const ARCHIVE_PROG_ID_PREFIX: &str = "ZXrawExplorer.Archive.";
+
+/// Which registration a ProgID belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    Photos,
+    Archives,
+}
+
+impl Group {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Photos => PROG_ID_PREFIX,
+            Self::Archives => ARCHIVE_PROG_ID_PREFIX,
+        }
+    }
+
+    /// Whether `prog_id` is one of this group's: archive ProgIDs also start with the photo
+    /// prefix, so photos are the rest.
+    fn owns(self, prog_id: &str) -> bool {
+        let starts = |prefix: &str| {
+            prog_id
+                .get(..prefix.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+        };
+        match self {
+            Self::Photos => starts(PROG_ID_PREFIX) && !starts(ARCHIVE_PROG_ID_PREFIX),
+            Self::Archives => starts(ARCHIVE_PROG_ID_PREFIX),
+        }
+    }
+}
 
 /// One extension to register, e.g. `jpg` described as "JPEG image".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +89,7 @@ pub struct DefaultApp {
 pub fn register_file_types(exe: impl AsRef<Path>, types: &[FileType]) -> Result<()> {
     #[cfg(windows)]
     {
-        let result = register_at(&Layout::user(), exe.as_ref(), types);
+        let result = register_at(&Layout::user(), Group::Photos, exe.as_ref(), types);
         notify_association_change();
         result
     }
@@ -67,7 +106,7 @@ pub fn unregister_file_types() -> Result<()> {
     #[cfg(windows)]
     {
         let restored = super::user_choice::restore_saved_defaults();
-        let result = unregister_at(&Layout::user());
+        let result = unregister_at(&Layout::user(), Group::Photos);
         notify_association_change();
         result?;
         let restored = restored?;
@@ -90,7 +129,7 @@ pub fn unregister_file_types() -> Result<()> {
 pub fn file_types_registered() -> Result<bool> {
     #[cfg(windows)]
     {
-        is_registered_at(&Layout::user())
+        is_registered_at(&Layout::user(), Group::Photos)
     }
     #[cfg(not(windows))]
     {
@@ -107,10 +146,79 @@ pub fn refresh_file_types_if_registered(
     #[cfg(windows)]
     {
         let layout = Layout::user();
-        if !is_registered_at(&layout)? || matches_at(&layout, current_exe.as_ref(), types)? {
+        if !is_registered_at(&layout, Group::Photos)?
+            || matches_at(&layout, Group::Photos, current_exe.as_ref(), types)?
+        {
             return Ok(false);
         }
         register_file_types(current_exe, types)?;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (current_exe, types);
+        Err(WinError::Unsupported)
+    }
+}
+
+/// Registers `exe` for the archive `types` (ProgIDs `ZXrawExplorer.Archive.<ext>`, "Open
+/// with", Settings > Default apps), replacing an earlier archive registration. Photo types
+/// are left as they are. `UserChoice` is never written: the user confirms the default in
+/// Settings ([`open_default_apps_settings`]). Only `HKCU` is modified.
+pub fn register_archive_types(exe: impl AsRef<Path>, types: &[FileType]) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let result = register_at(&Layout::user(), Group::Archives, exe.as_ref(), types);
+        notify_association_change();
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, types);
+        Err(WinError::Unsupported)
+    }
+}
+
+/// Removes the archive registration and restores the class defaults it replaced.
+pub fn unregister_archive_types() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let result = unregister_at(&Layout::user(), Group::Archives);
+        notify_association_change();
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        Err(WinError::Unsupported)
+    }
+}
+
+/// Whether some archive type is registered.
+pub fn archive_types_registered() -> Result<bool> {
+    #[cfg(windows)]
+    {
+        is_registered_at(&Layout::user(), Group::Archives)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(WinError::Unsupported)
+    }
+}
+
+/// [`refresh_file_types_if_registered`] for the archive registration.
+pub fn refresh_archive_types_if_registered(
+    current_exe: impl AsRef<Path>,
+    types: &[FileType],
+) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let layout = Layout::user();
+        if !is_registered_at(&layout, Group::Archives)?
+            || matches_at(&layout, Group::Archives, current_exe.as_ref(), types)?
+        {
+            return Ok(false);
+        }
+        register_archive_types(current_exe, types)?;
         Ok(true)
     }
     #[cfg(not(windows))]
@@ -188,8 +296,9 @@ fn current_prog_id(user_choice: Option<String>, association: Option<String>) -> 
     user_choice.or(association)
 }
 
-fn prog_id(extension: &str) -> String {
-    format!("{PROG_ID_PREFIX}{extension}")
+#[cfg(any(windows, test))]
+fn prog_id(group: Group, extension: &str) -> String {
+    format!("{}{extension}", group.prefix())
 }
 
 /// Our ProgIDs, or the key Windows creates when the user picked this exe through
@@ -300,16 +409,27 @@ impl Layout {
         format!("{}\\.{extension}", self.classes)
     }
 
-    fn prog_id_key(&self, extension: &str) -> String {
-        format!("{}\\{}", self.classes, prog_id(extension))
+    fn prog_id_key(&self, group: Group, extension: &str) -> String {
+        format!("{}\\{}", self.classes, prog_id(group, extension))
     }
 
-    fn registered_extensions(&self) -> Result<Vec<String>> {
-        Ok(registry::value_names(&self.associations())?
-            .iter()
-            .filter_map(|name| name.strip_prefix('.'))
-            .filter_map(|extension| checked_extension(extension).ok())
-            .collect())
+    /// The group's extensions, by the ProgID each `FileAssociations` entry names.
+    fn registered_extensions(&self, group: Group) -> Result<Vec<String>> {
+        let associations = self.associations();
+        let mut extensions = Vec::new();
+        for name in registry::value_names(&associations)? {
+            let Some(extension) = name.strip_prefix('.') else {
+                continue;
+            };
+            let Ok(extension) = checked_extension(extension) else {
+                continue;
+            };
+            let target = registry::string_value(&associations, Some(&name))?.unwrap_or_default();
+            if group.owns(&target) {
+                extensions.push(extension);
+            }
+        }
+        Ok(extensions)
     }
 }
 
@@ -325,12 +445,30 @@ fn icon_location(exe: &Path) -> Vec<u16> {
         .collect()
 }
 
+/// The icon Windows shows for compressed folders (`imageres.dll`, resource 174), as a full
+/// path: `REG_SZ` icon paths are not expanded. Falls back to the app's icon.
+#[cfg(windows)]
+fn archive_icon_location(exe: &Path) -> Vec<u16> {
+    let dll = std::env::var_os("SystemRoot")
+        .map(|root| Path::new(&root).join("System32").join("imageres.dll"))
+        .filter(|dll| dll.is_file());
+    match dll {
+        Some(dll) => format!("{},-174", dll.display())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect(),
+        None => icon_location(exe),
+    }
+}
+
 #[cfg(windows)]
 fn registration_plan(
     layout: &Layout,
+    group: Group,
     types: &[FileType],
     command: &[u16],
     icon: &[u16],
+    type_icon: &[u16],
 ) -> Result<RegistrationPlan> {
     let wanted = types
         .iter()
@@ -348,11 +486,11 @@ fn registration_plan(
         RegistryValue::wide(capabilities, Some("ApplicationIcon"), icon),
     ];
     for (extension, file_type) in wanted.iter().zip(types) {
-        let prog_id = prog_id(extension);
-        let prog_id_key = layout.prog_id_key(extension);
+        let prog_id = prog_id(group, extension);
+        let prog_id_key = layout.prog_id_key(group, extension);
         values.extend([
             RegistryValue::string(prog_id_key.clone(), None, &file_type.description),
-            RegistryValue::wide(format!("{prog_id_key}\\DefaultIcon"), None, icon),
+            RegistryValue::wide(format!("{prog_id_key}\\DefaultIcon"), None, type_icon),
             RegistryValue::wide(
                 format!("{prog_id_key}\\shell\\open\\command"),
                 None,
@@ -382,25 +520,29 @@ fn registration_plan(
 }
 
 #[cfg(windows)]
-fn register_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<()> {
+fn register_at(layout: &Layout, group: Group, exe: &Path, types: &[FileType]) -> Result<()> {
     let command = shell_command(exe, "%1")?;
     let icon = icon_location(exe);
-    let plan = registration_plan(layout, types, &command, &icon)?;
+    let type_icon = match group {
+        Group::Photos => icon.clone(),
+        Group::Archives => archive_icon_location(exe),
+    };
+    let plan = registration_plan(layout, group, types, &command, &icon, &type_icon)?;
 
     let result = (|| {
-        for extension in layout.registered_extensions()? {
+        for extension in layout.registered_extensions(group)? {
             if !plan.extensions.contains(&extension) {
-                unregister_extension_at(layout, &extension)?;
+                unregister_extension_at(layout, group, &extension)?;
             }
         }
         for extension in &plan.extensions {
-            preserve_class_default_at(layout, extension)?;
+            preserve_class_default_at(layout, group, extension)?;
         }
         for value in &plan.values {
             registry::set_wide(&value.key, value.name.as_deref(), &value.value)?;
         }
         for extension in &plan.extensions {
-            let prog_id = prog_id(extension);
+            let prog_id = prog_id(group, extension);
             let extension_key = layout.extension_key(extension);
             let current = registry::string_value(&extension_key, None)?;
             if !current
@@ -414,14 +556,14 @@ fn register_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<()> {
     })();
     if result.is_err() {
         // Leave nothing half-registered; replaced class defaults are restored.
-        let _ = unregister_at(layout);
+        let _ = unregister_at(layout, group);
     }
     result
 }
 
 #[cfg(windows)]
-fn preserve_class_default_at(layout: &Layout, extension: &str) -> Result<()> {
-    let prog_id = prog_id(extension);
+fn preserve_class_default_at(layout: &Layout, group: Group, extension: &str) -> Result<()> {
+    let prog_id = prog_id(group, extension);
     let extension_key = layout.extension_key(extension);
     let dotted = format!(".{extension}");
     let current = registry::string_value(&extension_key, None)?;
@@ -440,17 +582,25 @@ fn preserve_class_default_at(layout: &Layout, extension: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn unregister_at(layout: &Layout) -> Result<()> {
-    for extension in layout.registered_extensions()? {
-        unregister_extension_at(layout, &extension)?;
+fn unregister_at(layout: &Layout, group: Group) -> Result<()> {
+    for extension in layout.registered_extensions(group)? {
+        unregister_extension_at(layout, group, &extension)?;
     }
-    registry::delete_value(&layout.registered_apps, Some(APP_NAME))?;
-    registry::delete_tree(&layout.app)
+    let other = match group {
+        Group::Photos => Group::Archives,
+        Group::Archives => Group::Photos,
+    };
+    // The shared Capabilities entry stays while the other group still uses it.
+    if layout.registered_extensions(other)?.is_empty() {
+        registry::delete_value(&layout.registered_apps, Some(APP_NAME))?;
+        registry::delete_tree(&layout.app)?;
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn unregister_extension_at(layout: &Layout, extension: &str) -> Result<()> {
-    let prog_id = prog_id(extension);
+fn unregister_extension_at(layout: &Layout, group: Group, extension: &str) -> Result<()> {
+    let prog_id = prog_id(group, extension);
     let dotted = format!(".{extension}");
     let extension_key = layout.extension_key(extension);
     registry::delete_value(&format!("{extension_key}\\OpenWithProgids"), Some(&prog_id))?;
@@ -469,20 +619,20 @@ fn unregister_extension_at(layout: &Layout, extension: &str) -> Result<()> {
     }
     registry::delete_value(&layout.previous_defaults(), Some(&dotted))?;
     registry::delete_value(&layout.associations(), Some(&dotted))?;
-    registry::delete_tree(&layout.prog_id_key(extension))
+    registry::delete_tree(&layout.prog_id_key(group, extension))
 }
 
 #[cfg(windows)]
-fn is_registered_at(layout: &Layout) -> Result<bool> {
-    Ok(!layout.registered_extensions()?.is_empty())
+fn is_registered_at(layout: &Layout, group: Group) -> Result<bool> {
+    Ok(!layout.registered_extensions(group)?.is_empty())
 }
 
-/// Whether exactly `types` are registered, each opening `exe`.
+/// Whether exactly `types` are registered in `group`, each opening `exe`.
 #[cfg(windows)]
-fn matches_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<bool> {
+fn matches_at(layout: &Layout, group: Group, exe: &Path, types: &[FileType]) -> Result<bool> {
     let command = shell_command(exe, "%1")?;
     let command = &command[..command.len() - 1];
-    let mut registered = layout.registered_extensions()?;
+    let mut registered = layout.registered_extensions(group)?;
     let mut wanted = types
         .iter()
         .map(|file_type| checked_extension(&file_type.extension))
@@ -494,7 +644,8 @@ fn matches_at(layout: &Layout, exe: &Path, types: &[FileType]) -> Result<bool> {
         return Ok(false);
     }
     for extension in &wanted {
-        let key = format!("{}\\shell\\open\\command", layout.prog_id_key(extension));
+        let key = format!("{}\\shell\\open\\command", layout.prog_id_key(group, extension));
+
         if registry::default_wide(&key)?.as_deref() != Some(command) {
             return Ok(false);
         }
@@ -643,7 +794,7 @@ mod tests {
                 description: "CR3 raw image".into(),
             },
         ];
-        let plan = registration_plan(&layout, &types, &command, &icon).unwrap();
+        let plan = registration_plan(&layout, Group::Photos, &types, &command, &icon, &icon).unwrap();
         let text = |key: &str, name: Option<&str>| {
             plan.values
                 .iter()
@@ -801,12 +952,12 @@ mod tests {
         .unwrap();
 
         let exe = Path::new(r"C:\Test Folder\zxraw.exe");
-        assert!(!is_registered_at(&layout).unwrap());
-        register_at(&layout, exe, &types(&["jpg", "png"])).unwrap();
-        assert!(is_registered_at(&layout).unwrap());
-        assert!(matches_at(&layout, exe, &types(&["png", "jpg"])).unwrap());
-        assert!(!matches_at(&layout, Path::new(r"D:\zxraw.exe"), &types(&["jpg", "png"])).unwrap());
-        assert!(!matches_at(&layout, exe, &types(&["jpg"])).unwrap());
+        assert!(!is_registered_at(&layout, Group::Photos).unwrap());
+        register_at(&layout, Group::Photos, exe, &types(&["jpg", "png"])).unwrap();
+        assert!(is_registered_at(&layout, Group::Photos).unwrap());
+        assert!(matches_at(&layout, Group::Photos, exe, &types(&["png", "jpg"])).unwrap());
+        assert!(!matches_at(&layout, Group::Photos, Path::new(r"D:\zxraw.exe"), &types(&["jpg", "png"])).unwrap());
+        assert!(!matches_at(&layout, Group::Photos, exe, &types(&["jpg"])).unwrap());
 
         let default = |extension: &str| {
             registry::string_value(&layout.extension_key(extension), None).unwrap()
@@ -814,7 +965,7 @@ mod tests {
         assert_eq!(default("jpg").as_deref(), Some("ZXrawExplorer.jpg"));
         assert_eq!(default("png").as_deref(), Some("ZXrawExplorer.png"));
         let command = registry::string_value(
-            &format!("{}\\shell\\open\\command", layout.prog_id_key("jpg")),
+            &format!("{}\\shell\\open\\command", layout.prog_id_key(Group::Photos, "jpg")),
             None,
         )
         .unwrap();
@@ -830,16 +981,16 @@ mod tests {
         );
 
         // Re-registering with fewer types drops the rest and restores their defaults.
-        register_at(&layout, exe, &types(&["jpg"])).unwrap();
+        register_at(&layout, Group::Photos, exe, &types(&["jpg"])).unwrap();
         assert_eq!(default("png"), None);
-        assert!(!registry::key_exists(&layout.prog_id_key("png")).unwrap());
+        assert!(!registry::key_exists(&layout.prog_id_key(Group::Photos, "png")).unwrap());
         assert_eq!(
-            layout.registered_extensions().unwrap(),
+            layout.registered_extensions(Group::Photos).unwrap(),
             vec!["jpg".to_string()]
         );
 
-        unregister_at(&layout).unwrap();
-        assert!(!is_registered_at(&layout).unwrap());
+        unregister_at(&layout, Group::Photos).unwrap();
+        assert!(!is_registered_at(&layout, Group::Photos).unwrap());
         assert_eq!(default("jpg").as_deref(), Some("OtherViewer.jpg"));
         assert_eq!(
             registry::value_names(&format!("{}\\OpenWithProgids", layout.extension_key("jpg")))
@@ -882,14 +1033,111 @@ mod tests {
             extension: "tif".into(),
             description: "TIFF image".into(),
         }];
-        register_at(&layout, Path::new(r"C:\zxraw.exe"), &types).unwrap();
+        register_at(&layout, Group::Photos, Path::new(r"C:\zxraw.exe"), &types).unwrap();
         registry::set_default_string(&layout.extension_key("tif"), "LaterApp.tif").unwrap();
-        unregister_at(&layout).unwrap();
+        unregister_at(&layout, Group::Photos).unwrap();
         assert_eq!(
             registry::string_value(&layout.extension_key("tif"), None)
                 .unwrap()
                 .as_deref(),
             Some("LaterApp.tif")
         );
+    }
+
+    #[test]
+    fn groups_own_only_their_prog_ids() {
+        assert!(Group::Photos.owns("ZXrawExplorer.jpg"));
+        assert!(!Group::Photos.owns("ZXrawExplorer.Archive.zip"));
+        assert!(Group::Archives.owns("zxrawexplorer.archive.ZIP"));
+        assert!(!Group::Archives.owns("ZXrawExplorer.jpg"));
+        assert!(!Group::Photos.owns("CompressedFolder"));
+        assert!(is_own_prog_id(&prog_id(Group::Archives, "7z")));
+    }
+
+    /// Photo and archive registrations share the Capabilities entry: removing one leaves the
+    /// other (and the entry) in place; removing both removes everything.
+    #[cfg(windows)]
+    #[test]
+    fn photo_and_archive_registrations_are_independent() {
+        use std::time::SystemTime;
+
+        let root = format!(
+            "Software\\ZXrawExplorer-FileTypes-Test-{}-{}-groups",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = registry::delete_tree(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let layout = Layout {
+            classes: format!("{root}\\Classes"),
+            app: format!("{root}\\App"),
+            registered_apps: format!("{root}\\RegisteredApplications"),
+        };
+        let file_type = |extension: &str, description: &str| FileType {
+            extension: extension.into(),
+            description: description.into(),
+        };
+        let exe = Path::new(r"C:\Apps\zxraw.exe");
+        registry::set_default_string(&layout.extension_key("zip"), "CompressedFolder").unwrap();
+
+        register_at(&layout, Group::Photos, exe, &[file_type("jpg", "JPEG image")]).unwrap();
+        register_at(
+            &layout,
+            Group::Archives,
+            exe,
+            &[file_type("zip", "ZIP archive"), file_type("7z", "7z archive")],
+        )
+        .unwrap();
+        assert_eq!(layout.registered_extensions(Group::Photos).unwrap(), ["jpg"]);
+        let mut archives = layout.registered_extensions(Group::Archives).unwrap();
+        archives.sort();
+        assert_eq!(archives, ["7z", "zip"]);
+        assert!(matches_at(&layout, Group::Archives, exe, &[file_type("zip", ""), file_type("7z", "")]).unwrap());
+        assert_eq!(
+            registry::string_value(&layout.extension_key("zip"), None).unwrap().as_deref(),
+            Some("ZXrawExplorer.Archive.zip")
+        );
+        assert_eq!(
+            registry::string_value(&layout.prog_id_key(Group::Archives, "zip"), None)
+                .unwrap()
+                .as_deref(),
+            Some("ZIP archive")
+        );
+        let icon = registry::string_value(
+            &format!("{}\\DefaultIcon", layout.prog_id_key(Group::Archives, "zip")),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(icon.to_ascii_lowercase().contains("imageres.dll"), "{icon}");
+
+        // Re-registering photos keeps the archive types.
+        register_at(&layout, Group::Photos, exe, &[file_type("png", "PNG image")]).unwrap();
+        assert_eq!(layout.registered_extensions(Group::Archives).unwrap().len(), 2);
+
+        unregister_at(&layout, Group::Photos).unwrap();
+        assert!(!is_registered_at(&layout, Group::Photos).unwrap());
+        assert!(is_registered_at(&layout, Group::Archives).unwrap());
+        assert_eq!(
+            registry::string_value(&layout.registered_apps, Some(APP_NAME)).unwrap().as_deref(),
+            Some(layout.capabilities().as_str())
+        );
+
+        unregister_at(&layout, Group::Archives).unwrap();
+        assert_eq!(
+            registry::string_value(&layout.extension_key("zip"), None).unwrap().as_deref(),
+            Some("CompressedFolder")
+        );
+        assert!(!registry::key_exists(&layout.prog_id_key(Group::Archives, "zip")).unwrap());
+        assert!(!registry::key_exists(&layout.app).unwrap());
+        assert_eq!(registry::string_value(&layout.registered_apps, Some(APP_NAME)).unwrap(), None);
     }
 }

@@ -35,8 +35,16 @@
 //!
 //! The rule when in doubt is that the sender opens its own window: a launch is never lost.
 //! Under rare scheduling delays (the "accepted" answer arrives after the sender stopped
-//! waiting) a launch may also open its own window, besides the tab in the running one. That
-//! extra window is accepted; a full commit protocol to rule it out is not worth its cost.
+//! waiting) a launch of paths may also open its own window, besides the tab in the running
+//! one. That extra window is accepted for opening folders.
+//!
+//! Actions (a request with an [action](Handoff::action), e.g. "extract here" from the
+//! Explorer menu) must run exactly once, so they take one more step: after reading
+//! "accepted" the sender confirms with a commit message, and the window runs the action
+//! only once that confirmation arrived. A sender that stopped waiting never confirms (it
+//! closes the pipe and runs the action in its own window), and the window then drops the
+//! action. The receiver waits up to [`COMMIT_WAIT`] for the confirmation; only a sender
+//! stalled that long between reading the answer and confirming it could lose an action.
 //!
 //! Versions: the protocol version is part of the pipe name, so windows of different
 //! versions never talk to each other. While an update overlaps (the old window still open,
@@ -57,12 +65,18 @@ use crate::Result;
 use crate::WinError;
 
 /// Payload format version, also part of the pipe name. A receiver refuses any other version.
-/// 2 added the sender's wait.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// 2 added the sender's wait; 3 the action and its commit step, and larger requests (a
+/// whole Explorer selection).
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Largest accepted request, in bytes.
-pub const MAX_PAYLOAD: usize = 64 * 1024;
+pub const MAX_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Most paths in one request.
-pub const MAX_PATHS: usize = 64;
+pub const MAX_PATHS: usize = 8192;
+/// Longest action name, in UTF-16 units.
+pub const MAX_ACTION_UNITS: usize = 32;
+/// How long the receiver waits for an accepted action's commit message (see the module
+/// notes) before dropping it.
+pub const COMMIT_WAIT: Duration = Duration::from_secs(60);
 /// Longest accepted path or working directory, in UTF-16 units (the Win32 maximum).
 pub const MAX_PATH_UNITS: usize = 32_767;
 /// How long the receiver waits for a ready window to take a request before answering busy.
@@ -80,6 +94,8 @@ const WAIT_OFFSET: usize = 8;
 
 const REQUEST_MAGIC: [u8; 4] = *b"ZXOR";
 const REPLY_MAGIC: [u8; 4] = *b"ZXRP";
+/// The sender's confirmation after an "accepted" answer.
+const COMMIT: [u8; 8] = *b"ZXCM\x01\0\0\0";
 
 /// Why a request payload was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +113,8 @@ pub enum PayloadError {
     NoWorkingDirectory,
     /// Not an absolute drive or UNC path after resolving (e.g. `C:foo`, `\\.\pipe\x`).
     NotAbsolute(String),
+    /// The action name is empty, too long or not lower-case letters, digits and dashes.
+    BadAction(String),
 }
 
 impl std::fmt::Display for PayloadError {
@@ -113,6 +131,7 @@ impl std::fmt::Display for PayloadError {
             Self::ContainsNul => f.write_str("a path contains NUL"),
             Self::NoWorkingDirectory => f.write_str("a relative path without a working directory"),
             Self::NotAbsolute(p) => write!(f, "not an absolute drive or network path: {p}"),
+            Self::BadAction(a) => write!(f, "not an action name: {a:?}"),
         }
     }
 }
@@ -121,20 +140,36 @@ impl std::error::Error for PayloadError {}
 
 /// Encodes an open request: the sender's working directory (for relative paths) and the
 /// paths as given on its command line. No paths means "just bring the window forward".
+pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<u8>, PayloadError> {
+    encode_action_request(cwd, paths, None)
+}
+
+/// Encodes a request to run `action` (e.g. `extract-here`) on `paths`, or to open them when
+/// `action` is `None`.
 ///
 /// Layout, little-endian: magic `ZXOR`, `u32` version, `u32` milliseconds the sender waits
-/// for the answer (filled in when sending, see [`set_reply_wait`]), the working directory, a
-/// `u32` path count, then each path. A string is a `u32` count of UTF-16 units followed by
-/// the units.
-pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<u8>, PayloadError> {
+/// for the answer (filled in when sending, see [`set_reply_wait`]), the working directory,
+/// the action (empty = open), a `u32` path count, then each path. A string is a `u32` count
+/// of UTF-16 units followed by the units.
+pub fn encode_action_request(
+    cwd: &Path,
+    paths: &[PathBuf],
+    action: Option<&str>,
+) -> std::result::Result<Vec<u8>, PayloadError> {
     if paths.len() > MAX_PATHS {
         return Err(PayloadError::TooManyPaths(paths.len()));
+    }
+    if let Some(action) = action
+        && !valid_action(action)
+    {
+        return Err(PayloadError::BadAction(action.to_string()));
     }
     let mut out = Vec::new();
     out.extend_from_slice(&REQUEST_MAGIC);
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     put_string(&mut out, cwd.as_os_str())?;
+    put_string(&mut out, std::ffi::OsStr::new(action.unwrap_or("")))?;
     out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
     for path in paths {
         put_string(&mut out, path.as_os_str())?;
@@ -143,6 +178,20 @@ pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<
         return Err(PayloadError::TooLarge(out.len()));
     }
     Ok(out)
+}
+
+/// Lower-case ASCII letters, digits and dashes, at most [`MAX_ACTION_UNITS`] long.
+fn valid_action(action: &str) -> bool {
+    (1..=MAX_ACTION_UNITS).contains(&action.len())
+        && action
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Whether `request` (from [`encode_action_request`]) carries an action, which the sender
+/// must confirm after the answer.
+fn request_has_action(request: &[u8]) -> bool {
+    decode_request(request).is_ok_and(|r| r.action.is_some())
 }
 
 /// Sets how long the sender of `request` (from [`encode_request`]) waits for the answer.
@@ -179,8 +228,11 @@ fn wide_units(s: &std::ffi::OsStr) -> Vec<u16> {
 /// A validated request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// Absolute paths to open; empty = only bring the window forward.
+    /// Absolute paths to open (or to run the action on); empty = only bring the window
+    /// forward.
     pub paths: Vec<PathBuf>,
+    /// The command to run on the paths; `None` opens them.
+    pub action: Option<String>,
     /// How long the sender waits for the answer (at most 10 s).
     pub reply_within: Duration,
 }
@@ -201,6 +253,14 @@ pub fn decode_request(bytes: &[u8]) -> std::result::Result<Request, PayloadError
     }
     let reply_within = Duration::from_millis(u64::from(r.u32()?)).min(MAX_REPLY_WAIT);
     let cwd = r.string()?;
+    let action = r.string()?;
+    let action = if action.is_empty() {
+        None
+    } else if valid_action(&action) {
+        Some(action)
+    } else {
+        return Err(PayloadError::BadAction(action));
+    };
     let count = r.u32()? as usize;
     if count > MAX_PATHS {
         return Err(PayloadError::TooManyPaths(count));
@@ -222,7 +282,11 @@ pub fn decode_request(bytes: &[u8]) -> std::result::Result<Request, PayloadError
         .into_iter()
         .map(|p| resolve(cwd.as_deref(), &p))
         .collect::<std::result::Result<_, _>>()?;
-    Ok(Request { paths, reply_within })
+    Ok(Request {
+        paths,
+        action,
+        reply_within,
+    })
 }
 
 /// `path` as an absolute path: kept if it already is one, else joined to `cwd`.
@@ -335,16 +399,28 @@ impl Reply {
 
 type Waker = Box<dyn Fn() + Send + Sync>;
 
+/// A launch another process handed over: paths to open, or an action to run on them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handoff {
+    /// The command to run (e.g. `extract-here`); `None` opens the paths.
+    pub action: Option<String>,
+    pub paths: Vec<PathBuf>,
+}
+
 /// A request waiting for the window, with the channel its pipe thread waits on for the answer.
 struct Pending {
     id: u64,
-    paths: Vec<PathBuf>,
+    handoff: Handoff,
     answer: std::sync::mpsc::SyncSender<Reply>,
 }
 
 #[derive(Default)]
 struct InboxState {
     queue: VecDeque<Pending>,
+    /// Actions the window took, waiting for their sender's commit message.
+    awaiting: Vec<(u64, Handoff)>,
+    /// Committed actions, handed out on the next take.
+    committed: VecDeque<Handoff>,
     next_id: u64,
     /// The window has taken requests at least once: from then on, an untaken request means
     /// the window is not responding.
@@ -377,21 +453,49 @@ impl Inbox {
         self.window.store(hwnd, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Takes every waiting request (each a list of paths; empty = focus only) and marks the
-    /// window ready.
-    /// Each request is answered "accepted" here, at the moment it is taken.
+    /// The paths of every launch [`take_handoffs`](Self::take_handoffs) hands out.
     pub fn take(&self) -> Vec<Vec<PathBuf>> {
+        self.take_handoffs().into_iter().map(|h| h.paths).collect()
+    }
+
+    /// Takes every waiting request and marks the window ready. Each request is answered
+    /// "accepted" here, at the moment it is taken. Opens are handed out at once; an action
+    /// is handed out by a later take, once its sender confirmed it (see the module notes),
+    /// and never if it did not.
+    pub fn take_handoffs(&self) -> Vec<Handoff> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.ready = true;
-        state
-            .queue
-            .drain(..)
-            .map(|pending| {
-                // Never blocks: the channel holds one answer and only this one is sent.
-                let _ = pending.answer.try_send(Reply::Accepted);
-                pending.paths
-            })
-            .collect()
+        let mut out: Vec<Handoff> = state.committed.drain(..).collect();
+        let queue = std::mem::take(&mut state.queue);
+        for pending in queue {
+            // Never blocks: the channel holds one answer and only this one is sent.
+            let _ = pending.answer.try_send(Reply::Accepted);
+            if pending.handoff.action.is_some() {
+                state.awaiting.push((pending.id, pending.handoff));
+            } else {
+                out.push(pending.handoff);
+            }
+        }
+        out
+    }
+
+    /// The sender of action `id` confirmed it: the next take hands it out.
+    fn commit(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(i) = state.awaiting.iter().position(|(at, _)| *at == id) {
+            let (_, handoff) = state.awaiting.remove(i);
+            state.committed.push_back(handoff);
+        }
+        drop(state);
+        if let Some(wake) = &*self.waker.lock().unwrap_or_else(|p| p.into_inner()) {
+            wake();
+        }
+    }
+
+    /// The sender of action `id` never confirmed it (it runs the action itself): drop it.
+    fn abandon(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.awaiting.retain(|(at, _)| *at != id);
     }
 
     /// From now on, requests are answered [`Reply::Closing`] so their senders start their
@@ -413,14 +517,27 @@ impl Inbox {
     /// [`Reply`]. Waits at most `wait` while the window is starting and at most `ui_wait`
     /// (and `wait`) once it is up.
     pub fn deliver(&self, paths: Vec<PathBuf>, wait: Duration, ui_wait: Duration) -> Reply {
+        self.deliver_handoff(Handoff { action: None, paths }, wait, ui_wait).0
+    }
+
+    /// [`deliver`](Self::deliver) for any handoff. For an accepted action, also returns the
+    /// ticket its commit message ([`Inbox::commit`]) or its absence ([`Inbox::abandon`])
+    /// is reported with.
+    pub fn deliver_handoff(
+        &self,
+        handoff: Handoff,
+        wait: Duration,
+        ui_wait: Duration,
+    ) -> (Reply, Option<u64>) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.closing {
-            return Reply::Closing;
+            return (Reply::Closing, None);
         }
         let id = state.next_id;
         state.next_id += 1;
+        let is_action = handoff.action.is_some();
         let (answer, reply) = std::sync::mpsc::sync_channel(1);
-        state.queue.push_back(Pending { id, paths, answer });
+        state.queue.push_back(Pending { id, handoff, answer });
         let ready = state.ready;
         drop(state);
         if let Some(wake) = &*self.waker.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -430,17 +547,18 @@ impl Inbox {
         // A starting window gets the sender's whole wait; a running one that does not take a
         // request within `ui_wait` is not responding.
         let limit = if ready { wait.min(ui_wait) } else { wait };
+        let ticket = |answer: Reply| (answer, (is_action && answer == Reply::Accepted).then_some(id));
         if let Ok(answer) = reply.recv_timeout(limit) {
-            return answer;
+            return ticket(answer);
         }
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         match state.queue.iter().position(|pending| pending.id == id) {
             Some(i) => {
                 state.queue.remove(i);
-                Reply::Busy
+                (Reply::Busy, None)
             }
             // Taken or withdrawn just now: its answer was sent under the lock held above.
-            None => reply.try_recv().unwrap_or(Reply::Busy),
+            None => ticket(reply.try_recv().unwrap_or(Reply::Busy)),
         }
     }
 
@@ -604,8 +722,8 @@ mod imp {
     use windows::core::{HRESULT, PCWSTR, PWSTR};
 
     use super::{
-        ForwardError, Inbox, MAX_PAYLOAD, REPLY_MARGIN, Reply, UI_WAIT, decode_request,
-        set_reply_wait,
+        COMMIT, COMMIT_WAIT, ForwardError, Handoff, Inbox, MAX_PAYLOAD, REPLY_MARGIN, Reply,
+        UI_WAIT, decode_request, request_has_action, set_reply_wait,
     };
     use crate::{Result, WinError};
 
@@ -1159,28 +1277,33 @@ mod imp {
             tracing::warn!("instance pipe: refused a request: {why}");
             return;
         }
-        let reply = match read_message(pipe.0, MAX_PAYLOAD, READ_TIMEOUT) {
+        let (reply, ticket) = match read_message(pipe.0, MAX_PAYLOAD, READ_TIMEOUT) {
             Ok(bytes) => match decode_request(&bytes) {
                 Ok(request) => {
                     tracing::info!(
-                        "received a launch with {} path(s) from process {pid}",
-                        request.paths.len()
+                        "received a launch with {} path(s) from process {pid} ({})",
+                        request.paths.len(),
+                        request.action.as_deref().unwrap_or("open")
                     );
                     let wait = request.reply_within.saturating_sub(REPLY_MARGIN);
-                    let reply = inbox.deliver(request.paths, wait, UI_WAIT);
+                    let handoff = Handoff {
+                        action: request.action,
+                        paths: request.paths,
+                    };
+                    let (reply, ticket) = inbox.deliver_handoff(handoff, wait, UI_WAIT);
                     if reply != Reply::Accepted {
                         tracing::warn!("a launch from process {pid} was withdrawn: {reply:?}");
                     }
-                    reply
+                    (reply, ticket)
                 }
                 Err(e) => {
                     tracing::warn!("instance pipe: invalid request from process {pid}: {e}");
-                    Reply::Rejected
+                    (Reply::Rejected, None)
                 }
             },
             Err(IoError::MoreData) => {
                 tracing::warn!("instance pipe: request from process {pid} is too large");
-                Reply::Rejected
+                (Reply::Rejected, None)
             }
             Err(IoError::TimedOut) => {
                 tracing::warn!("instance pipe: process {pid} sent nothing");
@@ -1195,13 +1318,30 @@ mod imp {
             std::thread::sleep(reply_delay);
         }
         if write_message(pipe.0, &reply.encode(), READ_TIMEOUT).is_err() {
-            if reply == Reply::Accepted {
+            if let Some(ticket) = ticket {
+                // The sender runs it itself.
+                inbox.abandon(ticket);
+                tracing::warn!("instance pipe: could not answer process {pid}; dropped its action");
+            } else if reply == Reply::Accepted {
                 tracing::warn!(
                     "instance pipe: opened a launch from process {pid}, but could not tell it; \
                      it may open its own window as well"
                 );
             } else {
                 tracing::warn!("instance pipe: could not answer process {pid}");
+            }
+            return;
+        }
+        if let Some(ticket) = ticket {
+            // An action runs only once its sender confirmed it read "accepted".
+            match read_message(pipe.0, 16, COMMIT_WAIT) {
+                Ok(bytes) if bytes == COMMIT => inbox.commit(ticket),
+                _ => {
+                    inbox.abandon(ticket);
+                    tracing::warn!(
+                        "instance pipe: process {pid} did not confirm its action; it runs it itself"
+                    );
+                }
             }
             return;
         }
@@ -1272,7 +1412,18 @@ mod imp {
         write_message(pipe.0, &request, remaining()).map_err(|e| io(e, "sending"))?;
         let answer = read_message(pipe.0, 64, remaining()).map_err(|e| io(e, "waiting for the answer"))?;
         match Reply::decode(&answer) {
-            Some(Reply::Accepted) => Ok(()),
+            Some(Reply::Accepted) => {
+                // Confirms that this end read the answer and will not run the launch itself.
+                // An action waits for this; for an open it only ends the exchange.
+                let confirmed = write_message(pipe.0, &COMMIT, Duration::from_secs(2));
+                if confirmed.is_err() && request_has_action(&request) {
+                    return Err(ForwardError::Failed(WinError::Invalid(
+                        "could not confirm the action to the running window".into(),
+                    )));
+                }
+                Ok(())
+            }
+
             Some(reply) => Err(ForwardError::Refused(reply)),
             None => Err(ForwardError::Failed(WinError::Invalid("unreadable answer".into()))),
         }
@@ -1365,6 +1516,8 @@ mod tests {
         out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(cwd);
+        // No action.
+        out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
         for p in paths {
             out.extend_from_slice(p);
@@ -1449,7 +1602,7 @@ mod tests {
     fn oversized_requests_are_refused_on_both_ends() {
         let long = PathBuf::from(format!(r"C:\{}", "a".repeat(30_000)));
         assert!(matches!(
-            encode_request(Path::new(r"C:\"), &[long.clone(), long.clone(), long]),
+            encode_request(Path::new(r"C:\"), &vec![long; MAX_PAYLOAD / 60_000 + 1]),
             Err(PayloadError::TooLarge(_))
         ));
         let many = vec![PathBuf::from(r"C:\x"); MAX_PATHS + 1];
@@ -1495,6 +1648,79 @@ mod tests {
         let mut odd = 1u32.to_le_bytes().to_vec();
         odd.push(b'C');
         assert_eq!(decode_request(&raw(PROTOCOL_VERSION, &odd, &[])), Err(PayloadError::Truncated));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn actions_round_trip_and_bad_names_are_refused_on_both_ends() {
+        let bytes = encode_action_request(
+            Path::new(r"C:\work"),
+            &[PathBuf::from("a.zip"), PathBuf::from(r"D:\b.7z")],
+            Some("extract-here"),
+        )
+        .unwrap();
+        let request = decode_request(&bytes).unwrap();
+        assert_eq!(request.action.as_deref(), Some("extract-here"));
+        assert_eq!(request.paths, [PathBuf::from(r"C:\work\a.zip"), PathBuf::from(r"D:\b.7z")]);
+        assert!(request_has_action(&bytes));
+        assert!(!request_has_action(&encode_request(Path::new(r"C:\"), &[]).unwrap()));
+        assert_eq!(decode_request(&encode_request(Path::new(r"C:\"), &[]).unwrap()).unwrap().action, None);
+        for bad in ["", "Extract", "a b", "x/../y", &"a".repeat(MAX_ACTION_UNITS + 1)] {
+            assert_eq!(
+                encode_action_request(Path::new(r"C:\"), &[], Some(bad)),
+                Err(PayloadError::BadAction(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+        // A receiver checks the action as well.
+        let mut forged = REQUEST_MAGIC.to_vec();
+        forged.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        forged.extend_from_slice(&0u32.to_le_bytes());
+        forged.extend_from_slice(&units(r"C:\"));
+        forged.extend_from_slice(&units("RUN ME"));
+        forged.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_request(&forged), Err(PayloadError::BadAction("RUN ME".into())));
+    }
+
+    #[test]
+    fn an_action_is_handed_out_only_after_its_commit_and_never_after_an_abandon() {
+        let inbox = std::sync::Arc::new(Inbox::new());
+        inbox.take_handoffs();
+        let action = |name: &str| Handoff {
+            action: Some("add-zip".into()),
+            paths: vec![PathBuf::from(name)],
+        };
+        let deliver = |handoff: Handoff| {
+            let inbox = inbox.clone();
+            std::thread::spawn(move || inbox.deliver_handoff(handoff, Duration::from_secs(5), UI_WAIT))
+        };
+        let committed = deliver(action("a"));
+        let abandoned = deliver(action("b"));
+        let mut taken = Vec::new();
+        while !(committed.is_finished() && abandoned.is_finished()) {
+            taken.extend(inbox.take_handoffs());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(taken.is_empty(), "taken before any commit");
+        let (reply, a) = committed.join().unwrap();
+        assert_eq!(reply, Reply::Accepted);
+        let (reply, b) = abandoned.join().unwrap();
+        assert_eq!(reply, Reply::Accepted);
+        inbox.abandon(b.unwrap());
+        inbox.commit(a.unwrap());
+        assert_eq!(inbox.take_handoffs(), vec![action("a")]);
+        assert!(inbox.take_handoffs().is_empty(), "handed out once");
+        // An open needs no commit and has no ticket.
+        let open = std::thread::spawn({
+            let inbox = inbox.clone();
+            move || inbox.deliver_handoff(Handoff { action: None, paths: vec![] }, Duration::from_secs(5), UI_WAIT)
+        });
+        while !open.is_finished() {
+            taken.extend(inbox.take_handoffs());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(open.join().unwrap(), (Reply::Accepted, None));
+        assert_eq!(taken.len(), 1);
     }
 
     #[test]
@@ -1819,6 +2045,72 @@ mod tests {
 
         /// The documented trade-off: an "accepted" answer that arrives after the sender gave up
         /// leaves the launch open in both windows. Never lost, at worst one extra window.
+        /// [`window`] for actions: every handoff, with its action.
+        fn action_window(inbox: Arc<Inbox>) -> (Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<Vec<Handoff>>) {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    all.extend(inbox.take_handoffs());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // A commit may still be on its way from the pipe thread.
+                std::thread::sleep(Duration::from_millis(300));
+                all.extend(inbox.take_handoffs());
+                all
+            });
+            (stop, thread)
+        }
+
+        #[test]
+        fn a_forwarded_action_reaches_the_owner_once_with_all_its_paths() {
+            let channel = Channel::current(&unique_tag("act")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let paths: Vec<PathBuf> = (0..50).map(|i| PathBuf::from(format!(r"C:\sel\file {i}.jpg"))).collect();
+            let request = encode_action_request(Path::new(r"C:\"), &paths, Some("add-zip")).unwrap();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Forwarded => {}
+                Startup::Primary(_) => panic!("a second owner was allowed"),
+                Startup::Standalone(why) => panic!("not forwarded: {why}"),
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                window.join().unwrap(),
+                vec![Handoff {
+                    action: Some("add-zip".into()),
+                    paths
+                }]
+            );
+        }
+
+        #[test]
+        fn a_late_accepted_answer_never_runs_an_action_twice() {
+            let channel = Channel::current(&unique_tag("late-act")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server =
+                Server::claim_with_reply_delay(&channel, inbox.clone(), Duration::from_secs(3))
+                    .unwrap()
+                    .expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let request =
+                encode_action_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\a.zip")], Some("extract-here"))
+                    .unwrap();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("in time"), "{why}"),
+                _ => panic!("a sender past its deadline runs the action itself"),
+            }
+            // The receiver notices the missing commit once the sender's end is closed.
+            std::thread::sleep(Duration::from_secs(3));
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                window.join().unwrap().is_empty(),
+                "the window must not run an action its sender runs as well"
+            );
+        }
+
         #[test]
         fn a_late_accepted_answer_means_an_extra_window_never_a_lost_launch() {
             let channel = Channel::current(&unique_tag("late")).unwrap();
