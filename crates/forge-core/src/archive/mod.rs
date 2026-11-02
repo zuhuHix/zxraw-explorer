@@ -51,6 +51,8 @@ mod tests_codecs;
 mod tests_edit;
 #[cfg(test)]
 mod tests_hostile;
+#[cfg(all(test, windows))]
+mod tests_leftovers;
 #[cfg(test)]
 mod tests_name_collision;
 #[cfg(test)]
@@ -980,6 +982,8 @@ fn extract_pinned(
     let verified_blocks =
         verify_crowded_blocks(backend, archive, password, ctx, &mut planned, &mut report)?;
     let root = base.root();
+    // Leftovers of crashed or older runs; before any entry of this job is written.
+    remove_leftovers(base, &planned);
     let zone = if opts.mark_of_the_web {
         motw::read_zone(archive)
     } else {
@@ -1797,21 +1801,124 @@ pub fn extract_entry_to_temp(
     Ok(target)
 }
 
-/// Remove temp folders of opened entries that were last written more than `older_than` ago.
-pub fn prune_temp(older_than: Duration) {
-    let Ok(rd) = fs::read_dir(temp_root()) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for e in rd.flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > older_than));
-        if old && e.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = fs::remove_dir_all(e.path());
+/// Leftover temp files older than this are removed from a folder an extraction writes into.
+/// A running job's files are always younger (they are written and renamed in seconds).
+const LEFTOVER_AGE: Duration = Duration::from_secs(3600);
+
+/// Remove the leftover temp files (see [`ops::remove_stale_partials`]) from the destination
+/// and from each folder of `planned` that files are written into, when the folder already
+/// exists. A missing folder is never created here. Each folder is pinned while it is cleaned.
+fn remove_leftovers(base: &safety::PinnedBase, planned: &[Planned]) {
+    ops::remove_stale_partials(base.root(), LEFTOVER_AGE);
+    let folders: HashSet<&Path> = planned
+        .iter()
+        .filter(|p| !p.entry.is_dir)
+        .filter_map(|p| p.rel.parent())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .collect();
+    for rel in folders {
+        let path = base.root().join(rel);
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        // Held while cleaned: the folder cannot be swapped for a link meanwhile.
+        if let Ok(_pinned) = safety::pin_dirs(base, rel) {
+            ops::remove_stale_partials(&path, LEFTOVER_AGE);
         }
     }
+}
+
+/// Remove temp folders of opened entries that were last written more than `older_than` ago,
+/// and stray temp files older than that (see [`prune_dir`]).
+pub fn prune_temp(older_than: Duration) {
+    prune_dir(&temp_root(), older_than);
+}
+
+/// The startup prune, for `root`. Only top-level entries are touched:
+/// - A stage folder `out-<pid>-<id>` of a process still running is kept at any age.
+/// - A folder is removed only when it and every direct child were last written more than
+///   `older_than` ago, so a file still being written keeps its folder.
+/// - A link or junction is removed as the link itself, never followed.
+/// - Files in use fail to delete and are ignored.
+fn prune_dir(root: &Path, older_than: Duration) {
+    let Ok(rd) = fs::read_dir(root) else {
+        return;
+    };
+    ops::remove_stale_partials(root, older_than);
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if safety::is_link_or_reparse(&md) {
+            if ops::is_older_than(md.modified(), older_than) {
+                let _ = fs::remove_dir(&path).or_else(|_| fs::remove_file(&path));
+            }
+            continue;
+        }
+        if !md.is_dir() || stage_owner_alive(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        if ops::is_older_than(md.modified(), older_than) && children_older_than(&path, older_than) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Is every direct child of `dir` last written more than `age` ago? Unreadable counts as not.
+fn children_older_than(dir: &Path, age: Duration) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    rd.into_iter().all(|c| {
+        c.is_ok_and(|c| {
+            ops::is_older_than(
+                fs::symlink_metadata(c.path()).and_then(|m| m.modified()),
+                age,
+            )
+        })
+    })
+}
+
+/// Is `name` a stage folder `out-<pid>-<id>` whose process is still running?
+fn stage_owner_alive(name: &str) -> bool {
+    let Some((pid, id)) = name
+        .strip_prefix("out-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(id) && pid.parse::<u32>().is_ok_and(process_alive)
+}
+
+/// Is the process with this id still running? An id that cannot be opened is dead, except
+/// when access is denied (the process exists but is not ours to query).
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is used and closed here only; the out value is a valid u32.
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut code = 0u32;
+                let alive =
+                    GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+                let _ = CloseHandle(handle);
+                alive
+            }
+            Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        }
+    }
+}
+
+/// Without Windows process queries every stage folder is treated as live (never pruned early).
+#[cfg(not(windows))]
+fn process_alive(_: u32) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
