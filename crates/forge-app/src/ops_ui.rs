@@ -127,7 +127,7 @@ pub fn start_clipboard_move(
 /// never queued out of sight, never dropped silently, and never run past a confirmation the
 /// user is still reading. Checked at the public entry points (copy, move, paste, drag and
 /// drop, to the other pane) before anything else.
-fn refused_while_a_dialog_is_open(app: &mut ZxrawApp, kind: OpKind) -> bool {
+pub(crate) fn refused_while_a_dialog_is_open(app: &mut ZxrawApp, kind: OpKind) -> bool {
     if app.ops.modal.is_none() {
         return false;
     }
@@ -816,30 +816,7 @@ fn start_transfer_with(
         job.progress.add_total_items(plan.files + plan.links);
         job.progress.add_total_bytes(plan.bytes);
 
-        // Conflicts are forwarded to the UI; this thread blocks until the user answers
-        // (or the job is cancelled).
-        let ui_tx = tx.clone();
-        let ui_ctx = ctx.clone();
-        let cancel = job.cancel.clone();
-        let mut resolver = move |info: &ConflictInfo| -> Resolution {
-            let (rtx, rrx) = bounded(1);
-            let _ = ui_tx.send(Event::Conflict(ConflictQuestion {
-                info: info.clone(),
-                job_title: title2.clone(),
-                reply: rtx,
-                apply_all: false,
-            }));
-            ui_ctx.request_repaint();
-            loop {
-                match rrx.recv_timeout(Duration::from_millis(200)) {
-                    Ok(r) => return r,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {
-                        continue;
-                    }
-                    _ => return Resolution::once(ConflictDecision::Cancel),
-                }
-            }
-        };
+        let mut resolver = conflict_resolver(&tx, &ctx, title2.clone(), &job.cancel);
         let mut report = ops::execute(&plan, job, &mut resolver);
         for path in vanished {
             report
@@ -888,6 +865,36 @@ fn start_transfer_with(
     app.ops
         .jobs
         .spawn_queued("transfer", title, disks, job_body, unstarted);
+}
+
+/// Forwards a job's conflicts to the UI. The job thread blocks until the user answers (or
+/// the job is cancelled).
+pub(crate) fn conflict_resolver(
+    tx: &Sender<Event>,
+    ctx: &egui::Context,
+    job_title: String,
+    cancel: &CancelToken,
+) -> impl FnMut(&ConflictInfo) -> Resolution + use<> {
+    let (ui_tx, ui_ctx, cancel) = (tx.clone(), ctx.clone(), cancel.clone());
+    move |info: &ConflictInfo| -> Resolution {
+        let (rtx, rrx) = bounded(1);
+        let _ = ui_tx.send(Event::Conflict(ConflictQuestion {
+            info: info.clone(),
+            job_title: job_title.clone(),
+            reply: rtx,
+            apply_all: false,
+        }));
+        ui_ctx.request_repaint();
+        loop {
+            match rrx.recv_timeout(Duration::from_millis(200)) {
+                Ok(r) => return r,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {
+                    continue;
+                }
+                _ => return Resolution::once(ConflictDecision::Cancel),
+            }
+        }
+    }
 }
 
 /// What a source path pointed at when a move was queued.
@@ -1165,7 +1172,7 @@ fn source_identity(path: &Path) -> Option<SourceIdentity> {
 /// Physical disks a transfer reads and writes, or `None` if any of them is unknown
 /// (network paths). Looked up per drive letter and cached briefly, because a drive
 /// letter can be given to another card reader or USB disk.
-fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
+pub(crate) fn transfer_disks(sources: &[PathBuf], dest: &Path) -> forge_jobs::DiskSet {
     use std::collections::HashMap;
     use std::path::Component;
     use std::sync::LazyLock;
@@ -1256,7 +1263,7 @@ fn uncovered_moves(sources: &[PathBuf], dest: &Path, report: &OpReport) -> Vec<(
     pairs
 }
 
-fn finish_report(
+pub(crate) fn finish_report(
     job: &JobHandle,
     report: &OpReport,
     tx: &Sender<Event>,
@@ -1268,6 +1275,10 @@ fn finish_report(
     for d in dests.iter().chain(sources.iter()) {
         let _ = tx.send(Event::Changed(d.clone()));
     }
+    // Explorer and the Desktop otherwise notice our changes only through their own file
+    // system watchers, which can take seconds (a file moved off the Desktop lingered there).
+    let dirs: Vec<PathBuf> = dests.iter().chain(sources.iter()).cloned().collect();
+    crate::shell_sync::announce(&crate::shell_sync::changes(report, &dirs));
     if !report.undo.is_empty() {
         let _ = tx.send(Event::Undo(UndoEntry::Ops(report.undo.clone())));
     }

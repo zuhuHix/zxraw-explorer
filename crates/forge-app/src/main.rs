@@ -47,6 +47,7 @@ mod tags_ui;
 mod watermark;
 mod terminal;
 mod settings;
+mod shell_sync;
 mod settings_ui;
 mod sidebar;
 mod similar;
@@ -65,6 +66,7 @@ mod updater;
 mod video_ui;
 mod viewer;
 mod viewer_host;
+mod virtual_copy;
 mod views;
 mod watcher;
 
