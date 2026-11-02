@@ -280,11 +280,12 @@ pub(super) fn entries_of(path: &Path, a: &sz::Archive) -> Vec<Option<ArchiveEntr
                 (Some(b), Some(info)) if f.has_stream && f.size > 0 => {
                     let off = offsets[b];
                     offsets[b] = off.saturating_add(f.size);
+                    // Rounded up: a tiny file of a big block still takes some room.
                     let share = if info.unpack_size == 0 {
                         0
                     } else {
-                        (u128::from(f.size) * u128::from(info.pack_size)
-                            / u128::from(info.unpack_size)) as u64
+                        (u128::from(f.size) * u128::from(info.pack_size))
+                            .div_ceil(u128::from(info.unpack_size)) as u64
                     };
                     (off, share)
                 }

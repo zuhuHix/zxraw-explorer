@@ -366,3 +366,226 @@ fn edit_keeps_untouched_blocks_and_recompresses_touched_ones() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hand-built headers: bombs are refused before anything is allocated or decoded
+// ---------------------------------------------------------------------------
+
+/// 7z's variable-length number.
+fn num(v: u64) -> Vec<u8> {
+    if v < 0x80 {
+        return vec![v as u8];
+    }
+    let mut out = vec![0xFF];
+    out.extend_from_slice(&v.to_le_bytes());
+    out
+}
+
+/// A 7z file: signature header, `packed` data, then `header` as the next header.
+fn raw_7z(packed: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut start = Vec::new();
+    start.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    start.extend_from_slice(&crc32fast::hash(header).to_le_bytes());
+    let mut out = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    out.extend_from_slice(&crc32fast::hash(&start).to_le_bytes());
+    out.extend_from_slice(&start);
+    out.extend_from_slice(packed);
+    out.extend_from_slice(header);
+    out
+}
+
+/// Streams info with one pack stream of `pack` bytes and one folder of one coder.
+fn one_folder(pack: u64, id: &[u8], props: &[u8], unpack: u64) -> Vec<u8> {
+    let mut h = vec![0x06];
+    h.extend(num(0));
+    h.extend(num(1));
+    h.push(0x09);
+    h.extend(num(pack));
+    h.push(0x00);
+    h.push(0x07);
+    h.push(0x0B);
+    h.extend(num(1));
+    h.push(0); // not external
+    h.extend(num(1)); // coders
+    h.push(id.len() as u8 | if props.is_empty() { 0 } else { 0x20 });
+    h.extend_from_slice(id);
+    if !props.is_empty() {
+        h.extend(num(props.len() as u64));
+        h.extend_from_slice(props);
+    }
+    h.push(0x0C);
+    h.extend(num(unpack));
+    h.push(0x00);
+    h
+}
+
+/// A plain header holding one file named `f.txt` whose data is a block with `id`/`props`.
+fn file_header(pack: u64, id: &[u8], props: &[u8], unpack: u64) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04];
+    h.extend(one_folder(pack, id, props, unpack));
+    h.extend([0x08, 0x00]); // sub-streams: one per folder
+    h.push(0x00); // end of streams info
+    h.push(0x05);
+    h.extend(num(1));
+    let name: Vec<u8> = "f.txt\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    h.push(0x11);
+    h.extend(num(name.len() as u64 + 1));
+    h.push(0);
+    h.extend(name);
+    h.push(0x00); // end of files info
+    h.push(0x00); // end of header
+    h
+}
+
+fn write_raw(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    let p = dir.join(name);
+    fs::write(&p, bytes).unwrap();
+    p
+}
+
+fn assert_refused(path: &Path, needle: &str) {
+    let e = list(path).unwrap_err();
+    assert!(e.to_string().contains(needle), "{}: {e}", path.display());
+}
+
+#[test]
+fn hand_built_plain_header_lists_and_extracts() {
+    // The builder makes archives the reader accepts: the bomb tests below differ in one value.
+    let d = tempfile::tempdir().unwrap();
+    let data = b"hello 7z";
+    let p = write_raw(
+        d.path(),
+        "ok.7z",
+        &raw_7z(data, &file_header(data.len() as u64, &[0x00], &[], data.len() as u64)),
+    );
+    let l = list(&p).unwrap();
+    assert_eq!(l.entries.len(), 1);
+    assert_eq!(l.entries[0].name, "f.txt");
+    let x = d.path().join("x");
+    let r = extract_all(&p, &x, None);
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(x.join("f.txt")).unwrap(), data);
+}
+
+#[test]
+fn header_bombs_are_refused_before_allocating() {
+    let d = tempfile::tempdir().unwrap();
+    // A billion entries declared in a few bytes.
+    let mut h = vec![0x01, 0x05];
+    h.extend(num(1_000_000_000));
+    h.extend([0x00, 0x00]);
+    assert_refused(&write_raw(d.path(), "files.7z", &raw_7z(&[], &h)), "entries");
+    // 100 coders in one folder.
+    let mut h = vec![0x01, 0x04, 0x07, 0x0B];
+    h.extend(num(1));
+    h.push(0);
+    h.extend(num(100));
+    h.extend([0x00; 64]);
+    assert_refused(&write_raw(d.path(), "coders.7z", &raw_7z(&[], &h)), "coders");
+    // A billion folders.
+    let mut h = vec![0x01, 0x04, 0x07, 0x0B];
+    h.extend(num(1_000_000_000));
+    h.extend([0x00; 16]);
+    assert_refused(&write_raw(d.path(), "folders.7z", &raw_7z(&[], &h)), "folders");
+    // A next header bigger than the file, and one bigger than allowed.
+    let mut bytes = raw_7z(&[], &[0x01, 0x00]);
+    bytes[20..28].copy_from_slice(&(1u64 << 40).to_le_bytes());
+    let start_crc = crc32fast::hash(&bytes[12..32]);
+    bytes[8..12].copy_from_slice(&start_crc.to_le_bytes());
+    assert_refused(&write_raw(d.path(), "past.7z", &bytes), "larger than allowed");
+    let mut bytes = raw_7z(&[], &[0x01, 0x00]);
+    bytes[20..28].copy_from_slice(&(1u64 << 20).to_le_bytes());
+    let start_crc = crc32fast::hash(&bytes[12..32]);
+    bytes[8..12].copy_from_slice(&start_crc.to_le_bytes());
+    assert_refused(&write_raw(d.path(), "past2.7z", &bytes), "past the end");
+}
+
+#[test]
+fn encoded_header_bombs_are_refused_before_decoding() {
+    let d = tempfile::tempdir().unwrap();
+    let packed = [0u8; 32];
+    // LZMA with a 4 GiB dictionary.
+    let mut h = vec![0x17];
+    h.extend(one_folder(32, &[0x03, 0x01, 0x01], &[0x5D, 0xFF, 0xFF, 0xFF, 0xFF], 100));
+    h.push(0x00);
+    assert_refused(
+        &write_raw(d.path(), "dict.7z", &raw_7z(&packed, &h)),
+        "decoder memory",
+    );
+    // A header that would expand to a terabyte.
+    let mut h = vec![0x17];
+    h.extend(one_folder(32, &[0x03, 0x01, 0x01], &[0x5D, 0, 0, 1, 0], 1 << 40));
+    h.push(0x00);
+    assert_refused(
+        &write_raw(d.path(), "huge.7z", &raw_7z(&packed, &h)),
+        "expands to more than",
+    );
+    // An AES-encrypted header without a password is a password question, not damage.
+    let mut h = vec![0x17];
+    let mut folder = one_folder(32, &[0x06, 0xF1, 0x07, 0x01], &[0x13, 0x00], 32);
+    folder.pop();
+    folder.extend([0x0A, 0x01]); // the decoded header's CRC
+    folder.extend(0xDEAD_BEEFu32.to_le_bytes());
+    folder.push(0x00);
+    h.extend(folder);
+    h.push(0x00);
+    let p = write_raw(d.path(), "aes.7z", &raw_7z(&packed, &h));
+    assert!(matches!(list(&p), Err(CoreError::PasswordRequired(_))));
+    assert!(matches!(
+        list_with_password(&p, Some(&Password::new("x"))),
+        Err(CoreError::WrongPassword(_))
+    ));
+}
+
+#[test]
+fn data_block_with_a_huge_dictionary_is_refused_before_writing() {
+    let d = tempfile::tempdir().unwrap();
+    let packed = [0u8; 16];
+    // LZMA2 property 40: a 4 GiB dictionary.
+    let p = write_raw(
+        d.path(),
+        "lzma2.7z",
+        &raw_7z(&packed, &file_header(16, &[0x21], &[40], 1000)),
+    );
+    let l = list(&p).unwrap();
+    assert_eq!(l.entries[0].method, "LZMA2");
+    let x = d.path().join("x");
+    fs::create_dir_all(&x).unwrap();
+    let (c, pr) = ctx_parts();
+    let e = extract(&p, &x, &ExtractOptions::default(), None, &JobCtx::new(&c, &pr)).unwrap_err();
+    assert!(e.to_string().contains("decoder memory"), "{e}");
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 0);
+    // PPMd asking for 4 GiB of model memory, the same.
+    let p = write_raw(
+        d.path(),
+        "ppmd.7z",
+        &raw_7z(
+            &packed,
+            &file_header(16, &[0x03, 0x04, 0x01], &[6, 0xFF, 0xFF, 0xFF, 0xFF], 1000),
+        ),
+    );
+    let e = extract(&p, &x, &ExtractOptions::default(), None, &JobCtx::new(&c, &pr)).unwrap_err();
+    assert!(e.to_string().contains("decoder memory"), "{e}");
+}
+
+#[test]
+fn incomplete_and_truncated_archives_are_damage() {
+    let d = tempfile::tempdir().unwrap();
+    let mut bytes = raw_7z(b"data", &[0x01, 0x00]);
+    bytes[8..32].fill(0);
+    assert_refused(&write_raw(d.path(), "incomplete.7z", &bytes), "incomplete");
+    let src = sample_tree(d.path());
+    let out = d.path().join("t.7z");
+    let (c, p) = ctx_parts();
+    create(
+        std::slice::from_ref(&src),
+        &out,
+        &opts_7z(Preset::Fast, true, None, false),
+        &JobCtx::new(&c, &p),
+    )
+    .unwrap();
+    let full = fs::read(&out).unwrap();
+    let cut = write_raw(d.path(), "cut.7z", &full[..full.len() / 2]);
+    assert!(matches!(list(&cut), Err(CoreError::Invalid(_))));
+}

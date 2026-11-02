@@ -43,6 +43,10 @@ mod tests_edit;
 mod tests_hostile;
 #[cfg(test)]
 mod tests_sevenz;
+#[cfg(test)]
+mod tests_sevenz_fixtures;
+#[cfg(test)]
+mod tests_sevenz_hostile;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
