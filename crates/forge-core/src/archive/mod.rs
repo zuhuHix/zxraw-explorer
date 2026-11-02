@@ -178,6 +178,9 @@ pub struct ArchiveEntry {
     /// [`ArchiveBackend::read_entries_checked`]).
     #[serde(default)]
     pub checked_by_block: bool,
+    /// The compressed block holding its data (7z), for grouping files of one block.
+    #[serde(default)]
+    pub block: Option<usize>,
 }
 
 impl ArchiveEntry {
@@ -590,6 +593,10 @@ pub struct ExtractReport {
     /// Names of encrypted entries without a checksum skipped because the password was not
     /// proven (also in `skipped`): extract them with `allow_unchecked_encrypted` if wanted.
     pub unchecked: Vec<String>,
+    /// [`extract_to`] made `dest` itself (its `create_dir` succeeded): only then may a caller
+    /// remove it again.
+    #[serde(default)]
+    pub created_dest: bool,
 }
 
 struct Planned {
@@ -750,6 +757,10 @@ pub fn extract(
             false
         });
     }
+    // Blocks with more files to hold than handles we keep open are checked first (decoded
+    // once to verify their checksum, after the preflight above), then extracted directly.
+    let verified_blocks =
+        verify_crowded_blocks(backend, archive, password, ctx, &mut planned, &mut report)?;
     // The destination, resolved and pinned from the volume root for the whole job; entries
     // are written beneath its final path and reported beneath `dest_dir`.
     let base = safety::PinnedBase::open(dest_dir)?;
@@ -777,7 +788,10 @@ pub fn extract(
     };
     // Files waiting for their solid block's checksum (temp files, deleted if dropped), with
     // their folder inside the destination; and what became of them.
-    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, PathBuf)>> = Default::default();
+    // Each held file keeps its open handle and the pins of the folders it goes into until it
+    // is published or dropped: neither it nor its folders can be swapped meanwhile.
+    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs)>> =
+        Default::default();
     let settled: std::cell::RefCell<(Vec<PathBuf>, Vec<OpIssue>)> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
         ctx.cancel.check()?;
@@ -791,7 +805,7 @@ pub fn extract(
             p.rel.parent().unwrap_or(Path::new(""))
         };
         // Held until the entry is in place: the folders it is written into can't be swapped.
-        let _pinned = match safety::pin_dirs(&base, parent_rel) {
+        let pinned = match safety::pin_dirs(&base, parent_rel) {
             Ok(pinned) => pinned,
             Err(e) => {
                 report
@@ -844,13 +858,13 @@ pub fn extract(
             ..Default::default()
         };
         let label = PathBuf::from(&p.entry.name);
-        if p.entry.checked_by_block {
+        let verified = p.entry.block.is_some_and(|b| verified_blocks.contains(&b));
+        if p.entry.checked_by_block && !verified {
             return match ops::write_stream_held(reader, &label, &dest, sopts, keep_both, ctx) {
                 Ok((out, file)) => {
                     remaining = remaining.saturating_sub(out.bytes);
                     report.bytes += out.bytes;
-                    held.borrow_mut()
-                        .push((file, shown(&dest), parent_rel.to_path_buf()));
+                    held.borrow_mut().push((file, shown(&dest), pinned));
                     Ok(())
                 }
                 Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
@@ -887,14 +901,15 @@ pub fn extract(
     let mut block_end = |outcome: Result<()>| -> Result<()> {
         let waiting = std::mem::take(&mut *held.borrow_mut());
         let mut settled = settled.borrow_mut();
-        for (file, label, parent_rel) in waiting {
+        for (file, label, pinned) in waiting {
             if outcome.is_err() {
-                drop(file); // deletes the temp file
+                drop(file); // deleted through its handle
                 settled.1.push(OpIssue::new(label, BLOCK_CHECK_FAILED));
                 continue;
             }
-            // Pinned again while it is renamed into place, as when it was written.
-            let published = safety::pin_dirs(&base, &parent_rel).and_then(|_pinned| file.publish());
+            // Still pinned since it was written; renamed through its own handle.
+            let published = file.publish();
+            drop(pinned);
             match published {
                 Ok(placed) => {
                     if let Some(zone) = &zone
@@ -929,6 +944,105 @@ pub fn extract(
         Err(e) => return Err(e),
     }
     Ok(report)
+}
+
+/// Most files held open per solid block while its checksum is pending (each holds a handle
+/// and its folders' pins).
+const MAX_HELD_PER_BLOCK: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a smaller [`MAX_HELD_PER_BLOCK`].
+    pub(crate) static HELD_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn held_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = HELD_CAP.with(|c| c.get()) {
+        return cap;
+    }
+    MAX_HELD_PER_BLOCK
+}
+
+/// Blocks holding more planned [`ArchiveEntry::checked_by_block`] files than
+/// [`MAX_HELD_PER_BLOCK`] are decoded once first, only to check their checksum. Those that
+/// match are returned (their files are then extracted directly); the files of those that
+/// don't are taken out of `planned` and reported failed.
+fn verify_crowded_blocks(
+    backend: &dyn ArchiveBackend,
+    archive: &Path,
+    password: Option<&Password>,
+    ctx: &JobCtx<'_>,
+    planned: &mut Vec<Planned>,
+    report: &mut ExtractReport,
+) -> Result<HashSet<usize>> {
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for p in planned.iter().filter(|p| p.entry.checked_by_block) {
+        if let Some(b) = p.entry.block {
+            *counts.entry(b).or_default() += 1;
+        }
+    }
+    let mut crowded: Vec<usize> = counts
+        .into_iter()
+        .filter(|&(_, n)| n > held_cap())
+        .map(|(b, _)| b)
+        .collect();
+    if crowded.is_empty() {
+        return Ok(HashSet::new());
+    }
+    crowded.sort_unstable();
+    ctx.progress
+        .set_note("Checking solid blocks before extracting (too many files to hold)");
+    let checked: HashSet<usize> = crowded.iter().copied().collect();
+    let in_crowded =
+        |e: &ArchiveEntry| e.checked_by_block && e.block.is_some_and(|b| checked.contains(&b));
+    let names: HashSet<usize> = planned
+        .iter()
+        .filter(|p| in_crowded(&p.entry))
+        .map(|p| p.entry.index)
+        .collect();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut drain = |_: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
+        if let Ok(r) = reader {
+            loop {
+                ctx.cancel.check()?;
+                match r.read(&mut buf) {
+                    Ok(0) | Err(_) => break, // a bad read fails the block's check
+                    Ok(_) => {}
+                }
+            }
+        }
+        Ok(())
+    };
+    // One outcome per crowded block, in block order (as the backend reads them).
+    let mut outcomes = Vec::new();
+    let mut block_end = |outcome: Result<()>| -> Result<()> {
+        outcomes.push(outcome.is_ok());
+        Ok(())
+    };
+    backend.read_entries_checked(
+        archive,
+        &|e| names.contains(&e.index),
+        password,
+        Some(ctx),
+        &mut drain,
+        &mut block_end,
+    )?;
+    ctx.progress.set_note("");
+    let mut verified = HashSet::new();
+    for (i, b) in crowded.iter().enumerate() {
+        if outcomes.get(i).copied().unwrap_or(false) {
+            verified.insert(*b);
+        }
+    }
+    planned.retain(|p| {
+        let bad = in_crowded(&p.entry) && p.entry.block.is_some_and(|b| !verified.contains(&b));
+        if bad {
+            report.failed.push(OpIssue::new(&p.rel, BLOCK_CHECK_FAILED));
+        }
+        !bad
+    });
+    Ok(verified)
 }
 
 /// The reason shown for an entry whose data could not be read.
@@ -1112,7 +1226,10 @@ fn finish_created(
     opts: &ExtractOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<ExtractReport> {
-    let result = extract(archive, &dest, opts, None, ctx);
+    let result = extract(archive, &dest, opts, None, ctx).map(|mut r| {
+        r.created_dest = true;
+        r
+    });
     let failed_empty = match &result {
         Err(_) => true,
         Ok(r) => r.cancelled || r.extracted.is_empty() && !r.failed.is_empty(),

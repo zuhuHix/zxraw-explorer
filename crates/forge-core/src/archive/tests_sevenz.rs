@@ -1243,3 +1243,247 @@ fn a_test_under_an_unproven_password_does_not_say_all_ok() {
     assert_eq!(t.unverified().count(), 1, "{t:?}");
     assert!(!t.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Verification round (#44): held files keep their handle and pins, the hold cap, zip starts
+// ---------------------------------------------------------------------------
+
+/// A held file for `dest` with `data`.
+fn held(dest: &Path, data: &[u8], overwrite: bool, keep_both: bool) -> ops::HeldFile {
+    let (c, p) = ctx_parts();
+    let opts = ops::StreamOptions {
+        overwrite,
+        exact: Some(data.len() as u64),
+        ..Default::default()
+    };
+    ops::write_stream_held(
+        data,
+        Path::new("x"),
+        dest,
+        opts,
+        keep_both,
+        &JobCtx::new(&c, &p),
+    )
+    .unwrap()
+    .1
+}
+
+#[test]
+fn a_held_file_cant_be_written_renamed_or_deleted_by_others() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("out.txt");
+    let h = held(&dest, b"held data", false, false);
+    let tmp = h.temp_path().to_path_buf();
+    assert!(tmp.exists());
+    assert!(
+        fs::OpenOptions::new().write(true).open(&tmp).is_err(),
+        "opened for write"
+    );
+    assert!(fs::remove_file(&tmp).is_err(), "deleted");
+    assert!(fs::rename(&tmp, d.path().join("moved")).is_err(), "renamed");
+    // Reading is allowed.
+    assert_eq!(fs::read(&tmp).unwrap(), b"held data");
+    let placed = h.publish().unwrap();
+    assert_eq!(placed, dest);
+    assert_eq!(fs::read(&dest).unwrap(), b"held data");
+    assert!(!tmp.exists());
+    // Dropped unpublished: deleted through its handle.
+    let h = held(&d.path().join("gone.txt"), b"x", false, false);
+    let tmp = h.temp_path().to_path_buf();
+    drop(h);
+    assert!(!tmp.exists() && !d.path().join("gone.txt").exists());
+}
+
+#[test]
+fn held_files_publish_under_each_conflict_policy() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("f.txt");
+    fs::write(&dest, b"old").unwrap();
+    // Skip (neither): refused, the old file stays, the temp goes.
+    let h = held(&dest, b"new", false, false);
+    let tmp = h.temp_path().to_path_buf();
+    assert!(matches!(h.publish(), Err(CoreError::AlreadyExists(_))));
+    assert_eq!(fs::read(&dest).unwrap(), b"old");
+    assert!(!tmp.exists());
+    // Keep both: the next free name.
+    let placed = held(&dest, b"both", false, true).publish().unwrap();
+    assert_ne!(placed, dest);
+    assert_eq!(fs::read(&placed).unwrap(), b"both");
+    assert_eq!(fs::read(&dest).unwrap(), b"old");
+    // Overwrite: replaced, even read-only.
+    let mut perms = fs::metadata(&dest).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&dest, perms).unwrap();
+    let placed = held(&dest, b"replaced", true, false).publish().unwrap();
+    assert_eq!(placed, dest);
+    assert_eq!(fs::read(&dest).unwrap(), b"replaced");
+}
+
+/// Three 8-byte files in folders s1/, s2/ and s3/, stored in one block whose only checksum
+/// is the block's.
+fn block_crc_only_in_folders_7z() -> Vec<u8> {
+    let mut h = vec![0x01, 0x04];
+    h.extend([0x06, 0x00, 0x01, 0x09, 0x18, 0x00]);
+    h.extend([0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00]);
+    h.extend([0x0C, 0x18, 0x0A, 0x01]);
+    h.extend(crc32fast::hash(&BLOCK_DATA).to_le_bytes());
+    h.push(0x00);
+    h.extend([0x08, 0x0D, 0x03, 0x09, 0x08, 0x08, 0x00]);
+    h.push(0x00);
+    h.extend([0x05, 0x03, 0x11]);
+    let names: Vec<u8> = "s1/a.txt\0s2/b.txt\0s3/c.txt\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    h.extend(num(names.len() as u64 + 1));
+    h.push(0);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    raw_7z(&BLOCK_DATA, &h)
+}
+
+#[test]
+fn a_held_files_folder_stays_pinned_until_it_is_published() {
+    let d = tempfile::tempdir().unwrap();
+    let archive = write_raw(d.path(), "folders.7z", &block_crc_only_in_folders_7z());
+    let x = d.path().join("x");
+    fs::create_dir_all(&x).unwrap();
+    // While s2/b.txt is written, s1/a.txt waits for the block: its folder can't be moved.
+    let s1 = x.join("s1");
+    let moved = std::rc::Rc::new(std::cell::Cell::new(None::<bool>));
+    let seen = moved.clone();
+    let target = d.path().join("s1-moved");
+    ops::AFTER_CHUNK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |label, _| {
+            if label.ends_with("b.txt") && seen.get().is_none() {
+                seen.set(Some(fs::rename(&s1, &target).is_ok()));
+            }
+        }))
+    });
+    let (c, p) = ctx_parts();
+    let r = extract(
+        &archive,
+        &x,
+        &ExtractOptions::default(),
+        None,
+        &JobCtx::new(&c, &p),
+    );
+    ops::AFTER_CHUNK.with(|h| *h.borrow_mut() = None);
+    let r = r.unwrap();
+    assert_eq!(
+        moved.get(),
+        Some(false),
+        "the waiting file's folder was moved"
+    );
+    assert_eq!(r.extracted.len(), 3, "{r:?}");
+    assert_eq!(fs::read(x.join("s1/a.txt")).unwrap(), b"aaaaaaaa");
+}
+
+#[test]
+fn blocks_with_more_files_than_the_hold_cap_are_checked_first() {
+    let d = tempfile::tempdir().unwrap();
+    let good = write_raw(d.path(), "good.7z", &block_crc_only_7z(&BLOCK_DATA));
+    let bad = damaged_block_7z(d.path(), "bad.7z");
+    HELD_CAP.with(|c| c.set(Some(1)));
+    let gx = d.path().join("good");
+    let bx = d.path().join("bad");
+    let good_report = extract_all(&good, &gx, None);
+    let bad_report = extract_all(&bad, &bx, None);
+    HELD_CAP.with(|c| c.set(None));
+    assert_eq!(good_report.extracted.len(), 3, "{good_report:?}");
+    assert_eq!(fs::read(gx.join("b.txt")).unwrap(), b"bbbbbbbb");
+    assert!(bad_report.extracted.is_empty(), "{bad_report:?}");
+    assert_eq!(bad_report.failed.len(), 3, "{bad_report:?}");
+    assert!(
+        bad_report
+            .failed
+            .iter()
+            .all(|f| f.reason == BLOCK_CHECK_FAILED)
+    );
+    assert_eq!(fs::read_dir(&bx).unwrap().count(), 0);
+}
+
+#[test]
+fn zips_starting_with_the_spanning_marker_or_empty_zip64_can_be_edited() {
+    let d = tempfile::tempdir().unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let extra = d.path().join("extra.txt");
+    fs::write(&extra, b"new").unwrap();
+    let add = ArchiveEdit {
+        add: vec![(extra.clone(), String::new())],
+        delete: vec![],
+    };
+    // A single-segment "spanned" zip: the marker, then an ordinary archive whose offsets
+    // count from the start of the file.
+    let mut cur = std::io::Cursor::new(b"PK\x07\x08".to_vec());
+    cur.set_position(4);
+    let mut zw = zip::ZipWriter::new(cur);
+    zw.start_file("a.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zw, b"marker zip").unwrap();
+    let bytes = zw.finish().unwrap().into_inner();
+    assert!(bytes.starts_with(b"PK\x07\x08PK\x03\x04"));
+    let spanned = write_raw(d.path(), "spanned.zip", &bytes);
+    assert_eq!(list(&spanned).unwrap().entries.len(), 1);
+    update(&spanned, &add, &CreateOptions::default(), &ctx).unwrap();
+    let names: Vec<String> = list(&spanned)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["a.txt", "extra.txt"]);
+    // An empty zip64 archive: zip64 end record, its locator, the end record.
+    let mut z = Vec::new();
+    z.extend(b"PK\x06\x06");
+    z.extend(44u64.to_le_bytes()); // size of the rest of the record
+    z.extend([45, 0, 45, 0]); // versions
+    z.extend([0u8; 8]); // disk numbers
+    z.extend([0u8; 16]); // entries on this disk, entries
+    z.extend([0u8; 8]); // directory size
+    z.extend([0u8; 8]); // directory offset
+    z.extend(b"PK\x06\x07");
+    z.extend([0u8; 4]);
+    z.extend(0u64.to_le_bytes()); // zip64 end record at offset 0
+    z.extend(1u32.to_le_bytes());
+    z.extend(b"PK\x05\x06");
+    z.extend([0u8; 4]);
+    z.extend([0xFF; 4]);
+    z.extend([0xFF; 8]);
+    z.extend([0u8; 2]);
+    let empty64 = write_raw(d.path(), "empty64.zip", &z);
+    assert!(list(&empty64).unwrap().entries.is_empty());
+    update(&empty64, &add, &CreateOptions::default(), &ctx).unwrap();
+    let names: Vec<String> = list(&empty64)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["extra.txt"]);
+}
+
+#[test]
+fn extract_to_says_whether_it_made_the_folder() {
+    let d = tempfile::tempdir().unwrap();
+    let src = sample_tree(d.path());
+    let out = d.path().join("named.7z");
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    create(
+        std::slice::from_ref(&src),
+        &out,
+        &CreateOptions::default(),
+        &ctx,
+    )
+    .unwrap();
+    let parent = d.path().join("p");
+    fs::create_dir_all(&parent).unwrap();
+    let opts = ExtractOptions::default();
+    let r = extract_to(&out, &parent, ExtractTarget::NamedFolder, &opts, &ctx).unwrap();
+    assert!(r.created_dest);
+    // The folder exists now (someone else's, as far as the next run knows).
+    let r = extract_to(&out, &parent, ExtractTarget::NamedFolder, &opts, &ctx).unwrap();
+    assert!(!r.created_dest);
+}

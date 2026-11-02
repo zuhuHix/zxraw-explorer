@@ -145,6 +145,7 @@ fn to_entry<R: Read>(index: usize, f: &zip::read::ZipFile<'_, R>) -> ArchiveEntr
         block_offset: 0,
         unchecked: false,
         checked_by_block: false,
+        block: None,
     }
 }
 
@@ -498,14 +499,28 @@ const STALE_PARTIAL_AGE: std::time::Duration = std::time::Duration::from_secs(36
 /// Shown when an edit is refused because the zip has something in front of it.
 pub const SFX_NOT_EDITABLE: &str = "Self-extracting archives can't be edited; extract them instead";
 
-/// Refuse a zip with a prefix (a self-extractor stub): its first local header is not at the
-/// start, or its directory places the archive further in. A rebuild would drop the stub.
+/// Refuse a zip with a prefix (a self-extractor stub): it doesn't start with a zip record,
+/// or its directory places the archive further in. A rebuild would drop the stub. Valid
+/// starts: a local header; the spanning marker followed by one; an empty archive's end
+/// record or zip64 end record.
 pub(crate) fn check_no_prefix(archive: &Path, file: &mut File) -> Result<()> {
-    let mut head = [0u8; 4];
+    let mut head = [0u8; 8];
+    let mut n = 0;
     file.seek(SeekFrom::Start(0))
-        .and_then(|_| file.read_exact(&mut head))
         .map_err(|e| CoreError::io(archive, e))?;
-    let starts_right = head == *b"PK\x03\x04" || head == *b"PK\x05\x06";
+    while n < head.len() {
+        match file.read(&mut head[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(CoreError::io(archive, e)),
+        }
+    }
+    let head = &head[..n];
+    let starts_right = head.starts_with(b"PK\x03\x04")
+        || head.starts_with(b"PK\x05\x06")
+        || head.starts_with(b"PK\x06\x06")
+        || head.starts_with(b"PK\x07\x08PK\x03\x04");
     file.seek(SeekFrom::Start(0))
         .map_err(|e| CoreError::io(archive, e))?;
     let offset = ZipArchive::new(BufReader::new(&mut *file))
