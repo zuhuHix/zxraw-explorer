@@ -48,7 +48,18 @@ pub struct UpdateRequest {
     /// The archive has encrypted entries: the edit needs its password (added files are
     /// encrypted with it). The engine refuses to add files without it in any case.
     pub encrypted: bool,
+    /// Only folders are encrypted: there is no file to check a password against, so the new
+    /// files' password is typed twice, as for a new encrypted archive.
+    pub confirm_password: bool,
     pub title: String,
+}
+
+/// Whether adding to an archive needs a password, and whether it must be typed twice: only
+/// folders are encrypted, so there is no file to check it against.
+pub fn password_needs(listing: &forge_core::archive::ArchiveListing) -> (bool, bool) {
+    let encrypted = listing.any_encrypted();
+    let files = listing.entries.iter().any(|e| e.encrypted && !e.is_dir);
+    (encrypted, encrypted && !files)
 }
 
 /// "1 item" / "3 items".
@@ -300,6 +311,7 @@ fn add_into(
         format!("{folder}/")
     };
     let existing = existing_names(&view.index, folder, &sources);
+    let lock = password_needs(&view.index.listing);
     let request = UpdateRequest {
         archive: view.archive.clone(),
         title: format!("Adding {} to {name}", items(sources.len())),
@@ -307,7 +319,8 @@ fn add_into(
             add: sources.into_iter().map(|s| (s, dest.clone())).collect(),
             delete: Vec::new(),
         },
-        encrypted: view.index.nodes().iter().any(|n| n.encrypted),
+        encrypted: lock.0,
+        confirm_password: lock.1,
     };
     if existing.is_empty() {
         return start_update(app, request);
@@ -365,7 +378,9 @@ pub fn ask_delete(app: &mut ZxrawApp) {
                 add: Vec::new(),
                 delete: selection_names(nodes),
             },
+            // Kept entries are copied as stored: deleting needs no password.
             encrypted: false,
+            confirm_password: false,
         }),
         title: "Delete from archive".into(),
         confirm_label: "Delete".into(),
@@ -426,17 +441,20 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
             Ok(report) => {
                 let summary = update_summary(&report, &request.edit, &name);
                 job.log(summary.clone());
-                let event = if report.skipped.is_empty() {
+                let event = if report.skipped.is_empty() && report.warnings.is_empty() {
                     Event::Toast(summary)
                 } else {
                     let mut lines = vec![summary];
+                    lines.extend(report.warnings.iter().cloned());
                     for s in &report.skipped {
                         lines.push(format!("skipped {}: {}", s.path.display(), s.reason));
                     }
-                    Event::Report {
-                        title: format!("{} — some files skipped", job.title),
-                        lines,
-                    }
+                    let title = if report.skipped.is_empty() {
+                        job.title.to_string()
+                    } else {
+                        format!("{} — some files skipped", job.title)
+                    };
+                    Event::Report { title, lines }
                 };
                 let _ = events.send(event);
                 Ok(())
@@ -530,6 +548,33 @@ mod tests {
         assert_eq!(sel.base, "sub/");
         assert_eq!(sel.names, ["sub/a.txt", "sub/deep/"]);
         assert!(selection_of(&v, &[PathBuf::from(r"D:\x\a.zip\missing")]).is_none());
+    }
+
+    #[test]
+    fn encrypted_folders_alone_ask_for_the_password_twice() {
+        let listing = |locked: &[(&str, bool)]| ArchiveListing {
+            format: ArchiveFormat::Zip,
+            entries: locked
+                .iter()
+                .map(|&(n, enc)| ArchiveEntry {
+                    encrypted: enc,
+                    ..entry(n)
+                })
+                .collect(),
+            comment: String::new(),
+        };
+        assert_eq!(
+            password_needs(&listing(&[("a.txt", false)])),
+            (false, false)
+        );
+        assert_eq!(
+            password_needs(&listing(&[("a/", true), ("b.txt", false)])),
+            (true, true)
+        );
+        assert_eq!(
+            password_needs(&listing(&[("a/", true), ("a/b.txt", true)])),
+            (true, false)
+        );
     }
 
     #[test]

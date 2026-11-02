@@ -25,7 +25,7 @@ use zip::{AesMode, CompressionMethod, PreparedZipFile, ZipArchive, ZipReadOption
 use super::{
     ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, CreateOptions,
     CreateReport, Encryption, EntryEncryption, EntryVisitor, ExtractLimits, Method, Password,
-    SourceItem, collect_sources, cp437, crypto_peek, motw, safety,
+    SourceItem, collect_sources, cp437, crypto_peek, motw, safety, zip_merge,
 };
 use crate::error::{CoreError, Result};
 use crate::ops::{self, JobCtx, NodeKind, OpIssue, TempGuard};
@@ -375,72 +375,99 @@ impl ArchiveBackend for ZipBackend {
         if let Some(dir) = archive.parent() {
             remove_stale_partials(dir, STALE_PARTIAL_AGE);
         }
-        let mut src = open_zip(archive)?;
-        let (mut zw, tmp, mut guard) = start_output(archive, ctx)?;
+        // Kept entries are copied record by record, as stored (see `zip_merge`): nothing is
+        // decoded, decrypted or re-encoded.
+        let mut za = open_zip(archive)?;
+        let mut src = File::open(archive).map_err(|e| CoreError::io(archive, e))?;
+        let records = zip_merge::raw_records(archive, &mut src, &mut za)?;
+        let comment = za.comment().to_vec();
         let mut names = HashSet::new();
-        let total_kept: u64 = (0..src.len())
-            .filter_map(|i| src.by_index_raw(i).ok().map(|f| f.compressed_size()))
-            .sum();
-        ctx.progress.add_total_bytes(total_kept);
-        for i in 0..src.len() {
+        let mut kept = Vec::new();
+        for (i, record) in records.iter().enumerate() {
             ctx.cancel.check()?;
-            let f = src.by_index_raw(i).map_err(|e| zip_err(archive, e))?;
-            let name = decode_name(&f);
+            let name = decode_name(&za.by_index_raw(i).map_err(|e| zip_err(archive, e))?);
             let key = name.trim_end_matches('/').to_lowercase();
-            let comp = f.compressed_size();
-            ctx.progress.add_bytes(comp);
             if is_deleted(&name) {
                 report.deleted += 1;
-                continue;
-            }
-            if added.contains(&key) {
+            } else if added.contains(&key) {
                 report.replaced += 1;
-                continue;
+            } else if names.insert(key) {
+                kept.push(record);
             }
-            if !names.insert(key) {
-                continue; // keep the first of duplicate names
-            }
-            let zipcrypto =
-                f.encrypted() && !f.is_dir() && f.get_metadata().aes_settings().is_none();
-            if !zipcrypto {
-                zw.raw_copy_file(f).map_err(|e| zip_err(archive, e))?;
-                report.kept += 1;
-                continue;
-            }
-            // `raw_copy_file` drops the encryption flag, which would leave a ZipCrypto entry
-            // unreadable: decrypt it and write it again with the same password.
-            let (method, mtime, size) = (f.compression(), f.last_modified(), f.size());
-            drop(f);
-            let password = match &opts.encryption {
-                Encryption::None => {
-                    return Err(CoreError::PasswordRequired(paths::display_path(archive)));
-                }
-                Encryption::Aes256(p) | Encryption::ZipCryptoLegacy(p) => p,
-            };
-            reencrypt(&mut src, i, &name, (method, mtime, size), password, &mut zw, ctx)
-                .map_err(|e| match e {
-                    CoreError::Cancelled => e,
-                    e => CoreError::Invalid(format!("{}: {e}", archive.display())),
-                })?;
+            // else: the first of duplicate names is kept
+        }
+        drop(za);
+
+        // New files are compressed into a side archive next to it, then copied the same way.
+        let side = if adds.is_empty() {
+            None
+        } else {
+            let (mut zw, side_tmp, side_guard) = start_output(archive, ctx)?;
+            write_items(
+                &mut zw,
+                adds,
+                &mut names,
+                opts,
+                ctx,
+                &mut report,
+                archive,
+                &side_tmp,
+            )?;
+            let w = zw.finish().map_err(|e| zip_err(archive, e))?;
+            drop(
+                w.inner
+                    .into_inner()
+                    .map_err(|e| CoreError::io(archive, e.into_error()))?,
+            );
+            Some((side_tmp, side_guard))
+        };
+
+        let dir = archive
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let tmp = dir.join(ops::partial_name());
+        let file = File::create_new(&tmp).map_err(|e| CoreError::io(archive, e))?;
+        let mut guard = TempGuard(Some(tmp.clone()));
+        let mut out = zip_merge::MergeWriter::new(CountingWriter {
+            inner: BufWriter::with_capacity(1 << 20, file),
+            ctx: *ctx,
+            high: 0,
+            pos: 0,
+        });
+        let mut buf = vec![0u8; 1 << 20];
+        ctx.progress
+            .add_total_bytes(kept.iter().map(|r| r.end - r.start).sum());
+        for record in kept {
+            out.copy(&mut src, record, ctx, &mut buf)?;
+            ctx.progress.add_bytes(record.end - record.start);
             report.kept += 1;
         }
-        write_items(
-            &mut zw,
-            adds,
-            &mut names,
-            opts,
-            ctx,
-            &mut report,
-            archive,
-            &tmp,
-        )?;
-        ctx.cancel.check()?;
         drop(src);
+        if let Some((side_tmp, _guard)) = &side {
+            let mut side_file = File::open(side_tmp).map_err(|e| CoreError::io(archive, e))?;
+            let mut side_zip = open_zip(side_tmp)?;
+            for record in zip_merge::raw_records(side_tmp, &mut side_file, &mut side_zip)? {
+                out.copy(&mut side_file, &record, ctx, &mut buf)?;
+            }
+        }
+        ctx.cancel.check()?;
+        let w = out
+            .finish(&comment)
+            .map_err(|e| CoreError::io(archive, e))?;
+        report.bytes_out = w.high;
+        let file = w
+            .inner
+            .into_inner()
+            .map_err(|e| CoreError::io(archive, e.into_error()))?;
+        file.sync_all().map_err(|e| CoreError::io(archive, e))?;
+        drop(file);
+        drop(side);
         // The rebuilt file replaces the original: keep its Mark-of-the-Web.
         if let Err(e) = motw::copy_zone_stream(archive, &tmp) {
             tracing::warn!("could not keep the zone of {}: {e}", archive.display());
         }
-        finish_output(zw, &tmp, archive, true, &mut report)?;
+        ops::place(&tmp, archive, true)?;
         guard.disarm();
         Ok(report)
     }
@@ -520,56 +547,6 @@ fn delete_if_unused(path: &Path) {
 
 #[cfg(not(windows))]
 fn delete_if_unused(_: &Path) {}
-
-/// Copy the ZipCrypto entry `index` of `src` into `zw`, decrypted and encrypted again with
-/// `password` (ZipCrypto, so it opens in the same tools as before).
-fn reencrypt(
-    src: &mut ZipArchive<BufReader<File>>,
-    index: usize,
-    name: &str,
-    (method, mtime, size): (CompressionMethod, Option<zip::DateTime>, u64),
-    password: &Password,
-    zw: &mut Output<'_>,
-    ctx: &JobCtx<'_>,
-) -> Result<()> {
-    let options = ZipReadOptions::new()
-        .password(Some(password.as_bytes()))
-        .enforce_header_consistency(true);
-    let mut data = src
-        .by_index_with_options(index, options)
-        .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
-    let method = match method {
-        CompressionMethod::Stored
-        | CompressionMethod::Zstd
-        | CompressionMethod::Bzip2
-        | CompressionMethod::Xz => method,
-        _ => CompressionMethod::Deflated,
-    };
-    let o = FileOptions::<()>::default()
-        .compression_method(method)
-        .last_modified_time(mtime.unwrap_or_default())
-        .large_file(size >= u32::MAX as u64)
-        .with_deprecated_encryption(password.as_bytes())
-        .map_err(|_| CoreError::Invalid("the password must not be empty".into()))?;
-    zw.start_file(name, o)
-        .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        ctx.cancel.check()?;
-        let n = match data.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => {
-                return Err(CoreError::Invalid(format!(
-                    "{name}: {e} (damaged data or wrong password)"
-                )));
-            }
-        };
-        zw.write_all(&buf[..n])
-            .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
-    }
-}
 
 /// Counts what is written to the archive file, for the progress output figure.
 struct CountingWriter<'a, W> {
