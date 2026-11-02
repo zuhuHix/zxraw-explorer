@@ -334,7 +334,16 @@ impl Drop for Stage {
         self.inner.cancel.cancel();
         self.inner.changed.notify_all();
         if !running {
-            let _ = fs::remove_dir_all(&self.inner.dir);
+            // The last release may come on the UI thread: a big folder is removed off it.
+            let dir = self.inner.dir.clone();
+            let spawned = std::thread::Builder::new()
+                .name("archive-stage-cleanup".into())
+                .spawn(move || {
+                    let _ = fs::remove_dir_all(dir);
+                });
+            if spawned.is_err() {
+                let _ = fs::remove_dir_all(&self.inner.dir);
+            }
         }
     }
 }
