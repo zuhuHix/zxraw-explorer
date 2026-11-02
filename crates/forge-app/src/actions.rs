@@ -709,6 +709,9 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::ContactSheet => crate::extra_tools_ui::contact_sheet(app),
         Cmd::BrowseArchive => crate::extra_tools_ui::browse_archive(app),
         Cmd::CreateArchive => crate::extra_tools_ui::create_archive(app),
+        Cmd::ExtractHere | Cmd::ExtractToFolder | Cmd::ExtractTo | Cmd::TestArchive => {
+            crate::archive_extract::run(app, cmd)
+        }
         Cmd::SplitFile => crate::extra_tools_ui::split_file(app),
         Cmd::JoinFiles => crate::extra_tools_ui::join_files(app),
         Cmd::GroupSimilar => crate::similar::toggle(app),
@@ -1993,6 +1996,7 @@ pub fn shutdown(app: &mut ZxrawApp) {
 
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
     crate::archive_ui::password_modal(app, ui.ctx());
+    crate::archive_extract::windows(app, ui.ctx());
     crate::sidebar::network::dialog(app, ui.ctx());
     crate::ops_ui::jobs_window(app, ui.ctx());
     crate::ops_ui::progress_popup(app, ui.ctx());
