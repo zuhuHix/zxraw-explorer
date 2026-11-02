@@ -623,7 +623,11 @@ pub(super) fn update(
         })
     };
 
-    let s = tar_backend::scan(archive, codec, DEFAULT_MAX_ARCHIVE_ENTRIES, Some(ctx))?;
+    let limits = super::ExtractLimits {
+        max_entries: DEFAULT_MAX_ARCHIVE_ENTRIES.min(opts.limits.max_entries),
+        ..opts.limits.clone()
+    };
+    let s = tar_backend::scan(archive, codec, Some(&limits), Some(ctx))?;
     // Members kept: listed (the last of its name), not deleted, not replaced.
     let mut keep = vec![false; s.members.len()];
     let mut names = HashSet::new();
@@ -698,7 +702,7 @@ pub(super) fn update(
         let dec = codec::decoder(
             codec,
             std::io::BufReader::with_capacity(256 * 1024, file),
-            opts.limits.max_decoder_memory,
+            tar_backend::read_limit(s.memory),
         )
         .map_err(err)?;
         copy_kept(

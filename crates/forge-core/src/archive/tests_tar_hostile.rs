@@ -682,3 +682,149 @@ fn a_volume_label_with_data_survives_an_edit() {
     try_extract(&p, &x, ExtractLimits::default()).unwrap();
     assert_eq!(fs::read(x.join("keep.txt")).unwrap(), b"keep");
 }
+
+/// An xz stream of `data` whose (only) block header declares a 256 MiB dictionary: the
+/// header's LZMA2 property is changed and its CRC made to match again.
+fn xz_with_big_dictionary(data: &[u8]) -> Vec<u8> {
+    let mut w =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+    w.write_all(data).unwrap();
+    let mut xz = w.finish().unwrap();
+    let len = (usize::from(xz[12]) + 1) * 4;
+    let header = 12..12 + len;
+    let at = xz[header.clone()]
+        .windows(2)
+        .position(|w| w == [0x21, 0x01])
+        .unwrap()
+        + 12
+        + 2;
+    xz[at] = 32; // 2 << (32 / 2 + 11) = 256 MiB
+    let crc = crc32fast::hash(&xz[12..12 + len - 4]);
+    xz[12 + len - 4..12 + len].copy_from_slice(&crc.to_le_bytes());
+    xz
+}
+
+fn small_memory() -> ExtractLimits {
+    ExtractLimits {
+        max_decoder_memory: 64 << 20,
+        ..Default::default()
+    }
+}
+
+/// Listing within `limits`, extracting and testing under them are all refused for memory,
+/// before anything is written.
+fn refused_for_memory(p: &Path, d: &Path) {
+    let limits = small_memory();
+    let backend = backend_for_file(p).unwrap();
+    let err = backend.list_progress(p, &limits, None, None).unwrap_err();
+    assert!(
+        matches!(&err, CoreError::UnsafePath(m) if m.contains("memory")),
+        "{}: {err:?}",
+        p.display()
+    );
+    let x = d.join(format!("x-{}", paths::name_of(p)));
+    fs::create_dir(&x).unwrap();
+    let err = try_extract(p, &x, limits.clone()).unwrap_err();
+    assert!(err.to_string().contains("memory"), "{err}");
+    assert!(tree_files(&x).is_empty());
+    let (c, pr) = (CancelToken::new(), Progress::default());
+    let err = test_archive(p, None, &limits, &JobCtx::new(&c, &pr)).unwrap_err();
+    assert!(err.to_string().contains("memory"), "{err}");
+}
+
+#[test]
+fn decoder_memory_limits_are_checked_before_decoding() {
+    let d = tempfile::tempdir().unwrap();
+    let tar = Tar::default().file("a.txt", b"hello").end();
+    // xz with a 256 MiB dictionary: a tar, and a single file.
+    let p = write(d.path(), "dict.tar.xz", &xz_with_big_dictionary(&tar));
+    refused_for_memory(&p, d.path());
+    // Listed with the default limit (1 GiB), the cached listing is still checked against a
+    // lower one.
+    assert_eq!(list(&p).unwrap().entries.len(), 1);
+    let x = d.path().join("after-cache");
+    fs::create_dir(&x).unwrap();
+    assert!(try_extract(&p, &x, small_memory()).is_err());
+    assert!(tree_files(&x).is_empty());
+    let p = write(
+        d.path(),
+        "dict.bin.xz",
+        &xz_with_big_dictionary(b"single file"),
+    );
+    refused_for_memory(&p, d.path());
+    // Zstandard frames with a 128 MiB window: a tar, and a single file.
+    let zstd_big = |data: &[u8]| {
+        let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        e.window_log(27).unwrap();
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    };
+    let p = write(d.path(), "window.tar.zst", &zstd_big(&tar));
+    refused_for_memory(&p, d.path());
+    let p = write(d.path(), "window.bin.zst", &zstd_big(b"single file"));
+    refused_for_memory(&p, d.path());
+    // Within the limit, all is well; below Zstandard's smallest window, refused.
+    let p = write(
+        d.path(),
+        "ok.tar.zst",
+        &zstd::bulk::compress(&tar, 3).unwrap(),
+    );
+    let x = d.path().join("ok");
+    fs::create_dir(&x).unwrap();
+    try_extract(&p, &x, small_memory()).unwrap();
+    assert_eq!(fs::read(x.join("a.txt")).unwrap(), b"hello");
+    let tiny = ExtractLimits {
+        max_decoder_memory: 512,
+        ..Default::default()
+    };
+    let y = d.path().join("tiny");
+    fs::create_dir(&y).unwrap();
+    assert!(try_extract(&p, &y, tiny).is_err());
+}
+
+#[test]
+fn many_long_names_hit_the_metadata_budget() {
+    let d = tempfile::tempdir().unwrap();
+    let mut t = Tar::default();
+    for i in 0..40 {
+        let long = format!("{i:03}/{}", "n".repeat(60_000));
+        let h = header(b"././@LongLink", b'L', long.len() as u64 + 1, |_| {});
+        let mut data = long.into_bytes();
+        data.push(0);
+        t = t.raw(h, &data).file("short", b"x");
+    }
+    let p = write(d.path(), "names.tar", &t.end());
+    tar_backend::METADATA_CAP.with(|c| c.set(Some(1 << 20)));
+    let err = list(&p).unwrap_err();
+    tar_backend::METADATA_CAP.with(|c| c.set(None));
+    assert!(err.to_string().contains("list of names"), "{err}");
+    // Within the budget the same archive lists, each name kept once (by the entry).
+    let l = list(&p).unwrap();
+    assert_eq!(l.entries.len(), 40);
+}
+
+#[test]
+fn the_scan_cache_stays_within_its_budget() {
+    use std::sync::atomic::Ordering;
+    let d = tempfile::tempdir().unwrap();
+    let cap = 300_000u64;
+    tar_backend::CACHE_CAP.store(cap, Ordering::Relaxed);
+    for i in 0..6 {
+        let mut t = Tar::default();
+        for j in 0..300 {
+            t = t.file(&format!("dir{i}/file-{j:04}-{}.txt", "x".repeat(40)), b"x");
+        }
+        let p = write(d.path(), &format!("c{i}.tar"), &t.end());
+        list(&p).unwrap();
+        assert!(tar_backend::cache_weight() <= cap, "after {i}");
+    }
+    // A scan heavier than the whole budget is used but not kept.
+    let mut t = Tar::default();
+    for j in 0..3000 {
+        t = t.file(&format!("big/file-{j:05}-{}.txt", "y".repeat(80)), b"y");
+    }
+    let p = write(d.path(), "big.tar", &t.end());
+    assert_eq!(list(&p).unwrap().entries.len(), 3000);
+    assert!(tar_backend::cache_weight() <= cap);
+    tar_backend::CACHE_CAP.store(0, Ordering::Relaxed);
+}

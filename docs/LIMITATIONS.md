@@ -16,8 +16,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   but not applied. Multi-volume tars are refused, and a tar ends at its first zero block
   (`tar --ignore-zeros` archives, several tars glued together, read as the first one).
 * Tar limits: a PAX header of at most 1 MiB, GNU long names of at most 64 KiB, 32 extension
-  headers before one file, 100,000 regions in a sparse file's map, 100,000 entries, the usual
-  size, ratio and decoder-memory limits. Names that are not UTF-8 are read as code page 437
+  headers before one file, 100,000 regions in a sparse file's map, 100,000 entries, 256 MB for
+  the names and bookkeeping of one listing, the usual size, ratio and decoder-memory limits.
+  The memory a compressed tar or file needs (xz dictionaries, Zstandard windows, LZ4 blocks,
+  the Brotli window) is read from all its headers and checked against the limit before
+  anything is decoded; Zstandard windows over 128 MB and large-window Brotli are refused.
+  Cached listings are kept within 512 MB in all. Names that are not UTF-8 are read as code page 437
   (what Windows' tar.exe writes in ustar headers), not in the code page of the computer that
   made them.
 * Listing a compressed tar decodes it to its end (it has no table of contents), and the listing

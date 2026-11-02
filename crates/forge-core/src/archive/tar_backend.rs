@@ -47,11 +47,51 @@ use crate::error::{CoreError, Result};
 use crate::ops::JobCtx;
 use crate::paths;
 
-/// Memory a decoder may use while listing or reading (xz dictionaries, Zstandard windows).
-fn decoder_memory(limits: Option<&ExtractLimits>) -> u64 {
-    limits.map_or(ExtractLimits::default().max_decoder_memory, |l| {
-        l.max_decoder_memory
-    })
+/// The headers of a compressed archive, checked against `limits` before anything is
+/// decoded: the memory its decoders need must be within `max_decoder_memory`.
+fn checked_info(archive: &Path, codec: Codec, limits: &ExtractLimits) -> Result<codec::StreamInfo> {
+    let info = codec::stream_info(codec, archive).map_err(|e| stream_err(archive, e))?;
+    check_memory(archive, info.memory, limits)?;
+    Ok(info)
+}
+
+fn check_memory(archive: &Path, memory: u64, limits: &ExtractLimits) -> Result<()> {
+    if memory > limits.max_decoder_memory {
+        return Err(CoreError::UnsafePath(format!(
+            "{}: decoding it needs {} MiB of memory, more than the {} MiB allowed",
+            paths::display_path(archive),
+            memory.div_ceil(1 << 20),
+            limits.max_decoder_memory >> 20
+        )));
+    }
+    Ok(())
+}
+
+/// The memory limit a decoder of a checked stream is built with: what its headers asked for
+/// (a little more, for rounding), never more than was allowed when it was checked.
+pub(super) fn read_limit(memory: u64) -> u64 {
+    memory.saturating_add(1 << 20)
+}
+
+/// Most bytes the names and bookkeeping of one tar's listing may take (many long names
+/// within the per-name and entry limits could still add up to gigabytes).
+const METADATA_BUDGET: u64 = 256 << 20;
+/// Bookkeeping counted per member beyond its names.
+const MEMBER_OVERHEAD: u64 =
+    (std::mem::size_of::<Member>() + std::mem::size_of::<ArchiveEntry>() + 64) as u64;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a smaller [`METADATA_BUDGET`].
+    pub(super) static METADATA_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn metadata_budget() -> u64 {
+    #[cfg(test)]
+    if let Some(cap) = METADATA_CAP.with(|c| c.get()) {
+        return cap;
+    }
+    METADATA_BUDGET
 }
 
 // ---------------------------------------------------------------------------
@@ -160,12 +200,18 @@ pub(super) struct Scan {
     pub decoded: u64,
     /// The compressed file's size.
     pub file_size: u64,
+    /// Memory its decoders need (0 for a plain tar).
+    pub memory: u64,
+    /// Memory the scan itself takes, roughly (for the cache's budget).
+    weight: u64,
 }
 
 /// What a single compressed file holds.
 pub(super) struct SingleScan {
     pub codec: Codec,
     pub entry: ArchiveEntry,
+    /// Memory its decoder needs.
+    pub memory: u64,
 }
 
 enum Cached {
@@ -174,11 +220,73 @@ enum Cached {
 }
 
 type Key = (u64, Option<SystemTime>, bool);
-type ScanCache = Mutex<lru::LruCache<PathBuf, (Key, Cached)>>;
 
-fn cache() -> &'static ScanCache {
-    static CACHE: OnceLock<ScanCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(6).unwrap())))
+/// Cached scans, least recently used first, with their weight: evicted from the front
+/// while their total is over [`cache_budget`]. A scan heavier than the budget isn't kept.
+#[derive(Default)]
+struct ScanCache {
+    slots: Vec<(PathBuf, Key, Cached, u64)>,
+    weight: u64,
+}
+
+/// Total memory of cached scans.
+const CACHE_BUDGET: u64 = 512 << 20;
+
+#[cfg(test)]
+pub(super) static CACHE_CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cache_budget() -> u64 {
+    #[cfg(test)]
+    match CACHE_CAP.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        cap => return cap,
+    }
+    CACHE_BUDGET
+}
+
+impl ScanCache {
+    fn get(&mut self, path: &Path, key: &Key) -> Option<&Cached> {
+        let i = self.slots.iter().position(|s| s.0 == path)?;
+        if self.slots[i].1 != *key {
+            self.pop(path);
+            return None;
+        }
+        let slot = self.slots.remove(i);
+        self.slots.push(slot);
+        self.slots.last().map(|s| &s.2)
+    }
+
+    fn put(&mut self, path: PathBuf, key: Key, cached: Cached, weight: u64) {
+        self.pop(&path);
+        let budget = cache_budget();
+        if weight > budget {
+            return;
+        }
+        while self.weight + weight > budget && !self.slots.is_empty() {
+            let old = self.slots.remove(0);
+            self.weight -= old.3;
+        }
+        self.weight += weight;
+        self.slots.push((path, key, cached, weight));
+    }
+
+    fn pop(&mut self, path: &Path) {
+        if let Some(i) = self.slots.iter().position(|s| s.0 == path) {
+            let old = self.slots.remove(i);
+            self.weight -= old.3;
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<ScanCache> {
+    static CACHE: OnceLock<Mutex<ScanCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// The total weight of the cached scans (tests).
+#[cfg(test)]
+pub(super) fn cache_weight() -> u64 {
+    cache().lock().weight
 }
 
 fn key_of(archive: &Path, tar: bool) -> Result<(PathBuf, Key)> {
@@ -194,26 +302,49 @@ pub(super) fn forget(archive: &Path) {
     cache().lock().pop(&paths::lexical_normalize(archive));
 }
 
-/// The walk of a tar, cached while the file's size and modified time stay the same.
+/// The walk of a tar, cached while the file's size and modified time stay the same. With
+/// `limits` (listing, preflight, an edit), a cached walk is checked against them too: its
+/// entries, its decoded size and its decoders' memory. Without (reading, after a listing
+/// that checked them), a walk made now uses the default limits.
 pub(super) fn scan(
     archive: &Path,
     codec: Codec,
-    max_entries: usize,
+    limits: Option<&ExtractLimits>,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Arc<Scan>> {
     let (path, key) = key_of(archive, true)?;
-    if let Some((k, Cached::Tar(s))) = cache().lock().get(&path)
-        && *k == key
-        && s.codec == codec
-    {
-        if s.members.len() > max_entries {
-            return Err(too_many(max_entries));
+    let cached = match cache().lock().get(&path, &key) {
+        Some(Cached::Tar(s)) if s.codec == codec => Some(s.clone()),
+        _ => None,
+    };
+    let s = match cached {
+        Some(s) => s,
+        None => {
+            let defaults = ExtractLimits::default();
+            let s = Arc::new(walk(archive, codec, limits.unwrap_or(&defaults), ctx)?);
+            cache()
+                .lock()
+                .put(path, key, Cached::Tar(s.clone()), s.weight);
+            return Ok(s);
         }
-        return Ok(s.clone());
+    };
+    if let Some(limits) = limits {
+        if s.members.len() > limits.max_entries {
+            return Err(too_many(limits.max_entries));
+        }
+        check_memory(archive, s.memory, limits)?;
+        if s.decoded > limits.max_total_bytes {
+            return Err(expands(archive, limits.max_total_bytes));
+        }
     }
-    let s = Arc::new(walk(archive, codec, max_entries, ctx)?);
-    cache().lock().put(path, (key, Cached::Tar(s.clone())));
     Ok(s)
+}
+
+fn expands(archive: &Path, max: u64) -> CoreError {
+    CoreError::UnsafePath(format!(
+        "{}: the archive expands to more than {max} bytes",
+        paths::display_path(archive)
+    ))
 }
 
 fn too_many(max: usize) -> CoreError {
@@ -224,9 +355,31 @@ fn too_many(max: usize) -> CoreError {
 fn walk(
     archive: &Path,
     codec: Codec,
-    max_entries: usize,
+    limits: &ExtractLimits,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Scan> {
+    let max_entries = limits.max_entries;
+    // Names and bookkeeping, counted as they are read.
+    let mut meta = 0u64;
+    let budget = metadata_budget();
+    let mut count_meta = |m: &Member| -> Result<()> {
+        meta = meta
+            .saturating_add((m.name.len() + m.link.len()) as u64)
+            .saturating_add(MEMBER_OVERHEAD)
+            .saturating_add(
+                m.sparse
+                    .as_ref()
+                    .map_or(0, |s| (s.regions.len() * 16) as u64),
+            );
+        if meta > budget {
+            return Err(CoreError::UnsafePath(format!(
+                "{}: the archive's list of names needs more than {} MiB of memory",
+                paths::display_path(archive),
+                budget >> 20
+            )));
+        }
+        Ok(())
+    };
     let err = |e| stream_err(archive, e);
     let file = File::open(archive).map_err(|e| CoreError::io(archive, e))?;
     let file_size = file
@@ -238,14 +391,15 @@ fn walk(
         ctx.progress.set_note("Reading the archive's contents");
     }
     let mut members = Vec::new();
-    let (decoded, checksum) = if codec == Codec::None {
+    let (decoded, checksum, memory) = if codec == Codec::None {
         drop(file);
         let mut p = TarParser::new(
             SeekFile::open(archive, 0).map_err(|e| CoreError::io(archive, e))?,
             max_entries,
         );
         while let Some(m) = p.next_member().map_err(err)? {
-            check_total(archive, &m)?;
+            check_total(archive, &m, limits)?;
+            count_meta(&m)?;
             if let Some(ctx) = ctx {
                 ctx.cancel.check()?;
                 ctx.progress.add_bytes(m.end.saturating_sub(m.start));
@@ -253,45 +407,65 @@ fn walk(
             members.push(m);
         }
         // Past the end marker: padding, or anything (nothing reads it).
-        (file_size, false)
+        (file_size, false, 0)
     } else {
-        let checksum = codec::every_frame_checked(codec, archive);
+        // Before decoding anything: what the decoders will need, within the limit.
+        let info = checked_info(archive, codec, limits)?;
         let watched = Watched {
             inner: BufReader::with_capacity(256 * 1024, file),
             ctx,
             count: true,
         };
-        let dec = codec::decoder(codec, watched, decoder_memory(None)).map_err(err)?;
+        let dec = codec::decoder(codec, watched, limits.max_decoder_memory).map_err(err)?;
         let mut p = TarParser::new(dec, max_entries);
         while let Some(m) = p.next_member().map_err(err)? {
-            check_total(archive, &m)?;
+            check_total(archive, &m, limits)?;
+            count_meta(&m)?;
             members.push(m);
         }
         let tar_end = p.pos();
         let mut dec = p.into_inner();
-        let max = ExtractLimits::default().max_total_bytes;
+        let max = limits.max_total_bytes;
         let rest = drain(&mut dec, max.saturating_sub(tar_end), ctx).map_err(err)?;
-        (tar_end + rest, checksum)
+        (tar_end + rest, info.checked, info.memory)
     };
-    let entries = entries_of(archive, codec, &members, decoded, checksum, file_size);
+    let entries = entries_of(codec, &mut members, decoded, checksum, file_size);
+    let weight = (members.len() as u64)
+        .saturating_mul(std::mem::size_of::<Member>() as u64)
+        .saturating_add(
+            members
+                .iter()
+                .filter_map(|m| m.sparse.as_ref())
+                .map(|s| (s.regions.len() * 16) as u64)
+                .sum::<u64>(),
+        )
+        .saturating_add(
+            entries
+                .iter()
+                .map(|e| {
+                    (std::mem::size_of::<ArchiveEntry>()
+                        + e.name.len()
+                        + e.method.len()
+                        + e.skip.as_ref().map_or(0, String::len)) as u64
+                })
+                .sum::<u64>(),
+        );
     Ok(Scan {
         codec,
         members,
         entries,
         decoded,
         file_size,
+        memory,
+        weight,
     })
 }
 
-/// A member ending past the extraction limit's total stops the walk: skipping its data
-/// would decode that much.
-fn check_total(archive: &Path, m: &Member) -> Result<()> {
-    let max = ExtractLimits::default().max_total_bytes;
-    if m.end > max {
-        return Err(CoreError::UnsafePath(format!(
-            "{}: the archive expands to more than {max} bytes",
-            paths::display_path(archive)
-        )));
+/// A member ending past the total limit stops the walk: skipping its data would decode
+/// that much.
+fn check_total(archive: &Path, m: &Member, limits: &ExtractLimits) -> Result<()> {
+    if m.end > limits.max_total_bytes {
+        return Err(expands(archive, limits.max_total_bytes));
     }
     Ok(())
 }
@@ -340,27 +514,37 @@ fn skip_reason(m: &Member) -> Option<String> {
     }
 }
 
+/// The listing of the walked members. Their names move into the entries (each name is
+/// kept once: the members are found again by offset and header hash, not by name).
 fn entries_of(
-    archive: &Path,
     codec: Codec,
-    members: &[Member],
+    members: &mut [Member],
     decoded: u64,
     checksum: bool,
     file_size: u64,
 ) -> Vec<ArchiveEntry> {
     let compressed = codec != Codec::None;
-    // The last member of each name wins; earlier ones are left out.
-    let mut last: HashMap<String, usize> = HashMap::new();
     let names: Vec<String> = members.iter().map(listed_name).collect();
-    for (i, n) in names.iter().enumerate() {
-        if !n.is_empty() {
-            last.insert(n.trim_end_matches('/').to_owned(), i);
+    // The last member of each name wins; earlier ones are left out.
+    let keep: Vec<bool> = {
+        let mut last: HashMap<&str, usize> = HashMap::with_capacity(names.len());
+        for (i, n) in names.iter().enumerate() {
+            if !n.is_empty() {
+                last.insert(n.trim_end_matches('/'), i);
+            }
         }
-    }
-    let _ = archive;
-    let mut out = Vec::with_capacity(last.len());
-    for (i, (m, name)) in members.iter().zip(names).enumerate() {
-        if name.is_empty() || last.get(name.trim_end_matches('/')) != Some(&i) {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| !n.is_empty() && last.get(n.trim_end_matches('/')) == Some(&i))
+            .collect()
+    };
+    let mut out = Vec::with_capacity(keep.iter().filter(|k| **k).count());
+    for (i, (m, name)) in members.iter_mut().zip(names).enumerate() {
+        let skip = skip_reason(m);
+        m.name = String::new();
+        m.link = String::new();
+        if !keep[i] {
             continue;
         }
         let is_file = m.is_file();
@@ -400,7 +584,7 @@ fn entries_of(
             checked_by_block: checked,
             block: (compressed && is_file).then_some(0),
             block_end: if checked { decoded } else { 0 },
-            skip: skip_reason(m),
+            skip,
             name,
         });
     }
@@ -463,7 +647,7 @@ fn read_tar(
         ctx,
         count: false,
     };
-    let dec = codec::decoder(s.codec, watched, decoder_memory(None)).map_err(err)?;
+    let dec = codec::decoder(s.codec, watched, read_limit(s.memory)).map_err(err)?;
     let mut p = TarParser::new(dec, s.members.len());
     let result = (|| -> Result<()> {
         for (k, want) in s.members.iter().enumerate() {
@@ -579,17 +763,21 @@ impl ArchiveBackend for TarBackend {
         max_entries: usize,
         password: Option<&Password>,
     ) -> Result<ArchiveListing> {
-        self.list_progress(archive, max_entries, password, None)
+        let limits = ExtractLimits {
+            max_entries,
+            ..Default::default()
+        };
+        self.list_progress(archive, &limits, password, None)
     }
 
     fn list_progress(
         &self,
         archive: &Path,
-        max_entries: usize,
+        limits: &ExtractLimits,
         _password: Option<&Password>,
         ctx: Option<&JobCtx<'_>>,
     ) -> Result<ArchiveListing> {
-        let s = scan(archive, self.codec, max_entries, ctx)?;
+        let s = scan(archive, self.codec, Some(limits), ctx)?;
         Ok(ArchiveListing {
             format: self.format(),
             entries: s.entries.clone(),
@@ -599,13 +787,13 @@ impl ArchiveBackend for TarBackend {
 
     fn preflight(
         &self,
-        _archive: &Path,
+        archive: &Path,
         _indices: &[usize],
         _password: Option<&Password>,
-        _limits: &ExtractLimits,
+        limits: &ExtractLimits,
     ) -> Result<()> {
-        // Members can't overlap, and decoder memory is bounded as the stream is read.
-        Ok(())
+        // Members can't overlap; the stream's decoder memory and size against `limits`.
+        scan(archive, self.codec, Some(limits), None).map(|_| ())
     }
 
     fn read_entries(
@@ -616,12 +804,7 @@ impl ArchiveBackend for TarBackend {
         ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()> {
-        let s = scan(
-            archive,
-            self.codec,
-            super::DEFAULT_MAX_ARCHIVE_ENTRIES,
-            None,
-        )?;
+        let s = scan(archive, self.codec, None, None)?;
         read_tar(archive, &s, wanted, ctx, visit, &mut |_| Ok(()))
     }
 
@@ -634,12 +817,7 @@ impl ArchiveBackend for TarBackend {
         visit: &mut EntryVisitor<'_>,
         block_end: &mut BlockEnd<'_>,
     ) -> Result<()> {
-        let s = scan(
-            archive,
-            self.codec,
-            super::DEFAULT_MAX_ARCHIVE_ENTRIES,
-            None,
-        )?;
+        let s = scan(archive, self.codec, None, None)?;
         read_tar(archive, &s, wanted, ctx, visit, block_end)
     }
 
@@ -717,38 +895,36 @@ fn single_name(archive: &Path, head: &[u8]) -> String {
     }
 }
 
-/// The exact size a Zstandard file states in its frame headers, if every frame states one.
-fn zstd_declared_size(archive: &Path) -> Option<u64> {
-    codec::zstd_frames(archive)?.size
-}
-
 /// What a single compressed file holds, cached like tar listings.
 pub(super) fn single_scan(
     archive: &Path,
     codec: Codec,
+    limits: Option<&ExtractLimits>,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Arc<SingleScan>> {
     let (path, key) = key_of(archive, false)?;
-    if let Some((k, Cached::Single(s))) = cache().lock().get(&path)
-        && *k == key
-        && s.codec == codec
-    {
-        return Ok(s.clone());
+    let cached = match cache().lock().get(&path, &key) {
+        Some(Cached::Single(s)) if s.codec == codec => Some(s.clone()),
+        _ => None,
+    };
+    let defaults = ExtractLimits::default();
+    let limits_or_default = limits.unwrap_or(&defaults);
+    if let Some(s) = cached {
+        if let Some(limits) = limits {
+            check_memory(archive, s.memory, limits)?;
+        }
+        return Ok(s);
     }
+    let limits = limits_or_default;
     let mut head = [0u8; 300];
     let n = read_head(archive, &mut head)?;
     let head = &head[..n];
     let file_size = std::fs::metadata(archive)
         .map_err(|e| CoreError::io(archive, e))?
         .len();
-    let declared = match codec {
-        Codec::Xz => File::open(archive)
-            .ok()
-            .and_then(|f| lzma_rust2::xz_uncompressed_size(BufReader::new(f)).ok()),
-        Codec::Zstd => zstd_declared_size(archive),
-        _ => None,
-    };
-    let size = match declared {
+    // Before decoding anything: what the decoder will need, within the limit.
+    let info = checked_info(archive, codec, limits)?;
+    let size = match info.size {
         Some(size) => size,
         None => {
             // Decoded once to count it (and to check its checksum).
@@ -762,13 +938,12 @@ pub(super) fn single_scan(
                 ctx,
                 count: true,
             };
-            let mut dec = codec::decoder(codec, watched, decoder_memory(None))
+            let mut dec = codec::decoder(codec, watched, limits.max_decoder_memory)
                 .map_err(|e| stream_err(archive, e))?;
-            drain(&mut dec, ExtractLimits::default().max_file_bytes, ctx)
-                .map_err(|e| stream_err(archive, e))?
+            drain(&mut dec, limits.max_file_bytes, ctx).map_err(|e| stream_err(archive, e))?
         }
     };
-    let checksum = codec::every_frame_checked(codec, archive);
+    let checksum = info.checked;
     let name = single_name(archive, head);
     let entry = ArchiveEntry {
         index: 0,
@@ -784,8 +959,15 @@ pub(super) fn single_scan(
         unchecked: size > 0 && !checksum,
         ..Default::default()
     };
-    let s = Arc::new(SingleScan { codec, entry });
-    cache().lock().put(path, (key, Cached::Single(s.clone())));
+    let weight = (std::mem::size_of::<SingleScan>() + entry.name.len()) as u64;
+    let s = Arc::new(SingleScan {
+        codec,
+        entry,
+        memory: info.memory,
+    });
+    cache()
+        .lock()
+        .put(path, key, Cached::Single(s.clone()), weight);
     Ok(s)
 }
 
@@ -813,20 +995,20 @@ impl ArchiveBackend for SingleBackend {
     fn list(
         &self,
         archive: &Path,
-        max_entries: usize,
+        _max_entries: usize,
         password: Option<&Password>,
     ) -> Result<ArchiveListing> {
-        self.list_progress(archive, max_entries, password, None)
+        self.list_progress(archive, &ExtractLimits::default(), password, None)
     }
 
     fn list_progress(
         &self,
         archive: &Path,
-        _max_entries: usize,
+        limits: &ExtractLimits,
         _password: Option<&Password>,
         ctx: Option<&JobCtx<'_>>,
     ) -> Result<ArchiveListing> {
-        let s = single_scan(archive, self.codec, ctx)?;
+        let s = single_scan(archive, self.codec, Some(limits), ctx)?;
         Ok(ArchiveListing {
             format: self.format(),
             entries: vec![s.entry.clone()],
@@ -836,12 +1018,12 @@ impl ArchiveBackend for SingleBackend {
 
     fn preflight(
         &self,
-        _archive: &Path,
+        archive: &Path,
         _indices: &[usize],
         _password: Option<&Password>,
-        _limits: &ExtractLimits,
+        limits: &ExtractLimits,
     ) -> Result<()> {
-        Ok(())
+        single_scan(archive, self.codec, Some(limits), None).map(|_| ())
     }
 
     fn read_entries(
@@ -852,7 +1034,7 @@ impl ArchiveBackend for SingleBackend {
         _ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()> {
-        let s = single_scan(archive, self.codec, None)?;
+        let s = single_scan(archive, self.codec, None, None)?;
         if !wanted(&s.entry) {
             return Ok(());
         }
@@ -860,7 +1042,7 @@ impl ArchiveBackend for SingleBackend {
         let mut dec = codec::decoder(
             self.codec,
             BufReader::with_capacity(256 * 1024, file),
-            decoder_memory(None),
+            read_limit(s.memory),
         )
         .map_err(|e| stream_err(archive, e))?;
         // Read to the stream's end, where its checksum is checked.
@@ -905,10 +1087,24 @@ impl ArchiveBackend for SingleBackend {
 pub(super) fn stream_backend(path: &Path, codec: Codec) -> &'static dyn super::ArchiveBackend {
     let named_tar = codec::by_name(&paths::name_of(path)).is_some_and(|(_, tar)| tar);
     let mut head = Vec::with_capacity(512);
-    let peeked = File::open(path).ok().and_then(|f| {
-        let dec = codec::decoder(codec, f, decoder_memory(None)).ok()?;
+    // Peeked only when its headers can be read and its decoder fits the default limit;
+    // otherwise its name decides (and listing it reports the problem).
+    let memory = codec::stream_info(codec, path)
+        .ok()
+        .map(|i| i.memory)
+        .filter(|&m| m <= ExtractLimits::default().max_decoder_memory);
+    let peeked = memory.and_then(|memory| {
+        let f = File::open(path).ok()?;
+        let dec = codec::decoder(codec, f, read_limit(memory)).ok()?;
         dec.take(512).read_to_end(&mut head).ok()
     });
+    if peeked.is_none() {
+        return if named_tar {
+            tar_backend(codec)
+        } else {
+            single_backend(codec)
+        };
+    }
     let is_tar = peeked.is_some()
         && (tar_read::looks_like_tar(&head)
             || named_tar && head.len() == 512 && head.iter().all(|&b| b == 0)
@@ -923,10 +1119,9 @@ pub(super) fn stream_backend(path: &Path, codec: Codec) -> &'static dyn super::A
 /// Seek helper for tests: the offset of a member's data in the uncompressed stream.
 #[cfg(test)]
 pub(super) fn member_offsets(archive: &Path, codec: Codec) -> Vec<(String, u64)> {
-    scan(archive, codec, usize::MAX, None)
-        .unwrap()
-        .members
+    let s = scan(archive, codec, None, None).unwrap();
+    s.entries
         .iter()
-        .map(|m| (m.name.clone(), m.data))
+        .map(|e| (e.name.clone(), s.members[e.index].data))
         .collect()
 }

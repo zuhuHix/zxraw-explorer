@@ -273,17 +273,19 @@ pub trait ArchiveBackend: Sync {
         max_entries: usize,
         password: Option<&Password>,
     ) -> Result<ArchiveListing>;
-    /// [`list`](Self::list), counting progress (bytes of the archive read) and checking for
-    /// cancel in `ctx`: listing a tar decodes the whole stream.
+    /// [`list`](Self::list) within `limits` (entries; for a tar, which is decoded to its end
+    /// to be listed, also its decoders' memory and its decoded size, checked from its headers
+    /// before anything is decoded), counting progress (bytes of the archive read) and
+    /// checking for cancel in `ctx`.
     fn list_progress(
         &self,
         archive: &Path,
-        max_entries: usize,
+        limits: &ExtractLimits,
         password: Option<&Password>,
         ctx: Option<&JobCtx<'_>>,
     ) -> Result<ArchiveListing> {
         let _ = ctx;
-        self.list(archive, max_entries, password)
+        self.list(archive, limits.max_entries, password)
     }
     /// Structural checks before any data is extracted from the entries at `indices`:
     /// overlapping entries, decoder memory above `limits.max_decoder_memory` (for encrypted
@@ -514,7 +516,27 @@ pub fn inner_path(archive: &Path, inner: &str) -> PathBuf {
 }
 
 type CacheKey = (PathBuf, u64, Option<SystemTime>);
-type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>)>>;
+type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>, u64)>>;
+
+/// Memory the cached indexes may take together (a big tar's names can be hundreds of MB):
+/// the least recently used go first, and one heavier than this isn't kept.
+const INDEX_CACHE_BUDGET: u64 = 512 << 20;
+
+/// Roughly the memory of an index: its entries and nodes, and their names and paths.
+fn index_weight(idx: &ArchiveIndex) -> u64 {
+    let entries: u64 = idx
+        .listing
+        .entries
+        .iter()
+        .map(|e| (std::mem::size_of::<ArchiveEntry>() + e.name.len() + e.method.len()) as u64)
+        .sum();
+    let nodes: u64 = idx
+        .nodes()
+        .iter()
+        .map(|n| (std::mem::size_of::<ArchiveNode>() + 2 * n.path.len() + n.name.len()) as u64)
+        .sum();
+    entries + nodes
+}
 
 fn cache() -> &'static IndexCache {
     static CACHE: OnceLock<IndexCache> = OnceLock::new();
@@ -543,19 +565,30 @@ pub fn index_cached_progress(
     let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
     let key: CacheKey = (archive.to_path_buf(), md.len(), md.modified().ok());
     let lookup = paths::lexical_normalize(archive);
-    if let Some((k, idx)) = cache().lock().get(&lookup)
+    if let Some((k, idx, _)) = cache().lock().get(&lookup)
         && *k == key
     {
         return Ok(idx.clone());
     }
     let listing = backend_for_file(archive)?.list_progress(
         archive,
-        DEFAULT_MAX_ARCHIVE_ENTRIES,
+        &ExtractLimits::default(),
         password,
         ctx,
     )?;
     let idx = Arc::new(ArchiveIndex::build(listing));
-    cache().lock().put(lookup, (key, idx.clone()));
+    let weight = index_weight(&idx);
+    let mut cache = cache().lock();
+    cache.pop(&lookup);
+    if weight <= INDEX_CACHE_BUDGET {
+        let mut total = weight + cache.iter().map(|(_, (_, _, w))| *w).sum::<u64>();
+        while total > INDEX_CACHE_BUDGET
+            && let Some((_, (_, _, w))) = cache.pop_lru()
+        {
+            total -= w;
+        }
+        cache.put(lookup, (key, idx.clone(), weight));
+    }
     Ok(idx)
 }
 
@@ -695,13 +728,13 @@ pub struct ExtractReport {
 fn list_cancellable(
     backend: &dyn ArchiveBackend,
     archive: &Path,
-    max_entries: usize,
+    limits: &ExtractLimits,
     password: Option<&Password>,
     ctx: &JobCtx<'_>,
 ) -> Result<ArchiveListing> {
     let quiet = forge_jobs::Progress::default();
     let only_cancel = JobCtx::new(ctx.cancel, &quiet);
-    backend.list_progress(archive, max_entries, password, Some(&only_cancel))
+    backend.list_progress(archive, limits, password, Some(&only_cancel))
 }
 
 struct Planned {
@@ -737,7 +770,7 @@ pub fn extract(
     }
     let backend = backend_for_file(archive)?;
     let limits = &opts.limits;
-    let listing = list_cancellable(backend, archive, limits.max_entries, opts.password.as_ref(), ctx)?;
+    let listing = list_cancellable(backend, archive, limits, opts.password.as_ref(), ctx)?;
     let mut report = ExtractReport {
         dest: dest_dir.to_path_buf(),
         ..Default::default()
@@ -1311,7 +1344,7 @@ pub fn extract_to(
     let listing = list_cancellable(
         backend,
         archive,
-        opts.limits.max_entries,
+        &opts.limits,
         opts.password.as_ref(),
         ctx,
     )?;
@@ -1443,7 +1476,7 @@ pub fn test_archive(
     ctx: &JobCtx<'_>,
 ) -> Result<TestReport> {
     let backend = backend_for_file(archive)?;
-    let listing = list_cancellable(backend, archive, limits.max_entries, password, ctx)?;
+    let listing = list_cancellable(backend, archive, limits, password, ctx)?;
     let files: Vec<&ArchiveEntry> = listing
         .entries
         .iter()
