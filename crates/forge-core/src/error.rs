@@ -30,6 +30,9 @@ pub enum CoreError {
     /// The password given for an encrypted archive entry is not the right one.
     #[error("{0}: wrong password")]
     WrongPassword(String),
+    /// Something this version can't do with the input; the message is for the user as is.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;

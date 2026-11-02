@@ -476,6 +476,11 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
                 let _ = msgs.send(crate::archive_ui::Msg::NeedPassword { retry, wrong });
                 Ok(())
             }
+            // Said as it is: a split zip, for one, is left untouched.
+            Err(CoreError::Unsupported(msg)) => {
+                let _ = events.send(Event::Error(format!("{name}: {msg}")));
+                Err(msg)
+            }
             Err(e) => {
                 let _ = events.send(Event::Error(format!("{} failed: {e}", job.title)));
                 Err(e.to_string())

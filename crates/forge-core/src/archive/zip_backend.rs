@@ -372,6 +372,11 @@ impl ArchiveBackend for ZipBackend {
             })
         };
 
+        // Split archives are refused before anything else is opened or written.
+        zip_merge::check_single_disk(
+            archive,
+            &mut File::open(archive).map_err(|e| CoreError::io(archive, e))?,
+        )?;
         if let Some(dir) = archive.parent() {
             remove_stale_partials(dir, STALE_PARTIAL_AGE);
         }
