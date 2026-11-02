@@ -885,10 +885,7 @@ fn matches_delete_snapshot(
 /// pair would copy a folder into itself (and Mirror could recycle files of the source). Real
 /// paths are compared when both resolve, so a junction or a differently spelled path is caught.
 fn roots_overlap(left: &Path, right: &Path) -> bool {
-    let (left, right) = (
-        resolve_existing_prefix(left),
-        resolve_existing_prefix(right),
-    );
+    let (left, right) = (resolve_existing_prefix(left), resolve_existing_prefix(right));
     crate::paths::is_within(&left, &right) || crate::paths::is_within(&right, &left)
 }
 
@@ -901,10 +898,7 @@ fn resolve_existing_prefix(path: &Path) -> PathBuf {
     let mut current = absolute.as_path();
     loop {
         if let Ok(real) = fs::canonicalize(current) {
-            return missing
-                .iter()
-                .rev()
-                .fold(real, |acc: PathBuf, part| acc.join(part));
+            return missing.iter().rev().fold(real, |acc: PathBuf, part| acc.join(part));
         }
         match (current.parent(), current.file_name()) {
             (Some(parent), Some(name)) => {
@@ -1977,12 +1971,7 @@ mod tests {
         let outer = d.path().join("Photos");
         fs::create_dir_all(&outer).unwrap();
         // Spelled differently (`.` component) and missing: still inside `outer`.
-        let inner = d
-            .path()
-            .join(".")
-            .join("Photos")
-            .join("Backup")
-            .join("2026");
+        let inner = d.path().join(".").join("Photos").join("Backup").join("2026");
         assert!(roots_overlap(&outer, &inner));
         assert!(roots_overlap(&inner, &outer));
         assert!(!roots_overlap(&outer, &d.path().join("Elsewhere")));
@@ -2009,11 +1998,7 @@ mod tests {
         fs::create_dir_all(r.join("sub")).unwrap();
         fs::write(r.join("sub/new.txt"), b"right").unwrap();
         let (plan, cancel, progress) = two_way_plan(&l, &r, &CompareOptions::default());
-        assert!(
-            plan.actions
-                .iter()
-                .any(|a| matches!(a, SyncAction::Copy { to_left: true, .. }))
-        );
+        assert!(plan.actions.iter().any(|a| matches!(a, SyncAction::Copy { to_left: true, .. })));
         // Replace L/sub with a junction to a folder outside the sync root.
         let outside = d.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
@@ -2026,10 +2011,7 @@ mod tests {
             .unwrap();
         assert!(status.status.success(), "{status:?}");
         let result = execute_sync(&plan, true, None, &JobCtx::new(&cancel, &progress));
-        assert!(
-            !outside.join("new.txt").exists(),
-            "copy went through the junction"
-        );
+        assert!(!outside.join("new.txt").exists(), "copy went through the junction");
         assert_eq!(result.failed.len(), 1, "{result:?}");
     }
 

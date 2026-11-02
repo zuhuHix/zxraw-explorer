@@ -74,7 +74,10 @@ pub const AUDIO_EXTS: &[&str] = &[
     "wav", "mp3", "flac", "aac", "m4a", "ogg", "opus", "aif", "aiff", "wma", "bwf",
 ];
 pub const SIDECAR_EXTS: &[&str] = &["xmp", "thm", "pp3", "dop", "cos", "on1", "aae"];
-pub const ARCHIVE_EXTS: &[&str] = &["zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "xz", "zst"];
+pub const ARCHIVE_EXTS: &[&str] = &[
+    "zip", "7z", "rar", "tar", "gz", "tgz", "taz", "bz2", "tbz", "tbz2", "tb2", "xz", "txz", "zst",
+    "tzst", "lz4", "tlz4", "br",
+];
 pub const PROJECT_EXTS: &[&str] = &[
     "drp",
     "prproj",

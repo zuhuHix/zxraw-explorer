@@ -72,10 +72,7 @@ fn is_remote_drive(letter: char) -> bool {
     use windows::core::PCWSTR;
     // DRIVE_REMOTE (4). Not re-exported as a constant by every `windows` feature set.
     const DRIVE_REMOTE: u32 = 4;
-    let root: Vec<u16> = format!("{letter}:\\")
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
+    let root: Vec<u16> = format!("{letter}:\\").encode_utf16().chain(Some(0)).collect();
     // SAFETY: `root` is NUL-terminated and outlives the call.
     unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_REMOTE }
 }
@@ -167,29 +164,20 @@ pub fn validate_share_path(input: &str) -> Result<PathBuf, String> {
     };
     let share = comps[1];
     if share.trim() != share {
-        return Err(format!(
-            "The share name \"{share}\" cannot start or end with a space."
-        ));
+        return Err(format!("The share name \"{share}\" cannot start or end with a space."));
     }
     for c in &comps[1..] {
         if *c == "." || *c == ".." {
             return Err("The path cannot contain . or .. folders.".into());
         }
-        if c.chars()
-            .any(|ch| INVALID_CHARS.contains(&ch) || ch.is_control())
-        {
-            return Err(format!(
-                "\"{c}\" contains a character Windows does not allow."
-            ));
+        if c.chars().any(|ch| INVALID_CHARS.contains(&ch) || ch.is_control()) {
+            return Err(format!("\"{c}\" contains a character Windows does not allow."));
         }
         if c.ends_with(' ') || c.ends_with('.') {
             return Err(format!("\"{c}\" cannot end with a space or a dot."));
         }
     }
-    Ok(PathBuf::from(format!(
-        r"\\{server}\{}",
-        comps[1..].join("\\")
-    )))
+    Ok(PathBuf::from(format!(r"\\{server}\{}", comps[1..].join("\\"))))
 }
 
 /// Checks a server name and returns it as it must appear in a UNC path. A host name or an
@@ -202,11 +190,7 @@ fn unc_server(server: &str) -> Result<String, String> {
         if addr.parse::<std::net::Ipv6Addr>().is_err() || !zone_ok {
             return Err(format!("\"{server}\" is not a valid IPv6 address."));
         }
-        let zone = if zone.is_empty() {
-            String::new()
-        } else {
-            format!("s{zone}")
-        };
+        let zone = if zone.is_empty() { String::new() } else { format!("s{zone}") };
         return Ok(format!("{}{zone}.ipv6-literal.net", addr.replace(':', "-")));
     }
     validate_server(server)?;
@@ -219,15 +203,17 @@ fn validate_server(server: &str) -> Result<(), String> {
     if server.len() > 253 {
         return Err("The server name is too long.".into());
     }
-    let ok = server.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && label
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-    });
+    let ok = server
+        .split('.')
+        .all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        });
     if ok {
         Ok(())
     } else {
@@ -238,10 +224,7 @@ fn validate_server(server: &str) -> Result<(), String> {
 }
 
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len()
-        && s.is_char_boundary(prefix.len())
-        && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-    {
+    if s.len() >= prefix.len() && s.is_char_boundary(prefix.len()) && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
         Some(&s[prefix.len()..])
     } else {
         None
@@ -298,16 +281,10 @@ mod tests {
         assert_eq!(ok(r" \\nas\photos\ "), PathBuf::from(r"\\nas\photos"));
         assert_eq!(ok(r#""\\nas\photos""#), PathBuf::from(r"\\nas\photos"));
         assert_eq!(ok("//nas/photos/2024"), PathBuf::from(r"\\nas\photos\2024"));
-        assert_eq!(
-            ok("smb://nas.local/photos"),
-            PathBuf::from(r"\\nas.local\photos")
-        );
+        assert_eq!(ok("smb://nas.local/photos"), PathBuf::from(r"\\nas.local\photos"));
         assert_eq!(ok("SMB://nas/photos"), PathBuf::from(r"\\nas\photos"));
         assert_eq!(ok("file://nas/photos"), PathBuf::from(r"\\nas\photos"));
-        assert_eq!(
-            ok(r"\\192.168.1.20\photos$"),
-            PathBuf::from(r"\\192.168.1.20\photos$")
-        );
+        assert_eq!(ok(r"\\192.168.1.20\photos$"), PathBuf::from(r"\\192.168.1.20\photos$"));
         assert_eq!(
             ok(r"\\[fe80::1]\photos"),
             PathBuf::from(r"\\fe80--1.ipv6-literal.net\photos")
@@ -320,19 +297,10 @@ mod tests {
             ok(r"\\fe80--1.ipv6-literal.net\photos"),
             PathBuf::from(r"\\fe80--1.ipv6-literal.net\photos")
         );
-        assert_eq!(
-            ok(r"\\192.0.2.1\x\sub dir\"),
-            PathBuf::from(r"\\192.0.2.1\x\sub dir")
-        );
-        assert_eq!(
-            ok(r"\\?\UNC\nas\photos\2024"),
-            PathBuf::from(r"\\nas\photos\2024")
-        );
+        assert_eq!(ok(r"\\192.0.2.1\x\sub dir\"), PathBuf::from(r"\\192.0.2.1\x\sub dir"));
+        assert_eq!(ok(r"\\?\UNC\nas\photos\2024"), PathBuf::from(r"\\nas\photos\2024"));
         assert_eq!(ok(r"\\?\unc\nas\photos"), PathBuf::from(r"\\nas\photos"));
-        assert_eq!(
-            ok(r"\\my_nas\Photo Archive"),
-            PathBuf::from(r"\\my_nas\Photo Archive")
-        );
+        assert_eq!(ok(r"\\my_nas\Photo Archive"), PathBuf::from(r"\\my_nas\Photo Archive"));
 
         for bad in [
             "",
@@ -363,10 +331,7 @@ mod tests {
             "smb://nas",
             r"\\nas:445\photos",
         ] {
-            assert!(
-                validate_share_path(bad).is_err(),
-                "{bad:?} should be rejected"
-            );
+            assert!(validate_share_path(bad).is_err(), "{bad:?} should be rejected");
         }
     }
 

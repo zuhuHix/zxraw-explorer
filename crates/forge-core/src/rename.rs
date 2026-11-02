@@ -1441,11 +1441,7 @@ mod tests {
         fs::write(&a, b"a").unwrap();
         fs::write(&b, b"b").unwrap();
         let r = rename_paths(&[(a.clone(), b.clone())]);
-        assert!(
-            matches!(r.status, RenameStatus::RolledBack { .. }),
-            "{:?}",
-            r.status
-        );
+        assert!(matches!(r.status, RenameStatus::RolledBack { .. }), "{:?}", r.status);
         assert_eq!(fs::read(&a).unwrap(), b"a");
         assert_eq!(fs::read(&b).unwrap(), b"b");
     }
@@ -1468,10 +1464,7 @@ mod tests {
             };
             let (first, second) = (run(a.clone()), run(b.clone()));
             let statuses = [first.join().unwrap(), second.join().unwrap()];
-            let done = statuses
-                .iter()
-                .filter(|s| **s == RenameStatus::Completed)
-                .count();
+            let done = statuses.iter().filter(|s| **s == RenameStatus::Completed).count();
             assert_eq!(done, 1, "{statuses:?}");
             // One file has the final name, the other is back under its own name.
             let mut contents: Vec<Vec<u8>> = fs::read_dir(d.path())
