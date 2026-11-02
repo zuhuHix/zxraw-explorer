@@ -39,6 +39,8 @@ pub(super) const MAX_DECODED_HEADER: u64 = 128 << 20;
 /// Memory the encoded header's decoder may need (7-Zip uses small LZMA dictionaries there).
 pub(super) const MAX_HEADER_DECODER_MEMORY: u64 = 256 << 20;
 pub(super) const MAX_HEADER_CODERS: usize = 4;
+/// Most data all the folders of an archive may declare together (1 PiB).
+pub(super) const MAX_UNPACKED_TOTAL: u64 = 1 << 50;
 /// Coders of one folder (BCJ2 with its three LZMA streams is four).
 pub(super) const MAX_CODERS: u64 = 8;
 /// In/out streams of one coder (BCJ2 has four inputs).
@@ -62,6 +64,7 @@ const K_CRC: u8 = 0x0A;
 const K_FOLDER: u8 = 0x0B;
 const K_CODERS_UNPACK_SIZE: u8 = 0x0C;
 const K_NUM_UNPACK_STREAM: u8 = 0x0D;
+const K_EMPTY_STREAM: u8 = 0x0E;
 const K_ENCODED_HEADER: u8 = 0x17;
 
 pub(super) const ID_COPY: &[u8] = &[0x00];
@@ -169,6 +172,7 @@ pub(super) fn check(
     let (files, main) = walk_header(&mut r, &limits).map_err(|e| e.at(archive))?;
     if let Some(main) = &main {
         check_packs(main, len).map_err(|e| e.at(archive))?;
+        check_unpacked(main).map_err(|e| e.at(archive))?;
     }
     if files > max_entries as u64 {
         return Err(CoreError::Invalid(format!(
@@ -179,6 +183,26 @@ pub(super) fn check(
         encrypted,
         verified,
     })
+}
+
+/// Everything an archive's folders declare, together, is at most [`MAX_UNPACKED_TOTAL`]
+/// (extraction holds the files to much smaller limits; this keeps every sum in range).
+fn check_unpacked(info: &StreamsInfo) -> Walk<()> {
+    let mut total = 0u64;
+    for f in &info.folders {
+        for &s in &f.unpack_sizes {
+            total = total
+                .checked_add(s)
+                .filter(|&t| t <= MAX_UNPACKED_TOTAL)
+                .ok_or_else(|| {
+                    WalkError::TooBig(format!(
+                        "7z archive declares more than {} TiB of data",
+                        MAX_UNPACKED_TOTAL >> 40
+                    ))
+                })?;
+        }
+    }
+    Ok(())
 }
 
 /// Every packed stream lies inside the file (`len` bytes), and the folders' packed streams
@@ -279,6 +303,8 @@ pub(super) struct StreamsInfo {
     pub pack_pos: u64,
     pub pack_sizes: Vec<u64>,
     pub folders: Vec<FolderInfo>,
+    /// Files with data the sub-streams info declares (`None`: one per folder).
+    pub substreams: Option<u64>,
 }
 
 struct Cursor<'a> {
@@ -501,7 +527,8 @@ fn read_unpack_info(r: &mut Cursor<'_>, limits: &Limits, info: &mut StreamsInfo)
     Ok(())
 }
 
-fn read_sub_streams_info(r: &mut Cursor<'_>, limits: &Limits, info: &StreamsInfo) -> Walk<()> {
+/// Returns the number of sub-streams (files with data).
+fn read_sub_streams_info(r: &mut Cursor<'_>, limits: &Limits, info: &StreamsInfo) -> Walk<u64> {
     let mut per_folder = vec![1u64; info.folders.len()];
     let mut ty = r.byte()?;
     if ty == K_NUM_UNPACK_STREAM {
@@ -534,7 +561,7 @@ fn read_sub_streams_info(r: &mut Cursor<'_>, limits: &Limits, info: &StreamsInfo
     }
     loop {
         match ty {
-            K_END => return Ok(()),
+            K_END => return Ok(per_folder.iter().sum()),
             K_CRC => {
                 let digests: u64 = per_folder
                     .iter()
@@ -559,7 +586,9 @@ fn read_streams_info(r: &mut Cursor<'_>, limits: &Limits) -> Walk<StreamsInfo> {
             K_END => break,
             K_PACK_INFO => read_pack_info(r, limits, &mut info)?,
             K_UNPACK_INFO => read_unpack_info(r, limits, &mut info)?,
-            K_SUB_STREAMS_INFO => read_sub_streams_info(r, limits, &info)?,
+            K_SUB_STREAMS_INFO => {
+                info.substreams = Some(read_sub_streams_info(r, limits, &info)?);
+            }
             _ => return Err(WalkError::Damaged("unexpected property in streams info")),
         }
     }
@@ -596,15 +625,29 @@ fn walk_header(r: &mut Cursor<'_>, limits: &Limits) -> Walk<(u64, Option<Streams
     if ty == K_FILES_INFO {
         // Each entry takes at least two bytes of name (its terminator).
         files = r.count(limits.entries, 16, "entries")?;
+        let mut empty = 0u64;
         loop {
             let prop = r.byte()?;
             if prop == K_END {
                 break;
             }
             let n = r.number()?;
-            r.skip(n)?;
+            let body = r.bytes(n)?;
+            if prop == K_EMPTY_STREAM {
+                let mut b = Cursor::new(body);
+                empty = b.bits(files)?.into_iter().filter(|&e| e).count() as u64;
+            }
         }
         ty = r.byte()?;
+        // Every file with data takes one sub-stream, and every sub-stream belongs to one.
+        let substreams = main
+            .as_ref()
+            .map_or(0, |m| m.substreams.unwrap_or(m.folders.len() as u64));
+        if files - empty != substreams {
+            return Err(WalkError::Damaged(
+                "the number of files with data doesn't match the streams",
+            ));
+        }
     } else if folders > 0 {
         return Err(WalkError::Damaged("streams without entries"));
     }

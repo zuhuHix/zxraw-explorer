@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{ArchiveFormat, Password};
+use super::{ArchiveFormat, ExtractLimits, Password};
 
 /// The choices of the compress dialog. For ZIP the first three write standard Deflate, which
 /// every unzip tool (and Windows Explorer) opens; the advanced ones trade compatibility for
@@ -244,6 +244,8 @@ pub struct CreateOptions {
     pub solid_block_size: Option<u64>,
     /// 7z with a password: encrypt the file names too, so listing needs the password.
     pub encrypt_names: bool,
+    /// Limits for what an edit decodes (7z: the solid blocks it recompresses).
+    pub limits: ExtractLimits,
 }
 
 impl Default for CreateOptions {
@@ -257,6 +259,7 @@ impl Default for CreateOptions {
             solid: true,
             solid_block_size: None,
             encrypt_names: true,
+            limits: ExtractLimits::default(),
         }
     }
 }

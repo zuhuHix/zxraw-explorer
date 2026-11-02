@@ -22,8 +22,8 @@ use sevenz_rust2 as sz;
 use super::sevenz_guard::{self, ID_AES, decoder_memory};
 use super::{
     ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, CreateOptions,
-    CreateReport, EntryEncryption, EntryVisitor, ExtractLimits, Password, archive_stem,
-    normalize_entry_name, validate_entry_name,
+    CreateReport, EntryEncryption, EntryVisitor, ExtractLimits, Password, PasswordProof,
+    archive_stem, normalize_entry_name, validate_entry_name,
 };
 use crate::error::{CoreError, Result};
 use crate::ops::JobCtx;
@@ -223,6 +223,8 @@ pub(super) struct BlockInfo {
     pub unpack_size: u64,
     /// Files with data in it.
     pub files: usize,
+    /// The block carries a CRC of its whole output.
+    pub has_crc: bool,
 }
 
 pub(super) fn block_infos(a: &sz::Archive) -> Vec<BlockInfo> {
@@ -259,6 +261,7 @@ pub(super) fn block_infos(a: &sz::Archive) -> Vec<BlockInfo> {
                 pack_size,
                 unpack_size: block.get_unpack_size(),
                 files: counts[i],
+                has_crc: block.has_crc,
             }
         })
         .collect()
@@ -323,6 +326,10 @@ pub(super) fn entries_of(path: &Path, a: &sz::Archive) -> Vec<Option<ArchiveEntr
                 method: info.map_or_else(String::new, |b| b.method.clone()),
                 solid: info.is_some_and(|b| b.files > 1),
                 block_offset,
+                // A block's own CRC checks a file only when the file is all of it.
+                unchecked: has_data(f)
+                    && !f.has_crc
+                    && !info.is_some_and(|b| b.has_crc && b.files == 1),
             })
         })
         .collect()
@@ -380,6 +387,48 @@ impl std::error::Error for Cancelled {}
 
 fn is_cancel(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<Cancelled>())
+}
+
+/// Block `b` may be decoded: a sane number of coders, their memory within
+/// `limits.max_decoder_memory`.
+pub(super) fn check_block_memory(
+    archive: &Path,
+    a: &sz::Archive,
+    b: usize,
+    limits: &ExtractLimits,
+) -> Result<()> {
+    let block = &a.blocks[b];
+    if block.coders.len() as u64 > sevenz_guard::MAX_CODERS {
+        return Err(CoreError::UnsafePath(format!(
+            "{}: a block has {} coders",
+            paths::display_path(archive),
+            block.coders.len()
+        )));
+    }
+    let mut need = 0u64;
+    for c in &block.coders {
+        let m = decoder_memory(c.encoder_method_id(), c.properties()).ok_or_else(|| {
+            CoreError::Invalid(format!(
+                "{}: damaged 7z archive (bad coder properties)",
+                paths::display_path(archive)
+            ))
+        })?;
+        need = need.saturating_add(m);
+    }
+    if need > limits.max_decoder_memory {
+        let name = a
+            .files
+            .iter()
+            .zip(&a.stream_map.file_block_index)
+            .find(|(_, fb)| **fb == Some(b))
+            .map_or("", |(f, _)| f.name.as_str());
+        return Err(CoreError::UnsafePath(format!(
+            "{name}: needs {} MiB of decoder memory (limit {} MiB)",
+            need >> 20,
+            limits.max_decoder_memory >> 20
+        )));
+    }
+    Ok(())
 }
 
 /// Whether block `b` is compressed (a wrong key makes its decoder fail early), not stored.
@@ -711,32 +760,7 @@ impl ArchiveBackend for SevenZipBackend {
             if std::mem::replace(&mut checked[b], true) {
                 continue;
             }
-            let block = &a.blocks[b];
-            if block.coders.len() as u64 > sevenz_guard::MAX_CODERS {
-                return Err(CoreError::UnsafePath(format!(
-                    "{}: a block has {} coders",
-                    paths::display_path(archive),
-                    block.coders.len()
-                )));
-            }
-            let mut need = 0u64;
-            for c in &block.coders {
-                let m = decoder_memory(c.encoder_method_id(), c.properties()).ok_or_else(|| {
-                    CoreError::Invalid(format!(
-                        "{}: damaged 7z archive (bad coder properties)",
-                        paths::display_path(archive)
-                    ))
-                })?;
-                need = need.saturating_add(m);
-            }
-            if need > limits.max_decoder_memory {
-                let name = a.files.get(i).map_or("", |f| f.name.as_str());
-                return Err(CoreError::UnsafePath(format!(
-                    "{name}: needs {} MiB of decoder memory (limit {} MiB)",
-                    need >> 20,
-                    limits.max_decoder_memory >> 20
-                )));
-            }
+            check_block_memory(archive, a, b, limits)?;
         }
         Ok(())
     }
@@ -759,12 +783,13 @@ impl ArchiveBackend for SevenZipBackend {
         archive: &Path,
         entries: &[&ArchiveEntry],
         password: Option<&Password>,
-    ) -> Result<()> {
+    ) -> Result<PasswordProof> {
         // Unverified goes ahead: each file is checked against its CRC as it is extracted,
-        // and one that fails is never published.
+        // and one that fails is never published; `extract` holds back those without a CRC.
         match verify_password(archive, entries, password)? {
             PasswordCheck::Failed => Err(CoreError::WrongPassword(paths::display_path(archive))),
-            _ => Ok(()),
+            PasswordCheck::Unverified => Ok(PasswordProof::Unverified),
+            _ => Ok(PasswordProof::Proven),
         }
     }
 

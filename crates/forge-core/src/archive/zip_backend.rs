@@ -143,6 +143,7 @@ fn to_entry<R: Read>(index: usize, f: &zip::read::ZipFile<'_, R>) -> ArchiveEntr
         name,
         solid: false,
         block_offset: 0,
+        unchecked: false,
     }
 }
 
