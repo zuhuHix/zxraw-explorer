@@ -43,6 +43,7 @@ pub mod shell;
 pub mod shell_notify;
 mod user_choice;
 pub mod virtual_files;
+pub mod virtual_source;
 pub mod watch;
 pub mod window;
 

@@ -315,6 +315,25 @@ fn read_drag(obj: &windows::Win32::System::Com::IDataObject) -> Option<CurrentDr
 
     use crate::virtual_files::{Medium, hglobal_format};
 
+    // Archive items dragged out of this app and back in: handled as the in-app drag of
+    // their listed paths, not read through their virtual-file streams.
+    if let Ok(format) = crate::virtual_source::own_format()
+        && let Ok(bytes) = crate::virtual_files::read_hglobal_bytes(
+            obj,
+            format,
+            "IDataObject::GetData(ZXraw Archive Items)",
+            1 << 22,
+        )
+        && let Some(files) = crate::virtual_source::own_paths(&bytes)
+    {
+        return Some(CurrentDrag {
+            info: DragInfo {
+                files,
+                virtual_count: 0,
+            },
+            is_virtual: false,
+        });
+    }
     // SAFETY: `hglobal_format` is a valid FORMATETC; the medium is owned by the guard.
     if let Ok(medium) = unsafe { obj.GetData(&hglobal_format(CF_HDROP.0)) }.map(Medium)
         && medium.0.tymed == TYMED_HGLOBAL.0 as u32

@@ -517,7 +517,7 @@ pub fn set_clipboard_to_shell_item(_parsing_name: &str, _marker: &str) -> crate:
 
 /// Gives `bytes` to `obj` as an HGLOBAL in `format` (`SetData` with fRelease).
 #[cfg(windows)]
-fn set_hglobal(
+pub(crate) fn set_hglobal(
     obj: &windows::Win32::System::Com::IDataObject,
     format: u16,
     bytes: &[u8],
@@ -555,7 +555,7 @@ fn set_hglobal(
 }
 
 #[cfg(windows)]
-fn descriptor_format() -> crate::Result<u16> {
+pub(crate) fn descriptor_format() -> crate::Result<u16> {
     registered_format(
         windows::core::w!("FileGroupDescriptorW"),
         "RegisterClipboardFormatW(FileGroupDescriptorW)",
@@ -563,7 +563,7 @@ fn descriptor_format() -> crate::Result<u16> {
 }
 
 #[cfg(windows)]
-fn contents_format() -> crate::Result<u16> {
+pub(crate) fn contents_format() -> crate::Result<u16> {
     registered_format(
         windows::core::w!("FileContents"),
         "RegisterClipboardFormatW(FileContents)",
