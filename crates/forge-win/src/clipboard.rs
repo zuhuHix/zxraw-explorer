@@ -737,7 +737,7 @@ fn open_clipboard_retry(owner: Option<windows::Win32::Foundation::HWND>) -> Resu
 }
 
 #[cfg(windows)]
-fn read_hdrop(handle: windows::Win32::Foundation::HANDLE) -> Result<Vec<PathBuf>> {
+pub(crate) fn read_hdrop(handle: windows::Win32::Foundation::HANDLE) -> Result<Vec<PathBuf>> {
     use std::{mem::size_of, os::windows::ffi::OsStringExt};
 
     use windows::Win32::Foundation::HGLOBAL;
