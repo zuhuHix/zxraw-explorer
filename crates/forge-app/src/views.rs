@@ -251,28 +251,97 @@ const CONTEXT_BACKGROUND: &[Option<Cmd>] = &[
     Some(Cmd::OpenTerminalAdmin),
 ];
 
-/// `network`: the pane shows a folder on a share, so "Add to Network…" is offered.
-fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], network: bool, out: &mut Vec<ViewEvent>) {
+/// What a context menu offers beyond its fixed items.
+struct MenuCtx {
+    /// The pane shows a folder on a share, so "Add to Network…" is offered.
+    network: bool,
+    archive: ArchiveMenu,
+}
+
+/// The extract commands a context menu offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArchiveMenu {
+    None,
+    /// On an archive file in a folder, with the text of "Extract to `<name>\`".
+    File(String),
+    /// In a pane showing an archive's contents.
+    Inside,
+}
+
+const CONTEXT_ARCHIVE_FILE: &[Cmd] = &[
+    Cmd::ExtractHere,
+    Cmd::ExtractToFolder,
+    Cmd::ExtractTo,
+    Cmd::TestArchive,
+];
+
+const CONTEXT_ARCHIVE_INSIDE: &[Cmd] = &[Cmd::ExtractHere, Cmd::ExtractTo, Cmd::TestArchive];
+
+/// The menu context of `pane`, right-clicked on `entry` (`None`: the background).
+fn menu_ctx(pane: &Pane, entry: Option<&FileEntry>) -> MenuCtx {
+    let archive = if pane.in_archive() {
+        ArchiveMenu::Inside
+    } else {
+        match entry {
+            Some(e)
+                if e.kind == EntryKind::File && forge_core::archive::is_archive_name(&e.path) =>
+            {
+                ArchiveMenu::File(crate::archive_extract::named_folder_label(&e.path))
+            }
+            _ => ArchiveMenu::None,
+        }
+    };
+    MenuCtx {
+        network: forge_core::netpath::is_unc(&pane.path),
+        archive,
+    }
+}
+
+/// The text of an extract command in `menu`.
+fn archive_item_label(cmd: Cmd, menu: &ArchiveMenu) -> String {
+    match (cmd, menu) {
+        (Cmd::ExtractToFolder, ArchiveMenu::File(named)) => named.clone(),
+        (Cmd::ExtractHere, ArchiveMenu::Inside) => "Extract here (next to the archive)".into(),
+        _ => cmd.label().into(),
+    }
+}
+
+fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], menu: &MenuCtx, out: &mut Vec<ViewEvent>) {
     let overrides = crate::commands::published_key_state(ui.ctx()).overrides;
+    let mut item = |ui: &mut Ui, c: Cmd, label: &str| {
+        let sc = c.binding_text(&overrides);
+        let button = ui.add(egui::Button::new(label).shortcut_text(sc));
+        crate::testhook::note_menu_rect(ui, label, button.rect);
+        if button.clicked() {
+            out.push(ViewEvent::Command(c));
+            ui.close();
+        }
+        if c == Cmd::Deliver && crate::batch_export::deliver_menu(ui) {
+            out.push(ViewEvent::Command(Cmd::Deliver));
+            ui.close();
+        }
+    };
+    let archive_items = match menu.archive {
+        ArchiveMenu::None => &[][..],
+        ArchiveMenu::File(_) => CONTEXT_ARCHIVE_FILE,
+        ArchiveMenu::Inside => CONTEXT_ARCHIVE_INSIDE,
+    };
+    let mut archive_shown = archive_items.is_empty();
     for it in items {
         match it {
             None => {
+                // The extract commands go after the first group.
+                if !archive_shown {
+                    archive_shown = true;
+                    ui.separator();
+                    for c in archive_items {
+                        item(ui, *c, &archive_item_label(*c, &menu.archive));
+                    }
+                }
                 ui.separator();
             }
-            Some(Cmd::AddToNetwork) if !network => {}
-            Some(c) => {
-                let sc = c.binding_text(&overrides);
-                let button = ui.add(egui::Button::new(c.label()).shortcut_text(sc));
-                crate::testhook::note_menu_rect(ui, c.label(), button.rect);
-                if button.clicked() {
-                    out.push(ViewEvent::Command(*c));
-                    ui.close();
-                }
-                if *c == Cmd::Deliver && crate::batch_export::deliver_menu(ui) {
-                    out.push(ViewEvent::Command(Cmd::Deliver));
-                    ui.close();
-                }
-            }
+            Some(Cmd::AddToNetwork) if !menu.network => {}
+            Some(c) => item(ui, *c, c.label()),
         }
     }
 }
@@ -1754,8 +1823,8 @@ pub fn details(
             }
             remember_accessible_focus(ui, id, &response);
             remember_cursor_accessible_focus(ui, id, &response);
-            let network = forge_core::netpath::is_unc(&pane.path);
-            response.context_menu(|menu| menu_items(menu, CONTEXT_FILE, network, &mut out));
+            let menu = menu_ctx(pane, Some(&entry_clone));
+            response.context_menu(|ui| menu_items(ui, CONTEXT_FILE, &menu, &mut out));
         }
         if let Some(group) = group_rect {
             ui.painter().rect_stroke(
@@ -1843,8 +1912,8 @@ fn background_interactions(
     if bg.secondary_clicked() {
         out.push(ViewEvent::Focus);
     }
-    let network = forge_core::netpath::is_unc(&dir);
-    bg.context_menu(|ui| menu_items(ui, CONTEXT_BACKGROUND, network, out));
+    let menu = menu_ctx(pane, None);
+    bg.context_menu(|ui| menu_items(ui, CONTEXT_BACKGROUND, &menu, out));
 }
 
 // ---------------------------------------------------------------------------
@@ -2478,8 +2547,8 @@ pub fn grid(
                     }
                     remember_accessible_focus(ui, id, &resp);
                     remember_cursor_accessible_focus(ui, id, &resp);
-                    let network = forge_core::netpath::is_unc(&pane.path);
-                    resp.context_menu(|ui| menu_items(ui, CONTEXT_FILE, network, &mut out));
+                    let menu = menu_ctx(pane, Some(&entry));
+                    resp.context_menu(|ui| menu_items(ui, CONTEXT_FILE, &menu, &mut out));
                 }
             });
         }

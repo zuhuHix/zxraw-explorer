@@ -11,7 +11,9 @@ use std::time::SystemTime;
 use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use egui::{RichText, Ui};
-use forge_core::archive::{ArchiveEntry, ExtractOptions};
+use forge_core::archive::{
+    ArchiveEntry, CreateOptions, Encryption, ExtractOptions, Password, Preset,
+};
 use forge_core::model::{EntryKind, MediaKind};
 use forge_core::netpath;
 use forge_core::ops::JobCtx;
@@ -96,6 +98,61 @@ struct CreateArchiveWindow {
     name: String,
     job: Option<JobHandle>,
     open: bool,
+    preset: Preset,
+    auto_store: bool,
+    /// Typed passwords: never logged or saved, wiped when the job starts or the window goes.
+    password: String,
+    confirm: String,
+    legacy_zipcrypto: bool,
+}
+
+impl CreateArchiveWindow {
+    fn new(sources: Vec<PathBuf>, directory: PathBuf, name: String) -> Self {
+        Self {
+            sources,
+            directory,
+            name,
+            job: None,
+            open: true,
+            preset: Preset::Balanced,
+            auto_store: true,
+            password: String::new(),
+            confirm: String::new(),
+            legacy_zipcrypto: false,
+        }
+    }
+}
+
+impl Drop for CreateArchiveWindow {
+    fn drop(&mut self) {
+        crate::archive_ui::wipe(&mut self.password);
+        crate::archive_ui::wipe(&mut self.confirm);
+    }
+}
+
+/// The create options the dialog's choices make; an error when the passwords differ.
+fn create_options(
+    preset: Preset,
+    auto_store: bool,
+    password: &str,
+    confirm: &str,
+    legacy_zipcrypto: bool,
+) -> Result<CreateOptions, &'static str> {
+    let encryption = if password.is_empty() && confirm.is_empty() {
+        Encryption::None
+    } else if password != confirm {
+        return Err("The passwords do not match");
+    } else if legacy_zipcrypto {
+        Encryption::ZipCryptoLegacy(Password::new(password))
+    } else {
+        Encryption::Aes256(Password::new(password))
+    };
+    Ok(CreateOptions {
+        preset,
+        auto_store,
+        encryption,
+        ..CreateOptions::default()
+    })
 }
 
 struct SplitWindow {
@@ -119,6 +176,7 @@ enum UiAction {
         sources: Vec<PathBuf>,
         directory: PathBuf,
         name: String,
+        options: CreateOptions,
     },
     StartSplit {
         source: PathBuf,
@@ -224,10 +282,12 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
                 sources,
                 directory,
                 name,
+                options,
             } => {
                 if let Some(state) = tools.create_archive.as_mut() {
-                    let job =
-                        start_create_archive(&jobs, &event_tx, &app_ctx, sources, directory, name);
+                    let job = start_create_archive(
+                        &jobs, &event_tx, &app_ctx, sources, directory, name, options,
+                    );
                     state.job = Some(job);
                 }
             }
@@ -385,13 +445,11 @@ pub fn create_archive(app: &mut ZxrawApp) {
     }
     let directory = app.pane().path.clone();
     let stem = app.pane().title();
-    app.ops.extra_tools.create_archive = Some(CreateArchiveWindow {
+    app.ops.extra_tools.create_archive = Some(CreateArchiveWindow::new(
         sources,
         directory,
-        name: format!("{stem}.zip"),
-        job: None,
-        open: true,
-    });
+        format!("{stem}.zip"),
+    ));
 }
 
 /// Open the split dialog for the selected file.
@@ -563,14 +621,11 @@ pub(crate) fn automation_create_archive(
         sources.clone(),
         directory.clone(),
         name.clone(),
+        CreateOptions::default(),
     );
-    app.ops.extra_tools.create_archive = Some(CreateArchiveWindow {
-        sources,
-        directory,
-        name,
-        job: Some(job),
-        open: true,
-    });
+    let mut window = CreateArchiveWindow::new(sources, directory, name);
+    window.job = Some(job);
+    app.ops.extra_tools.create_archive = Some(window);
     Ok(())
 }
 
@@ -1986,19 +2041,113 @@ fn render_create_archive(
                 ui.text_edit_singleline(&mut state.name);
             });
             ui.label(format!("Saved in {}", state.directory.display()));
-            if state.job.is_none() {
-                if ui.button("Create ZIP").clicked() && !state.name.trim().is_empty() {
-                    actions.push(UiAction::StartCreateArchive {
-                        sources: state.sources.clone(),
-                        directory: state.directory.clone(),
-                        name: state.name.clone(),
-                    });
-                }
-            } else if let Some(job) = &state.job {
+            if let Some(job) = &state.job {
                 draw_job_progress(ui, job);
+                return;
+            }
+            ui.add_space(6.0);
+            create_choices(ui, state);
+            let options = create_options(
+                state.preset,
+                state.auto_store,
+                &state.password,
+                &state.confirm,
+                state.legacy_zipcrypto,
+            );
+            ui.add_space(6.0);
+            let ready = options.is_ok() && !state.name.trim().is_empty();
+            if ui
+                .add_enabled(ready, egui::Button::new("Create ZIP"))
+                .clicked()
+                && let Ok(options) = options
+            {
+                crate::archive_ui::wipe(&mut state.password);
+                crate::archive_ui::wipe(&mut state.confirm);
+                actions.push(UiAction::StartCreateArchive {
+                    sources: state.sources.clone(),
+                    directory: state.directory.clone(),
+                    name: state.name.clone(),
+                    options,
+                });
             }
         });
     state.open = open;
+}
+
+/// The compress dialog's choices: preset, the advanced presets, storing compressed files,
+/// and the password.
+fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
+    let warn = ui.visuals().warn_fg_color;
+    ui.label(RichText::new("Compression").strong());
+    ui.horizontal(|ui| {
+        for p in Preset::ALL.into_iter().filter(|p| !p.is_advanced()) {
+            ui.radio_value(&mut state.preset, p, p.label());
+        }
+    });
+    ui.label(RichText::new(state.preset.estimate()).small().weak());
+    egui::CollapsingHeader::new("Advanced")
+        .id_salt("create-archive-advanced")
+        .default_open(state.preset.is_advanced())
+        .show(ui, |ui| {
+            for p in Preset::ALL.into_iter().filter(|p| p.is_advanced()) {
+                ui.radio_value(&mut state.preset, p, p.label());
+            }
+            let shown = if state.preset.is_advanced() {
+                state.preset
+            } else {
+                Preset::Zstd
+            };
+            ui.label(RichText::new(shown.compatibility()).small().color(warn));
+        });
+    ui.checkbox(
+        &mut state.auto_store,
+        "Store already-compressed files (jpg, mp4, zip…)",
+    )
+    .on_hover_text("Faster, and barely larger: these formats do not compress further");
+    egui::CollapsingHeader::new("Password")
+        .id_salt("create-archive-password")
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut state.password)
+                    .password(true)
+                    .hint_text("Password (optional)")
+                    .desired_width(260.0),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut state.confirm)
+                    .password(true)
+                    .hint_text("Confirm password")
+                    .desired_width(260.0),
+            );
+            ui.radio_value(&mut state.legacy_zipcrypto, false, "AES-256 (recommended)");
+            ui.radio_value(
+                &mut state.legacy_zipcrypto,
+                true,
+                "Legacy ZipCrypto (weak, for old tools)",
+            );
+            if state.legacy_zipcrypto {
+                ui.label(
+                    RichText::new(
+                        "ZipCrypto is easy to break. Use it only for tools that cannot open \
+                         AES-encrypted ZIP files.",
+                    )
+                    .small()
+                    .color(warn),
+                );
+            }
+            if !state.confirm.is_empty() && state.password != state.confirm {
+                ui.label(
+                    RichText::new("The passwords do not match")
+                        .small()
+                        .color(ui.visuals().error_fg_color),
+                );
+            }
+            ui.label(
+                RichText::new("File names stay readable; their contents are encrypted.")
+                    .small()
+                    .weak(),
+            );
+        });
 }
 
 fn start_create_archive(
@@ -2008,6 +2157,7 @@ fn start_create_archive(
     sources: Vec<PathBuf>,
     directory: PathBuf,
     name: String,
+    options: CreateOptions,
 ) -> JobHandle {
     let filename = archive_filename(&name);
     let requested = directory.join(filename);
@@ -2022,7 +2172,7 @@ fn start_create_archive(
         let job_ctx = JobCtx::from_job(job);
         let result = match ArchiveStaging::create(&directory) {
             Ok(mut staging) => {
-                match forge_core::archive::create_zip(&sources, staging.path(), &job_ctx) {
+                match forge_core::archive::create(&sources, staging.path(), &options, &job_ctx) {
                     Ok(report) => {
                         staging.owns_archive = true;
                         staging.publish(&requested).map(|output| (report, output))
@@ -2042,7 +2192,11 @@ fn start_create_archive(
                     ));
                     job.progress.add_error();
                 }
-                let _ = tx.send(Event::Toast(format!("Created {}", output.display())));
+                let _ = tx.send(Event::Toast(format!(
+                    "Created {} ({})",
+                    output.display(),
+                    crate::ops_ui::compression_text(report.bytes_in, report.bytes_out)
+                )));
                 let _ = tx.send(Event::Changed(directory));
                 ctx.request_repaint();
                 Ok(())
@@ -2321,6 +2475,10 @@ fn draw_job_progress(ui: &mut Ui, job: &JobHandle) {
             ui.label(text);
         });
     }
+    let finished = job.state().is_finished();
+    if let Some(line) = crate::ops_ui::throughput_line(&progress, job.elapsed(), finished) {
+        ui.label(RichText::new(line).small().weak());
+    }
     if !progress.current.is_empty() {
         ui.label(RichText::new(progress.current).small().weak());
     }
@@ -2352,6 +2510,24 @@ fn format_system_time(time: Option<SystemTime>) -> String {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn the_compress_dialog_builds_its_options() {
+        let o = create_options(Preset::Max, false, "", "", false).unwrap();
+        assert_eq!(o.preset, Preset::Max);
+        assert!(!o.auto_store);
+        assert!(o.encryption.is_none());
+        let o = create_options(Preset::Balanced, true, "pw", "pw", false).unwrap();
+        assert!(matches!(&o.encryption, Encryption::Aes256(p) if p.as_bytes() == b"pw"));
+        let o = create_options(Preset::Balanced, true, "pw", "pw", true).unwrap();
+        assert!(matches!(o.encryption, Encryption::ZipCryptoLegacy(_)));
+        assert!(create_options(Preset::Balanced, true, "pw", "pW", false).is_err());
+        assert!(create_options(Preset::Balanced, true, "", "pw", false).is_err());
+        assert_eq!(
+            CreateArchiveWindow::new(vec![], PathBuf::new(), "a.zip".into()).preset,
+            Preset::Balanced
+        );
+    }
 
     #[test]
     fn contact_sheet_pagination_uses_rows_times_columns() {

@@ -1985,7 +1985,7 @@ const POPUP_MAX_JOBS: usize = 3;
 
 /// Whether a job of this kind gets the progress popup: the ones that change files.
 fn popup_kind(kind: &str) -> bool {
-    matches!(kind, "delete" | "transfer" | "undo")
+    matches!(kind, "delete" | "transfer" | "undo") || kind == crate::archive_extract::EXTRACT_KIND
 }
 
 /// A small window in front of the app with the progress of copies, moves and deletes that
@@ -2185,6 +2185,51 @@ fn time_left(secs: f64) -> String {
         60..3600 => format!("{} min left", secs.div_ceil(60)),
         _ => format!("{} h {} min left", secs / 3600, (secs % 3600) / 60),
     }
+}
+
+/// "1.2 GB → 400 MB (33%)": what went into an archive and what came out of it.
+pub(crate) fn compression_text(bytes_in: u64, bytes_out: u64) -> String {
+    let ratio = if bytes_in > 0 {
+        (bytes_out as f64 * 100.0 / bytes_in as f64).round() as u64
+    } else {
+        100
+    };
+    format!(
+        "{} → {} ({ratio}%)",
+        format_size(bytes_in),
+        format_size(bytes_out)
+    )
+}
+
+/// The speed line of a job that counts bytes: "1.2 GB → 400 MB (33%) · 50 MB/s · 20 s
+/// left" for one writing an archive (`bytes_out`), "50 MB/s · 20 s left" for others (an
+/// extraction). The speed is the average over the job's `elapsed` time; no time left once
+/// `finished`. `None` when there is nothing to say yet.
+pub(crate) fn throughput_line(
+    snap: &forge_jobs::ProgressSnapshot,
+    elapsed: Duration,
+    finished: bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if snap.bytes_out > 0 {
+        parts.push(compression_text(snap.bytes_done, snap.bytes_out));
+    }
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs >= 0.5 {
+        snap.bytes_done as f64 / secs
+    } else {
+        0.0
+    };
+    if rate >= 1.0 {
+        parts.push(format!("{}/s", format_size(rate as u64)));
+        if !finished && snap.bytes_total > snap.bytes_done {
+            let left = time_left((snap.bytes_total - snap.bytes_done) as f64 / rate);
+            if !left.is_empty() {
+                parts.push(left);
+            }
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
 /// The popup's line under the bar: what a pending Pause or Cancel waits for, "Paused", or
@@ -2474,6 +2519,14 @@ fn job_progress(ui: &mut Ui, j: &JobHandle, snap: &forge_jobs::ProgressSnapshot,
         _ => {
             ui.label(RichText::new(text).weak());
         }
+    }
+    // An archive being written: how much it shrinks (speed and time left are above).
+    if snap.bytes_out > 0 {
+        ui.label(
+            RichText::new(compression_text(snap.bytes_done, snap.bytes_out))
+                .small()
+                .weak(),
+        );
     }
     if !snap.current.is_empty() && !state.is_finished() {
         ui.add(egui::Label::new(RichText::new(&snap.current).small().weak()).truncate());
@@ -2891,8 +2944,47 @@ mod tests {
     }
 
     #[test]
+    fn archive_jobs_show_ratio_speed_and_time_left() {
+        let snap = |done, total, out| forge_jobs::ProgressSnapshot {
+            items_done: 0,
+            items_total: 0,
+            bytes_done: done,
+            bytes_total: total,
+            bytes_out: out,
+            errors: 0,
+            current: String::new(),
+            note: String::new(),
+        };
+        let mb = 1024 * 1024;
+        let secs = Duration::from_secs;
+        // Compressing: 100 MB of 300 read in 10 s, 25 MB written.
+        let line = throughput_line(&snap(100 * mb, 300 * mb, 25 * mb), secs(10), false).unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "{} → {} (25%) · {}/s · 20 s left",
+                format_size(100 * mb),
+                format_size(25 * mb),
+                format_size(10 * mb)
+            )
+        );
+        // Extracting: no ratio; finished jobs give no time left.
+        let line = throughput_line(&snap(50 * mb, 100 * mb, 0), secs(5), false).unwrap();
+        assert_eq!(line, format!("{}/s · 5 s left", format_size(10 * mb)));
+        let line = throughput_line(&snap(50 * mb, 100 * mb, 0), secs(5), true).unwrap();
+        assert_eq!(line, format!("{}/s", format_size(10 * mb)));
+        // Nothing measured yet.
+        assert_eq!(throughput_line(&snap(0, 100, 0), secs(5), false), None);
+        assert_eq!(
+            throughput_line(&snap(10, 100, 0), Duration::ZERO, false),
+            None
+        );
+        assert!(compression_text(0, 10).ends_with("(100%)"));
+    }
+
+    #[test]
     fn the_progress_popup_is_for_jobs_that_change_files() {
-        for kind in ["delete", "transfer", "undo"] {
+        for kind in ["delete", "transfer", "undo", "extract"] {
             assert!(popup_kind(kind), "{kind}");
         }
         for kind in ["index", "checksums", "update", "folder-size"] {

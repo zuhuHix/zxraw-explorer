@@ -7,7 +7,7 @@
 //! archive's password when an entry is encrypted. Passwords are kept for the session only
 //! ([`ArchivePasswords`]), never logged and never saved.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -283,7 +283,7 @@ pub enum OpenHow {
 }
 
 #[derive(Debug, Clone)]
-struct OpenRequest {
+pub(crate) struct OpenRequest {
     archive: PathBuf,
     /// Inner path of the entry.
     entry: String,
@@ -293,13 +293,50 @@ struct OpenRequest {
     from: PathBuf,
 }
 
-enum Msg {
-    NeedPassword { request: OpenRequest, wrong: bool },
-    Browse { from: PathBuf, path: PathBuf },
+/// A job that stopped for a password: run again once one is typed.
+#[derive(Debug, Clone)]
+pub(crate) enum Retry {
+    Open(OpenRequest),
+    Extract(crate::archive_extract::ExtractRequest),
+    Test(crate::archive_extract::TestRequest),
+}
+
+impl Retry {
+    fn archive(&self) -> &Path {
+        match self {
+            Retry::Open(r) => &r.archive,
+            Retry::Extract(r) => &r.archive,
+            Retry::Test(r) => &r.archive,
+        }
+    }
+
+    /// What the dialog says is encrypted.
+    fn what(&self) -> String {
+        let archive = forge_core::paths::name_of(self.archive());
+        match self {
+            Retry::Open(r) => format!("{} in {archive} is encrypted.", r.name),
+            Retry::Extract(_) | Retry::Test(_) => format!("{archive} is encrypted."),
+        }
+    }
+}
+
+pub(crate) enum Msg {
+    NeedPassword {
+        retry: Retry,
+        wrong: bool,
+    },
+    Browse {
+        from: PathBuf,
+        path: PathBuf,
+    },
+    /// An extraction would replace files: ask once how to handle them.
+    Conflicts(crate::archive_extract::ConflictAsk),
+    /// A "Test archive" job finished.
+    Tested(crate::archive_extract::Tested),
 }
 
 struct PasswordPrompt {
-    request: OpenRequest,
+    retry: Retry,
     text: String,
     wrong: bool,
     focused: bool,
@@ -309,7 +346,12 @@ struct PasswordPrompt {
 pub struct ArchiveUi {
     pub passwords: ArchivePasswords,
     prompt: Option<PasswordPrompt>,
-    tx: Sender<Msg>,
+    /// Jobs waiting for the password dialog (several archives may need one), with whether
+    /// the password they had was wrong.
+    waiting: VecDeque<(Retry, bool)>,
+    /// Extract questions and test results (see `archive_extract`).
+    pub(crate) extract: crate::archive_extract::ExtractUi,
+    pub(crate) tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
 
@@ -319,6 +361,8 @@ impl Default for ArchiveUi {
         Self {
             passwords: ArchivePasswords::default(),
             prompt: None,
+            waiting: VecDeque::new(),
+            extract: Default::default(),
             tx,
             rx,
         }
@@ -326,9 +370,15 @@ impl Default for ArchiveUi {
 }
 
 impl ArchiveUi {
-    /// The password dialog is showing.
+    /// The password dialog or an extract question is showing.
     pub fn prompt_open(&self) -> bool {
-        self.prompt.is_some()
+        self.prompt.is_some() || self.extract.question_open()
+    }
+}
+
+impl Drop for PasswordPrompt {
+    fn drop(&mut self) {
+        wipe(&mut self.text);
     }
 }
 
@@ -383,14 +433,14 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
             },
             Err(CoreError::PasswordRequired(_)) => {
                 let _ = msgs.send(Msg::NeedPassword {
-                    request,
+                    retry: Retry::Open(request),
                     wrong: false,
                 });
                 Ok(())
             }
             Err(CoreError::WrongPassword(_)) => {
                 let _ = msgs.send(Msg::NeedPassword {
-                    request,
+                    retry: Retry::Open(request),
                     wrong: true,
                 });
                 Ok(())
@@ -406,25 +456,19 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
     });
 }
 
-/// Results of open jobs (call every frame). Returns true if anything changed.
+/// Results of open, extract and test jobs (call every frame). Returns true if anything
+/// changed.
 pub fn poll(app: &mut ZxrawApp) -> bool {
     let mut changed = false;
     while let Ok(msg) = app.ops.archive.rx.try_recv() {
         changed = true;
         match msg {
-            Msg::NeedPassword { request, wrong } => {
+            Msg::NeedPassword { retry, wrong } => {
                 if wrong {
-                    app.ops.archive.passwords.forget(&request.archive);
+                    app.ops.archive.passwords.forget(retry.archive());
                 }
-                // One prompt at a time; a second encrypted file waits for the next open.
-                if app.ops.archive.prompt.is_none() {
-                    app.ops.archive.prompt = Some(PasswordPrompt {
-                        request,
-                        text: String::new(),
-                        wrong,
-                        focused: false,
-                    });
-                }
+                // One prompt at a time; the others wait their turn.
+                app.ops.archive.waiting.push_back((retry, wrong));
             }
             Msg::Browse { from, path } => {
                 // Only where it was asked: the user may have moved on meanwhile.
@@ -432,13 +476,40 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                     app.pane_mut().navigate(path);
                 }
             }
+            Msg::Conflicts(ask) => app.ops.archive.extract.ask(ask),
+            Msg::Tested(tested) => app.ops.archive.extract.tested(tested),
+        }
+    }
+    let ui = &mut app.ops.archive;
+    if ui.prompt.is_none()
+        && let Some((retry, wrong)) = ui.waiting.pop_front()
+    {
+        changed = true;
+        // Another job of this archive got its password meanwhile: just run it again.
+        if !wrong && ui.passwords.get(retry.archive()).is_some() {
+            run_retry(app, retry);
+        } else {
+            ui.prompt = Some(PasswordPrompt {
+                retry,
+                text: String::new(),
+                wrong,
+                focused: false,
+            });
         }
     }
     changed
 }
 
+fn run_retry(app: &mut ZxrawApp, retry: Retry) {
+    match retry {
+        Retry::Open(r) => start_open(app, r),
+        Retry::Extract(r) => crate::archive_extract::start_extract(app, r),
+        Retry::Test(r) => crate::archive_extract::start_test(app, r),
+    }
+}
+
 /// Overwrite the typed password before its memory is freed.
-fn wipe(text: &mut String) {
+pub(crate) fn wipe(text: &mut String) {
     let mut bytes = std::mem::take(text).into_bytes();
     bytes.iter_mut().for_each(|b| *b = 0);
     std::hint::black_box(&bytes);
@@ -457,11 +528,7 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
         ui.set_width(420.0);
         ui.heading("Password needed");
         ui.add_space(6.0);
-        ui.label(format!(
-            "{} in {} is encrypted.",
-            prompt.request.name,
-            forge_core::paths::name_of(&prompt.request.archive)
-        ));
+        ui.label(prompt.retry.what());
         if prompt.wrong {
             ui.label(
                 RichText::new("That password is not right. Try again.")
@@ -495,10 +562,16 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
         app.ops
             .archive
             .passwords
-            .set(&prompt.request.archive, password);
-        start_open(app, prompt.request);
+            .set(prompt.retry.archive(), password);
+        run_retry(app, prompt.retry.clone());
     } else if cancel || resp.should_close() {
         wipe(&mut prompt.text);
+        // Other jobs of the same archive wait for the same password: give them up too.
+        let archive = prompt.retry.archive().to_path_buf();
+        app.ops
+            .archive
+            .waiting
+            .retain(|(r, _)| !forge_core::paths::paths_equal(r.archive(), &archive));
     } else {
         app.ops.archive.prompt = Some(prompt);
     }
