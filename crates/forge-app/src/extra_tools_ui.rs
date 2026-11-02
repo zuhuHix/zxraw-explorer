@@ -12,7 +12,7 @@ use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{
-    ArchiveEntry, ArchiveFormat, CreateOptions, Encryption, ExtractOptions, Password, Preset,
+    ArchiveEntry, ArchiveFormat, Codec, CreateOptions, Encryption, ExtractOptions, Password, Preset,
 };
 use forge_core::model::{EntryKind, MediaKind};
 use forge_core::netpath;
@@ -111,10 +111,32 @@ struct CreateArchiveWindow {
     password: String,
     confirm: String,
     legacy_zipcrypto: bool,
+    /// The only source is one regular file: the single-file compressed formats are offered.
+    single_file: bool,
 }
+
+/// Tar formats the dialog offers, in the order of its Tar row.
+const TAR_FORMATS: [ArchiveFormat; 6] = [
+    ArchiveFormat::Tar(Codec::Gzip),
+    ArchiveFormat::Tar(Codec::Xz),
+    ArchiveFormat::Tar(Codec::Zstd),
+    ArchiveFormat::Tar(Codec::Bzip2),
+    ArchiveFormat::Tar(Codec::Lz4),
+    ArchiveFormat::Tar(Codec::None),
+];
+
+/// Single-file compressed formats, offered when the only source is one regular file.
+const SINGLE_FILE_FORMATS: [ArchiveFormat; 4] = [
+    ArchiveFormat::Compressed(Codec::Gzip),
+    ArchiveFormat::Compressed(Codec::Xz),
+    ArchiveFormat::Compressed(Codec::Zstd),
+    ArchiveFormat::Compressed(Codec::Brotli),
+];
 
 impl CreateArchiveWindow {
     fn new(sources: Vec<PathBuf>, directory: PathBuf, name: String) -> Self {
+        let single_file =
+            sources.len() == 1 && fs::symlink_metadata(&sources[0]).is_ok_and(|m| m.is_file());
         Self {
             sources,
             directory,
@@ -130,6 +152,7 @@ impl CreateArchiveWindow {
             password: String::new(),
             confirm: String::new(),
             legacy_zipcrypto: false,
+            single_file,
         }
     }
 }
@@ -143,9 +166,16 @@ const SOLID_BLOCK_SIZES: [(&str, u64); 5] = [
     ("4 GB", 4 << 30),
 ];
 
-/// The name without a trailing `.zip` or `.7z` (any case), or `None` when it has neither.
+/// Archive extensions the dialog knows, longest first so `.tar.gz` is not read as `.gz`.
+const ARCHIVE_EXTENSIONS: [&str; 15] = [
+    "tar.gz", "tar.xz", "tar.zst", "tar.bz2", "tar.lz4", "tar.br", "tar", "gz", "xz", "zst", "bz2",
+    "lz4", "br", "zip", "7z",
+];
+
+/// The name without a trailing archive extension (any case, see `ARCHIVE_EXTENSIONS`), or
+/// `None` when it has none.
 fn strip_archive_extension(name: &str) -> Option<&str> {
-    ["zip", "7z"].into_iter().find_map(|ext| {
+    ARCHIVE_EXTENSIONS.into_iter().find_map(|ext| {
         let cut = name.len().checked_sub(ext.len() + 1)?;
         let suffix = name.get(cut..)?;
         (suffix.starts_with('.') && suffix[1..].eq_ignore_ascii_case(ext)).then(|| &name[..cut])
@@ -160,14 +190,58 @@ fn name_for_format(name: &str, format: ArchiveFormat) -> String {
     }
 }
 
-/// Switches the dialog to `format`: the name follows it, and a preset the format lacks
-/// (Zstandard for 7z) becomes Balanced.
+/// Switches the dialog to `format`: the name follows it. A preset the format lacks becomes
+/// Balanced (or the first preset it offers); a plain tar offers none, so the preset stays.
+/// A format that cannot encrypt drops any typed password.
 fn switch_format(state: &mut CreateArchiveWindow, format: ArchiveFormat) {
     state.name = name_for_format(&state.name, format);
-    if !Preset::for_format(format).contains(&state.preset) {
-        state.preset = Preset::Balanced;
+    let offered = Preset::for_format(format);
+    if let Some(&first) = offered.first()
+        && !offered.contains(&state.preset)
+    {
+        state.preset = if offered.contains(&Preset::Balanced) {
+            Preset::Balanced
+        } else {
+            first
+        };
+    }
+    if !format.can_encrypt() {
+        crate::archive_ui::wipe(&mut state.password);
+        crate::archive_ui::wipe(&mut state.confirm);
     }
     state.format = format;
+}
+
+/// Splits a file name into its stem and extension (no dot; empty when there is none). A
+/// trailing `.tar.<ext>` counts as one extension: `photos.tar.gz` gives `("photos", "tar.gz")`.
+fn split_file_name(filename: &str) -> (&str, &str) {
+    let Some(last) = filename.rfind('.').filter(|&i| i > 0) else {
+        return (filename, "");
+    };
+    if let Some(before) = filename[..last].rfind('.').filter(|&i| i > 0)
+        && filename[before..last].eq_ignore_ascii_case(".tar")
+    {
+        return (&filename[..before], &filename[before + 1..]);
+    }
+    (&filename[..last], &filename[last + 1..])
+}
+
+/// `stem` + `suffix` + `.extension`, with the dot only when there is an extension.
+fn join_file_name(stem: &str, extension: &str, suffix: &str) -> String {
+    if extension.is_empty() {
+        format!("{stem}{suffix}")
+    } else {
+        format!("{stem}{suffix}.{extension}")
+    }
+}
+
+/// The label of the dialog's create button.
+fn create_button_label(format: ArchiveFormat) -> String {
+    match format {
+        ArchiveFormat::Zip | ArchiveFormat::SevenZip => format!("Create {}", format.name()),
+        ArchiveFormat::Tar(_) => format!("Create {}", format.extension()),
+        ArchiveFormat::Compressed(_) => format!("Create .{}", format.extension()),
+    }
 }
 
 /// Ids of the compress dialog's password fields (their egui state is forgotten when done).
@@ -187,7 +261,8 @@ impl Drop for CreateArchiveWindow {
 }
 
 /// The create options the dialog's choices make; an error when the passwords differ.
-/// 7z always uses AES-256: `legacy_zipcrypto` only applies to ZIP.
+/// 7z always uses AES-256: `legacy_zipcrypto` only applies to ZIP. A format that cannot
+/// encrypt (tar, single compressed files) never gets a password, typed or not.
 #[allow(clippy::too_many_arguments)]
 fn create_options(
     format: ArchiveFormat,
@@ -200,7 +275,7 @@ fn create_options(
     confirm: &str,
     legacy_zipcrypto: bool,
 ) -> Result<CreateOptions, &'static str> {
-    let encryption = if password.is_empty() && confirm.is_empty() {
+    let encryption = if !format.can_encrypt() || (password.is_empty() && confirm.is_empty()) {
         Encryption::None
     } else if password != confirm {
         return Err("The passwords do not match");
@@ -2196,10 +2271,7 @@ fn render_create_archive(
             ui.add_space(6.0);
             let ready = options.is_ok() && !state.name.trim().is_empty();
             if ui
-                .add_enabled(
-                    ready,
-                    egui::Button::new(format!("Create {}", state.format.name())),
-                )
+                .add_enabled(ready, egui::Button::new(create_button_label(state.format)))
                 .clicked()
                 && let Ok(options) = options
             {
@@ -2218,74 +2290,114 @@ fn render_create_archive(
     state.open = open;
 }
 
+/// One radio for `format`; choosing it switches the dialog to that format.
+fn format_radio(ui: &mut Ui, state: &mut CreateArchiveWindow, format: ArchiveFormat, label: &str) {
+    if ui.radio(state.format == format, label).clicked() {
+        switch_format(state, format);
+    }
+}
+
 /// The compress dialog's choices: format, preset, the advanced presets, storing compressed
-/// files, 7z solid blocks, and the password.
+/// files, 7z solid blocks, and the password. Tar and single-file formats have no password
+/// and no "store" choice; a plain tar has no compression choice either.
 fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
     let warn = ui.visuals().warn_fg_color;
     let format = state.format;
-    ui.horizontal(|ui| {
+    let tar_or_single = matches!(format, ArchiveFormat::Tar(_) | ArchiveFormat::Compressed(_));
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Format").strong());
         for f in [ArchiveFormat::Zip, ArchiveFormat::SevenZip] {
-            if ui.radio(state.format == f, f.name()).clicked() {
-                switch_format(state, f);
+            format_radio(ui, state, f, f.name());
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Tar").strong());
+        for f in TAR_FORMATS {
+            format_radio(ui, state, f, f.name());
+        }
+    });
+    if state.single_file {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Single file").strong());
+            for f in SINGLE_FILE_FORMATS {
+                format_radio(ui, state, f, &format!(".{}", f.extension()));
             }
-        }
-    });
+        });
+    }
     ui.label(RichText::new("Compression").strong());
-    ui.horizontal(|ui| {
-        for p in Preset::for_format(format)
-            .iter()
-            .copied()
-            .filter(|p| !p.is_advanced())
-        {
-            ui.radio_value(&mut state.preset, p, p.label_for(format));
-        }
-    });
-    ui.label(
-        RichText::new(state.preset.estimate_for(format))
-            .small()
-            .weak(),
-    );
-    egui::CollapsingHeader::new("Advanced")
-        .id_salt("create-archive-advanced")
-        .default_open(state.preset.is_advanced())
-        .show(ui, |ui| {
+    if Preset::for_format(format).is_empty() {
+        ui.label(RichText::new("No compression").small().weak());
+    } else {
+        ui.horizontal(|ui| {
             for p in Preset::for_format(format)
                 .iter()
                 .copied()
-                .filter(|p| p.is_advanced())
+                .filter(|p| !p.is_advanced())
             {
                 ui.radio_value(&mut state.preset, p, p.label_for(format));
             }
-            if format == ArchiveFormat::SevenZip {
-                let info = Preset::Ultra.sevenzip();
-                ui.label(
-                    RichText::new(format!(
-                        "Ultra needs about {} MB of memory per compressing thread and {} MB \
-                         on every computer that opens it.",
-                        info.compress_memory >> 20,
-                        info.decompress_memory >> 20
-                    ))
-                    .small()
-                    .color(warn),
-                );
-            }
-            let shown = if state.preset.is_advanced() {
-                state.preset
-            } else {
-                Preset::Zstd
-            };
-            ui.label(
-                RichText::new(shown.compatibility_for(format))
-                    .small()
-                    .color(warn),
-            );
         });
-    ui.checkbox(
-        &mut state.auto_store,
-        "Store already-compressed files (jpg, mp4, zip…)",
-    )
-    .on_hover_text("Faster, and barely larger: these formats do not compress further");
+        ui.label(
+            RichText::new(state.preset.estimate_for(format))
+                .small()
+                .weak(),
+        );
+    }
+    if tar_or_single {
+        ui.label(
+            RichText::new(state.preset.compatibility_for(format))
+                .small()
+                .weak(),
+        );
+    }
+    let has_advanced = Preset::for_format(format).iter().any(|p| p.is_advanced());
+    // ZIP and 7z always show it, as before; tar formats only when they have advanced presets.
+    if has_advanced || !tar_or_single {
+        egui::CollapsingHeader::new("Advanced")
+            .id_salt("create-archive-advanced")
+            .default_open(state.preset.is_advanced())
+            .show(ui, |ui| {
+                for p in Preset::for_format(format)
+                    .iter()
+                    .copied()
+                    .filter(|p| p.is_advanced())
+                {
+                    ui.radio_value(&mut state.preset, p, p.label_for(format));
+                }
+                if format == ArchiveFormat::SevenZip {
+                    let info = Preset::Ultra.sevenzip();
+                    ui.label(
+                        RichText::new(format!(
+                            "Ultra needs about {} MB of memory per compressing thread and {} MB \
+                             on every computer that opens it.",
+                            info.compress_memory >> 20,
+                            info.decompress_memory >> 20
+                        ))
+                        .small()
+                        .color(warn),
+                    );
+                }
+                let shown = if state.preset.is_advanced() {
+                    state.preset
+                } else if tar_or_single {
+                    Preset::Ultra
+                } else {
+                    Preset::Zstd
+                };
+                ui.label(
+                    RichText::new(shown.compatibility_for(format))
+                        .small()
+                        .color(warn),
+                );
+            });
+    }
+    if !tar_or_single {
+        ui.checkbox(
+            &mut state.auto_store,
+            "Store already-compressed files (jpg, mp4, zip…)",
+        )
+        .on_hover_text("Faster, and barely larger: these formats do not compress further");
+    }
     if format == ArchiveFormat::SevenZip {
         ui.horizontal(|ui| {
             ui.checkbox(&mut state.solid, "Solid archive")
@@ -2312,6 +2424,19 @@ fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
                     });
             });
         });
+    }
+    if !format.can_encrypt() {
+        let what = if matches!(format, ArchiveFormat::Tar(_)) {
+            "Tar archives have no password"
+        } else {
+            "Compressed files have no password"
+        };
+        ui.label(
+            RichText::new(format!("{what}; choose ZIP or 7z to encrypt."))
+                .small()
+                .weak(),
+        );
+        return;
     }
     egui::CollapsingHeader::new("Password")
         .id_salt("create-archive-password")
@@ -2463,23 +2588,20 @@ fn unique_path(requested: &Path) -> PathBuf {
     if fs::symlink_metadata(requested).is_err() {
         return requested.to_path_buf();
     }
-    let stem = requested.file_stem().unwrap_or_default().to_string_lossy();
-    let extension = requested
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
+    let name = requested.file_name().unwrap_or_default().to_string_lossy();
+    let (stem, extension) = split_file_name(&name);
     for number in 2..100_000usize {
-        let filename = if extension.is_empty() {
-            format!("{stem} ({number})")
-        } else {
-            format!("{stem} ({number}).{extension}")
-        };
+        let filename = join_file_name(stem, extension, &format!(" ({number})"));
         let candidate = requested.with_file_name(filename);
         if fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
     }
-    requested.with_file_name(format!("{}-{}.{}", stem, std::process::id(), extension))
+    requested.with_file_name(join_file_name(
+        stem,
+        extension,
+        &format!("-{}", std::process::id()),
+    ))
 }
 
 struct ArchiveStaging {
@@ -2547,17 +2669,9 @@ fn numbered_archive_path(requested: &Path, suffix: usize) -> PathBuf {
     if suffix == 1 {
         return requested.to_path_buf();
     }
-    let stem = requested.file_stem().unwrap_or_default().to_string_lossy();
-    let extension = requested
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    let filename = if extension.is_empty() {
-        format!("{stem} ({suffix})")
-    } else {
-        format!("{stem} ({suffix}).{extension}")
-    };
-    requested.with_file_name(filename)
+    let name = requested.file_name().unwrap_or_default().to_string_lossy();
+    let (stem, extension) = split_file_name(&name);
+    requested.with_file_name(join_file_name(stem, extension, &format!(" ({suffix})")))
 }
 
 fn render_split(state: &mut SplitWindow, ctx: &egui::Context, actions: &mut Vec<UiAction>) {
@@ -2872,6 +2986,132 @@ mod tests {
         state.name = "no extension".into();
         switch_format(&mut state, ArchiveFormat::SevenZip);
         assert_eq!(state.name, "no extension");
+    }
+
+    #[test]
+    fn tar_and_single_file_names_round_trip_between_formats() {
+        assert_eq!(strip_archive_extension("a.tar.gz"), Some("a"));
+        assert_eq!(strip_archive_extension("a.TAR.GZ"), Some("a"));
+        assert_eq!(strip_archive_extension("a.gz"), Some("a"));
+        assert_eq!(strip_archive_extension("a.tar"), Some("a"));
+        assert_eq!(strip_archive_extension("a.tgz"), None);
+
+        let tar_gz = ArchiveFormat::Tar(Codec::Gzip);
+        let mut state = CreateArchiveWindow::new(vec![], PathBuf::new(), "photos.zip".into());
+        switch_format(&mut state, tar_gz);
+        assert_eq!(state.name, "photos.tar.gz");
+        switch_format(&mut state, ArchiveFormat::Zip);
+        assert_eq!(state.name, "photos.zip");
+        switch_format(&mut state, tar_gz);
+        switch_format(&mut state, ArchiveFormat::Tar(Codec::None));
+        assert_eq!(state.name, "photos.tar");
+        switch_format(&mut state, ArchiveFormat::Compressed(Codec::Gzip));
+        assert_eq!(state.name, "photos.gz");
+        state.name = "PHOTOS.TAR.GZ".into();
+        switch_format(&mut state, ArchiveFormat::SevenZip);
+        assert_eq!(state.name, "PHOTOS.7z");
+    }
+
+    #[test]
+    fn archive_filename_handles_compound_extensions() {
+        let tar_gz = ArchiveFormat::Tar(Codec::Gzip);
+        assert_eq!(archive_filename("x", tar_gz), "x.tar.gz");
+        assert_eq!(archive_filename("x.TAR.GZ", tar_gz), "x.TAR.GZ");
+        assert_eq!(
+            archive_filename("x", ArchiveFormat::Tar(Codec::None)),
+            "x.tar"
+        );
+        assert_eq!(
+            archive_filename("x", ArchiveFormat::Compressed(Codec::Gzip)),
+            "x.gz"
+        );
+        assert_eq!(create_button_label(tar_gz), "Create tar.gz");
+        assert_eq!(
+            create_button_label(ArchiveFormat::Compressed(Codec::Xz)),
+            "Create .xz"
+        );
+    }
+
+    #[test]
+    fn numbered_names_keep_the_compound_extension() {
+        assert_eq!(split_file_name("photos.tar.gz"), ("photos", "tar.gz"));
+        assert_eq!(split_file_name("photos.zip"), ("photos", "zip"));
+        assert_eq!(split_file_name("notes"), ("notes", ""));
+        assert_eq!(split_file_name(".hidden"), (".hidden", ""));
+        assert_eq!(
+            numbered_archive_path(Path::new("dir/photos.tar.gz"), 2),
+            Path::new("dir/photos (2).tar.gz")
+        );
+        assert_eq!(
+            numbered_archive_path(Path::new("dir/photos.zip"), 3),
+            Path::new("dir/photos (3).zip")
+        );
+        assert_eq!(
+            numbered_archive_path(Path::new("dir/notes"), 2),
+            Path::new("dir/notes (2)")
+        );
+    }
+
+    #[test]
+    fn unique_path_keeps_the_compound_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "zxraw-create-name-test-{}-{}",
+            std::process::id(),
+            OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("photos.tar.gz");
+        assert_eq!(unique_path(&first), first);
+        fs::write(&first, b"x").unwrap();
+        assert_eq!(unique_path(&first), dir.join("photos (2).tar.gz"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn switching_to_a_tar_format_falls_back_to_balanced() {
+        let mut state = CreateArchiveWindow::new(vec![], PathBuf::new(), "a.tar.xz".into());
+        state.format = ArchiveFormat::Tar(Codec::Xz);
+        state.preset = Preset::Ultra;
+        switch_format(&mut state, ArchiveFormat::Tar(Codec::Gzip));
+        assert_eq!(state.preset, Preset::Balanced);
+        state.preset = Preset::Max;
+        switch_format(&mut state, ArchiveFormat::Tar(Codec::Bzip2));
+        assert_eq!(state.preset, Preset::Balanced);
+        switch_format(&mut state, ArchiveFormat::Tar(Codec::None));
+        assert_eq!(state.preset, Preset::Balanced);
+        state.preset = Preset::Ultra;
+        switch_format(&mut state, ArchiveFormat::Tar(Codec::None));
+        assert_eq!(state.preset, Preset::Ultra);
+    }
+
+    #[test]
+    fn tar_formats_never_get_a_password() {
+        let o = create_options(
+            ArchiveFormat::Tar(Codec::Gzip),
+            Preset::Balanced,
+            true,
+            true,
+            None,
+            true,
+            "pw",
+            "pW",
+            true,
+        )
+        .unwrap();
+        assert!(o.encryption.is_none());
+        let o = create_options(
+            ArchiveFormat::Compressed(Codec::Xz),
+            Preset::Balanced,
+            true,
+            true,
+            None,
+            true,
+            "pw",
+            "pw",
+            false,
+        )
+        .unwrap();
+        assert!(o.encryption.is_none());
     }
 
     #[test]

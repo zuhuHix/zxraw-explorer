@@ -1116,7 +1116,13 @@ impl ZxrawApp {
             match &p.load {
                 LoadState::Loading { since } if since.elapsed() > Duration::from_millis(200) => {
                     ui.spinner();
-                    ui.label(RichText::new("Loading…").color(theme::muted(ui)));
+                    // A compressed tar is decoded to its end to list it: say how far.
+                    let text = match crate::archive_ui::listing_progress(&p.path) {
+                        Some(done) => format!("Reading the archive… {:.0}%", done * 100.0),
+                        None => "Loading…".to_owned(),
+                    };
+                    ui.label(RichText::new(text).color(theme::muted(ui)));
+                    ui.ctx().request_repaint_after(Duration::from_millis(250));
                 }
                 LoadState::Ready { errors } if *errors > 0 => {
                     ui.label(

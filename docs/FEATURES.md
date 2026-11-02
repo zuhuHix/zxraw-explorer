@@ -612,7 +612,23 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   passwords, and the input → output progress line — unit tests only; the dialog is not automated.
 * 🟡 Archive, split/join, and contact-sheet UI workflows — `forge-app/src/extra_tools_ui.rs`.
   The engine is tested; the dialogs and progress display are not automated.
-* ⬜ 7z and RAR archives — not implemented.
+* ✅ Tar and single compressed files (engine) — `forge-core/src/archive/tests_tar.rs`: round trip
+  of every codec (none, gzip, bzip2, xz, Zstandard, LZ4, Brotli) × every preset, checked by the
+  `tar` crate and by Windows' `tar.exe` when present; fixtures made by GNU tar 1.35, bsdtar 3.8
+  and Python (`fixtures/tar-*`, `make-tar-fixtures.sh`): GNU long names, PAX, ustar, V7, CP437
+  names, hard and symbolic links, devices, FIFOs, a duplicate name, gzip with two members;
+  single compressed files of every codec (gzip names, declared xz and Zstandard sizes); the
+  stream checksum holding files back; editing (kept members byte for byte, add, replace,
+  delete, a damaged original left untouched); cancel leaving nothing; listing progress and
+  cancel. `tests_tar_hostile.rs`: `..`, absolute and drive names, a PAX path that escapes, links
+  to outside and files "through" a link name, last-wins duplicates, oversized PAX and long-name
+  headers, endless extension headers, bad octal, base-256 and negative sizes, sparse files (GNU
+  old, PAX 0.1 and 1.0) and sparse-map bombs, truncation, compression bombs, hostile gzip names.
+  Codec and parser units in `codec.rs`, `tar_read.rs`, `tar_write.rs`.
+* ✅ Tar in the app: double-clicking a `.tar.zst` browses the tar inside and copies out;
+  *Extract to `<name>\`* on a `.tar.zst` and *Extract here* on a single `.gz` — e2e
+  `tools::tar_zst_*`; compress-dialog formats in `forge-app/src/extra_tools_ui.rs` tests.
+* ⬜ RAR archives — not implemented (phase 4).
 
 ## Status bar
 

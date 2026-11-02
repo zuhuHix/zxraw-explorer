@@ -85,10 +85,49 @@ pub enum ArchiveListing {
 /// Lists `path` when it points into an archive; `None` for ordinary paths. Touches the disk
 /// only for path components with an archive extension (see `split_archive_path`), so call
 /// it off the UI thread.
+#[cfg(test)]
 pub fn list_archive_path(path: &Path) -> Option<ArchiveListing> {
+    list_archive_path_cancellable(path, &forge_jobs::CancelToken::new())
+}
+
+type Scans = parking_lot::Mutex<Vec<(PathBuf, Arc<forge_jobs::Progress>)>>;
+
+/// Archives whose listing is being built (a compressed tar is decoded to its end), with
+/// their progress, for the status bar.
+fn scans() -> &'static Scans {
+    static SCANS: std::sync::OnceLock<Scans> = std::sync::OnceLock::new();
+    SCANS.get_or_init(Default::default)
+}
+
+/// While the listing of the archive `path` is in is being built: the share of the archive
+/// read so far (0.0-1.0).
+pub fn listing_progress(path: &Path) -> Option<f32> {
+    let scans = scans().lock();
+    let (_, p) = scans.iter().find(|(a, _)| path.starts_with(a))?;
+    let s = p.snapshot();
+    Some(if s.bytes_total == 0 {
+        0.0
+    } else {
+        (s.bytes_done as f64 / s.bytes_total as f64).clamp(0.0, 1.0) as f32
+    })
+}
+
+/// [`list_archive_path`], stopping when `cancel` is (the pane went elsewhere) and showing
+/// its progress meanwhile (see [`listing_progress`]).
+pub fn list_archive_path_cancellable(
+    path: &Path,
+    cancel: &forge_jobs::CancelToken,
+) -> Option<ArchiveListing> {
     let (file, inner) = archive::split_archive_path(path)?;
     let password = session_password(&file);
-    let index = match archive::index_cached_with(&file, password.as_ref()) {
+    let progress = Arc::new(forge_jobs::Progress::default());
+    scans().lock().push((file.clone(), progress.clone()));
+    let listed = {
+        let ctx = JobCtx::new(cancel, &progress);
+        archive::index_cached_progress(&file, password.as_ref(), Some(&ctx))
+    };
+    scans().lock().retain(|(_, p)| !Arc::ptr_eq(p, &progress));
+    let index = match listed {
         Ok(index) => index,
         Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
             let wrong = matches!(e, CoreError::WrongPassword(_));
@@ -477,12 +516,20 @@ pub fn info_grid(ui: &mut egui::Ui, e: &FileEntry, view: &ArchiveView) {
             let size = forge_core::model::format_size(e.size);
             row(ui, "Size", format!("{size} ({} bytes)", e.size));
             if let Some(n) = node {
+                // A compressed tar is one stream: like a solid 7z block, only its ratio is
+                // known.
+                let tar = matches!(view.index.listing.format, archive::ArchiveFormat::Tar(_));
                 if n.solid {
                     // Its bytes are mixed with others in one compressed stream: only the
                     // block's ratio is known.
-                    row(ui, "Compressed", "— (in a solid block)".into());
+                    let (place, its) = if tar {
+                        ("— (the archive is one compressed stream)", "the archive's")
+                    } else {
+                        ("— (in a solid block)", "its block")
+                    };
+                    row(ui, "Compressed", place.into());
                     if let Some(ratio) = n.ratio_percent() {
-                        row(ui, "Ratio", format!("{ratio}% (its block)"));
+                        row(ui, "Ratio", format!("{ratio}% ({its})"));
                     }
                 } else {
                     row(
@@ -781,7 +828,8 @@ pub fn open_entry(app: &mut ZxrawApp, e: &FileEntry, how: OpenHow) {
         name: node.name.clone(),
         how,
         from: pane.path.clone(),
-        decode_before: node.block_offset,
+        // Its block up to it, or (a compressed tar) the whole stream, checked at its end.
+        decode_before: node.decode_cost().saturating_sub(node.size),
     };
     start_open(app, request);
 }
@@ -791,7 +839,7 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
     let archive_name = forge_core::paths::name_of(&request.archive);
     let title = match request.decode_before {
         n if n > OPEN_NOTE_DECODE => format!(
-            "Opening {} from {archive_name} (decoding {} MB of its solid block first)",
+            "Opening {} from {archive_name} (decoding {} MB of the archive to check it)",
             request.name,
             n >> 20
         ),
@@ -1226,6 +1274,7 @@ mod tests {
             entry: Some(0),
             solid: false,
             block_offset: 0,
+            block_end: 0,
         };
         let archive = Path::new(r"C:\x\a.zip");
         let check = |n: ArchiveNode, known| wants_temp_copy(&file_entry(archive, &n), &n, known);
