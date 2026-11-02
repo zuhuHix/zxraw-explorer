@@ -652,15 +652,26 @@ pub fn start_test(app: &mut ZxrawApp, request: TestRequest) {
 pub fn test_summary(report: &TestReport) -> String {
     let total = report.entries.len();
     let failed = report.failures().count();
+    let unverified = report.unverified().count();
     if report.cancelled {
         format!("Cancelled after {total} file(s)")
-    } else if failed == 0 {
+    } else if failed == 0 && unverified == 0 {
         format!(
             "OK: {total} file(s) ({}) verified",
             format_size(report.bytes)
         )
-    } else {
+    } else if failed == 0 {
+        format!(
+            "No errors, but {unverified} of {total} file(s) {}",
+            archive::CANT_VERIFY
+        )
+    } else if unverified == 0 {
         format!("{failed} of {total} file(s) failed")
+    } else {
+        format!(
+            "{failed} of {total} file(s) failed; {unverified} {}",
+            archive::CANT_VERIFY
+        )
     }
 }
 
@@ -850,12 +861,26 @@ fn test_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                                 );
                             }
                             Ok(report) => {
-                                let color = if report.cancelled {
-                                    ui.visuals().warn_fg_color
-                                } else {
-                                    ui.visuals().error_fg_color
-                                };
+                                let color =
+                                    if report.cancelled || report.failures().next().is_none() {
+                                        ui.visuals().warn_fg_color
+                                    } else {
+                                        ui.visuals().error_fg_color
+                                    };
                                 ui.label(RichText::new(test_summary(report)).color(color));
+                                for f in report.unverified().take(500) {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(format!(
+                                                "{}: {}",
+                                                f.name,
+                                                archive::CANT_VERIFY
+                                            ))
+                                            .small(),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
                                 for f in report.failures().take(500) {
                                     let why = f.error.as_deref().unwrap_or_default();
                                     ui.add(
@@ -1036,6 +1061,12 @@ mod tests {
             unverified: false,
         });
         assert_eq!(test_summary(&test), "1 of 2 file(s) failed");
+        test.entries[1].error = None;
+        test.entries[1].unverified = true;
+        assert_eq!(
+            test_summary(&test),
+            "No errors, but 1 of 2 file(s) can't be verified (no checksum)"
+        );
     }
 
     #[test]
