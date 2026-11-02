@@ -36,6 +36,23 @@ use crate::paths;
 
 /// Memory all LZMA2 threads of one block may use together.
 const MT_MEMORY_BUDGET: u64 = 1536 << 20;
+#[cfg(test)]
+thread_local! {
+    /// Tests: the free space the spill check sees.
+    pub(super) static FAKE_FREE_SPACE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn free_space(dir: &Path) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(free) = FAKE_FREE_SPACE.with(|f| f.get()) {
+        return Ok(free);
+    }
+    crate::split::free_space_available(dir).map_err(|e| CoreError::io(dir, e))
+}
+
+/// Free space wanted beyond the spilled files when recompressing (the new archive grows).
+const SPILL_SLACK: u64 = 64 << 20;
 /// 7-Zip's AES key derivation work factor (2^19 SHA-256 rounds).
 const AES_CYCLES_POWER: u8 = 19;
 
@@ -545,6 +562,7 @@ fn spill_block(
     keep: &dyn Fn(usize) -> bool,
     spill: &mut BufWriter<File>,
     pos: &mut u64,
+    budget: &mut u64,
     encrypted: bool,
     ctx: &JobCtx<'_>,
 ) -> Result<Vec<Spilled>> {
@@ -574,6 +592,16 @@ fn spill_block(
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(sz::Error::from(e)),
             };
+            match budget.checked_sub(n as u64) {
+                Some(left) => *budget = left,
+                None => {
+                    failed = Some(CoreError::UnsafePath(format!(
+                        "{}: a block decodes to more than it declares",
+                        paths::display_path(archive)
+                    )));
+                    return Err(sz::Error::Other("over the limit".into()));
+                }
+            }
             if wanted {
                 if let Err(e) = spill.write_all(&buf[..n]) {
                     failed = Some(CoreError::io(archive, e));
@@ -697,6 +725,41 @@ pub(super) fn update(
     {
         return Err(CoreError::PasswordRequired(paths::display_path(archive)));
     }
+    // The blocks to recompress are decoded: the extraction limits apply, and their kept
+    // files must fit next to the archive, all before anything is written.
+    let limits = &opts.limits;
+    for (b, _) in touched.iter().enumerate().filter(|(_, t)| **t) {
+        sevenz_backend::check_block_memory(archive, &o.archive, b, limits)?;
+    }
+    if recompress > limits.max_total_bytes {
+        return Err(CoreError::UnsafePath(format!(
+            "{}: the blocks to recompress expand to more than {} bytes",
+            paths::display_path(archive),
+            limits.max_total_bytes
+        )));
+    }
+    let spill_need = o
+        .archive
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.has_stream && !removed[*i] && block_of(*i).is_some_and(|b| touched[b]))
+        .fold(0u64, |a, (_, f)| a.saturating_add(f.size));
+    if spill_need > 0 {
+        let dir = parent_dir(archive);
+        let free = free_space(dir)?;
+        // Room for the spilled files and some slack for the new archive's first blocks.
+        if free < spill_need.saturating_add(SPILL_SLACK) {
+            return Err(CoreError::Invalid(format!(
+                "not enough free space next to {} to recompress it: {} MB needed, {} MB free",
+                paths::display_path(archive),
+                spill_need.saturating_add(SPILL_SLACK) >> 20,
+                free >> 20
+            )));
+        }
+    }
+    // Never decode more than the touched blocks declare (nor than the limit).
+    let mut decode_budget = recompress.min(limits.max_total_bytes);
     let methods = Methods::new(opts, password);
 
     let (mut w, tmp, mut guard) = start(archive, ctx)?;
@@ -763,7 +826,17 @@ pub(super) fn update(
         sp.seek(SeekFrom::Start(0))
             .map_err(|e| CoreError::io(&spill_path, e))?;
         let mut pos = 0u64;
-        let kept = spill_block(archive, &mut o, b, &keep, sp, &mut pos, info.encrypted, ctx)?;
+        let kept = spill_block(
+            archive,
+            &mut o,
+            b,
+            &keep,
+            sp,
+            &mut pos,
+            &mut decode_budget,
+            info.encrypted,
+            ctx,
+        )?;
         sp.flush().map_err(|e| CoreError::io(&spill_path, e))?;
         let bytes = kept.iter().fold(0u64, |a, k| a.saturating_add(k.len));
         let mut chain = methods.chain(Kind::Lzma, bytes);

@@ -903,3 +903,171 @@ fn a_zip_behind_a_stub_is_found_by_its_end_record() {
     fs::write(&sfx, &bytes).unwrap();
     assert_eq!(backend_for_file(&sfx).unwrap().format(), ArchiveFormat::Zip);
 }
+
+// ---------------------------------------------------------------------------
+// Review round 2 (#44): unchecked encrypted files, bounded edits, guard caps
+// ---------------------------------------------------------------------------
+
+/// A plain header: one folder with `id`/`props` holding two files of `sizes` (no CRCs).
+fn two_file_header(pack: u64, id: &[u8], props: &[u8], sizes: [u64; 2]) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04];
+    h.extend(one_folder(pack, id, props, sizes[0] + sizes[1]));
+    h.extend([0x08, 0x0D, 0x02, 0x09]);
+    h.extend(num(sizes[0]));
+    h.push(0x00);
+    h.push(0x00); // end of streams info
+    h.push(0x05);
+    h.extend(num(2));
+    let names: Vec<u8> = "a.txt\0b.txt\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    h.push(0x11);
+    h.extend(num(names.len() as u64 + 1));
+    h.push(0);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    h
+}
+
+#[test]
+fn encrypted_files_without_a_checksum_need_a_proven_password() {
+    let d = tempfile::tempdir().unwrap();
+    // One AES coder, no CRC anywhere: any key "decrypts" it.
+    let p = write_raw(
+        d.path(),
+        "nocrc.7z",
+        &raw_7z(
+            &[0x42; 16],
+            &file_header(16, &[0x06, 0xF1, 0x07, 0x01], &[0x01], 16),
+        ),
+    );
+    let l = list(&p).unwrap();
+    assert!(l.entries[0].encrypted && l.entries[0].unchecked);
+    let (c, pr) = ctx_parts();
+    let ctx = JobCtx::new(&c, &pr);
+    let x = d.path().join("x");
+    fs::create_dir_all(&x).unwrap();
+    let mut opts = ExtractOptions {
+        password: Some(Password::new("wrong")),
+        ..Default::default()
+    };
+    let r = extract(&p, &x, &opts, None, &ctx).unwrap();
+    assert!(r.extracted.is_empty(), "{r:?}");
+    assert_eq!(r.unchecked, ["f.txt"]);
+    assert_eq!(r.skipped.len(), 1);
+    assert_eq!(r.skipped[0].reason, UNCHECKED_REASON);
+    assert!(!x.join("f.txt").exists(), "not published");
+    // Asked for explicitly, it is extracted.
+    opts.allow_unchecked_encrypted = true;
+    let r = extract(&p, &x, &opts, None, &ctx).unwrap();
+    assert_eq!(r.extracted.len(), 1, "{r:?}");
+    assert!(r.unchecked.is_empty());
+    assert_eq!(fs::read(x.join("f.txt")).unwrap().len(), 16);
+    // A proven password (files with CRCs) extracts everything without the option.
+    let src = sample_tree(d.path());
+    let out = d.path().join("proven.7z");
+    create(
+        std::slice::from_ref(&src),
+        &out,
+        &opts_7z(Preset::Fast, true, Some("pw"), false),
+        &ctx,
+    )
+    .unwrap();
+    assert!(list(&out).unwrap().entries.iter().all(|e| !e.unchecked));
+    let r = extract_all(&out, &d.path().join("y"), Some("pw"));
+    assert!(
+        r.skipped.is_empty() && r.unchecked.is_empty() && r.failed.is_empty(),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn guard_caps_declared_data_and_requires_one_stream_per_file() {
+    let d = tempfile::tempdir().unwrap();
+    let data = [0u8; 16];
+    // A folder declaring more than 1 PiB.
+    let p = write_raw(
+        d.path(),
+        "pib.7z",
+        &raw_7z(&data, &file_header(16, &[0x00], &[], 1 << 51)),
+    );
+    assert_refused(&p, "TiB");
+    // Three sub-streams for one file with data.
+    let mut h = vec![0x01, 0x04];
+    h.extend(one_folder(16, &[0x00], &[], 16));
+    h.extend([0x08, 0x0D, 0x03, 0x09, 0x01, 0x01, 0x00, 0x00]);
+    h.push(0x05);
+    h.extend(num(1));
+    let name: Vec<u8> = "f.txt\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    h.push(0x11);
+    h.extend(num(name.len() as u64 + 1));
+    h.push(0);
+    h.extend(name);
+    h.extend([0x00, 0x00]);
+    let p = write_raw(d.path(), "subs.7z", &raw_7z(&data, &h));
+    assert_refused(&p, "doesn't match the streams");
+}
+
+#[test]
+fn edits_hold_recompressed_blocks_to_the_limits_and_leave_the_original() {
+    let d = tempfile::tempdir().unwrap();
+    let (c, pr) = ctx_parts();
+    let ctx = JobCtx::new(&c, &pr);
+    let delete_a = ArchiveEdit {
+        add: vec![],
+        delete: vec!["a.txt".into()],
+    };
+    // A touched block whose decoder would need a 4 GiB dictionary.
+    let p = write_raw(
+        d.path(),
+        "dict.7z",
+        &raw_7z(&[0u8; 16], &two_file_header(16, &[0x21], &[40], [10, 10])),
+    );
+    let before = fs::read(&p).unwrap();
+    let e = update(&p, &delete_a, &CreateOptions::default(), &ctx).unwrap_err();
+    assert!(e.to_string().contains("decoder memory"), "{e}");
+    assert_eq!(fs::read(&p).unwrap(), before);
+    // Touched blocks over the size limit.
+    let src = d.path().join("s");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), "aaaa".repeat(5000)).unwrap();
+    fs::write(src.join("b.txt"), "bbbb".repeat(5000)).unwrap();
+    let out = d.path().join("solid.7z");
+    create(
+        &[src.join("a.txt"), src.join("b.txt")],
+        &out,
+        &CreateOptions::default(),
+        &ctx,
+    )
+    .unwrap();
+    let before = fs::read(&out).unwrap();
+    let mut small = CreateOptions::default();
+    small.limits.max_total_bytes = 1000;
+    let e = update(&out, &delete_a, &small, &ctx).unwrap_err();
+    assert!(e.to_string().contains("expand to more than"), "{e}");
+    assert_eq!(fs::read(&out).unwrap(), before);
+    // Not enough free space for the spill.
+    sevenz_writer::FAKE_FREE_SPACE.with(|f| f.set(Some(1024)));
+    let e = update(&out, &delete_a, &CreateOptions::default(), &ctx).unwrap_err();
+    sevenz_writer::FAKE_FREE_SPACE.with(|f| f.set(None));
+    assert!(e.to_string().contains("not enough free space"), "{e}");
+    assert_eq!(fs::read(&out).unwrap(), before);
+    let leftovers = fs::read_dir(d.path())
+        .unwrap()
+        .filter(|e| ops::is_partial_name(&e.as_ref().unwrap().file_name().to_string_lossy()))
+        .count();
+    assert_eq!(leftovers, 0);
+    // Within the limits it works.
+    update(&out, &delete_a, &CreateOptions::default(), &ctx).unwrap();
+    let names: Vec<String> = list(&out)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["b.txt"]);
+}

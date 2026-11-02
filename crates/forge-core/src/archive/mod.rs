@@ -168,6 +168,11 @@ pub struct ArchiveEntry {
     /// discards first (0 unless `solid`).
     #[serde(default)]
     pub block_offset: u64,
+    /// Its data has no checksum (no CRC of its own or of its block): decoding it with a wrong
+    /// password can't be noticed. Such encrypted entries are held back unless the password
+    /// is proven (see [`ExtractOptions::allow_unchecked_encrypted`]).
+    #[serde(default)]
+    pub unchecked: bool,
 }
 
 impl ArchiveEntry {
@@ -236,20 +241,23 @@ pub trait ArchiveBackend: Sync {
     ) -> Result<()>;
     /// Check `password` against the encrypted entries among `entries` before anything is
     /// extracted: [`CoreError::PasswordRequired`] / [`CoreError::WrongPassword`] when it can't
-    /// open them. The default opens the cheapest one to read.
+    /// open them, else whether a checksum proved it. The default opens the cheapest one to
+    /// read (ZIP's encryption checks the password itself).
     fn check_password(
         &self,
         archive: &Path,
         entries: &[&ArchiveEntry],
         password: Option<&Password>,
-    ) -> Result<()> {
+    ) -> Result<PasswordProof> {
         match entries
             .iter()
             .filter(|e| e.encrypted && !e.is_dir)
             .min_by_key(|e| e.block_offset)
         {
-            Some(first) => open_one(self, archive, first.index, password),
-            None => Ok(()),
+            Some(first) => {
+                open_one(self, archive, first.index, password).map(|()| PasswordProof::Proven)
+            }
+            None => Ok(PasswordProof::Proven),
         }
     }
     fn can_write(&self) -> bool {
@@ -276,6 +284,21 @@ pub trait ArchiveBackend: Sync {
         Err(read_only(archive, self.format()))
     }
 }
+
+/// How sure [`ArchiveBackend::check_password`] is of a password it didn't refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordProof {
+    /// Checked (or nothing needs it).
+    Proven,
+    /// Nothing refused it, but no checksum confirmed it either (7z AES). Entries with a
+    /// checksum are still verified as they are read; entries without one are held back.
+    Unverified,
+}
+
+/// Why an encrypted entry without a checksum was not extracted (see
+/// [`ExtractOptions::allow_unchecked_encrypted`]).
+pub const UNCHECKED_REASON: &str =
+    "the password can't be confirmed for this file (the archive stores no checksum)";
 
 fn read_only(path: &Path, format: ArchiveFormat) -> CoreError {
     CoreError::Invalid(format!(
@@ -466,6 +489,11 @@ pub struct ExtractOptions {
     /// Copy the archive's Mark-of-the-Web to the extracted files.
     #[serde(default = "yes")]
     pub mark_of_the_web: bool,
+    /// Extract encrypted entries that have no checksum even when the password is not proven
+    /// (a wrong one would write garbage unnoticed). Off: they are skipped with
+    /// [`UNCHECKED_REASON`] and listed in [`ExtractReport::unchecked`].
+    #[serde(default)]
+    pub allow_unchecked_encrypted: bool,
 }
 
 impl Default for ExtractOptions {
@@ -475,6 +503,7 @@ impl Default for ExtractOptions {
             policy: ConflictPolicy::default(),
             password: None,
             mark_of_the_web: true,
+            allow_unchecked_encrypted: false,
         }
     }
 }
@@ -530,6 +559,9 @@ pub struct ExtractReport {
     pub failed: Vec<OpIssue>,
     pub bytes: u64,
     pub cancelled: bool,
+    /// Names of encrypted entries without a checksum skipped because the password was not
+    /// proven (also in `skipped`): extract them with `allow_unchecked_encrypted` if wanted.
+    pub unchecked: Vec<String>,
 }
 
 struct Planned {
@@ -677,7 +709,19 @@ pub fn extract(
     // preflight reads encrypted headers only when the password passes their check.
     backend.preflight(archive, &indices, password, limits)?;
     let planned_entries: Vec<&ArchiveEntry> = planned.iter().map(|p| &p.entry).collect();
-    backend.check_password(archive, &planned_entries, password)?;
+    let proof = backend.check_password(archive, &planned_entries, password)?;
+    if proof == PasswordProof::Unverified && !opts.allow_unchecked_encrypted {
+        // With a password nothing confirmed, a file nothing checks could be garbage.
+        planned.retain(|p| {
+            if !(p.entry.encrypted && p.entry.unchecked && !p.entry.is_dir) {
+                return true;
+            }
+            report.skipped.push(OpIssue::new(&p.rel, UNCHECKED_REASON));
+            report.unchecked.push(p.entry.name.clone());
+            selected_total = selected_total.saturating_sub(p.entry.size);
+            false
+        });
+    }
     // The destination, resolved and pinned from the volume root for the whole job; entries
     // are written beneath its final path and reported beneath `dest_dir`.
     let base = safety::PinnedBase::open(dest_dir)?;
@@ -1056,6 +1100,8 @@ pub fn test_archive(
     let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
     backend.preflight(archive, &indices, password, limits)?;
+    // Testing writes nothing: every file is decoded, and one without a checksum is reported
+    // as such below only if decoding fails.
     backend.check_password(archive, &files, password)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
@@ -1199,6 +1245,8 @@ pub fn extract_entry_to_temp(
         policy: ConflictPolicy::Overwrite,
         password: password.cloned(),
         mark_of_the_web: true,
+        // Opened files are never garbage from an unproven password.
+        allow_unchecked_encrypted: false,
     };
     let sel = Selection::new(base, vec![node.path.clone()]);
     let report = extract(archive, &dir, &opts, Some(&sel), ctx)?;

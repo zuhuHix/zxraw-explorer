@@ -577,7 +577,7 @@ fn ensure_free_space(
 }
 
 #[cfg(windows)]
-fn free_space_available(path: &Path) -> io::Result<u64> {
+pub(crate) fn free_space_available(path: &Path) -> io::Result<u64> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     use windows::core::PCWSTR;
@@ -595,7 +595,7 @@ fn free_space_available(path: &Path) -> io::Result<u64> {
 }
 
 #[cfg(not(windows))]
-fn free_space_available(_path: &Path) -> io::Result<u64> {
+pub(crate) fn free_space_available(_path: &Path) -> io::Result<u64> {
     // The production target is Windows; keep other targets buildable where the standard
     // library does not expose a portable free-space query.
     Ok(u64::MAX)
