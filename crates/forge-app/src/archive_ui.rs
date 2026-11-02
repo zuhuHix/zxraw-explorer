@@ -1028,6 +1028,8 @@ mod tests {
             encrypted,
             method: String::new(),
             entry: Some(0),
+            solid: false,
+            block_offset: 0,
         };
         let archive = Path::new(r"C:\x\a.zip");
         let check = |n: ArchiveNode, known| wants_temp_copy(&file_entry(archive, &n), &n, known);
