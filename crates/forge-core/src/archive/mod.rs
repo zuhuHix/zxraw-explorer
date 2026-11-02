@@ -1,7 +1,8 @@
 //! Archives: browsing, safe extraction, integrity tests, creation and editing.
 //!
-//! Formats plug in through [`ArchiveBackend`]: ZIP (see `zip_backend`) and 7z (see
-//! `sevenz_backend`).
+//! Formats plug in through [`ArchiveBackend`]: ZIP (see `zip_backend`), 7z (see
+//! `sevenz_backend`), tar plain or compressed and single compressed files (see
+//! `tar_backend`).
 //! Everything format-independent lives here, so a new format only has to list entries and
 //! stream their data:
 //!
@@ -21,6 +22,7 @@
 //!   [`CoreError::PasswordRequired`] / [`CoreError::WrongPassword`], apart from corruption.
 //!   Passwords are never logged (their `Debug` is redacted) and are wiped when dropped.
 
+mod codec;
 mod cp437;
 mod crypto_peek;
 mod motw;
@@ -29,6 +31,9 @@ mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
 mod sevenz_writer;
+mod tar_backend;
+mod tar_read;
+mod tar_write;
 mod tree;
 mod zip_backend;
 mod zip_merge;
@@ -47,6 +52,10 @@ mod tests_sevenz;
 mod tests_sevenz_fixtures;
 #[cfg(test)]
 mod tests_sevenz_hostile;
+#[cfg(test)]
+mod tests_tar;
+#[cfg(test)]
+mod tests_tar_hostile;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -62,6 +71,7 @@ use crate::error::{CoreError, Result};
 use crate::ops::{self, ConflictPolicy, JobCtx, NodeKind, OpIssue, StreamOptions, node_kind};
 use crate::paths;
 
+pub use codec::{Codec, StreamLevel};
 pub use presets::{
     CreateOptions, Encryption, Method, Preset, SevenZipPresetInfo, ZOPFLI_MAX_FILE,
     is_precompressed,
@@ -79,6 +89,10 @@ const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 100_000;
 pub enum ArchiveFormat {
     Zip,
     SevenZip,
+    /// A tar, plain (`Codec::None`) or in a compression stream (`.tar.gz`...).
+    Tar(Codec),
+    /// One compressed file (`.gz`, `.xz`...), shown as an archive of one file.
+    Compressed(Codec),
 }
 
 impl ArchiveFormat {
@@ -86,6 +100,16 @@ impl ArchiveFormat {
         match self {
             ArchiveFormat::Zip => "ZIP",
             ArchiveFormat::SevenZip => "7z",
+            ArchiveFormat::Tar(c) => match c {
+                Codec::None => "tar",
+                Codec::Gzip => "tar.gz",
+                Codec::Bzip2 => "tar.bz2",
+                Codec::Xz => "tar.xz",
+                Codec::Zstd => "tar.zst",
+                Codec::Lz4 => "tar.lz4",
+                Codec::Brotli => "tar.br",
+            },
+            ArchiveFormat::Compressed(c) => c.name(),
         }
     }
 
@@ -94,7 +118,14 @@ impl ArchiveFormat {
         match self {
             ArchiveFormat::Zip => "zip",
             ArchiveFormat::SevenZip => "7z",
+            ArchiveFormat::Tar(c) => c.tar_extension(),
+            ArchiveFormat::Compressed(c) => c.extension(),
         }
+    }
+
+    /// Whether archives of this format can hold a password.
+    pub fn can_encrypt(self) -> bool {
+        matches!(self, ArchiveFormat::Zip | ArchiveFormat::SevenZip)
     }
 }
 
@@ -181,12 +212,23 @@ pub struct ArchiveEntry {
     /// The compressed block holding its data (7z), for grouping files of one block.
     #[serde(default)]
     pub block: Option<usize>,
+    /// Decoded bytes up to the end of its block, when reading it means decoding the block to
+    /// its end (a file of a compressed tar is published only once the whole stream decoded
+    /// and its checksum matched); 0 otherwise.
+    #[serde(default)]
+    pub block_end: u64,
+    /// Why this entry is listed but never extracted (tar hard links, devices, FIFOs).
+    #[serde(default)]
+    pub skip: Option<String>,
 }
 
 impl ArchiveEntry {
-    /// Bytes decoded to read this entry: its block up to it, then its own data.
+    /// Bytes decoded to read this entry: its block up to it, then its own data (or the whole
+    /// block, see [`ArchiveEntry::block_end`]).
     pub fn decode_cost(&self) -> u64 {
-        self.block_offset.saturating_add(self.size)
+        self.block_offset
+            .saturating_add(self.size)
+            .max(self.block_end)
     }
 }
 
@@ -231,6 +273,18 @@ pub trait ArchiveBackend: Sync {
         max_entries: usize,
         password: Option<&Password>,
     ) -> Result<ArchiveListing>;
+    /// [`list`](Self::list), counting progress (bytes of the archive read) and checking for
+    /// cancel in `ctx`: listing a tar decodes the whole stream.
+    fn list_progress(
+        &self,
+        archive: &Path,
+        max_entries: usize,
+        password: Option<&Password>,
+        ctx: Option<&JobCtx<'_>>,
+    ) -> Result<ArchiveListing> {
+        let _ = ctx;
+        self.list(archive, max_entries, password)
+    }
     /// Structural checks before any data is extracted from the entries at `indices`:
     /// overlapping entries, decoder memory above `limits.max_decoder_memory` (for encrypted
     /// entries, read from their data decrypted with `password`)...
@@ -346,8 +400,16 @@ pub fn backends() -> &'static [&'static dyn ArchiveBackend] {
     BACKENDS
 }
 
-/// The backend for a file name's extension, if any (no I/O).
+/// The backend for a file name's extension, if any (no I/O). `x.tar.gz` and `x.tgz` are
+/// tar archives; `x.gz` is a single compressed file.
 pub fn backend_for_name(path: &Path) -> Option<&'static dyn ArchiveBackend> {
+    if let Some((codec, tar)) = codec::by_name(&paths::name_of(path)) {
+        return Some(if tar {
+            tar_backend::tar_backend(codec)
+        } else {
+            tar_backend::single_backend(codec)
+        });
+    }
     let ext = crate::model::ext_of(path);
     BACKENDS
         .iter()
@@ -361,11 +423,12 @@ pub fn is_archive_name(path: &Path) -> bool {
 }
 
 /// The backend for an archive file, by what it holds: its signature (a 7z renamed `.zip`
-/// is still read as 7z, and edited as 7z), then a ZIP end record near its end (a zip behind
-/// a self-extractor stub), then its extension.
+/// is still read as 7z, and edited as 7z; a compression stream is a tar when a tar header
+/// starts its decoded data, else a single compressed file), then a tar header, then a ZIP
+/// end record near its end (a zip behind a self-extractor stub), then its extension.
 pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     let mut file = fs::File::open(path).map_err(|e| CoreError::io(path, e))?;
-    let mut head = [0u8; 16];
+    let mut head = [0u8; 512];
     let mut n = 0;
     while n < head.len() {
         match file.read(&mut head[n..]) {
@@ -378,8 +441,19 @@ pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     if let Some(b) = BACKENDS.iter().copied().find(|b| b.sniff(&head[..n])) {
         return Ok(b);
     }
+    if let Some(c) = codec::sniff(&head[..n]) {
+        return Ok(tar_backend::stream_backend(path, c));
+    }
+    // Before the end record: a tar whose last file is a zip has one near its end.
+    if tar_read::looks_like_tar(&head[..n]) {
+        return Ok(tar_backend::tar_backend(Codec::None));
+    }
     if zip_backend::has_end_record(&mut file) {
         return Ok(&zip_backend::ZIP);
+    }
+    // Brotli has no signature: by name, then a tar inside or not.
+    if let Some((Codec::Brotli, _)) = codec::by_name(&paths::name_of(path)) {
+        return Ok(tar_backend::stream_backend(path, Codec::Brotli));
     }
     backend_for_name(path)
         .ok_or_else(|| CoreError::Invalid(format!("{}: not a supported archive", path.display())))
@@ -456,6 +530,16 @@ pub fn index_cached(archive: &Path) -> Result<Arc<ArchiveIndex>> {
 /// [`index_cached`] for an archive whose names may be encrypted (7z): `password` is used
 /// only when the index isn't cached yet. Errors as [`ArchiveBackend::list`].
 pub fn index_cached_with(archive: &Path, password: Option<&Password>) -> Result<Arc<ArchiveIndex>> {
+    index_cached_progress(archive, password, None)
+}
+
+/// [`index_cached_with`], counting progress and checking for cancel in `ctx` while the
+/// listing is built (a compressed tar is decoded to its end to list it).
+pub fn index_cached_progress(
+    archive: &Path,
+    password: Option<&Password>,
+    ctx: Option<&JobCtx<'_>>,
+) -> Result<Arc<ArchiveIndex>> {
     let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
     let key: CacheKey = (archive.to_path_buf(), md.len(), md.modified().ok());
     let lookup = paths::lexical_normalize(archive);
@@ -464,7 +548,13 @@ pub fn index_cached_with(archive: &Path, password: Option<&Password>) -> Result<
     {
         return Ok(idx.clone());
     }
-    let idx = Arc::new(ArchiveIndex::build(list_with_password(archive, password)?));
+    let listing = backend_for_file(archive)?.list_progress(
+        archive,
+        DEFAULT_MAX_ARCHIVE_ENTRIES,
+        password,
+        ctx,
+    )?;
+    let idx = Arc::new(ArchiveIndex::build(listing));
     cache().lock().put(lookup, (key, idx.clone()));
     Ok(idx)
 }
@@ -472,6 +562,7 @@ pub fn index_cached_with(archive: &Path, password: Option<&Password>) -> Result<
 /// Forget the cached index of an archive (after it was edited).
 pub fn invalidate_cached(archive: &Path) {
     cache().lock().pop(&paths::lexical_normalize(archive));
+    tar_backend::forget(archive);
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +778,10 @@ pub fn extract(
                 &rel,
                 "symbolic link entries are not extracted",
             ));
+            continue;
+        }
+        if let Some(reason) = &e.skip {
+            report.skipped.push(OpIssue::new(&rel, reason.clone()));
             continue;
         }
         selected_total = selected_total.saturating_add(e.size);
@@ -1167,13 +1262,16 @@ pub enum ExtractTarget {
     NamedFolder,
 }
 
-/// The archive's name without its extension(s) (`photos.tar.gz` would give `photos`).
+/// The archive's name without its extension(s) (`photos.tar.gz` gives `photos`).
 pub fn archive_stem(archive: &Path) -> String {
     let name = paths::name_of(archive);
-    let stem = match name.rsplit_once('.') {
+    let mut stem = match name.rsplit_once('.') {
         Some((s, _)) if !s.is_empty() => s.to_owned(),
         _ => name,
     };
+    if stem.len() > 4 && stem.to_lowercase().ends_with(".tar") {
+        stem.truncate(stem.len() - 4);
+    }
     paths::sanitize_file_name(&stem)
 }
 
@@ -1317,7 +1415,11 @@ pub fn test_archive(
 ) -> Result<TestReport> {
     let backend = backend_for_file(archive)?;
     let listing = backend.list(archive, limits.max_entries, password)?;
-    let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
+    let files: Vec<&ArchiveEntry> = listing
+        .entries
+        .iter()
+        .filter(|e| !e.is_dir && e.skip.is_none())
+        .collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
     backend.preflight(archive, &indices, password, limits)?;
     // Testing writes nothing: every file is decoded. Under a password no checksum proved,
@@ -1374,10 +1476,11 @@ pub fn test_archive(
         report.entries.push(EntryTest {
             name: entry.name.clone(),
             size: entry.size,
+            // No checksum at all (a plain tar, Brotli), or encrypted without one under a
+            // password nothing proved.
             unverified: error.is_none()
-                && entry.encrypted
                 && entry.unchecked
-                && proof == PasswordProof::Unverified,
+                && (!entry.encrypted || proof == PasswordProof::Unverified),
             error,
         });
         Ok(())
@@ -1389,7 +1492,7 @@ pub fn test_archive(
         }
         Ok(())
     };
-    let wanted = |e: &ArchiveEntry| !e.is_dir;
+    let wanted = |e: &ArchiveEntry| !e.is_dir && e.skip.is_none();
     let result = backend.read_entries_checked(
         archive,
         &wanted,

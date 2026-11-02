@@ -146,6 +146,8 @@ fn to_entry<R: Read>(index: usize, f: &zip::read::ZipFile<'_, R>) -> ArchiveEntr
         unchecked: false,
         checked_by_block: false,
         block: None,
+        block_end: 0,
+        skip: None,
     }
 }
 

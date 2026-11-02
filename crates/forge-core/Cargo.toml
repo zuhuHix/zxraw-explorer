@@ -21,6 +21,11 @@ zip.workspace = true
 sevenz-rust2.workspace = true
 lzma-rust2.workspace = true
 crc32fast.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+zstd.workspace = true
+lz4_flex.workspace = true
+brotli.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 aes.workspace = true
@@ -30,6 +35,8 @@ lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# An independent reader to check the tar files we write.
+tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }

@@ -340,6 +340,8 @@ pub(super) fn entries_of(path: &Path, a: &sz::Archive) -> Vec<Option<ArchiveEntr
                     && !f.has_crc
                     && info.is_some_and(|b| b.has_crc && b.files > 1),
                 block,
+                block_end: 0,
+                skip: None,
             })
         })
         .collect()

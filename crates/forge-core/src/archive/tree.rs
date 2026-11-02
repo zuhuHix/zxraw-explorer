@@ -26,12 +26,17 @@ pub struct ArchiveNode {
     pub solid: bool,
     /// Bytes decoded before this file's data in its block (see `ArchiveEntry`).
     pub block_offset: u64,
+    /// Bytes decoded to its block's end before it is published (see `ArchiveEntry`).
+    pub block_end: u64,
 }
 
 impl ArchiveNode {
-    /// Bytes decoded to read this file: its block up to it, then its own data.
+    /// Bytes decoded to read this file: its block up to it, then its own data (or the
+    /// whole block, when its checksum is checked before the file is published).
     pub fn decode_cost(&self) -> u64 {
-        self.block_offset.saturating_add(self.size)
+        self.block_offset
+            .saturating_add(self.size)
+            .max(self.block_end)
     }
 
     /// `compressed / size` in percent, for files with data.
@@ -134,6 +139,7 @@ impl ArchiveIndex {
             entry: Some(entry),
             solid: e.solid && !e.is_dir,
             block_offset: e.block_offset,
+            block_end: e.block_end,
         });
         self.by_path.insert(key.clone(), n);
         if e.is_dir {
@@ -162,6 +168,7 @@ impl ArchiveIndex {
             entry: None,
             solid: false,
             block_offset: 0,
+            block_end: 0,
         });
         self.by_path.insert(key.clone(), n);
         self.children.entry(key.clone()).or_default();
