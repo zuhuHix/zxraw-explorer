@@ -50,9 +50,7 @@ use crate::error::{CoreError, Result};
 use crate::ops::{self, ConflictPolicy, JobCtx, NodeKind, OpIssue, StreamOptions, node_kind};
 use crate::paths;
 
-pub use presets::{
-    CreateOptions, Encryption, Method, Preset, ZOPFLI_MAX_FILE, is_precompressed,
-};
+pub use presets::{CreateOptions, Encryption, Method, Preset, ZOPFLI_MAX_FILE, is_precompressed};
 pub use safety::{collision_key, normalize_entry_name, validate_entry_name};
 pub use tree::{ArchiveIndex, ArchiveNode};
 
@@ -284,10 +282,10 @@ pub fn inner_path(archive: &Path, inner: &str) -> PathBuf {
 }
 
 type CacheKey = (PathBuf, u64, Option<SystemTime>);
+type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>)>>;
 
-fn cache() -> &'static Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>)>> {
-    static CACHE: OnceLock<Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>)>>> =
-        OnceLock::new();
+fn cache() -> &'static IndexCache {
+    static CACHE: OnceLock<IndexCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap())))
 }
 
@@ -474,9 +472,7 @@ pub fn extract(
             continue; // "/" root entry
         }
         let full_rel = validate_entry_name(&e.name)?;
-        if !e.is_dir
-            && e.size > 1024 * 1024
-            && e.size / e.compressed_size.max(1) > limits.max_ratio
+        if !e.is_dir && e.size > 1024 * 1024 && e.size / e.compressed_size.max(1) > limits.max_ratio
         {
             return Err(CoreError::UnsafePath(format!(
                 "{}: suspicious compression ratio (zip bomb)",
@@ -510,9 +506,10 @@ pub fn extract(
             }
         };
         if e.is_symlink {
-            report
-                .skipped
-                .push(OpIssue::new(&rel, "symbolic link entries are not extracted"));
+            report.skipped.push(OpIssue::new(
+                &rel,
+                "symbolic link entries are not extracted",
+            ));
             continue;
         }
         selected_total = selected_total.saturating_add(e.size);
@@ -535,7 +532,11 @@ pub fn extract(
     let dir_keys: HashSet<String> = planned
         .iter()
         .flat_map(|p| {
-            let rel = if p.entry.is_dir { p.rel.as_path() } else { p.rel.parent().unwrap_or(Path::new("")) };
+            let rel = if p.entry.is_dir {
+                p.rel.as_path()
+            } else {
+                p.rel.parent().unwrap_or(Path::new(""))
+            };
             rel.ancestors()
                 .filter(|a| !a.as_os_str().is_empty())
                 .map(collision_key)
@@ -563,7 +564,10 @@ pub fn extract(
     let indices: Vec<usize> = planned.iter().map(|p| p.entry.index).collect();
     backend.preflight(archive, &indices, limits)?;
     let password = opts.password.as_ref();
-    if let Some(first) = planned.iter().find(|p| p.entry.encrypted && !p.entry.is_dir) {
+    if let Some(first) = planned
+        .iter()
+        .find(|p| p.entry.encrypted && !p.entry.is_dir)
+    {
         check_password(backend, archive, first.entry.index, password)?;
     }
     let zone = if opts.mark_of_the_web {
@@ -811,7 +815,9 @@ pub fn extract_to(
     let dest = parent.join(&stem);
     let created = match fs::create_dir(&dest) {
         Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && target == ExtractTarget::NamedFolder => {
+        Err(e)
+            if e.kind() == io::ErrorKind::AlreadyExists && target == ExtractTarget::NamedFolder =>
+        {
             safety::verify_real_directory(&dest)?;
             false
         }
@@ -925,7 +931,8 @@ pub fn test_archive(
         ctx.cancel.check()?;
         ctx.progress.add_items(1);
         ctx.progress.set_current(entry.name.clone());
-        let mut error = (!entry.safe_name).then(|| "unsafe name; it would not be extracted".to_owned());
+        let mut error =
+            (!entry.safe_name).then(|| "unsafe name; it would not be extracted".to_owned());
         match reader {
             Err(e) => error = Some(e.to_string()),
             Ok(r) => {
@@ -999,7 +1006,10 @@ pub fn extract_entry_to_temp(
         .map_or(0, |d| d.as_nanos());
     let key = format!(
         "{}|{}|{stamp}",
-        paths::lexical_normalize(archive).display().to_string().to_lowercase(),
+        paths::lexical_normalize(archive)
+            .display()
+            .to_string()
+            .to_lowercase(),
         md.len()
     );
     let dir = temp_root().join(format!(
@@ -1114,9 +1124,8 @@ pub fn create(
     opts: &CreateOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
-    let backend = backend_for_name(out).ok_or_else(|| {
-        CoreError::Invalid(format!("{}: unknown archive type", out.display()))
-    })?;
+    let backend = backend_for_name(out)
+        .ok_or_else(|| CoreError::Invalid(format!("{}: unknown archive type", out.display())))?;
     backend.create(sources, out, opts, ctx)
 }
 

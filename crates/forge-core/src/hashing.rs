@@ -692,8 +692,7 @@ mod tests {
 
         // A deleted file is still reported as missing under Skip.
         fs::remove_file(d.path().join("local.txt")).unwrap();
-        let missing =
-            verify_manifest_with(&mpath, &cancel, None, OnlineOnlyPolicy::Skip).unwrap();
+        let missing = verify_manifest_with(&mpath, &cancel, None, OnlineOnlyPolicy::Skip).unwrap();
         assert_eq!(missing.missing, vec!["local.txt".to_string()]);
         assert_eq!(missing.skipped_online_only, vec!["cloud.txt".to_string()]);
         cloud::clear_simulated_online_only(&online);
@@ -705,8 +704,8 @@ mod tests {
         fs::write(d.path().join("a.txt"), b"a").unwrap();
         let mpath = d.path().join("checksums.b3");
         let cancel = CancelToken::new();
-        let (entries, _) = build_manifest(d.path(), std::slice::from_ref(&mpath), &cancel, None)
-            .unwrap();
+        let (entries, _) =
+            build_manifest(d.path(), std::slice::from_ref(&mpath), &cancel, None).unwrap();
         write_manifest(&mpath, &entries).unwrap();
         let manifest_len = fs::metadata(&mpath).unwrap().len();
         cloud::simulate_online_only(&mpath);

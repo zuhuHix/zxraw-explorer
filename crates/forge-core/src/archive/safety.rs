@@ -217,7 +217,10 @@ mod tests {
             "..",
             "./..",
         ] {
-            assert!(validate_entry_name(evil).is_err(), "{evil:?} must be rejected");
+            assert!(
+                validate_entry_name(evil).is_err(),
+                "{evil:?} must be rejected"
+            );
         }
     }
 
@@ -252,7 +255,10 @@ mod tests {
         let lzma = [5, 2, 5, 0, 0x5D, 0, 0, 0, 4];
         assert_eq!(zip_lzma_dictionary(&lzma), Some(64 << 20));
         // 8 MiB PPMd model, order 6.
-        assert_eq!(zip_ppmd_memory(&((7u16 << 4) | 5).to_le_bytes()), Some(8 << 20));
+        assert_eq!(
+            zip_ppmd_memory(&((7u16 << 4) | 5).to_le_bytes()),
+            Some(8 << 20)
+        );
         let mut xz = vec![0xFD, b'7', b'z', b'X', b'Z', 0, 0, 1, 0, 0, 0, 0];
         // Block header: size byte 2 (12 bytes), one filter, LZMA2 (0x21) with 1 prop byte.
         xz.extend([2, 0, 0x21, 1, 22, 0, 0, 0, 0, 0, 0, 0]);

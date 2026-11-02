@@ -274,7 +274,16 @@ impl ArchiveBackend for ZipBackend {
         let items = collect_sources(sources, "", ctx, &mut report.skipped)?;
         let (mut zw, tmp, mut guard) = start_output(out, ctx)?;
         let mut names = HashSet::new();
-        write_items(&mut zw, items, &mut names, opts, ctx, &mut report, out, &tmp)?;
+        write_items(
+            &mut zw,
+            items,
+            &mut names,
+            opts,
+            ctx,
+            &mut report,
+            out,
+            &tmp,
+        )?;
         finish_output(zw, &tmp, out, false, &mut report)?;
         guard.disarm();
         Ok(report)
@@ -298,7 +307,9 @@ impl ArchiveBackend for ZipBackend {
                 safety::validate_entry_name(&prefix)?;
             }
             if paths::paths_equal(src, archive) {
-                return Err(CoreError::Invalid("an archive can't be added to itself".into()));
+                return Err(CoreError::Invalid(
+                    "an archive can't be added to itself".into(),
+                ));
             }
             adds.extend(collect_sources(
                 std::slice::from_ref(src),
@@ -350,7 +361,16 @@ impl ArchiveBackend for ZipBackend {
             zw.raw_copy_file(f).map_err(|e| zip_err(archive, e))?;
             report.kept += 1;
         }
-        write_items(&mut zw, adds, &mut names, opts, ctx, &mut report, archive, &tmp)?;
+        write_items(
+            &mut zw,
+            adds,
+            &mut names,
+            opts,
+            ctx,
+            &mut report,
+            archive,
+            &tmp,
+        )?;
         ctx.cancel.check()?;
         drop(src);
         // The rebuilt file replaces the original: keep its Mark-of-the-Web.
@@ -440,7 +460,11 @@ fn file_options<'k>(
     let mtime = item.modified.map(system_to_zip_time).unwrap_or_default();
     let o = FileOptions::<()>::default()
         .compression_method(method.zip())
-        .compression_level(if method == Method::Stored { None } else { level })
+        .compression_level(if method == Method::Stored {
+            None
+        } else {
+            level
+        })
         .last_modified_time(mtime)
         .large_file(item.size >= u32::MAX as u64);
     Ok(match &opts.encryption {
@@ -516,12 +540,28 @@ fn write_items(
             batch_bytes += item.size;
             batch.push(item);
             if batch_bytes >= batch_budget || batch.len() >= 512 {
-                flush_batch(zw, std::mem::take(&mut batch), opts, threads, ctx, report, out)?;
+                flush_batch(
+                    zw,
+                    std::mem::take(&mut batch),
+                    opts,
+                    threads,
+                    ctx,
+                    report,
+                    out,
+                )?;
                 batch_bytes = 0;
             }
             continue;
         }
-        flush_batch(zw, std::mem::take(&mut batch), opts, threads, ctx, report, out)?;
+        flush_batch(
+            zw,
+            std::mem::take(&mut batch),
+            opts,
+            threads,
+            ctx,
+            report,
+            out,
+        )?;
         batch_bytes = 0;
         ctx.progress.add_items(1);
         write_one(zw, &item, opts, ctx, report, out, &mut buf)?;
@@ -546,7 +586,8 @@ fn write_one(
         NodeKind::Dir => {
             let mtime = item.modified.map(system_to_zip_time).unwrap_or_default();
             let o = FileOptions::<()>::default().last_modified_time(mtime);
-            zw.add_directory(format!("{}/", item.name), o).map_err(zerr)?;
+            zw.add_directory(format!("{}/", item.name), o)
+                .map_err(zerr)?;
             report.dirs += 1;
         }
         NodeKind::File => {

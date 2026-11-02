@@ -2,15 +2,15 @@
 
 use super::safety::BEFORE_PARENT_CREATE;
 use super::*;
+use forge_jobs::{CancelToken, Progress};
 use std::fs::File;
 use std::io::Write;
-use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
-use forge_jobs::{CancelToken, Progress};
 #[cfg(windows)]
 use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 fn ctx_parts() -> (CancelToken, Progress) {
     (CancelToken::new(), Progress::default())

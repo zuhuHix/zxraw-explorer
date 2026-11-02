@@ -175,9 +175,8 @@ const PRECOMPRESSED: &[&str] = &[
     // audio
     "mp3", "aac", "m4a", "ogg", "oga", "opus", "flac", "wma",
     // archives and compressed streams
-    "zip", "7z", "rar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "tzst", "lz4", "br",
-    "lzma", "cab", "zipx", "apk", "jar",
-    // documents that are zip containers
+    "zip", "7z", "rar", "gz", "tgz", "bz2", "tbz2", "xz", "txz", "zst", "tzst", "lz4", "br", "lzma",
+    "cab", "zipx", "apk", "jar", // documents that are zip containers
     "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
 ];
 
@@ -211,7 +210,9 @@ mod tests {
         assert_eq!(o.method_for("txt", 10).0, Method::Deflate);
         o.auto_store = false;
         assert_eq!(o.method_for("jpg", 10).0, Method::Deflate);
-        for ext in ["png", "heic", "webp", "mp4", "mkv", "mov", "mp3", "aac", "flac", "zip"] {
+        for ext in [
+            "png", "heic", "webp", "mp4", "mkv", "mov", "mp3", "aac", "flac", "zip",
+        ] {
             assert!(is_precompressed(ext), "{ext}");
         }
         for ext in ["7z", "rar", "gz", "xz", "zst"] {
