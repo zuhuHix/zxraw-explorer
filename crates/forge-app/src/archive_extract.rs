@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use egui::{Key, RichText};
 use forge_core::archive::{
     self, ArchiveEntry, ArchiveListing, ExtractLimits, ExtractOptions, ExtractReport,
-    ExtractTarget, Password, TestReport, TopLevel,
+    ExtractTarget, NewFolder, Password, TestReport, TopLevel,
 };
 use forge_core::model::format_size;
 use forge_core::ops::{ConflictPolicy, JobCtx};
@@ -411,7 +411,6 @@ fn run_extract(
             Err(e) => return Err(CoreError::io(parent, e)),
         }
     }
-    let named = parent.join(archive::archive_stem(archive));
     // Whether this extraction made its folder: from the `create_dir` that made it (never a
     // guess from looking first, which a folder made meanwhile would fool).
     let mut created = false;
@@ -438,28 +437,31 @@ fn run_extract(
                 let dest = forge_core::paths::unique_name_with(parent, &stem, false, |p| {
                     fs::symlink_metadata(p).is_ok()
                 });
-                fs::create_dir(&dest).map_err(|e| CoreError::io(&dest, e))?;
-                created = true;
-                let result = archive::extract(archive, &dest, &opts, Some(sel), ctx);
-                // Kept for "Extract them anyway" when files were held back.
-                let empty = match &result {
-                    Err(_) => true,
-                    Ok(r) => r.extracted.is_empty() && r.unchecked.is_empty(),
+                let name = forge_core::paths::name_of(&dest);
+                let folder = NewFolder {
+                    parent,
+                    name: &name,
+                    reuse: false,
                 };
-                if empty {
-                    // Only if nothing is in it.
-                    let _ = fs::remove_dir(&dest);
-                }
-                result
+                // Removed again (if empty) when nothing landed in it; kept for "Extract them
+                // anyway" when files were held back.
+                archive::extract_into_folder(archive, folder, &opts, Some(sel), ctx, |result| {
+                    match result {
+                        Err(_) => true,
+                        Ok(r) => r.extracted.is_empty() && r.unchecked.is_empty(),
+                    }
+                })
+                .inspect(|rep| created = rep.created_dest)
             }
             SelectionDest::Named => {
-                let dest = named.clone();
-                match fs::create_dir(&dest) {
-                    Ok(()) => created = true,
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dest.is_dir() => {}
-                    Err(e) => return Err(CoreError::io(&dest, e)),
-                }
-                archive::extract(archive, &dest, &opts, Some(sel), ctx)
+                let name = archive::archive_stem(archive);
+                let folder = NewFolder {
+                    parent,
+                    name: &name,
+                    reuse: true,
+                };
+                archive::extract_into_folder(archive, folder, &opts, Some(sel), ctx, |_| false)
+                    .inspect(|rep| created = rep.created_dest)
             }
         },
     }?;

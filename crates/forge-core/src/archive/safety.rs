@@ -17,6 +17,26 @@ pub(crate) type BeforeParentCreateHook = Box<dyn Fn(&Path)>;
 thread_local! {
     pub(crate) static BEFORE_PARENT_CREATE: RefCell<Option<BeforeParentCreateHook>> =
         const { RefCell::new(None) };
+    /// Tests: runs with the destination's final path as soon as an extraction pinned it,
+    /// before the archive is listed and planned.
+    pub(crate) static AFTER_DEST_PINNED: RefCell<Option<BeforeParentCreateHook>> =
+        const { RefCell::new(None) };
+    /// Tests: runs with the folder's final path before an extraction that made its folder
+    /// takes back what it wrote (cancelled, or nothing extracted).
+    pub(crate) static BEFORE_CREATED_CLEANUP: RefCell<Option<BeforeParentCreateHook>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn run_hook(
+    hook: &'static std::thread::LocalKey<RefCell<Option<BeforeParentCreateHook>>>,
+    path: &Path,
+) {
+    hook.with(|h| {
+        if let Some(f) = &*h.borrow() {
+            f(path);
+        }
+    });
 }
 
 /// Normalise an entry name as stored: `\` becomes `/`. Directory names keep their trailing `/`.
@@ -83,6 +103,42 @@ impl PinnedBase {
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+
+    /// The folder `name` directly inside this one, pinned (refused when it is a link or
+    /// not a folder). Only that folder is pinned by the result: keep `self` alive with it
+    /// for its ancestors to stay pinned.
+    pub(crate) fn child(&self, name: &std::ffi::OsStr) -> Result<PinnedBase> {
+        let mut parts = Path::new(name).components();
+        if !matches!(
+            (parts.next(), parts.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        ) {
+            return Err(CoreError::Invalid(format!(
+                "{} is not a folder name",
+                Path::new(name).display()
+            )));
+        }
+        let root = self.root.join(name);
+        let handle = open_pinned(&root)?;
+        Ok(Self {
+            root,
+            _chain: PinnedDirs {
+                handles: vec![handle],
+            },
+        })
+    }
+}
+
+/// Pin the existing folders of `rel` below `base` without creating any, refusing links
+/// (see [`pin_dirs`]): what is then removed beneath them is what the job wrote there.
+pub(crate) fn pin_existing(base: &PinnedBase, rel: &Path) -> Result<PinnedDirs> {
+    let mut handles = Vec::new();
+    let mut cur = base.root().to_path_buf();
+    for c in rel.components() {
+        cur.push(c);
+        handles.push(open_pinned(&cur)?);
+    }
+    Ok(PinnedDirs { handles })
 }
 
 /// Create `base/rel` one component at a time, refusing to pass through links, junctions
@@ -164,7 +220,8 @@ fn open_pinned(path: &Path) -> Result<fs::File> {
     fs::File::open(path).map_err(|e| CoreError::io(path, e))
 }
 
-pub(crate) fn verify_real_directory(path: &Path) -> Result<()> {
+#[cfg(not(windows))]
+fn verify_real_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).map_err(|error| CoreError::io(path, error))?;
     if metadata.is_dir() && !is_link_or_reparse(&metadata) {
         Ok(())
