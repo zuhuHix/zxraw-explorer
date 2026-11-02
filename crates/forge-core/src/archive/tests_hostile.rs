@@ -559,3 +559,81 @@ fn mark_of_the_web_follows_the_archive_zone() {
     ctx_run(&z, &dest, &ExtractOptions::default()).unwrap();
     assert!(fs::read(zone_stream(&dest.join("doc.txt"))).is_err());
 }
+
+/// Replace every occurrence of `from` in `bytes` with `to` (same length); returns the count.
+fn patch_all(bytes: &mut [u8], from: &[u8], to: &[u8]) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i + from.len() <= bytes.len() {
+        if &bytes[i..i + from.len()] == from {
+            bytes[i..i + from.len()].copy_from_slice(to);
+            n += 1;
+            i += from.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+#[test]
+fn encrypted_entries_are_held_to_the_decoder_memory_limit() {
+    use zip::unstable::write::FileOptionsExt;
+    let d = tempfile::tempdir().unwrap();
+    // LZMA properties declaring a 2 GiB dictionary, then filler.
+    let mut plain = vec![5, 2, 5, 0, 0x5D, 0, 0, 0, 0x80];
+    plain.extend([0u8; 64]);
+    for legacy in [false, true] {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let o = if legacy {
+            o.with_deprecated_encryption(b"pw").unwrap()
+        } else {
+            o.with_aes_encryption(zip::AesMode::Aes256, "pw")
+        };
+        zw.start_file("model.bin", o).unwrap();
+        std::io::Write::write_all(&mut zw, &plain).unwrap();
+        let mut bytes = zw.finish().unwrap().into_inner();
+        // Declare the entry LZMA (method 14).
+        let patched = if legacy {
+            // Method field of the local (offset 8) and central (offset 10) headers.
+            let local = 8;
+            let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap() + 10;
+            for at in [local, central] {
+                assert_eq!(&bytes[at..at + 2], &[0, 0]);
+                bytes[at] = 14;
+            }
+            2
+        } else {
+            // The AES extra field: id 0x9901, size 7, AE-1 or AE-2, "AE", AES-256, method 0.
+            (1..=2u8)
+                .map(|v| {
+                    patch_all(
+                        &mut bytes,
+                        &[0x01, 0x99, 7, 0, v, 0, b'A', b'E', 3, 0, 0],
+                        &[0x01, 0x99, 7, 0, v, 0, b'A', b'E', 3, 14, 0],
+                    )
+                })
+                .sum()
+        };
+        assert_eq!(patched, 2, "legacy {legacy}");
+        let z = write_archive(d.path(), &format!("enc-lzma-{legacy}.zip"), &bytes);
+        let dest = fresh_dest(d.path(), &format!("dest-{legacy}"));
+        let opts = ExtractOptions {
+            password: Some(Password::new("pw")),
+            ..Default::default()
+        };
+        match ctx_run(&z, &dest, &opts) {
+            Err(CoreError::UnsafePath(msg)) => assert!(msg.contains("decoder memory"), "{msg}"),
+            other => panic!("legacy {legacy}: expected a decoder memory refusal, got {other:?}"),
+        }
+        assert!(is_empty_dir(&dest));
+        let test = test_archive(&z, opts.password.as_ref(), &ExtractLimits::default(), &{
+            static C: std::sync::OnceLock<(forge_jobs::CancelToken, forge_jobs::Progress)> =
+                std::sync::OnceLock::new();
+            let (c, p) = C.get_or_init(|| (forge_jobs::CancelToken::new(), Default::default()));
+            JobCtx::new(c, p)
+        });
+        assert!(matches!(test, Err(CoreError::UnsafePath(_))), "{test:?}");
+    }
+}

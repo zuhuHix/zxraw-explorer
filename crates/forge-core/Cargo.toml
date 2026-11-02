@@ -19,6 +19,9 @@ xxhash-rust.workspace = true
 forge-jobs.workspace = true
 zip.workspace = true
 zeroize.workspace = true
+aes.workspace = true
+pbkdf2.workspace = true
+sha1.workspace = true
 lru.workspace = true
 
 [dev-dependencies]

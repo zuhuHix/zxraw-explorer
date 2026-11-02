@@ -21,6 +21,7 @@
 //!   Passwords are never logged (their `Debug` is redacted) and are wiped when dropped.
 
 mod cp437;
+mod crypto_peek;
 mod motw;
 mod presets;
 mod safety;
@@ -151,8 +152,15 @@ pub trait ArchiveBackend: Sync {
     /// Read the directory (no entry data). Fails if there are more than `max_entries`.
     fn list(&self, archive: &Path, max_entries: usize) -> Result<ArchiveListing>;
     /// Structural checks before any data is extracted from the entries at `indices`:
-    /// overlapping entries, decoder memory above `limits.max_decoder_memory`...
-    fn preflight(&self, archive: &Path, indices: &[usize], limits: &ExtractLimits) -> Result<()>;
+    /// overlapping entries, decoder memory above `limits.max_decoder_memory` (for encrypted
+    /// entries, read from their data decrypted with `password`)...
+    fn preflight(
+        &self,
+        archive: &Path,
+        indices: &[usize],
+        password: Option<&Password>,
+        limits: &ExtractLimits,
+    ) -> Result<()>;
     /// Stream the entries `wanted` accepts, in archive order, to `visit`. Implementations
     /// must check local headers against the directory and verify checksums as they read.
     fn read_entries(
@@ -562,7 +570,6 @@ pub fn extract(
     });
 
     let indices: Vec<usize> = planned.iter().map(|p| p.entry.index).collect();
-    backend.preflight(archive, &indices, limits)?;
     let password = opts.password.as_ref();
     if let Some(first) = planned
         .iter()
@@ -570,6 +577,7 @@ pub fn extract(
     {
         check_password(backend, archive, first.entry.index, password)?;
     }
+    backend.preflight(archive, &indices, password, limits)?;
     let zone = if opts.mark_of_the_web {
         motw::read_zone(archive)
     } else {
@@ -923,10 +931,10 @@ pub fn test_archive(
     let listing = backend.list(archive, limits.max_entries)?;
     let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
-    backend.preflight(archive, &indices, limits)?;
     if let Some(first) = files.iter().find(|e| e.encrypted) {
         check_password(backend, archive, first.index, password)?;
     }
+    backend.preflight(archive, &indices, password, limits)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
         .add_total_bytes(files.iter().map(|e| e.size).sum());
