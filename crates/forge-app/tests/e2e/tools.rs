@@ -2404,3 +2404,65 @@ fn encrypted_archive_copy_asks_for_the_password_before_the_copy_is_published() {
         "the decrypted file is what was pasted"
     );
 }
+
+/// A RAR fixture of forge-core (made by rar.exe, see its `make-rar-fixtures.sh`), copied to
+/// `dir/test.rar`.
+fn pane_rar(dir: &Path, fixture: &str) -> PathBuf {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../forge-core/src/archive/fixtures")
+        .join(fixture);
+    fs::create_dir_all(dir).unwrap();
+    let out = dir.join("test.rar");
+    fs::copy(src, &out).unwrap();
+    out
+}
+
+#[test]
+fn rar_pane_browses_and_copies_out_but_is_never_edited() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let archive = pane_rar(&sandbox.path().join("rars"), "rar5-solid.rar");
+    let before = fs::read(&archive).unwrap();
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let assert_root = format!("ui browser assert-archive {} | /", shown(&archive));
+    let script = dual_pane_script(
+        &archive,
+        &dest,
+        &[
+            "wait-entry src",
+            &assert_root,
+            "double-click-entry src",
+            "wait-entry hello.txt",
+            "assert-entry sub",
+            "select hello.txt, sub",
+            // Read only: deleting and cutting are refused, copying out works.
+            "cmd DeletePermanently",
+            "assert-toast Delete: RAR archives can be opened and extracted, not edited",
+            "cmd Cut",
+            "assert-toast Cut: RAR archives can be opened and extracted, not edited",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            "focus right",
+            "wait-entry hello.txt",
+            "select hello.txt",
+            "cmd CopyToOtherPane",
+            "assert-toast RAR archives can be opened and extracted, not edited",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let files = tree(&dest);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["hello.txt", "sub/data.bin"]);
+    assert_eq!(files[0].1, "hello rar\n".repeat(200).into_bytes());
+    assert_eq!(
+        fs::read(&archive).unwrap(),
+        before,
+        "the RAR archive was changed"
+    );
+}

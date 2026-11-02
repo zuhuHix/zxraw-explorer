@@ -257,6 +257,10 @@ pub fn transfer(
             copy_out(app, paths, target, copy);
             true
         }
+        (false, Some(Ok((view, _)))) if view.read_only().is_some() => {
+            app.toast(format!("{what}: {}", view.read_only().unwrap_or_default()));
+            true
+        }
         (false, Some(Ok((view, folder)))) => {
             add_into(app, &view, &folder, paths.to_vec(), copy);
             true
@@ -327,6 +331,10 @@ pub fn copy_paths(app: &mut ZxrawApp, paths: &[PathBuf], cut: bool) {
     let Some(view) = paths.first().and_then(|p| view_listing(app, p)) else {
         return;
     };
+    if cut && let Some(why) = view.read_only() {
+        app.toast(format!("Cut: {why}. Copy the items instead."));
+        return;
+    }
     let Some(selection) = selection_of(&view, paths) else {
         return;
     };
@@ -475,6 +483,10 @@ pub fn ask_delete(app: &mut ZxrawApp) {
     let Some(view) = app.pane().archive.clone() else {
         return;
     };
+    if let Some(why) = view.read_only() {
+        app.toast(format!("Delete: {why}"));
+        return;
+    }
     let targets = app.pane().action_targets();
     let nodes: Vec<(String, bool)> = targets
         .iter()

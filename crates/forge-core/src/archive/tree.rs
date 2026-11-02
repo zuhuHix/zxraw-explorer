@@ -124,6 +124,11 @@ impl ArchiveIndex {
         for (i, e) in listing.entries.iter().enumerate() {
             let path = e.name.trim_matches('/');
             if path.is_empty() {
+                // The root folder; a nameless file is a name the reader refused (UnRAR
+                // blanks `..` names).
+                if !e.is_dir {
+                    idx.unsafe_entries += 1;
+                }
                 continue;
             }
             if !e.safe_name {

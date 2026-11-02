@@ -965,6 +965,39 @@ mod tests {
     }
 
     #[test]
+    fn rar_selections_read_back_every_file() {
+        // Solid, and a file split over volumes (staged from the set's last volume).
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/archive/fixtures");
+        for (name, wanted) in [
+            ("rar5-solid.rar", "src/sub/data.bin"),
+            ("rar4-solid.rar", "src/hello.txt"),
+            ("rar5-vol.part4.rar", "src/big.bin"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let archive = fixtures.join(name);
+            let staged = plan(
+                &list(&archive).unwrap(),
+                &Selection::new("", vec!["src/".into()]),
+                &ExtractLimits::default(),
+            )
+            .unwrap();
+            let k = staged.files.iter().position(|e| e.name == wanted).unwrap();
+            let (stage, _log) = stage_of(&archive, &staged, tmp.path().join("stage"), None);
+            let data = read_file(&stage, k).unwrap();
+            assert_eq!(data.len() as u64, staged.files[k].size, "{name}");
+            if wanted == "src/hello.txt" {
+                assert_eq!(
+                    data,
+                    "hello rar
+"
+                    .repeat(200)
+                    .into_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn plan_refuses_a_selection_over_the_total_size_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let archive = tmp.path().join("big.zip");

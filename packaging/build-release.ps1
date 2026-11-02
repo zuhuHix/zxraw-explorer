@@ -68,7 +68,8 @@ try {
         "LICENSE-MIT",
         "LICENSE-APACHE",
         "packaging/THIRD_PARTY.md",
-        "packaging/LICENSES-NOTE.md"
+        "packaging/LICENSES-NOTE.md",
+        "packaging/LICENSE-UNRAR.txt"
     )) {
         $source = Join-Path $repoRoot $file
         if (-not (Test-Path -LiteralPath $source)) { throw "Required release file missing: $source" }

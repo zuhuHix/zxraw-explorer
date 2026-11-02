@@ -339,6 +339,11 @@ Explorer is a file manager designed around that workflow:
   names and links, sparse files), PAX (UTF-8 names, big sizes, exact times, sparse files) and old
   V7; names that aren't UTF-8 are read as Windows' tar.exe writes them. Gzip files with several
   members and Zstandard files with several frames read as one.
+- **RAR opens and extracts, read only.** `.rar` archives (RAR4, and RAR5 and RAR7) open like
+  folders and extract the same three ways, with the same safety rules. Solid archives, encrypted
+  files and encrypted headers are read; with encrypted headers the password is asked for before
+  the listing. A multi-volume set (`.part1.rar`, or `.rar` with `.r00`, `.r01`...) opens from any
+  of its volumes. ZXraw does not create or edit RAR archives.
 - **One listing per archive.** A tar has no table of contents, so opening a compressed one decodes
   it to its end once (the status bar says how far) and remembers where each file is. A plain
   `.tar` is then read by jumping straight to the file you open. A compressed tar's checksum
