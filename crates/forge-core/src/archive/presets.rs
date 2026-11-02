@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::codec::{self, Codec, StreamLevel};
 use super::{ArchiveFormat, ExtractLimits, Password};
 
 /// The choices of the compress dialog. For ZIP the first three write standard Deflate, which
@@ -51,20 +52,53 @@ impl Preset {
     }
 
     /// The presets offered for a format (7z has no Zstandard preset: 7-Zip can't read it).
+    /// Tar and single compressed files: Fast, Balanced and Max where the codec has them,
+    /// Ultra (advanced) for xz (`-9e`) and Zstandard (22, long mode); a plain tar has none.
     pub fn for_format(format: ArchiveFormat) -> &'static [Preset] {
         match format {
             ArchiveFormat::Zip => &Preset::ALL,
             ArchiveFormat::SevenZip => {
                 &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra]
             }
+            ArchiveFormat::Tar(c) | ArchiveFormat::Compressed(c) => match c {
+                Codec::None => &[],
+                // bzip2's best level is barely slower than its others; LZ4 has two modes.
+                Codec::Bzip2 | Codec::Lz4 => &[Preset::Fast, Preset::Balanced],
+                Codec::Xz | Codec::Zstd => {
+                    &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra]
+                }
+                Codec::Gzip | Codec::Brotli => &[Preset::Fast, Preset::Balanced, Preset::Max],
+            },
         }
     }
 
     /// The label for a format's dialog.
     pub fn label_for(self, format: ArchiveFormat) -> &'static str {
-        match (format, self) {
-            (ArchiveFormat::SevenZip, Preset::Ultra) => "Ultra (LZMA2, 256 MB dictionary)",
-            (ArchiveFormat::SevenZip, Preset::Max) => "Max (slow)",
+        let codec = match format {
+            ArchiveFormat::Tar(c) | ArchiveFormat::Compressed(c) => Some(c),
+            _ => None,
+        };
+        match (format, codec, self) {
+            (ArchiveFormat::SevenZip, _, Preset::Ultra) => "Ultra (LZMA2, 256 MB dictionary)",
+            (ArchiveFormat::SevenZip, _, Preset::Max) => "Max (slow)",
+            (_, Some(Codec::Gzip), Preset::Fast) => "Fast (level 1)",
+            (_, Some(Codec::Gzip), Preset::Balanced) => "Balanced (level 6)",
+            (_, Some(Codec::Gzip), _) => "Max (level 9)",
+            (_, Some(Codec::Bzip2), Preset::Fast) => "Fast (level 1)",
+            (_, Some(Codec::Bzip2), _) => "Balanced (level 9, bzip2's best)",
+            (_, Some(Codec::Xz), Preset::Fast) => "Fast (level 1)",
+            (_, Some(Codec::Xz), Preset::Balanced) => "Balanced (level 6)",
+            (_, Some(Codec::Xz), Preset::Max) => "Max (level 9, slow)",
+            (_, Some(Codec::Xz), _) => "Ultra (level 9e, very slow)",
+            (_, Some(Codec::Zstd), Preset::Fast) => "Fast (level 3)",
+            (_, Some(Codec::Zstd), Preset::Balanced) => "Balanced (level 9)",
+            (_, Some(Codec::Zstd), Preset::Max) => "Max (level 19, slow)",
+            (_, Some(Codec::Zstd), _) => "Ultra (level 22, long mode)",
+            (_, Some(Codec::Lz4), Preset::Fast) => "Fast (independent blocks)",
+            (_, Some(Codec::Lz4), _) => "Balanced (linked blocks)",
+            (_, Some(Codec::Brotli), Preset::Fast) => "Fast (quality 5)",
+            (_, Some(Codec::Brotli), Preset::Balanced) => "Balanced (quality 9)",
+            (_, Some(Codec::Brotli), _) => "Max (quality 11, very slow)",
             _ => self.label(),
         }
     }
@@ -76,12 +110,111 @@ impl Preset {
             ArchiveFormat::SevenZip => {
                 "LZMA2 7z: opens in 7-Zip, NanaZip, WinRAR and Windows 11 Explorer (23H2+)."
             }
+            ArchiveFormat::Tar(c) | ArchiveFormat::Compressed(c) => match c {
+                Codec::None => "Plain tar: opens with tar, 7-Zip, WinRAR and Windows 11 Explorer.",
+                Codec::Gzip | Codec::Bzip2 => {
+                    "Opens with tar, 7-Zip, WinRAR and Windows 11 Explorer (23H2+)."
+                }
+                Codec::Xz => "Opens with tar, 7-Zip, WinRAR and Windows 11 Explorer (23H2+).",
+                Codec::Zstd if self == Preset::Ultra => {
+                    "Long mode: zstd needs --long=27 (or --memory=128MB) to open it; tar and \
+                     7-Zip 24+ open it."
+                }
+                Codec::Zstd => {
+                    "Opens with tar, zstd, 7-Zip 24+, NanaZip and Windows 11 Explorer (23H2+)."
+                }
+                Codec::Lz4 => {
+                    "Opens with lz4, tar (with lz4), 7-Zip ZS and NanaZip; not Windows Explorer."
+                }
+                Codec::Brotli => "Opens with brotli and some tools; not Windows Explorer or 7-Zip.",
+            },
+        }
+    }
+
+    /// The codec settings of the preset (threads 1: see `CreateOptions`).
+    pub fn stream_level(self, codec: Codec) -> StreamLevel {
+        let p = match self {
+            Preset::Zstd => Preset::Balanced,
+            p => p,
+        };
+        let (level, extreme, long) = match (codec, p) {
+            (Codec::Gzip, Preset::Fast) => (1, false, false),
+            (Codec::Gzip, Preset::Balanced) => (6, false, false),
+            (Codec::Gzip, _) => (9, false, false),
+            (Codec::Bzip2, Preset::Fast) => (1, false, false),
+            (Codec::Bzip2, _) => (9, false, false),
+            (Codec::Xz, Preset::Fast) => (1, false, false),
+            (Codec::Xz, Preset::Balanced) => (6, false, false),
+            (Codec::Xz, Preset::Max) => (9, false, false),
+            (Codec::Xz, _) => (9, true, false),
+            (Codec::Zstd, Preset::Fast) => (3, false, false),
+            (Codec::Zstd, Preset::Balanced) => (9, false, false),
+            (Codec::Zstd, Preset::Max) => (19, false, false),
+            (Codec::Zstd, _) => (22, false, true),
+            (Codec::Lz4, Preset::Fast) => (1, false, false),
+            (Codec::Lz4, _) => (1, true, false),
+            (Codec::Brotli, Preset::Fast) => (5, false, false),
+            (Codec::Brotli, Preset::Balanced) => (9, false, false),
+            (Codec::Brotli, _) => (11, false, false),
+            (Codec::None, _) => (0, false, false),
+        };
+        StreamLevel {
+            level,
+            extreme,
+            long,
+            threads: 1,
         }
     }
 
     /// A rough time and memory estimate for a format's dialog.
     pub fn estimate_for(self, format: ArchiveFormat) -> String {
         match format {
+            ArchiveFormat::Tar(c) | ArchiveFormat::Compressed(c) => {
+                let l = self.stream_level(c);
+                let mb = |b: u64| b.div_ceil(1 << 20);
+                match c {
+                    Codec::None => "No compression: as fast as the disk".to_owned(),
+                    Codec::Gzip => match l.level {
+                        1 => "Very fast (~150 MB/s), little memory".to_owned(),
+                        6 => "Fast (~50 MB/s), little memory".to_owned(),
+                        _ => "Medium (~15 MB/s), little memory".to_owned(),
+                    },
+                    Codec::Bzip2 => "Slow (~10 MB/s), ~8 MB memory; one thread".to_owned(),
+                    Codec::Xz => {
+                        let speed = match (l.level, l.extreme) {
+                            (1, _) => "Fast (~20 MB/s per thread)",
+                            (6, _) => "Slow (~3 MB/s per thread)",
+                            (_, false) => "Slow (~2 MB/s per thread)",
+                            _ => "Very slow (~1.5 MB/s per thread)",
+                        };
+                        let dict = codec::xz_options(l.level, l.extreme).lzma_options.dict_size;
+                        format!(
+                            "{speed}; compressing needs ~{} MB per thread, opening ~{} MB",
+                            mb(codec::xz_thread_memory(l.level, l.extreme)),
+                            mb(u64::from(dict))
+                        )
+                    }
+                    Codec::Zstd => {
+                        let speed = match l.level {
+                            3 => "Very fast (~300 MB/s per thread)",
+                            9 => "Fast (~60 MB/s per thread)",
+                            19 => "Slow (~3 MB/s per thread)",
+                            _ => "Very slow (~2 MB/s per thread)",
+                        };
+                        let open = if l.long { 128 } else { 8 };
+                        format!(
+                            "{speed}; compressing needs ~{} MB per thread, opening ~{open} MB",
+                            mb(codec::zstd_memory(l.level, l.long))
+                        )
+                    }
+                    Codec::Lz4 => "Fastest (~400 MB/s), ~12 MB memory; one thread".to_owned(),
+                    Codec::Brotli => match l.level {
+                        5 => "Fast (~40 MB/s), ~30 MB memory".to_owned(),
+                        9 => "Medium (~8 MB/s), ~60 MB memory".to_owned(),
+                        _ => "Very slow (~0.5 MB/s), ~100 MB memory".to_owned(),
+                    },
+                }
+            }
             ArchiveFormat::Zip => self.estimate().to_owned(),
             ArchiveFormat::SevenZip => {
                 let info = self.sevenzip();

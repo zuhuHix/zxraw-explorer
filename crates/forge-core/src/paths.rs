@@ -731,16 +731,20 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         };
         let (f, t) = (wide(from), wide(to));
         // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive the call.
-        unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }
-            .map_err(|e| {
+        unsafe { MoveFileExW(PCWSTR(f.as_ptr()), PCWSTR(t.as_ptr()), MOVE_FILE_FLAGS(0)) }.map_err(
+            |e| {
                 // ERROR_ALREADY_EXISTS (183) / ERROR_FILE_EXISTS (80) -> AlreadyExists.
                 let code = (e.code().0 as u32) & 0xFFFF;
                 if code == 183 || code == 80 {
-                    std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination already exists")
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "destination already exists",
+                    )
                 } else {
                     std::io::Error::from_raw_os_error(code as i32)
                 }
-            })
+            },
+        )
     }
     #[cfg(not(windows))]
     {

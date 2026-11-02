@@ -64,8 +64,16 @@ zip = { version = "9.1.3", default-features = false, features = ["deflate", "def
 # AES-256 data and headers; writes LZMA2 (+BCJ), Copy and AES. Same lzma-rust2/ppmd/bzip2/aes
 # versions as zip, so nothing is built twice.
 sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["aes256", "bzip2", "compress", "ppmd", "deflate"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "encoder"] }
+lzma-rust2 = { version = "0.23", default-features = false, features = ["std", "encoder", "xz"] }
 crc32fast = "1.4"
+
+# tar and single-file streams (.gz .bz2 .xz .zst .lz4 .br): the same flate2 (zlib-rs), bzip2
+# (pure Rust), lzma-rust2 (xz) and zstd as zip and 7z; plus pure-Rust LZ4 frames and Brotli.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+bzip2 = "0.6"
+zstd = { version = "0.14", features = ["zstdmt"] }
+lz4_flex = "0.14"
+brotli = "9.1"
 
 zeroize = "1.8"
 # Same versions the zip crate uses: decrypting the head of encrypted entries.

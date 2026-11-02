@@ -43,7 +43,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn free_space(dir: &Path) -> Result<u64> {
+pub(super) fn free_space(dir: &Path) -> Result<u64> {
     #[cfg(test)]
     if let Some(free) = FAKE_FREE_SPACE.with(|f| f.get()) {
         return Ok(free);
