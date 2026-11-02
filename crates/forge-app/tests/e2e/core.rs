@@ -1282,7 +1282,7 @@ pub(crate) fn clipboard_lock() -> ClipboardLock {
 /// copy the user makes during the test is kept, and nothing is restored. Remaining window: a
 /// user copy that lands between two of the test's own clipboard writes less than one
 /// watcher poll (50 ms) apart, or a user emptying the clipboard, looks like the test's own.
-fn clipboard_guard(sandbox: &Path) -> Option<ClipboardGuard> {
+pub(crate) fn clipboard_guard(sandbox: &Path) -> Option<ClipboardGuard> {
     let lock = clipboard_lock();
     let saved = match Snapshot::save() {
         Ok(saved) => saved,
@@ -1332,7 +1332,7 @@ fn watch_clipboard(
     (false, seen)
 }
 
-struct ClipboardGuard {
+pub(crate) struct ClipboardGuard {
     saved: Snapshot,
     sandbox: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

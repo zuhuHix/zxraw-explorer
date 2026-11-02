@@ -134,53 +134,41 @@ pub(crate) fn own_format() -> crate::Result<u16> {
 #[cfg(windows)]
 pub use imp::VirtualDataObject;
 
-/// Pastes the clipboard into `folder` as Explorer's Paste does: the shell's own drop target
-/// of the folder is given the clipboard's data object, allowed only its "Preferred
-/// DropEffect" (Move for a Cut). Returns at once; the shell copies on its own threads, so
-/// the calling (UI) thread must keep pumping messages. For tests and automation.
+/// Drops `data` on the shell's own drop target of `folder` (what Explorer and the desktop
+/// use), allowing only `effect`, with the left button as a drop has it. Returns at once; the
+/// shell copies on its own threads while the calling thread keeps pumping messages.
 #[cfg(windows)]
-pub fn shell_paste_clipboard(folder: &std::path::Path) -> crate::Result<()> {
+fn shell_drop(
+    data: &windows::Win32::System::Com::IDataObject,
+    folder: &std::path::Path,
+    effect: u32,
+) -> crate::Result<()> {
     use windows::Win32::Foundation::POINTL;
     use windows::Win32::System::Com::IBindCtx;
-    use windows::Win32::System::Ole::{DROPEFFECT, IDropTarget, OleGetClipboard};
-    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+    use windows::Win32::System::Ole::{DROPEFFECT, IDropTarget};
+    use windows::Win32::System::SystemServices::MK_LBUTTON;
     use windows::Win32::UI::Shell::{BHID_SFUIObject, IShellItem, SHCreateItemFromParsingName};
     use windows::core::PCWSTR;
 
-    // SAFETY: plain OLE and shell calls on this (OLE) thread with live objects.
+    let wide = crate::to_wide(folder);
+    // SAFETY: plain shell and OLE calls on this (OLE) thread with live objects.
     unsafe {
-        let data = OleGetClipboard().map_err(|e| crate::api_err("OleGetClipboard", e))?;
-        let format = crate::virtual_files::registered_format(
-            windows::core::w!("Preferred DropEffect"),
-            "RegisterClipboardFormatW(Preferred DropEffect)",
-        )?;
-        let preferred = crate::virtual_files::read_hglobal_bytes(&data, format, "Preferred DropEffect", 4)
-            .ok()
-            .and_then(|b| Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
-            .filter(|&e| e != 0)
-            .unwrap_or(EFFECT_COPY);
-        let wide = crate::to_wide(folder);
-        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
-            .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
+        let item: IShellItem =
+            SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
+                .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
         let target: IDropTarget = item
             .BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)
             .map_err(|e| crate::api_err("BindToHandler(IDropTarget)", e))?;
-        let keys = MODIFIERKEYS_FLAGS(0);
-        let mut effect = DROPEFFECT(preferred);
+        let mut answer = DROPEFFECT(effect);
         target
-            .DragEnter(&data, keys, POINTL::default(), &mut effect)
+            .DragEnter(data, MK_LBUTTON, POINTL::default(), &mut answer)
             .map_err(|e| crate::api_err("IDropTarget::DragEnter", e))?;
-        effect = DROPEFFECT(preferred);
+        answer = DROPEFFECT(effect);
         target
-            .Drop(&data, keys, POINTL::default(), &mut effect)
+            .Drop(data, MK_LBUTTON, POINTL::default(), &mut answer)
             .map_err(|e| crate::api_err("IDropTarget::Drop", e))?;
     }
     Ok(())
-}
-
-#[cfg(not(windows))]
-pub fn shell_paste_clipboard(_folder: &std::path::Path) -> crate::Result<()> {
-    Err(crate::WinError::Unsupported)
 }
 
 /// Stand-in so callers compile everywhere.
@@ -203,6 +191,9 @@ impl VirtualDataObject {
         false
     }
     pub fn clear_clipboard_if_current(&self) {}
+    pub fn shell_paste_into(&self, _folder: &std::path::Path) -> crate::Result<()> {
+        Err(crate::WinError::Unsupported)
+    }
     pub fn report(&self) -> TargetReport {
         TargetReport::default()
     }
@@ -909,6 +900,21 @@ mod imp {
                 // SAFETY: plain OLE call; releases our object and empties the clipboard.
                 let _ = unsafe { windows::Win32::System::Ole::OleSetClipboard(None::<&IDataObject>) };
             }
+        }
+
+        /// Pastes this object, while it is on the clipboard, into `folder` as Explorer's Paste
+        /// does: the folder's shell drop target, allowed only the "Preferred DropEffect" (Move
+        /// for a Cut). Returns at once; keep pumping messages while the shell copies. For
+        /// automation. The object itself is dropped: in this process the shell does not read
+        /// virtual files through the `OleGetClipboard` wrapper (Explorer, in its own process,
+        /// reaches this same object through its proxy).
+        pub fn shell_paste_into(&self, folder: &std::path::Path) -> crate::Result<()> {
+            if !self.is_on_clipboard() {
+                return Err(crate::WinError::Invalid(
+                    "these items are no longer on the clipboard".into(),
+                ));
+            }
+            super::shell_drop(&self.obj, folder, self.shared.preferred)
         }
 
         /// The modal drag returned `effect`.

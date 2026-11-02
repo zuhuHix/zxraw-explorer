@@ -1455,10 +1455,11 @@ fn archive_pane_lists_folders_and_up_returns_to_the_zip() {
 
 #[test]
 fn archive_items_copied_to_a_folder_are_extracted() {
-    // Ctrl+V reads the Windows clipboard to find the newest copy: nothing else may write
-    // to it meanwhile.
-    let _clipboard = crate::core::clipboard_lock();
     let sandbox = tempfile::tempdir().unwrap();
+    // Ctrl+C publishes the items on the Windows clipboard: keep the user's copy safe.
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
     let profile = sandbox.path().join("profile");
     let zip = pane_zip(&sandbox.path().join("zips"));
     let dest = sandbox.path().join("dest");
@@ -1481,11 +1482,13 @@ fn archive_items_copied_to_a_folder_are_extracted() {
             "focus right",
             "cmd Paste",
             "wait-jobs 30",
-            // F6 out of an archive copies.
+            // F6 out of an archive extracts, then asks whether to remove the items from the
+            // archive. Declined: the archive stays as it was.
             "focus left",
             "select deep",
             "cmd MoveToOtherPane",
-            "assert-toast copying them instead",
+            "ui browser wait-dialog Finish the move",
+            "cancel",
             "wait-jobs 30",
             "assert-no-error-toast",
         ],
@@ -1515,6 +1518,217 @@ fn archive_items_copied_to_a_folder_are_extracted() {
         zip_names(&zip),
         ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
         "a move out of an archive leaves it as it was"
+    );
+}
+
+/// The expected `(relative name, bytes)` list, sorted like [`tree`] returns it.
+fn owned_tree(pairs: &[(&str, &[u8])]) -> Vec<(String, Vec<u8>)> {
+    pairs
+        .iter()
+        .map(|(n, b)| (n.to_string(), b.to_vec()))
+        .collect()
+}
+
+#[test]
+fn archive_f6_out_removes_the_entries_once_the_move_is_accepted() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = dual_pane_script(
+        &zip,
+        &dest,
+        &[
+            "wait-entry sub",
+            "double-click-entry sub",
+            "wait-entry deep",
+            "select deep",
+            "cmd MoveToOtherPane",
+            "ui browser wait-dialog Finish the move",
+            "accept",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), owned_tree(&[("deep/x.txt", b"deep x")]));
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/inner.txt", "top.txt"],
+        "the moved entry is gone from the archive"
+    );
+}
+
+#[test]
+fn archive_cut_here_and_pasted_in_the_other_pane_moves_out_once_accepted() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = dual_pane_script(
+        &zip,
+        &dest,
+        &[
+            "wait-entry sub",
+            "select top.txt",
+            "cmd Cut",
+            "focus right",
+            "cmd Paste",
+            "ui browser wait-dialog Finish the move",
+            "accept",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        tree(&dest),
+        owned_tree(&[("top.txt", b"top of the archive")])
+    );
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt"],
+        "the cut entry is gone from the archive"
+    );
+}
+
+#[test]
+fn archive_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         select sub\n\
+         cmd Copy\n\
+         ui browser assert-archive-copy 1\n\
+         ui system shell-paste {dest}\n\
+         wait-exists {inner}\n\
+         wait-exists {deep}\n\
+         sleep 500\n\
+         ui browser assert-no-dialog\n\
+         assert-no-error-toast\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+        inner = shown(&dest.join("sub").join("inner.txt")),
+        deep = shown(&dest.join("sub").join("deep").join("x.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        tree(&dest),
+        owned_tree(&[
+            ("sub/deep/x.txt", b"deep x"),
+            ("sub/inner.txt", b"inner text"),
+        ])
+    );
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
+        "a copy leaves the archive as it was"
+    );
+}
+
+#[test]
+fn archive_cut_and_shell_pasted_asks_to_finish_the_move_and_removes_on_accept() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         select sub\n\
+         cmd Cut\n\
+         ui system shell-paste {dest}\n\
+         ui browser wait-dialog Finish the move | 60\n\
+         accept\n\
+         wait-jobs 30\n\
+         assert-no-error-toast\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        tree(&dest),
+        owned_tree(&[
+            ("sub/deep/x.txt", b"deep x"),
+            ("sub/inner.txt", b"inner text"),
+        ])
+    );
+    assert_eq!(zip_names(&zip), ["top.txt"]);
+}
+
+#[test]
+fn archive_cut_then_archive_changed_shell_paste_gives_out_and_removes_nothing() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         select top.txt\n\
+         cmd Cut\n\
+         ui system touch {zip}\n\
+         ui system shell-paste {dest}\n\
+         ui browser wait-dialog some files were not given out\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    // The stage refuses every file of an archive changed since it was listed: nothing is
+    // handed out from contents the listing no longer describes, and nothing is removed.
+    assert!(
+        tree(&dest).iter().all(|(_, bytes)| bytes.is_empty()),
+        "{:?}",
+        tree(&dest)
+    );
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
+        "a changed archive keeps every entry"
     );
 }
 
@@ -1609,6 +1823,12 @@ fn small_images_in_an_archive_get_thumbnails() {
 
 /// A solid 7z made by the engine with the same three files as [`pane_zip`].
 fn pane_7z(dir: &Path, password: Option<&str>) -> PathBuf {
+    pane_7z_with(dir, password, true)
+}
+
+/// [`pane_7z`] with the choice of encrypted names: with `encrypt_names: false` the names
+/// list without the password, and only the contents need it.
+fn pane_7z_with(dir: &Path, password: Option<&str>, encrypt_names: bool) -> PathBuf {
     let src = dir.join("content");
     write_file(&src.join("top.txt"), b"top of the archive");
     write_file(&src.join("sub/inner.txt"), b"inner text");
@@ -1618,6 +1838,7 @@ fn pane_7z(dir: &Path, password: Option<&str>) -> PathBuf {
         encryption: password.map_or(forge_core::archive::Encryption::None, |p| {
             forge_core::archive::Encryption::Aes256(forge_core::archive::Password::new(p))
         }),
+        encrypt_names,
         ..Default::default()
     };
     let (cancel, progress) = (forge_jobs::CancelToken::new(), forge_jobs::Progress::default());
@@ -1922,4 +2143,87 @@ fn tar_zst_extract_to_folder_and_single_gz_extract_here() {
     // `pack.tar.zst` extracts to `pack\`, not `pack.tar\`.
     assert_eq!(tree(&zips.join("pack")), expected_7z_tree());
     assert_eq!(fs::read(zips.join("notes.txt")).unwrap(), b"compressed notes");
+}
+
+#[test]
+fn seven_zip_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let archive = pane_7z(&sandbox.path().join("zips"), None);
+    let before = zip_names(&archive);
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {archive}\n\
+         wait-entry sub\n\
+         select top.txt, sub\n\
+         cmd Copy\n\
+         ui browser assert-archive-copy 2\n\
+         ui system shell-paste {dest}\n\
+         wait-exists {top}\n\
+         wait-exists {deep}\n\
+         sleep 500\n\
+         ui browser assert-no-dialog\n\
+         assert-no-error-toast\n\
+         exit\n",
+        archive = shown(&archive),
+        dest = shown(&dest),
+        top = shown(&dest.join("top.txt")),
+        deep = shown(&dest.join("sub").join("deep").join("x.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+    assert_eq!(
+        zip_names(&archive),
+        before,
+        "a copy leaves the archive as it was"
+    );
+}
+
+#[test]
+fn encrypted_archive_copy_asks_for_the_password_before_the_copy_is_published() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    // Names in the clear, contents encrypted: the pane lists without a password.
+    let archive = pane_7z_with(&sandbox.path().join("zips"), Some("pw"), false);
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    // The toast comes only once the copy is on the clipboard (a failed publish says so
+    // instead). The paste is the app's own, since the shell paste does not copy yet (see
+    // `archive_folder_copied_and_shell_pasted_is_extracted_byte_identical`).
+    let script = dual_pane_script(
+        &archive,
+        &dest,
+        &[
+            "wait-entry sub",
+            "select top.txt",
+            "cmd Copy",
+            "ui browser archive-password pw",
+            "ui system wait-toast Copied 1 item from the archive",
+            "focus right",
+            "cmd Paste",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        tree(&dest),
+        owned_tree(&[("top.txt", b"top of the archive")]),
+        "the decrypted file is what was pasted"
+    );
 }

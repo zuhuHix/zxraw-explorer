@@ -271,3 +271,39 @@ fn a_shift_drop_on_the_shell_confirms_the_move() {
     eprintln!("shell move report: {:?}", data.report());
     assert_eq!(provider.moved.load(Ordering::SeqCst), 1, "{:?}", data.report());
 }
+
+#[test]
+fn a_shell_paste_of_the_clipboard_writes_the_virtual_files() {
+    use crate::clipboard_test_support::{ClipboardLock, Snapshot};
+
+    let _lock = ClipboardLock::acquire();
+    let saved = match Snapshot::save() {
+        Ok(saved) => saved,
+        Err(why) => {
+            eprintln!("skipped: the clipboard holds {why}, which this test can't restore");
+            return;
+        }
+    };
+    let _ole = OleApartment::new().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let (offer, provider) = offer(false, true);
+    let data = VirtualDataObject::new(offer, provider.clone()).unwrap();
+    data.set_clipboard().unwrap();
+    let pasted = data.shell_paste_into(dest.path());
+    let big_file = dest.path().join(r"docs\sub\big.bin");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    pump_until(|| {
+        (std::fs::read(&big_file).is_ok_and(|b| b == big())
+            && provider.moved.load(Ordering::SeqCst) > 0)
+            || std::time::Instant::now() > deadline
+    });
+    let report = data.report();
+    data.clear_clipboard_if_current();
+    if let Err(e) = saved.restore_if(|| true) {
+        eprintln!("warning: could not restore the clipboard: {e}");
+    }
+    pasted.unwrap();
+    eprintln!("shell paste report: {report:?}");
+    assert_eq!(std::fs::read(&big_file).unwrap(), big());
+    assert_eq!(provider.moved.load(Ordering::SeqCst), 1, "{report:?}");
+}
