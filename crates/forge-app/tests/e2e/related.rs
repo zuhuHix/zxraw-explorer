@@ -72,10 +72,13 @@ fn video_proxy_conventions_and_external_root_scan_are_visible() {
     let shots_local = shot("video-related-local.png");
     let shots_dji = shot("video-related-dji.png");
     let shots_external = shot("video-related-located.png");
+    // Scrolls move by fixed amounts, so each one waits for `wait-preview-settled`: the
+    // thumbnail, metadata and scans that load in the background change the layout.
     let steps = vec![
         path_step("navigate", &videos),
         "cmd TogglePreview".into(),
         "select GX010001.MP4".into(),
+        "ui related wait-preview-settled".into(),
         "wait-frames 2".into(),
         "pointer 1400 700".into(),
         "scroll -600".into(),
@@ -88,17 +91,20 @@ fn video_proxy_conventions_and_external_root_scan_are_visible() {
         "wait-frames 2".into(),
         "ui related assert-proxies GX010001_proxy.mp4".into(),
         "select DJI_0001.MP4".into(),
+        "ui related wait-preview-settled".into(),
         "wait-frames 2".into(),
         "ui related assert-proxies DJI_0001.LRF".into(),
         path_step("screenshot", &shots_dji),
         "select C0001.MP4".into(),
+        "ui related wait-preview-settled".into(),
         "wait-frames 2".into(),
         "ui related assert-proxies C0001S03.MP4".into(),
         "select GX010001.MP4".into(),
         "wait-frames 2".into(),
         path_step("dialog", &external),
         "ui related proxies-locate".into(),
-        // Wait for the asynchronous scan before scrolling; its results extend the preview.
+        // Wait for the asynchronous scan (and the rest of the preview) before scrolling.
+        "ui related wait-preview-settled".into(),
         "ui related assert-no-proxies GX010002_proxy.mp4".into(),
         // Scroll just far enough to bring the located row into the visible Related section.
         "pointer 1250 700".into(),

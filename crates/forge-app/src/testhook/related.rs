@@ -1,6 +1,9 @@
 //! `ui related <verb> [args]` script verbs.
 //!
 //! - `proxies-locate`: open the folder picker (answer with the script `dialog` step).
+//! - `wait-preview-settled`: wait until the selected file's preview has loaded everything it
+//!   loads in the background (thumbnail, metadata, related scans, export associations), so a
+//!   following scroll lands on the final layout.
 //! - `assert-proxies <name>[, <name>...]`: wait for local or located proxy matches.
 //! - `assert-no-proxies <name>[, <name>...]`: wait for the proxy scan, then require that none of the names match.
 //! - `assert-originals <name>[, <name>...]` and `assert-exports ...`: wait for filename-rule matches.
@@ -29,6 +32,7 @@ pub(super) fn step(
             crate::video_ui::locate_proxies(app);
             Ok(Flow::Done)
         }
+        "wait-preview-settled" => wait_preview_settled(app, ctx, st),
         "assert-proxies" => assert_proxies(app, ctx, args, st, true),
         "assert-no-proxies" => assert_proxies(app, ctx, args, st, false),
         "assert-originals" => assert_associations(app, ctx, args, st, false),
@@ -140,6 +144,53 @@ fn assert_proxies(
         ));
     }
     Ok(Flow::Done)
+}
+
+/// Waits until everything the preview panel of the selected file loads off the UI thread has
+/// arrived: its thumbnail (drawn above the scrolled part), its metadata, its related-file and
+/// proxy scans and its export associations. Each of them changes the height of what is drawn
+/// above or below the related rows, so a scroll by a fixed amount means the same thing only
+/// once they are all in.
+fn wait_preview_settled(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+) -> Result<Flow, String> {
+    if app.pane().is_loading() {
+        wait_timed_out(st, "the pane listing before the preview settles")?;
+        return Ok(Flow::Wait("the pane listing is still loading".into()));
+    }
+    let Some(entry) = app.pane().cursor_entry().cloned() else {
+        return Err("select a file before waiting for its preview".into());
+    };
+    let ffmpeg_dir = app.settings.ffmpeg_dir.clone();
+    app.ops
+        .video_ui
+        .ensure_related_scan(&entry, ffmpeg_dir.as_deref(), ctx);
+    let rules = crate::export_assoc::active_rules(&app.settings.export_rules);
+    crate::export_assoc::request_for(&entry.path, &rules, ctx);
+    let ui = &app.ops.video_ui;
+    let waiting = if ui.relation_scan_pending() || ui.proxy_scan_pending() {
+        Some("the related-file scans")
+    } else if app.ops.meta.get(&entry, ctx).is_none() {
+        Some("the preview metadata")
+    } else if matches!(
+        crate::export_assoc::cached_for(&entry.path, &rules),
+        Some(crate::export_assoc::QueryState::Pending) | None
+    ) {
+        Some("the export associations")
+    } else if !app.ops.thumbs.is_idle() {
+        Some("the thumbnails")
+    } else {
+        None
+    };
+    match waiting {
+        Some(what) => {
+            wait_timed_out(st, what)?;
+            Ok(Flow::Wait(format!("waiting for {what}")))
+        }
+        None => Ok(Flow::Done),
+    }
 }
 
 fn path_name(path: &std::path::Path) -> String {

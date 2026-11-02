@@ -105,6 +105,7 @@ mod windows_impl {
     use std::path::Path;
 
     use image::{DynamicImage, RgbaImage};
+    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Graphics::Imaging::{
         CLSID_WICImagingFactory, GUID_ContainerFormatHeif, GUID_WICPixelFormat32bppRGBA,
@@ -120,7 +121,6 @@ mod windows_impl {
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
         CoUninitialize, IEnumUnknown,
     };
-    use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
     use windows::core::{GUID, IUnknown, Interface, PCWSTR, w};
 
     use crate::error::{MediaError, Result};
