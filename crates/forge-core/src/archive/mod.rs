@@ -571,13 +571,15 @@ pub fn extract(
 
     let indices: Vec<usize> = planned.iter().map(|p| p.entry.index).collect();
     let password = opts.password.as_ref();
+    // Limits first: checking the password opens an entry, which sets up its decoder. The
+    // preflight reads encrypted headers only when the password passes their check.
+    backend.preflight(archive, &indices, password, limits)?;
     if let Some(first) = planned
         .iter()
         .find(|p| p.entry.encrypted && !p.entry.is_dir)
     {
         check_password(backend, archive, first.entry.index, password)?;
     }
-    backend.preflight(archive, &indices, password, limits)?;
     // The destination, resolved and pinned from the volume root for the whole job; entries
     // are written beneath its final path and reported beneath `dest_dir`.
     let base = safety::PinnedBase::open(dest_dir)?;
@@ -946,10 +948,10 @@ pub fn test_archive(
     let listing = backend.list(archive, limits.max_entries)?;
     let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
+    backend.preflight(archive, &indices, password, limits)?;
     if let Some(first) = files.iter().find(|e| e.encrypted) {
         check_password(backend, archive, first.index, password)?;
     }
-    backend.preflight(archive, &indices, password, limits)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
         .add_total_bytes(files.iter().map(|e| e.size).sum());
