@@ -56,14 +56,62 @@ pub struct Dropped {
     /// The selected items' file system paths.
     pub paths: Vec<PathBuf>,
     /// Display names of selected items that have no file system path (a library, a phone,
-    /// "This PC"). The command must not run on the rest alone.
+    /// "This PC") or could not be read. The command must not run on the rest alone.
     pub unresolved: Vec<String>,
+    /// The selection itself could not be read (why). The command must not run at all.
+    pub failure: Option<String>,
 }
 
 impl Dropped {
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty() && self.unresolved.is_empty()
+        self.paths.is_empty() && self.unresolved.is_empty() && self.failure.is_none()
     }
+
+    fn failed(why: impl Into<String>) -> Self {
+        Self {
+            failure: Some(why.into()),
+            ..Self::default()
+        }
+    }
+}
+
+/// One selected item as the shell lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SelectedItem {
+    /// Its file system path; `None` when it has none.
+    pub path: Option<PathBuf>,
+    /// Its display name, for messages.
+    pub name: Option<String>,
+}
+
+/// A selection as Explorer's shell item array lists it (a trait so tests can make it fail).
+pub(crate) trait Selection {
+    fn count(&self) -> std::result::Result<u32, String>;
+    fn item(&self, index: u32) -> std::result::Result<SelectedItem, String>;
+}
+
+/// Every item of `selection`, or why not. Once the shell's own list of the selection was
+/// obtained, nothing falls back to a smaller list: an item that cannot be read, or has no
+/// file system path, is reported in `unresolved`, and a list that cannot be counted (or
+/// is empty) is a `failure`, so the command never runs on part of the selection.
+pub(crate) fn collect(selection: &dyn Selection) -> Dropped {
+    let count = match selection.count() {
+        Ok(0) => return Dropped::failed("Explorer passed an empty selection"),
+        Ok(count) => count,
+        Err(why) => return Dropped::failed(format!("Explorer could not list the selected items ({why})")),
+    };
+    let mut out = Dropped::default();
+    for index in 0..count {
+        let label = |name: Option<String>| name.unwrap_or_else(|| format!("item {}", index + 1));
+        match selection.item(index) {
+            Ok(SelectedItem { path: Some(path), .. }) => out.paths.push(path),
+            Ok(SelectedItem { path: None, name }) => out.unresolved.push(label(name)),
+            Err(why) => out
+                .unresolved
+                .push(format!("{} (Explorer could not read it: {why})", label(None))),
+        }
+    }
+    out
 }
 
 /// Serves `verb`'s class until Explorer dropped the selection on it, at most `wait`.
@@ -241,33 +289,42 @@ mod imp {
         text.ok().filter(|t| !t.is_empty())
     }
 
-    /// The items a data object carries: through its shell items (covers search results and
-    /// libraries), else its `CF_HDROP` list. An item without a file system path is listed in
-    /// `unresolved`, never skipped silently.
+    struct ShellItems(IShellItemArray);
+
+    impl super::Selection for ShellItems {
+        fn count(&self) -> std::result::Result<u32, String> {
+            // SAFETY: a live shell item array.
+            unsafe { self.0.GetCount() }.map_err(|e| e.message())
+        }
+
+        fn item(&self, index: u32) -> std::result::Result<super::SelectedItem, String> {
+            // SAFETY: as above; `index` is below the count.
+            let item = unsafe { self.0.GetItemAt(index) }.map_err(|e| e.message())?;
+            Ok(super::SelectedItem {
+                path: display_name(&item, SIGDN_FILESYSPATH).map(PathBuf::from),
+                name: display_name(&item, SIGDN_NORMALDISPLAY),
+            })
+        }
+    }
+
+    /// The items a data object carries, through its shell items (covers search results and
+    /// libraries; see [`super::collect`]). Only a data object that has no shell item list at
+    /// all is read through its `CF_HDROP` list instead.
     pub(super) fn read_items(data: &IDataObject) -> Dropped {
-        let from_items = (|| -> windows::core::Result<Dropped> {
-            // SAFETY: plain COM calls on a live data object.
-            let items: IShellItemArray = unsafe { SHCreateShellItemArrayFromDataObject(data) }?;
-            let count = unsafe { items.GetCount() }?;
-            let mut out = Dropped::default();
-            for i in 0..count {
-                let item = unsafe { items.GetItemAt(i) }?;
-                match display_name(&item, SIGDN_FILESYSPATH) {
-                    Some(path) => out.paths.push(PathBuf::from(path)),
-                    None => out.unresolved.push(
-                        display_name(&item, SIGDN_NORMALDISPLAY)
-                            .unwrap_or_else(|| format!("item {}", i + 1)),
-                    ),
+        // SAFETY: plain COM call on a live data object.
+        match unsafe { SHCreateShellItemArrayFromDataObject::<_, IShellItemArray>(data) } {
+            Ok(items) => super::collect(&ShellItems(items)),
+            Err(_) => {
+                let paths = read_hdrop(data);
+                if paths.is_empty() {
+                    Dropped::failed("Explorer passed no files or folders")
+                } else {
+                    Dropped {
+                        paths,
+                        ..Dropped::default()
+                    }
                 }
             }
-            Ok(out)
-        })();
-        match from_items {
-            Ok(items) if !items.is_empty() => items,
-            _ => Dropped {
-                paths: read_hdrop(data),
-                unresolved: Vec::new(),
-            },
         }
     }
 
@@ -397,6 +454,62 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(5));
     }
+
+    /// A selection whose items the test decides: `Ok(Some(path))`, `Ok(None)` (no file
+    /// system path), or `Err` (the item cannot be read).
+    struct Fake {
+        count: std::result::Result<u32, String>,
+        items: Vec<std::result::Result<Option<&'static str>, String>>,
+    }
+
+    impl Selection for Fake {
+        fn count(&self) -> std::result::Result<u32, String> {
+            self.count.clone()
+        }
+        fn item(&self, index: u32) -> std::result::Result<SelectedItem, String> {
+            self.items[index as usize].clone().map(|path| SelectedItem {
+                path: path.map(PathBuf::from),
+                name: Some(format!("Name {index}")),
+            })
+        }
+    }
+
+    #[test]
+    fn an_enumeration_failure_refuses_rather_than_shrinking_the_selection() {
+        let ok = |p: &'static str| Ok(Some(p));
+        let all = collect(&Fake {
+            count: Ok(2),
+            items: vec![ok(r"C:\a"), ok(r"C:\b")],
+        });
+        assert_eq!(all.paths, [PathBuf::from(r"C:\a"), PathBuf::from(r"C:\b")]);
+        assert!(all.unresolved.is_empty() && all.failure.is_none());
+
+        // One item fails to read: it is reported, so the command is refused.
+        let broken = collect(&Fake {
+            count: Ok(3),
+            items: vec![ok(r"C:\a"), Err("RPC failed".into()), ok(r"C:\c")],
+        });
+        assert_eq!(broken.unresolved, ["item 2 (Explorer could not read it: RPC failed)"]);
+        assert!(!broken.is_empty());
+
+        // An item without a file system path is reported by name.
+        let virtual_item = collect(&Fake {
+            count: Ok(2),
+            items: vec![ok(r"C:\a"), Ok(None)],
+        });
+        assert_eq!(virtual_item.unresolved, ["Name 1"]);
+
+        // The list cannot be counted, or is empty: the whole command fails.
+        let uncounted = collect(&Fake {
+            count: Err("E_FAIL".into()),
+            items: vec![],
+        });
+        assert!(uncounted.paths.is_empty());
+        assert!(uncounted.failure.unwrap().contains("E_FAIL"));
+        let empty = collect(&Fake { count: Ok(0), items: vec![] });
+        assert!(empty.failure.is_some());
+    }
+
 
     /// The way Explorer runs a verb: create the class out of process and drop a data object
     /// holding several items on it. One drop carries every item. Nothing is registered in the

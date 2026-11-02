@@ -43,6 +43,14 @@ pub fn unresolved_message(verb: MenuVerb, names: &[String]) -> String {
     )
 }
 
+/// Why a menu command did not run: Explorer's selection could not be read (`why`).
+pub fn drop_failure_message(verb: MenuVerb, why: &str) -> String {
+    format!(
+        "\"{}\" did not run: {why}. Nothing was changed; select the items again and try once more.",
+        verb.label()
+    )
+}
+
 /// Why a menu command did not run: some items are gone (or, for the extract commands, are
 /// not archives). `None` when all are usable.
 fn refusal(verb: MenuVerb, paths: &[PathBuf]) -> Option<String> {
@@ -234,6 +242,11 @@ mod tests {
         let text = unresolved_message(MenuVerb::AddZip, &["This PC".into()]);
         assert!(text.contains("\"This PC\" is not a file or folder on disk"), "{text}");
         assert!(text.starts_with("\"Add to \"<name>.zip\"\" did not run"), "{text}");
+        let text = drop_failure_message(MenuVerb::ExtractHere, "Explorer passed an empty selection");
+        assert_eq!(
+            text,
+            "\"Extract here\" did not run: Explorer passed an empty selection. Nothing was changed; select the items again and try once more."
+        );
     }
 
     #[test]

@@ -366,7 +366,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   (for `.zip`, Windows' compressed folders) until then.
 * A menu command runs on the whole selection or not at all: an item without a file system path (a
   library entry, a phone, *This PC*), an item that vanished, or a non-archive given to an extract
-  command refuses the command with a message naming the items.
+  command refuses the command with a message naming the items. So does a selection Explorer
+  could not list completely; the menu never falls back to a shorter list of the selection.
 * `.rar` is registered for the menu and file types, but the extract commands open it only once
   ZXraw reads RAR (extract only: no creating `.rar`). Until then they report it as not an archive.
 * A selection of more than 8192 items, or over 4 MiB of paths, cannot be handed to the running window
