@@ -556,3 +556,89 @@ fn stale_partials_beside_an_archive_are_removed_unless_in_use() {
     assert_eq!(fs::read(&user_file).unwrap(), b"precious");
     drop(held);
 }
+
+#[test]
+fn adding_to_an_encrypted_archive_needs_its_password() {
+    let d = tempfile::tempdir().unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    for legacy in [false, true] {
+        let secret = d.path().join("secret.txt");
+        write(&secret, "top secret");
+        let archive = d.path().join(format!("enc-{legacy}.zip"));
+        let with = |pw: &str| CreateOptions {
+            encryption: if legacy {
+                Encryption::ZipCryptoLegacy(Password::new(pw))
+            } else {
+                Encryption::Aes256(Password::new(pw))
+            },
+            ..Default::default()
+        };
+        create(std::slice::from_ref(&secret), &archive, &with("pw"), &ctx).unwrap();
+        let original = fs::read(&archive).unwrap();
+        let fresh = d.path().join("fresh.txt");
+        write(&fresh, "fresh data");
+        let edit = ArchiveEdit {
+            add: vec![edit_add(fresh, "")],
+            delete: vec![],
+        };
+
+        // No password: never added unencrypted, nothing changes.
+        let err = update(&archive, &edit, &CreateOptions::default(), &ctx).unwrap_err();
+        assert!(matches!(err, CoreError::PasswordRequired(_)), "{err:?}");
+        assert_eq!(fs::read(&archive).unwrap(), original);
+        // A wrong password (ZipCrypto's one-byte check is backed by the checksum): nothing
+        // changes either.
+        for wrong in ["nope", "pw2", "PW", "x", "secret", "1234"] {
+            let err = update(&archive, &edit, &with(wrong), &ctx).unwrap_err();
+            assert!(matches!(err, CoreError::WrongPassword(_)), "{wrong}: {err:?}");
+            assert_eq!(fs::read(&archive).unwrap(), original);
+        }
+        assert!(
+            fs::read_dir(d.path())
+                .unwrap()
+                .flatten()
+                .all(|e| !ops::is_partial_name(&e.file_name().to_string_lossy()))
+        );
+
+        // The right password: the new entry is encrypted with it.
+        update(&archive, &edit, &with("pw"), &ctx).unwrap();
+        let listing = list(&archive).unwrap();
+        let added = listing.entries.iter().find(|e| e.name == "fresh.txt").unwrap();
+        assert!(added.encrypted && added.encryption.is_some(), "{added:?}");
+        let dest = d.path().join(format!("dest-{legacy}"));
+        fs::create_dir(&dest).unwrap();
+        let none = extract(&archive, &dest, &ExtractOptions::default(), None, &ctx).unwrap_err();
+        assert!(matches!(none, CoreError::PasswordRequired(_)), "{none:?}");
+        let opts = ExtractOptions {
+            password: Some(Password::new("pw")),
+            ..Default::default()
+        };
+        let r = extract(&archive, &dest, &opts, None, &ctx).unwrap();
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert_eq!(fs::read(dest.join("fresh.txt")).unwrap(), b"fresh data");
+
+        // Deleting copies AES entries as they are, so it needs no password; ZipCrypto
+        // entries are encrypted again, which does.
+        let del = ArchiveEdit {
+            add: vec![],
+            delete: vec!["fresh.txt".into()],
+        };
+        if legacy {
+            let err = update(&archive, &del, &CreateOptions::default(), &ctx).unwrap_err();
+            assert!(matches!(err, CoreError::PasswordRequired(_)), "{err:?}");
+            update(&archive, &del, &with("pw"), &ctx).unwrap();
+        } else {
+            update(&archive, &del, &CreateOptions::default(), &ctx).unwrap();
+        }
+        let listing = list(&archive).unwrap();
+        assert_eq!(listing.entries.len(), 1);
+        assert!(listing.entries[0].encrypted);
+        let again = d.path().join(format!("again-{legacy}"));
+        fs::create_dir(&again).unwrap();
+        let r = extract(&archive, &again, &opts, None, &ctx).unwrap();
+        assert!(r.failed.is_empty(), "{r:?}");
+        assert_eq!(fs::read(again.join("secret.txt")).unwrap(), b"top secret");
+    }
+}
+

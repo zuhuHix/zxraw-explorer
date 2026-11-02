@@ -400,7 +400,28 @@ impl ArchiveBackend for ZipBackend {
             if !names.insert(key) {
                 continue; // keep the first of duplicate names
             }
-            zw.raw_copy_file(f).map_err(|e| zip_err(archive, e))?;
+            let zipcrypto =
+                f.encrypted() && !f.is_dir() && f.get_metadata().aes_settings().is_none();
+            if !zipcrypto {
+                zw.raw_copy_file(f).map_err(|e| zip_err(archive, e))?;
+                report.kept += 1;
+                continue;
+            }
+            // `raw_copy_file` drops the encryption flag, which would leave a ZipCrypto entry
+            // unreadable: decrypt it and write it again with the same password.
+            let (method, mtime, size) = (f.compression(), f.last_modified(), f.size());
+            drop(f);
+            let password = match &opts.encryption {
+                Encryption::None => {
+                    return Err(CoreError::PasswordRequired(paths::display_path(archive)));
+                }
+                Encryption::Aes256(p) | Encryption::ZipCryptoLegacy(p) => p,
+            };
+            reencrypt(&mut src, i, &name, (method, mtime, size), password, &mut zw, ctx)
+                .map_err(|e| match e {
+                    CoreError::Cancelled => e,
+                    e => CoreError::Invalid(format!("{}: {e}", archive.display())),
+                })?;
             report.kept += 1;
         }
         write_items(
@@ -499,6 +520,56 @@ fn delete_if_unused(path: &Path) {
 
 #[cfg(not(windows))]
 fn delete_if_unused(_: &Path) {}
+
+/// Copy the ZipCrypto entry `index` of `src` into `zw`, decrypted and encrypted again with
+/// `password` (ZipCrypto, so it opens in the same tools as before).
+fn reencrypt(
+    src: &mut ZipArchive<BufReader<File>>,
+    index: usize,
+    name: &str,
+    (method, mtime, size): (CompressionMethod, Option<zip::DateTime>, u64),
+    password: &Password,
+    zw: &mut Output<'_>,
+    ctx: &JobCtx<'_>,
+) -> Result<()> {
+    let options = ZipReadOptions::new()
+        .password(Some(password.as_bytes()))
+        .enforce_header_consistency(true);
+    let mut data = src
+        .by_index_with_options(index, options)
+        .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
+    let method = match method {
+        CompressionMethod::Stored
+        | CompressionMethod::Zstd
+        | CompressionMethod::Bzip2
+        | CompressionMethod::Xz => method,
+        _ => CompressionMethod::Deflated,
+    };
+    let o = FileOptions::<()>::default()
+        .compression_method(method)
+        .last_modified_time(mtime.unwrap_or_default())
+        .large_file(size >= u32::MAX as u64)
+        .with_deprecated_encryption(password.as_bytes())
+        .map_err(|_| CoreError::Invalid("the password must not be empty".into()))?;
+    zw.start_file(name, o)
+        .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        ctx.cancel.check()?;
+        let n = match data.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(CoreError::Invalid(format!(
+                    "{name}: {e} (damaged data or wrong password)"
+                )));
+            }
+        };
+        zw.write_all(&buf[..n])
+            .map_err(|e| CoreError::Invalid(format!("{name}: {e}")))?;
+    }
+}
 
 /// Counts what is written to the archive file, for the progress output figure.
 struct CountingWriter<'a, W> {

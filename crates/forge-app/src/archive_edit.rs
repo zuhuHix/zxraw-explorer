@@ -45,7 +45,8 @@ pub struct ArchiveCopy {
 pub struct UpdateRequest {
     pub archive: PathBuf,
     pub edit: ArchiveEdit,
-    /// The archive has encrypted entries: added files are encrypted with its stored password.
+    /// The archive has encrypted entries: the edit needs its password (added files are
+    /// encrypted with it). The engine refuses to add files without it in any case.
     pub encrypted: bool,
     pub title: String,
 }
@@ -397,11 +398,13 @@ pub fn update_summary(report: &CreateReport, edit: &ArchiveEdit, name: &str) -> 
 
 /// Run an archive edit as a job; the panes showing the archive are listed again after.
 pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
-    let password = if request.encrypted {
-        app.ops.archive.passwords.get(&request.archive).cloned()
-    } else {
-        None
-    };
+    // Always the archive's own password: new entries never go in unencrypted, or encrypted
+    // with a different one. Without it, ask first; the engine checks it before rebuilding.
+    let password = app.ops.archive.passwords.get(&request.archive).cloned();
+    if request.encrypted && password.is_none() {
+        crate::archive_ui::ask_password(app, crate::archive_ui::Retry::Update(request), false);
+        return;
+    }
     let msgs = app.ops.archive.tx.clone();
     let events = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -443,6 +446,16 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
                     "{} — cancelled; {name} is unchanged",
                     job.title
                 )));
+                Ok(())
+            }
+            // Nothing was written: ask (again) and run the edit once the password is typed.
+            Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
+                let wrong = matches!(e, CoreError::WrongPassword(_));
+                let retry = crate::archive_ui::Retry::Update(UpdateRequest {
+                    encrypted: true,
+                    ..request.clone()
+                });
+                let _ = msgs.send(crate::archive_ui::Msg::NeedPassword { retry, wrong });
                 Ok(())
             }
             Err(e) => {

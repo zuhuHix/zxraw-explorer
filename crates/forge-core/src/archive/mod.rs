@@ -1182,6 +1182,14 @@ pub fn create_zip(sources: &[PathBuf], out: &Path, ctx: &JobCtx<'_>) -> Result<C
 /// Apply `edit` to `archive`: the archive is rebuilt into a temp file next to it (unchanged
 /// entries copied without recompressing) and atomically replaces the original when done.
 /// A cancelled or failed update leaves the original untouched.
+///
+/// Files added to an archive that has encrypted entries must be encrypted with the
+/// archive's password, and ZipCrypto entries are decrypted and encrypted again (their raw
+/// copy would lose the encryption flag). So when files are added to an encrypted archive,
+/// or the archive has ZipCrypto entries, the password must come in `opts.encryption`:
+/// without one the update fails with [`CoreError::PasswordRequired`], and with one that
+/// doesn't decrypt an existing entry with [`CoreError::WrongPassword`], before anything
+/// is written.
 pub fn update(
     archive: &Path,
     edit: &ArchiveEdit,
@@ -1189,9 +1197,63 @@ pub fn update(
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
     let backend = backend_for_file(archive)?;
+    check_update_password(backend, archive, edit, opts)?;
     let result = backend.update(archive, edit, opts, ctx);
     invalidate_cached(archive);
     result
+}
+
+/// The password new entries of an encrypted archive will get must open its existing ones.
+/// The smallest encrypted file is decoded in full, so ZipCrypto's one-byte check (or AES's
+/// two-byte one) passing by chance is caught by the checksum.
+fn check_update_password(
+    backend: &dyn ArchiveBackend,
+    archive: &Path,
+    edit: &ArchiveEdit,
+    opts: &CreateOptions,
+) -> Result<()> {
+    let listing = backend.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES)?;
+    let zipcrypto = listing
+        .entries
+        .iter()
+        .any(|e| e.encryption == Some(EntryEncryption::ZipCrypto));
+    if edit.add.is_empty() && !zipcrypto {
+        return Ok(());
+    }
+    let Some(probe) = listing
+        .entries
+        .iter()
+        .filter(|e| e.encrypted && !e.is_dir)
+        .min_by_key(|e| e.size)
+    else {
+        return Ok(());
+    };
+    let label = || paths::display_path(archive);
+    let password = match &opts.encryption {
+        Encryption::None => return Err(CoreError::PasswordRequired(label())),
+        Encryption::Aes256(p) | Encryption::ZipCryptoLegacy(p) => p,
+    };
+    let mut outcome = Err(CoreError::WrongPassword(label()));
+    backend.read_entries(
+        archive,
+        &|e| e.index == probe.index,
+        Some(password),
+        &mut |_, reader| {
+            match reader {
+                Ok(r) => {
+                    let mut sink = io::sink();
+                    let limit = probe.size.saturating_add(1);
+                    if io::copy(&mut r.take(limit), &mut sink).is_ok_and(|n| n == probe.size) {
+                        outcome = Ok(());
+                    }
+                }
+                Err(e) if is_password_error(&e) => outcome = Err(CoreError::WrongPassword(label())),
+                Err(e) => outcome = Err(e),
+            }
+            Ok(())
+        },
+    )?;
+    outcome
 }
 
 /// Source files and folders to add, flattened (folders walked, links reported).
