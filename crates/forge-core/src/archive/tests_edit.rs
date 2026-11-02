@@ -516,18 +516,28 @@ fn index_cached_is_refreshed_after_update() {
 #[test]
 fn stale_partials_beside_an_archive_are_removed_unless_in_use() {
     let d = tempfile::tempdir().unwrap();
-    let old = d
+    let name = || d.path().join(crate::ops::partial_name());
+    let (old, busy, fresh, linked) = (name(), name(), name(), name());
+    // Look like ours but aren't exactly: a user's file.
+    let notes = d
         .path()
-        .join(format!("{}stale", crate::ops::PARTIAL_PREFIX));
-    let busy = d.path().join(format!("{}busy", crate::ops::PARTIAL_PREFIX));
-    let fresh = d
-        .path()
-        .join(format!("{}fresh", crate::ops::PARTIAL_PREFIX));
-    for p in [&old, &busy, &fresh] {
+        .join(format!("{}notes.txt", crate::ops::PARTIAL_PREFIX));
+    let upper = d.path().join(format!(
+        "{}{}.tmp",
+        crate::ops::PARTIAL_PREFIX,
+        "A".repeat(32)
+    ));
+    for p in [&old, &busy, &fresh, &linked, &notes, &upper] {
         fs::write(p, b"partial").unwrap();
     }
+    // A matching name hard-linked to a user's file: deleting it would be harmless to the data,
+    // but it is not ours alone, so it stays.
+    let user_file = d.path().join("precious.dat");
+    fs::write(&user_file, b"precious").unwrap();
+    fs::remove_file(&linked).unwrap();
+    fs::hard_link(&user_file, &linked).unwrap();
     let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-    for p in [&old, &busy] {
+    for p in [&old, &busy, &linked, &notes, &upper] {
         File::options()
             .write(true)
             .open(p)
@@ -540,5 +550,9 @@ fn stale_partials_beside_an_archive_are_removed_unless_in_use() {
     assert!(!old.exists(), "an old unused partial is removed");
     assert!(busy.exists(), "a partial something has open stays");
     assert!(fresh.exists(), "a recent partial stays");
+    assert!(linked.exists(), "a hard-linked match stays");
+    assert!(notes.exists(), "a user's .forge-partial-notes.txt stays");
+    assert!(upper.exists(), "names not exactly ours stay");
+    assert_eq!(fs::read(&user_file).unwrap(), b"precious");
     drop(held);
 }

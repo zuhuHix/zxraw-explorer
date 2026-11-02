@@ -415,9 +415,10 @@ impl ArchiveBackend for ZipBackend {
 /// archive in the same folder once they are this old.
 const STALE_PARTIAL_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// Remove our temp files (`.forge-partial-*`) in `dir` last written more than `age` ago
-/// that nothing has open: each is opened exclusively (no sharing) with delete-on-close, so
-/// one still being written by a copy or another update is left alone.
+/// Remove our temp files in `dir` (exactly [`ops::is_partial_name`]) last written more than
+/// `age` ago that nothing has open. Each is opened exclusively (no sharing) without following
+/// a reparse point, and deleted through that handle only if it is a plain file with a single
+/// name: one still being written, a link, or a hard link to something else is left alone.
 pub(crate) fn remove_stale_partials(dir: &Path, age: std::time::Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -441,15 +442,47 @@ pub(crate) fn remove_stale_partials(dir: &Path, age: std::time::Duration) {
 #[cfg(windows)]
 fn delete_if_unused(path: &Path) {
     use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_DISPOSITION_INFO, FileDispositionInfo,
+        GetFileInformationByHandle, SetFileInformationByHandle,
+    };
     const DELETE: u32 = 0x0001_0000;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     // Share mode 0: fails while any other handle is open.
-    let _ = std::fs::OpenOptions::new()
-        .access_mode(DELETE)
+    let Ok(file) = std::fs::OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
         .share_mode(0)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path);
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    else {
+        return;
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open for the duration of the call and `info` is a valid out value.
+    if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_err()
+        || info.nNumberOfLinks != 1
+        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    {
+        return;
+    }
+    let disposition = FILE_DISPOSITION_INFO {
+        DeleteFile: true.into(),
+    };
+    // SAFETY: the pointer and size describe `disposition`, which outlives the call.
+    let _ = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
 }
 
 #[cfg(not(windows))]
