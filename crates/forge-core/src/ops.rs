@@ -3902,7 +3902,11 @@ mod tests {
         let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| false);
         assert!(r.is_err());
         assert_eq!(fs::read(&dest).unwrap(), b"the user's edit");
-        assert_eq!(fs::read_dir(&f.dst).unwrap().count(), 1, "the temp file is removed");
+        assert_eq!(
+            fs::read_dir(&f.dst).unwrap().count(),
+            1,
+            "the temp file is removed"
+        );
         let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| true);
         assert!(r.is_ok());
         assert_eq!(fs::read(&dest).unwrap(), b"source bytes");

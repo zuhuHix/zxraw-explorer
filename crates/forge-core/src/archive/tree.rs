@@ -27,7 +27,8 @@ pub struct ArchiveNode {
 impl ArchiveNode {
     /// `compressed / size` in percent, for files with data.
     pub fn ratio_percent(&self) -> Option<u32> {
-        (self.size > 0).then(|| ((self.compressed_size as f64 / self.size as f64) * 100.0).round() as u32)
+        (self.size > 0)
+            .then(|| ((self.compressed_size as f64 / self.size as f64) * 100.0).round() as u32)
     }
 }
 
@@ -116,7 +117,11 @@ impl ArchiveIndex {
             compressed_size: if e.is_dir { 0 } else { e.compressed_size },
             modified: e.modified,
             encrypted: e.encrypted,
-            method: if e.is_dir { String::new() } else { e.method.clone() },
+            method: if e.is_dir {
+                String::new()
+            } else {
+                e.method.clone()
+            },
             entry: Some(entry),
         });
         self.by_path.insert(key.clone(), n);
@@ -219,13 +224,23 @@ mod tests {
             comment: String::new(),
         });
         assert_eq!(idx.unsafe_entries, 1);
-        let root: Vec<&str> = idx.children("").unwrap().iter().map(|n| n.name.as_str()).collect();
+        let root: Vec<&str> = idx
+            .children("")
+            .unwrap()
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
         assert_eq!(root, ["a.txt", "b"]);
         let b = idx.node("B").unwrap();
         assert!(b.is_dir);
         assert_eq!(b.size, 16);
         assert!(b.entry.is_some(), "the explicit folder entry is attached");
-        let kids: Vec<&str> = idx.children("b/").unwrap().iter().map(|n| n.name.as_str()).collect();
+        let kids: Vec<&str> = idx
+            .children("b/")
+            .unwrap()
+            .iter()
+            .map(|n| n.name.as_str())
+            .collect();
         assert_eq!(kids, ["c", "two.txt"]);
         assert!(idx.is_dir("b/c") && idx.is_dir("") && !idx.is_dir("a.txt"));
         assert!(idx.children("a.txt").is_none() && idx.children("nope").is_none());

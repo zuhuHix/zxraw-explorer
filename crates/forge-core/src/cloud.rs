@@ -606,7 +606,12 @@ mod tests {
         let local = |_: &Path| Some((0x10, 0));
         let roots = [PathBuf::from(r"C:\Users\a\OneDrive")];
         let shoot = Path::new(r"D:\Shoots\2026");
-        assert!(!folder_may_hold_cloud_files_with(shoot, Some(&roots), &local, &no_sample));
+        assert!(!folder_may_hold_cloud_files_with(
+            shoot,
+            Some(&roots),
+            &local,
+            &no_sample
+        ));
         // A sync root inside the selected folder (copying the whole profile folder).
         assert!(folder_may_hold_cloud_files_with(
             Path::new(r"c:\users\A"),
@@ -622,7 +627,9 @@ mod tests {
             &no_sample
         ));
         // Registrations unreadable: assume anywhere.
-        assert!(folder_may_hold_cloud_files_with(shoot, None, &local, &no_sample));
+        assert!(folder_may_hold_cloud_files_with(
+            shoot, None, &local, &no_sample
+        ));
         // Marked by the Cloud Files reparse tag on an ancestor (a root not registered).
         let tagged = |p: &Path| {
             if p == Path::new(r"D:\Shoots") {
@@ -631,9 +638,19 @@ mod tests {
                 Some((0x10, 0))
             }
         };
-        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &tagged, &no_sample));
+        assert!(folder_may_hold_cloud_files_with(
+            shoot,
+            Some(&[]),
+            &tagged,
+            &no_sample
+        ));
         // Attributes unreadable: fail closed.
-        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &|_| None, &no_sample));
+        assert!(folder_may_hold_cloud_files_with(
+            shoot,
+            Some(&[]),
+            &|_| None,
+            &no_sample
+        ));
     }
 
     fn no_sample(_: &Path) -> bool {
@@ -644,8 +661,18 @@ mod tests {
     fn a_folder_whose_listing_shows_offline_files_is_walked() {
         let local = |_: &Path| Some((0x10, 0));
         let shoot = Path::new(r"\\fileserver\tiered\2026");
-        assert!(!folder_may_hold_cloud_files_with(shoot, Some(&[]), &local, &no_sample));
-        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &local, &|_| true));
+        assert!(!folder_may_hold_cloud_files_with(
+            shoot,
+            Some(&[]),
+            &local,
+            &no_sample
+        ));
+        assert!(folder_may_hold_cloud_files_with(
+            shoot,
+            Some(&[]),
+            &local,
+            &|_| true
+        ));
 
         let d = tempfile::tempdir().unwrap();
         for i in 0..5 {
@@ -657,7 +684,10 @@ mod tests {
         assert!(first_page_has_online_only(d.path(), LISTING_SAMPLE));
         clear_simulated_online_only(&offline);
         // An unreadable folder fails closed.
-        assert!(first_page_has_online_only(&d.path().join("missing"), LISTING_SAMPLE));
+        assert!(first_page_has_online_only(
+            &d.path().join("missing"),
+            LISTING_SAMPLE
+        ));
     }
 
     #[test]
