@@ -207,6 +207,8 @@ pub(super) struct Scan {
     pub file_size: u64,
     /// Memory its decoders need (0 for a plain tar).
     pub memory: u64,
+    /// Some member was left out of the listing because a later one has its name.
+    pub superseded: bool,
     /// Memory the scan itself takes, roughly (for the cache's budget).
     weight: u64,
 }
@@ -434,7 +436,7 @@ fn walk(
         let rest = drain(&mut dec, max.saturating_sub(tar_end), ctx).map_err(err)?;
         (tar_end + rest, info.checked, info.memory)
     };
-    let entries = entries_of(codec, &mut members, decoded, checksum, file_size);
+    let (entries, superseded) = entries_of(codec, &mut members, decoded, checksum, file_size);
     members.shrink_to_fit();
     let weight = (members.capacity() as u64)
         .saturating_mul(std::mem::size_of::<Member>() as u64)
@@ -463,6 +465,7 @@ fn walk(
         decoded,
         file_size,
         memory,
+        superseded,
         weight,
     })
 }
@@ -528,7 +531,7 @@ fn entries_of(
     decoded: u64,
     checksum: bool,
     file_size: u64,
-) -> Vec<ArchiveEntry> {
+) -> (Vec<ArchiveEntry>, bool) {
     let compressed = codec != Codec::None;
     // Each member's name is dropped as its listed form is made: never two copies of all.
     let names: Vec<String> = members
@@ -553,6 +556,10 @@ fn entries_of(
             .map(|(i, n)| !n.is_empty() && last.get(n.trim_end_matches('/')) == Some(&i))
             .collect()
     };
+    let superseded = names
+        .iter()
+        .zip(&keep)
+        .any(|(n, kept)| !n.is_empty() && !kept);
     let mut out = Vec::with_capacity(keep.iter().filter(|k| **k).count());
     for (i, (m, name)) in members.iter_mut().zip(names).enumerate() {
         let skip = skip_reason(m);
@@ -601,7 +608,7 @@ fn entries_of(
             name,
         });
     }
-    out
+    (out, superseded)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +703,12 @@ fn read_tar(
         }
     }
     result
+}
+
+/// Whether a tar has a name given more than once (the earlier members are left out of its
+/// listing, and an edit, which rewrites only the listed ones, would drop them).
+pub(super) fn has_superseded(archive: &Path, codec: Codec) -> Result<bool> {
+    Ok(scan(archive, codec, None, None)?.superseded)
 }
 
 /// Hand one member's data to the visitor (a sparse file with its holes as zeros).
