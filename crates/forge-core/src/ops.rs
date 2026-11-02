@@ -262,6 +262,96 @@ pub fn is_partial_name(name: &str) -> bool {
         })
 }
 
+/// Our temp names from older versions: `.forge-partial-<16 lowercase hex>`, no suffix. Strict,
+/// like [`is_partial_name`].
+pub fn is_legacy_partial_name(name: &str) -> bool {
+    name.strip_prefix(PARTIAL_PREFIX).is_some_and(|hex| {
+        hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Any temp file name this program has written, current or legacy shape.
+pub fn is_leftover_name(name: &str) -> bool {
+    is_partial_name(name) || is_legacy_partial_name(name)
+}
+
+/// Delete the leftover temp files directly in `dir` (see [`is_leftover_name`]) that were last
+/// written more than `age` ago and that nothing has open. Folders, links and hard-linked
+/// files are never touched, and links are never followed. Errors are ignored: a file that
+/// cannot be deleted now is left for a later run.
+pub fn remove_stale_partials(dir: &Path, age: std::time::Duration) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if !is_leftover_name(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        let path = e.path();
+        // Cheap pre-check on the entry itself (not followed); the open handle decides.
+        let old = fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.is_file() && is_older_than(m.modified(), age));
+        if old {
+            delete_unused_file(&path, age);
+        }
+    }
+}
+
+/// Was a file last written more than `age` ago? Unknown times count as young.
+pub(crate) fn is_older_than(modified: io::Result<SystemTime>, age: std::time::Duration) -> bool {
+    modified.is_ok_and(|t| SystemTime::now().duration_since(t).is_ok_and(|a| a > age))
+}
+
+/// Opens the file exclusively without following a reparse point, then deletes it through that
+/// handle only if it is a plain file with one name that is still older than `age`.
+#[cfg(windows)]
+fn delete_unused_file(path: &Path, age: std::time::Duration) {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_DISPOSITION_INFO, FileDispositionInfo,
+        GetFileInformationByHandle, SetFileInformationByHandle,
+    };
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    // Share mode 0: fails while any other handle is open.
+    let Ok(file) = OpenOptions::new()
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    else {
+        return;
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` is open for the duration of the call and `info` is a valid out value.
+    if unsafe { GetFileInformationByHandle(handle, &mut info) }.is_err()
+        || info.nNumberOfLinks != 1
+        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        || !is_older_than(file.metadata().and_then(|m| m.modified()), age)
+    {
+        return;
+    }
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: the pointer and size describe `disposition`, which outlives the call.
+    let _ = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const disposition).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+}
+
+#[cfg(not(windows))]
+fn delete_unused_file(_: &Path, _: std::time::Duration) {}
+
 #[cfg(windows)]
 fn win_attrs(md: &fs::Metadata) -> u32 {
     use std::os::windows::fs::MetadataExt;
@@ -2781,6 +2871,159 @@ pub fn delete_permanently(targets: &[PathBuf], ctx: &JobCtx<'_>) -> OpReport {
         ctx.progress.add_items(1);
     }
     report
+}
+
+/// Helpers and tests for the cleanup of leftover temp files (`remove_stale_partials`).
+#[cfg(all(test, windows))]
+pub(crate) mod leftover_tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime};
+
+    /// The cleanup age used by extraction (one hour).
+    pub(crate) const AGE: Duration = Duration::from_secs(3600);
+
+    /// Two hours ago: old enough to be removed.
+    pub(crate) fn old() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(2 * 3600)
+    }
+
+    /// Set the modified time of a file or folder itself (a link is never followed).
+    pub(crate) fn set_mtime(path: &Path, t: SystemTime) {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// A junction `link` to `target`. `None` when `mklink` is unavailable.
+    pub(crate) fn junction(link: &Path, target: &Path) -> Option<()> {
+        let ok = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .is_ok_and(|s| s.success());
+        ok.then_some(())
+    }
+
+    #[test]
+    fn leftover_names_are_strict() {
+        let current = partial_name();
+        assert!(is_leftover_name(&current));
+        assert!(is_leftover_name(".forge-partial-0123456789abcdef"));
+        for bad in [
+            ".forge-partial-notes.txt",
+            ".forge-partial-1234",
+            ".forge-partial-0123456789ABCDEF",
+            ".forge-partial-0123456789abcdef0",
+            ".forge-partial-0123456789abcdef.tmp",
+            ".forge-partial-0123456789abcdef0123456789abcdef",
+            ".forge-partial-0123456789abcdef0123456789abcde.tmp",
+            "forge-partial-0123456789abcdef",
+            "x.forge-partial-0123456789abcdef",
+        ] {
+            assert!(!is_leftover_name(bad), "{bad} is not ours");
+        }
+    }
+
+    #[test]
+    fn old_leftovers_are_removed_and_everything_else_is_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path();
+        let legacy = p.join(".forge-partial-0123456789abcdef");
+        let current = p.join(partial_name());
+        let young = p.join(partial_name());
+        let near: Vec<PathBuf> = [
+            ".forge-partial-notes.txt",
+            ".forge-partial-1234",
+            // Upper case: a different file from the legacy name only on case-sensitive systems,
+            // so use other digits (Windows folders are case-insensitive).
+            ".forge-partial-FEDCBA9876543210",
+            ".forge-partial-0123456789abcdef.tmp",
+            ".forge-partial-0123456789abcdef0",
+        ]
+        .iter()
+        .map(|n| p.join(n))
+        .collect();
+        // A folder with a partial name is never a leftover.
+        let dir = p.join(format!("{PARTIAL_PREFIX}{}.tmp", "a".repeat(32)));
+        for f in [&legacy, &current, &young].into_iter().chain(&near) {
+            fs::write(f, b"leftover").unwrap();
+        }
+        fs::create_dir(&dir).unwrap();
+        for f in [&legacy, &current].into_iter().chain(&near) {
+            set_mtime(f, old());
+        }
+        set_mtime(&dir, old());
+        remove_stale_partials(p, AGE);
+        assert!(!legacy.exists(), "old legacy leftover removed");
+        assert!(!current.exists(), "old current leftover removed");
+        assert!(young.exists(), "young leftover kept");
+        for f in &near {
+            assert!(f.exists(), "{} kept", f.display());
+        }
+        assert!(dir.is_dir(), "a folder with a partial name kept");
+    }
+
+    #[test]
+    fn a_leftover_in_use_is_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let busy = d.path().join(partial_name());
+        fs::write(&busy, b"in use").unwrap();
+        set_mtime(&busy, old());
+        let held = File::open(&busy).unwrap();
+        remove_stale_partials(d.path(), AGE);
+        assert!(busy.exists(), "a file with an open handle is kept");
+        drop(held);
+        remove_stale_partials(d.path(), AGE);
+        assert!(!busy.exists(), "removed once nothing has it open");
+    }
+
+    #[test]
+    fn a_hard_linked_leftover_is_kept() {
+        let d = tempfile::tempdir().unwrap();
+        let user = d.path().join("precious.dat");
+        fs::write(&user, b"precious").unwrap();
+        let linked = d.path().join(partial_name());
+        fs::hard_link(&user, &linked).unwrap();
+        set_mtime(&linked, old());
+        remove_stale_partials(d.path(), AGE);
+        assert!(linked.exists(), "a hard-linked match is kept");
+        assert_eq!(fs::read(&user).unwrap(), b"precious");
+    }
+
+    #[test]
+    fn a_junction_with_a_leftover_name_is_not_followed() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("root");
+        let target = d.path().join("target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let inside = target.join(partial_name());
+        fs::write(&inside, b"not ours to delete").unwrap();
+        set_mtime(&inside, old());
+        let link = root.join(".forge-partial-0123456789abcdef");
+        if junction(&link, &target).is_none() {
+            eprintln!("skipped: mklink /J unavailable");
+            return;
+        }
+        set_mtime(&link, old());
+        remove_stale_partials(&root, AGE);
+        assert!(inside.exists(), "the junction's target is never touched");
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "a junction is never deleted here"
+        );
+        fs::remove_dir(&link).unwrap();
+    }
 }
 
 #[cfg(test)]
