@@ -37,7 +37,7 @@ use std::time::SystemTime;
 use parking_lot::Mutex;
 
 use super::codec::{self, Codec};
-use super::tar_read::{self, Kind, Member, SeekFile, Source, SparseReader, TarParser};
+use super::tar_read::{self, Kind, Member, SeekFile, Source, SparseMap, SparseReader, TarParser};
 use super::{
     ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, BlockEnd,
     CreateOptions, CreateReport, EntryVisitor, ExtractLimits, Password, archive_stem,
@@ -430,23 +430,24 @@ fn walk(
         (tar_end + rest, info.checked, info.memory)
     };
     let entries = entries_of(codec, &mut members, decoded, checksum, file_size);
-    let weight = (members.len() as u64)
+    members.shrink_to_fit();
+    let weight = (members.capacity() as u64)
         .saturating_mul(std::mem::size_of::<Member>() as u64)
         .saturating_add(
             members
                 .iter()
                 .filter_map(|m| m.sparse.as_ref())
-                .map(|s| (s.regions.len() * 16) as u64)
+                .map(|s| (std::mem::size_of::<SparseMap>() + s.regions.capacity() * 16) as u64)
                 .sum::<u64>(),
         )
+        .saturating_add((entries.capacity() * std::mem::size_of::<ArchiveEntry>()) as u64)
         .saturating_add(
             entries
                 .iter()
                 .map(|e| {
-                    (std::mem::size_of::<ArchiveEntry>()
-                        + e.name.len()
-                        + e.method.len()
-                        + e.skip.as_ref().map_or(0, String::len)) as u64
+                    (e.name.capacity()
+                        + e.method.capacity()
+                        + e.skip.as_ref().map_or(0, String::capacity)) as u64
                 })
                 .sum::<u64>(),
         );
@@ -524,7 +525,15 @@ fn entries_of(
     file_size: u64,
 ) -> Vec<ArchiveEntry> {
     let compressed = codec != Codec::None;
-    let names: Vec<String> = members.iter().map(listed_name).collect();
+    // Each member's name is dropped as its listed form is made: never two copies of all.
+    let names: Vec<String> = members
+        .iter_mut()
+        .map(|m| {
+            let n = listed_name(m);
+            m.name = String::new();
+            n
+        })
+        .collect();
     // The last member of each name wins; earlier ones are left out.
     let keep: Vec<bool> = {
         let mut last: HashMap<&str, usize> = HashMap::with_capacity(names.len());
@@ -542,7 +551,6 @@ fn entries_of(
     let mut out = Vec::with_capacity(keep.iter().filter(|k| **k).count());
     for (i, (m, name)) in members.iter_mut().zip(names).enumerate() {
         let skip = skip_reason(m);
-        m.name = String::new();
         m.link = String::new();
         if !keep[i] {
             continue;

@@ -522,20 +522,9 @@ type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>, u64
 /// the least recently used go first, and one heavier than this isn't kept.
 const INDEX_CACHE_BUDGET: u64 = 512 << 20;
 
-/// Roughly the memory of an index: its entries and nodes, and their names and paths.
+/// The memory of an index (see [`ArchiveIndex::memory_estimate`]).
 fn index_weight(idx: &ArchiveIndex) -> u64 {
-    let entries: u64 = idx
-        .listing
-        .entries
-        .iter()
-        .map(|e| (std::mem::size_of::<ArchiveEntry>() + e.name.len() + e.method.len()) as u64)
-        .sum();
-    let nodes: u64 = idx
-        .nodes()
-        .iter()
-        .map(|n| (std::mem::size_of::<ArchiveNode>() + 2 * n.path.len() + n.name.len()) as u64)
-        .sum();
-    entries + nodes
+    idx.memory_estimate()
 }
 
 fn cache() -> &'static IndexCache {

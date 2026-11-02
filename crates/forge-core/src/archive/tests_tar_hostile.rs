@@ -828,3 +828,129 @@ fn the_scan_cache_stays_within_its_budget() {
     assert!(tar_backend::cache_weight() <= cap);
     tar_backend::CACHE_CAP.store(0, Ordering::Relaxed);
 }
+
+#[test]
+fn header_walks_are_bounded_in_blocks() {
+    let d = tempfile::tempdir().unwrap();
+    codec::HEADER_BLOCKS_CAP.with(|c| c.set(Some(1000)));
+    // A Zstandard frame of 1,500 empty raw blocks.
+    let mut zst = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+    for i in 0..1500 {
+        let last = u8::from(i == 1499);
+        zst.extend([last, 0, 0]);
+    }
+    let p = write(d.path(), "blocks.tar.zst", &zst);
+    let err = list(&p).unwrap_err();
+    assert!(err.to_string().contains("more than 1000 blocks"), "{err}");
+    let p = write(d.path(), "blocks.bin.zst", &zst);
+    assert!(
+        list(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("more than 1000 blocks")
+    );
+    // An LZ4 frame of 1,500 one-byte stored blocks.
+    let mut lz4 = vec![0x04, 0x22, 0x4d, 0x18, 0x60, 0x40, 0x82];
+    for _ in 0..1500 {
+        lz4.extend(0x8000_0001u32.to_le_bytes());
+        lz4.push(b'a');
+    }
+    lz4.extend(0u32.to_le_bytes());
+    let p = write(d.path(), "blocks.bin.lz4", &lz4);
+    let err = list(&p).unwrap_err();
+    assert!(err.to_string().contains("more than 1000 blocks"), "{err}");
+    codec::HEADER_BLOCKS_CAP.with(|c| c.set(None));
+    // Within the budget the same streams read.
+    let p = write(d.path(), "ok.bin.lz4", &lz4);
+    assert_eq!(list(&p).unwrap().entries[0].size, 1500);
+}
+
+/// An xz file whose index is replaced by `records` (a raw record list after its count).
+fn xz_with_index(count: u64, records: &[u8]) -> Vec<u8> {
+    let mut w =
+        lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+    w.write_all(b"data").unwrap();
+    let xz = w.finish().unwrap();
+    let footer = xz.len() - 12;
+    let backward = u32::from_le_bytes(xz[footer + 4..footer + 8].try_into().unwrap());
+    let index_start = footer - (backward as usize + 1) * 4;
+    let mut index = vec![0u8];
+    let mut v = count;
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        index.push(if v == 0 { b } else { b | 0x80 });
+        if v == 0 {
+            break;
+        }
+    }
+    index.extend_from_slice(records);
+    while index.len() % 4 != 0 {
+        index.push(0);
+    }
+    index.extend(crc32fast::hash(&index).to_le_bytes());
+    let mut out = xz[..index_start].to_vec();
+    out.extend(&index);
+    let mut f = xz[footer..].to_vec();
+    f[4..8].copy_from_slice(&((index.len() / 4 - 1) as u32).to_le_bytes());
+    let crc = crc32fast::hash(&f[4..10]);
+    f[..4].copy_from_slice(&crc.to_le_bytes());
+    out.extend(f);
+    out
+}
+
+#[test]
+fn xz_index_records_are_counted_before_anything_is_kept() {
+    let d = tempfile::tempdir().unwrap();
+    // 2^60 records in a 16-byte index: refused from the count alone.
+    let p = write(d.path(), "count.bin.xz", &xz_with_index(1 << 60, &[]));
+    let err = list(&p).unwrap_err();
+    assert!(err.to_string().contains("damaged"), "{err}");
+    // More records than the work budget: refused before any is read.
+    codec::HEADER_BLOCKS_CAP.with(|c| c.set(Some(50)));
+    let records: Vec<u8> = (0..100).flat_map(|_| [0x10u8, 0x04]).collect();
+    let p = write(d.path(), "many.bin.xz", &xz_with_index(100, &records));
+    let err = list(&p).unwrap_err();
+    codec::HEADER_BLOCKS_CAP.with(|c| c.set(None));
+    assert!(err.to_string().contains("more than 50 blocks"), "{err}");
+}
+
+#[test]
+fn zstd_window_checks_match_the_decoder() {
+    assert_eq!(codec::zstd_window_log(5 << 20), 23);
+    assert_eq!(codec::zstd_window_log(4 << 20), 22);
+    assert_eq!(codec::zstd_window_log(1), 10);
+    assert_eq!(codec::zstd_window_log_max(6 << 20), Some(22));
+    assert_eq!(codec::zstd_window_log_max(1 << 30), Some(27));
+    assert_eq!(codec::zstd_window_log_max(1000), None);
+    let d = tempfile::tempdir().unwrap();
+    let tar = Tar::default().file("w.txt", b"window").end();
+    // A frame declaring a 5 MiB window (2^22 + 2/8 of it).
+    let mut e = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    e.window_log(22).unwrap();
+    e.write_all(&tar).unwrap();
+    let mut zst = e.finish().unwrap();
+    assert_eq!(zst[4] & 0x20, 0, "not single-segment");
+    assert_eq!(zst[5], 12 << 3);
+    zst[5] = (12 << 3) | 2;
+    let p = write(d.path(), "five.tar.zst", &zst);
+    // Under 6 MiB: refused up front (the decoder would need an 8 MiB window), not failed
+    // half-way.
+    let x = dest(d.path());
+    let limits = ExtractLimits {
+        max_decoder_memory: 6 << 20,
+        ..Default::default()
+    };
+    let err = try_extract(&p, &x, limits).unwrap_err();
+    assert!(
+        matches!(&err, CoreError::UnsafePath(m) if m.contains("memory")),
+        "{err:?}"
+    );
+    // Under 10 MiB it decodes.
+    let limits = ExtractLimits {
+        max_decoder_memory: 10 << 20,
+        ..Default::default()
+    };
+    try_extract(&p, &x, limits).unwrap();
+    assert_eq!(fs::read(x.join("w.txt")).unwrap(), b"window");
+}

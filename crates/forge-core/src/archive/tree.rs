@@ -59,7 +59,55 @@ pub struct ArchiveIndex {
     pub unsafe_entries: usize,
 }
 
+/// Heap memory of a `HashMap` with `capacity` and entries of `slot` bytes, roughly: its
+/// buckets (a power of two, at most 7/8 full) and their control bytes.
+fn map_bytes(capacity: usize, slot: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity.saturating_mul(8) / 7).next_power_of_two();
+    buckets * (slot + 1) + 16
+}
+
 impl ArchiveIndex {
+    /// An upper estimate of the memory the index holds (for caches): its listing, its nodes
+    /// and both maps, with every string, vector and map counted by capacity.
+    pub fn memory_estimate(&self) -> u64 {
+        use std::mem::size_of;
+        let entries = self.listing.entries.capacity() * size_of::<ArchiveEntry>()
+            + self
+                .listing
+                .entries
+                .iter()
+                .map(|e| {
+                    e.name.capacity()
+                        + e.method.capacity()
+                        + e.skip.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>()
+            + self.listing.comment.capacity();
+        let nodes = self.nodes.capacity() * size_of::<ArchiveNode>()
+            + self
+                .nodes
+                .iter()
+                .map(|n| n.name.capacity() + n.path.capacity() + n.method.capacity())
+                .sum::<usize>();
+        let by_path = map_bytes(self.by_path.capacity(), size_of::<(String, usize)>())
+            + self.by_path.keys().map(String::capacity).sum::<usize>();
+        let children = map_bytes(self.children.capacity(), size_of::<(String, Vec<usize>)>())
+            + self
+                .children
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity() * size_of::<usize>())
+                .sum::<usize>();
+        // Allocator bookkeeping and rounding, per allocation.
+        let allocations = self.listing.entries.len() * 2
+            + self.nodes.len() * 3
+            + self.by_path.len()
+            + self.children.len() * 2;
+        (size_of::<Self>() + entries + nodes + by_path + children + allocations * 16) as u64
+    }
+
     pub fn build(listing: ArchiveListing) -> Self {
         let mut idx = Self {
             listing: ArchiveListing {

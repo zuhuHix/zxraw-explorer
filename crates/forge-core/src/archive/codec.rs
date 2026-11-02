@@ -159,6 +159,70 @@ fn bad_headers(what: &str) -> io::Error {
     )
 }
 
+/// Most block headers read, over all frames or streams, before a file is decoded. Frame
+/// headers alone don't say where the next frame starts (Zstandard and LZ4 frames don't
+/// state their compressed length), so the walk goes block by block; millions of tiny
+/// blocks would make it long, so it stops here. A real file with this many blocks is at
+/// least hundreds of GB (Zstandard blocks are up to 128 KiB, LZ4 up to 4 MiB).
+const MAX_HEADER_BLOCKS: u64 = 4_000_000;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a smaller [`MAX_HEADER_BLOCKS`].
+    pub(crate) static HEADER_BLOCKS_CAP: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The work a header walk may do: block headers read, counted across all frames.
+struct Work {
+    blocks: u64,
+    max: u64,
+    exceeded: bool,
+}
+
+impl Work {
+    fn new() -> Self {
+        #[cfg(test)]
+        if let Some(max) = HEADER_BLOCKS_CAP.with(|c| c.get()) {
+            return Self {
+                blocks: 0,
+                max,
+                exceeded: false,
+            };
+        }
+        Self {
+            blocks: 0,
+            max: MAX_HEADER_BLOCKS,
+            exceeded: false,
+        }
+    }
+
+    /// Count `n` more blocks; `None` (and `exceeded`) past the budget.
+    fn blocks(&mut self, n: u64) -> Option<()> {
+        self.blocks = self.blocks.saturating_add(n);
+        if self.blocks > self.max {
+            self.exceeded = true;
+            return None;
+        }
+        Some(())
+    }
+
+    /// The error for a walk that stopped: too many blocks, or damaged headers.
+    fn error(&self, what: &str) -> io::Error {
+        if self.exceeded {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the {what} file has more than {} blocks; it is not read",
+                    self.max
+                ),
+            )
+        } else {
+            bad_headers(what)
+        }
+    }
+}
+
 /// Read the headers of the compressed file at `path` (see [`StreamInfo`]). An error when they
 /// can't be read, or ask for something the decoders refuse (a large-window Brotli stream).
 pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
@@ -172,7 +236,8 @@ pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
         Codec::Gzip => fixed(true, GZIP_MEMORY),
         Codec::Bzip2 => fixed(true, BZIP2_MEMORY),
         Codec::Xz => {
-            let x = xz_streams(path).ok_or_else(|| bad_headers("xz"))?;
+            let mut work = Work::new();
+            let x = xz_streams(path, &mut work).ok_or_else(|| work.error("xz"))?;
             let size = std::fs::File::open(path)
                 .ok()
                 .and_then(|f| lzma_rust2::xz_uncompressed_size(BufReader::new(f)).ok());
@@ -183,25 +248,29 @@ pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
             }
         }
         Codec::Zstd => {
-            let z = zstd_frames(path).ok_or_else(|| bad_headers("Zstandard"))?;
-            if z.window > 1 << ZSTD_WINDOW_LOG_MAX {
+            let mut work = Work::new();
+            let z = zstd_frames(path, &mut work).ok_or_else(|| work.error("Zstandard"))?;
+            // The decoder's window limit is a power of two: the window rounded up to one.
+            let log = zstd_window_log(z.window);
+            if log > ZSTD_WINDOW_LOG_MAX {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "a Zstandard window of {} MiB (at most 128 MiB is supported)",
-                        z.window >> 20
+                        z.window.div_ceil(1 << 20)
                     ),
                 ));
             }
             StreamInfo {
                 checked: z.checked,
                 // The window, plus a block's buffers.
-                memory: z.window.saturating_add(1 << 20),
+                memory: (1u64 << log).saturating_add(1 << 20),
                 size: z.size,
             }
         }
         Codec::Lz4 => {
-            let l = lz4_frames(path).ok_or_else(|| bad_headers("LZ4"))?;
+            let mut work = Work::new();
+            let l = lz4_frames(path, &mut work).ok_or_else(|| work.error("LZ4"))?;
             // Compressed and decoded blocks, and a linked block's 64 KiB window.
             fixed(
                 l.checked,
@@ -220,6 +289,19 @@ pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
             fixed(false, window.saturating_add(256 << 10))
         }
     })
+}
+
+/// The smallest window log (power of two, at least Zstandard's 2^10) holding `window`.
+pub(crate) fn zstd_window_log(window: u64) -> u32 {
+    let log = 64 - window.saturating_sub(1).leading_zeros();
+    log.max(10)
+}
+
+/// The largest window log a decoder under `limit` bytes may use: the power of two at or
+/// below it (`None` below Zstandard's smallest window).
+pub(crate) fn zstd_window_log_max(limit: u64) -> Option<u32> {
+    let log = 63 - limit.max(1).leading_zeros();
+    (log >= 10).then_some(log.min(ZSTD_WINDOW_LOG_MAX))
 }
 
 /// The window a Brotli stream declares in its first bits (RFC 7932, 9.1); `None` for a
@@ -242,7 +324,7 @@ fn brotli_window(head: &[u8]) -> Option<u64> {
 }
 
 /// What the frame headers of a Zstandard file say.
-pub(crate) struct ZstdFrames {
+struct ZstdFrames {
     /// The total size, when every frame states its own.
     pub size: Option<u64>,
     /// Every frame has a content checksum.
@@ -263,7 +345,7 @@ fn read_n<const N: usize>(f: &mut BufReader<File>) -> Option<[u8; N]> {
 
 /// Walk a Zstandard file's frame and block headers (blocks are skipped by their sizes).
 /// `None` when it isn't well-formed.
-pub(crate) fn zstd_frames(path: &Path) -> Option<ZstdFrames> {
+fn zstd_frames(path: &Path, work: &mut Work) -> Option<ZstdFrames> {
     let mut f = BufReader::new(File::open(path).ok()?);
     let len = f.get_ref().metadata().ok()?.len();
     let (mut pos, mut total, mut frames) = (0u64, Some(0u64), 0u32);
@@ -317,6 +399,7 @@ pub(crate) fn zstd_frames(path: &Path) -> Option<ZstdFrames> {
         window = window.max(frame_window.or(content)?);
         pos = pos.checked_add(5 + u64::from(!single) + dict + fcs_len)?;
         loop {
+            work.blocks(1)?;
             let bh = read_n::<3>(&mut f)?;
             let h = u32::from(bh[0]) | u32::from(bh[1]) << 8 | u32::from(bh[2]) << 16;
             let stored = match (h >> 1) & 3 {
@@ -349,7 +432,7 @@ struct Lz4Frames {
     block: u64,
 }
 
-fn lz4_frames(path: &Path) -> Option<Lz4Frames> {
+fn lz4_frames(path: &Path, work: &mut Work) -> Option<Lz4Frames> {
     let mut f = BufReader::new(File::open(path).ok()?);
     let len = f.get_ref().metadata().ok()?.len();
     let mut pos = 0u64;
@@ -394,6 +477,7 @@ fn lz4_frames(path: &Path) -> Option<Lz4Frames> {
         skip(&mut f, extra)?;
         pos = pos.checked_add(6 + extra)?;
         loop {
+            work.blocks(1)?;
             let size = u32::from_le_bytes(read_n::<4>(&mut f)?);
             pos = pos.checked_add(4)?;
             if size == 0 {
@@ -420,7 +504,7 @@ struct XzStreams {
 
 /// Walk an xz file from its end: stream footers, indexes, stream headers and every block
 /// header (concatenated streams and stream padding allowed).
-fn xz_streams(path: &Path) -> Option<XzStreams> {
+fn xz_streams(path: &Path, work: &mut Work) -> Option<XzStreams> {
     let mut f = File::open(path).ok()?;
     let mut end = f.metadata().ok()?.len();
     let at = |f: &mut File, pos: u64, buf: &mut [u8]| -> Option<()> {
@@ -432,7 +516,6 @@ fn xz_streams(path: &Path) -> Option<XzStreams> {
         dict: 0,
     };
     let mut streams = 0u32;
-    let mut blocks_seen = 0u64;
     while end > 0 {
         streams += 1;
         if streams > 100_000 {
@@ -464,29 +547,34 @@ fn xz_streams(path: &Path) -> Option<XzStreams> {
         if index.first() != Some(&0) {
             return None;
         }
-        let mut p = 1usize;
-        let mut sizes = Vec::new();
-        {
-            let mut varint = || -> Option<u64> {
-                let mut v = 0u64;
-                for i in 0..9 {
-                    let b = *index.get(p)?;
-                    p += 1;
-                    v |= u64::from(b & 0x7f) << (7 * i);
-                    if b & 0x80 == 0 {
-                        return Some(v);
-                    }
+        // The records are read twice, never kept: once for the blocks' total size (where
+        // the stream starts), once for each block's header. Their count is checked first,
+        // against the work budget and what the index can hold (two bytes a record at least).
+        let varint = |p: &mut usize| -> Option<u64> {
+            let mut v = 0u64;
+            for i in 0..9 {
+                let b = *index.get(*p)?;
+                *p += 1;
+                v |= u64::from(b & 0x7f) << (7 * i);
+                if b & 0x80 == 0 {
+                    return Some(v);
                 }
-                None
-            };
-            let records = varint()?;
-            for _ in 0..records {
-                let unpadded = varint()?;
-                varint()?;
-                sizes.push(unpadded.checked_add(3)? & !3);
             }
+            None
+        };
+        let mut p = 1usize;
+        let records = varint(&mut p)?;
+        if records > (index.len() as u64) / 2 {
+            return None;
         }
-        let blocks = sizes.iter().try_fold(0u64, |a, &b| a.checked_add(b))?;
+        work.blocks(records)?;
+        let first_record = p;
+        let mut blocks = 0u64;
+        for _ in 0..records {
+            let unpadded = varint(&mut p)?;
+            varint(&mut p)?;
+            blocks = blocks.checked_add(unpadded.checked_add(3)? & !3)?;
+        }
         let start = index_start.checked_sub(blocks)?.checked_sub(12)?;
         let mut header = [0u8; 12];
         at(&mut f, start, &mut header)?;
@@ -496,13 +584,12 @@ fn xz_streams(path: &Path) -> Option<XzStreams> {
         }
         // Each block's header: its filters, the LZMA2 one with its dictionary.
         let mut block_at = start + 12;
-        for size in sizes {
-            blocks_seen += 1;
-            if blocks_seen > 10_000_000 {
-                return None;
-            }
+        let mut p = first_record;
+        for _ in 0..records {
+            let unpadded = varint(&mut p)?;
+            varint(&mut p)?;
             out.dict = out.dict.max(xz_block_dict(&mut f, block_at)?);
-            block_at = block_at.checked_add(size)?;
+            block_at = block_at.checked_add(unpadded.checked_add(3)? & !3)?;
         }
         end = start;
     }
@@ -592,15 +679,14 @@ pub(crate) fn decoder<'a, R: Read + 'a>(
         Codec::Zstd => {
             // The window is the decoder's memory: at most 128 MiB, less under a lower limit
             // (never raised to Zstandard's 1 KiB minimum: refused below it).
-            let log = 63 - mem_limit.max(1).leading_zeros();
-            if log < 10 {
-                return Err(io::Error::new(
+            let log = zstd_window_log_max(mem_limit).ok_or_else(|| {
+                io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "the decoder memory limit is below Zstandard's smallest window",
-                ));
-            }
+                )
+            })?;
             let mut d = zstd::stream::read::Decoder::new(r)?;
-            d.window_log_max(log.min(ZSTD_WINDOW_LOG_MAX))?;
+            d.window_log_max(log)?;
             Box::new(d)
         }
         // Blocks of at most 4 MiB, nothing else to bound.
