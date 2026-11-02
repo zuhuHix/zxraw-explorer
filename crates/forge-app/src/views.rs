@@ -266,6 +266,8 @@ enum ArchiveMenu {
     File(String),
     /// In a pane showing an archive's contents.
     Inside,
+    /// On a `.exe` in a folder: it may be a self-extracting archive ("Open as archive").
+    Exe,
 }
 
 const CONTEXT_ARCHIVE_FILE: &[Cmd] = &[
@@ -277,6 +279,8 @@ const CONTEXT_ARCHIVE_FILE: &[Cmd] = &[
 
 const CONTEXT_ARCHIVE_INSIDE: &[Cmd] = &[Cmd::ExtractHere, Cmd::ExtractTo, Cmd::TestArchive];
 
+const CONTEXT_EXE: &[Cmd] = &[Cmd::OpenAsArchive];
+
 /// The menu context of `pane`, right-clicked on `entry` (`None`: the background).
 fn menu_ctx(pane: &Pane, entry: Option<&FileEntry>) -> MenuCtx {
     let archive = if pane.in_archive() {
@@ -287,6 +291,9 @@ fn menu_ctx(pane: &Pane, entry: Option<&FileEntry>) -> MenuCtx {
                 if e.kind == EntryKind::File && forge_core::archive::is_archive_name(&e.path) =>
             {
                 ArchiveMenu::File(crate::archive_extract::named_folder_label(&e.path))
+            }
+            Some(e) if e.kind == EntryKind::File && crate::archive_ui::is_exe_file(&e.path) => {
+                ArchiveMenu::Exe
             }
             _ => ArchiveMenu::None,
         }
@@ -325,6 +332,7 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], menu: &MenuCtx, out: &mut Vec<
         ArchiveMenu::None => &[][..],
         ArchiveMenu::File(_) => CONTEXT_ARCHIVE_FILE,
         ArchiveMenu::Inside => CONTEXT_ARCHIVE_INSIDE,
+        ArchiveMenu::Exe => CONTEXT_EXE,
     };
     let mut archive_shown = archive_items.is_empty();
     for it in items {

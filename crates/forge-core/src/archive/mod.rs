@@ -32,6 +32,7 @@ mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
 mod sevenz_writer;
+pub mod sfx;
 pub mod stage;
 mod tar_backend;
 mod tar_read;
@@ -58,6 +59,8 @@ mod tests_sevenz;
 mod tests_sevenz_fixtures;
 #[cfg(test)]
 mod tests_sevenz_hostile;
+#[cfg(test)]
+mod tests_sfx;
 #[cfg(test)]
 mod tests_tar;
 #[cfg(test)]
@@ -456,15 +459,23 @@ pub fn backend_for_name(path: &Path) -> Option<&'static dyn ArchiveBackend> {
         .find(|b| b.extensions().contains(&ext.as_str()))
 }
 
-/// Whether a file name has a browsable archive extension (no I/O).
+/// Whether a file name has a browsable archive extension (no I/O). A `.exe` is not one: it
+/// runs. See [`is_archive_path`] for the one the user opened as an archive.
 pub fn is_archive_name(path: &Path) -> bool {
     backend_for_name(path).is_some()
 }
 
+/// Whether a path may be browsed as an archive: a name with an archive extension, or a file
+/// the user opened as one (a self-extracting `.exe`, see [`sfx::mark_open_as_archive`]).
+pub fn is_archive_path(path: &Path) -> bool {
+    is_archive_name(path) || sfx::is_open_as_archive(path)
+}
+
 /// The backend for an archive file, by what it holds: its signature (a 7z renamed `.zip`
 /// is still read as 7z, and edited as 7z; a compression stream is a tar when a tar header
-/// starts its decoded data, else a single compressed file), then a tar header, then a ZIP
-/// end record near its end (a zip behind a self-extractor stub), then its extension.
+/// starts its decoded data, else a single compressed file), then a tar header, then a
+/// self-extractor's payload (a program stub in front: see [`sfx`]), then a ZIP end record
+/// near its end, then its extension.
 pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     let mut file = fs::File::open(path).map_err(|e| CoreError::io(path, e))?;
     let mut head = [0u8; 512];
@@ -486,6 +497,11 @@ pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     // Before the end record: a tar whose last file is a zip has one near its end.
     if tar_read::looks_like_tar(&head[..n]) {
         return Ok(tar_backend::tar_backend(Codec::None));
+    }
+    if head[..n].starts_with(b"MZ") {
+        if let Some(b) = sfx::sfx_backend(path)? {
+            return Ok(b);
+        }
     }
     if zip_backend::has_end_record(&mut file) {
         return Ok(&zip_backend::ZIP);
@@ -529,7 +545,7 @@ pub fn split_archive_path(path: &Path) -> Option<(PathBuf, String)> {
     let mut prefix = PathBuf::new();
     for (i, c) in comps.iter().enumerate() {
         prefix.push(c);
-        if !matches!(c, Component::Normal(_)) || !is_archive_name(&prefix) {
+        if !matches!(c, Component::Normal(_)) || !is_archive_path(&prefix) {
             continue;
         }
         if fs::metadata(&prefix).is_ok_and(|m| m.is_file()) {
@@ -1859,6 +1875,7 @@ pub fn update(
     opts: &CreateOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
+    sfx::refuse_edit_if_sfx(archive)?;
     let backend = backend_for_file(archive)?;
     if !backend.can_write() {
         // RAR: refused before anything is read.

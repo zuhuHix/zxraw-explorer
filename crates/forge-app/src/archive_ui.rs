@@ -207,7 +207,29 @@ fn file_entry(archive: &Path, node: &ArchiveNode) -> FileEntry {
 /// archive extension. The listing finds out for sure.
 pub fn maybe_in_archive(path: &Path) -> bool {
     path.ancestors()
-        .any(|p| p.file_name().is_some() && archive::is_archive_name(p))
+        .any(|p| p.file_name().is_some() && archive::is_archive_path(p))
+}
+
+/// Whether a path is a `.exe`: a program that may also be a self-extracting archive.
+pub fn is_exe_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+}
+
+/// "Open as archive" on the `.exe` the focused pane selects: it is browsed as an archive
+/// folder from now on, and its listing (on a background thread) says whether it carries one.
+/// Double-clicking it still runs it.
+pub fn open_as_archive(app: &mut ZxrawApp) {
+    if app.pane().archive.is_some() || app.pane().in_archive() {
+        app.toast("Open as archive works on a file in a folder");
+        return;
+    }
+    let Some(exe) = app.pane().action_targets().into_iter().find(|p| is_exe_file(p)) else {
+        app.toast("Select a .exe first");
+        return;
+    };
+    archive::sfx::mark_open_as_archive(&exe);
+    app.pane_mut().navigate(exe);
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1300,21 @@ mod tests {
         assert!(maybe_in_archive(Path::new(r"C:\x\a.zip")));
         assert!(!maybe_in_archive(Path::new(r"C:\x\zip\sub")));
         assert!(!maybe_in_archive(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn an_exe_is_not_an_archive_until_it_is_opened_as_one() {
+        // Double-click (and Enter) on a program still runs it.
+        let exe = Path::new(r"C:\x\setup.exe");
+        assert!(!archive::is_archive_name(exe));
+        assert!(!archive::is_archive_path(exe));
+        assert!(!maybe_in_archive(exe));
+        assert!(is_exe_file(exe));
+        assert!(is_exe_file(Path::new(r"C:\x\SETUP.EXE")));
+        assert!(!is_exe_file(Path::new(r"C:\x\setup.zip")));
+        archive::sfx::mark_open_as_archive(exe);
+        assert!(!archive::is_archive_name(exe));
+        assert!(maybe_in_archive(&exe.join("sub")));
     }
 
     #[test]
