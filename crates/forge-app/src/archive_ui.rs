@@ -722,6 +722,22 @@ pub(crate) fn wipe(text: &mut String) {
     std::hint::black_box(&bytes);
 }
 
+/// egui keeps each text field's state, with an undo history of what was typed, under the
+/// field's id: forget it for password fields once they are done with.
+pub(crate) fn forget_text_state(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| {
+        if let Some(mut state) = d.get_persisted::<egui::text_edit::TextEditState>(id) {
+            // The undo history is shared with any copy egui still holds.
+            state.clear_undoer();
+        }
+        d.remove::<egui::text_edit::TextEditState>(id);
+    });
+}
+
+fn password_field_id() -> egui::Id {
+    egui::Id::new("archive-password-field")
+}
+
 /// The password dialog for an encrypted entry (drawn every frame while open).
 pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
     let Some(mut prompt) = app.ops.archive.prompt.take() else {
@@ -745,6 +761,7 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
         ui.add_space(6.0);
         let r = ui.add(
             egui::TextEdit::singleline(&mut prompt.text)
+                .id(password_field_id())
                 .password(true)
                 .hint_text("Password")
                 .desired_width(f32::INFINITY),
@@ -766,6 +783,7 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
     if accept && !prompt.text.is_empty() {
         let password = Password::new(&prompt.text);
         wipe(&mut prompt.text);
+        forget_text_state(ctx, password_field_id());
         app.ops
             .archive
             .passwords
@@ -773,6 +791,7 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
         run_retry(app, prompt.retry.clone());
     } else if cancel || resp.should_close() {
         wipe(&mut prompt.text);
+        forget_text_state(ctx, password_field_id());
         // Other jobs of the same archive wait for the same password: give them up too.
         let archive = prompt.retry.archive().to_path_buf();
         app.ops
@@ -800,6 +819,32 @@ mod tests {
         store.forget(Path::new(r"C:\X\a.zip"));
         assert!(store.get(Path::new(r"C:\x\A.zip")).is_none());
         assert!(!format!("{:?}", Password::new("secret")).contains("secret"));
+    }
+
+    #[test]
+    fn typed_password_state_is_forgotten() {
+        let ctx = egui::Context::default();
+        let id = password_field_id();
+        let mut text = String::new();
+        let mut frame = |events: Vec<egui::Event>, text: &mut String| {
+            let input = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                let r = ui.add(egui::TextEdit::singleline(text).id(id).password(true));
+                r.request_focus();
+            });
+            out.textures_delta.clear();
+        };
+        frame(Vec::new(), &mut text);
+        frame(vec![egui::Event::Text("hunter2".into())], &mut text);
+        assert_eq!(text, "hunter2");
+        let kept = egui::text_edit::TextEditState::load(&ctx, id).expect("egui keeps state");
+        forget_text_state(&ctx, id);
+        assert!(egui::text_edit::TextEditState::load(&ctx, id).is_none());
+        // The undo history shared with copies egui may still hold is emptied too.
+        assert!(!kept.undoer().has_undo(&(Default::default(), String::new())));
     }
 
     #[test]
