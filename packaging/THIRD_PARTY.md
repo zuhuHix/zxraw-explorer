@@ -16,6 +16,8 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | ahash | 0.8.12 | MIT OR Apache-2.0 | https://github.com/tkaitchuck/ahash | Permissive |
 | aho-corasick | 1.1.5 | Unlicense OR MIT | https://github.com/BurntSushi/aho-corasick | Permissive |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 | https://github.com/zakarumych/allocator-api2 | Permissive |
+| alloc-no-stdlib | 3.0.0 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib | Permissive |
+| alloc-stdlib | 0.3.0 | BSD-3-Clause | https://github.com/dropbox/rust-alloc-no-stdlib | Permissive |
 | anstream | 1.0.0 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git | Permissive |
 | anstyle | 1.0.14 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git | Permissive |
 | anstyle-parse | 1.0.0 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git | Permissive |
@@ -34,6 +36,8 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | block-padding | 0.4.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
+| brotli | 9.1.1 | BSD-3-Clause AND MIT | https://github.com/dropbox/rust-brotli | Permissive |
+| brotli-decompressor | 6.2.0 | BSD-3-Clause/MIT | https://github.com/dropbox/rust-brotli-decompressor | Permissive |
 | bstr | 1.13.1 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr | Permissive |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | https://github.com/fitzgen/bumpalo | Permissive |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck | Permissive |
@@ -114,13 +118,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.8.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
@@ -213,6 +217,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | Permissive |
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log | Permissive |
 | lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git | Permissive |
+| lz4_flex | 0.14.0 | MIT | https://github.com/pseitz/lz4_flex | Permissive |
 | lzma-rust2 | 0.23.0 | Apache-2.0 | https://github.com/hasenbanck/lzma-rust2/ | Permissive |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers | Permissive |
 | md-5 | 0.10.6 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
@@ -313,6 +318,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | tracing-log | 0.2.0 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | tracing-subscriber | 0.3.23 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | Permissive |
+| twox-hash | 2.1.5 | MIT | https://github.com/shepmaster/twox-hash | Permissive |
 | typed-path | 0.13.0 | MIT OR Apache-2.0 | https://github.com/chipsenkbeil/typed-path | Permissive |
 | typeid | 1.0.3 | MIT OR Apache-2.0 | https://github.com/dtolnay/typeid | Permissive |
 | type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
