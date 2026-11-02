@@ -434,6 +434,9 @@ pub struct StreamOptions {
     pub readonly: bool,
     /// Abort with `Invalid` if the stream yields more than this many bytes.
     pub limit: Option<u64>,
+    /// Abort with `Invalid`, publishing nothing, unless the stream yields exactly this many
+    /// bytes (an archive entry shorter than it declares is damaged).
+    pub exact: Option<u64>,
     /// Windows file attributes to apply at creation (hidden/system/archive…); readonly is
     /// applied after placement instead.
     pub attributes: u32,
@@ -516,6 +519,7 @@ fn copy_file_counted(
         modified: md.modified().ok(),
         readonly: md.permissions().readonly(),
         limit: None,
+        exact: None,
         attributes,
     };
     stream_into_place(
@@ -642,6 +646,14 @@ fn stream_into_place<R: Read>(
                 f(label, total);
             }
         });
+    }
+    if let Some(exact) = opts.exact
+        && total != exact
+    {
+        return Err(CoreError::Invalid(format!(
+            "{}: {total} bytes of data, {exact} declared (damaged or truncated)",
+            label.display()
+        )));
     }
     if let Some(m) = opts.modified
         && let Err(e) = out.set_modified(m)

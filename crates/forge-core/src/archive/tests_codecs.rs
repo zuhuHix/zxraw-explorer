@@ -460,3 +460,32 @@ fn extract_entry_to_temp_reuses_copies_and_checks_limits() {
     // Remove this archive's temp folder again.
     fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
+
+#[test]
+fn temp_copies_of_same_named_entries_stay_apart() {
+    let d = tempfile::tempdir().unwrap();
+    let zip = d.path().join("cfg.zip");
+    {
+        let mut zw = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
+        for (name, data) in [("a/config.json", b"{\"a\":1}"), ("b/config.json", b"{\"b\":2}")] {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut zw, data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+    let (c, p) = (CancelToken::new(), Progress::default());
+    let ctx = JobCtx::new(&c, &p);
+    let a = extract_entry_to_temp(&zip, "a/config.json", None, 1 << 20, &ctx).unwrap();
+    let b = extract_entry_to_temp(&zip, "b/config.json", None, 1 << 20, &ctx).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(fs::read(&a).unwrap(), b"{\"a\":1}");
+    assert_eq!(fs::read(&b).unwrap(), b"{\"b\":2}");
+    // A copy changed on disk (same size) is not reused.
+    fs::write(&a, b"{\"x\":9}").unwrap();
+    let again = extract_entry_to_temp(&zip, "a/config.json", None, 1 << 20, &ctx).unwrap();
+    assert_eq!(fs::read(&again).unwrap(), b"{\"a\":1}");
+    for p in [&a, &b] {
+        let _ = fs::remove_dir_all(p.parent().unwrap().parent().unwrap());
+    }
+}

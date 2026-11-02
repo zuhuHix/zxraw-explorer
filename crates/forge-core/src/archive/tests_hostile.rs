@@ -261,6 +261,30 @@ fn lying_sizes_never_write_past_the_declared_size() {
 }
 
 #[test]
+fn entries_shorter_than_declared_fail_and_are_not_published() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = fresh_dest(d.path(), "dest");
+    let data = vec![7u8; 1000];
+    // 1000 bytes of data whose checksum matches, declared as 1010 bytes.
+    let mut short = Ent::stored(b"short.bin", &data);
+    short.size = 1010;
+    short.crc = crc32(&data);
+    let ents = [short, Ent::stored(b"good.txt", b"fine")];
+    let z = write_archive(d.path(), "short.zip", &zip_bytes(&ents, &[0, 1]));
+    let report = ctx_run(&z, &dest, &ExtractOptions::default()).unwrap();
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert!(report.failed[0].reason.contains("declared"), "{report:?}");
+    assert!(!dest.join("short.bin").exists());
+    assert_eq!(report.extracted, vec![dest.join("good.txt")]);
+    assert!(
+        fs::read_dir(&dest)
+            .unwrap()
+            .flatten()
+            .all(|e| !crate::ops::is_partial_name(&e.file_name().to_string_lossy()))
+    );
+}
+
+#[test]
 fn local_and_central_name_mismatch_fails_only_that_entry() {
     let d = tempfile::tempdir().unwrap();
     let dest = fresh_dest(d.path(), "dest");

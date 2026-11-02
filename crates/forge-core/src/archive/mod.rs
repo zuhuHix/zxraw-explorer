@@ -641,6 +641,7 @@ pub fn extract(
             modified: p.entry.modified,
             // Never trust the declared size beyond the limits.
             limit: Some(p.entry.size.min(limits.max_file_bytes).min(remaining)),
+            exact: Some(p.entry.size),
             ..Default::default()
         };
         let label = PathBuf::from(&p.entry.name);
@@ -748,26 +749,32 @@ pub enum TopLevel {
 
 /// Classify the top level of `listing` (unsafe names are ignored here; extraction rejects them).
 pub fn top_level(listing: &ArchiveListing) -> TopLevel {
-    let mut first: Option<(String, bool)> = None;
+    // The one top-level name, and whether it was seen as a file and as a folder.
+    let mut first: Option<(String, bool, bool)> = None;
     for e in &listing.entries {
         let name = e.name.trim_matches('/');
         if name.is_empty() {
             continue;
         }
-        let (head, nested) = match name.split_once('/') {
+        let (head, folder) = match name.split_once('/') {
             Some((h, _)) => (h, true),
             None => (name, e.is_dir),
         };
         match &mut first {
-            None => first = Some((head.to_owned(), nested)),
-            Some((h, is_dir)) if h.eq_ignore_ascii_case(head) => *is_dir |= nested,
+            None => first = Some((head.to_owned(), !folder, folder)),
+            Some((h, as_file, as_folder)) if h.eq_ignore_ascii_case(head) => {
+                *as_file |= !folder;
+                *as_folder |= folder;
+            }
             Some(_) => return TopLevel::Many,
         }
     }
     match first {
         None => TopLevel::Empty,
-        Some((h, true)) => TopLevel::Folder(h),
-        Some((h, false)) => TopLevel::File(h),
+        // A file and a folder of the same name: two things, not one.
+        Some((_, true, true)) => TopLevel::Many,
+        Some((h, false, _)) => TopLevel::Folder(h),
+        Some((h, true, false)) => TopLevel::File(h),
     }
 }
 
@@ -1030,12 +1037,27 @@ pub fn extract_entry_to_temp(
             node.size
         )));
     }
-    let base = match entry_name.rsplit_once('/') {
+    // One folder per entry (by its full path), so `a/config.json` and `b/config.json` never
+    // share a copy.
+    let dir = dir.join(format!(
+        "{:016x}",
+        xxhash_rust::xxh3::xxh3_64(node.path.to_lowercase().as_bytes())
+    ));
+    let base = match node.path.rsplit_once('/') {
         Some((parent, _)) => format!("{parent}/"),
         None => String::new(),
     };
     let target = dir.join(&file_name);
-    if fs::metadata(&target).is_ok_and(|m| m.is_file() && m.len() == node.size) {
+    // Reused only when it is still the file this extraction wrote: a plain file (not a link)
+    // with the entry's size and modified time.
+    let reusable = node.modified.is_some()
+        && fs::symlink_metadata(&target).is_ok_and(|m| {
+            m.is_file()
+                && !safety::is_link_or_reparse(&m)
+                && m.len() == node.size
+                && m.modified().ok() == node.modified
+        });
+    if reusable {
         return Ok(target);
     }
     fs::create_dir_all(&dir).map_err(|e| CoreError::io(&dir, e))?;
@@ -1048,7 +1070,7 @@ pub fn extract_entry_to_temp(
         password: password.cloned(),
         mark_of_the_web: true,
     };
-    let sel = Selection::new(base, vec![entry_name.to_owned()]);
+    let sel = Selection::new(base, vec![node.path.clone()]);
     let report = extract(archive, &dir, &opts, Some(&sel), ctx)?;
     if report.cancelled {
         return Err(CoreError::Cancelled);
