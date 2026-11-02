@@ -54,6 +54,35 @@ pub struct ExtractRequest {
     pub selection: Option<archive::Selection>,
     /// How existing files are handled; `None` until asked (only when there are any).
     pub policy: Option<ConflictPolicy>,
+    /// Extract encrypted files without a checksum even though the password isn't proven
+    /// (the user said "Extract them anyway").
+    pub allow_unchecked: bool,
+}
+
+/// Encrypted files without a checksum were held back (the password isn't proven): ask
+/// whether to extract them anyway.
+pub struct UncheckedAsk {
+    /// Extracts just those files where they would have gone, with the option set.
+    request: ExtractRequest,
+    count: usize,
+    example: String,
+}
+
+/// The extraction of only the files `report` held back for lack of a checksum, into the
+/// same places, allowing them this time.
+pub fn unchecked_rerun(request: &ExtractRequest, report: &ExtractReport) -> ExtractRequest {
+    let base = request
+        .selection
+        .as_ref()
+        .map_or(String::new(), |s| s.base.clone());
+    ExtractRequest {
+        archive: request.archive.clone(),
+        parent: report.dest.clone(),
+        place: Place::Into,
+        selection: Some(archive::Selection::new(base, report.unchecked.clone())),
+        policy: Some(ConflictPolicy::Skip),
+        allow_unchecked: true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,12 +108,16 @@ pub struct Tested {
 #[derive(Default)]
 pub struct ExtractUi {
     questions: VecDeque<ConflictAsk>,
+    unchecked: VecDeque<UncheckedAsk>,
     tests: Vec<Tested>,
 }
 
 impl ExtractUi {
     pub fn question_open(&self) -> bool {
-        !self.questions.is_empty()
+        !self.questions.is_empty() || !self.unchecked.is_empty()
+    }
+    pub(crate) fn ask_unchecked(&mut self, ask: UncheckedAsk) {
+        self.unchecked.push_back(ask);
     }
     pub(crate) fn ask(&mut self, ask: ConflictAsk) {
         self.questions.push_back(ask);
@@ -161,6 +194,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd) {
                 place,
                 selection: None,
                 policy: None,
+                allow_unchecked: false,
             },
         );
     }
@@ -211,6 +245,7 @@ fn run_inside(app: &mut ZxrawApp, cmd: Cmd, view: ArchiveView) {
             place: place_of(cmd),
             selection,
             policy: None,
+            allow_unchecked: false,
         },
     );
 }
@@ -289,6 +324,13 @@ pub fn start_extract(app: &mut ZxrawApp, request: ExtractRequest) {
             }
             Ok(Outcome::Done(report)) => {
                 finish_extract(job, &request, &report, &events);
+                if let Some(example) = report.unchecked.first() {
+                    let _ = msgs.send(Msg::Unchecked(UncheckedAsk {
+                        request: unchecked_rerun(&request, &report),
+                        count: report.unchecked.len(),
+                        example: example.clone(),
+                    }));
+                }
                 Ok(())
             }
             Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
@@ -333,6 +375,7 @@ fn run_extract(
         // Nothing existed when checked: a file that turns up meanwhile is kept.
         policy: r.policy.unwrap_or(ConflictPolicy::Skip),
         password,
+        allow_unchecked_encrypted: r.allow_unchecked,
         ..ExtractOptions::default()
     };
     let (archive, parent) = (&r.archive, &r.parent);
@@ -585,6 +628,7 @@ pub fn test_summary(report: &TestReport) -> String {
 /// The conflict question and the test results (call every frame).
 pub fn windows(app: &mut ZxrawApp, ctx: &egui::Context) {
     question_modal(app, ctx);
+    unchecked_modal(app, ctx);
     test_window(app, ctx);
 }
 
@@ -602,6 +646,70 @@ pub fn conflict_text(count: usize, example: &str, dest: &Path) -> String {
             n - 1,
             dest.display()
         ),
+    }
+}
+
+/// "“a.txt” and 2 more encrypted files in x.7z store no checksum…"
+pub fn unchecked_text(count: usize, example: &str, archive: &Path) -> String {
+    let name = example
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(example);
+    let archive = forge_core::paths::name_of(archive);
+    let what = match count {
+        0 | 1 => format!("“{name}” in {archive} is encrypted and stores no checksum"),
+        2 => format!("“{name}” and 1 more encrypted file in {archive} store no checksum"),
+        n => format!(
+            "“{name}” and {} more encrypted files in {archive} store no checksum",
+            n - 1
+        ),
+    };
+    format!(
+        "{what}, so ZXraw can't confirm the password for them and they were skipped. With a \
+         wrong password they would come out as garbage, with no error."
+    )
+}
+
+fn unchecked_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
+    if !app.ops.archive.extract.questions.is_empty() {
+        return; // one question at a time
+    }
+    let Some(q) = app.ops.archive.extract.unchecked.front() else {
+        return;
+    };
+    let esc = ctx.input(|i| i.key_pressed(Key::Escape));
+    let mut answer: Option<bool> = None;
+    egui::Modal::new(egui::Id::new("archive-extract-unchecked")).show(ctx, |ui| {
+        ui.set_width(480.0);
+        ui.heading("Password not confirmed");
+        ui.add_space(6.0);
+        ui.label(unchecked_text(q.count, &q.example, &q.request.archive));
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Extract them anyway")
+                .on_hover_text("Only if you are sure the password is right")
+                .clicked()
+            {
+                answer = Some(true);
+            }
+            if ui.button("Leave them").clicked() || esc {
+                answer = Some(false);
+            }
+        });
+    });
+    if let Some(go) = answer {
+        let q = app
+            .ops
+            .archive
+            .extract
+            .unchecked
+            .pop_front()
+            .expect("front exists");
+        if go {
+            start_extract(app, q.request);
+        }
     }
 }
 
@@ -820,6 +928,7 @@ mod tests {
             place,
             selection,
             policy: None,
+            allow_unchecked: false,
         };
         let many = ArchiveListing {
             format: archive::ArchiveFormat::Zip,
@@ -894,6 +1003,35 @@ mod tests {
         assert_eq!(
             conflict_text(5, "a.txt", dest),
             r"“a.txt” and 4 more files already exist in D:\x."
+        );
+    }
+    #[test]
+    fn files_without_a_checksum_are_extracted_again_only_when_asked() {
+        let request = ExtractRequest {
+            archive: PathBuf::from(r"D:\x\secret.7z"),
+            parent: PathBuf::from(r"D:\x"),
+            place: Place::Smart,
+            selection: Some(archive::Selection::new("docs/", vec!["docs/a.txt".into()])),
+            policy: None,
+            allow_unchecked: false,
+        };
+        let report = ExtractReport {
+            dest: PathBuf::from(r"D:\x\secret"),
+            unchecked: vec!["docs/a.txt".into(), "docs/b.txt".into()],
+            ..Default::default()
+        };
+        let again = unchecked_rerun(&request, &report);
+        assert!(again.allow_unchecked);
+        assert_eq!(again.parent, report.dest);
+        assert_eq!(again.place, Place::Into);
+        let sel = again.selection.unwrap();
+        assert_eq!(sel.base, "docs/");
+        assert_eq!(sel.names, report.unchecked);
+        assert_eq!(again.policy, Some(ConflictPolicy::Skip));
+        let text = unchecked_text(2, "docs/a.txt", &request.archive);
+        assert!(
+            text.starts_with("“a.txt” and 1 more encrypted file in secret.7z"),
+            "{text}"
         );
     }
 }

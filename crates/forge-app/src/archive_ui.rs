@@ -690,6 +690,8 @@ pub(crate) enum Msg {
     },
     /// An extraction would replace files: ask once how to handle them.
     Conflicts(crate::archive_extract::ConflictAsk),
+    /// Encrypted files without a checksum were held back: ask about extracting them anyway.
+    Unchecked(crate::archive_extract::UncheckedAsk),
     /// A "Test archive" job finished.
     Tested(crate::archive_extract::Tested),
     /// An archive was edited (see `archive_edit`): its temp copies are out of date.
@@ -876,6 +878,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 }
             }
             Msg::Conflicts(ask) => app.ops.archive.extract.ask(ask),
+            Msg::Unchecked(ask) => app.ops.archive.extract.ask_unchecked(ask),
             Msg::Tested(tested) => app.ops.archive.extract.tested(tested),
             Msg::Updated(archive) => app.ops.archive.materialize.forget(&archive),
         }

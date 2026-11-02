@@ -215,6 +215,7 @@ fn extract_selection(
             place: Place::Into,
             selection: Some(selection),
             policy: None,
+            allow_unchecked: false,
         },
     );
 }

@@ -16,15 +16,20 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   decodes in full and matches its CRC (ZXraw decodes at most 4 MB of each encrypted block from
   its start looking for one), or when encrypted names pass their checksum. A password that
   fails to decode is refused before anything is written. One that can't be proven (big stored
-  files, an archive without CRCs) still lets you extract, because every file is checked against
-  its CRC and one that fails, "damaged data or wrong password", is never written; but files are
-  not added to such an archive.
+  files, an archive without CRCs) still lets you extract: every file with a checksum is checked
+  and one that fails, "damaged data or wrong password", is never written. Encrypted files that
+  store no checksum at all are skipped then ("the password can't be confirmed for this file"),
+  and you're asked whether to extract them anyway. Files are not added to such an archive.
 * The 7z library (`sevenz-rust2`) keeps its own UTF-16 copy of the password during an
   operation (freed, not wiped, afterwards) and keeps the last AES key it derived in memory
   until it derives another. ZXraw's own copies are wiped.
 * 7z limits: headers of at most 64 MB on disk and 128 MB decoded, at most 100,000 entries,
   1 GB of decoder memory per block (256 MB for the header). Anything over them is refused
   before memory is allocated. 7z entries are decoded on one thread.
+* Editing a 7z recompresses the solid blocks that lose a file. Those blocks are held to the
+  extraction limits (decoder memory, total size), and their kept files are spilled to a temp
+  file next to the archive, so that much free space is needed there; otherwise the edit is
+  refused before anything is written.
 * Pause and cancel in 7z: while compressing they are checked on every read of a source file;
   while decoding a solid block up to the wanted files, every 256 KB. One case is coarser: when
   a file being extracted fails (a disk error), the rest of its data is decoded without checks.
