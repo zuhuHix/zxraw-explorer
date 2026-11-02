@@ -2219,7 +2219,7 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
                     let scale = (w / sz.x).min(w / sz.y);
                     ui.vertical_centered(|ui| ui.image((tex.id(), sz * scale)));
                 }
-                None if app.ops.archive.materialize.state(&e.path) == Some(false) => {}
+                None if app.ops.archive.materialize.state(&e.path, view.version) == Some(false) => {}
                 None => {
                     ui.add_space(8.0);
                     ui.vertical_centered(|ui| ui.spinner());
