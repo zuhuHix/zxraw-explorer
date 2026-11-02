@@ -363,6 +363,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   window of its own. This extra window is accepted rather than adding a commit protocol.
 * The protocol version is part of the pipe name. While an update overlaps (the old version's window
   still open, the new version launched), launches of the new version open their own window.
+* A handed-over path that no longer exists when the running window gets to it is treated like a cold
+  start with a missing path: a missing local folder or file opens nothing (no tab, no message), and a
+  network path, which is never probed first, opens a tab whose listing reports the error.
 * The hand-off pipe only trusts a process of the same user, session and integrity level that runs
   the same executable file. Another program of the same user is otherwise outside the threat model:
   it can already do far more to that user than receive a folder path. Creating the pipe first
