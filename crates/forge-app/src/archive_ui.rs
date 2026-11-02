@@ -37,6 +37,9 @@ pub struct ArchiveView {
     pub archive: PathBuf,
     pub inner: String,
     pub index: Arc<ArchiveIndex>,
+    /// The archive file's size and modified time when listed, hashed: anything derived
+    /// from its contents (temp copies for thumbnails) is kept per version.
+    pub version: u64,
 }
 
 impl ArchiveView {
@@ -85,11 +88,27 @@ pub fn list_archive_path(path: &Path) -> Option<ArchiveListing> {
     };
     let entries = children.iter().map(|n| file_entry(&file, n)).collect();
     let view = ArchiveView {
+        version: archive_version(&file),
         archive: file,
         inner,
         index: index.clone(),
     };
     Some(ArchiveListing::Folder { view, entries })
+}
+
+/// A number that changes when the archive file is replaced or written (size and modified
+/// time). Reads the file's metadata: call it off the UI thread.
+pub fn archive_version(archive: &Path) -> u64 {
+    let Ok(md) = std::fs::metadata(archive) else {
+        return 0;
+    };
+    let stamp = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let stamp = stamp as u64 ^ (stamp >> 64) as u64;
+    md.len().rotate_left(40) ^ stamp ^ 1
 }
 
 /// The listing row of an archive node.
@@ -223,6 +242,7 @@ pub fn wants_temp_copy(e: &FileEntry, node: &ArchiveNode, password_known: bool) 
 
 struct TempCopyJob {
     listed: PathBuf,
+    version: u64,
     archive: PathBuf,
     entry: String,
     password: Option<Password>,
@@ -232,13 +252,19 @@ struct TempCopyJob {
 /// [`MATERIALIZE_WORKERS`] threads, newest request first, so a thumbnail or the preview
 /// can read a real file. Never the whole archive.
 pub struct Materialize {
-    /// By listed path: the temp copy, or `None` when it could not be made.
-    done: HashMap<PathBuf, Option<PathBuf>>,
+    /// By listed path and archive version: the temp copy, or `None` when it could not be
+    /// made. A changed archive has a new version, so nothing made from the old one is shown.
+    done: HashMap<(PathBuf, u64), Option<PathBuf>>,
     queued: VecDeque<TempCopyJob>,
-    running: HashSet<PathBuf>,
-    tx: Sender<(PathBuf, Option<PathBuf>)>,
-    rx: Receiver<(PathBuf, Option<PathBuf>)>,
+    running: HashSet<(PathBuf, u64)>,
+    /// The newest version seen of each archive; copies of older ones are dropped.
+    current: HashMap<PathBuf, u64>,
+    tx: Sender<CopyMade>,
+    rx: Receiver<CopyMade>,
 }
+
+/// A finished temp copy: (listed path, archive, version, the copy).
+type CopyMade = (PathBuf, PathBuf, u64, Option<PathBuf>);
 
 impl Default for Materialize {
     fn default() -> Self {
@@ -247,6 +273,7 @@ impl Default for Materialize {
             done: HashMap::new(),
             queued: VecDeque::new(),
             running: HashSet::new(),
+            current: HashMap::new(),
             tx,
             rx,
         }
@@ -259,15 +286,27 @@ impl Materialize {
     pub fn request(
         &mut self,
         listed: &Path,
-        archive: &Path,
+        view: &ArchiveView,
         entry: &str,
         password: Option<&Password>,
         ctx: &egui::Context,
     ) -> Option<PathBuf> {
-        if let Some(done) = self.done.get(listed) {
+        let (archive, version) = (view.archive.as_path(), view.version);
+        if self.current.get(archive) != Some(&version) {
+            // A new version of the archive: what was made from the old one is out of date.
+            self.forget(archive);
+            self.current.insert(archive.to_path_buf(), version);
+        }
+        let key = (listed.to_path_buf(), version);
+        if let Some(done) = self.done.get(&key) {
             return done.clone();
         }
-        if self.running.contains(listed) || self.queued.iter().any(|j| j.listed == listed) {
+        if self.running.contains(&key)
+            || self
+                .queued
+                .iter()
+                .any(|j| j.listed == listed && j.version == version)
+        {
             return None;
         }
         if self.queued.len() >= MATERIALIZE_QUEUE {
@@ -276,6 +315,7 @@ impl Materialize {
         }
         self.queued.push_back(TempCopyJob {
             listed: listed.to_path_buf(),
+            version,
             archive: archive.to_path_buf(),
             entry: entry.to_owned(),
             password: password.cloned(),
@@ -285,8 +325,10 @@ impl Materialize {
     }
 
     /// Whether the entry's temp copy was made (`Some(false)`: it could not be).
-    pub fn state(&self, listed: &Path) -> Option<bool> {
-        self.done.get(listed).map(Option::is_some)
+    pub fn state(&self, listed: &Path, version: u64) -> Option<bool> {
+        self.done
+            .get(&(listed.to_path_buf(), version))
+            .map(Option::is_some)
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
@@ -294,7 +336,7 @@ impl Materialize {
             let Some(job) = self.queued.pop_back() else {
                 return;
             };
-            self.running.insert(job.listed.clone());
+            self.running.insert((job.listed.clone(), job.version));
             let (tx, ctx) = (self.tx.clone(), ctx.clone());
             let spawned = std::thread::Builder::new()
                 .name("archive-preview".into())
@@ -312,7 +354,7 @@ impl Materialize {
                     if let Err(e) = &made {
                         tracing::debug!("no preview copy of {}: {e}", job.entry);
                     }
-                    let _ = tx.send((job.listed, made.ok()));
+                    let _ = tx.send((job.listed, job.archive, job.version, made.ok()));
                     ctx.request_repaint();
                 });
             if spawned.is_err() {
@@ -324,10 +366,15 @@ impl Materialize {
     /// Finished copies (call every frame). Returns true if any arrived.
     pub fn poll(&mut self, ctx: &egui::Context) -> bool {
         let mut changed = false;
-        while let Ok((listed, made)) = self.rx.try_recv() {
-            self.running.remove(&listed);
-            self.done.insert(listed, made);
-            changed = true;
+        while let Ok((listed, archive, version, made)) = self.rx.try_recv() {
+            let key = (listed, version);
+            if !self.running.remove(&key) {
+                continue; // forgotten meanwhile: the archive changed
+            }
+            if self.current.get(&archive) == Some(&version) {
+                self.done.insert(key, made);
+                changed = true;
+            }
         }
         if changed {
             self.pump(ctx);
@@ -337,8 +384,11 @@ impl Materialize {
 
     /// Forget the copies of an archive that changed.
     pub fn forget(&mut self, archive: &Path) {
-        self.done.retain(|p, _| !p.starts_with(archive));
+        self.done.retain(|(p, _), _| !p.starts_with(archive));
         self.queued.retain(|j| !j.listed.starts_with(archive));
+        // Copies being made finish, but their results are dropped (see `poll`).
+        self.running.retain(|(p, _)| !p.starts_with(archive));
+        self.current.remove(archive);
     }
 }
 
@@ -357,7 +407,7 @@ pub fn temp_copy_of(
         return None;
     }
     let entry = node.path.clone();
-    let temp = materialize.request(&e.path, &view.archive, &entry, password, ctx)?;
+    let temp = materialize.request(&e.path, view, &entry, password, ctx)?;
     Some(FileEntry {
         path: temp,
         ..e.clone()
@@ -821,6 +871,69 @@ mod tests {
         assert!(!format!("{:?}", Password::new("secret")).contains("secret"));
     }
 
+    fn zip_with(path: &Path, data: &[u8]) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        w.start_file("p.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut w, data).unwrap();
+        w.finish().unwrap();
+    }
+
+    fn view_of(archive: &Path) -> ArchiveView {
+        match list_archive_path(archive) {
+            Some(ArchiveListing::Folder { view, .. }) => view,
+            _ => panic!("not listed"),
+        }
+    }
+
+    /// Poll until the copy of `listed` for `view` is made (or could not be).
+    fn made(m: &mut Materialize, listed: &Path, view: &ArchiveView) -> Option<PathBuf> {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            m.poll(&ctx);
+            if m.state(listed, view.version).is_some() {
+                return m.request(listed, view, "p.png", None, &ctx);
+            }
+            m.request(listed, view, "p.png", None, &ctx);
+            assert!(std::time::Instant::now() < deadline, "no temp copy");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn temp_copies_follow_the_archive_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("pics.zip");
+        let listed = zip.join("p.png");
+        zip_with(&zip, b"old picture");
+        let v1 = view_of(&zip);
+        let mut m = Materialize::default();
+        let first = made(&mut m, &listed, &v1).expect("copy");
+        assert_eq!(std::fs::read(&first).unwrap(), b"old picture");
+
+        // The archive changes on disk (another size, so another version).
+        zip_with(&zip, b"the new picture");
+        let v2 = view_of(&zip);
+        assert_ne!(v1.version, v2.version);
+        let second = made(&mut m, &listed, &v2).expect("copy");
+        assert_eq!(std::fs::read(&second).unwrap(), b"the new picture");
+        assert_eq!(m.state(&listed, v1.version), None, "the old copy is forgotten");
+
+        // A copy still being made for an old version is dropped when it arrives.
+        let ctx = egui::Context::default();
+        m.forget(&zip);
+        assert!(m.request(&listed, &v1, "p.png", None, &ctx).is_none());
+        assert!(m.request(&listed, &v2, "p.png", None, &ctx).is_none());
+        made(&mut m, &listed, &v2);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        m.poll(&ctx);
+        assert_eq!(m.state(&listed, v1.version), None);
+        assert!(m.done.keys().all(|(_, v)| *v == v2.version));
+        let _ = std::fs::remove_dir_all(first.parent().unwrap());
+        let _ = std::fs::remove_dir_all(second.parent().unwrap());
+    }
+
     #[test]
     fn typed_password_state_is_forgotten() {
         let ctx = egui::Context::default();
@@ -883,6 +996,7 @@ mod tests {
         let view = ArchiveView {
             archive: PathBuf::from(r"C:\x\a.zip"),
             inner: String::new(),
+            version: 0,
             index: Arc::new(ArchiveIndex::build(forge_core::archive::ArchiveListing {
                 format: forge_core::archive::ArchiveFormat::Zip,
                 entries: Vec::new(),

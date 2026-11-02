@@ -501,6 +501,7 @@ mod tests {
         ArchiveView {
             archive: PathBuf::from(r"D:\x\a.zip"),
             inner: String::new(),
+            version: 0,
             index: Arc::new(ArchiveIndex::build(ArchiveListing {
                 format: ArchiveFormat::Zip,
                 entries: names.iter().map(|n| entry(n)).collect(),

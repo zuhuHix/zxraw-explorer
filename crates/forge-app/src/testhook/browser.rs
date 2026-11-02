@@ -336,7 +336,7 @@ pub(super) fn step(
             else {
                 return Err(format!("`{name}` is not listed"));
             };
-            let state = match app.ops.archive.materialize.state(&e.path) {
+            let state = match app.ops.archive.materialize.state(&e.path, view.version) {
                 Some(false) => return Err(format!("no temp copy of `{name}` could be made")),
                 None => "no temp copy yet".to_string(),
                 Some(true) => {
