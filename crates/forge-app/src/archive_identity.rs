@@ -49,6 +49,16 @@ const FILE_SHARE_DELETE: u32 = 0x4;
 const DELETE: u32 = 0x0001_0000;
 /// `ERROR_SHARING_VIOLATION`: another program has the file open in a way ours conflicts with.
 const SHARING_VIOLATION: i32 = 32;
+/// `ERROR_ACCESS_DENIED`: also what replacing a file gives while another program has it
+/// open without sharing deleting, or mapped (as a virus scanner does with a file just
+/// written).
+const ACCESS_DENIED: i32 = 5;
+/// How long [`PrivateCopy::replace`] keeps trying again when the rename is refused that way,
+/// checking the original again before each try; the pause between tries doubles from
+/// [`FIRST_PAUSE`] up to [`MAX_PAUSE`].
+const SCANNER_WAIT: Duration = Duration::from_millis(1500);
+const FIRST_PAUSE: Duration = Duration::from_millis(20);
+const MAX_PAUSE: Duration = Duration::from_millis(400);
 
 /// The identity of the archive at `path` now (reads its directory region: call it off the
 /// UI thread).
@@ -330,36 +340,86 @@ impl PrivateCopy {
     /// still `expected`. The original is held from that check through the rename, sharing
     /// reading and deleting only: it can't be written meanwhile, and the rename (through the
     /// copy's own handle, so the file moved is this copy) may replace it.
+    ///
+    /// A rename refused because another program has one of the two files open or mapped
+    /// for a moment (a virus scanner reading a file just written) is tried again for up to
+    /// [`SCANNER_WAIT`], and every try checks the original again first: a file that is no
+    /// longer `expected` is never replaced.
     pub fn replace(
         mut self,
         original: &Path,
         expected: &ArchiveIdentity,
     ) -> Result<Replaced, String> {
+        let until = Instant::now() + SCANNER_WAIT;
+        let mut pause = FIRST_PAUSE;
+        loop {
+            let mut held =
+                open_waiting(original, FILE_SHARE_READ | FILE_SHARE_DELETE, 0, WRITER_WAIT)?;
+            if of_file(&mut held)? != *expected {
+                return Err("it changed while the copy was edited".into());
+            }
+            #[cfg(test)]
+            BEFORE_RENAME.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            });
+            match self.rename_over(original) {
+                Ok(()) => {
+                    self.placed = true;
+                    let replaced =
+                        forge_win::files::handle_identity(&held).is_ok_and(|id| id.links == 0);
+                    return Ok(if replaced {
+                        Replaced::Original
+                    } else {
+                        Replaced::MovedAway
+                    });
+                }
+                Err(Rename::Busy(_)) if Instant::now() + pause <= until => {
+                    drop(held);
+                    std::thread::sleep(pause);
+                    pause = (pause * 2).min(MAX_PAUSE);
+                }
+                Err(Rename::Busy(e) | Rename::Failed(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// Renames this copy over `original` through its own handle.
+    fn rename_over(&self, original: &Path) -> Result<(), Rename> {
         use std::os::windows::fs::OpenOptionsExt;
 
-        let mut held = open_waiting(original, FILE_SHARE_READ | FILE_SHARE_DELETE, 0, WRITER_WAIT)?;
-        if of_file(&mut held)? != *expected {
-            return Err("it changed while the copy was edited".into());
-        }
-        #[cfg(test)]
-        BEFORE_RENAME.with(|hook| {
-            if let Some(hook) = hook.borrow().as_ref() {
-                hook();
-            }
-        });
         let edited = std::fs::OpenOptions::new()
             .access_mode(DELETE)
             .share_mode(0)
             .open(&self.path)
-            .map_err(|e| e.to_string())?;
-        forge_win::files::rename_open_file_over(&edited, original).map_err(|e| e.to_string())?;
-        self.placed = true;
-        let replaced = forge_win::files::handle_identity(&held).is_ok_and(|id| id.links == 0);
-        Ok(if replaced {
-            Replaced::Original
-        } else {
-            Replaced::MovedAway
+            .map_err(|e| Rename::of(e.raw_os_error(), e.to_string()))?;
+        forge_win::files::rename_open_file_over(&edited, original).map_err(|e| {
+            // An HRESULT made from a Win32 error: 0x8007xxxx.
+            let code = match &e {
+                forge_win::WinError::Api { code, .. } if code >> 16 == 0x8007 => {
+                    Some((code & 0xFFFF) as i32)
+                }
+                _ => None,
+            };
+            Rename::of(code, e.to_string())
         })
+    }
+}
+
+/// Why a rename of the copy failed.
+enum Rename {
+    /// Another program has one of the files open or mapped: it may pass.
+    Busy(String),
+    Failed(String),
+}
+
+impl Rename {
+    fn of(code: Option<i32>, message: String) -> Self {
+        match code {
+            Some(SHARING_VIOLATION | ACCESS_DENIED) => Self::Busy(message),
+            _ => Self::Failed(message),
+        }
     }
 }
 
@@ -617,13 +677,21 @@ mod tests {
         let original = std::fs::read(&zip).unwrap();
         let expected = read(&zip).unwrap();
         let away = dir.path().join("away.zip");
-        let (zip_hook, away_hook) = (zip.clone(), away.clone());
+        // The substitute is written before the move starts, not in the hook: a virus
+        // scanner reads a file just written and may keep it from being replaced for a
+        // moment, and `replace` would then check again, find the substitute and refuse
+        // (`a_substitute_held_at_the_rename_is_checked_again_and_left_untouched`).
+        let staged = dir.path().join("substitute.zip");
+        zip_of(&staged, &["one.txt", "two.txt", "three.txt"]);
+        let swap = std::cell::Cell::new(Some((zip.clone(), away.clone(), staged)));
         BEFORE_RENAME.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 // Deleting is shared from the last check on: the original can be moved
                 // away and a substitute put in its place.
-                std::fs::rename(&zip_hook, &away_hook).unwrap();
-                zip_of(&zip_hook, &["one.txt", "two.txt", "three.txt"]);
+                if let Some((zip, away, staged)) = swap.take() {
+                    std::fs::rename(&zip, &away).unwrap();
+                    std::fs::rename(&staged, &zip).unwrap();
+                }
             }));
         });
         let result = remove(&zip, &expected, &["one.txt"]);
@@ -632,6 +700,108 @@ mod tests {
         // byte-identical where it went; nothing was removed from the substitute.
         assert_eq!(result, Ok(Replaced::MovedAway));
         assert_eq!(names_in(&zip), ["two.txt"]);
+        assert_eq!(std::fs::read(&away).unwrap(), original);
+        assert!(partials_in(dir.path()).is_empty());
+    }
+
+    /// Opens `path` sharing only reading, as a virus scanner may: it can't be replaced
+    /// while this is open.
+    fn scanner_open(path: &Path) -> File {
+        use std::os::windows::fs::OpenOptionsExt;
+        File::options()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Runs `each_try(n)` (n from 1) at every try of the rename, after its check.
+    fn on_each_try(each_try: impl Fn(usize) + 'static) -> std::rc::Rc<std::cell::Cell<usize>> {
+        let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counter = tries.clone();
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                counter.set(counter.get() + 1);
+                each_try(counter.get());
+            }));
+        });
+        tries
+    }
+
+    #[test]
+    fn a_rename_refused_for_a_moment_is_tried_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt", "two.txt"]);
+        let expected = read(&zip).unwrap();
+        let scanner = std::cell::RefCell::new(Some(scanner_open(&zip)));
+        // The scanner lets go once the first try has been refused.
+        let tries = on_each_try(move |n| {
+            if n == 2 {
+                scanner.borrow_mut().take();
+            }
+        });
+        let result = remove(&zip, &expected, &["one.txt"]);
+        BEFORE_RENAME.with(|hook| hook.borrow_mut().take());
+        assert_eq!(result, Ok(Replaced::Original));
+        assert_eq!(tries.get(), 2, "refused once, then checked again and renamed");
+        assert_eq!(names_in(&zip), ["two.txt"]);
+        assert!(partials_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_rename_refused_for_longer_than_the_wait_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt", "two.txt"]);
+        let bytes = std::fs::read(&zip).unwrap();
+        let expected = read(&zip).unwrap();
+        let scanner = scanner_open(&zip);
+        let tries = on_each_try(|_| {});
+        let started = Instant::now();
+        let error = remove(&zip, &expected, &["one.txt"]).unwrap_err();
+        let took = started.elapsed();
+        BEFORE_RENAME.with(|hook| hook.borrow_mut().take());
+        drop(scanner);
+        assert!(error.contains("0x80070020") || error.contains("0x80070005"), "{error}");
+        assert!(tries.get() >= 3, "tried {} times", tries.get());
+        // It gives up once the next pause would end past the wait, and not before.
+        assert!(took >= SCANNER_WAIT - MAX_PAUSE, "gave up after {took:?}");
+        assert!(took < SCANNER_WAIT * 4, "gave up after {took:?}");
+        assert_eq!(std::fs::read(&zip).unwrap(), bytes);
+        assert!(partials_in(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_substitute_held_at_the_rename_is_checked_again_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt", "two.txt"]);
+        let original = std::fs::read(&zip).unwrap();
+        let expected = read(&zip).unwrap();
+        let away = dir.path().join("away.zip");
+        let staged = dir.path().join("substitute.zip");
+        zip_of(&staged, &["one.txt", "two.txt", "three.txt"]);
+        let substitute = std::fs::read(&staged).unwrap();
+        // After the last check the original is moved away and a substitute put in its
+        // place, which a scanner then holds: the rename is refused.
+        let scanner = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held = scanner.clone();
+        let (zip_hook, away_hook) = (zip.clone(), away.clone());
+        let tries = on_each_try(move |n| {
+            if n == 1 {
+                std::fs::rename(&zip_hook, &away_hook).unwrap();
+                std::fs::rename(&staged, &zip_hook).unwrap();
+                *held.borrow_mut() = Some(scanner_open(&zip_hook));
+            }
+        });
+        let error = remove(&zip, &expected, &["one.txt"]).unwrap_err();
+        BEFORE_RENAME.with(|hook| hook.borrow_mut().take());
+        scanner.borrow_mut().take();
+        // The second try checked the file at the path again and refused the substitute.
+        assert!(error.contains("changed"), "{error}");
+        assert_eq!(tries.get(), 1);
+        assert_eq!(std::fs::read(&zip).unwrap(), substitute, "nothing removed from it");
         assert_eq!(std::fs::read(&away).unwrap(), original);
         assert!(partials_in(dir.path()).is_empty());
     }
