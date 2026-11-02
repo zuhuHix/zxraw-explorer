@@ -73,6 +73,8 @@ pub enum ConfirmKind {
     /// Each item carries what it was when asked, so a replaced one is left alone.
     DeleteWithWindows(Vec<crate::ops_ui::DeleteTarget>),
     Recycle(Vec<PathBuf>),
+    /// Add to or delete inside an archive (see `archive_edit`).
+    ArchiveUpdate(crate::archive_edit::UpdateRequest),
     /// Download and install FFmpeg (see `ffmpeg_setup`).
     DownloadFfmpeg,
     /// A copy or move that would first download online-only files; Accept resumes it.

@@ -1,13 +1,15 @@
 //! Browsing archives like folders: a pane sent to `D:\x\a.zip\sub` lists the archive's
 //! folder from its cached index (see `forge_core::archive`). The paths shown are virtual:
 //! nothing that reads or changes files may reach them, so the file services skip archive
-//! panes and the file commands are refused with a toast ([`block_in_archive`]).
+//! panes and the file commands are refused with a toast ([`block_in_archive`]). Copying in
+//! and out and deleting are in `archive_edit`. Small images get thumbnails and a preview
+//! from temp copies made in the background ([`Materialize`]).
 //!
 //! Opening a file inside extracts it to a private temp folder first (a job), asking for the
 //! archive's password when an entry is encrypted. Passwords are kept for the session only
 //! ([`ArchivePasswords`]), never logged and never saved.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,13 +17,18 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use egui::{Key, RichText};
 use forge_core::archive::{self, ArchiveIndex, ArchiveNode, Password};
 use forge_core::ops::JobCtx;
-use forge_core::{CoreError, EntryKind, FileEntry};
+use forge_core::{CoreError, EntryKind, FileEntry, MediaKind};
 
 use crate::app::ZxrawApp;
 use crate::commands::Cmd;
 
 /// Largest entry opened from an archive (extracted to temp first).
 const OPEN_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Largest image entry given a thumbnail and preview (from a temp copy).
+pub const PREVIEW_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Temp copies for previews made at once, and waiting at most.
+const MATERIALIZE_WORKERS: usize = 2;
+const MATERIALIZE_QUEUE: usize = 64;
 
 /// What a pane in an archive shows: the archive file, the folder inside it (`/`-separated,
 /// `""` for the root) and the archive's index.
@@ -200,6 +207,185 @@ impl crate::views::ThumbProvider for NoFileServices {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Temp copies for thumbnails and the preview
+// ---------------------------------------------------------------------------
+
+/// Whether a listed entry gets a thumbnail and preview from a temp copy: an image of at
+/// most [`PREVIEW_MAX_BYTES`], not encrypted unless the archive's password is known.
+pub fn wants_temp_copy(e: &FileEntry, node: &ArchiveNode, password_known: bool) -> bool {
+    e.kind == EntryKind::File
+        && !node.is_dir
+        && matches!(e.media_kind(), MediaKind::Image | MediaKind::Raw)
+        && node.size <= PREVIEW_MAX_BYTES
+        && (!node.encrypted || password_known)
+}
+
+struct TempCopyJob {
+    listed: PathBuf,
+    archive: PathBuf,
+    entry: String,
+    password: Option<Password>,
+}
+
+/// Temp copies of single small entries (`archive::extract_entry_to_temp`), made by at most
+/// [`MATERIALIZE_WORKERS`] threads, newest request first, so a thumbnail or the preview
+/// can read a real file. Never the whole archive.
+pub struct Materialize {
+    /// By listed path: the temp copy, or `None` when it could not be made.
+    done: HashMap<PathBuf, Option<PathBuf>>,
+    queued: VecDeque<TempCopyJob>,
+    running: HashSet<PathBuf>,
+    tx: Sender<(PathBuf, Option<PathBuf>)>,
+    rx: Receiver<(PathBuf, Option<PathBuf>)>,
+}
+
+impl Default for Materialize {
+    fn default() -> Self {
+        let (tx, rx) = unbounded();
+        Self {
+            done: HashMap::new(),
+            queued: VecDeque::new(),
+            running: HashSet::new(),
+            tx,
+            rx,
+        }
+    }
+}
+
+impl Materialize {
+    /// The temp copy of the entry `listed` (inner path `entry` of `archive`): `Some` once
+    /// made; else it is queued (once) and `None` is returned.
+    pub fn request(
+        &mut self,
+        listed: &Path,
+        archive: &Path,
+        entry: &str,
+        password: Option<&Password>,
+        ctx: &egui::Context,
+    ) -> Option<PathBuf> {
+        if let Some(done) = self.done.get(listed) {
+            return done.clone();
+        }
+        if self.running.contains(listed) || self.queued.iter().any(|j| j.listed == listed) {
+            return None;
+        }
+        if self.queued.len() >= MATERIALIZE_QUEUE {
+            // The oldest requests are the ones scrolled away from.
+            self.queued.pop_front();
+        }
+        self.queued.push_back(TempCopyJob {
+            listed: listed.to_path_buf(),
+            archive: archive.to_path_buf(),
+            entry: entry.to_owned(),
+            password: password.cloned(),
+        });
+        self.pump(ctx);
+        None
+    }
+
+    /// Whether the entry's temp copy was made (`Some(false)`: it could not be).
+    pub fn state(&self, listed: &Path) -> Option<bool> {
+        self.done.get(listed).map(Option::is_some)
+    }
+
+    fn pump(&mut self, ctx: &egui::Context) {
+        while self.running.len() < MATERIALIZE_WORKERS {
+            let Some(job) = self.queued.pop_back() else {
+                return;
+            };
+            self.running.insert(job.listed.clone());
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            let spawned = std::thread::Builder::new()
+                .name("archive-preview".into())
+                .spawn(move || {
+                    let cancel = forge_jobs::CancelToken::new();
+                    let progress = forge_jobs::Progress::new();
+                    let job_ctx = JobCtx::new(&cancel, progress.as_ref());
+                    let made = archive::extract_entry_to_temp(
+                        &job.archive,
+                        &job.entry,
+                        job.password.as_ref(),
+                        PREVIEW_MAX_BYTES,
+                        &job_ctx,
+                    );
+                    if let Err(e) = &made {
+                        tracing::debug!("no preview copy of {}: {e}", job.entry);
+                    }
+                    let _ = tx.send((job.listed, made.ok()));
+                    ctx.request_repaint();
+                });
+            if spawned.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Finished copies (call every frame). Returns true if any arrived.
+    pub fn poll(&mut self, ctx: &egui::Context) -> bool {
+        let mut changed = false;
+        while let Ok((listed, made)) = self.rx.try_recv() {
+            self.running.remove(&listed);
+            self.done.insert(listed, made);
+            changed = true;
+        }
+        if changed {
+            self.pump(ctx);
+        }
+        changed
+    }
+
+    /// Forget the copies of an archive that changed.
+    pub fn forget(&mut self, archive: &Path) {
+        self.done.retain(|p, _| !p.starts_with(archive));
+        self.queued.retain(|j| !j.listed.starts_with(archive));
+    }
+}
+
+/// The temp copy of a listed archive entry for its thumbnail or preview, requested when
+/// missing; `None` while it is made or when the entry does not get one.
+pub fn temp_copy_of(
+    materialize: &mut Materialize,
+    passwords: &ArchivePasswords,
+    view: &ArchiveView,
+    e: &FileEntry,
+    ctx: &egui::Context,
+) -> Option<FileEntry> {
+    let node = view.node_of(&e.path)?;
+    let password = passwords.get(&view.archive);
+    if !wants_temp_copy(e, node, password.is_some()) {
+        return None;
+    }
+    let entry = node.path.clone();
+    let temp = materialize.request(&e.path, &view.archive, &entry, password, ctx)?;
+    Some(FileEntry {
+        path: temp,
+        ..e.clone()
+    })
+}
+
+/// The grid's thumbnail source in an archive pane: small images from their temp copies;
+/// no annotations, Git badges or folder sizes.
+pub struct ArchiveThumbs<'a> {
+    pub thumbs: &'a mut crate::thumbs::ThumbManager,
+    pub archive: &'a mut ArchiveUi,
+    pub view: ArchiveView,
+}
+
+impl crate::views::ThumbProvider for ArchiveThumbs<'_> {
+    fn thumb(&mut self, ui: &egui::Ui, e: &FileEntry, size: u32) -> Option<egui::TextureHandle> {
+        let ui_state = &mut *self.archive;
+        let real = temp_copy_of(
+            &mut ui_state.materialize,
+            &ui_state.passwords,
+            &self.view,
+            e,
+            ui.ctx(),
+        )?;
+        self.thumbs.thumb(ui, &real, size)
+    }
+}
+
 /// The preview panel's details of an entry inside an archive, from the archive's index.
 pub fn info_grid(ui: &mut egui::Ui, e: &FileEntry, view: &ArchiveView) {
     let node = view.node_of(&e.path);
@@ -333,6 +519,8 @@ pub(crate) enum Msg {
     Conflicts(crate::archive_extract::ConflictAsk),
     /// A "Test archive" job finished.
     Tested(crate::archive_extract::Tested),
+    /// An archive was edited (see `archive_edit`): its temp copies are out of date.
+    Updated(PathBuf),
 }
 
 struct PasswordPrompt {
@@ -351,6 +539,10 @@ pub struct ArchiveUi {
     waiting: VecDeque<(Retry, bool)>,
     /// Extract questions and test results (see `archive_extract`).
     pub(crate) extract: crate::archive_extract::ExtractUi,
+    /// Entries copied with Ctrl+C in an archive pane (see `archive_edit`).
+    pub copied: Option<crate::archive_edit::ArchiveCopy>,
+    /// Temp copies of small images for thumbnails and the preview.
+    pub materialize: Materialize,
     pub(crate) tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -363,6 +555,8 @@ impl Default for ArchiveUi {
             prompt: None,
             waiting: VecDeque::new(),
             extract: Default::default(),
+            copied: None,
+            materialize: Materialize::default(),
             tx,
             rx,
         }
@@ -478,8 +672,10 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             }
             Msg::Conflicts(ask) => app.ops.archive.extract.ask(ask),
             Msg::Tested(tested) => app.ops.archive.extract.tested(tested),
+            Msg::Updated(archive) => app.ops.archive.materialize.forget(&archive),
         }
     }
+    changed |= app.ops.archive.materialize.poll(&app.ops.ctx);
     let ui = &mut app.ops.archive;
     if ui.prompt.is_none()
         && let Some((retry, wrong)) = ui.waiting.pop_front()
@@ -601,6 +797,29 @@ mod tests {
         assert!(maybe_in_archive(Path::new(r"C:\x\a.zip")));
         assert!(!maybe_in_archive(Path::new(r"C:\x\zip\sub")));
         assert!(!maybe_in_archive(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn only_small_images_get_temp_copies() {
+        let node = |name: &str, size, encrypted| ArchiveNode {
+            name: name.into(),
+            path: name.into(),
+            is_dir: false,
+            size,
+            compressed_size: size,
+            modified: None,
+            encrypted,
+            method: String::new(),
+            entry: Some(0),
+        };
+        let archive = Path::new(r"C:\x\a.zip");
+        let check = |n: ArchiveNode, known| wants_temp_copy(&file_entry(archive, &n), &n, known);
+        assert!(check(node("p.jpg", 10, false), false));
+        assert!(!check(node("notes.txt", 10, false), false));
+        assert!(!check(node("p.jpg", PREVIEW_MAX_BYTES + 1, false), false));
+        // Encrypted: only with the archive's password.
+        assert!(!check(node("p.jpg", 10, true), false));
+        assert!(check(node("p.jpg", 10, true), true));
     }
 
     #[test]

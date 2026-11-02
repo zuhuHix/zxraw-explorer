@@ -363,8 +363,9 @@ fn handle_drop(resp: &egui::Response, target_dir: &Path, out: &mut Vec<ViewEvent
 }
 
 fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
-    // Items inside an archive are not files yet: nothing to drag.
-    if resp.drag_started() && !pane.in_archive() {
+    // Items inside an archive drag within the app only (dropped on a folder, they are
+    // extracted); nothing while the archive is still being read.
+    if resp.drag_started() && draggable(pane) {
         let paths = if pane.is_selected(entry) {
             // A selected folder already carries the selected items inside it.
             pane.selected_roots()
@@ -373,6 +374,11 @@ fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
         };
         resp.dnd_set_drag_payload(DragPaths::from_pane(pane, paths));
     }
+}
+
+/// Whether the pane's items can be dragged: not while an archive is still being listed.
+fn draggable(pane: &Pane) -> bool {
+    pane.archive.is_some() || !pane.in_archive()
 }
 
 /// Width of one tree level in details view, and of a folder's disclosure arrow.
@@ -2520,7 +2526,7 @@ pub fn grid(
                     };
                     let resp = resp.on_hover_text_at_pointer(tip);
                     if let Some(members) = &item.members {
-                        if resp.drag_started() && !pane.in_archive() {
+                        if resp.drag_started() && draggable(pane) {
                             resp.dnd_set_drag_payload(DragPaths::from_pane(pane, members.clone()));
                         }
                         if !badge_clicked {

@@ -277,6 +277,10 @@ impl ZxrawApp {
         pending_crash: Option<PathBuf>,
     ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        // Temp copies of archive entries opened in earlier sessions.
+        std::thread::spawn(|| {
+            forge_core::archive::prune_temp(std::time::Duration::from_secs(24 * 3600));
+        });
         let mut settings: Settings = settings::load_json(&paths.config.join("settings.json"));
         settings.migrate();
         let session: Session = if settings.restore_session {
@@ -1176,13 +1180,23 @@ impl ZxrawApp {
                     });
                     Vec::new()
                 }
-                // Nothing inside an archive is a file the thumbnail, Git or size services
-                // could read.
+                // Nothing inside an archive is a file the Git or size services could read;
+                // small images get thumbnails from temp copies.
                 None if pane.in_archive() => {
                     let mut none = crate::archive_ui::NoFileServices;
-                    match pane.view {
-                        ViewMode::Details => views::details(ui, pane, focused, id, &none),
-                        ViewMode::Grid => views::grid(ui, pane, focused, id, thumb_size, &mut none),
+                    match (pane.view, pane.archive.clone()) {
+                        (ViewMode::Details, _) => views::details(ui, pane, focused, id, &none),
+                        (ViewMode::Grid, Some(view)) => {
+                            let mut thumbs = crate::archive_ui::ArchiveThumbs {
+                                thumbs: &mut ops.thumbs,
+                                archive: &mut ops.archive,
+                                view,
+                            };
+                            views::grid(ui, pane, focused, id, thumb_size, &mut thumbs)
+                        }
+                        (ViewMode::Grid, None) => {
+                            views::grid(ui, pane, focused, id, thumb_size, &mut none)
+                        }
                     }
                 }
                 None => match pane.view {
