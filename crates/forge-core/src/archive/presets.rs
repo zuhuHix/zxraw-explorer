@@ -57,6 +57,8 @@ impl Preset {
     pub fn for_format(format: ArchiveFormat) -> &'static [Preset] {
         match format {
             ArchiveFormat::Zip => &Preset::ALL,
+            // Read only: never created.
+            ArchiveFormat::Rar => &[],
             ArchiveFormat::SevenZip => {
                 &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra]
             }
@@ -107,6 +109,7 @@ impl Preset {
     pub fn compatibility_for(self, format: ArchiveFormat) -> &'static str {
         match format {
             ArchiveFormat::Zip => self.compatibility(),
+            ArchiveFormat::Rar => "RAR archives are opened and extracted, never created.",
             ArchiveFormat::SevenZip => {
                 "LZMA2 7z: opens in 7-Zip, NanaZip, WinRAR and Windows 11 Explorer (23H2+)."
             }
@@ -216,6 +219,7 @@ impl Preset {
                 }
             }
             ArchiveFormat::Zip => self.estimate().to_owned(),
+            ArchiveFormat::Rar => String::new(),
             ArchiveFormat::SevenZip => {
                 let info = self.sevenzip();
                 let speed = match self.for_sevenzip() {

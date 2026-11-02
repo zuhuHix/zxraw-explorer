@@ -2,7 +2,7 @@
 //!
 //! Formats plug in through [`ArchiveBackend`]: ZIP (see `zip_backend`), 7z (see
 //! `sevenz_backend`), tar plain or compressed and single compressed files (see
-//! `tar_backend`).
+//! `tar_backend`), and RAR, read only (see `rar_backend`).
 //! Everything format-independent lives here, so a new format only has to list entries and
 //! stream their data:
 //!
@@ -27,6 +27,7 @@ mod cp437;
 mod crypto_peek;
 mod motw;
 mod presets;
+mod rar_backend;
 mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
@@ -48,13 +49,15 @@ mod tests_edit;
 #[cfg(test)]
 mod tests_hostile;
 #[cfg(test)]
+mod tests_name_collision;
+#[cfg(test)]
+mod tests_rar;
+#[cfg(test)]
 mod tests_sevenz;
 #[cfg(test)]
 mod tests_sevenz_fixtures;
 #[cfg(test)]
 mod tests_sevenz_hostile;
-#[cfg(test)]
-mod tests_name_collision;
 #[cfg(test)]
 mod tests_tar;
 #[cfg(test)]
@@ -96,6 +99,8 @@ pub enum ArchiveFormat {
     Tar(Codec),
     /// One compressed file (`.gz`, `.xz`...), shown as an archive of one file.
     Compressed(Codec),
+    /// RAR (any version), opened and extracted only: the UnRAR licence forbids writing it.
+    Rar,
 }
 
 impl ArchiveFormat {
@@ -113,6 +118,7 @@ impl ArchiveFormat {
                 Codec::Brotli => "tar.br",
             },
             ArchiveFormat::Compressed(c) => c.name(),
+            ArchiveFormat::Rar => "RAR",
         }
     }
 
@@ -123,12 +129,18 @@ impl ArchiveFormat {
             ArchiveFormat::SevenZip => "7z",
             ArchiveFormat::Tar(c) => c.tar_extension(),
             ArchiveFormat::Compressed(c) => c.extension(),
+            ArchiveFormat::Rar => "rar",
         }
     }
 
     /// Whether archives of this format can hold a password.
     pub fn can_encrypt(self) -> bool {
         matches!(self, ArchiveFormat::Zip | ArchiveFormat::SevenZip)
+    }
+
+    /// Whether ZXraw can create and edit archives of this format (RAR: no).
+    pub fn can_write(self) -> bool {
+        self != ArchiveFormat::Rar
     }
 }
 
@@ -163,6 +175,10 @@ pub enum EntryEncryption {
     /// 7z AES-256. It has no password check of its own: a wrong password shows up as bad
     /// data (the 7z backend tests the start of each encrypted block before extracting).
     SevenZipAes,
+    /// RAR5 AES-256, whose password check value refuses a wrong password up front.
+    RarAes,
+    /// RAR 3.x/4.x AES-128: no password check, a wrong password fails the file's CRC.
+    Rar4Aes,
 }
 
 impl EntryEncryption {
@@ -170,7 +186,7 @@ impl EntryEncryption {
     pub fn ambiguous_errors(self) -> bool {
         matches!(
             self,
-            EntryEncryption::ZipCrypto | EntryEncryption::SevenZipAes
+            EntryEncryption::ZipCrypto | EntryEncryption::SevenZipAes | EntryEncryption::Rar4Aes
         )
     }
 }
@@ -391,6 +407,13 @@ pub const UNCHECKED_REASON: &str =
     "the password can't be confirmed for this file (the archive stores no checksum)";
 
 fn read_only(path: &Path, format: ArchiveFormat) -> CoreError {
+    if format == ArchiveFormat::Rar {
+        return CoreError::Unsupported(format!(
+            "{}: {}",
+            paths::display_path(path),
+            rar_backend::READ_ONLY
+        ));
+    }
     CoreError::Invalid(format!(
         "{}: {} archives can't be written",
         path.display(),
@@ -398,7 +421,14 @@ fn read_only(path: &Path, format: ArchiveFormat) -> CoreError {
     ))
 }
 
-static BACKENDS: &[&dyn ArchiveBackend] = &[&zip_backend::ZIP, &sevenz_backend::SEVEN_ZIP];
+static BACKENDS: &[&dyn ArchiveBackend] = &[
+    &zip_backend::ZIP,
+    &sevenz_backend::SEVEN_ZIP,
+    &rar_backend::RAR,
+];
+
+/// Why RAR archives are never created or edited.
+pub const RAR_READ_ONLY: &str = rar_backend::READ_ONLY;
 
 /// Every registered backend.
 pub fn backends() -> &'static [&'static dyn ArchiveBackend] {
@@ -416,6 +446,10 @@ pub fn backend_for_name(path: &Path) -> Option<&'static dyn ArchiveBackend> {
         });
     }
     let ext = crate::model::ext_of(path);
+    if rar_backend::is_old_volume_ext(&ext) {
+        // `x.r00`...: a later volume of an old-style RAR set (opened from `x.rar`).
+        return Some(&rar_backend::RAR);
+    }
     BACKENDS
         .iter()
         .copied()
@@ -1765,6 +1799,10 @@ pub fn update(
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
     let backend = backend_for_file(archive)?;
+    if !backend.can_write() {
+        // RAR: refused before anything is read.
+        return Err(read_only(archive, backend.format()));
+    }
     if backend.format() == ArchiveFormat::Zip {
         // Before anything reads the directory: a split zip can't be rebuilt as one file.
         let mut file = fs::File::open(archive).map_err(|e| CoreError::io(archive, e))?;

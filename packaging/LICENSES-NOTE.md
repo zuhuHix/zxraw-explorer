@@ -10,3 +10,9 @@ release. The report calls out MPL-2.0 as weak copyleft and flags licenses outsid
 the permissive allowlist. ZXraw Explorer does not bundle FFmpeg or ffprobe (the in-app
 download fetches them from their publisher only when the user asks); they
 remain optional external programs discovered on PATH or configured by the user.
+
+RAR support uses the freeware UnRAR source code by Alexander Roshal, under the UnRAR licence
+(full text in THIRD_PARTY.md and in LICENSE-UNRAR.txt). The licence allows the source to be used
+to handle RAR archives, but not to develop a RAR (WinRAR) compatible archiver or to re-create the
+RAR compression algorithm. ZXraw Explorer only opens and extracts RAR archives; it does not create
+them.

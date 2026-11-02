@@ -7,8 +7,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Formats and media
 
-* Archive support is ZIP, 7z, tar (plain, gzip, bzip2, xz, Zstandard, LZ4, Brotli) and single
-  compressed files. There is no RAR reader yet (`forge-core/src/archive/`).
+* Archive support is ZIP, 7z, RAR (read only), tar (plain, gzip, bzip2, xz, Zstandard, LZ4,
+  Brotli) and single compressed files (`forge-core/src/archive/`).
 * Tar: links (symbolic and hard) are never created, not even a hard link to a file in the same
   archive: its entry is skipped and reported. Devices and FIFOs are skipped. Owners and
   permission bits are ignored (a file with no write bit is not made read-only). A name given
@@ -89,6 +89,22 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * A 7z "update" archive (one with deletion markers, anti-items) can be opened and extracted
   (the markers are ignored) but not edited. A 7z entry name containing NUL makes the archive
   unreadable rather than listing that entry as unsafe.
+* RAR is read only. ZXraw never creates or edits a RAR archive: the UnRAR licence forbids
+  re-creating the RAR compression algorithm. In-archive delete, add and cut are refused with a
+  message (a move out copies and leaves the items in the archive); copy and drag out work.
+* RAR hard links and RAR5 "file copy" references (made by `rar -oi`) are listed but not extracted.
+  Symbolic links and junctions are not extracted, as in the other formats.
+* A self-extracting RAR (`.exe`) doesn't open. Recovery records and recovery volumes (`.rev`) are
+  not used to repair a damaged archive.
+* A multi-volume set opens from any of its volumes only when its first volume is present; a
+  missing later volume is named.
+* RAR4 has no password check, so a wrong password shows as "damaged data or wrong password", as
+  damage does. RAR5 tells the two apart.
+* A RAR whose dictionary is over the decoder-memory limit (1 GiB by default) is refused before
+  extracting. UnRAR itself allows 4 GB.
+* UnRAR itself turns `:` in RAR names into `_` (such files extract under that name) and blanks a
+  name with `..` in it; a blanked name counts as unsafe, so the archive refuses extraction, as
+  other formats do with unsafe names.
 * Inside an open zip, 7z or tar, rename and new folder are not available, and copying between two
   archives is refused. Photos inside a zip open with their default app, not the built-in viewer.
 * Items dragged or copied out of an archive to other apps are virtual files

@@ -241,6 +241,8 @@ fn create_button_label(format: ArchiveFormat) -> String {
         ArchiveFormat::Zip | ArchiveFormat::SevenZip => format!("Create {}", format.name()),
         ArchiveFormat::Tar(_) => format!("Create {}", format.extension()),
         ArchiveFormat::Compressed(_) => format!("Create .{}", format.extension()),
+        // Never offered: RAR is read only.
+        ArchiveFormat::Rar => "Create".to_owned(),
     }
 }
 

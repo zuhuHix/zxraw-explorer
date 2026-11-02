@@ -628,7 +628,18 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Tar in the app: double-clicking a `.tar.zst` browses the tar inside and copies out;
   *Extract to `<name>\`* on a `.tar.zst` and *Extract here* on a single `.gz` — e2e
   `tools::tar_zst_*`; compress-dialog formats in `forge-app/src/extra_tools_ui.rs` tests.
-* ⬜ RAR archives — not implemented (phase 4).
+* ✅ RAR read and extract (engine) — `forge-core/src/archive/rar_backend.rs`, `tests_rar.rs`,
+  fixtures in `archive/fixtures/` (made by `make-rar-fixtures.sh`). UnRAR never writes files: its
+  decoded data is streamed into ZXraw's own writers, with the same name checks as the other formats.
+  * ✅ RAR4 (RAR 1.5 to 4.x) and RAR5/RAR7; solid archives; encrypted files and encrypted headers
+    (the password is asked for to list them).
+  * ✅ Multi-volume sets: `x.part1.rar`, `x.part01.rar`, and `x.rar` with `x.r00`, `x.r01`...;
+    opening any volume opens the set, and a missing volume is named.
+  * ✅ CRC32 and BLAKE2 checks, and *Test archive*; a wrong password is told apart from damaged
+    data on RAR5 (RAR4 has no password check).
+  * ✅ Dictionary size checked against the decoder-memory limit (1 GiB default) before extracting.
+  * ✅ Read only: in-archive delete, add and cut are refused with a message, and a move out
+    copies; copy and drag out work (`tools::rar_pane_browses_and_copies_out_but_is_never_edited`).
 
 ## Status bar
 

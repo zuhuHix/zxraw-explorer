@@ -52,6 +52,12 @@ pub struct ArchiveView {
 }
 
 impl ArchiveView {
+    /// Why this archive can't be edited (RAR is opened and extracted only), if so: adding,
+    /// deleting and cutting are refused with it; copying out works.
+    pub fn read_only(&self) -> Option<&'static str> {
+        (!self.index.listing.format.can_write()).then_some(forge_core::archive::RAR_READ_ONLY)
+    }
+
     /// Inner path of a listed path (`None` for paths outside the archive or the archive).
     pub fn inner_of(&self, path: &Path) -> Option<String> {
         let rest = path.strip_prefix(&self.archive).ok()?;

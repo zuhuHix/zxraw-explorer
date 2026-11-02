@@ -41,6 +41,8 @@ pub struct MoveOut {
     /// Covered entries that are not removed (links, names that clash on Windows or with
     /// another entry): they stay.
     pub left_out: usize,
+    /// The archive can't be edited (RAR): a move out of it copies, nothing is removed.
+    pub read_only: bool,
     /// The archive file the items were read from, recorded when reading them began: the
     /// removal happens only on that file, unchanged (see `archive_identity`).
     identity: Arc<Mutex<Option<ArchiveIdentity>>>,
@@ -51,7 +53,10 @@ pub struct MoveOut {
 impl MoveOut {
     fn of_plan(view: &ArchiveView, plan: &archive::stage::StagePlan, offer: Option<u64>) -> Self {
         let listing = &view.index.listing;
-        let (names, shared) = if archive::stage::has_shared_names(listing) {
+        let read_only = view.read_only().is_some();
+        let (names, shared) = if read_only {
+            (Vec::new(), 0)
+        } else if archive::stage::has_shared_names(listing) {
             // Its rewrite would merge names that differ only in case: nothing is removed.
             (Vec::new(), plan.move_names().len())
         } else {
@@ -62,6 +67,7 @@ impl MoveOut {
             version: view.version,
             names,
             left_out: plan.left_out.len() + shared,
+            read_only,
             identity: Arc::default(),
             offer,
         }
@@ -455,7 +461,12 @@ fn finish_move(app: &mut ZxrawApp, moved: MoveOut, unchanged: bool) {
         return;
     }
     if moved.names.is_empty() {
-        if moved.left_out > 0 {
+        if moved.read_only {
+            app.toast(format!(
+                "The items were copied and stay in {name}: {}",
+                archive::RAR_READ_ONLY
+            ));
+        } else if moved.left_out > 0 {
             app.toast(format!(
                 "The items were copied; {} couldn't be removed from {name} (links, or names \
                  another entry shares) and stay in it",
