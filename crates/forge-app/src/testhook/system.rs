@@ -29,6 +29,9 @@
 //! - `clipboard-files cut|copy <path>, <path>, …`: put the files on the clipboard as another
 //!   app (Explorer) does: `CF_HDROP` and the preferred drop effect, no text. Waits first for
 //!   the app's own copy or cut to finish publishing, so it does not overwrite this.
+//! - `clipboard-shell-item <path>`: put the shell item on the clipboard as Explorer's Copy
+//!   does (its data object, through the OLE clipboard); `path` may be an item inside a zip
+//!   file (`t.zip\sub`), which offers virtual files and no file list.
 //! - `wait-no-cut`: wait (up to 30 s) until the app no longer holds a cut, e.g. after
 //!   Explorer pasted it.
 //! - `wait-cut <n>`: wait (up to 30 s) until the app holds a cut of exactly n items; `0`
@@ -119,6 +122,13 @@ pub(super) fn step(
                 .map(|p| super::sandboxed_entry(Path::new(p.trim())))
                 .collect::<Result<Vec<_>, _>>()?;
             forge_win::set_files_without_text(&paths, effect)
+                .map_err(|e| format!("could not set the clipboard: {e}"))?;
+            Ok(Flow::Done)
+        }
+        "clipboard-shell-item" => {
+            let item = super::shell_item_inside(args.trim(), &|p| super::sandboxed(p))?;
+            let marker = super::sandboxed(Path::new(""))?.display().to_string();
+            forge_win::virtual_files::set_clipboard_to_shell_item(&item, &marker)
                 .map_err(|e| format!("could not set the clipboard: {e}"))?;
             Ok(Flow::Done)
         }

@@ -412,6 +412,97 @@ pub(crate) fn registered_format(
         .ok_or_else(|| crate::api_err(op, windows::core::Error::from_thread()))
 }
 
+/// The shell's data object for the item `parsing_name` (e.g. `C:\x\t.zip\sub`), the one
+/// Explorer copies or drags for it. Call on an OLE thread.
+#[cfg(windows)]
+pub(crate) fn shell_item_data_object(
+    parsing_name: &str,
+) -> crate::Result<windows::Win32::System::Com::IDataObject> {
+    use windows::Win32::System::Com::{IBindCtx, IDataObject};
+    use windows::Win32::UI::Shell::{BHID_DataObject, IShellItem, SHCreateItemFromParsingName};
+    use windows::core::PCWSTR;
+
+    let wide = crate::to_wide(parsing_name);
+    // SAFETY: `wide` is NUL-terminated; the caller's thread has OLE initialized.
+    let item: IShellItem =
+        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>) }
+            .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
+    // SAFETY: a plain call on a live shell item.
+    unsafe { item.BindToHandler::<_, IDataObject>(None::<&IBindCtx>, &BHID_DataObject) }
+        .map_err(|e| crate::api_err("IShellItem::BindToHandler(BHID_DataObject)", e))
+}
+
+/// The clipboard format [`set_clipboard_to_shell_item`] marks its data with.
+pub const TEST_MARKER_FORMAT: &str = "ZXraw automation marker";
+
+/// For automation: puts the shell item `parsing_name` on the clipboard as Explorer's Copy
+/// does (its data object, through `OleSetClipboard`), plus `marker` as UTF-16 text in the
+/// format [`TEST_MARKER_FORMAT`] when the data object takes it, so a test can tell its own
+/// clipboard content. Call on the window thread, which keeps pumping messages while other
+/// threads read the clipboard.
+#[cfg(windows)]
+pub fn set_clipboard_to_shell_item(parsing_name: &str, marker: &str) -> crate::Result<()> {
+    use windows::Win32::System::Ole::OleSetClipboard;
+
+    let data = shell_item_data_object(parsing_name)?;
+    let format = registered_format(
+        windows::core::w!("ZXraw automation marker"),
+        "RegisterClipboardFormatW(marker)",
+    )?;
+    let mut bytes: Vec<u8> = marker
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    bytes.extend([0, 0]);
+    if let Err(e) = set_hglobal(&data, format, &bytes) {
+        tracing::debug!("the data object refused the marker: {e}");
+    }
+    // SAFETY: a live data object; OLE is initialized on this thread.
+    unsafe { OleSetClipboard(&data) }.map_err(|e| crate::api_err("OleSetClipboard", e))
+}
+
+#[cfg(not(windows))]
+pub fn set_clipboard_to_shell_item(_parsing_name: &str, _marker: &str) -> crate::Result<()> {
+    Err(crate::WinError::Unsupported)
+}
+
+/// Gives `bytes` to `obj` as an HGLOBAL in `format` (`SetData` with fRelease).
+#[cfg(windows)]
+fn set_hglobal(
+    obj: &windows::Win32::System::Com::IDataObject,
+    format: u16,
+    bytes: &[u8],
+) -> crate::Result<()> {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::System::Com::{STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL};
+    use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+    // SAFETY: a fresh block of `bytes.len()` bytes, filled while locked and handed to
+    // SetData, which owns it on success; freed here otherwise.
+    unsafe {
+        let global = GlobalAlloc(GMEM_MOVEABLE, bytes.len())
+            .map_err(|e| crate::api_err("GlobalAlloc", e))?;
+        let ptr = GlobalLock(global);
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(global));
+            return Err(crate::api_err("GlobalLock", windows::core::Error::from_thread()));
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast::<u8>(), bytes.len());
+        let _ = GlobalUnlock(global);
+        let medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: global },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        };
+        obj.SetData(&hglobal_format(format), &medium, true)
+            .inspect_err(|_| {
+                let _ = GlobalFree(Some(global));
+            })
+            .map_err(|e| crate::api_err("IDataObject::SetData", e))
+    }
+}
+
 #[cfg(windows)]
 fn descriptor_format() -> crate::Result<u16> {
     registered_format(

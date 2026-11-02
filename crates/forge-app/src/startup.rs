@@ -171,3 +171,23 @@ mod tests {
         assert!(!retry_with_default_backends(true, false, &Err(error)));
     }
 }
+
+/// Puts our own OLE drop target on the main window in place of winit's, so drags that carry
+/// no file paths (items of a zip folder) can drop too. See `dnd::external`.
+pub fn register_drop_target(
+    cc: &eframe::CreationContext<'_>,
+) -> Option<forge_win::drop_target::DropTargetHandle> {
+    let Ok(RawWindowHandle::Win32(handle)) = cc.window_handle().map(|handle| handle.as_raw())
+    else {
+        tracing::warn!("no Win32 window handle; drag and drop from other apps stays winit's");
+        return None;
+    };
+    let ctx = cc.egui_ctx.clone();
+    match forge_win::drop_target::register(handle.hwnd.get(), Box::new(move || ctx.request_repaint())) {
+        Ok(target) => Some(target),
+        Err(error) => {
+            tracing::warn!("could not register the drop target ({error}); keeping winit's");
+            None
+        }
+    }
+}

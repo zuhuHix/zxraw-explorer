@@ -21,9 +21,15 @@ pub fn folder_drop(resp: &egui::Response, target: &Path) -> (bool, Option<(Vec<P
         let keys = resp.ctx.input(|i| (i.modifiers.command, i.modifiers.shift));
         Some((p.0.clone(), keys))
     } else if from_outside {
-        external::take(&resp.ctx).map(|drop| {
+        external::note_hover_target(&resp.ctx, target);
+        external::take(&resp.ctx).and_then(|drop| {
+            if drop.virtual_files.is_some() {
+                // Copied out by the app (`ZxrawApp::unclaimed_external_drop`).
+                external::claim(&resp.ctx, drop, target);
+                return None;
+            }
             let keys = drop.keys(&resp.ctx);
-            (drop.paths, keys)
+            Some((drop.paths, keys))
         })
     } else {
         None
@@ -40,6 +46,33 @@ pub fn folder_drop(resp: &egui::Response, target: &Path) -> (bool, Option<(Vec<P
         Some((paths, copy))
     });
     (hovering, transfer)
+}
+
+/// What a drop of `drag` onto the folder `target` would do, for the drag cursor: the same
+/// rules as [`folder_drop`] (nothing when every item is already there or refused). Virtual
+/// files are always copied, and only into a folder.
+pub fn drop_effect(
+    drag: &forge_win::drop_target::DragInfo,
+    target: &Path,
+    ctrl: bool,
+    shift: bool,
+) -> forge_win::drop_target::DropEffect {
+    use forge_win::drop_target::DropEffect;
+    if drag.files.is_empty() {
+        return if drag.virtual_count > 0 && target.is_dir() {
+            DropEffect::Copy
+        } else {
+            DropEffect::None
+        };
+    }
+    let (paths, _refused) = drop_sources(&drag.files, target);
+    if paths.is_empty() {
+        DropEffect::None
+    } else if drop_is_copy(&paths, target, ctrl, shift) {
+        DropEffect::Copy
+    } else {
+        DropEffect::Move
+    }
 }
 
 /// The volume identity of an existing path (see `forge_win::files::volume_identity`), or

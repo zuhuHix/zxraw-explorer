@@ -106,6 +106,8 @@ pub struct TestHook {
     animations_off: bool,
     pub(crate) input: InputQueue,
     pub(crate) perf: perf::FrameClock,
+    /// What the drop target told the source at the last `drop-shell-item`.
+    last_drop: Option<forge_win::drop_target::SimulatedDrop>,
 }
 
 /// True when the environment asks for an automated run (checked before the app starts so
@@ -302,6 +304,13 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 ///                            shown label or folder name matches, ignoring case; `drag` takes
 ///                            the same targets); the drop is delivered to the frame
 ///                            after the pointer has settled over the target
+/// drop-shell-item <target> | <path> [| ctrl|shift] the shell item `path` dropped as Explorer
+///                            drags it, through the window's own OLE drop target (its
+///                            data object, its answer to the source); `path` may be an
+///                            item inside a zip file, e.g. `t.zip\sub`
+/// assert-drop-reply <effect> [<performed>] the last `drop-shell-item` returned `effect`
+///                            (none|copy|move) to the source and, if given, set its
+///                            "Performed DropEffect" to `performed`
 /// scroll <dy>                mouse wheel at the pointer; positive scrolls content down
 /// dialog <path> | cancel     queue the answer for the next native file/folder dialog
 /// wait-exists <path> [| s]   wait until the path exists (default 30 s)
@@ -366,6 +375,14 @@ enum Step {
         to: DropTarget,
         modifiers: egui::Modifiers,
     },
+    /// A shell item dropped through the window's OLE drop target.
+    DropShellItem {
+        target: DropTarget,
+        item: String,
+        ctrl: bool,
+        shift: bool,
+    },
+    AssertDropReply(u32, Option<u32>),
     /// Files from another application dropped onto an entry or the empty area.
     DropFiles {
         target: DropTarget,
@@ -891,6 +908,25 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
                 modifiers: drop_modifiers(parts.get(2).copied())?,
             }
         }
+        "drop-shell-item" => {
+            let parts: Vec<&str> = rest.split(" | ").map(str::trim).collect();
+            if !(2..=3).contains(&parts.len()) || parts[1].is_empty() {
+                return Err("expected `<target> | <path> [| ctrl|shift]`".into());
+            }
+            let modifiers = drop_modifiers(parts.get(2).copied())?;
+            Step::DropShellItem {
+                target: DropTarget::parse(parts[0])?,
+                item: shell_item_inside(parts[1], &inside)?,
+                ctrl: modifiers.command,
+                shift: modifiers.shift,
+            }
+        }
+        "assert-drop-reply" => {
+            let mut words = rest.split_whitespace().map(drop_effect_bits);
+            let returned = words.next().ok_or("expected none|copy|move")??;
+            let performed = words.next().transpose()?;
+            Step::AssertDropReply(returned, performed)
+        }
         "click-entry" | "double-click-entry" | "right-click-entry" => Step::ClickEntry {
             name: non_empty(rest)?,
             double: verb == "double-click-entry",
@@ -982,6 +1018,43 @@ impl DropTarget {
                 None => Ok(Self::Entry(text.to_string())),
             },
         }
+    }
+}
+
+/// A shell item path for `drop-shell-item`: the file system part (up to and including a
+/// `.zip` file, if the path goes into one) must be inside the sandbox.
+pub(crate) fn shell_item_inside(
+    raw: &str,
+    inside: &dyn Fn(&Path) -> Result<PathBuf, String>,
+) -> Result<String, String> {
+    let path = Path::new(raw);
+    let mut file_system = PathBuf::new();
+    let mut within = PathBuf::new();
+    for component in path.components() {
+        if within.as_os_str().is_empty()
+            && !file_system
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("zip"))
+        {
+            file_system.push(component);
+        } else {
+            within.push(component);
+        }
+    }
+    let resolved = inside(&file_system)?;
+    Ok(if within.as_os_str().is_empty() {
+        resolved.display().to_string()
+    } else {
+        resolved.join(within).display().to_string()
+    })
+}
+
+fn drop_effect_bits(word: &str) -> Result<u32, String> {
+    match word {
+        "none" => Ok(0),
+        "copy" => Ok(1),
+        "move" => Ok(2),
+        other => Err(format!("expected none|copy|move, got `{other}`")),
     }
 }
 
@@ -1682,6 +1755,69 @@ fn drop_files(
     }
 }
 
+/// `drop-shell-item`: hover the target for two frames as a drag of the item (so the app
+/// works out its answer), then drop the item's shell data object through the window's own
+/// drop target, which hands the drop to the next frame.
+fn drop_shell_item(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+    target: &DropTarget,
+    item: &str,
+    (ctrl, shift): (bool, bool),
+) -> Result<Flow, String> {
+    if st.data.is_none() {
+        let Some(point) = target_point(app, ctx, target)? else {
+            return Ok(Flow::Wait("the drop target is not on screen".into()));
+        };
+        st.data = Some(Box::new(DropPlan {
+            point,
+            modifiers: egui::Modifiers::NONE,
+        }));
+    }
+    let point = st.data.as_ref().unwrap().downcast_ref::<DropPlan>().unwrap().point;
+    match st.frames {
+        0 | 1 => {
+            let path = Path::new(item);
+            let info = forge_win::drop_target::DragInfo {
+                files: if path.exists() { vec![path.to_path_buf()] } else { Vec::new() },
+                virtual_count: usize::from(!path.exists()),
+            };
+            app.os_drop.simulated = Some((info, ctrl, shift));
+            app.testhook.input.pointer = Some(point);
+            match inject(app, st, &[egui::Event::PointerMoved(point)]) {
+                Flow::Done => {
+                    st.frames += 1;
+                    st.phase = 0;
+                    Ok(Flow::Wait("hovering the drop target".into()))
+                }
+                other => Ok(other),
+            }
+        }
+        2 => {
+            let answer = app.os_drop.answer();
+            app.os_drop.simulated = None;
+            let handle = app
+                .os_drop
+                .handle
+                .as_ref()
+                .ok_or("the window has no OLE drop target")?;
+            let reply = handle
+                .simulate_drop_of_shell_item(item, ctrl, shift, answer)
+                .map_err(|e| format!("the drop failed: {e}"))?;
+            app.testhook.last_drop = Some(reply);
+            st.frames = 3;
+            Ok(Flow::Wait("item dropped".into()))
+        }
+        // The drop target queued the drop; the frame after this one takes it.
+        3 => {
+            st.frames = 4;
+            Ok(Flow::Wait("the drop is not delivered yet".into()))
+        }
+        _ => Ok(Flow::Done),
+    }
+}
+
 pub(crate) fn inject(app: &mut ZxrawApp, st: &mut StepState, events: &[egui::Event]) -> Flow {
     let input = &mut app.testhook.input;
     if st.phase == 0 {
@@ -2024,6 +2160,30 @@ fn exec(
             paths,
             modifiers,
         } => drop_files(app, ctx, st, target, paths, *modifiers),
+        Step::DropShellItem {
+            target,
+            item,
+            ctrl,
+            shift,
+        } => drop_shell_item(app, ctx, st, target, item, (*ctrl, *shift)),
+        Step::AssertDropReply(returned, performed) => {
+            let Some(last) = &app.testhook.last_drop else {
+                return Err("no drop-shell-item has run".into());
+            };
+            if last.returned != *returned {
+                return Err(format!(
+                    "the drop returned effect {} to the source, expected {returned}",
+                    last.returned
+                ));
+            }
+            if performed.is_some() && last.performed != *performed {
+                return Err(format!(
+                    "Performed DropEffect is {:?}, expected {performed:?}",
+                    last.performed
+                ));
+            }
+            Ok(Flow::Done)
+        }
         Step::ReleasePointer => {
             let Some(pos) = app.testhook.input.pointer else {
                 return Err("there is no pointer position to release".into());

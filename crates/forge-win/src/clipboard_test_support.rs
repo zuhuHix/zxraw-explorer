@@ -122,12 +122,35 @@ fn inside(path: &Path, dir: &Path) -> bool {
     Path::new(&lower(path)).starts_with(lower(dir))
 }
 
-/// With the clipboard open: whether it is empty or holds only files inside `dir`.
+/// With the clipboard open: whether it is empty or holds only files inside `dir`, or holds
+/// shell items a test marked as its own with a folder inside `dir` (see forge-win's
+/// `virtual_files::set_clipboard_to_shell_item`).
 pub fn holds_only_files_in(dir: &Path) -> bool {
     let empty = unsafe { CountClipboardFormats() } == 0;
     empty
         || dropped_paths()
             .is_some_and(|paths| !paths.is_empty() && paths.iter().all(|p| inside(p, dir)))
+        || marker().is_some_and(|m| inside(&m, dir))
+}
+
+/// The folder in the open clipboard's "ZXraw automation marker" format, if it has one.
+fn marker() -> Option<PathBuf> {
+    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
+    unsafe {
+        let format = RegisterClipboardFormatW(w!("ZXraw automation marker"));
+        let handle = GetClipboardData(format).ok()?;
+        let global = HGLOBAL(handle.0);
+        let size = GlobalSize(global) / 2;
+        let ptr = GlobalLock(global).cast::<u16>();
+        if ptr.is_null() {
+            return None;
+        }
+        let units = std::slice::from_raw_parts(ptr, size);
+        let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        let text = String::from_utf16_lossy(&units[..len]);
+        let _ = GlobalUnlock(global);
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    }
 }
 
 /// Opens the clipboard and reports `(sequence, holds_only_files_in(dir))`; `None` while it
