@@ -1263,8 +1263,10 @@ mod imp {
             IoError::MoreData => ForwardError::Failed(WinError::Invalid("oversized reply".into())),
             IoError::Os(e) => ForwardError::Failed(crate::api_err("pipe I/O", e)),
         };
-        // The owner answers within this, so the answer always arrives while this end listens
-        // and a request this end gave up on is never also opened there.
+        // The owner answers within this (minus its margin), so the answer normally arrives
+        // while this end listens. Under rare scheduling delays an "accepted" answer arrives
+        // late: this end then opens its own window and the launch opens in both. Nothing is
+        // ever lost (see the module notes).
         let mut request = request.to_vec();
         set_reply_wait(&mut request, remaining());
         write_message(pipe.0, &request, remaining()).map_err(|e| io(e, "sending"))?;
