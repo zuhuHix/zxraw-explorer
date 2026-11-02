@@ -1743,3 +1743,90 @@ fn seven_zip_round_trip_through_the_create_and_browse_windows() {
     assert_eq!(listing.format, forge_core::archive::ArchiveFormat::SevenZip);
     assert_eq!(tree(&dest), tree(&src), "extracted tree must match the source");
 }
+
+#[test]
+fn browse_window_asks_for_the_password_of_encrypted_names() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let archive = pane_7z(&sandbox.path().join("zips"), Some("pw"));
+    let dest = sandbox.path().join("restored");
+    let script = format!(
+        "ui tools archive open {archive}\n\
+         ui browser archive-password nope\n\
+         ui browser archive-password pw\n\
+         ui tools archive wait 30\n\
+         ui tools archive assert-entry top.txt\n\
+         ui browser assert-password-fields-forgotten\n\
+         ui tools archive extract {dest}\n\
+         wait-jobs 30\n\
+         assert-no-error-toast\n\
+         exit\n",
+        archive = shown(&archive),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+}
+
+#[test]
+fn cancelling_the_browse_windows_password_closes_it() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let archive = pane_7z(&sandbox.path().join("zips"), Some("pw"));
+    let script = format!(
+        "ui tools archive open {archive}\n\
+         ui browser archive-password-cancel\n\
+         ui tools archive assert-closed\n\
+         ui browser assert-password-fields-forgotten\n\
+         assert-no-error-toast\n\
+         exit\n",
+        archive = shown(&archive),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn renamed_archives_browse_as_what_they_are() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let dir = sandbox.path().join("zips");
+    // A 7z named .zip, and a zip named .7z.
+    let seven = pane_7z(&dir, None);
+    let fake_zip = dir.join("really-7z.zip");
+    fs::rename(&seven, &fake_zip).unwrap();
+    let zip = pane_zip(&dir);
+    let fake_7z = dir.join("really-zip.7z");
+    fs::rename(&zip, &fake_7z).unwrap();
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = dual_pane_script(
+        &fake_zip,
+        &dest,
+        &[
+            "wait-entry sub",
+            "select top.txt, sub",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            &format!("navigate {}", shown(&fake_7z)),
+            "wait-entry sub",
+            "double-click-entry sub",
+            "wait-entry inner.txt",
+            "assert-entry deep",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+}

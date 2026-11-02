@@ -558,20 +558,47 @@ pub fn session_password(archive: &Path) -> Option<Password> {
 
 /// Listings that stopped for the password of an archive with encrypted names:
 /// (archive, the path to list again, whether the password was wrong). Taken by [`poll`].
-fn browse_requests() -> &'static parking_lot::Mutex<Vec<(PathBuf, PathBuf, bool)>> {
-    static PENDING: std::sync::OnceLock<parking_lot::Mutex<Vec<(PathBuf, PathBuf, bool)>>> =
+fn browse_requests() -> &'static parking_lot::Mutex<Vec<(Retry, bool)>> {
+    static PENDING: std::sync::OnceLock<parking_lot::Mutex<Vec<(Retry, bool)>>> =
         std::sync::OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
-fn request_browse_password(archive: &Path, path: &Path, wrong: bool) {
+/// Queue a password question for a listing thread: once per archive and kind.
+fn request_listing_password(retry: Retry, wrong: bool) {
     let mut pending = browse_requests().lock();
-    if !pending
-        .iter()
-        .any(|(a, _, _)| forge_core::paths::paths_equal(a, archive))
-    {
-        pending.push((archive.to_path_buf(), path.to_path_buf(), wrong));
+    if !pending.iter().any(|(r, _)| same_listing(r, &retry)) {
+        pending.push((retry, wrong));
     }
+}
+
+/// Both list the same archive the same way (the pane, or the browse window).
+fn same_listing(a: &Retry, b: &Retry) -> bool {
+    let kind = |r: &Retry| match r {
+        Retry::Browse { .. } => Some(0),
+        Retry::BrowseWindow { .. } => Some(1),
+        _ => None,
+    };
+    kind(a).is_some()
+        && kind(a) == kind(b)
+        && forge_core::paths::paths_equal(a.archive(), b.archive())
+}
+
+fn request_browse_password(archive: &Path, path: &Path, wrong: bool) {
+    let retry = Retry::Browse {
+        archive: archive.to_path_buf(),
+        path: path.to_path_buf(),
+    };
+    request_listing_password(retry, wrong);
+}
+
+/// The browse window's listing needs the password of `archive` (any thread): ask, then list
+/// again; a cancelled question closes the window.
+pub(crate) fn request_window_password(archive: &Path, wrong: bool) {
+    let retry = Retry::BrowseWindow {
+        archive: archive.to_path_buf(),
+    };
+    request_listing_password(retry, wrong);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,12 +640,16 @@ pub(crate) enum Retry {
         archive: PathBuf,
         path: PathBuf,
     },
+    /// List `archive` again in the browse window (see `extra_tools_ui`).
+    BrowseWindow {
+        archive: PathBuf,
+    },
 }
 
 impl Retry {
     fn archive(&self) -> &Path {
         match self {
-            Retry::Browse { archive, .. } => archive,
+            Retry::Browse { archive, .. } | Retry::BrowseWindow { archive } => archive,
             Retry::Open(r) => &r.archive,
             Retry::Extract(r) => &r.archive,
             Retry::Test(r) => &r.archive,
@@ -630,7 +661,7 @@ impl Retry {
     fn what(&self) -> String {
         let archive = forge_core::paths::name_of(self.archive());
         match self {
-            Retry::Browse { .. } => {
+            Retry::Browse { .. } | Retry::BrowseWindow { .. } => {
                 format!(
                     "{archive} has encrypted file names: its contents can't be listed without the password."
                 )
@@ -665,7 +696,10 @@ pub(crate) enum Msg {
     Updated(PathBuf),
 }
 
+/// The password dialog's state. However it ends (OK, Cancel, automation, the app closing),
+/// dropping it wipes what was typed and makes egui forget the fields' state and undo history.
 struct PasswordPrompt {
+    ctx: egui::Context,
     retry: Retry,
     text: String,
     /// The password typed again, when there is nothing to check it against (see
@@ -721,6 +755,8 @@ impl Drop for PasswordPrompt {
         if let Some(confirm) = &mut self.confirm {
             wipe(confirm);
         }
+        forget_text_state(&self.ctx, password_field_id());
+        forget_text_state(&self.ctx, confirm_field_id());
     }
 }
 
@@ -810,8 +846,7 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
 /// changed.
 pub fn poll(app: &mut ZxrawApp) -> bool {
     let mut changed = false;
-    for (archive, path, wrong) in std::mem::take(&mut *browse_requests().lock()) {
-        let retry = Retry::Browse { archive, path };
+    for (retry, wrong) in std::mem::take(&mut *browse_requests().lock()) {
         let queued = app
             .ops
             .archive
@@ -819,10 +854,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             .iter()
             .map(|(r, _)| r)
             .chain(app.ops.archive.prompt.as_ref().map(|p| &p.retry))
-            .any(|r| {
-                matches!(r, Retry::Browse { .. })
-                    && forge_core::paths::paths_equal(r.archive(), retry.archive())
-            });
+            .any(|r| same_listing(r, &retry));
         if !queued {
             let _ = app.ops.archive.tx.send(Msg::NeedPassword { retry, wrong });
         }
@@ -861,6 +893,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             let confirm =
                 matches!(&retry, Retry::Update(r) if r.confirm_password).then(String::new);
             ui.prompt = Some(PasswordPrompt {
+                ctx: app.ops.ctx.clone(),
                 retry,
                 text: String::new(),
                 confirm,
@@ -874,6 +907,9 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
 
 fn run_retry(app: &mut ZxrawApp, retry: Retry) {
     match retry {
+        Retry::BrowseWindow { archive } => {
+            crate::extra_tools_ui::relist_archive_window(app, &archive)
+        }
         Retry::Browse { path, .. } => {
             // List it again where it failed (the pane may have moved on).
             if app.pane().path == path {
@@ -902,12 +938,30 @@ pub(crate) fn automation_answer_password(app: &mut ZxrawApp, text: &str) -> bool
     let Some(prompt) = app.ops.archive.prompt.take() else {
         return false;
     };
-    app.ops
-        .archive
-        .passwords
-        .set(prompt.retry.archive(), Password::new(text));
-    run_retry(app, prompt.retry.clone());
+    accept_prompt(app, prompt, Password::new(text));
     true
+}
+
+/// Automation: press Cancel in the open password dialog. False while none is open.
+pub(crate) fn automation_cancel_password(app: &mut ZxrawApp) -> bool {
+    let Some(prompt) = app.ops.archive.prompt.take() else {
+        return false;
+    };
+    cancel_prompt(app, prompt);
+    true
+}
+
+/// Whether the password dialog's fields have egui state (typed text, undo history) kept.
+#[cfg(any(debug_assertions, feature = "automation"))]
+pub(crate) fn password_fields_remembered(ctx: &egui::Context) -> bool {
+    ctx.data_mut(|d| {
+        [password_field_id(), confirm_field_id()]
+            .into_iter()
+            .any(|id| {
+                d.get_persisted::<egui::text_edit::TextEditState>(id)
+                    .is_some()
+            })
+    })
 }
 
 /// Overwrite the typed password before its memory is freed.
@@ -1000,33 +1054,40 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
             }
         });
     });
-    let forget_fields = |prompt: &mut PasswordPrompt| {
-        wipe(&mut prompt.text);
-        if let Some(confirm) = &mut prompt.confirm {
-            wipe(confirm);
-        }
-        forget_text_state(ctx, password_field_id());
-        forget_text_state(ctx, confirm_field_id());
-    };
+    // Dropping `prompt` (below, on OK or Cancel) wipes the fields: see `PasswordPrompt`.
     if accept && !prompt.text.is_empty() {
         let password = Password::new(&prompt.text);
-        forget_fields(&mut prompt);
-        app.ops
-            .archive
-            .passwords
-            .set(prompt.retry.archive(), password);
-        run_retry(app, prompt.retry.clone());
+        accept_prompt(app, prompt, password);
     } else if cancel || resp.should_close() {
-        forget_fields(&mut prompt);
-        // Other jobs of the same archive wait for the same password: give them up too.
-        let archive = prompt.retry.archive().to_path_buf();
-        app.ops
-            .archive
-            .waiting
-            .retain(|(r, _)| !forge_core::paths::paths_equal(r.archive(), &archive));
+        cancel_prompt(app, prompt);
     } else {
         app.ops.archive.prompt = Some(prompt);
     }
+}
+
+/// OK: keep the password for the session and run what asked for it.
+fn accept_prompt(app: &mut ZxrawApp, prompt: PasswordPrompt, password: Password) {
+    app.ops
+        .archive
+        .passwords
+        .set(prompt.retry.archive(), password);
+    let retry = prompt.retry.clone();
+    drop(prompt);
+    run_retry(app, retry);
+}
+
+/// Cancel: give up the jobs of this archive waiting for the same password; a browse window
+/// that asked closes.
+fn cancel_prompt(app: &mut ZxrawApp, prompt: PasswordPrompt) {
+    let archive = prompt.retry.archive().to_path_buf();
+    if matches!(prompt.retry, Retry::BrowseWindow { .. }) {
+        crate::extra_tools_ui::close_archive_window(app, &archive);
+    }
+    drop(prompt);
+    app.ops
+        .archive
+        .waiting
+        .retain(|(r, _)| !forge_core::paths::paths_equal(r.archive(), &archive));
 }
 
 #[cfg(test)]

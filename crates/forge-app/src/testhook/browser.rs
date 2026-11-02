@@ -32,6 +32,9 @@
 //!   (`0`: no archive copy is kept).
 //! - `archive-password <text>`: waits (10 s) for the archive password dialog and answers it
 //!   with `<text>`, as typing it and pressing OK.
+//! - `archive-password-cancel`: waits (10 s) for the archive password dialog and cancels it.
+//! - `assert-password-fields-forgotten`: egui keeps no state (text, undo history) of the
+//!   password dialog's fields.
 //! - `wait-archive-thumb <name> [| <seconds>]`: waits (30 s default) until the focused
 //!   archive pane's image `<name>` has its temp copy and a decoded thumbnail of it. The grid
 //!   view or the preview panel must be showing the entry (they ask for both). Fails if the
@@ -307,6 +310,23 @@ pub(super) fn step(
                 Err("no archive password dialog opened".into())
             } else {
                 Ok(Flow::Wait("waiting for the archive password dialog".into()))
+            }
+        }
+        "archive-password-cancel" => {
+            let started = *st.started.get_or_insert_with(Instant::now);
+            if crate::archive_ui::automation_cancel_password(app) {
+                Ok(Flow::Done)
+            } else if started.elapsed() >= Duration::from_secs(10) {
+                Err("no archive password dialog opened".into())
+            } else {
+                Ok(Flow::Wait("waiting for the archive password dialog".into()))
+            }
+        }
+        "assert-password-fields-forgotten" => {
+            if crate::archive_ui::password_fields_remembered(ctx) {
+                Err("egui still keeps the password fields' state".into())
+            } else {
+                Ok(Flow::Done)
             }
         }
         "assert-archive-copy" => {
