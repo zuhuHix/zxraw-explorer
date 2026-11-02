@@ -26,12 +26,21 @@
 //!
 //! Races: the pipe always has a listening instance while the owner runs (the next one is
 //! created before a connected one is handled), so a second launch never sees "no owner"
-//! while one exists. A request is answered "accepted" only once the window has taken it:
-//! the receiver holds the answer while the window is still starting, for as long as the
-//! sender said it would wait (minus [`REPLY_MARGIN`]), and for at most [`UI_WAIT`] once the
-//! window is up. A request not taken by then is withdrawn and answered "busy" (or "closing"
-//! when the window began closing, see [`Inbox::close`]), so the sender opens a window of its
-//! own and the path opens exactly once: never in both windows, never in neither.
+//! while one exists. A request is answered "accepted" at the moment the window takes it
+//! ([`Inbox::take`] hands the answer to the waiting pipe thread directly). The receiver holds
+//! the answer while the window is still starting, for as long as the sender said it would
+//! wait minus [`REPLY_MARGIN`], and for at most [`UI_WAIT`] once the window is up. A request
+//! not taken by then is withdrawn and answered "busy" (or "closing" once the window began
+//! closing, see [`Inbox::close`]), and the sender opens a window of its own.
+//!
+//! The rule when in doubt is that the sender opens its own window: a launch is never lost.
+//! Under rare scheduling delays (the "accepted" answer arrives after the sender stopped
+//! waiting) a launch may also open its own window, besides the tab in the running one. That
+//! extra window is accepted; a full commit protocol to rule it out is not worth its cost.
+//!
+//! Versions: the protocol version is part of the pipe name, so windows of different
+//! versions never talk to each other. While an update overlaps (the old window still open,
+//! the new executable launched), a launch of the new version opens its own window.
 //!
 //! Identity: the sender also checks that the pipe's owner runs the same executable file as
 //! itself (volume serial and file index), so another program of the same user that creates
@@ -40,15 +49,16 @@
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf, Prefix};
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 #[cfg(not(windows))]
 use crate::Result;
 use crate::WinError;
 
-/// Payload format version. A receiver refuses any other version.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Payload format version, also part of the pipe name. A receiver refuses any other version.
+/// 2 added the sender's wait.
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Largest accepted request, in bytes.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
 /// Most paths in one request.
@@ -61,8 +71,8 @@ pub const UI_WAIT: Duration = Duration::from_millis(1500);
 /// that is still starting (its first frame), which the receiver waits for.
 pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(4000);
 /// The receiver answers this long before the sender's stated wait runs out, so the answer
-/// arrives while the sender still listens.
-pub const REPLY_MARGIN: Duration = Duration::from_millis(500);
+/// arrives while the sender still listens (see the module notes on rare late answers).
+pub const REPLY_MARGIN: Duration = Duration::from_secs(1);
 /// Upper bound on the wait a sender may ask for.
 const MAX_REPLY_WAIT: Duration = Duration::from_secs(10);
 /// Byte offset of the sender's wait (`u32` milliseconds) in a request.
@@ -325,9 +335,16 @@ impl Reply {
 
 type Waker = Box<dyn Fn() + Send + Sync>;
 
+/// A request waiting for the window, with the channel its pipe thread waits on for the answer.
+struct Pending {
+    id: u64,
+    paths: Vec<PathBuf>,
+    answer: std::sync::mpsc::SyncSender<Reply>,
+}
+
 #[derive(Default)]
 struct InboxState {
-    queue: VecDeque<(u64, Vec<PathBuf>)>,
+    queue: VecDeque<Pending>,
     next_id: u64,
     /// The window has taken requests at least once: from then on, an untaken request means
     /// the window is not responding.
@@ -340,7 +357,6 @@ struct InboxState {
 #[derive(Default)]
 pub struct Inbox {
     state: Mutex<InboxState>,
-    taken: Condvar,
     waker: Mutex<Option<Waker>>,
     /// The window to restore and bring to the front, as an `HWND` value; 0 = none yet.
     window: std::sync::atomic::AtomicIsize,
@@ -363,21 +379,30 @@ impl Inbox {
 
     /// Takes every waiting request (each a list of paths; empty = focus only) and marks the
     /// window ready.
+    /// Each request is answered "accepted" here, at the moment it is taken.
     pub fn take(&self) -> Vec<Vec<PathBuf>> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.ready = true;
-        let taken: Vec<_> = state.queue.drain(..).map(|(_, paths)| paths).collect();
-        drop(state);
-        self.taken.notify_all();
-        taken
+        state
+            .queue
+            .drain(..)
+            .map(|pending| {
+                // Never blocks: the channel holds one answer and only this one is sent.
+                let _ = pending.answer.try_send(Reply::Accepted);
+                pending.paths
+            })
+            .collect()
     }
 
     /// From now on, requests are answered [`Reply::Closing`] so their senders start their
-    /// own window. Requests queued but not taken yet are withdrawn by their pipe threads and
-    /// answered the same; what the window already took is its own.
+    /// own window; requests queued but not taken yet are withdrawn and answered the same.
+    /// What the window already took is its own.
     pub fn close(&self) {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).closing = true;
-        self.taken.notify_all();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closing = true;
+        for pending in state.queue.drain(..) {
+            let _ = pending.answer.try_send(Reply::Closing);
+        }
     }
 
     pub fn is_closing(&self) -> bool {
@@ -394,7 +419,8 @@ impl Inbox {
         }
         let id = state.next_id;
         state.next_id += 1;
-        state.queue.push_back((id, paths));
+        let (answer, reply) = std::sync::mpsc::sync_channel(1);
+        state.queue.push_back(Pending { id, paths, answer });
         let ready = state.ready;
         drop(state);
         if let Some(wake) = &*self.waker.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -404,19 +430,17 @@ impl Inbox {
         // A starting window gets the sender's whole wait; a running one that does not take a
         // request within `ui_wait` is not responding.
         let limit = if ready { wait.min(ui_wait) } else { wait };
-        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let (mut state, _) = self
-            .taken
-            .wait_timeout_while(state, limit, |s| {
-                !s.closing && s.queue.iter().any(|(queued, _)| *queued == id)
-            })
-            .unwrap_or_else(|p| p.into_inner());
-        match state.queue.iter().position(|(queued, _)| *queued == id) {
-            None => Reply::Accepted,
+        if let Ok(answer) = reply.recv_timeout(limit) {
+            return answer;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        match state.queue.iter().position(|pending| pending.id == id) {
             Some(i) => {
                 state.queue.remove(i);
-                if state.closing { Reply::Closing } else { Reply::Busy }
+                Reply::Busy
             }
+            // Taken or withdrawn just now: its answer was sent under the lock held above.
+            None => reply.try_recv().unwrap_or(Reply::Busy),
         }
     }
 
@@ -647,6 +671,69 @@ mod imp {
         }
     }
 
+    /// `a` and `b` are the same file: same volume serial and file index; when those cannot be
+    /// read, the same final path (8.3 names, `subst` drives and `\\?\` prefixes resolved by
+    /// Windows), ignoring case; when not even that, the same path as given, ignoring case.
+    pub(crate) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+        if let (Ok(a), Ok(b)) = (crate::files::file_id(a), crate::files::file_id(b)) {
+            return a == b;
+        }
+        path_key(a) == path_key(b)
+    }
+
+    /// `path` as compared when file identities cannot be read: its final path (or the path
+    /// as given), without a `\\?\` prefix, lowercased.
+    pub(crate) fn path_key(path: &std::path::Path) -> String {
+        let text = final_path(path).unwrap_or_else(|_| path.as_os_str().to_string_lossy().into_owned());
+        strip_verbatim(&text).to_lowercase()
+    }
+
+    /// `\\?\C:\x` -> `C:\x`, `\\?\UNC\s\x` -> `\\s\x`.
+    fn strip_verbatim(path: &str) -> String {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+        }
+    }
+
+    /// The normalized path Windows reports for the open file (`GetFinalPathNameByHandleW`).
+    pub(crate) fn final_path(path: &std::path::Path) -> Result<String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+        };
+        const FILE_SHARE_ALL: u32 = 7;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .map_err(|source| WinError::Io {
+                op: "open for its final path",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let handle = HANDLE(file.as_raw_handle());
+        let mut buf = vec![0u16; 1024];
+        loop {
+            let len = unsafe {
+                GetFinalPathNameByHandleW(handle, &mut buf, windows::Win32::Storage::FileSystem::GETFINALPATHNAMEBYHANDLE_FLAGS(
+                    FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0,
+                ))
+            } as usize;
+            if len == 0 {
+                return Err(crate::last_io_err("GetFinalPathNameByHandleW", path));
+            }
+            if len < buf.len() {
+                return Ok(String::from_utf16_lossy(&buf[..len]));
+            }
+            buf.resize(len + 1, 0);
+        }
+    }
+
     /// The full Win32 path of the executable process `pid` runs.
     fn image_path(pid: u32) -> Result<std::path::PathBuf> {
         use std::os::windows::ffi::OsStringExt;
@@ -693,6 +780,12 @@ mod imp {
         /// The channel of the current process. `tag` separates builds (installed, dev,
         /// tests): 1 to 48 characters from `A-Z a-z 0-9 . _ -`.
         pub fn current(tag: &str) -> Result<Self> {
+            Self::for_version(tag, super::PROTOCOL_VERSION)
+        }
+
+        /// The pipe ends in `-v<version>`: launches of another protocol version never find
+        /// this one (each opens its own window instead).
+        pub(crate) fn for_version(tag: &str, version: u32) -> Result<Self> {
             if tag.is_empty()
                 || tag.len() > 48
                 || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
@@ -701,7 +794,7 @@ mod imp {
             }
             let me = identity_of(unsafe { GetCurrentProcessId() })?;
             let display = format!(
-                r"\\.\pipe\ZXrawExplorer-{}-{}-{:x}-{tag}",
+                r"\\.\pipe\ZXrawExplorer-{}-{}-{:x}-{tag}-v{version}",
                 me.sid, me.session, me.integrity
             );
             let exe = std::env::current_exe().map_err(|source| WinError::Io {
@@ -719,19 +812,11 @@ mod imp {
             self
         }
 
-        /// The owner `pid` runs the same executable file as this process: same volume serial
-        /// and file index, or (when those cannot be read) the same full path, ignoring case.
+        /// The owner `pid` runs the same executable file as this process (see [`same_file`]).
         /// Keeps another program of this user that took the pipe name from swallowing launches.
         pub(crate) fn check_exe(&self, pid: u32) -> std::result::Result<(), String> {
             let theirs = image_path(pid).map_err(|e| format!("process {pid}: {e}"))?;
-            let same = match (crate::files::file_id(&theirs), crate::files::file_id(&self.exe)) {
-                (Ok(a), Ok(b)) => a == b,
-                _ => theirs
-                    .as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&self.exe.as_os_str().to_string_lossy()),
-            };
-            if same {
+            if same_file(&theirs, &self.exe) {
                 Ok(())
             } else {
                 Err(format!(
@@ -856,6 +941,24 @@ mod imp {
         /// Creates the pipe's first instance and starts accepting, or returns `None` when
         /// another process already owns the pipe.
         pub fn claim(channel: &Channel, inbox: Arc<Inbox>) -> Result<Option<Server>> {
+            Self::claim_with(channel, inbox, Duration::ZERO)
+        }
+
+        /// Tests: answers every request `reply_delay` late, as a descheduled receiver would.
+        #[cfg(test)]
+        pub(crate) fn claim_with_reply_delay(
+            channel: &Channel,
+            inbox: Arc<Inbox>,
+            reply_delay: Duration,
+        ) -> Result<Option<Server>> {
+            Self::claim_with(channel, inbox, reply_delay)
+        }
+
+        fn claim_with(
+            channel: &Channel,
+            inbox: Arc<Inbox>,
+            reply_delay: Duration,
+        ) -> Result<Option<Server>> {
             // A label above what the process may set fails; the DACL and the identity
             // checks still hold without it.
             let (sd, first) = match channel.security_descriptor(true).and_then(|sd| {
@@ -881,7 +984,7 @@ mod imp {
                 let channel = channel.clone();
                 std::thread::Builder::new()
                     .name("instance-pipe".into())
-                    .spawn(move || accept_loop(channel, sd, first, stop, inbox))
+                    .spawn(move || accept_loop(channel, sd, first, stop, inbox, reply_delay))
                     .map_err(|e| WinError::Invalid(format!("could not start the pipe thread: {e}")))?
             };
             Ok(Some(Server {
@@ -913,6 +1016,7 @@ mod imp {
         mut current: Owned,
         stop: Arc<Owned>,
         inbox: Arc<Inbox>,
+        reply_delay: Duration,
     ) {
         let handlers = Arc::new(AtomicUsize::new(0));
         loop {
@@ -948,7 +1052,7 @@ mod imp {
             let spawned = std::thread::Builder::new()
                 .name("instance-request".into())
                 .spawn(move || {
-                    handle(&channel, connected, &inbox);
+                    handle(&channel, connected, &inbox, reply_delay);
                     handlers.fetch_sub(1, Ordering::SeqCst);
                 });
             if let Err(e) = spawned {
@@ -1045,7 +1149,7 @@ mod imp {
 
     /// One connection: check the sender, read and validate its request, hand it to the
     /// window and answer.
-    fn handle(channel: &Channel, pipe: Owned, inbox: &Inbox) {
+    fn handle(channel: &Channel, pipe: Owned, inbox: &Inbox, reply_delay: Duration) {
         let mut pid = 0;
         if let Err(e) = unsafe { GetNamedPipeClientProcessId(pipe.0, &mut pid) } {
             tracing::warn!("instance pipe: unknown sender: {e}");
@@ -1087,8 +1191,18 @@ mod imp {
                 return;
             }
         };
+        if !reply_delay.is_zero() {
+            std::thread::sleep(reply_delay);
+        }
         if write_message(pipe.0, &reply.encode(), READ_TIMEOUT).is_err() {
-            tracing::warn!("instance pipe: could not answer process {pid}");
+            if reply == Reply::Accepted {
+                tracing::warn!(
+                    "instance pipe: opened a launch from process {pid}, but could not tell it; \
+                     it may open its own window as well"
+                );
+            } else {
+                tracing::warn!("instance pipe: could not answer process {pid}");
+            }
             return;
         }
         // Closing before the sender has read the answer could discard it: wait until the
@@ -1294,9 +1408,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn relative_paths_need_an_absolute_working_directory() {
-        let bytes = raw(1, &units(""), &[units("Trip")]);
+        let bytes = raw(PROTOCOL_VERSION, &units(""), &[units("Trip")]);
         assert_eq!(decode_request(&bytes), Err(PayloadError::NoWorkingDirectory));
-        let bytes = raw(1, &units("relative"), &[units(r"C:\x")]);
+        let bytes = raw(PROTOCOL_VERSION, &units("relative"), &[units(r"C:\x")]);
         assert!(matches!(decode_request(&bytes), Err(PayloadError::NotAbsolute(_))));
     }
 
@@ -1304,23 +1418,26 @@ mod tests {
     #[test]
     fn drive_relative_and_device_paths_are_refused() {
         for bad in [r"C:foo", r"\\.\pipe\other", r"\\?\GLOBALROOT\Device\HarddiskVolume1"] {
-            let bytes = raw(1, &units(r"D:\work"), &[units(bad)]);
+            let bytes = raw(PROTOCOL_VERSION, &units(r"D:\work"), &[units(bad)]);
             assert!(
                 matches!(decode_request(&bytes), Err(PayloadError::NotAbsolute(_))),
                 "{bad} was accepted"
             );
         }
-        let bytes = raw(1, &units(r"D:\work"), &[units(r"\\?\C:\long\path")]);
+        let bytes = raw(PROTOCOL_VERSION, &units(r"D:\work"), &[units(r"\\?\C:\long\path")]);
         assert_eq!(decode_request(&bytes).unwrap().paths, vec![PathBuf::from(r"\\?\C:\long\path")]);
     }
 
     #[test]
     fn wrong_version_and_magic_are_refused() {
-        assert_eq!(
-            decode_request(&raw(2, &units(""), &[])),
-            Err(PayloadError::WrongVersion(2))
-        );
-        let mut bytes = raw(1, &units(""), &[]);
+        // Strict: the previous version and unknown later ones are refused alike.
+        for version in [1, PROTOCOL_VERSION + 1] {
+            assert_eq!(
+                decode_request(&raw(version, &units(""), &[])),
+                Err(PayloadError::WrongVersion(version))
+            );
+        }
+        let mut bytes = raw(PROTOCOL_VERSION, &units(""), &[]);
         bytes[0] = b'X';
         assert_eq!(decode_request(&bytes), Err(PayloadError::BadMagic));
         assert_eq!(decode_request(b"ZX"), Err(PayloadError::Truncated));
@@ -1342,7 +1459,7 @@ mod tests {
             decode_request(&vec![0u8; MAX_PAYLOAD + 1]),
             Err(PayloadError::TooLarge(_))
         ));
-        let mut huge_count = raw(1, &units(""), &[]);
+        let mut huge_count = raw(PROTOCOL_VERSION, &units(""), &[]);
         let at = huge_count.len() - 4;
         huge_count[at..].copy_from_slice(&u32::MAX.to_le_bytes());
         assert_eq!(
@@ -1350,9 +1467,9 @@ mod tests {
             Err(PayloadError::TooManyPaths(u32::MAX as usize))
         );
         // A string length past the data is caught, not trusted.
-        let bytes = raw(1, &(u32::MAX).to_le_bytes(), &[]);
+        let bytes = raw(PROTOCOL_VERSION, &(u32::MAX).to_le_bytes(), &[]);
         assert!(matches!(decode_request(&bytes), Err(PayloadError::StringTooLong(_))));
-        let bytes = raw(1, &1000u32.to_le_bytes(), &[]);
+        let bytes = raw(PROTOCOL_VERSION, &1000u32.to_le_bytes(), &[]);
         assert_eq!(decode_request(&bytes), Err(PayloadError::Truncated));
     }
 
@@ -1362,20 +1479,20 @@ mod tests {
         let mut lone = 1u32.to_le_bytes().to_vec();
         lone.extend_from_slice(&0xD800u16.to_le_bytes());
         assert_eq!(
-            decode_request(&raw(1, &units(r"C:\"), &[lone])),
+            decode_request(&raw(PROTOCOL_VERSION, &units(r"C:\"), &[lone])),
             Err(PayloadError::InvalidUtf16)
         );
         assert_eq!(
-            decode_request(&raw(1, &units(r"C:\"), &[units("C:\\a\0b")])),
+            decode_request(&raw(PROTOCOL_VERSION, &units(r"C:\"), &[units("C:\\a\0b")])),
             Err(PayloadError::ContainsNul)
         );
-        let mut bytes = raw(1, &units(""), &[]);
+        let mut bytes = raw(PROTOCOL_VERSION, &units(""), &[]);
         bytes.push(0);
         assert_eq!(decode_request(&bytes), Err(PayloadError::TrailingBytes));
         // An odd byte count cannot hold the units it announces.
         let mut odd = 1u32.to_le_bytes().to_vec();
         odd.push(b'C');
-        assert_eq!(decode_request(&raw(1, &odd, &[])), Err(PayloadError::Truncated));
+        assert_eq!(decode_request(&raw(PROTOCOL_VERSION, &odd, &[])), Err(PayloadError::Truncated));
     }
 
     #[test]
@@ -1675,6 +1792,82 @@ mod tests {
             // Over the pipe's message limit: the receiver sees more data than it accepts.
             assert_eq!(imp::raw_send(&channel, &vec![b'x'; MAX_PAYLOAD + 10]), Some(Reply::Rejected));
             assert!(inbox.take().is_empty());
+        }
+
+        #[test]
+        fn launches_of_another_protocol_version_never_reach_each_other() {
+            let tag = unique_tag("ver");
+            let old = Channel::for_version(&tag, 1).unwrap();
+            let old_inbox = Arc::new(Inbox::new());
+            let _old = Server::claim(&old, old_inbox.clone()).unwrap().expect("v1 owner");
+            let (stop, window) = window(old_inbox.clone());
+            let new = Channel::current(&tag).unwrap();
+            assert!(old.pipe_name().ends_with("-v1"), "{}", old.pipe_name());
+            assert!(new.pipe_name().ends_with(&format!("-v{PROTOCOL_VERSION}")));
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
+            // During an update overlap the new launch becomes a window of its own.
+            match claim_or_forward(&new, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Primary(_) => {}
+                Startup::Forwarded => panic!("a v2 launch reached a v1 window"),
+                Startup::Standalone(why) => panic!("the v2 launch should own its own pipe: {why}"),
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(window.join().unwrap().is_empty(), "the v1 window was contacted");
+        }
+
+        /// The documented trade-off: an "accepted" answer that arrives after the sender gave up
+        /// leaves the launch open in both windows. Never lost, at worst one extra window.
+        #[test]
+        fn a_late_accepted_answer_means_an_extra_window_never_a_lost_launch() {
+            let channel = Channel::current(&unique_tag("late")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server =
+                Server::claim_with_reply_delay(&channel, inbox.clone(), Duration::from_secs(3))
+                    .unwrap()
+                    .expect("owner");
+            let (stop, window) = window(inbox.clone());
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("in time"), "{why}"),
+                _ => panic!("a sender past its deadline must open its own window"),
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                window.join().unwrap(),
+                vec![vec![PathBuf::from(r"C:\Users")]],
+                "the running window opened it as well (the accepted, documented duplicate)"
+            );
+        }
+
+        #[test]
+        fn the_same_executable_is_recognised_through_path_aliases() {
+            let exe = std::env::current_exe().unwrap();
+            let plain = imp::path_key(&exe);
+            let verbatim = PathBuf::from(format!(r"\\?\{}", exe.display()));
+            assert_eq!(imp::path_key(&verbatim), plain);
+            assert!(imp::same_file(&exe, &verbatim));
+            let upper = PathBuf::from(exe.to_string_lossy().to_uppercase());
+            assert_eq!(imp::path_key(&upper), plain);
+            // An 8.3 alias, where the volume has short names.
+            let wide = crate::to_wide(&exe);
+            let mut short = vec![0u16; 1024];
+            let len = unsafe {
+                windows::Win32::Storage::FileSystem::GetShortPathNameW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    Some(&mut short),
+                )
+            } as usize;
+            if len > 0 && len < short.len() {
+                let short = PathBuf::from(String::from_utf16_lossy(&short[..len]));
+                if short != exe {
+                    assert_eq!(imp::path_key(&short), plain, "{}", short.display());
+                } else {
+                    eprintln!("no 8.3 alias on this volume; skipped that case");
+                }
+            }
+            let other = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
+            assert!(!imp::same_file(&exe, &other));
+            assert_ne!(imp::path_key(&other), plain);
         }
 
         #[test]

@@ -177,7 +177,9 @@ Explorer is a file manager designed around that workflow:
 - **One window, many folders.** Opening a folder, a photo or a file from Explorer, a shortcut or a
   terminal (`zxraw <path>`) adds a tab to the window that is already running and brings it to the
   front. Shift+right-click a folder for *Open in new ZXraw window*, or run `zxraw --new-window`, for
-  a separate window. Settings › Browsing turns this off.
+  a separate window. Settings › Browsing turns this off. A launch is never lost: if the running
+  window doesn't answer in time it opens its own window instead (and, under rare delays, may do so
+  as well as opening the tab).
 - **Your NAS in the sidebar.** Save shares like `\\nas\photos` to the Network section, next to
   your mapped drives. A status dot shows which are online, and an offline NAS never freezes the
   window. If a share needs a password, *Connect…* lets Windows ask for it: ZXraw Explorer never
