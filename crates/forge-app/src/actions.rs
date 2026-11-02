@@ -284,6 +284,8 @@ pub struct Actions {
     pub git: crate::git_status::GitStatus,
     pub folder_sizes: crate::folder_sizes::FolderSizes,
     folder_wants: FolderWants,
+    /// Archive passwords and the opening of files inside archives (see `archive_ui`).
+    pub archive: crate::archive_ui::ArchiveUi,
 }
 
 /// Grid thumbnail source that overlays library annotations (ratings/labels/picks).
@@ -354,6 +356,7 @@ impl Actions {
             git: crate::git_status::GitStatus::new(ctx.clone()),
             folder_sizes: crate::folder_sizes::FolderSizes::new(ctx.clone()),
             folder_wants: Default::default(),
+            archive: Default::default(),
             library: crate::library::Library::open(paths.data.join("forge.db"), ctx.clone()),
             ctx,
             thumbs: crate::thumbs::ThumbManager::new(
@@ -392,7 +395,10 @@ impl Actions {
 }
 
 pub fn modal_open(app: &ZxrawApp) -> bool {
-    app.ops.modal.is_some() || app.ops.batch_rename.is_some() || !app.ops.conflicts.is_empty()
+    app.ops.modal.is_some()
+        || app.ops.batch_rename.is_some()
+        || !app.ops.conflicts.is_empty()
+        || app.ops.archive.prompt_open()
 }
 
 /// Whether the selection is entirely hidden (filtered out, hidden files off, inside a
@@ -410,7 +416,25 @@ fn hidden_selection(app: &mut ZxrawApp, verb: &str) -> bool {
 
 pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
     let dir = app.pane().path.clone();
+    // Tools that read the listed items as files.
+    if crate::archive_ui::needs_real_files(cmd)
+        && crate::archive_ui::block_in_archive(app, cmd.label())
+    {
+        return;
+    }
     match cmd {
+        Cmd::NewFolder if crate::archive_ui::block_in_archive(app, "New folder") => {}
+        Cmd::NewFile if crate::archive_ui::block_in_archive(app, "New file") => {}
+        Cmd::Rename if crate::archive_ui::block_in_archive(app, "Rename") => {}
+        Cmd::DeletePermanently | Cmd::Recycle
+            if crate::archive_ui::block_in_archive(app, "Delete") => {}
+        Cmd::Properties if crate::archive_ui::block_in_archive(app, "Properties") => {}
+        Cmd::OpenTerminal | Cmd::OpenTerminalAdmin
+            if crate::archive_ui::block_in_archive(app, "Open terminal") => {}
+        Cmd::Copy if crate::archive_ui::block_in_archive(app, "Copy") => {}
+        Cmd::Cut if crate::archive_ui::block_in_archive(app, "Cut") => {}
+        Cmd::Paste if crate::archive_ui::block_in_archive(app, "Paste") => {}
+        Cmd::BatchRename if crate::archive_ui::block_in_archive(app, "Batch rename") => {}
         Cmd::NewFolder => {
             let name = unique_listed_name(app, &dir, "New folder");
             app.ops.modal = Some(Modal::Prompt(Prompt::new(
@@ -490,6 +514,11 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             app.ops
                 .spawn_shell("Properties", move || forge_win::show_properties(&p));
         }
+        Cmd::OpenWith if app.pane().archive.is_some() => {
+            if let Some(e) = app.pane().rename_target().cloned() {
+                crate::archive_ui::open_entry(app, &e, crate::archive_ui::OpenHow::OpenWith);
+            }
+        }
         Cmd::OpenWith => {
             if let Some(p) = app.pane().rename_target().map(|e| e.path.clone()) {
                 app.ops
@@ -510,6 +539,14 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                     ctx.request_repaint();
                 }
             });
+        }
+        Cmd::RevealInExplorer if app.pane().archive.is_some() => {
+            // Items inside an archive are not files Explorer could show: show the archive.
+            if let Some(p) = app.pane().archive.as_ref().map(|a| a.archive.clone()) {
+                app.ops.spawn_shell("Show in Explorer", move || {
+                    forge_win::reveal_in_explorer(&p)
+                });
+            }
         }
         Cmd::RevealInExplorer => {
             let p = app
@@ -581,6 +618,9 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 return;
             };
             let paths = app.pane().action_targets();
+            if crate::archive_ui::block_paths(app, cmd.label(), &paths, &other) {
+                return;
+            }
             let kind = if cmd == Cmd::CopyToOtherPane {
                 OpKind::Copy
             } else {
@@ -1079,6 +1119,9 @@ fn undo_rename(app: &mut ZxrawApp, pairs: Vec<(PathBuf, PathBuf)>, slot: UndoSlo
 }
 
 fn annotate_targets(app: &mut ZxrawApp, change: AnnotationChange) {
+    if crate::archive_ui::block_in_archive(app, "Ratings and labels") {
+        return;
+    }
     // The listed kind, not the disk: `is_file` could block the UI on an offline share.
     let pane = app.pane();
     let all = pane.action_targets();
@@ -1454,6 +1497,10 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
 }
 
 pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
+    let what = if copy { "Copy" } else { "Move" };
+    if crate::archive_ui::block_paths(app, what, &paths, &target) {
+        return;
+    }
     let kind = if copy { OpKind::Copy } else { OpKind::Move };
     crate::ops_ui::start_transfer(app, paths, target, kind);
 }
@@ -1529,11 +1576,13 @@ impl FolderWants {
                 }
             }
             let focused = tab.focused();
+            // `listed_folders` leaves out archive panes; so do their selected folders.
+            let real = !focused.in_archive();
             folders.extend(
                 focused
                     .entries
                     .iter()
-                    .filter(|e| e.is_dir() && focused.selected.contains(&e.path))
+                    .filter(|e| real && e.is_dir() && focused.selected.contains(&e.path))
                     .map(|e| e.path.clone()),
             );
             if folders != self.folders {
@@ -1547,15 +1596,28 @@ impl FolderWants {
 
 pub fn poll(app: &mut ZxrawApp) -> bool {
     crate::tags_ui::tick(app);
-    let folders: Vec<PathBuf> = app
-        .tabs
-        .get(app.active)
-        .map(|t| {
-            std::iter::once(t.left.path.clone())
-                .chain(t.right.as_ref().map(|r| r.path.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // The folders shown, for the file services. A pane inside an archive shows no folder
+    // on disk; the folder holding its archive is watched instead (see `refresh_all_showing`).
+    let panes = |t: &crate::app::Tab| -> Vec<(PathBuf, bool)> {
+        std::iter::once(&t.left)
+            .chain(t.right.as_ref())
+            .filter_map(|p| match &p.archive {
+                Some(a) => a.archive.parent().map(|d| (d.to_path_buf(), false)),
+                None if p.in_archive() => None,
+                None => Some((p.path.clone(), true)),
+            })
+            .collect()
+    };
+    let shown = app.tabs.get(app.active).map(panes).unwrap_or_default();
+    let folders: Vec<PathBuf> = shown
+        .iter()
+        .filter(|(_, real)| *real)
+        .map(|(p, _)| p.clone())
+        .collect();
+    let archive_dirs = shown
+        .iter()
+        .filter(|(_, real)| !*real)
+        .map(|(p, _)| p.clone());
     for f in &folders {
         app.ops.library.ensure_dir(f);
     }
@@ -1573,11 +1635,17 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         .map(|t| {
             std::iter::once(&t.left)
                 .chain(t.right.as_ref())
+                .filter(|p| !p.in_archive())
                 .flat_map(|p| p.open_folders().map(Path::to_path_buf))
                 .collect()
         })
         .unwrap_or_default();
-    let watched: Vec<PathBuf> = folders.iter().cloned().chain(watched).collect();
+    let watched: Vec<PathBuf> = folders
+        .iter()
+        .cloned()
+        .chain(watched)
+        .chain(archive_dirs)
+        .collect();
     app.ops.watcher.sync(&watched);
     let tabs = &app.tabs;
     let due = app.ops.watcher.due(|d| {
@@ -1626,6 +1694,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     changed |= app.ops.thumbs.upload_ready(&app.ops.ctx);
     // A finished "Select originals/exports" match (computed off the UI thread).
     changed |= crate::export_assoc::poll(app);
+    changed |= crate::archive_ui::poll(app);
     if app
         .ops
         .paste_waiting
@@ -1923,6 +1992,7 @@ pub fn shutdown(app: &mut ZxrawApp) {
 }
 
 pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
+    crate::archive_ui::password_modal(app, ui.ctx());
     crate::sidebar::network::dialog(app, ui.ctx());
     crate::ops_ui::jobs_window(app, ui.ctx());
     crate::ops_ui::progress_popup(app, ui.ctx());
@@ -2079,6 +2149,11 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
     };
     preview::header(ui, &e);
     ui.separator();
+    if let Some(view) = &app.pane().archive {
+        // Inside an archive: what the archive's index says (a later task previews files).
+        crate::archive_ui::info_grid(ui, &e, view);
+        return;
+    }
     if preview::is_media(&e) {
         // Large preview from the thumbnail pipeline (largest bucket).
         let w = ui.available_width().min(512.0);
