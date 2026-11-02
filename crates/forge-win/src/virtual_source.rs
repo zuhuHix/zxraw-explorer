@@ -132,6 +132,55 @@ pub(crate) fn own_format() -> crate::Result<u16> {
 #[cfg(windows)]
 pub use imp::VirtualDataObject;
 
+/// Pastes the clipboard into `folder` as Explorer's Paste does: the shell's own drop target
+/// of the folder is given the clipboard's data object, allowed only its "Preferred
+/// DropEffect" (Move for a Cut). Returns at once; the shell copies on its own threads, so
+/// the calling (UI) thread must keep pumping messages. For tests and automation.
+#[cfg(windows)]
+pub fn shell_paste_clipboard(folder: &std::path::Path) -> crate::Result<()> {
+    use windows::Win32::Foundation::POINTL;
+    use windows::Win32::System::Com::IBindCtx;
+    use windows::Win32::System::Ole::{DROPEFFECT, IDropTarget, OleGetClipboard};
+    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+    use windows::Win32::UI::Shell::{BHID_SFUIObject, IShellItem, SHCreateItemFromParsingName};
+    use windows::core::PCWSTR;
+
+    // SAFETY: plain OLE and shell calls on this (OLE) thread with live objects.
+    unsafe {
+        let data = OleGetClipboard().map_err(|e| crate::api_err("OleGetClipboard", e))?;
+        let format = crate::virtual_files::registered_format(
+            windows::core::w!("Preferred DropEffect"),
+            "RegisterClipboardFormatW(Preferred DropEffect)",
+        )?;
+        let preferred = crate::virtual_files::read_hglobal_bytes(&data, format, "Preferred DropEffect", 4)
+            .ok()
+            .and_then(|b| Some(u32::from_le_bytes(b.get(..4)?.try_into().ok()?)))
+            .filter(|&e| e != 0)
+            .unwrap_or(EFFECT_COPY);
+        let wide = crate::to_wide(folder);
+        let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>)
+            .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
+        let target: IDropTarget = item
+            .BindToHandler(None::<&IBindCtx>, &BHID_SFUIObject)
+            .map_err(|e| crate::api_err("BindToHandler(IDropTarget)", e))?;
+        let keys = MODIFIERKEYS_FLAGS(0);
+        let mut effect = DROPEFFECT(preferred);
+        target
+            .DragEnter(&data, keys, POINTL::default(), &mut effect)
+            .map_err(|e| crate::api_err("IDropTarget::DragEnter", e))?;
+        effect = DROPEFFECT(preferred);
+        target
+            .Drop(&data, keys, POINTL::default(), &mut effect)
+            .map_err(|e| crate::api_err("IDropTarget::Drop", e))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn shell_paste_clipboard(_folder: &std::path::Path) -> crate::Result<()> {
+    Err(crate::WinError::Unsupported)
+}
+
 /// Stand-in so callers compile everywhere.
 #[cfg(not(windows))]
 pub struct VirtualDataObject;
