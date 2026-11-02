@@ -6,8 +6,12 @@
 //! from temp copies made in the background ([`Materialize`]).
 //!
 //! Opening a file inside extracts it to a private temp folder first (a job), asking for the
-//! archive's password when an entry is encrypted. Passwords are kept for the session only
+//! archive's password when an entry is encrypted. A 7z archive with encrypted names asks for
+//! it before it can be listed at all. Passwords are kept for the session only
 //! ([`ArchivePasswords`]), never logged and never saved.
+//!
+//! Files in a solid 7z block are read by decoding the block up to them: thumbnails are made
+//! only when that is at most [`PREVIEW_MAX_DECODE`] bytes.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -26,6 +30,11 @@ use crate::commands::Cmd;
 const OPEN_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// Largest image entry given a thumbnail and preview (from a temp copy).
 pub const PREVIEW_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Most bytes decoded for a thumbnail or preview: a file deep in a solid 7z block is skipped
+/// rather than decoding hundreds of MB of its block.
+pub const PREVIEW_MAX_DECODE: u64 = 64 * 1024 * 1024;
+/// Opening a file that decodes more than this of its solid block says so in the job title.
+const OPEN_NOTE_DECODE: u64 = 256 * 1024 * 1024;
 /// Temp copies for previews made at once, and waiting at most.
 const MATERIALIZE_WORKERS: usize = 2;
 const MATERIALIZE_QUEUE: usize = 64;
@@ -68,6 +77,9 @@ pub enum ArchiveListing {
     /// The path is a file inside the archive: show its folder with it selected.
     File,
     Failed(String),
+    /// The archive's names are encrypted (7z): the password dialog was asked for; the text
+    /// is shown meanwhile.
+    NeedsPassword(String),
 }
 
 /// Lists `path` when it points into an archive; `None` for ordinary paths. Touches the disk
@@ -75,8 +87,17 @@ pub enum ArchiveListing {
 /// it off the UI thread.
 pub fn list_archive_path(path: &Path) -> Option<ArchiveListing> {
     let (file, inner) = archive::split_archive_path(path)?;
-    let index = match archive::index_cached(&file) {
+    let password = session_password(&file);
+    let index = match archive::index_cached_with(&file, password.as_ref()) {
         Ok(index) => index,
+        Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
+            let wrong = matches!(e, CoreError::WrongPassword(_));
+            request_browse_password(&file, path, wrong);
+            return Some(ArchiveListing::NeedsPassword(format!(
+                "{}: the file names are encrypted; enter the password to see them",
+                forge_core::paths::name_of(&file)
+            )));
+        }
         Err(e) => return Some(ArchiveListing::Failed(e.to_string())),
     };
     let Some(children) = index.children(&inner) else {
@@ -232,11 +253,14 @@ impl crate::views::ThumbProvider for NoFileServices {
 
 /// Whether a listed entry gets a thumbnail and preview from a temp copy: an image of at
 /// most [`PREVIEW_MAX_BYTES`], not encrypted unless the archive's password is known.
+/// A file in a solid 7z block also needs its block decoded up to it: at most
+/// [`PREVIEW_MAX_DECODE`] in all.
 pub fn wants_temp_copy(e: &FileEntry, node: &ArchiveNode, password_known: bool) -> bool {
     e.kind == EntryKind::File
         && !node.is_dir
         && matches!(e.media_kind(), MediaKind::Image | MediaKind::Raw)
         && node.size <= PREVIEW_MAX_BYTES
+        && node.decode_cost() <= PREVIEW_MAX_DECODE
         && (!node.encrypted || password_known)
 }
 
@@ -453,13 +477,22 @@ pub fn info_grid(ui: &mut egui::Ui, e: &FileEntry, view: &ArchiveView) {
             let size = forge_core::model::format_size(e.size);
             row(ui, "Size", format!("{size} ({} bytes)", e.size));
             if let Some(n) = node {
-                row(
-                    ui,
-                    "Compressed",
-                    forge_core::model::format_size(n.compressed_size),
-                );
-                if let Some(ratio) = n.ratio_percent().filter(|_| !n.is_dir) {
-                    row(ui, "Ratio", format!("{ratio}%"));
+                if n.solid {
+                    // Its bytes are mixed with others in one compressed stream: only the
+                    // block's ratio is known.
+                    row(ui, "Compressed", "— (in a solid block)".into());
+                    if let Some(ratio) = n.ratio_percent() {
+                        row(ui, "Ratio", format!("{ratio}% (its block)"));
+                    }
+                } else {
+                    row(
+                        ui,
+                        "Compressed",
+                        forge_core::model::format_size(n.compressed_size),
+                    );
+                    if let Some(ratio) = n.ratio_percent().filter(|_| !n.is_dir) {
+                        row(ui, "Ratio", format!("{ratio}%"));
+                    }
                 }
                 if !n.method.is_empty() {
                     row(ui, "Method", n.method.clone());
@@ -497,10 +530,47 @@ impl ArchivePasswords {
         self.0.get(&Self::key(archive))
     }
     pub fn set(&mut self, archive: &Path, password: Password) {
+        session_store()
+            .lock()
+            .insert(Self::key(archive), password.clone());
         self.0.insert(Self::key(archive), password);
     }
     pub fn forget(&mut self, archive: &Path) {
+        session_store().lock().remove(&Self::key(archive));
         self.0.remove(&Self::key(archive));
+    }
+}
+
+/// The passwords of [`ArchivePasswords`], for listing threads (encrypted 7z names).
+fn session_store() -> &'static parking_lot::Mutex<HashMap<PathBuf, Password>> {
+    static STORE: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, Password>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(Default::default)
+}
+
+/// The session's password of `archive`, if one was typed (any thread).
+pub fn session_password(archive: &Path) -> Option<Password> {
+    session_store()
+        .lock()
+        .get(&ArchivePasswords::key(archive))
+        .cloned()
+}
+
+/// Listings that stopped for the password of an archive with encrypted names:
+/// (archive, the path to list again, whether the password was wrong). Taken by [`poll`].
+fn browse_requests() -> &'static parking_lot::Mutex<Vec<(PathBuf, PathBuf, bool)>> {
+    static PENDING: std::sync::OnceLock<parking_lot::Mutex<Vec<(PathBuf, PathBuf, bool)>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+fn request_browse_password(archive: &Path, path: &Path, wrong: bool) {
+    let mut pending = browse_requests().lock();
+    if !pending
+        .iter()
+        .any(|(a, _, _)| forge_core::paths::paths_equal(a, archive))
+    {
+        pending.push((archive.to_path_buf(), path.to_path_buf(), wrong));
     }
 }
 
@@ -527,6 +597,8 @@ pub(crate) struct OpenRequest {
     how: OpenHow,
     /// The pane's folder when asked (a nested archive opens only if the pane is still there).
     from: PathBuf,
+    /// Bytes of its solid block decoded before it (7z).
+    decode_before: u64,
 }
 
 /// A job that stopped for a password: run again once one is typed.
@@ -536,11 +608,17 @@ pub(crate) enum Retry {
     Extract(crate::archive_extract::ExtractRequest),
     Test(crate::archive_extract::TestRequest),
     Update(crate::archive_edit::UpdateRequest),
+    /// List `path` again once the password of `archive` (with encrypted names) is typed.
+    Browse {
+        archive: PathBuf,
+        path: PathBuf,
+    },
 }
 
 impl Retry {
     fn archive(&self) -> &Path {
         match self {
+            Retry::Browse { archive, .. } => archive,
             Retry::Open(r) => &r.archive,
             Retry::Extract(r) => &r.archive,
             Retry::Test(r) => &r.archive,
@@ -552,6 +630,11 @@ impl Retry {
     fn what(&self) -> String {
         let archive = forge_core::paths::name_of(self.archive());
         match self {
+            Retry::Browse { .. } => {
+                format!(
+                    "{archive} has encrypted file names: its contents can't be listed without the password."
+                )
+            }
             Retry::Open(r) => format!("{} in {archive} is encrypted.", r.name),
             Retry::Extract(_) | Retry::Test(_) => format!("{archive} is encrypted."),
             Retry::Update(r) if r.confirm_password => format!(
@@ -660,6 +743,7 @@ pub fn open_entry(app: &mut ZxrawApp, e: &FileEntry, how: OpenHow) {
         name: node.name.clone(),
         how,
         from: pane.path.clone(),
+        decode_before: node.block_offset,
     };
     start_open(app, request);
 }
@@ -667,7 +751,14 @@ pub fn open_entry(app: &mut ZxrawApp, e: &FileEntry, how: OpenHow) {
 fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
     let password = app.ops.archive.passwords.get(&request.archive).cloned();
     let archive_name = forge_core::paths::name_of(&request.archive);
-    let title = format!("Opening {} from {archive_name}", request.name);
+    let title = match request.decode_before {
+        n if n > OPEN_NOTE_DECODE => format!(
+            "Opening {} from {archive_name} (decoding {} MB of its solid block first)",
+            request.name,
+            n >> 20
+        ),
+        _ => format!("Opening {} from {archive_name}", request.name),
+    };
     let msgs = app.ops.archive.tx.clone();
     let events = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
@@ -719,6 +810,23 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
 /// changed.
 pub fn poll(app: &mut ZxrawApp) -> bool {
     let mut changed = false;
+    for (archive, path, wrong) in std::mem::take(&mut *browse_requests().lock()) {
+        let retry = Retry::Browse { archive, path };
+        let queued = app
+            .ops
+            .archive
+            .waiting
+            .iter()
+            .map(|(r, _)| r)
+            .chain(app.ops.archive.prompt.as_ref().map(|p| &p.retry))
+            .any(|r| {
+                matches!(r, Retry::Browse { .. })
+                    && forge_core::paths::paths_equal(r.archive(), retry.archive())
+            });
+        if !queued {
+            let _ = app.ops.archive.tx.send(Msg::NeedPassword { retry, wrong });
+        }
+    }
     while let Ok(msg) = app.ops.archive.rx.try_recv() {
         changed = true;
         match msg {
@@ -766,6 +874,16 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
 
 fn run_retry(app: &mut ZxrawApp, retry: Retry) {
     match retry {
+        Retry::Browse { path, .. } => {
+            // List it again where it failed (the pane may have moved on).
+            if app.pane().path == path {
+                app.pane_mut().navigate(path);
+            } else if let Some(other) = app.tab_mut().right.as_mut().filter(|p| p.path == path) {
+                other.navigate(path);
+            } else if app.tab().left.path == path {
+                app.tab_mut().left.navigate(path);
+            }
+        }
         Retry::Open(r) => start_open(app, r),
         Retry::Extract(r) => crate::archive_extract::start_extract(app, r),
         Retry::Test(r) => crate::archive_extract::start_test(app, r),
@@ -776,6 +894,20 @@ fn run_retry(app: &mut ZxrawApp, retry: Retry) {
 /// Ask for an archive's password before running `retry` (queued behind other prompts).
 pub(crate) fn ask_password(app: &mut ZxrawApp, retry: Retry, wrong: bool) {
     let _ = app.ops.archive.tx.send(Msg::NeedPassword { retry, wrong });
+}
+
+/// Automation: answer the open password dialog with `text`, as typing it and pressing OK.
+/// False while no dialog is open.
+pub(crate) fn automation_answer_password(app: &mut ZxrawApp, text: &str) -> bool {
+    let Some(prompt) = app.ops.archive.prompt.take() else {
+        return false;
+    };
+    app.ops
+        .archive
+        .passwords
+        .set(prompt.retry.archive(), Password::new(text));
+    run_retry(app, prompt.retry.clone());
+    true
 }
 
 /// Overwrite the typed password before its memory is freed.
@@ -1033,6 +1165,13 @@ mod tests {
         };
         let archive = Path::new(r"C:\x\a.zip");
         let check = |n: ArchiveNode, known| wants_temp_copy(&file_entry(archive, &n), &n, known);
+        // Deep in a solid 7z block: its block would be decoded up to it.
+        let mut deep = node("deep.jpg", 10, false);
+        deep.solid = true;
+        deep.block_offset = PREVIEW_MAX_DECODE;
+        assert!(!check(deep.clone(), false));
+        deep.block_offset = PREVIEW_MAX_DECODE / 2;
+        assert!(check(deep, false));
         assert!(check(node("p.jpg", 10, false), false));
         assert!(!check(node("notes.txt", 10, false), false));
         assert!(!check(node("p.jpg", PREVIEW_MAX_BYTES + 1, false), false));

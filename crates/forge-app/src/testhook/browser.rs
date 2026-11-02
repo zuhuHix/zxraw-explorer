@@ -30,6 +30,8 @@
 //!   (`/`-separated inner path, `/` for the root), from the archive's index.
 //! - `assert-archive-copy <count>`: Ctrl+C in an archive pane recorded this many entries
 //!   (`0`: no archive copy is kept).
+//! - `archive-password <text>`: waits (10 s) for the archive password dialog and answers it
+//!   with `<text>`, as typing it and pressing OK.
 //! - `wait-archive-thumb <name> [| <seconds>]`: waits (30 s default) until the focused
 //!   archive pane's image `<name>` has its temp copy and a decoded thumbnail of it. The grid
 //!   view or the preview panel must be showing the entry (they ask for both). Fails if the
@@ -296,6 +298,16 @@ pub(super) fn step(
                 ));
             }
             Ok(Flow::Done)
+        }
+        "archive-password" => {
+            let started = *st.started.get_or_insert_with(Instant::now);
+            if crate::archive_ui::automation_answer_password(app, args.trim()) {
+                Ok(Flow::Done)
+            } else if started.elapsed() >= Duration::from_secs(10) {
+                Err("no archive password dialog opened".into())
+            } else {
+                Ok(Flow::Wait("waiting for the archive password dialog".into()))
+            }
         }
         "assert-archive-copy" => {
             let want: usize = args

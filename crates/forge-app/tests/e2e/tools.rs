@@ -1602,3 +1602,144 @@ fn small_images_in_an_archive_get_thumbnails() {
     expect_ok(&outcome);
     assert_no_crash(&profile);
 }
+
+// ---------------------------------------------------------------------------
+// 7z archives
+// ---------------------------------------------------------------------------
+
+/// A solid 7z made by the engine with the same three files as [`pane_zip`].
+fn pane_7z(dir: &Path, password: Option<&str>) -> PathBuf {
+    let src = dir.join("content");
+    write_file(&src.join("top.txt"), b"top of the archive");
+    write_file(&src.join("sub/inner.txt"), b"inner text");
+    write_file(&src.join("sub/deep/x.txt"), b"deep x");
+    let out = dir.join("a.7z");
+    let opts = forge_core::archive::CreateOptions {
+        encryption: password.map_or(forge_core::archive::Encryption::None, |p| {
+            forge_core::archive::Encryption::Aes256(forge_core::archive::Password::new(p))
+        }),
+        ..Default::default()
+    };
+    let (cancel, progress) = (forge_jobs::CancelToken::new(), forge_jobs::Progress::default());
+    let ctx = forge_core::ops::JobCtx::new(&cancel, &progress);
+    // The archive holds the files themselves, not their folder.
+    let sources = [src.join("top.txt"), src.join("sub")];
+    forge_core::archive::create(&sources, &out, &opts, &ctx).unwrap();
+    fs::remove_dir_all(&src).unwrap();
+    out
+}
+
+fn expected_7z_tree() -> Vec<(String, Vec<u8>)> {
+    [
+        ("sub/deep/x.txt", &b"deep x"[..]),
+        ("sub/inner.txt", b"inner text"),
+        ("top.txt", b"top of the archive"),
+    ]
+    .iter()
+    .map(|(n, b)| (n.to_string(), b.to_vec()))
+    .collect()
+}
+
+#[test]
+fn seven_zip_pane_browses_folders_and_copies_out() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let archive = pane_7z(&sandbox.path().join("zips"), None);
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let assert_root = format!("ui browser assert-archive {} | /", shown(&archive));
+    let assert_sub = format!("ui browser assert-archive {} | sub", shown(&archive));
+    let script = dual_pane_script(
+        &archive,
+        &dest,
+        &[
+            "wait-entry sub",
+            &assert_root,
+            "assert-entry top.txt",
+            "double-click-entry sub",
+            "wait-entry inner.txt",
+            &assert_sub,
+            "assert-entry deep",
+            "cmd Up",
+            "wait-entry top.txt",
+            "select top.txt, sub",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+}
+
+#[test]
+fn seven_zip_with_encrypted_names_asks_for_the_password_to_browse() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let archive = pane_7z(&sandbox.path().join("zips"), Some("pw"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = dual_pane_script(
+        &archive,
+        &dest,
+        &[
+            // A wrong password is asked again; the right one lists the archive.
+            "ui browser archive-password nope",
+            "ui browser archive-password pw",
+            "wait-entry sub",
+            "assert-entry top.txt",
+            "select top.txt, sub",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+}
+
+#[test]
+fn seven_zip_round_trip_through_the_create_and_browse_windows() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let src = sandbox.path().join("src");
+    write_file(&src.join("nested").join("deep").join("ü-file.txt"), b"nested text
+");
+    write_file(&src.join("nested").join("noise.bin"), &noise(300 * 1024, 43));
+    write_file(&src.join("tool.exe"), &noise(64 * 1024, 44));
+    let out = sandbox.path().join("out");
+    let dest = sandbox.path().join("restored");
+    fs::create_dir_all(&out).unwrap();
+    let script = format!(
+        "ui tools archive create {out} | round.7z | {nested} | {exe}
+         wait-jobs 30
+         ui tools archive open {archive}
+         ui tools archive wait 30
+         ui tools archive assert-entry nested/deep/ü-file.txt
+         ui tools archive extract {dest}
+         wait-jobs 30
+         exit
+",
+        out = shown(&out),
+        nested = shown(&src.join("nested")),
+        exe = shown(&src.join("tool.exe")),
+        archive = shown(&out.join("round.7z")),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let listing = forge_core::archive::list(&out.join("round.7z")).unwrap();
+    assert_eq!(listing.format, forge_core::archive::ArchiveFormat::SevenZip);
+    assert_eq!(tree(&dest), tree(&src), "extracted tree must match the source");
+}

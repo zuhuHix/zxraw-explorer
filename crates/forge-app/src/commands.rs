@@ -415,7 +415,7 @@ impl Cmd {
             GenerateProxies => "Generate video proxies…",
             ContactSheet => "Create contact sheet…",
             BrowseArchive => "Browse archive",
-            CreateArchive => "Create zip archive…",
+            CreateArchive => "Create archive (zip, 7z)…",
             ExtractHere => "Extract here (smart)",
             ExtractToFolder => "Extract to a folder named after the archive",
             ExtractTo => "Extract to…",

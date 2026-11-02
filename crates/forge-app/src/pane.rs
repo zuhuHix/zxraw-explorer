@@ -101,6 +101,7 @@ fn subdir_queue() -> &'static Sender<ListJob> {
                                 }
                                 ArchiveListing::File => ListMsg::Failed("not a folder".into()),
                                 ArchiveListing::Failed(e) => ListMsg::Failed(e),
+                                ArchiveListing::NeedsPassword(e) => ListMsg::Failed(e),
                             };
                             let _ = job.tx.send((job.id, job.dir, msg));
                             continue;
@@ -625,6 +626,7 @@ impl Pane {
                         }
                         ArchiveListing::File => tx.send(ListMsg::IsFile),
                         ArchiveListing::Failed(e) => tx.send(ListMsg::Failed(e)),
+                        ArchiveListing::NeedsPassword(e) => tx.send(ListMsg::Failed(e)),
                     };
                     return;
                 }

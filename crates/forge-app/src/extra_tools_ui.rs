@@ -12,7 +12,7 @@ use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont, point};
 use crossbeam_channel::{Receiver, TryRecvError, unbounded};
 use egui::{RichText, Ui};
 use forge_core::archive::{
-    ArchiveEntry, CreateOptions, Encryption, ExtractOptions, Password, Preset,
+    ArchiveEntry, ArchiveFormat, CreateOptions, Encryption, ExtractOptions, Password, Preset,
 };
 use forge_core::model::{EntryKind, MediaKind};
 use forge_core::netpath;
@@ -98,8 +98,15 @@ struct CreateArchiveWindow {
     name: String,
     job: Option<JobHandle>,
     open: bool,
+    format: ArchiveFormat,
     preset: Preset,
     auto_store: bool,
+    /// 7z: solid blocks (see `CreateOptions::solid`).
+    solid: bool,
+    /// 7z: the largest solid block; `None` is the preset's default.
+    solid_block: Option<u64>,
+    /// 7z with a password: encrypt the file names too.
+    encrypt_names: bool,
     /// Typed passwords: never logged or saved, wiped when the job starts or the window goes.
     password: String,
     confirm: String,
@@ -114,13 +121,53 @@ impl CreateArchiveWindow {
             name,
             job: None,
             open: true,
+            format: ArchiveFormat::Zip,
             preset: Preset::Balanced,
             auto_store: true,
+            solid: true,
+            solid_block: None,
+            encrypt_names: true,
             password: String::new(),
             confirm: String::new(),
             legacy_zipcrypto: false,
         }
     }
+}
+
+/// Solid block sizes the dialog offers (the default one is "Auto").
+const SOLID_BLOCK_SIZES: [(&str, u64); 5] = [
+    ("16 MB", 16 << 20),
+    ("64 MB", 64 << 20),
+    ("256 MB", 256 << 20),
+    ("1 GB", 1 << 30),
+    ("4 GB", 4 << 30),
+];
+
+/// The name without a trailing `.zip` or `.7z` (any case), or `None` when it has neither.
+fn strip_archive_extension(name: &str) -> Option<&str> {
+    ["zip", "7z"].into_iter().find_map(|ext| {
+        let cut = name.len().checked_sub(ext.len() + 1)?;
+        let suffix = name.get(cut..)?;
+        (suffix.starts_with('.') && suffix[1..].eq_ignore_ascii_case(ext)).then(|| &name[..cut])
+    })
+}
+
+/// The dialog's name after its format changed: a trailing archive extension follows the format.
+fn name_for_format(name: &str, format: ArchiveFormat) -> String {
+    match strip_archive_extension(name) {
+        Some(stem) => format!("{stem}.{}", format.extension()),
+        None => name.to_owned(),
+    }
+}
+
+/// Switches the dialog to `format`: the name follows it, and a preset the format lacks
+/// (Zstandard for 7z) becomes Balanced.
+fn switch_format(state: &mut CreateArchiveWindow, format: ArchiveFormat) {
+    state.name = name_for_format(&state.name, format);
+    if !Preset::for_format(format).contains(&state.preset) {
+        state.preset = Preset::Balanced;
+    }
+    state.format = format;
 }
 
 /// Ids of the compress dialog's password fields (their egui state is forgotten when done).
@@ -140,9 +187,15 @@ impl Drop for CreateArchiveWindow {
 }
 
 /// The create options the dialog's choices make; an error when the passwords differ.
+/// 7z always uses AES-256: `legacy_zipcrypto` only applies to ZIP.
+#[allow(clippy::too_many_arguments)]
 fn create_options(
+    format: ArchiveFormat,
     preset: Preset,
     auto_store: bool,
+    solid: bool,
+    solid_block: Option<u64>,
+    encrypt_names: bool,
     password: &str,
     confirm: &str,
     legacy_zipcrypto: bool,
@@ -151,7 +204,7 @@ fn create_options(
         Encryption::None
     } else if password != confirm {
         return Err("The passwords do not match");
-    } else if legacy_zipcrypto {
+    } else if legacy_zipcrypto && format == ArchiveFormat::Zip {
         Encryption::ZipCryptoLegacy(Password::new(password))
     } else {
         Encryption::Aes256(Password::new(password))
@@ -160,6 +213,9 @@ fn create_options(
         preset,
         auto_store,
         encryption,
+        solid,
+        solid_block_size: solid_block,
+        encrypt_names,
         ..CreateOptions::default()
     })
 }
@@ -185,6 +241,7 @@ enum UiAction {
         sources: Vec<PathBuf>,
         directory: PathBuf,
         name: String,
+        format: ArchiveFormat,
         options: CreateOptions,
     },
     StartSplit {
@@ -292,11 +349,12 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
                 sources,
                 directory,
                 name,
+                format,
                 options,
             } => {
                 if let Some(state) = tools.create_archive.as_mut() {
                     let job = start_create_archive(
-                        &jobs, &event_tx, &app_ctx, sources, directory, name, options,
+                        &jobs, &event_tx, &app_ctx, sources, directory, name, format, options,
                     );
                     state.job = Some(job);
                 }
@@ -425,20 +483,11 @@ fn is_image(kind: MediaKind) -> bool {
 pub fn browse_archive(app: &mut ZxrawApp) {
     let target = pane_action_target(app);
     let Some(path) = target else {
-        app.toast_err("Select a ZIP archive to browse");
+        app.toast_err("Select a ZIP or 7z archive to browse");
         return;
     };
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if ext == "7z" || ext == "rar" {
-        app.toast_err(format!("{ext} archive browsing is not supported yet"));
-        return;
-    }
-    if ext != "zip" {
-        app.toast_err("Archive browsing currently supports ZIP files");
+    if !forge_core::archive::is_archive_name(&path) {
+        app.toast_err("This file is not an archive ZXraw can open");
         return;
     }
     let jobs = app.ops.jobs.clone();
@@ -450,7 +499,7 @@ pub fn browse_archive(app: &mut ZxrawApp) {
 pub fn create_archive(app: &mut ZxrawApp) {
     let sources = pane_action_targets(app);
     if sources.is_empty() {
-        app.toast_err("Select files or folders to add to a ZIP archive");
+        app.toast_err("Select files or folders to add to an archive");
         return;
     }
     let directory = app.pane().path.clone();
@@ -613,7 +662,8 @@ pub(crate) fn automation_archive_extract(
     Ok(())
 }
 
-/// Automation: create a ZIP named `name` in `directory` from `sources`, as the create dialog.
+/// Automation: create an archive named `name` in `directory` from `sources`, as the create
+/// dialog. The format follows the name: `.7z` is 7z, anything else ZIP.
 pub(crate) fn automation_create_archive(
     app: &mut ZxrawApp,
     sources: Vec<PathBuf>,
@@ -623,6 +673,11 @@ pub(crate) fn automation_create_archive(
     if sources.is_empty() {
         return Err("choose at least one file or folder".into());
     }
+    let format = if name.to_ascii_lowercase().ends_with(".7z") {
+        ArchiveFormat::SevenZip
+    } else {
+        ArchiveFormat::Zip
+    };
     let jobs = app.ops.jobs.clone();
     let event_tx = app.ops.tx.clone();
     let app_ctx = app.ops.ctx.clone();
@@ -633,9 +688,11 @@ pub(crate) fn automation_create_archive(
         sources.clone(),
         directory.clone(),
         name.clone(),
+        format,
         CreateOptions::default(),
     );
     let mut window = CreateArchiveWindow::new(sources, directory, name);
+    window.format = format;
     window.job = Some(job);
     app.ops.extra_tools.create_archive = Some(window);
     Ok(())
@@ -1690,7 +1747,12 @@ fn open_archive_state(jobs: &JobRegistry, app_ctx: &egui::Context, path: PathBuf
     let job = jobs.spawn(
         "archive-list",
         format!("Listing {}", path.display()),
-        move |job| match forge_core::archive::list_zip(&path_for_job) {
+        move |job| match forge_core::archive::list_with_password(
+            &path_for_job,
+            crate::archive_ui::session_password(&path_for_job).as_ref(),
+        )
+        .map(|l| l.entries)
+        {
             Ok(entries) => {
                 job.progress.add_total_items(entries.len() as u64);
                 job.progress.add_items(entries.len() as u64);
@@ -2041,7 +2103,7 @@ fn render_create_archive(
     actions: &mut Vec<UiAction>,
 ) {
     let mut open = state.open;
-    egui::Window::new("Create ZIP archive")
+    egui::Window::new("Create archive")
         .id(egui::Id::new("extra-create-archive"))
         .open(&mut open)
         .default_size([500.0, 300.0])
@@ -2060,8 +2122,12 @@ fn render_create_archive(
             ui.add_space(6.0);
             create_choices(ui, state);
             let options = create_options(
+                state.format,
                 state.preset,
                 state.auto_store,
+                state.solid,
+                state.solid_block,
+                state.encrypt_names,
                 &state.password,
                 &state.confirm,
                 state.legacy_zipcrypto,
@@ -2069,7 +2135,10 @@ fn render_create_archive(
             ui.add_space(6.0);
             let ready = options.is_ok() && !state.name.trim().is_empty();
             if ui
-                .add_enabled(ready, egui::Button::new("Create ZIP"))
+                .add_enabled(
+                    ready,
+                    egui::Button::new(format!("Create {}", state.format.name())),
+                )
                 .clicked()
                 && let Ok(options) = options
             {
@@ -2080,6 +2149,7 @@ fn render_create_archive(
                     sources: state.sources.clone(),
                     directory: state.directory.clone(),
                     name: state.name.clone(),
+                    format: state.format,
                     options,
                 });
             }
@@ -2087,36 +2157,101 @@ fn render_create_archive(
     state.open = open;
 }
 
-/// The compress dialog's choices: preset, the advanced presets, storing compressed files,
-/// and the password.
+/// The compress dialog's choices: format, preset, the advanced presets, storing compressed
+/// files, 7z solid blocks, and the password.
 fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
     let warn = ui.visuals().warn_fg_color;
-    ui.label(RichText::new("Compression").strong());
+    let format = state.format;
     ui.horizontal(|ui| {
-        for p in Preset::ALL.into_iter().filter(|p| !p.is_advanced()) {
-            ui.radio_value(&mut state.preset, p, p.label());
+        ui.label(RichText::new("Format").strong());
+        for f in [ArchiveFormat::Zip, ArchiveFormat::SevenZip] {
+            if ui.radio(state.format == f, f.name()).clicked() {
+                switch_format(state, f);
+            }
         }
     });
-    ui.label(RichText::new(state.preset.estimate()).small().weak());
+    ui.label(RichText::new("Compression").strong());
+    ui.horizontal(|ui| {
+        for p in Preset::for_format(format)
+            .iter()
+            .copied()
+            .filter(|p| !p.is_advanced())
+        {
+            ui.radio_value(&mut state.preset, p, p.label_for(format));
+        }
+    });
+    ui.label(
+        RichText::new(state.preset.estimate_for(format))
+            .small()
+            .weak(),
+    );
     egui::CollapsingHeader::new("Advanced")
         .id_salt("create-archive-advanced")
         .default_open(state.preset.is_advanced())
         .show(ui, |ui| {
-            for p in Preset::ALL.into_iter().filter(|p| p.is_advanced()) {
-                ui.radio_value(&mut state.preset, p, p.label());
+            for p in Preset::for_format(format)
+                .iter()
+                .copied()
+                .filter(|p| p.is_advanced())
+            {
+                ui.radio_value(&mut state.preset, p, p.label_for(format));
+            }
+            if format == ArchiveFormat::SevenZip {
+                let info = Preset::Ultra.sevenzip();
+                ui.label(
+                    RichText::new(format!(
+                        "Ultra needs about {} MB of memory per compressing thread and {} MB \
+                         on every computer that opens it.",
+                        info.compress_memory >> 20,
+                        info.decompress_memory >> 20
+                    ))
+                    .small()
+                    .color(warn),
+                );
             }
             let shown = if state.preset.is_advanced() {
                 state.preset
             } else {
                 Preset::Zstd
             };
-            ui.label(RichText::new(shown.compatibility()).small().color(warn));
+            ui.label(
+                RichText::new(shown.compatibility_for(format))
+                    .small()
+                    .color(warn),
+            );
         });
     ui.checkbox(
         &mut state.auto_store,
         "Store already-compressed files (jpg, mp4, zip…)",
     )
     .on_hover_text("Faster, and barely larger: these formats do not compress further");
+    if format == ArchiveFormat::SevenZip {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut state.solid, "Solid archive")
+                .on_hover_text(
+                    "Smaller archives: files are compressed together. Opening one file decodes \
+                 its block up to it. Already-compressed files always get a block of their own.",
+                );
+            let auto = format!("Auto ({} MB)", state.preset.sevenzip().solid_block >> 20);
+            ui.add_enabled_ui(state.solid, |ui| {
+                let selected = match state.solid_block {
+                    None => auto.clone(),
+                    Some(bytes) => SOLID_BLOCK_SIZES
+                        .iter()
+                        .find(|(_, size)| *size == bytes)
+                        .map_or_else(|| auto.clone(), |(label, _)| label.to_string()),
+                };
+                egui::ComboBox::from_id_salt("create-archive-solid-block")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut state.solid_block, None, auto);
+                        for (label, bytes) in SOLID_BLOCK_SIZES {
+                            ui.selectable_value(&mut state.solid_block, Some(bytes), label);
+                        }
+                    });
+            });
+        });
+    }
     egui::CollapsingHeader::new("Password")
         .id_salt("create-archive-password")
         .show(ui, |ui| {
@@ -2134,13 +2269,21 @@ fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
                     .hint_text("Confirm password")
                     .desired_width(260.0),
             );
-            ui.radio_value(&mut state.legacy_zipcrypto, false, "AES-256 (recommended)");
-            ui.radio_value(
-                &mut state.legacy_zipcrypto,
-                true,
-                "Legacy ZipCrypto (weak, for old tools)",
-            );
-            if state.legacy_zipcrypto {
+            if format == ArchiveFormat::SevenZip {
+                ui.label(RichText::new("AES-256").small().weak());
+                ui.checkbox(&mut state.encrypt_names, "Encrypt file names")
+                    .on_hover_text(
+                        "Without the password nobody can see what is inside, not even the names",
+                    );
+            } else {
+                ui.radio_value(&mut state.legacy_zipcrypto, false, "AES-256 (recommended)");
+                ui.radio_value(
+                    &mut state.legacy_zipcrypto,
+                    true,
+                    "Legacy ZipCrypto (weak, for old tools)",
+                );
+            }
+            if format == ArchiveFormat::Zip && state.legacy_zipcrypto {
                 ui.label(
                     RichText::new(
                         "ZipCrypto is easy to break. Use it only for tools that cannot open \
@@ -2157,14 +2300,16 @@ fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
                         .color(ui.visuals().error_fg_color),
                 );
             }
-            ui.label(
-                RichText::new("File names stay readable; their contents are encrypted.")
-                    .small()
-                    .weak(),
-            );
+            let note = if format == ArchiveFormat::SevenZip && state.encrypt_names {
+                "File names are encrypted too."
+            } else {
+                "File names stay readable; their contents are encrypted."
+            };
+            ui.label(RichText::new(note).small().weak());
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_create_archive(
     jobs: &JobRegistry,
     event_tx: &crossbeam_channel::Sender<Event>,
@@ -2172,9 +2317,10 @@ fn start_create_archive(
     sources: Vec<PathBuf>,
     directory: PathBuf,
     name: String,
+    format: ArchiveFormat,
     options: CreateOptions,
 ) -> JobHandle {
-    let filename = archive_filename(&name);
+    let filename = archive_filename(&name, format);
     let requested = directory.join(filename);
     let output = archive_output_hint(&requested);
     let title = format!(
@@ -2185,7 +2331,7 @@ fn start_create_archive(
     let ctx = app_ctx.clone();
     jobs.spawn("archive-create", title, move |job| {
         let job_ctx = JobCtx::from_job(job);
-        let result = match ArchiveStaging::create(&directory) {
+        let result = match ArchiveStaging::create(&directory, format.extension()) {
             Ok(mut staging) => {
                 match forge_core::archive::create(&sources, staging.path(), &options, &job_ctx) {
                     Ok(report) => {
@@ -2218,7 +2364,10 @@ fn start_create_archive(
             }
             Err(error) => {
                 let message = error.to_string();
-                let _ = tx.send(Event::Error(format!("ZIP creation failed: {message}")));
+                let _ = tx.send(Event::Error(format!(
+                    "{} creation failed: {message}",
+                    format.name()
+                )));
                 ctx.request_repaint();
                 Err(message)
             }
@@ -2226,12 +2375,16 @@ fn start_create_archive(
     })
 }
 
-fn archive_filename(name: &str) -> String {
+fn archive_filename(name: &str, format: ArchiveFormat) -> String {
     let clean = sanitize_filename(name);
-    if clean.to_ascii_lowercase().ends_with(".zip") {
+    let extension = format.extension();
+    if clean
+        .to_ascii_lowercase()
+        .ends_with(&format!(".{extension}"))
+    {
         clean
     } else {
-        format!("{clean}.zip")
+        format!("{clean}.{extension}")
     }
 }
 
@@ -2265,7 +2418,7 @@ fn unique_path(requested: &Path) -> PathBuf {
             return candidate;
         }
     }
-    requested.with_file_name(format!("{}-{}.zip", stem, std::process::id()))
+    requested.with_file_name(format!("{}-{}.{}", stem, std::process::id(), extension))
 }
 
 struct ArchiveStaging {
@@ -2275,7 +2428,9 @@ struct ArchiveStaging {
 }
 
 impl ArchiveStaging {
-    fn create(destination: &Path) -> forge_core::Result<Self> {
+    /// A new staging folder in `destination`; its archive is `archive.{extension}`, which is
+    /// what makes the engine write that format.
+    fn create(destination: &Path, extension: &str) -> forge_core::Result<Self> {
         loop {
             let sequence = OUTPUT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let directory = destination.join(format!(
@@ -2285,7 +2440,7 @@ impl ArchiveStaging {
             match fs::create_dir(&directory) {
                 Ok(()) => {
                     return Ok(Self {
-                        path: directory.join("archive.zip"),
+                        path: directory.join(format!("archive.{extension}")),
                         directory,
                         owns_archive: false,
                     });
@@ -2528,20 +2683,145 @@ mod tests {
 
     #[test]
     fn the_compress_dialog_builds_its_options() {
-        let o = create_options(Preset::Max, false, "", "", false).unwrap();
+        let zip = ArchiveFormat::Zip;
+        let o = create_options(zip, Preset::Max, false, true, None, true, "", "", false).unwrap();
         assert_eq!(o.preset, Preset::Max);
         assert!(!o.auto_store);
         assert!(o.encryption.is_none());
-        let o = create_options(Preset::Balanced, true, "pw", "pw", false).unwrap();
+        let o = create_options(
+            zip,
+            Preset::Balanced,
+            true,
+            true,
+            None,
+            true,
+            "pw",
+            "pw",
+            false,
+        )
+        .unwrap();
         assert!(matches!(&o.encryption, Encryption::Aes256(p) if p.as_bytes() == b"pw"));
-        let o = create_options(Preset::Balanced, true, "pw", "pw", true).unwrap();
+        let o = create_options(
+            zip,
+            Preset::Balanced,
+            true,
+            true,
+            None,
+            true,
+            "pw",
+            "pw",
+            true,
+        )
+        .unwrap();
         assert!(matches!(o.encryption, Encryption::ZipCryptoLegacy(_)));
-        assert!(create_options(Preset::Balanced, true, "pw", "pW", false).is_err());
-        assert!(create_options(Preset::Balanced, true, "", "pw", false).is_err());
+        assert!(
+            create_options(
+                zip,
+                Preset::Balanced,
+                true,
+                true,
+                None,
+                true,
+                "pw",
+                "pW",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            create_options(
+                zip,
+                Preset::Balanced,
+                true,
+                true,
+                None,
+                true,
+                "",
+                "pw",
+                false
+            )
+            .is_err()
+        );
         assert_eq!(
             CreateArchiveWindow::new(vec![], PathBuf::new(), "a.zip".into()).preset,
             Preset::Balanced
         );
+        assert_eq!(
+            CreateArchiveWindow::new(vec![], PathBuf::new(), "a.zip".into()).format,
+            zip
+        );
+    }
+
+    #[test]
+    fn seven_zip_options_use_aes_and_carry_the_solid_choices() {
+        let o = create_options(
+            ArchiveFormat::SevenZip,
+            Preset::Ultra,
+            true,
+            false,
+            Some(64 << 20),
+            false,
+            "pw",
+            "pw",
+            true,
+        )
+        .unwrap();
+        assert!(matches!(&o.encryption, Encryption::Aes256(p) if p.as_bytes() == b"pw"));
+        assert_eq!(o.preset, Preset::Ultra);
+        assert!(!o.solid);
+        assert_eq!(o.solid_block_size, Some(64 << 20));
+        assert!(!o.encrypt_names);
+        let o = create_options(
+            ArchiveFormat::SevenZip,
+            Preset::Balanced,
+            true,
+            true,
+            None,
+            true,
+            "",
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(o.encryption.is_none());
+        assert!(o.solid);
+        assert_eq!(o.solid_block_size, None);
+        assert!(o.encrypt_names);
+    }
+
+    #[test]
+    fn archive_filename_adds_the_format_extension_once() {
+        assert_eq!(archive_filename("x", ArchiveFormat::Zip), "x.zip");
+        assert_eq!(archive_filename("x", ArchiveFormat::SevenZip), "x.7z");
+        assert_eq!(archive_filename("x.7Z", ArchiveFormat::SevenZip), "x.7Z");
+        assert_eq!(archive_filename("x.ZIP", ArchiveFormat::Zip), "x.ZIP");
+    }
+
+    #[test]
+    fn switching_format_renames_the_archive_extension() {
+        let mut state = CreateArchiveWindow::new(vec![], PathBuf::new(), "name.zip".into());
+        switch_format(&mut state, ArchiveFormat::SevenZip);
+        assert_eq!(state.name, "name.7z");
+        assert_eq!(state.format, ArchiveFormat::SevenZip);
+        switch_format(&mut state, ArchiveFormat::Zip);
+        assert_eq!(state.name, "name.zip");
+        state.name = "Photos.7Z".into();
+        switch_format(&mut state, ArchiveFormat::Zip);
+        assert_eq!(state.name, "Photos.zip");
+        state.name = "no extension".into();
+        switch_format(&mut state, ArchiveFormat::SevenZip);
+        assert_eq!(state.name, "no extension");
+    }
+
+    #[test]
+    fn switching_to_7z_moves_zstandard_to_balanced() {
+        let mut state = CreateArchiveWindow::new(vec![], PathBuf::new(), "a.zip".into());
+        state.preset = Preset::Zstd;
+        switch_format(&mut state, ArchiveFormat::SevenZip);
+        assert_eq!(state.preset, Preset::Balanced);
+        state.preset = Preset::Ultra;
+        switch_format(&mut state, ArchiveFormat::Zip);
+        assert_eq!(state.preset, Preset::Ultra);
     }
 
     #[test]
@@ -2596,7 +2876,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let requested = directory.path().join("archive.zip");
         fs::write(&requested, b"existing archive").unwrap();
-        let mut staging = ArchiveStaging::create(directory.path()).unwrap();
+        let mut staging = ArchiveStaging::create(directory.path(), "zip").unwrap();
         fs::write(staging.path(), b"new archive").unwrap();
         staging.owns_archive = true;
 
