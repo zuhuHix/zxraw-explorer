@@ -38,8 +38,9 @@ use unrar_ng_sys as ur;
 use zeroize::Zeroizing;
 
 use super::{
-    ArchiveBackend, ArchiveEntry, ArchiveFormat, ArchiveListing, EntryEncryption, EntryVisitor,
-    ExtractLimits, Password, PasswordProof, normalize_entry_name, validate_entry_name,
+    ArchiveBackend, ArchiveEntry, ArchiveFormat, ArchiveListing, BlockEnd, EntryEncryption,
+    EntryVisitor, ExtractLimits, Password, PasswordProof, normalize_entry_name,
+    validate_entry_name,
 };
 use crate::error::{CoreError, Result};
 use crate::ops::JobCtx;
@@ -89,22 +90,33 @@ pub(super) fn is_old_volume_ext(ext: &str) -> bool {
 /// `x.part07.rar` -> `x.part01.rar`, `x.r03` -> `x.rar`. `None` when the name says nothing.
 pub(super) fn first_volume_name(path: &Path) -> Option<PathBuf> {
     let name = paths::name_of(path);
-    let lower = name.to_lowercase();
-    if let Some(stem) = lower.strip_suffix(".rar")
-        && let Some(at) = stem.rfind(".part")
-    {
-        let digits = &stem[at + 5..];
-        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-            let first = format!("{}{:0width$}.rar", &name[..at + 5], 1, width = digits.len());
+    if let Some(stem) = strip_suffix_ascii(&name, ".rar") {
+        let digits = stem.bytes().rev().take_while(u8::is_ascii_digit).count();
+        // ASCII digits: the cut is on a character boundary.
+        let before = &stem[..stem.len() - digits];
+        if digits > 0 && strip_suffix_ascii(before, ".part").is_some() {
+            let first = format!("{before}{:0digits$}{}", 1, &name[stem.len()..]);
             return Some(path.with_file_name(first));
         }
         return None;
     }
-    let ext = crate::model::ext_of(path);
-    if is_old_volume_ext(&ext) {
-        return Some(path.with_extension("rar"));
+    // `x.r00`...: `x.rar`.
+    let digits = name.bytes().rev().take_while(u8::is_ascii_digit).count();
+    if digits == 2
+        && let Some(stem) = strip_suffix_ascii(&name[..name.len() - 2], ".r")
+        && !stem.is_empty()
+    {
+        return Some(path.with_file_name(format!("{stem}.rar")));
     }
     None
+}
+
+/// `s` without `suffix` (ASCII, any case), compared on the original bytes: lowercasing
+/// other characters can change their length.
+fn strip_suffix_ascii<'s>(s: &'s str, suffix: &str) -> Option<&'s str> {
+    let cut = s.len().checked_sub(suffix.len())?;
+    let (head, tail) = (s.get(..cut)?, s.get(cut..)?);
+    tail.eq_ignore_ascii_case(suffix).then_some(head)
 }
 
 /// The archive to open for `path`: itself, or the first volume of its set. Encrypted
@@ -702,6 +714,7 @@ fn entries_of(raw: &[RawHeader]) -> Vec<ArchiveEntry> {
         } else {
             0
         };
+        let checked = size > 0 && (r.hash_type != ur::RAR_HASH_NONE || r.unp_ver < 50);
         out.push(ArchiveEntry {
             index: i,
             safe_name: validate_entry_name(&name).is_ok(),
@@ -726,8 +739,10 @@ fn entries_of(raw: &[RawHeader]) -> Vec<ArchiveEntry> {
             solid: false,
             block_offset: offset,
             unchecked: r.has_data() && r.hash_type == ur::RAR_HASH_NONE && r.unp_ver >= 50,
-            checked_by_block: false,
-            block: None,
+            // UnRAR checks a file's CRC32 or BLAKE2 only after its last data: the file is
+            // held (not published, not served) until then, as a block of its own.
+            checked_by_block: checked,
+            block: checked.then_some(i),
             block_end: 0,
             skip,
         });
@@ -751,7 +766,6 @@ fn entries_of(raw: &[RawHeader]) -> Vec<ArchiveEntry> {
             });
         for e in &mut out[start..end] {
             e.solid = true;
-            e.block = Some(start);
             if unp > 0 && e.size > 0 {
                 e.compressed_size = (u128::from(e.size) * pack).div_ceil(unp) as u64;
             }
@@ -973,8 +987,10 @@ fn read_set(
     wanted: &dyn Fn(&ArchiveEntry) -> bool,
     ctx: Option<&JobCtx<'_>>,
     visit: &mut EntryVisitor<'_>,
+    block_end: &mut BlockEnd<'_>,
 ) -> Result<()> {
-    let listed = list_set(archive, usize::MAX, password, None)?;
+    // Listed again (the file may have changed since): within the same entry limit.
+    let listed = list_set(archive, super::DEFAULT_MAX_ARCHIVE_ENTRIES, password, None)?;
     let want: HashSet<usize> = listed
         .entries
         .iter()
@@ -1011,6 +1027,7 @@ fn read_set(
             archive,
             ctx,
             visit,
+            block_end,
         );
         if result.is_err() {
             abort.store(true, Ordering::Release);
@@ -1034,6 +1051,7 @@ fn drive(
     archive: &Path,
     ctx: Option<&JobCtx<'_>>,
     visit: &mut EntryVisitor<'_>,
+    block_end: &mut BlockEnd<'_>,
 ) -> Result<()> {
     let changed = || {
         CoreError::Invalid(format!(
@@ -1088,7 +1106,8 @@ fn drive(
         run.command(Command::Test(Sink::Deliver))?;
         // The first data, or the outcome: a wrong password shows before any data.
         let first = run.next(ctx)?;
-        match first {
+        // What UnRAR's checksum said, for an entry held until then.
+        let checked: Result<()> = match first {
             Event::Data(d) => {
                 let mut reader = EntryReader {
                     run,
@@ -1101,22 +1120,29 @@ fn drive(
                 if let Some(e) = reader.fatal.take() {
                     return Err(e);
                 }
-                let finished = reader.done.is_some();
+                let done = reader.done.take();
                 visited?;
-                if !finished {
-                    let _ = run.finish(ctx)?;
+                match done {
+                    Some(r) => r.map_err(CoreError::Invalid),
+                    None => run.finish(ctx)?,
                 }
             }
             Event::Tick => {
                 // Only in discard mode; not expected here.
                 let _ = run.finish(ctx)?;
-                visit(
-                    entry,
-                    Err(CoreError::Invalid("the RAR decoder got out of step".into())),
-                )?;
+                let e = || CoreError::Invalid("the RAR decoder got out of step".into());
+                visit(entry, Err(e()))?;
+                Err(e())
             }
-            Event::Done(Ok(())) => visit(entry, Ok(&mut io::empty()))?,
-            Event::Done(Err(e)) => visit(entry, Err(e))?,
+            Event::Done(Ok(())) => {
+                visit(entry, Ok(&mut io::empty()))?;
+                Ok(())
+            }
+            Event::Done(Err(e)) => {
+                let text = e.to_string();
+                visit(entry, Err(e))?;
+                Err(CoreError::Invalid(text))
+            }
             Event::End(r) => {
                 r?;
                 return Err(changed());
@@ -1124,6 +1150,9 @@ fn drive(
             Event::Header(_) => {
                 return Err(CoreError::Invalid("the RAR decoder got out of step".into()));
             }
+        };
+        if entry.checked_by_block {
+            block_end(checked)?;
         }
         if i == last {
             return Ok(());
@@ -1219,7 +1248,19 @@ impl ArchiveBackend for RarBackend {
         ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()> {
-        read_set(archive, password, wanted, ctx, visit)
+        read_set(archive, password, wanted, ctx, visit, &mut |_| Ok(()))
+    }
+
+    fn read_entries_checked(
+        &self,
+        archive: &Path,
+        wanted: &dyn Fn(&ArchiveEntry) -> bool,
+        password: Option<&Password>,
+        ctx: Option<&JobCtx<'_>>,
+        visit: &mut EntryVisitor<'_>,
+        block_end: &mut BlockEnd<'_>,
+    ) -> Result<()> {
+        read_set(archive, password, wanted, ctx, visit, block_end)
     }
 
     fn check_password(
@@ -1260,6 +1301,7 @@ impl ArchiveBackend for RarBackend {
                 }
                 Ok(())
             },
+            &mut |_| Ok(()),
         )?;
         match outcome {
             Ok(()) => Ok(PasswordProof::Proven),
