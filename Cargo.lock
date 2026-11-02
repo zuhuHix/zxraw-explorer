@@ -1697,15 +1697,18 @@ dependencies = [
 name = "forge-core"
 version = "0.5.8"
 dependencies = [
+ "aes",
  "blake3",
  "chrono",
  "crossbeam-channel",
  "forge-jobs",
  "lru",
  "parking_lot",
+ "pbkdf2",
  "regex",
  "serde",
  "serde_json",
+ "sha1",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

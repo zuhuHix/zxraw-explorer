@@ -511,3 +511,30 @@ fn index_cached_is_refreshed_after_update() {
     assert!(after.node("new.txt").is_some());
     assert!(after.node("old.txt").is_some());
 }
+
+#[cfg(windows)]
+#[test]
+fn stale_partials_beside_an_archive_are_removed_unless_in_use() {
+    let d = tempfile::tempdir().unwrap();
+    let old = d.path().join(format!("{}stale", crate::ops::PARTIAL_PREFIX));
+    let busy = d.path().join(format!("{}busy", crate::ops::PARTIAL_PREFIX));
+    let fresh = d.path().join(format!("{}fresh", crate::ops::PARTIAL_PREFIX));
+    for p in [&old, &busy, &fresh] {
+        fs::write(p, b"partial").unwrap();
+    }
+    let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    for p in [&old, &busy] {
+        File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+    }
+    let held = File::open(&busy).unwrap();
+    zip_backend::remove_stale_partials(d.path(), std::time::Duration::from_secs(3600));
+    assert!(!old.exists(), "an old unused partial is removed");
+    assert!(busy.exists(), "a partial something has open stays");
+    assert!(fresh.exists(), "a recent partial stays");
+    drop(held);
+}

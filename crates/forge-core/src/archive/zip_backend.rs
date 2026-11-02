@@ -25,7 +25,7 @@ use zip::{AesMode, CompressionMethod, PreparedZipFile, ZipArchive, ZipReadOption
 use super::{
     ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, CreateOptions,
     CreateReport, Encryption, EntryEncryption, EntryVisitor, ExtractLimits, Method, Password,
-    SourceItem, collect_sources, cp437, motw, safety,
+    SourceItem, collect_sources, cp437, crypto_peek, motw, safety,
 };
 use crate::error::{CoreError, Result};
 use crate::ops::{self, JobCtx, NodeKind, OpIssue, TempGuard};
@@ -178,7 +178,13 @@ impl ArchiveBackend for ZipBackend {
         })
     }
 
-    fn preflight(&self, archive: &Path, indices: &[usize], limits: &ExtractLimits) -> Result<()> {
+    fn preflight(
+        &self,
+        archive: &Path,
+        indices: &[usize],
+        password: Option<&Password>,
+        limits: &ExtractLimits,
+    ) -> Result<()> {
         let mut za = open_zip(archive)?;
         if za
             .has_overlapping_entries()
@@ -191,15 +197,15 @@ impl ArchiveBackend for ZipBackend {
         for &i in indices {
             let mut f = za.by_index_raw(i).map_err(|e| zip_err(archive, e))?;
             let method = f.compression();
-            if f.encrypted()
-                || !matches!(
-                    method,
-                    CompressionMethod::Lzma | CompressionMethod::Xz | CompressionMethod::Ppmd
-                )
-            {
+            if !matches!(
+                method,
+                CompressionMethod::Lzma | CompressionMethod::Xz | CompressionMethod::Ppmd
+            ) {
                 continue;
             }
-            let mut head = [0u8; 64];
+            let aes = f.get_metadata().aes_settings().map(|(mode, _)| mode);
+            // Room for an AES salt and verifier or the ZipCrypto header before the 64 bytes.
+            let mut head = [0u8; 64 + 18];
             let mut n = 0;
             while n < head.len() {
                 match f.read(&mut head[n..]) {
@@ -209,7 +215,26 @@ impl ArchiveBackend for ZipBackend {
                     Err(e) => return Err(CoreError::io(archive, e)),
                 }
             }
-            let head = &head[..n];
+            let decrypted;
+            let head = match (f.encrypted(), password, aes) {
+                (false, ..) => &head[..n],
+                // Entries that can't be decrypted are not decoded either (the password is
+                // checked before this).
+                (true, None, _) => continue,
+                (true, Some(pw), Some(mode)) => {
+                    match crypto_peek::aes_head(&head[..n], mode, pw.as_bytes(), 64) {
+                        Some(h) => {
+                            decrypted = h;
+                            &decrypted[..]
+                        }
+                        None => continue,
+                    }
+                }
+                (true, Some(pw), None) => {
+                    decrypted = crypto_peek::zipcrypto_head(&head[..n], pw.as_bytes(), 64);
+                    &decrypted[..]
+                }
+            };
             let need = match method {
                 CompressionMethod::Lzma => safety::zip_lzma_dictionary(head),
                 CompressionMethod::Xz => safety::xz_dictionary(head),
@@ -333,6 +358,9 @@ impl ArchiveBackend for ZipBackend {
             })
         };
 
+        if let Some(dir) = archive.parent() {
+            remove_stale_partials(dir, STALE_PARTIAL_AGE);
+        }
         let mut src = open_zip(archive)?;
         let (mut zw, tmp, mut guard) = start_output(archive, ctx)?;
         let mut names = HashSet::new();
@@ -382,6 +410,50 @@ impl ArchiveBackend for ZipBackend {
         Ok(report)
     }
 }
+
+/// Temp files of an update cut short by a crash are removed by the next update of an
+/// archive in the same folder once they are this old.
+const STALE_PARTIAL_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Remove our temp files (`.forge-partial-*`) in `dir` last written more than `age` ago
+/// that nothing has open: each is opened exclusively (no sharing) with delete-on-close, so
+/// one still being written by a copy or another update is left alone.
+pub(crate) fn remove_stale_partials(dir: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for e in entries.flatten() {
+        if !ops::is_partial_name(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        let old = e.metadata().is_ok_and(|m| {
+            m.is_file()
+                && m.modified()
+                    .is_ok_and(|t| now.duration_since(t).is_ok_and(|a| a > age))
+        });
+        if old {
+            delete_if_unused(&e.path());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn delete_if_unused(path: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // Share mode 0: fails while any other handle is open.
+    let _ = std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path);
+}
+
+#[cfg(not(windows))]
+fn delete_if_unused(_: &Path) {}
 
 /// Counts what is written to the archive file, for the progress output figure.
 struct CountingWriter<'a, W> {

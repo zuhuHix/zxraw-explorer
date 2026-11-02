@@ -80,7 +80,8 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
 5. Ingest never modifies the source; verification re-reads the *destination* from disk.
 6. Archive extraction validates every entry name before writing (absolute, `..`, drive/UNC/device
    prefixes, `:` streams, NUL, reserved device names), never creates links or writes through a
-   junction, enforces entry count, size, ratio and decoder memory limits while streaming, rejects
+   junction (the destination folders are held open by handle, unswappable, while an entry is
+   written; data shorter than declared is not published), enforces entry count, size, ratio and decoder memory limits while streaming, rejects
    overlapping entries and local/central header mismatches, and copies the archive's
    Mark-of-the-Web to what it extracts.
 7. External tools are launched with argument vectors, never through a shell string.
