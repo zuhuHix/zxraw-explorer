@@ -795,10 +795,14 @@ fn data_error(entry: &ArchiveEntry, e: CoreError) -> String {
         return e.to_string();
     }
     let text = e.to_string();
+    // A disk error is what it says; bad data (the 7z reader reports it as `InvalidData`)
+    // may be the password.
+    let disk_error =
+        matches!(&e, CoreError::Io { source, .. } if source.kind() != io::ErrorKind::InvalidData);
     if entry
         .encryption
         .is_some_and(EntryEncryption::ambiguous_errors)
-        && !matches!(e, CoreError::Io { .. })
+        && !disk_error
     {
         // ZipCrypto's password check is one byte: a wrong password passes it 1 time in 256
         // and then fails as bad data. 7z AES has no check at all.
@@ -1046,7 +1050,7 @@ pub fn test_archive(
     backend.check_password(archive, &files, password)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
-        .add_total_bytes(files.iter().map(|e| e.size).sum());
+        .add_total_bytes(files.iter().fold(0u64, |a, e| a.saturating_add(e.size)));
     let mut report = TestReport::default();
     let mut buf = vec![0u8; 256 * 1024];
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
@@ -1351,11 +1355,19 @@ fn check_update_password(
         return Ok(Vec::new());
     }
     if backend.format() == ArchiveFormat::SevenZip {
-        // 7z AES has no header check to sample: the backend decodes the start of the
-        // encrypted blocks (opening a file in the middle of a solid block would decode the
-        // block up to it).
-        backend.check_password(archive, &files, Some(password))?;
-        return Ok(Vec::new());
+        // 7z AES has no header check to sample: the backend decodes the encrypted blocks
+        // from their start until a file's CRC proves the password (opening a file in the
+        // middle of a solid block would decode the block up to it). New files never get a
+        // password nothing confirmed.
+        return match sevenz_backend::verify_password(archive, &files, Some(password))? {
+            sevenz_backend::PasswordCheck::Failed => Err(CoreError::WrongPassword(label())),
+            sevenz_backend::PasswordCheck::Unverified => Err(CoreError::Unsupported(format!(
+                "{}: the password can't be confirmed (no encrypted file small enough to \
+                 check against its checksum), so no files were added",
+                label()
+            ))),
+            _ => Ok(Vec::new()),
+        };
     }
     files.sort_by_key(|e| e.size);
     files.truncate(PASSWORD_SAMPLE);

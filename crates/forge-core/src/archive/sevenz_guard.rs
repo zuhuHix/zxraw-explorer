@@ -10,7 +10,9 @@
 //!   password is [`CoreError::PasswordRequired`];
 //! * the decoded header is walked: pack streams, folders, coders per folder, streams per
 //!   coder, sub-streams and files are counted against the listing limits before anything is
-//!   allocated for them.
+//!   allocated for them; every packed stream must lie inside the file (its position and sizes
+//!   added up without overflow), every folder's packed streams must exist, and the sizes of a
+//!   folder's files must add up to no more than the folder's size.
 //!
 //! The library reads the same bytes again afterwards; everything it allocates is then
 //! bounded by these counts.
@@ -75,6 +77,8 @@ pub(super) const ID_AES: &[u8] = &[0x06, 0xF1, 0x07, 0x01];
 pub(super) struct HeaderInfo {
     /// The header (entry names) is encrypted; it decoded with the password given.
     pub encrypted: bool,
+    /// The encrypted header's checksum matched: the password is proven right.
+    pub verified: bool,
 }
 
 fn damaged(archive: &Path, what: &str) -> CoreError {
@@ -127,7 +131,10 @@ pub(super) fn check(
     let next_crc = u32::from_le_bytes(sig[28..32].try_into().unwrap());
     if next_size == 0 {
         // An empty archive.
-        return Ok(HeaderInfo { encrypted: false });
+        return Ok(HeaderInfo {
+            encrypted: false,
+            verified: false,
+        });
     }
     if next_size > MAX_RAW_HEADER {
         return Err(too_big(
@@ -146,23 +153,56 @@ pub(super) fn check(
         return Err(damaged(archive, "header checksum mismatch"));
     }
     let limits = Limits::new(max_entries);
-    let (header, encrypted) = if raw[0] == K_ENCODED_HEADER {
+    let (header, encrypted, verified) = if raw[0] == K_ENCODED_HEADER {
         let mut r = Cursor::new(&raw[1..]);
         let streams = read_streams_info(&mut r, &limits).map_err(|e| e.at(archive))?;
+        check_packs(&streams, len).map_err(|e| e.at(archive))?;
         let decoded = decode_header(archive, file, len, &streams, password)?;
-        (decoded.data, decoded.encrypted)
+        let verified =
+            decoded.encrypted && streams.folders.first().is_some_and(|f| f.crc.is_some());
+        (decoded.data, decoded.encrypted, verified)
     } else {
-        (raw, false)
+        (raw, false, false)
     };
     let mut r = Cursor::new(&header);
     // An encrypted header that passed its CRC is damaged here, not decrypted wrongly.
-    let files = walk_header(&mut r, &limits).map_err(|e| e.at(archive))?;
+    let (files, main) = walk_header(&mut r, &limits).map_err(|e| e.at(archive))?;
+    if let Some(main) = &main {
+        check_packs(main, len).map_err(|e| e.at(archive))?;
+    }
     if files > max_entries as u64 {
         return Err(CoreError::Invalid(format!(
             "archive has {files} entries (listing limit {max_entries})"
         )));
     }
-    Ok(HeaderInfo { encrypted })
+    Ok(HeaderInfo {
+        encrypted,
+        verified,
+    })
+}
+
+/// Every packed stream lies inside the file (`len` bytes), and the folders' packed streams
+/// exist.
+fn check_packs(info: &StreamsInfo, len: u64) -> Walk<()> {
+    let past_end = || WalkError::Damaged("packed data lies past the end of the file");
+    let mut end = SIGNATURE_HEADER_SIZE
+        .checked_add(info.pack_pos)
+        .ok_or_else(past_end)?;
+    for &size in &info.pack_sizes {
+        end = end.checked_add(size).ok_or_else(past_end)?;
+    }
+    if end > len {
+        return Err(past_end());
+    }
+    let used = info
+        .folders
+        .iter()
+        .try_fold(0u64, |n, f| n.checked_add(f.packed.len() as u64))
+        .ok_or(WalkError::Damaged("bad folder list"))?;
+    if used > info.pack_sizes.len() as u64 {
+        return Err(WalkError::Damaged("a folder's packed stream is missing"));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -212,6 +252,16 @@ pub(super) struct CoderInfo {
     pub props: Vec<u8>,
     pub num_in: u64,
     pub num_out: u64,
+}
+
+impl FolderInfo {
+    /// The size of the folder's result: its one unbound output.
+    fn final_size(&self) -> Option<u64> {
+        let outs = self.unpack_sizes.len() as u64;
+        (0..outs)
+            .find(|o| !self.bind_pairs.iter().any(|(_, bo)| bo == o))
+            .and_then(|o| self.unpack_sizes.get(o as usize).copied())
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -469,9 +519,15 @@ fn read_sub_streams_info(r: &mut Cursor<'_>, limits: &Limits, info: &StreamsInfo
         ty = r.byte()?;
     }
     if ty == K_SIZE {
-        for &n in &per_folder {
+        for (&n, f) in per_folder.iter().zip(&info.folders) {
+            // The last file gets what is left, so the others may not add up to more.
+            let size = f.final_size().unwrap_or(0);
+            let mut sum = 0u64;
             for _ in 1..n.max(1) {
-                r.number()?;
+                sum = sum
+                    .checked_add(r.number()?)
+                    .filter(|&s| s <= size)
+                    .ok_or(WalkError::Damaged("file sizes larger than their folder"))?;
             }
         }
         ty = r.byte()?;
@@ -510,8 +566,8 @@ fn read_streams_info(r: &mut Cursor<'_>, limits: &Limits) -> Walk<StreamsInfo> {
     Ok(info)
 }
 
-/// Walk a decoded header; returns the number of entries it declares.
-fn walk_header(r: &mut Cursor<'_>, limits: &Limits) -> Walk<u64> {
+/// Walk a decoded header; returns the number of entries it declares and its main streams.
+fn walk_header(r: &mut Cursor<'_>, limits: &Limits) -> Walk<(u64, Option<StreamsInfo>)> {
     if r.byte()? != K_HEADER {
         return Err(WalkError::Damaged("no header"));
     }
@@ -530,11 +586,12 @@ fn walk_header(r: &mut Cursor<'_>, limits: &Limits) -> Walk<u64> {
     if ty == K_ADDITIONAL_STREAMS_INFO {
         return Err(WalkError::Damaged("additional streams are not supported"));
     }
-    let mut folders = 0;
+    let mut main = None;
     if ty == K_MAIN_STREAMS_INFO {
-        folders = read_streams_info(r, limits)?.folders.len();
+        main = Some(read_streams_info(r, limits)?);
         ty = r.byte()?;
     }
+    let folders = main.as_ref().map_or(0, |m| m.folders.len());
     let mut files = 0;
     if ty == K_FILES_INFO {
         // Each entry takes at least two bytes of name (its terminator).
@@ -554,7 +611,7 @@ fn walk_header(r: &mut Cursor<'_>, limits: &Limits) -> Walk<u64> {
     if ty != K_END {
         return Err(WalkError::Damaged("header not terminated"));
     }
-    Ok(files)
+    Ok((files, main))
 }
 
 // ---------------------------------------------------------------------------

@@ -375,8 +375,7 @@ fn write_new(
         items
             .iter()
             .filter(|w| w.kind == NodeKind::File)
-            .map(|w| w.size)
-            .sum(),
+            .fold(0u64, |a, w| a.saturating_add(w.size)),
     );
     let mut planned = Vec::new();
     for item in items {
@@ -480,7 +479,7 @@ fn write_new(
                 .map_err(|e| write_err(out, e, ctx))?;
         }
         report.files += group.len() as u64;
-        report.bytes_in += bytes;
+        report.bytes_in = report.bytes_in.saturating_add(bytes);
         i = j;
     }
     Ok(())
@@ -691,8 +690,7 @@ pub(super) fn update(
         .iter()
         .zip(&touched)
         .filter(|(_, t)| **t)
-        .map(|(b, _)| b.unpack_size)
-        .sum();
+        .fold(0u64, |a, (b, _)| a.saturating_add(b.unpack_size));
     if recompress > 0
         && blocks.iter().zip(&touched).any(|(b, t)| *t && b.encrypted)
         && password.is_none()
@@ -706,9 +704,9 @@ pub(super) fn update(
         .iter()
         .zip(&touched)
         .filter(|(_, t)| !**t)
-        .map(|(b, _)| b.pack_size)
-        .sum();
-    ctx.progress.add_total_bytes(raw_bytes + recompress);
+        .fold(0u64, |a, (b, _)| a.saturating_add(b.pack_size));
+    ctx.progress
+        .add_total_bytes(raw_bytes.saturating_add(recompress));
     if recompress > 0 {
         ctx.progress.set_note(format!(
             "Recompressing {} MB of solid blocks",
@@ -767,7 +765,7 @@ pub(super) fn update(
         let mut pos = 0u64;
         let kept = spill_block(archive, &mut o, b, &keep, sp, &mut pos, info.encrypted, ctx)?;
         sp.flush().map_err(|e| CoreError::io(&spill_path, e))?;
-        let bytes: u64 = kept.iter().map(|k| k.len).sum();
+        let bytes = kept.iter().fold(0u64, |a, k| a.saturating_add(k.len));
         let mut chain = methods.chain(Kind::Lzma, bytes);
         if !info.encrypted && methods.password.is_some() {
             chain.remove(0); // it wasn't encrypted: keep it that way

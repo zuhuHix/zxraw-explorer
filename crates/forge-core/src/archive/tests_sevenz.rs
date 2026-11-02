@@ -663,3 +663,158 @@ fn incomplete_and_truncated_archives_are_damage() {
     let cut = write_raw(d.path(), "cut.7z", &full[..full.len() / 2]);
     assert!(matches!(list(&cut), Err(CoreError::Invalid(_))));
 }
+
+// ---------------------------------------------------------------------------
+// Review round 1: hostile pack sizes, unproven passwords
+// ---------------------------------------------------------------------------
+
+/// A plain header with only pack info: `sizes` packed streams from position `pos`.
+fn packs_header(pos: u64, sizes: &[u64]) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04, 0x06];
+    h.extend(num(pos));
+    h.extend(num(sizes.len() as u64));
+    h.push(0x09);
+    for &s in sizes {
+        h.extend(num(s));
+    }
+    h.extend([0x00, 0x00, 0x00]);
+    h
+}
+
+#[test]
+fn pack_sizes_past_u64_or_the_file_are_refused_without_panicking() {
+    let d = tempfile::tempdir().unwrap();
+    let data = [7u8; 16];
+    // Sizes adding up past u64::MAX.
+    let p = write_raw(
+        d.path(),
+        "wrap.7z",
+        &raw_7z(&data, &packs_header(0, &[u64::MAX - 10, 100])),
+    );
+    assert_refused(&p, "past the end");
+    // A position that overflows with the signature header.
+    let p = write_raw(
+        d.path(),
+        "pos.7z",
+        &raw_7z(&data, &packs_header(u64::MAX - 8, &[1])),
+    );
+    assert_refused(&p, "past the end");
+    // A packed stream running past the end of the file.
+    let p = write_raw(
+        d.path(),
+        "eof.7z",
+        &raw_7z(&data, &packs_header(0, &[1000])),
+    );
+    assert_refused(&p, "past the end");
+    // The files of a folder adding up to more than the folder.
+    let mut h = vec![0x01, 0x04];
+    h.extend(one_folder(16, &[0x00], &[], 16));
+    h.extend([0x08, 0x0D, 0x02, 0x09]);
+    h.extend(num(u64::MAX));
+    h.extend([0x00, 0x00, 0x00]);
+    let p = write_raw(d.path(), "subs.7z", &raw_7z(&data, &h));
+    assert_refused(&p, "larger than their folder");
+    // The archive reads fine when the same layout is consistent.
+    let p = write_raw(
+        d.path(),
+        "fine.7z",
+        &raw_7z(&data, &file_header(16, &[0x00], &[], 16)),
+    );
+    assert!(list(&p).is_ok());
+}
+
+#[test]
+fn an_archive_without_crcs_leaves_a_password_unverified() {
+    let d = tempfile::tempdir().unwrap();
+    // One AES coder (one key derivation round, no salt or IV) and no CRC anywhere.
+    let p = write_raw(
+        d.path(),
+        "nocrc.7z",
+        &raw_7z(
+            &[0x42; 16],
+            &file_header(16, &[0x06, 0xF1, 0x07, 0x01], &[0x01], 16),
+        ),
+    );
+    let l = list(&p).unwrap();
+    let files: Vec<&ArchiveEntry> = l.entries.iter().collect();
+    assert!(files[0].encrypted);
+    assert_eq!(
+        sevenz_backend::verify_password(&p, &files, Some(&Password::new("any"))).unwrap(),
+        sevenz_backend::PasswordCheck::Unverified
+    );
+}
+
+#[test]
+fn a_wrong_password_that_decodes_a_prefix_is_not_accepted() {
+    let d = tempfile::tempdir().unwrap();
+    let src = d.path().join("big");
+    fs::create_dir_all(&src).unwrap();
+    // Stored (Copy) data larger than the proof budget: any key decrypts its start.
+    let size = sevenz_backend::PASSWORD_PROOF_BUDGET as usize + 1024 * 1024;
+    let noise: Vec<u8> = (0..size as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    fs::write(src.join("movie.mp4"), &noise).unwrap();
+    let out = d.path().join("stored.7z");
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    create(
+        std::slice::from_ref(&src),
+        &out,
+        &opts_7z(Preset::Fast, true, Some("right"), false),
+        &ctx,
+    )
+    .unwrap();
+    let l = list(&out).unwrap();
+    let files: Vec<&ArchiveEntry> = l.entries.iter().filter(|e| !e.is_dir).collect();
+    for pw in ["right", "wrong"] {
+        assert_eq!(
+            sevenz_backend::verify_password(&out, &files, Some(&Password::new(pw))).unwrap(),
+            sevenz_backend::PasswordCheck::Unverified,
+            "{pw}: a decodable prefix proves nothing"
+        );
+    }
+    // Extraction goes ahead, but the file fails its CRC and is never published.
+    let x = d.path().join("x");
+    fs::create_dir_all(&x).unwrap();
+    let opts = ExtractOptions {
+        password: Some(Password::new("wrong")),
+        ..Default::default()
+    };
+    let r = extract(&out, &x, &opts, None, &ctx).unwrap();
+    assert!(r.extracted.is_empty(), "{r:?}");
+    assert_eq!(r.failed.len(), 1, "{r:?}");
+    assert!(
+        r.failed[0]
+            .reason
+            .contains("damaged data or wrong password"),
+        "{r:?}"
+    );
+    assert!(!x.join("big/movie.mp4").exists());
+    // The right password extracts it.
+    let opts = ExtractOptions {
+        password: Some(Password::new("right")),
+        ..Default::default()
+    };
+    let r = extract(&out, &x, &opts, None, &ctx).unwrap();
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert_eq!(fs::read(x.join("big/movie.mp4")).unwrap(), noise);
+    // Files are never added with a password nothing confirmed, right or wrong.
+    let extra = d.path().join("extra.txt");
+    fs::write(&extra, b"new").unwrap();
+    for pw in ["right", "wrong"] {
+        let edit = ArchiveEdit {
+            add: vec![(extra.clone(), String::new())],
+            delete: vec![],
+        };
+        let e = update(
+            &out,
+            &edit,
+            &opts_7z(Preset::Fast, true, Some(pw), false),
+            &ctx,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("can't be confirmed"), "{pw}: {e}");
+    }
+    assert_eq!(list(&out).unwrap().entries.len(), l.entries.len());
+}
