@@ -131,7 +131,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd) {
     }
     let archives = archive_targets(app);
     if archives.is_empty() {
-        app.toast("Select an archive (.zip) first");
+        app.toast("Select an archive (.zip or .7z) first");
         return;
     }
     if cmd == Cmd::TestArchive {
@@ -315,7 +315,7 @@ fn run_extract(
 ) -> forge_core::Result<Outcome> {
     if r.policy.is_none() {
         ctx.progress.set_note("Checking for existing files…");
-        let listing = archive::list(&r.archive)?;
+        let listing = archive::list_with_password(&r.archive, password.as_ref())?;
         ctx.progress.set_note("");
         if let Some(dest) = conflict_dest(r, &listing) {
             let existing = existing_files(&listing.entries, r.selection.as_ref(), &dest);
