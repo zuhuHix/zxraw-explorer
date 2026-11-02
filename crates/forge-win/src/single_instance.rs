@@ -594,6 +594,10 @@ pub enum Startup {
     Forwarded,
     /// Open a window of its own; the text says why forwarding did not happen.
     Standalone(String),
+    /// The running window took an action, but whether this end's commit reached it is
+    /// unknown: the window may run it. This process must neither run it (it could run twice)
+    /// nor stay silent: it tells the user. The text says what happened.
+    Unconfirmed(String),
 }
 
 /// Why forwarding failed.
@@ -606,6 +610,8 @@ pub enum ForwardError {
     TimedOut(&'static str),
     Refused(Reply),
     Failed(WinError),
+    /// An accepted action's commit may or may not have reached the window.
+    Unconfirmed(String),
 }
 
 impl std::fmt::Display for ForwardError {
@@ -618,6 +624,7 @@ impl std::fmt::Display for ForwardError {
             Self::Refused(Reply::Closing) => f.write_str("the running window is closing"),
             Self::Refused(reply) => write!(f, "the running window refused the request ({reply:?})"),
             Self::Failed(e) => write!(f, "{e}"),
+            Self::Unconfirmed(why) => write!(f, "the running window may or may not run the command: {why}"),
         }
     }
 }
@@ -642,6 +649,7 @@ pub fn claim_or_forward(
             Err(ForwardError::NoServer) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(20));
             }
+            Err(ForwardError::Unconfirmed(why)) => return Startup::Unconfirmed(why),
             Err(e) => return Startup::Standalone(e.to_string()),
         }
     }
@@ -688,7 +696,8 @@ mod imp {
 
     use windows::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND,
-        ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
+        ERROR_IO_PENDING, ERROR_MORE_DATA, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
         GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, LocalFree, WAIT_OBJECT_0,
     };
     use windows::Win32::Security::Authorization::{
@@ -1208,7 +1217,7 @@ mod imp {
         }
     }
 
-    enum IoError {
+    pub(super) enum IoError {
         TimedOut,
         MoreData,
         Os(windows::core::Error),
@@ -1230,12 +1239,19 @@ mod imp {
         }
         let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
         if unsafe { WaitForSingleObject(event.0, ms) } != WAIT_OBJECT_0 {
-            unsafe {
+            let mut n = 0;
+            // The operation may complete between the wait running out and the cancel: then it
+            // happened (a write was delivered), and the caller must know.
+            let settled = unsafe {
                 let _ = CancelIoEx(handle, Some(&ov));
-                let mut n = 0;
-                let _ = GetOverlappedResult(handle, &ov, &mut n, true);
-            }
-            return Err(IoError::TimedOut);
+                GetOverlappedResult(handle, &ov, &mut n, true)
+            };
+            return match settled {
+                Ok(()) => Ok(n),
+                Err(e) if is(&e, ERROR_OPERATION_ABORTED) => Err(IoError::TimedOut),
+                Err(e) if is(&e, ERROR_MORE_DATA) => Err(IoError::MoreData),
+                Err(e) => Err(IoError::Os(e)),
+            };
         }
         let mut n = 0;
         match unsafe { GetOverlappedResult(handle, &ov, &mut n, false) } {
@@ -1252,6 +1268,51 @@ mod imp {
         })?;
         buf.truncate(n as usize);
         Ok(buf)
+    }
+
+    /// Whether a commit message reached the receiver's end of the pipe.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CommitOutcome {
+        Delivered,
+        /// Provably not: the write was cancelled before it completed, or the receiver's end
+        /// was already closed, so the receiver drops the action.
+        NotDelivered,
+        /// Neither can be shown (a partial write, an unexpected error).
+        Unknown,
+    }
+
+    /// Classifies the commit write: `Ok(n)` is the number of bytes written.
+    pub(super) fn commit_outcome(written: std::result::Result<u32, &IoError>) -> CommitOutcome {
+        match written {
+            Ok(n) if n as usize == COMMIT.len() => CommitOutcome::Delivered,
+            Ok(_) => CommitOutcome::Unknown,
+            Err(IoError::TimedOut) => CommitOutcome::NotDelivered,
+            Err(IoError::Os(e))
+                if is(e, ERROR_BROKEN_PIPE) || is(e, ERROR_NO_DATA) || is(e, ERROR_PIPE_NOT_CONNECTED) =>
+            {
+                CommitOutcome::NotDelivered
+            }
+            Err(_) => CommitOutcome::Unknown,
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Tests: report the next commit as `Unknown` after actually writing it (the
+        /// ambiguous case: it got through, but this end cannot tell).
+        pub(super) static COMMIT_UNKNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn write_commit(handle: HANDLE) -> CommitOutcome {
+        let written = overlapped(handle, Duration::from_secs(2), |ov| unsafe {
+            WriteFile(handle, Some(&COMMIT), None, Some(ov))
+        });
+        let outcome = commit_outcome(written.as_ref().map(|n| *n));
+        #[cfg(test)]
+        if COMMIT_UNKNOWN.with(|c| c.replace(false)) {
+            return CommitOutcome::Unknown;
+        }
+        outcome
     }
 
     fn write_message(handle: HANDLE, bytes: &[u8], timeout: Duration) -> std::result::Result<(), IoError> {
@@ -1415,13 +1476,22 @@ mod imp {
             Some(Reply::Accepted) => {
                 // Confirms that this end read the answer and will not run the launch itself.
                 // An action waits for this; for an open it only ends the exchange.
-                let confirmed = write_message(pipe.0, &COMMIT, Duration::from_secs(2));
-                if confirmed.is_err() && request_has_action(&request) {
-                    return Err(ForwardError::Failed(WinError::Invalid(
-                        "could not confirm the action to the running window".into(),
-                    )));
+                let outcome = write_commit(pipe.0);
+                if !request_has_action(&request) {
+                    return Ok(());
                 }
-                Ok(())
+                match outcome {
+                    CommitOutcome::Delivered => Ok(()),
+                    // The window drops it: this end runs it.
+                    CommitOutcome::NotDelivered => Err(ForwardError::Failed(WinError::Invalid(
+                        "could not confirm the action to the running window".into(),
+                    ))),
+                    // Running it here could run it twice: report instead.
+                    CommitOutcome::Unknown => Err(ForwardError::Unconfirmed(
+                        "the confirmation to the running window may not have arrived".into(),
+                    )),
+                }
+
             }
 
             Some(reply) => Err(ForwardError::Refused(reply)),
@@ -1848,6 +1918,7 @@ mod tests {
                 Startup::Forwarded => {}
                 Startup::Primary(_) => panic!("a second owner was allowed"),
                 Startup::Standalone(why) => panic!("not forwarded: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
             }
             assert!(started.elapsed() < FORWARD_TIMEOUT);
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1984,6 +2055,7 @@ mod tests {
                             Startup::Primary(server) => Some(server),
                             Startup::Forwarded => None,
                             Startup::Standalone(why) => panic!("sender {i} fell back: {why}"),
+                            Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
                         }
                     })
                 })
@@ -2038,6 +2110,7 @@ mod tests {
                 Startup::Primary(_) => {}
                 Startup::Forwarded => panic!("a v2 launch reached a v1 window"),
                 Startup::Standalone(why) => panic!("the v2 launch should own its own pipe: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
             }
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
             assert!(window.join().unwrap().is_empty(), "the v1 window was contacted");
@@ -2075,6 +2148,7 @@ mod tests {
                 Startup::Forwarded => {}
                 Startup::Primary(_) => panic!("a second owner was allowed"),
                 Startup::Standalone(why) => panic!("not forwarded: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
             }
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
             assert_eq!(
@@ -2083,6 +2157,46 @@ mod tests {
                     action: Some("add-zip".into()),
                     paths
                 }]
+            );
+        }
+
+        #[test]
+        fn a_commit_is_delivered_only_when_provably_written() {
+            use imp::{CommitOutcome, IoError, commit_outcome};
+            use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_INVALID_HANDLE, ERROR_NO_DATA};
+            let os = |code| IoError::Os(windows::core::Error::from(code));
+            assert_eq!(commit_outcome(Ok(COMMIT.len() as u32)), CommitOutcome::Delivered);
+            // A partial write or an unexpected error: maybe delivered, maybe not.
+            assert_eq!(commit_outcome(Ok(3)), CommitOutcome::Unknown);
+            assert_eq!(commit_outcome(Err(&os(ERROR_INVALID_HANDLE))), CommitOutcome::Unknown);
+            assert_eq!(commit_outcome(Err(&IoError::MoreData)), CommitOutcome::Unknown);
+            // Cancelled before completing, or the receiver's end is gone.
+            assert_eq!(commit_outcome(Err(&IoError::TimedOut)), CommitOutcome::NotDelivered);
+            assert_eq!(commit_outcome(Err(&os(ERROR_BROKEN_PIPE))), CommitOutcome::NotDelivered);
+            assert_eq!(commit_outcome(Err(&os(ERROR_NO_DATA))), CommitOutcome::NotDelivered);
+        }
+
+        /// The ambiguous case: the commit got through, but the sender cannot tell. The window
+        /// runs the action once and the sender must not run it as well.
+        #[test]
+        fn an_unconfirmable_commit_is_reported_and_never_run_by_the_sender() {
+            let channel = Channel::current(&unique_tag("unknown-commit")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let paths = vec![PathBuf::from(r"C:\sel\a.jpg"), PathBuf::from(r"C:\sel\b.jpg")];
+            let request = encode_action_request(Path::new(r"C:\"), &paths, Some("add-zip")).unwrap();
+            imp::COMMIT_UNKNOWN.with(|c| c.set(true));
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Unconfirmed(why) => assert!(why.contains("may not"), "{why}"),
+                Startup::Standalone(why) => panic!("the sender would run it a second time: {why}"),
+                _ => panic!("an unconfirmed commit must be reported"),
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                window.join().unwrap(),
+                vec![Handoff { action: Some("add-zip".into()), paths }],
+                "the window runs it, once"
             );
         }
 

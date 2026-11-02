@@ -51,6 +51,15 @@ impl Group {
         }
     }
 
+    /// Whether the group also becomes the per-user class default (`Software\Classes\.<ext>`).
+    /// Photos do, for programs that read it directly (see the module notes). Archives do not:
+    /// that would override the system's handler (`.zip` is `CompressedFolder` in HKLM) for
+    /// Explorer and older programs before the user confirmed anything in Settings. They get
+    /// only `OpenWithProgids` and the Capabilities entries.
+    fn takes_class_default(self) -> bool {
+        matches!(self, Self::Photos)
+    }
+
     /// Whether `prog_id` is one of this group's: archive ProgIDs also start with the photo
     /// prefix, so photos are the rest.
     fn owns(self, prog_id: &str) -> bool {
@@ -535,14 +544,18 @@ fn register_at(layout: &Layout, group: Group, exe: &Path, types: &[FileType]) ->
                 unregister_extension_at(layout, group, &extension)?;
             }
         }
-        for extension in &plan.extensions {
-            preserve_class_default_at(layout, group, extension)?;
+        let takes_class_default = group.takes_class_default();
+        if takes_class_default {
+            for extension in &plan.extensions {
+                preserve_class_default_at(layout, group, extension)?;
+            }
         }
         for value in &plan.values {
             registry::set_wide(&value.key, value.name.as_deref(), &value.value)?;
         }
-        for extension in &plan.extensions {
+        for extension in plan.extensions.iter().filter(|_| takes_class_default) {
             let prog_id = prog_id(group, extension);
+
             let extension_key = layout.extension_key(extension);
             let current = registry::string_value(&extension_key, None)?;
             if !current
@@ -1101,9 +1114,26 @@ mod tests {
         archives.sort();
         assert_eq!(archives, ["7z", "zip"]);
         assert!(matches_at(&layout, Group::Archives, exe, &[file_type("zip", ""), file_type("7z", "")]).unwrap());
+        // The class default stays the system's: archives are only offered ("Open with",
+        // Default apps) until the user confirms them in Settings.
         assert_eq!(
             registry::string_value(&layout.extension_key("zip"), None).unwrap().as_deref(),
-            Some("ZXrawExplorer.Archive.zip")
+            Some("CompressedFolder")
+        );
+        assert_eq!(registry::string_value(&layout.extension_key("7z"), None).unwrap(), None);
+        assert_eq!(
+            registry::value_names(&format!("{}\\OpenWithProgids", layout.extension_key("zip")))
+                .unwrap(),
+            ["ZXrawExplorer.Archive.zip"]
+        );
+        assert!(
+            registry::string_value(&layout.previous_defaults(), Some(".zip")).unwrap().is_none(),
+            "nothing replaced, so nothing saved"
+        );
+        // Photos still take the class default (unchanged behaviour).
+        assert_eq!(
+            registry::string_value(&layout.extension_key("jpg"), None).unwrap().as_deref(),
+            Some("ZXrawExplorer.jpg")
         );
         assert_eq!(
             registry::string_value(&layout.prog_id_key(Group::Archives, "zip"), None)

@@ -186,6 +186,17 @@ pub fn startup(launch: &Launch, settings: &crate::settings::Settings) -> Decisio
             tracing::info!("opened in the running window");
             Decision::Exit(0)
         }
+        Startup::Unconfirmed(why) => {
+            // Running the command here as well could run it twice (two archives): tell the
+            // user to check the window instead.
+            tracing::warn!("a menu command may or may not have reached the running window: {why}");
+            report_error(&format!(
+                "ZXraw Explorer could not confirm that the running window received \"{}\".\n\n\
+                 Check the ZXraw Explorer window. If nothing happened there, run the command again.",
+                launch.action.map(|verb| verb.label()).unwrap_or("the command")
+            ));
+            Decision::Exit(4)
+        }
         Startup::Standalone(why) => {
             tracing::warn!("opening a new window: {why}");
             if forward_only() {
@@ -196,6 +207,16 @@ pub fn startup(launch: &Launch, settings: &crate::settings::Settings) -> Decisio
             Decision::Run { inbox: Some(inbox), server: None }
         }
     }
+}
+
+/// Tells the user about a launch this process could not carry out (it has no window): an
+/// error box, except in automated and forward-only runs, which only log it.
+pub fn report_error(text: &str) {
+    tracing::warn!("{text}");
+    if forward_only() || crate::testhook::env_requests_automation() {
+        return;
+    }
+    forge_win::shell_verb_server::show_error(text);
 }
 
 /// Connects the inbox to the new window: a request repaints it (so an idle window takes it

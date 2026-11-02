@@ -698,3 +698,27 @@ fn a_menu_command_on_a_multi_selection_makes_one_archive() {
     let entries = forge_core::archive::list(&zip).unwrap().entries;
     assert_eq!(entries.iter().filter(|e| !e.is_dir).count(), 3);
 }
+
+/// A forwarded `--add-zip` whose selection holds an item that vanished makes no archive of
+/// the rest: the window refuses the whole command and names the item.
+#[cfg(windows)]
+#[test]
+fn a_forwarded_add_zip_with_a_vanished_item_makes_no_archive() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let shoot = sandbox.path().join("Shoot");
+    std::fs::create_dir_all(&shoot).unwrap();
+    write_file(&shoot.join("a.txt"), b"a");
+    let tag = unique_tag("addzip-gone");
+    let script = "dismiss-notices\nui system wait-toast \"gone.txt\" no longer exists\nsleep 1000\nexit\n";
+    let first = owner_window(sandbox.path(), &profile, &tag, script.to_string());
+    let status = wait_exit(
+        forwarding_launch(&shoot, &tag, &["--add-zip".as_ref(), "a.txt".as_ref(), "gone.txt".as_ref()]),
+        Duration::from_secs(20),
+    );
+    assert_eq!(status.code(), Some(0), "the command was not handed over");
+    let outcome = first.join().unwrap();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(archives_in(&shoot, "zip").is_empty(), "no archive of only part of the selection");
+}
