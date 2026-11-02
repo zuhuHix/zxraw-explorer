@@ -320,6 +320,14 @@ impl ThumbProvider for GridProvider<'_> {
 }
 
 impl Actions {
+    /// Something newer than our file list went on the clipboard (archive items): that list
+    /// no longer pastes, and a paste waiting for it gives up.
+    pub fn supersede_file_clipboard(&mut self) {
+        self.clipboard = None;
+        self.clipboard_generation += 1;
+        self.paste_waiting = None;
+    }
+
     pub fn new(paths: &Paths, settings: &Settings, ctx: egui::Context) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
@@ -436,7 +444,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             if crate::archive_ui::block_in_archive(app, "Open terminal") => {}
         Cmd::Copy if app.pane().archive.is_some() => crate::archive_edit::copy(app),
         Cmd::Copy if crate::archive_ui::block_in_archive(app, "Copy") => {}
-        Cmd::Cut if crate::archive_ui::block_in_archive(app, "Cut") => {}
+        Cmd::Cut if app.pane().archive.is_some() => crate::archive_edit::cut(app),
         Cmd::Paste
             if app.pane().archive.is_none()
                 && crate::archive_ui::block_in_archive(app, "Paste") => {}
@@ -1407,17 +1415,20 @@ fn paste_with(
     };
     // Entries copied inside an archive (not on the Windows clipboard) while nothing newer
     // was copied: extracted here.
+    // Our own virtual files on the clipboard are always that copy.
+    let ours = app.ops.archive.out.on_clipboard();
     if let Some(copied) = app.ops.archive.copied.as_ref()
-        && crate::archive_edit::archive_copy_is_newest(
-            copied.baseline_sequence,
-            sequence,
-            owner.is_some_and(forge_win::ClipboardToken::is_from_this_process),
-            match system {
-                SystemFiles::Files => Some(true),
-                SystemFiles::NoFiles => Some(false),
-                SystemFiles::Unreadable => None,
-            },
-        )
+        && (ours
+            || crate::archive_edit::archive_copy_is_newest(
+                copied.baseline_sequence,
+                sequence,
+                owner.is_some_and(forge_win::ClipboardToken::is_from_this_process),
+                match system {
+                    SystemFiles::Files => Some(true),
+                    SystemFiles::NoFiles => Some(false),
+                    SystemFiles::Unreadable => None,
+                },
+            ))
     {
         let copied = copied.clone();
         return crate::archive_edit::paste_archive_copy(app, copied, dest);
@@ -1740,6 +1751,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
     // A finished "Select originals/exports" match (computed off the UI thread).
     changed |= crate::export_assoc::poll(app);
     changed |= crate::archive_ui::poll(app);
+    changed |= crate::archive_out::poll(app);
     if app
         .ops
         .paste_waiting
@@ -2023,6 +2035,7 @@ pub fn status_widgets(app: &mut ZxrawApp, ui: &mut Ui) {
 
 pub fn shutdown(app: &mut ZxrawApp) {
     crate::tags_ui::flush_for_exit(app);
+    crate::archive_out::shutdown(app);
     // Cancel running jobs; copies clean up their partial files on cancel.
     app.ops.jobs.cancel_all();
     for q in app.ops.conflicts.drain(..) {

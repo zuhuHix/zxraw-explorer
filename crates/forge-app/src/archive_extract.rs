@@ -57,6 +57,9 @@ pub struct ExtractRequest {
     /// Extract encrypted files without a checksum even though the password isn't proven
     /// (the user said "Extract them anyway").
     pub allow_unchecked: bool,
+    /// The first half of a move out of the archive: once everything was extracted, the
+    /// items are removed (after a confirmation, see `archive_out`).
+    pub then_remove: Option<crate::archive_out::MoveOut>,
 }
 
 /// Encrypted files without a checksum were held back (the password isn't proven): ask
@@ -84,6 +87,7 @@ pub fn unchecked_rerun(request: &ExtractRequest, report: &ExtractReport) -> Extr
         selection: Some(archive::Selection::new(base, report.unchecked.clone())),
         policy: Some(ConflictPolicy::Skip),
         allow_unchecked: true,
+        then_remove: None,
     }
 }
 
@@ -197,6 +201,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd) {
                 selection: None,
                 policy: None,
                 allow_unchecked: false,
+                then_remove: None,
             },
         );
     }
@@ -248,6 +253,7 @@ fn run_inside(app: &mut ZxrawApp, cmd: Cmd, view: ArchiveView) {
             selection,
             policy: None,
             allow_unchecked: false,
+            then_remove: None,
         },
     );
 }
@@ -325,6 +331,7 @@ pub fn start_extract(app: &mut ZxrawApp, request: ExtractRequest) {
     let msgs = app.ops.archive.tx.clone();
     let events = app.ops.tx.clone();
     let ctx = app.ops.ctx.clone();
+    let out = app.ops.archive.out.sender();
     app.ops.jobs.spawn(EXTRACT_KIND, title, move |job| {
         let job_ctx = JobCtx::from_job(job);
         let result = match run_extract(&request, password, &job_ctx) {
@@ -334,6 +341,9 @@ pub fn start_extract(app: &mut ZxrawApp, request: ExtractRequest) {
             }
             Ok(Outcome::Done(report, created)) => {
                 finish_extract(job, &request, &report, &events);
+                if let Some(moved) = &request.then_remove {
+                    out.extracted(moved, &report, &ctx);
+                }
                 if let Some(ask) = unchecked_ask(&request, &report, created) {
                     let _ = msgs.send(Msg::Unchecked(ask));
                 }
@@ -1013,6 +1023,7 @@ mod tests {
             selection,
             policy: None,
             allow_unchecked: false,
+            then_remove: None,
         };
         let many = ArchiveListing {
             format: archive::ArchiveFormat::Zip,
@@ -1104,6 +1115,7 @@ mod tests {
             selection: Some(archive::Selection::new("docs/", vec!["docs/a.txt".into()])),
             policy: None,
             allow_unchecked: false,
+            then_remove: None,
         };
         let report = ExtractReport {
             dest: PathBuf::from(r"D:\x\secret"),
@@ -1190,6 +1202,7 @@ mod tests {
                 selection: None,
                 policy: Some(ConflictPolicy::Skip),
                 allow_unchecked: false,
+                then_remove: None,
             };
             let folder = d.path().join("secret");
             // Declined: the folder the extraction made goes.
@@ -1241,6 +1254,7 @@ mod tests {
             selection: None,
             policy: Some(ConflictPolicy::Skip),
             allow_unchecked: false,
+            then_remove: None,
         };
         let outcome = run_extract(&request, Some(Password::new("whatever")), &ctx);
         BEFORE_EXTRACT.with(|h| *h.borrow_mut() = None);

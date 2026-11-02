@@ -50,12 +50,8 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let kinds = payload.1.clone();
     egui::DragAndDrop::clear_payload(ctx);
     ctx.data_mut(|d| d.remove::<egui::Pos2>(last_id));
-    // Items inside an archive are not files other apps could take.
-    if paths.iter().any(|p| crate::archive_ui::is_virtual(app, p)) {
-        app.toast("Dragging out of an archive to other apps is not available yet: drop the items on a folder here, or extract them");
-        return;
-    }
-    if paths.len() > MAX_DRAG_OUT_ITEMS {
+    let from_archive = paths.iter().any(|p| crate::archive_ui::is_virtual(app, p));
+    if !from_archive && paths.len() > MAX_DRAG_OUT_ITEMS {
         app.toast_err(format!(
             "Drag out at most {MAX_DRAG_OUT_ITEMS} items at a time ({} selected); \
              use Copy and paste for larger selections",
@@ -63,14 +59,16 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         ));
         return;
     }
-    // The OLE drag is modal; a scripted run has no one to drop it and would hang.
-    if app.testhook.active() {
+    // The OLE drag is modal; a scripted run has no one to drop it and would hang. (Archive
+    // items still build their offer, which may ask for a password; see `archive_out::drag`.)
+    if app.testhook.active() && !from_archive {
         tracing::info!(
             "automated run: not starting an OS drag-out of {} item(s)",
             paths.len()
         );
         return;
     }
+    let first_is_dir = kinds.first().copied().flatten() == Some(forge_core::EntryKind::Dir);
     let entry = paths.first().and_then(|path| {
         app.pane()
             .entries
@@ -88,6 +86,12 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
             height: image.height,
             rgba: &image.rgba,
         });
+    // Items inside an archive are offered as virtual files, extracted when the target reads
+    // them (see `archive_out`).
+    if from_archive {
+        crate::archive_out::drag(app, &paths, first_is_dir, drag_thumbnail);
+        return;
+    }
     // This runs on the UI thread, so nothing here may wait on a share. Each item carries the
     // kind the pane listing showed, so forge-win never stats it, and a network flag (UNC, or a
     // mapped drive by its drive type, which Windows answers locally). If any item is on the

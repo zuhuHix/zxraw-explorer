@@ -691,12 +691,20 @@ pub(crate) enum Retry {
     BrowseWindow {
         archive: PathBuf,
     },
+    /// Items of `archive` offered to other apps (see `archive_out`): copied or cut again
+    /// (`then`: the listed paths, and whether cut), or dragged again by the user.
+    Out {
+        archive: PathBuf,
+        then: Option<(Vec<PathBuf>, bool)>,
+    },
 }
 
 impl Retry {
     fn archive(&self) -> &Path {
         match self {
-            Retry::Browse { archive, .. } | Retry::BrowseWindow { archive } => archive,
+            Retry::Browse { archive, .. }
+            | Retry::BrowseWindow { archive }
+            | Retry::Out { archive, .. } => archive,
             Retry::Open(r) => &r.archive,
             Retry::Extract(r) => &r.archive,
             Retry::Test(r) => &r.archive,
@@ -714,7 +722,9 @@ impl Retry {
                 )
             }
             Retry::Open(r) => format!("{} in {archive} is encrypted.", r.name),
-            Retry::Extract(_) | Retry::Test(_) => format!("{archive} is encrypted."),
+            Retry::Extract(_) | Retry::Test(_) | Retry::Out { .. } => {
+                format!("{archive} is encrypted.")
+            }
             Retry::Update(r) if r.confirm_password => format!(
                 "{archive} has encrypted folders but no encrypted file to check a password \
                  against. Choose the password for the new files (AES-256)."
@@ -771,6 +781,8 @@ pub struct ArchiveUi {
     pub copied: Option<crate::archive_edit::ArchiveCopy>,
     /// Temp copies of small images for thumbnails and the preview.
     pub materialize: Materialize,
+    /// Archive items offered to other apps (see `archive_out`).
+    pub out: crate::archive_out::OutState,
     pub(crate) tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -785,6 +797,7 @@ impl Default for ArchiveUi {
             extract: Default::default(),
             copied: None,
             materialize: Materialize::default(),
+            out: Default::default(),
             tx,
             rx,
         }
@@ -975,6 +988,7 @@ fn run_retry(app: &mut ZxrawApp, retry: Retry) {
         Retry::Extract(r) => crate::archive_extract::start_extract(app, r),
         Retry::Test(r) => crate::archive_extract::start_test(app, r),
         Retry::Update(r) => crate::archive_edit::start_update(app, r),
+        Retry::Out { then, .. } => crate::archive_out::password_ready(app, then),
     }
 }
 
