@@ -690,6 +690,20 @@ pub struct ExtractReport {
     pub created_dest: bool,
 }
 
+/// List for a job: cancel stops a long listing (a compressed tar is decoded to its end);
+/// its progress is not counted as the job's.
+fn list_cancellable(
+    backend: &dyn ArchiveBackend,
+    archive: &Path,
+    max_entries: usize,
+    password: Option<&Password>,
+    ctx: &JobCtx<'_>,
+) -> Result<ArchiveListing> {
+    let quiet = forge_jobs::Progress::default();
+    let only_cancel = JobCtx::new(ctx.cancel, &quiet);
+    backend.list_progress(archive, max_entries, password, Some(&only_cancel))
+}
+
 struct Planned {
     entry: ArchiveEntry,
     rel: PathBuf,
@@ -723,7 +737,7 @@ pub fn extract(
     }
     let backend = backend_for_file(archive)?;
     let limits = &opts.limits;
-    let listing = backend.list(archive, limits.max_entries, opts.password.as_ref())?;
+    let listing = list_cancellable(backend, archive, limits.max_entries, opts.password.as_ref(), ctx)?;
     let mut report = ExtractReport {
         dest: dest_dir.to_path_buf(),
         ..Default::default()
@@ -892,6 +906,15 @@ pub fn extract(
         ctx.cancel.check()?;
         let p = &planned[by_index[&entry.index]];
         ctx.progress.add_items(1);
+        // Read from a listing of the archive made again (it changed since it was checked):
+        // never under another entry's name.
+        if entry.name != p.entry.name || entry.size != p.entry.size {
+            report.failed.push(OpIssue::new(
+                &p.rel,
+                "the archive changed while it was extracted",
+            ));
+            return Ok(());
+        }
         ctx.progress.set_current(entry.name.clone());
         let target = root.join(&p.rel);
         let parent_rel = if p.entry.is_dir {
@@ -1285,7 +1308,13 @@ pub fn extract_to(
     ctx: &JobCtx<'_>,
 ) -> Result<ExtractReport> {
     let backend = backend_for_file(archive)?;
-    let listing = backend.list(archive, opts.limits.max_entries, opts.password.as_ref())?;
+    let listing = list_cancellable(
+        backend,
+        archive,
+        opts.limits.max_entries,
+        opts.password.as_ref(),
+        ctx,
+    )?;
     let nest = match target {
         ExtractTarget::NamedFolder => true,
         ExtractTarget::Smart => matches!(top_level(&listing), TopLevel::Many),
@@ -1414,7 +1443,7 @@ pub fn test_archive(
     ctx: &JobCtx<'_>,
 ) -> Result<TestReport> {
     let backend = backend_for_file(archive)?;
-    let listing = backend.list(archive, limits.max_entries, password)?;
+    let listing = list_cancellable(backend, archive, limits.max_entries, password, ctx)?;
     let files: Vec<&ArchiveEntry> = listing
         .entries
         .iter()

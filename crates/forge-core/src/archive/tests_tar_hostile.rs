@@ -318,10 +318,28 @@ fn numbers_are_checked() {
             .raw(header(b"h.txt", b'0', 0, b256(&huge)), b"")
             .end(),
     );
+    // A member past the total limit stops the walk before its data would be skipped (or,
+    // through a compressor, decoded).
     let err = list(&p).unwrap_err();
-    assert!(err.to_string().contains("truncated"), "{err}");
-    // Through gzip it can't be seeked over: the end of the stream says truncated too.
+    assert!(err.to_string().contains("expands to more than"), "{err}");
     let p = write(d.path(), "huge.tar.gz", &gz(&fs::read(&p).unwrap()));
+    assert!(
+        list(&p)
+            .unwrap_err()
+            .to_string()
+            .contains("expands to more than")
+    );
+    // Within the limit but past the data: truncated.
+    let mut big = [0u8; 12];
+    big[0] = 0x80;
+    big[8] = 0x01; // 4 GiB
+    let p = write(
+        d.path(),
+        "big.tar",
+        &Tar::default()
+            .raw(header(b"b.txt", b'0', 0, b256(&big)), b"")
+            .end(),
+    );
     assert!(list(&p).unwrap_err().to_string().contains("truncated"));
 }
 
@@ -590,4 +608,77 @@ fn hostile_gzip_names_are_not_used() {
         try_extract(&p, &x, ExtractLimits::default()).unwrap();
         assert_eq!(fs::read(x.join(want)).unwrap(), b"payload");
     }
+}
+
+#[test]
+fn a_checksum_counts_only_when_every_frame_has_one() {
+    let d = tempfile::tempdir().unwrap();
+    let tar = Tar::default().file("a.txt", &[b'a'; 3000]).end();
+    // First frame with a checksum (one block of the tar), the rest without.
+    let mut first = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    first.include_checksum(true).unwrap();
+    first.write_all(&tar[..512]).unwrap();
+    let mut bytes = first.finish().unwrap();
+    let mut rest = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    rest.include_checksum(false).unwrap();
+    rest.write_all(&tar[512..]).unwrap();
+    bytes.extend(rest.finish().unwrap());
+    let p = write(d.path(), "mixed.tar.zst", &bytes);
+    let l = list(&p).unwrap();
+    let a = &l.entries[0];
+    assert!(!a.checked_by_block && a.unchecked, "{a:?}");
+    // Both frames checked: checked.
+    let mut all = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    all.include_checksum(true).unwrap();
+    all.write_all(&tar[..512]).unwrap();
+    let mut bytes = all.finish().unwrap();
+    let mut all = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    all.include_checksum(true).unwrap();
+    all.write_all(&tar[512..]).unwrap();
+    bytes.extend(all.finish().unwrap());
+    let p = write(d.path(), "both.tar.zst", &bytes);
+    assert!(list(&p).unwrap().entries[0].checked_by_block);
+    // xz: a second stream without a check.
+    let xz = |data: &[u8], check: lzma_rust2::CheckType| {
+        let mut o = lzma_rust2::XzOptions::with_preset(1);
+        o.set_check_sum_type(check);
+        let mut w = lzma_rust2::XzWriter::new(Vec::new(), o).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap()
+    };
+    let mut bytes = xz(&tar[..512], lzma_rust2::CheckType::Crc64);
+    bytes.extend(xz(&tar[512..], lzma_rust2::CheckType::None));
+    let p = write(d.path(), "mixed.tar.xz", &bytes);
+    assert!(!list(&p).unwrap().entries[0].checked_by_block);
+    let mut bytes = xz(&tar[..512], lzma_rust2::CheckType::Crc64);
+    bytes.extend([0u8; 8]); // stream padding
+    bytes.extend(xz(&tar[512..], lzma_rust2::CheckType::Crc32));
+    let p = write(d.path(), "both.tar.xz", &bytes);
+    assert!(list(&p).unwrap().entries[0].checked_by_block);
+}
+
+#[test]
+fn a_volume_label_with_data_survives_an_edit() {
+    let d = tempfile::tempdir().unwrap();
+    let label = vec![b'L'; 600];
+    let tar = Tar::default()
+        .raw(
+            header(b"MY VOLUME", b'V', label.len() as u64, |_| {}),
+            &label,
+        )
+        .file("keep.txt", b"keep")
+        .file("drop.txt", b"drop")
+        .end();
+    let p = write(d.path(), "label.tar", &tar);
+    assert_eq!(names_of(&list(&p).unwrap()), ["drop.txt", "keep.txt"]);
+    let (c, pr) = (CancelToken::new(), Progress::default());
+    let edit = ArchiveEdit {
+        add: vec![],
+        delete: vec!["drop.txt".into()],
+    };
+    update(&p, &edit, &CreateOptions::default(), &JobCtx::new(&c, &pr)).unwrap();
+    assert_eq!(names_of(&list(&p).unwrap()), ["keep.txt"]);
+    let x = dest(d.path());
+    try_extract(&p, &x, ExtractLimits::default()).unwrap();
+    assert_eq!(fs::read(x.join("keep.txt")).unwrap(), b"keep");
 }

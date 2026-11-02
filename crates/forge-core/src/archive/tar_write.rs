@@ -8,8 +8,9 @@
 //! Editing rewrites the whole archive into a temp file next to it: kept members are copied
 //! as they are (headers and data, nothing re-encoded but the compression), then new files
 //! are appended, and the stream is compressed again. The original is decoded to its end
-//! first so a damaged one is never rewritten with a fresh checksum. The temp file replaces
-//! the original only when complete; a cancelled or failed edit leaves it untouched.
+//! first, so a damaged one (when it has a checksum) is never rewritten with a fresh one. The
+//! temp file replaces the original only when complete; a cancelled or failed edit leaves it
+//! untouched.
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -196,7 +197,7 @@ fn ustar_split(name: &str) -> Option<(&str, &str)> {
     // The prefix ends at a '/' (not stored), as far right as the name part allows.
     name.char_indices()
         .rev()
-        .find(|&(i, c)| c == '/' && i <= 155 && name.len() - i - 1 <= 100 && i > 0)
+        .find(|&(i, c)| c == '/' && i > 0 && i <= 155 && (1..=100).contains(&(name.len() - i - 1)))
         .map(|(i, _)| (&name[..i], &name[i + 1..]))
 }
 
@@ -827,6 +828,9 @@ mod tests {
         let long = format!("{}/{}", "d".repeat(120), "f".repeat(90));
         assert_eq!(ustar_split(&long), Some((&long[..120], &long[121..])));
         assert_eq!(ustar_split("café"), None);
+        // A long folder name never leaves the name field empty.
+        let dir = format!("{}/", "d".repeat(120));
+        assert_eq!(ustar_split(&dir), None);
         assert_eq!(ustar_split(&"x".repeat(101)), None);
         let h = member_headers("café/ü.txt", false, 5, None);
         assert_eq!(h.len(), 512 * 3);

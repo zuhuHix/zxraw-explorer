@@ -28,6 +28,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   written without waiting. Thumbnails need the whole stream decoded, so they're made for
   compressed tars of up to 64 MB only. A truncated or damaged compressed tar can't be listed at
   all, so nothing can be salvaged from it here.
+* A sparse file counts its holes in its size: one whose size is over 1,000 times the data it
+  stores is refused as a compression bomb, like any other entry.
 * A plain `.tar` has no checksum: *Test archive* reports its files as "can't be verified".
   Brotli streams have none either; Zstandard and LZ4 streams written without one, likewise.
 * A single compressed file's size comes from the xz index or the Zstandard frame headers when

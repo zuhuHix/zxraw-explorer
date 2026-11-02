@@ -97,10 +97,11 @@ pub(super) fn stream_err(path: &Path, e: io::Error) -> CoreError {
     }
 }
 
-/// Reads the archive file, counting progress and checking for cancel.
+/// Reads the archive file, checking for cancel and (when `count`) counting progress.
 struct Watched<'c, R> {
     inner: R,
     ctx: Option<&'c JobCtx<'c>>,
+    count: bool,
 }
 
 impl<R: Read> Read for Watched<'_, R> {
@@ -111,7 +112,7 @@ impl<R: Read> Read for Watched<'_, R> {
             return Err(io::Error::other(Cancelled));
         }
         let n = self.inner.read(buf)?;
-        if let Some(ctx) = self.ctx {
+        if let Some(ctx) = self.ctx.filter(|_| self.count) {
             ctx.progress.add_bytes(n as u64);
         }
         Ok(n)
@@ -244,6 +245,7 @@ fn walk(
             max_entries,
         );
         while let Some(m) = p.next_member().map_err(err)? {
+            check_total(archive, &m)?;
             if let Some(ctx) = ctx {
                 ctx.cancel.check()?;
                 ctx.progress.add_bytes(m.end.saturating_sub(m.start));
@@ -253,16 +255,16 @@ fn walk(
         // Past the end marker: padding, or anything (nothing reads it).
         (file_size, false)
     } else {
-        let mut head = [0u8; 16];
-        let n = read_head(archive, &mut head)?;
-        let checksum = codec::stream_has_checksum(codec, &head[..n]);
+        let checksum = codec::every_frame_checked(codec, archive);
         let watched = Watched {
             inner: BufReader::with_capacity(256 * 1024, file),
             ctx,
+            count: true,
         };
         let dec = codec::decoder(codec, watched, decoder_memory(None)).map_err(err)?;
         let mut p = TarParser::new(dec, max_entries);
         while let Some(m) = p.next_member().map_err(err)? {
+            check_total(archive, &m)?;
             members.push(m);
         }
         let tar_end = p.pos();
@@ -279,6 +281,19 @@ fn walk(
         decoded,
         file_size,
     })
+}
+
+/// A member ending past the extraction limit's total stops the walk: skipping its data
+/// would decode that much.
+fn check_total(archive: &Path, m: &Member) -> Result<()> {
+    let max = ExtractLimits::default().max_total_bytes;
+    if m.end > max {
+        return Err(CoreError::UnsafePath(format!(
+            "{}: the archive expands to more than {max} bytes",
+            paths::display_path(archive)
+        )));
+    }
+    Ok(())
 }
 
 fn read_head(archive: &Path, head: &mut [u8]) -> Result<usize> {
@@ -441,9 +456,12 @@ fn read_tar(
     let last = picked.last().map_or(0, |e| e.index);
     let by_member: HashMap<usize, &ArchiveEntry> = picked.iter().map(|e| (e.index, *e)).collect();
     let file = File::open(archive).map_err(|e| CoreError::io(archive, e))?;
+    // Cancel is checked while unwanted members are decoded and skipped; the visitor counts
+    // the progress of what it reads.
     let watched = Watched {
         inner: BufReader::with_capacity(256 * 1024, file),
-        ctx: None,
+        ctx,
+        count: false,
     };
     let dec = codec::decoder(s.codec, watched, decoder_memory(None)).map_err(err)?;
     let mut p = TarParser::new(dec, s.members.len());
@@ -598,7 +616,12 @@ impl ArchiveBackend for TarBackend {
         ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()> {
-        let s = scan(archive, self.codec, usize::MAX, None)?;
+        let s = scan(
+            archive,
+            self.codec,
+            super::DEFAULT_MAX_ARCHIVE_ENTRIES,
+            None,
+        )?;
         read_tar(archive, &s, wanted, ctx, visit, &mut |_| Ok(()))
     }
 
@@ -611,7 +634,12 @@ impl ArchiveBackend for TarBackend {
         visit: &mut EntryVisitor<'_>,
         block_end: &mut BlockEnd<'_>,
     ) -> Result<()> {
-        let s = scan(archive, self.codec, usize::MAX, None)?;
+        let s = scan(
+            archive,
+            self.codec,
+            super::DEFAULT_MAX_ARCHIVE_ENTRIES,
+            None,
+        )?;
         read_tar(archive, &s, wanted, ctx, visit, block_end)
     }
 
@@ -690,86 +718,8 @@ fn single_name(archive: &Path, head: &[u8]) -> String {
 }
 
 /// The exact size a Zstandard file states in its frame headers, if every frame states one.
-/// Only headers are read (blocks are skipped by their sizes).
 fn zstd_declared_size(archive: &Path) -> Option<u64> {
-    let mut f = BufReader::new(File::open(archive).ok()?);
-    let len = f.get_ref().metadata().ok()?.len();
-    let mut pos = 0u64;
-    let mut total = 0u64;
-    let mut frames = 0;
-    while pos < len {
-        frames += 1;
-        if frames > 1_000_000 {
-            return None;
-        }
-        let mut magic = [0u8; 4];
-        f.read_exact(&mut magic).ok()?;
-        let m = u32::from_le_bytes(magic);
-        if (0x184d_2a50..=0x184d_2a5f).contains(&m) {
-            // Skippable frame.
-            let mut sz = [0u8; 4];
-            f.read_exact(&mut sz).ok()?;
-            let n = u64::from(u32::from_le_bytes(sz));
-            f.seek_relative(i64::try_from(n).ok()?).ok()?;
-            pos = pos.checked_add(8 + n)?;
-            continue;
-        }
-        if m != 0xfd2f_b528 {
-            return None;
-        }
-        let mut fhd = [0u8; 1];
-        f.read_exact(&mut fhd).ok()?;
-        let fhd = fhd[0];
-        let fcs_flag = fhd >> 6;
-        let single = fhd & 0x20 != 0;
-        let checksum = fhd & 0x04 != 0;
-        let dict = match fhd & 3 {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            _ => 4,
-        };
-        let fcs_len = match (fcs_flag, single) {
-            (0, false) => return None, // size not stated
-            (0, true) => 1,
-            (1, _) => 2,
-            (2, _) => 4,
-            _ => 8,
-        };
-        let mut skip = vec![0u8; usize::from(!single) + dict];
-        f.read_exact(&mut skip).ok()?;
-        let mut fcs = [0u8; 8];
-        f.read_exact(&mut fcs[..fcs_len]).ok()?;
-        let mut size = u64::from_le_bytes(fcs);
-        if fcs_len == 2 {
-            size += 256;
-        }
-        total = total.checked_add(size)?;
-        pos = pos.checked_add(4 + 1 + skip.len() as u64 + fcs_len as u64)?;
-        loop {
-            let mut bh = [0u8; 3];
-            f.read_exact(&mut bh).ok()?;
-            let h = u32::from(bh[0]) | u32::from(bh[1]) << 8 | u32::from(bh[2]) << 16;
-            let last = h & 1 != 0;
-            let kind = (h >> 1) & 3;
-            let size = u64::from(h >> 3);
-            let stored = match kind {
-                0 | 2 => size,
-                1 => 1,
-                _ => return None,
-            };
-            f.seek_relative(i64::try_from(stored).ok()?).ok()?;
-            pos = pos.checked_add(3 + stored)?;
-            if last {
-                break;
-            }
-        }
-        if checksum {
-            f.seek_relative(4).ok()?;
-            pos = pos.checked_add(4)?;
-        }
-    }
-    (pos == len).then_some(total)
+    codec::zstd_frames(archive)?.size
 }
 
 /// What a single compressed file holds, cached like tar listings.
@@ -810,6 +760,7 @@ pub(super) fn single_scan(
             let watched = Watched {
                 inner: BufReader::with_capacity(256 * 1024, file),
                 ctx,
+                count: true,
             };
             let mut dec = codec::decoder(codec, watched, decoder_memory(None))
                 .map_err(|e| stream_err(archive, e))?;
@@ -817,7 +768,7 @@ pub(super) fn single_scan(
                 .map_err(|e| stream_err(archive, e))?
         }
     };
-    let checksum = codec::stream_has_checksum(codec, head);
+    let checksum = codec::every_frame_checked(codec, archive);
     let name = single_name(archive, head);
     let entry = ArchiveEntry {
         index: 0,
