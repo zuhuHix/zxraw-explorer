@@ -578,6 +578,10 @@ pub fn extract(
         check_password(backend, archive, first.entry.index, password)?;
     }
     backend.preflight(archive, &indices, password, limits)?;
+    // The destination, resolved and pinned from the volume root for the whole job; entries
+    // are written beneath its final path and reported beneath `dest_dir`.
+    let base = safety::PinnedBase::open(dest_dir)?;
+    let root = base.root();
     let zone = if opts.mark_of_the_web {
         motw::read_zone(archive)
     } else {
@@ -599,17 +603,22 @@ pub fn extract(
         let p = &planned[by_index[&entry.index]];
         ctx.progress.add_items(1);
         ctx.progress.set_current(entry.name.clone());
-        let target = dest_dir.join(&p.rel);
+        let target = root.join(&p.rel);
+        // What reports show: the same item beneath the destination as the user named it.
+        let shown = |path: &Path| match path.strip_prefix(root) {
+            Ok(rel) => dest_dir.join(rel),
+            Err(_) => path.to_path_buf(),
+        };
         let parent_rel = if p.entry.is_dir {
             p.rel.as_path()
         } else {
             p.rel.parent().unwrap_or(Path::new(""))
         };
         // Held until the entry is in place: the folders it is written into can't be swapped.
-        let _pinned = match safety::pin_dirs(dest_dir, parent_rel) {
+        let _pinned = match safety::pin_dirs(&base, parent_rel) {
             Ok(pinned) => pinned,
             Err(e) => {
-                report.failed.push(OpIssue::new(&target, e.to_string()));
+                report.failed.push(OpIssue::new(shown(&target), e.to_string()));
                 return Ok(());
             }
         };
@@ -619,7 +628,7 @@ pub fn extract(
         let reader = match reader {
             Ok(r) => r,
             Err(e) => {
-                report.failed.push(OpIssue::new(&target, e.to_string()));
+                report.failed.push(OpIssue::new(shown(&target), e.to_string()));
                 ctx.progress.add_bytes(p.entry.size);
                 return Ok(());
             }
@@ -628,7 +637,7 @@ pub fn extract(
             Err(_) => (target, false, false),
             Ok(md) if node_kind(&md) != NodeKind::File => {
                 report.failed.push(OpIssue::new(
-                    &target,
+                    shown(&target),
                     "a folder or link with this name exists",
                 ));
                 return Ok(());
@@ -638,7 +647,9 @@ pub fn extract(
                 // The name is re-checked at publish time; a racing file gets the next name.
                 ConflictPolicy::KeepBoth => (target, false, true),
                 _ => {
-                    report.skipped.push(OpIssue::new(&target, "already exists"));
+                    report
+                        .skipped
+                        .push(OpIssue::new(shown(&target), "already exists"));
                     ctx.progress.add_bytes(p.entry.size);
                     return Ok(());
                 }
@@ -662,14 +673,14 @@ pub fn extract(
                 {
                     tracing::warn!("could not mark {} as downloaded: {e}", placed.display());
                 }
-                report.extracted.push(placed);
+                report.extracted.push(shown(&placed));
                 Ok(())
             }
             Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
             Err(e) => {
                 report
                     .failed
-                    .push(OpIssue::new(&dest, data_error(&p.entry, e)));
+                    .push(OpIssue::new(shown(&dest), data_error(&p.entry, e)));
                 Ok(())
             }
         }

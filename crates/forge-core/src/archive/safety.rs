@@ -41,22 +41,56 @@ pub fn collision_key(rel: &Path) -> String {
     paths::to_slash(rel).to_lowercase()
 }
 
-/// Folders of the destination held open from the base down to the folder an entry is
-/// written into. Each one was opened without following reparse points and checked by
-/// handle to be a real folder; the handles deny `FILE_SHARE_DELETE`, so while this lives
-/// none of them can be renamed, deleted or replaced by a junction, and a path through
-/// them (the temp file, its rename into place) resolves to the folders that were checked.
+/// Folders held open so they can't change under a write: each one was opened without
+/// following reparse points and checked by handle to be a real folder, and the handles deny
+/// `FILE_SHARE_DELETE`, so while they live none of them can be renamed, deleted or replaced
+/// by a junction, and a path through them resolves to the folders that were checked.
 pub(crate) struct PinnedDirs {
     #[allow(dead_code)] // held for their effect
     handles: Vec<fs::File>,
 }
 
+/// An extraction destination pinned for a whole job: resolved once to its final path
+/// (through any junction, subst or mapped drive the user's path legitimately goes through),
+/// then every folder of that real path, from the volume root down, pinned (see
+/// [`PinnedDirs`]). Entries are written beneath [`PinnedBase::root`]; per entry only the
+/// folders below it are pinned ([`pin_dirs`]).
+pub(crate) struct PinnedBase {
+    root: PathBuf,
+    _chain: PinnedDirs,
+}
+
+impl PinnedBase {
+    pub(crate) fn open(dest: &Path) -> Result<Self> {
+        let root = fs::canonicalize(dest).map_err(|e| CoreError::io(dest, e))?;
+        let mut handles = Vec::new();
+        let mut cur = PathBuf::new();
+        for c in root.components() {
+            cur.push(c);
+            // The prefix alone (`\\?\C:`) is not a folder; the root after it is.
+            if matches!(c, std::path::Component::Prefix(_)) {
+                continue;
+            }
+            handles.push(open_pinned(&cur)?);
+        }
+        Ok(Self {
+            root,
+            _chain: PinnedDirs { handles },
+        })
+    }
+
+    /// The destination's final path, which entries are written beneath.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
 /// Create `base/rel` one component at a time, refusing to pass through links, junctions
-/// or files, and return the chain pinned (see [`PinnedDirs`]). Keep it alive while
-/// anything is written beneath.
-pub(crate) fn pin_dirs(base: &Path, rel: &Path) -> Result<PinnedDirs> {
-    let mut handles = vec![open_pinned(base)?];
-    let mut cur = base.to_path_buf();
+/// or files, and return the folders below `base` pinned (see [`PinnedDirs`]); `base` itself
+/// is pinned by its [`PinnedBase`]. Keep it alive while anything is written beneath.
+pub(crate) fn pin_dirs(base: &PinnedBase, rel: &Path) -> Result<PinnedDirs> {
+    let mut handles = Vec::new();
+    let mut cur = base.root().to_path_buf();
     for c in rel.components() {
         cur.push(c);
         match fs::symlink_metadata(&cur) {
@@ -315,17 +349,21 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let base = d.path().join("dest");
         fs::create_dir(&base).unwrap();
-        let pinned = pin_dirs(&base, Path::new("a/b")).unwrap();
+        let pinned_base = PinnedBase::open(&base).unwrap();
+        let pinned = pin_dirs(&pinned_base, Path::new("a/b")).unwrap();
         // Neither a folder of the chain nor the base can be renamed or removed, so none can
         // be replaced by a junction while an entry is written beneath them.
         assert!(fs::rename(base.join("a"), d.path().join("moved")).is_err());
         assert!(fs::rename(base.join("a/b"), base.join("a/c")).is_err());
         assert!(fs::remove_dir(base.join("a/b")).is_err());
         assert!(fs::rename(&base, d.path().join("dest2")).is_err());
+        // Nor can any folder above the destination, up to the volume root.
+        assert!(fs::rename(d.path(), d.path().with_extension("moved")).is_err());
         // Writing beneath them still works.
         fs::write(base.join("a/b/x.txt"), b"x").unwrap();
         fs::rename(base.join("a/b/x.txt"), base.join("a/b/y.txt")).unwrap();
         drop(pinned);
+        drop(pinned_base);
         fs::remove_file(base.join("a/b/y.txt")).unwrap();
         fs::rename(base.join("a"), d.path().join("moved")).unwrap();
 
@@ -342,7 +380,10 @@ mod tests {
             eprintln!("mklink unavailable; skipping the junction assertion");
             return;
         }
-        let err = pin_dirs(&base, Path::new("j/sub")).err().expect("refused");
+        let pinned_base = PinnedBase::open(&base).unwrap();
+        let err = pin_dirs(&pinned_base, Path::new("j/sub"))
+            .err()
+            .expect("refused");
         assert!(matches!(err, CoreError::UnsafePath(_)), "{err:?}");
         assert!(!outside.join("sub").exists());
     }
