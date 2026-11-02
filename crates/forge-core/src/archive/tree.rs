@@ -22,9 +22,18 @@ pub struct ArchiveNode {
     pub method: String,
     /// The listing entry, if the node has one (implied folders don't).
     pub entry: Option<usize>,
+    /// A file sharing a solid 7z block with others: `compressed_size` is its share.
+    pub solid: bool,
+    /// Bytes decoded before this file's data in its block (see `ArchiveEntry`).
+    pub block_offset: u64,
 }
 
 impl ArchiveNode {
+    /// Bytes decoded to read this file: its block up to it, then its own data.
+    pub fn decode_cost(&self) -> u64 {
+        self.block_offset.saturating_add(self.size)
+    }
+
     /// `compressed / size` in percent, for files with data.
     pub fn ratio_percent(&self) -> Option<u32> {
         (self.size > 0)
@@ -123,6 +132,8 @@ impl ArchiveIndex {
                 e.method.clone()
             },
             entry: Some(entry),
+            solid: e.solid && !e.is_dir,
+            block_offset: e.block_offset,
         });
         self.by_path.insert(key.clone(), n);
         if e.is_dir {
@@ -149,6 +160,8 @@ impl ArchiveIndex {
             encrypted: false,
             method: String::new(),
             entry: None,
+            solid: false,
+            block_offset: 0,
         });
         self.by_path.insert(key.clone(), n);
         self.children.entry(key.clone()).or_default();

@@ -40,7 +40,9 @@ const MT_MEMORY_BUDGET: u64 = 1536 << 20;
 const AES_CYCLES_POWER: u8 = 19;
 
 /// Executables, for the x86 BCJ filter.
-const EXECUTABLE: &[&str] = &["exe", "dll", "sys", "ocx", "scr", "cpl", "efi", "drv", "com"];
+const EXECUTABLE: &[&str] = &[
+    "exe", "dll", "sys", "ocx", "scr", "cpl", "efi", "drv", "com",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -339,7 +341,11 @@ fn write_err(out: &Path, e: sz::Error, ctx: &JobCtx<'_>) -> CoreError {
         sz::Error::Io(e, what) => CoreError::Invalid(format!(
             "{}: {e}{}",
             paths::display_path(out),
-            if what.is_empty() { String::new() } else { format!(" ({what})") }
+            if what.is_empty() {
+                String::new()
+            } else {
+                format!(" ({what})")
+            }
         )),
         other => sz_err(out, other, false),
     }
@@ -433,7 +439,11 @@ fn write_new(
     }
     // Like 7-Zip: by kind, then extension, then name, so similar files share a block.
     planned.sort_by(|a, b| {
-        (a.kind, &a.ext, a.item.name.to_lowercase()).cmp(&(b.kind, &b.ext, b.item.name.to_lowercase()))
+        (a.kind, &a.ext, a.item.name.to_lowercase()).cmp(&(
+            b.kind,
+            &b.ext,
+            b.item.name.to_lowercase(),
+        ))
     });
     let limit = methods.solid_block(opts);
     let mut i = 0;
@@ -492,7 +502,15 @@ pub(super) fn create(
     let (mut w, tmp, mut guard) = start(out, ctx)?;
     let mut names = HashSet::new();
     write_new(
-        &mut w, items, &mut names, &methods, opts, ctx, &mut report, out, &tmp,
+        &mut w,
+        items,
+        &mut names,
+        &methods,
+        opts,
+        ctx,
+        &mut report,
+        out,
+        &tmp,
     )?;
     finish(
         w,
@@ -675,7 +693,10 @@ pub(super) fn update(
         .filter(|(_, t)| **t)
         .map(|(b, _)| b.unpack_size)
         .sum();
-    if recompress > 0 && blocks.iter().zip(&touched).any(|(b, t)| *t && b.encrypted) && password.is_none() {
+    if recompress > 0
+        && blocks.iter().zip(&touched).any(|(b, t)| *t && b.encrypted)
+        && password.is_none()
+    {
         return Err(CoreError::PasswordRequired(paths::display_path(archive)));
     }
     let methods = Methods::new(opts, password);
@@ -712,7 +733,9 @@ pub(super) fn update(
             if info.files == 0 && info.pack_size == 0 {
                 continue;
             }
-            let Opened { archive: a, file, .. } = &mut o;
+            let Opened {
+                archive: a, file, ..
+            } = &mut o;
             w.push_raw_block(a, b, file, |e| e.name.clone())
                 .map_err(|e| write_err(archive, e, ctx))?;
             ctx.progress.add_bytes(info.pack_size);
@@ -739,7 +762,8 @@ pub(super) fn update(
                 spill.insert(BufWriter::with_capacity(1 << 20, f))
             }
         };
-        sp.seek(SeekFrom::Start(0)).map_err(|e| CoreError::io(&spill_path, e))?;
+        sp.seek(SeekFrom::Start(0))
+            .map_err(|e| CoreError::io(&spill_path, e))?;
         let mut pos = 0u64;
         let kept = spill_block(archive, &mut o, b, &keep, sp, &mut pos, info.encrypted, ctx)?;
         sp.flush().map_err(|e| CoreError::io(&spill_path, e))?;

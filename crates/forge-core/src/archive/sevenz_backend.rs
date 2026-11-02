@@ -93,7 +93,10 @@ pub(super) fn sz_err(path: &Path, e: sz::Error, encrypted: bool) -> CoreError {
         sz::Error::ChecksumVerificationFailed if encrypted => CoreError::WrongPassword(label()),
         sz::Error::Io(e, _) | sz::Error::FileOpen(e, _) => {
             // Data errors from the decoders come wrapped in `io::Error`.
-            match e.get_ref().and_then(|inner| inner.downcast_ref::<sz::Error>()) {
+            match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<sz::Error>())
+            {
                 Some(sz::Error::ChecksumVerificationFailed) if encrypted => {
                     CoreError::WrongPassword(label())
                 }
@@ -137,7 +140,10 @@ struct Friendly<R>(R);
 impl<R: Read> Read for Friendly<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf).map_err(|e| {
-            let text = match e.get_ref().and_then(|inner| inner.downcast_ref::<sz::Error>()) {
+            let text = match e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<sz::Error>())
+            {
                 Some(sz::Error::ChecksumVerificationFailed) => "CRC mismatch".to_owned(),
                 Some(inner) => describe(inner),
                 None => return e,
@@ -438,7 +444,13 @@ impl SevenZipBackend {
         // The wanted files with data of each block, in order.
         let mut wanted_by_block: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
         for (i, f) in o.archive.files.iter().enumerate() {
-            if let Some(b) = o.archive.stream_map.file_block_index.get(i).copied().flatten()
+            if let Some(b) = o
+                .archive
+                .stream_map
+                .file_block_index
+                .get(i)
+                .copied()
+                .flatten()
                 && has_data(f)
                 && entries.get(i).and_then(Option::as_ref).is_some_and(wanted)
                 && let Some(list) = wanted_by_block.get_mut(b)
@@ -577,7 +589,10 @@ impl ArchiveBackend for SevenZipBackend {
         let o = open(archive, password, max_entries)?;
         Ok(ArchiveListing {
             format: ArchiveFormat::SevenZip,
-            entries: entries_of(archive, &o.archive).into_iter().flatten().collect(),
+            entries: entries_of(archive, &o.archive)
+                .into_iter()
+                .flatten()
+                .collect(),
             comment: String::new(),
         })
     }
@@ -663,7 +678,14 @@ impl ArchiveBackend for SevenZipBackend {
         let mut blocks: Vec<usize> = entries
             .iter()
             .filter(|e| e.encrypted && !e.is_dir && e.size > 0)
-            .filter_map(|e| o.archive.stream_map.file_block_index.get(e.index).copied().flatten())
+            .filter_map(|e| {
+                o.archive
+                    .stream_map
+                    .file_block_index
+                    .get(e.index)
+                    .copied()
+                    .flatten()
+            })
             .collect();
         blocks.sort_unstable();
         blocks.dedup();

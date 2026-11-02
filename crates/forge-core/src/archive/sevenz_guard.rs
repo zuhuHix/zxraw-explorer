@@ -114,7 +114,10 @@ pub(super) fn check(
     if start_crc == 0 && sig[12..].iter().all(|&b| b == 0) {
         // An archive whose writer never finished: 7-Zip searches for a header near the end;
         // we don't guess.
-        return Err(damaged(archive, "incomplete archive: its header was never written"));
+        return Err(damaged(
+            archive,
+            "incomplete archive: its header was never written",
+        ));
     }
     if crc32(&sig[12..]) != start_crc {
         return Err(damaged(archive, "start header checksum mismatch"));
@@ -345,7 +348,9 @@ fn read_folder(r: &mut Cursor<'_>) -> Walk<FolderInfo> {
     for _ in 0..num_coders {
         let flags = r.byte()?;
         if flags & 0x80 != 0 {
-            return Err(WalkError::Damaged("alternative coder methods are not supported"));
+            return Err(WalkError::Damaged(
+                "alternative coder methods are not supported",
+            ));
         }
         let id = r.bytes(u64::from(flags & 0x0F))?.to_vec();
         let (num_in, num_out) = if flags & 0x10 != 0 {
@@ -356,7 +361,9 @@ fn read_folder(r: &mut Cursor<'_>) -> Walk<FolderInfo> {
             (1, 1)
         };
         if num_in == 0 || num_out != 1 {
-            return Err(WalkError::Damaged("coder with an unsupported stream layout"));
+            return Err(WalkError::Damaged(
+                "coder with an unsupported stream layout",
+            ));
         }
         let props = if flags & 0x20 != 0 {
             let n = r.count(MAX_PROPS, 8, "bytes of coder properties")?;
@@ -691,7 +698,11 @@ fn decode_header(
                     .map_err(|e| e.unwrap_or_else(|| damaged(archive, "bad AES properties")))?
             }
             ID_LZMA => {
-                let props = coder.props.first().copied().ok_or_else(|| fail("bad LZMA"))?;
+                let props = coder
+                    .props
+                    .first()
+                    .copied()
+                    .ok_or_else(|| fail("bad LZMA"))?;
                 let dict = decoder_memory(ID_LZMA, &coder.props).ok_or_else(|| fail("bad LZMA"))?;
                 let reader = lzma_rust2::LzmaReader::new_with_props(
                     &data[..],
@@ -804,4 +815,3 @@ fn aes_decrypt(
 pub(super) fn crc32(data: &[u8]) -> u32 {
     crc32fast::hash(data)
 }
-

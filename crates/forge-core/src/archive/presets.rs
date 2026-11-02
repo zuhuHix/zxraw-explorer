@@ -54,7 +54,9 @@ impl Preset {
     pub fn for_format(format: ArchiveFormat) -> &'static [Preset] {
         match format {
             ArchiveFormat::Zip => &Preset::ALL,
-            ArchiveFormat::SevenZip => &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra],
+            ArchiveFormat::SevenZip => {
+                &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra]
+            }
         }
     }
 
@@ -329,7 +331,11 @@ mod tests {
         assert!(Preset::Max.sevenzip().compress_memory < 1 << 30);
         assert!(Preset::Ultra.is_advanced());
         assert_eq!(Preset::Zstd.for_sevenzip(), Preset::Balanced);
-        assert!(Preset::Fast.estimate_for(ArchiveFormat::SevenZip).contains("MB"));
+        assert!(
+            Preset::Fast
+                .estimate_for(ArchiveFormat::SevenZip)
+                .contains("MB")
+        );
     }
 
     #[test]
