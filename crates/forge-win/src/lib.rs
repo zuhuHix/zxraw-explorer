@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+pub mod archive_menu;
 mod clipboard;
 #[cfg(all(test, windows))]
 mod clipboard_test_support;
@@ -41,6 +42,7 @@ pub mod recycle;
 pub mod restart;
 pub mod shell;
 pub mod shell_notify;
+pub mod shell_verb_server;
 pub mod single_instance;
 mod user_choice;
 pub mod virtual_files;
@@ -53,10 +55,16 @@ pub use clipboard::{
     clipboard_sequence, get_files, get_files_and_owner, is_paste_keydown, replace_files_if_token, set_files_if_unchanged,
     set_files, set_files_without_text,
 };
+pub use archive_menu::{
+    MenuVerb, archive_menu_registered, refresh_archive_menu_if_registered, register_archive_menu,
+    unregister_archive_menu,
+};
 pub use drives::{DriveInfo, DriveKind, list_drives};
 pub use file_types::{
-    DefaultApp, FileType, default_app, file_types_registered, open_default_apps_settings,
-    refresh_file_types_if_registered, register_file_types, unregister_file_types,
+    DefaultApp, FileType, archive_types_registered, default_app, file_types_registered,
+    open_default_apps_settings, refresh_archive_types_if_registered,
+    refresh_file_types_if_registered, register_archive_types, register_file_types,
+    unregister_archive_types, unregister_file_types,
 };
 pub use files::{
     file_id, hard_link_count, is_removable, physical_disks, set_attributes, volume_serial,
