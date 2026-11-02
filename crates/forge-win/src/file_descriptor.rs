@@ -182,6 +182,104 @@ fn filetime_to_system_time(ticks: u64) -> Option<SystemTime> {
     }
 }
 
+/// One item to write with [`build_file_group_descriptor_w`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DescriptorItem {
+    /// Relative path, `\`-separated (see [`checked_relative_name`]).
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub modified: Option<SystemTime>,
+}
+
+/// `FILE_ATTRIBUTE_NORMAL`.
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
+/// Builds a `FILEGROUPDESCRIPTORW` block, every entry with attributes, size, progress UI
+/// and Unicode flags (and its write time when known). Fails for an unsafe or too long
+/// name: the target writes these names below the folder it pastes into.
+pub fn build_file_group_descriptor_w(items: &[DescriptorItem]) -> crate::Result<Vec<u8>> {
+    if items.len() as u64 > MAX_ITEMS {
+        return Err(invalid("too many items to offer at once"));
+    }
+    let mut bytes = vec![0u8; COUNT_SIZE + items.len() * FILE_DESCRIPTOR_SIZE];
+    bytes[..COUNT_SIZE].copy_from_slice(&(items.len() as u32).to_le_bytes());
+    for (index, item) in items.iter().enumerate() {
+        let start = COUNT_SIZE + index * FILE_DESCRIPTOR_SIZE;
+        let entry = &mut bytes[start..start + FILE_DESCRIPTOR_SIZE];
+        let name = checked_relative_name(&item.name)?;
+        let mut flags = FD_ATTRIBUTES | FD_FILESIZE | FD_PROGRESSUI | FD_UNICODE;
+        if let Some(ticks) = item.modified.and_then(system_time_to_filetime) {
+            flags |= FD_WRITESTIME;
+            entry[OFF_WRITTEN..OFF_WRITTEN + 8].copy_from_slice(&ticks.to_le_bytes());
+        }
+        entry[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        let attributes = if item.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        entry[OFF_ATTRIBUTES..OFF_ATTRIBUTES + 4].copy_from_slice(&attributes.to_le_bytes());
+        let size = if item.is_dir { 0 } else { item.size };
+        entry[OFF_SIZE_HIGH..OFF_SIZE_HIGH + 4].copy_from_slice(&((size >> 32) as u32).to_le_bytes());
+        entry[OFF_SIZE_LOW..OFF_SIZE_LOW + 4].copy_from_slice(&(size as u32).to_le_bytes());
+        for (i, unit) in name.iter().enumerate() {
+            let at = OFF_NAME + i * 2;
+            entry[at..at + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+/// `name` as the UTF-16 units of a safe relative path with `\` separators: no empty, `.`
+/// or `..` component, no drive, stream or wildcard characters, no control characters, no
+/// trailing dot or space, and short enough for `cFileName` (with its NUL).
+pub fn checked_relative_name(name: &str) -> crate::Result<Vec<u16>> {
+    let parts: Vec<&str> = name.split(['\\', '/']).collect();
+    let bad = |why: &str| crate::WinError::Invalid(format!("cannot offer {name:?}: {why}"));
+    for part in &parts {
+        if part.is_empty() || *part == "." || *part == ".." {
+            return Err(bad("not a relative path"));
+        }
+        if part
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+        {
+            return Err(bad("a character Windows names can't have"));
+        }
+        if part.ends_with(['.', ' ']) {
+            return Err(bad("a name ending with a dot or a space"));
+        }
+    }
+    let units: Vec<u16> = parts.join("\\").encode_utf16().collect();
+    if units.len() >= NAME_UNITS {
+        return Err(bad("the path is longer than 259 characters"));
+    }
+    Ok(units)
+}
+
+/// FILETIME ticks of `time`, or `None` before 1601 or for a zero result.
+fn system_time_to_filetime(time: SystemTime) -> Option<u64> {
+    let ticks = match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => UNIX_EPOCH_TICKS.checked_add(
+            after
+                .as_secs()
+                .checked_mul(TICKS_PER_SECOND)?
+                .checked_add(u64::from(after.subsec_nanos() / 100))?,
+        )?,
+        Err(before) => {
+            let before = before.duration();
+            UNIX_EPOCH_TICKS.checked_sub(
+                before
+                    .as_secs()
+                    .checked_mul(TICKS_PER_SECOND)?
+                    .checked_add(u64::from(before.subsec_nanos().div_ceil(100)))?,
+            )?
+        }
+    };
+    (ticks != 0).then_some(ticks)
+}
+
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
     let mut raw = [0u8; 4];
     raw.copy_from_slice(&bytes[at..at + 4]);
@@ -203,6 +301,52 @@ mod tests {
     use super::*;
 
     /// Layout check: the fields in `FILEDESCRIPTORW` add up to 592 bytes.
+    #[test]
+    fn built_descriptors_parse_back() {
+        let items = [
+            DescriptorItem {
+                name: "docs".into(),
+                is_dir: true,
+                size: 7,
+                modified: None,
+            },
+            DescriptorItem {
+                name: r"docs/sub\big.bin".into(),
+                is_dir: false,
+                size: 5 << 32 | 3,
+                modified: Some(at_unix(1_700_000_000)),
+            },
+        ];
+        let parsed = parse_file_group_descriptor_w(&build_file_group_descriptor_w(&items).unwrap())
+            .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "docs");
+        assert!(parsed[0].is_dir);
+        assert_eq!(parsed[0].size, Some(0));
+        assert_eq!(parsed[0].modified, None);
+        assert_eq!(parsed[1].name, r"docs\sub\big.bin");
+        assert!(!parsed[1].is_dir);
+        assert_eq!(parsed[1].size, Some(5 << 32 | 3));
+        assert_eq!(parsed[1].modified, Some(at_unix(1_700_000_000)));
+        assert_ne!(parsed[1].flags & FD_PROGRESSUI, 0);
+        assert_ne!(parsed[1].flags & FD_UNICODE, 0);
+    }
+
+    #[test]
+    fn unsafe_names_are_not_offered() {
+        for name in [
+            "", r"..\x", r"a\..\b", r"C:\x", r"\abs", r"a\\b", "a:stream", "x?.txt", "dot.",
+            "tab\tname",
+        ] {
+            assert!(checked_relative_name(name).is_err(), "{name:?}");
+        }
+        assert!(checked_relative_name(&"a".repeat(259)).is_err());
+        assert_eq!(
+            String::from_utf16(&checked_relative_name("a/b c.txt").unwrap()).unwrap(),
+            r"a\b c.txt"
+        );
+    }
+
     #[test]
     fn layout_adds_up_to_entry_size() {
         let fields = 4 // dwFlags

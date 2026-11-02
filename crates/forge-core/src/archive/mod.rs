@@ -31,6 +31,7 @@ mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
 mod sevenz_writer;
+pub mod stage;
 mod tar_backend;
 mod tar_read;
 mod tar_write;

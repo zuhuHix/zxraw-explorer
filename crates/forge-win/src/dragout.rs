@@ -156,6 +156,68 @@ pub fn drag_out_items(
     Ok(drop_result(result.0))
 }
 
+/// Runs the modal shell drag of ZXraw's virtual files (archive items, see
+/// [`crate::virtual_source`]). Explorer copies them from the streams, after the drop when it
+/// supports the asynchronous protocol. `first_is_dir` picks the stock icon when there is no
+/// thumbnail. A move is never done here: the data object tells its provider once the target
+/// confirmed one.
+#[cfg(windows)]
+pub fn drag_out_virtual(
+    hwnd: isize,
+    data: &crate::virtual_source::VirtualDataObject,
+    allow_move: bool,
+    first_is_dir: bool,
+    thumbnail: Option<DragThumbnail<'_>>,
+) -> Result<DropResult> {
+    use std::ffi::c_void;
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Ole::{DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, IDropSource};
+    use windows::Win32::UI::Shell::SHDoDragDrop;
+
+    if hwnd == 0 {
+        return Err(WinError::Invalid(
+            "drag-out needs a valid window handle".into(),
+        ));
+    }
+    let _apartment = OleApartment::new()?;
+    let object = data.data_object();
+    let _drag_image = match initialize_drag_image(object, None, first_is_dir, thumbnail) {
+        Ok(helper) => Some(helper),
+        Err(error) => {
+            tracing::debug!("could not initialize the virtual file drag image: {error}");
+            None
+        }
+    };
+    // No link: there is no file to link to.
+    let mut effects = DROPEFFECT_COPY.0;
+    if allow_move {
+        effects |= DROPEFFECT_MOVE.0;
+    }
+    let result = unsafe {
+        SHDoDragDrop(
+            Some(HWND(hwnd as *mut c_void)),
+            object,
+            None::<&IDropSource>,
+            DROPEFFECT(effects),
+        )
+    }
+    .map_err(|e| crate::api_err("SHDoDragDrop", e))?;
+    data.drag_returned(result.0);
+    Ok(drop_result(result.0))
+}
+
+#[cfg(not(windows))]
+pub fn drag_out_virtual(
+    _hwnd: isize,
+    _data: &crate::virtual_source::VirtualDataObject,
+    _allow_move: bool,
+    _first_is_dir: bool,
+    _thumbnail: Option<DragThumbnail<'_>>,
+) -> Result<DropResult> {
+    Err(WinError::Unsupported)
+}
+
 #[cfg(not(windows))]
 pub fn drag_out(_hwnd: isize, _paths: &[PathBuf], _allow_move: bool) -> Result<DropResult> {
     Err(WinError::Unsupported)
