@@ -732,6 +732,7 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::ExtractHere | Cmd::ExtractToFolder | Cmd::ExtractTo | Cmd::TestArchive => {
             crate::archive_extract::run(app, cmd)
         }
+        Cmd::OpenAsArchive => crate::archive_ui::open_as_archive(app),
         Cmd::SplitFile => crate::extra_tools_ui::split_file(app),
         Cmd::JoinFiles => crate::extra_tools_ui::join_files(app),
         Cmd::GroupSimilar => crate::similar::toggle(app),
