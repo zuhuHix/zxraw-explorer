@@ -89,9 +89,26 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * A 7z "update" archive (one with deletion markers, anti-items) can be opened and extracted
   (the markers are ignored) but not edited. A 7z entry name containing NUL makes the archive
   unreadable rather than listing that entry as unsafe.
-* Inside an open zip, 7z or tar, rename, new folder and cut are not available, a move out of a zip is a copy,
-  copying between two zips is refused, and items can't be dragged from a zip to Windows Explorer
-  (phase 4). Photos inside a zip open with their default app, not the built-in viewer.
+* Inside an open zip, 7z or tar, rename and new folder are not available, and copying between two
+  archives is refused. Photos inside a zip open with their default app, not the built-in viewer.
+* Items dragged or copied out of an archive to other apps are virtual files
+  (`FileGroupDescriptorW` + `FileContents`), extracted into a private folder under
+  `%TEMP%\ZXraw Archive Temp` as the target reads them. That folder needs free space for the
+  selection and is removed when the target releases the items (after a paste, when something
+  else is copied; leftovers after a day). Apps that only take real file paths (`CF_HDROP`)
+  can't take them. The files they write don't carry the archive's "downloaded from the
+  internet" mark (an extraction in ZXraw does), since the virtual-file protocol has no way to
+  pass it. A file whose only checksum is its solid 7z block's is handed over only once the
+  whole block was decoded and matched. Encrypted files without any checksum, under a
+  password nothing could prove, are refused there (extract them in ZXraw to choose "Extract
+  them anyway").
+* Archive items on the clipboard can't be pasted after ZXraw closes: their data comes from the
+  running app, so the clipboard is emptied on exit rather than flushed.
+* A move out of an archive (Ctrl+X, Shift-drag, F6) removes the items only when the target
+  reported a successful move *and* read every file to its end, the archive is unchanged since
+  it was listed, and you confirm. Anything less (a copy, a skipped file, an error) leaves the
+  archive as it was. A target that never reports the result (some apps don't) leaves it as a
+  copy.
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
   caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
   "damaged data or wrong password". AES archives always tell the two apart.

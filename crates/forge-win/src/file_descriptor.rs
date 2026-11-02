@@ -340,7 +340,8 @@ mod tests {
         ] {
             assert!(checked_relative_name(name).is_err(), "{name:?}");
         }
-        assert!(checked_relative_name(&"a".repeat(259)).is_err());
+        assert!(checked_relative_name(&"a".repeat(260)).is_err());
+        assert!(checked_relative_name(&"a".repeat(259)).is_ok());
         assert_eq!(
             String::from_utf16(&checked_relative_name("a/b c.txt").unwrap()).unwrap(),
             r"a\b c.txt"

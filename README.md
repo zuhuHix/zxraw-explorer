@@ -275,6 +275,13 @@ Explorer is a file manager designed around that workflow:
   / <kbd>Ctrl</kbd>+<kbd>V</kbd>) to a real folder to extract only those. Existing files are
   asked about once: keep both, skip or replace. Every file is written under a temporary name
   first, so a cancelled extraction leaves no half-written files.
+- **Straight into Explorer and other apps.** Drag entries of an open zip or 7z onto Explorer,
+  the desktop or a mail window, or copy them with <kbd>Ctrl</kbd>+<kbd>C</kbd> and paste
+  them there: folders come with everything inside. They are handed over the way Explorer's
+  own zip folders hand theirs over, extracted as the other app reads them, with every
+  checksum checked (a damaged file ends in an error there, never a silently broken copy).
+  <kbd>Ctrl</kbd>+<kbd>X</kbd>, <kbd>Shift</kbd>+drag and <kbd>F6</kbd> move items out:
+  once every file arrived, you're asked whether to remove them from the archive.
 - **Edit without unpacking.** Drop or paste files into an open zip to add them, or delete
   entries from it. Unchanged entries are copied as they are, not recompressed, and the new zip
   replaces the old one only when it is complete.
