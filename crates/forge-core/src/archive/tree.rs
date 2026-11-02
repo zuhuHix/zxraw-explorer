@@ -152,6 +152,27 @@ impl ArchiveIndex {
         for kids in idx.children.values_mut() {
             kids.sort_by_key(|&n| idx.nodes[n].name.to_lowercase());
         }
+        // Folder times: a folder without its own time gets the newest time inside it. A parent
+        // is always pushed before its children, so walking the nodes in reverse meets every
+        // child before its parent.
+        let mut parent = vec![None; idx.nodes.len()];
+        for (folder, kids) in &idx.children {
+            if let Some(&p) = idx.by_path.get(folder) {
+                for &k in kids {
+                    parent[k] = Some(p);
+                }
+            }
+        }
+        let mut newest: Vec<Option<SystemTime>> = vec![None; idx.nodes.len()];
+        for n in (0..idx.nodes.len()).rev() {
+            let node = &mut idx.nodes[n];
+            if node.is_dir && node.modified.is_none() {
+                node.modified = newest[n];
+            }
+            if let (Some(p), Some(t)) = (parent[n], node.modified) {
+                newest[p] = newest[p].max(Some(t));
+            }
+        }
         idx.listing = listing;
         idx
     }
@@ -260,6 +281,7 @@ impl ArchiveIndex {
 mod tests {
     use super::*;
     use crate::archive::ArchiveFormat;
+    use std::time::Duration;
 
     fn entry(name: &str, size: u64) -> ArchiveEntry {
         ArchiveEntry {
@@ -314,5 +336,42 @@ mod tests {
         assert!(idx.is_dir("b/c") && idx.is_dir("") && !idx.is_dir("a.txt"));
         assert!(idx.children("a.txt").is_none() && idx.children("nope").is_none());
         assert_eq!(idx.node("b/c/deep.txt").unwrap().ratio_percent(), Some(50));
+    }
+
+    #[test]
+    fn folder_times_come_from_own_entry_or_newest_descendant() {
+        let at = |secs: u64| Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        let idx = ArchiveIndex::build(ArchiveListing {
+            format: ArchiveFormat::Zip,
+            entries: vec![
+                ArchiveEntry {
+                    modified: at(100),
+                    ..entry("own/", 0)
+                },
+                ArchiveEntry {
+                    modified: at(200),
+                    ..entry("own/x.txt", 1)
+                },
+                ArchiveEntry {
+                    modified: at(300),
+                    ..entry("implied/a/deep.txt", 1)
+                },
+                ArchiveEntry {
+                    modified: at(120),
+                    ..entry("implied/a/other.txt", 1)
+                },
+                entry("untimed/sub/y.bin", 1),
+            ],
+            comment: String::new(),
+        });
+        // A folder's own time wins over a newer file inside it.
+        assert_eq!(idx.node("own").unwrap().modified, at(100));
+        // Implied folders take the newest time of their descendants, at every level.
+        assert_eq!(idx.node("implied/a").unwrap().modified, at(300));
+        assert_eq!(idx.node("implied").unwrap().modified, at(300));
+        assert_eq!(idx.node("implied/a/other.txt").unwrap().modified, at(120));
+        // No timed descendants: stays None.
+        assert_eq!(idx.node("untimed/sub").unwrap().modified, None);
+        assert_eq!(idx.node("untimed").unwrap().modified, None);
     }
 }
