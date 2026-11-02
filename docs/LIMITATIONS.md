@@ -8,6 +8,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 ## Formats and media
 
 * Archive support is ZIP only. There is no 7z, RAR, or TAR reader yet (`forge-core/src/archive/`).
+* Inside an open zip, rename, new folder and cut are not available, a move out of a zip is a copy,
+  copying between two zips is refused, and items can't be dragged from a zip to Windows Explorer
+  (phase 4). Photos inside a zip open with their default app, not the built-in viewer.
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
   caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
   "damaged data or wrong password". AES archives always tell the two apart.

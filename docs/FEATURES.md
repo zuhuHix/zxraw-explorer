@@ -589,6 +589,16 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   non-multiple sizes, changed and truncated part detection, whole-file hash mismatch publishes nothing,
   cancellation leaves no output, a simulated crash before publish leaves no final name, overwrite
   refused, symlinked parts rejected.
+* ✅ Browse a zip as a folder in the pane (listing, Up/Back, Compressed/Ratio/Method columns,
+  opening an entry via a temp copy, nested zips on demand) — `forge-app/src/archive_ui.rs`,
+  `pane.rs` tests; e2e `tools::` archive browsing scenario.
+* ✅ Extract here (smart) / Extract to `<name>\` / Extract to… / Test archive, from archive files and
+  from selections in an archive pane, with a one-time conflict question and password prompt —
+  `forge-app/src/archive_extract.rs`; e2e `tools::` extraction scenario (F5, Ctrl+C/Ctrl+V, move).
+* ✅ Add to and delete from an open zip, thumbnails of small images inside a zip —
+  `forge-app/src/archive_edit.rs`; e2e `tools::` edit and thumbnail scenarios.
+* 🟡 Compress dialog presets, Advanced (Zstandard/Ultra), auto-store, AES-256/ZipCrypto
+  passwords, and the input → output progress line — unit tests only; the dialog is not automated.
 * 🟡 Archive, split/join, and contact-sheet UI workflows — `forge-app/src/extra_tools_ui.rs`.
   The engine is tested; the dialogs and progress display are not automated.
 * ⬜ 7z and RAR archives — not implemented.

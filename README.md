@@ -262,6 +262,38 @@ Explorer is a file manager designed around that workflow:
 - **Renames never overwrite.** If the new name is already taken, you're asked again instead of
   losing a file, even on a slow network drive.
 
+### Zip archives
+
+- **Open a zip like a folder.** Double-click or press <kbd>Enter</kbd> on a `.zip` and browse
+  it in the pane: the path reads `D:\Photos	rip.zip\day 1\`, Back and Up lead out again, and
+  the Details view adds Compressed, Ratio and Method columns. Opening a file inside extracts
+  just that file to a temporary folder; small images get thumbnails and a preview without
+  unpacking the rest. A zip inside a zip opens only when you open it.
+- **Extract the way you mean it.** *Extract here (smart)* never nests a lone top-level folder
+  inside another one; *Extract to `trip\`* always makes a folder; *Extract to…* asks where.
+  Select entries in an open zip and copy them (<kbd>F5</kbd>, drag, or <kbd>Ctrl</kbd>+<kbd>C</kbd>
+  / <kbd>Ctrl</kbd>+<kbd>V</kbd>) to a real folder to extract only those. Existing files are
+  asked about once: keep both, skip or replace. Every file is written under a temporary name
+  first, so a cancelled extraction leaves no half-written files.
+- **Edit without unpacking.** Drop or paste files into an open zip to add them, or delete
+  entries from it. Unchanged entries are copied as they are, not recompressed, and the new zip
+  replaces the old one only when it is complete.
+- **Compress for anyone, or for size.** *Fast*, *Balanced* (the default) and *Max* make standard
+  zips that open everywhere, including Windows Explorer. *Advanced* adds Zstandard and Ultra,
+  which are smaller and faster but need 7-Zip 23 or another recent tool. Photos, videos, music
+  and other already-compressed files are stored as they are, which is faster and hardly larger.
+  Progress shows input → output, the ratio, speed and time left.
+- **Passwords done right.** New encrypted zips use AES-256. The old ZipCrypto scheme is there
+  only as a "legacy, weak" choice for old tools. When a zip needs a password you're asked;
+  a wrong password is told apart from a damaged file, and the password is kept for the session
+  only, never saved or logged. *Test archive* checks every file's checksum.
+- **Safe with zips from strangers.** Names that would escape the destination (`..\`, `C:\`,
+  `\server\`), Windows device names and hidden streams are refused before anything is written;
+  links are never created and planted junctions never followed; zip bombs (overlapping entries,
+  absurd ratios or sizes, huge decoder memory) are stopped. Files from a downloaded zip keep the
+  "downloaded from the internet" mark, as with Explorer. Reads zips made with Deflate,
+  Deflate64, bzip2, LZMA, XZ, Zstandard and PPMd, and names in CP437 or Unicode.
+
 ### Batch work on a selection
 
 Every one of these is in the command palette (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>) and can be
