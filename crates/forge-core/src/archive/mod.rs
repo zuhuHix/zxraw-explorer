@@ -32,7 +32,9 @@ mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
 mod sevenz_writer;
+mod stamp;
 pub mod stage;
+pub use stamp::archive_stamp;
 mod tar_backend;
 mod tar_read;
 mod tar_write;
@@ -62,6 +64,8 @@ mod tests_sevenz_hostile;
 mod tests_tar;
 #[cfg(test)]
 mod tests_tar_hostile;
+#[cfg(test)]
+mod tests_stamp;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -552,8 +556,9 @@ pub fn inner_path(archive: &Path, inner: &str) -> PathBuf {
     p
 }
 
-type CacheKey = (PathBuf, u64, Option<SystemTime>);
-type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>, u64)>>;
+/// Cached indexes by archive path: the [`archive_stamp`] they were built from, the index, and
+/// its weight.
+type IndexCache = Mutex<lru::LruCache<PathBuf, (u64, Arc<ArchiveIndex>, u64)>>;
 
 /// Memory the cached indexes may take together (a big tar's names can be hundreds of MB):
 /// the least recently used go first, and one heavier than this isn't kept.
@@ -588,14 +593,24 @@ pub fn index_cached_progress(
     password: Option<&Password>,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Arc<ArchiveIndex>> {
-    let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
-    let key: CacheKey = (archive.to_path_buf(), md.len(), md.modified().ok());
+    index_cached_stamped(archive, archive_stamp(archive)?, password, ctx)
+}
+
+/// [`index_cached_progress`] for an archive whose `stamp` ([`archive_stamp`]) the caller took.
+pub fn index_cached_stamped(
+    archive: &Path,
+    stamp: u64,
+    password: Option<&Password>,
+    ctx: Option<&JobCtx<'_>>,
+) -> Result<Arc<ArchiveIndex>> {
     let lookup = paths::lexical_normalize(archive);
-    if let Some((k, idx, _)) = cache().lock().get(&lookup)
-        && *k == key
+    if let Some((s, idx, _)) = cache().lock().get(&lookup)
+        && *s == stamp
     {
         return Ok(idx.clone());
     }
+    // The tar walk cache is keyed by size and time too: a replaced file must not get its walk.
+    tar_backend::forget(archive);
     let listing = backend_for_file(archive)?.list_progress(
         archive,
         &ExtractLimits::default(),
@@ -613,7 +628,7 @@ pub fn index_cached_progress(
         {
             total -= w;
         }
-        cache.put(lookup, (key, idx.clone(), weight));
+        cache.put(lookup, (stamp, idx.clone(), weight));
     }
     Ok(idx)
 }
@@ -1627,19 +1642,13 @@ pub fn extract_entry_to_temp(
     max_bytes: u64,
     ctx: &JobCtx<'_>,
 ) -> Result<PathBuf> {
-    let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
-    let stamp = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
+    let stamp = archive_stamp(archive)?;
     let key = format!(
-        "{}|{}|{stamp}",
+        "{}|{stamp:016x}",
         paths::lexical_normalize(archive)
             .display()
             .to_string()
-            .to_lowercase(),
-        md.len()
+            .to_lowercase()
     );
     let dir = temp_root().join(format!(
         "{:016x}",
@@ -1650,7 +1659,7 @@ pub fn extract_entry_to_temp(
         .file_name()
         .ok_or_else(|| CoreError::Invalid(format!("{entry_name}: not a file")))?
         .to_owned();
-    let index = index_cached_with(archive, password)?;
+    let index = index_cached_stamped(archive, stamp, password, None)?;
     let node = index
         .node(entry_name.trim_end_matches('/'))
         .filter(|n| !n.is_dir)
