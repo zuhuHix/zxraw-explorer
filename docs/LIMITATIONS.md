@@ -7,8 +7,29 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Formats and media
 
-* Archive support is ZIP only. There is no 7z, RAR, or TAR reader yet (`forge-core/src/archive/`).
-* Inside an open zip, rename, new folder and cut are not available, a move out of a zip is a copy,
+* Archive support is ZIP and 7z. There is no RAR or TAR reader yet (`forge-core/src/archive/`).
+* 7z: split archives (`.7z.001`), self-extracting `.exe` archives, archives whose header was
+  never finished, and Zstandard, Brotli, LZ4 or Deflate64 blocks (7-Zip forks) are not read;
+  the last are reported per file as an unsupported method. New 7z archives use LZMA2 with the
+  x86 BCJ filter for executables; BCJ2 and the ARM filters are read but never written.
+* 7z AES has no password check of its own. ZXraw decodes the start of the encrypted blocks
+  before extracting, which catches a wrong password for compressed data; for stored (Copy)
+  data in an archive with visible names it can't, and a wrong password then shows as a CRC
+  failure, "damaged data or wrong password". With encrypted names the header's checksum
+  settles it.
+* The 7z library (`sevenz-rust2`) keeps its own UTF-16 copy of the password during an
+  operation (freed, not wiped, afterwards) and keeps the last AES key it derived in memory
+  until it derives another. ZXraw's own copies are wiped.
+* 7z limits: headers of at most 64 MB on disk and 128 MB decoded, at most 100,000 entries,
+  1 GB of decoder memory per block (256 MB for the header). Anything over them is refused
+  before memory is allocated. 7z entries are decoded on one thread.
+* Pause and cancel in 7z: while compressing they are checked on every read of a source file;
+  while decoding a solid block up to the wanted files, every 256 KB. One case is coarser: when
+  a file being extracted fails (a disk error), the rest of its data is decoded without checks.
+* A 7z "update" archive (one with deletion markers, anti-items) can be opened and extracted
+  (the markers are ignored) but not edited. A 7z entry name containing NUL makes the archive
+  unreadable rather than listing that entry as unsafe.
+* Inside an open zip or 7z, rename, new folder and cut are not available, a move out of a zip is a copy,
   copying between two zips is refused, and items can't be dragged from a zip to Windows Explorer
   (phase 4). Photos inside a zip open with their default app, not the built-in viewer.
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is

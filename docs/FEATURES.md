@@ -580,6 +580,17 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
 * ✅ Smart extraction (no double nesting), extract to `<name>\`, cancel cleanup, and editing
   (add, replace, delete; unchanged entries raw-copied; a cancelled or failed update leaves the
   original byte-identical) — `archive/tests_edit.rs`.
+* ✅ 7z read, create and edit (engine) — `forge-core/src/archive/tests_sevenz.rs`: round-trip
+  matrix (Fast/Balanced/Max/Ultra × solid on/off × none/AES/AES with encrypted names, each also
+  tested by 7-Zip when installed), archives made by 7-Zip with LZMA, LZMA2, PPMd, BZip2, Deflate,
+  Copy, BCJ2, ARM64, Delta and AES, wrong vs missing password vs damage, solid blocks decoded once
+  for several selected files, cancel leaving nothing, editing (untouched blocks raw-copied, touched
+  solid blocks recompressed), header bombs (huge counts, coders, dictionaries, sizes) refused before
+  allocation; `tests_sevenz_fixtures.rs` (committed 7-Zip fixtures); `tests_sevenz_hostile.rs`
+  (malicious names, link attributes, anti-items, case collisions).
+* ✅ 7z in the app: browsing (also with encrypted names, asking for the password), copying out,
+  the create and browse windows, bounded thumbnails in solid blocks — e2e `tools::seven_zip_*`;
+  compress-dialog options in `forge-app/src/extra_tools_ui.rs` tests.
 * ✅ Contact sheets: pagination, bounded layout, and captions with system fonts —
   `forge-app/src/extra_tools_ui.rs` (`contact_sheet_pagination_uses_rows_times_columns`,
   `contact_sheet_page_loader_holds_at_most_one_page_of_thumbnails`,

@@ -262,7 +262,7 @@ Explorer is a file manager designed around that workflow:
 - **Renames never overwrite.** If the new name is already taken, you're asked again instead of
   losing a file, even on a slow network drive.
 
-### Zip archives
+### Zip and 7z archives
 
 - **Open a zip like a folder.** Double-click or press <kbd>Enter</kbd> on a `.zip` and browse
   it in the pane: the path reads `D:\Photos\trip.zip\day 1\`, Back and Up lead out again, and
@@ -293,6 +293,32 @@ Explorer is a file manager designed around that workflow:
   absurd ratios or sizes, huge decoder memory) are stopped. Files from a downloaded zip keep the
   "downloaded from the internet" mark, as with Explorer. Reads zips made with Deflate,
   Deflate64, bzip2, LZMA, XZ, Zstandard and PPMd, and names in CP437 or Unicode.
+- **7z works the same way.** A `.7z` opens like a folder, extracts the same three ways, can be
+  tested, edited and copied out of, with the same safety rules. Reads LZMA, LZMA2, PPMd, BZip2,
+  Deflate and stored data, the BCJ, BCJ2, ARM, ARM64 and Delta filters, and AES-256 encryption,
+  including archives whose file names are encrypted: those ask for the password as soon as you
+  open them, and a wrong password is told apart from a damaged file.
+- **Solid 7z, without the waiting.** In a solid archive many files share one compressed block, so
+  reading a file means decoding its block up to it. Extracting several files decodes each block
+  once; opening a file deep in a big block says so in its job; thumbnails are skipped for images
+  that would need more than 64 MB decoded. The Compressed figure of a file in a solid block shows
+  "—" and the Ratio is its block's.
+- **Create 7z.** Choose 7z in the compress dialog. All presets are LZMA2, solid by default:
+
+  | Preset | Dictionary | Memory to compress (per thread) | Memory to open |
+  |---|---|---|---|
+  | Fast | 4 MB | ~30 MB | ~4 MB |
+  | Balanced | 16 MB | ~185 MB | ~16 MB |
+  | Max | 64 MB | ~670 MB | ~64 MB |
+  | Ultra (Advanced) | 256 MB | ~2.7 GB | ~256 MB |
+
+  Big blocks are compressed on several threads, as many as fit in about 1.5 GB. Executables get
+  the x86 BCJ filter, already-compressed files are stored in blocks of their own, and the solid
+  block size can be changed or solid turned off. With a password every block is AES-256
+  encrypted and, unless you untick *Encrypt file names*, the names too.
+- **Editing a 7z** copies the blocks it keeps as they are. A solid block that loses or has a file
+  replaced is decoded and recompressed (the job says "Recompressing N MB"); the original is
+  replaced only when the new archive is complete.
 
 ### Batch work on a selection
 
