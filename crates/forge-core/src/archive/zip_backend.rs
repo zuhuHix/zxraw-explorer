@@ -485,9 +485,7 @@ fn delete_if_unused(path: &Path) {
     {
         return;
     }
-    let disposition = FILE_DISPOSITION_INFO {
-        DeleteFile: true.into(),
-    };
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
     // SAFETY: the pointer and size describe `disposition`, which outlives the call.
     let _ = unsafe {
         SetFileInformationByHandle(

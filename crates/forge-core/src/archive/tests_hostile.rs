@@ -759,11 +759,10 @@ fn zipcrypto_entries_with_another_password_are_not_parsed_with_this_one() {
             ..Default::default()
         };
         let other = fresh_dest(d.path(), &format!("other-{attempt}"));
-        // The first entry is checked first, and "two" is wrong for it.
-        assert!(matches!(
-            ctx_run(&z, &other, &own),
-            Err(CoreError::WrongPassword(_))
-        ));
+        match ctx_run(&z, &other, &own) {
+            Err(CoreError::UnsafePath(msg)) => assert!(msg.contains("decoder memory"), "{msg}"),
+            other => panic!("expected the decoder memory limit, got {other:?}"),
+        }
         return;
     }
     panic!("no header failed the check in 64 tries");
