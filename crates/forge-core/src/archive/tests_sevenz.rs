@@ -1071,3 +1071,175 @@ fn edits_hold_recompressed_blocks_to_the_limits_and_leave_the_original() {
         .collect();
     assert_eq!(names, ["b.txt"]);
 }
+
+// ---------------------------------------------------------------------------
+// Review round 3 (#44): files checked only by their solid block's CRC, zip SFX edits,
+// unverifiable tests
+// ---------------------------------------------------------------------------
+
+/// Three 8-byte files stored (Copy) in one block whose only checksum is the block's CRC.
+fn block_crc_only_7z(data: &[u8; 24]) -> Vec<u8> {
+    let mut h = vec![0x01, 0x04];
+    h.extend([0x06, 0x00, 0x01, 0x09, 0x18, 0x00]); // one 24-byte packed stream
+    h.extend([0x07, 0x0B, 0x01, 0x00, 0x01, 0x01, 0x00]); // one folder, one Copy coder
+    h.extend([0x0C, 0x18, 0x0A, 0x01]); // 24 bytes out, its CRC:
+    h.extend(crc32fast::hash(data).to_le_bytes());
+    h.push(0x00);
+    h.extend([0x08, 0x0D, 0x03, 0x09, 0x08, 0x08, 0x00]); // three files, no CRCs
+    h.push(0x00);
+    h.extend([0x05, 0x03, 0x11]);
+    let names: Vec<u8> = "a.txt\0b.txt\0c.txt\0"
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    h.extend(num(names.len() as u64 + 1));
+    h.push(0);
+    h.extend(names);
+    h.extend([0x00, 0x00]);
+    // The CRC is of the intact data; the packed bytes may be damaged.
+    raw_7z(data, &h)
+}
+
+const BLOCK_DATA: [u8; 24] = *b"aaaaaaaabbbbbbbbcccccccc";
+
+fn damaged_block_7z(dir: &Path, name: &str) -> PathBuf {
+    let mut bytes = block_crc_only_7z(&BLOCK_DATA);
+    bytes[32 + 23] ^= 1; // the last byte of the block
+    write_raw(dir, name, &bytes)
+}
+
+#[test]
+fn files_checked_only_by_their_block_wait_for_its_crc() {
+    let d = tempfile::tempdir().unwrap();
+    let good = write_raw(d.path(), "good.7z", &block_crc_only_7z(&BLOCK_DATA));
+    let bad = damaged_block_7z(d.path(), "bad.7z");
+    let l = list(&good).unwrap();
+    assert!(
+        l.entries.iter().all(|e| e.checked_by_block && !e.unchecked),
+        "{l:?}"
+    );
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let first = Selection::new("", vec!["a.txt".into()]);
+    // Only the first file, damage at the block's very end: nothing is published.
+    let x = d.path().join("bad-first");
+    fs::create_dir_all(&x).unwrap();
+    let r = extract(&bad, &x, &ExtractOptions::default(), Some(&first), &ctx).unwrap();
+    assert!(r.extracted.is_empty(), "{r:?}");
+    assert_eq!(r.failed.len(), 1);
+    assert_eq!(r.failed[0].reason, BLOCK_CHECK_FAILED);
+    assert_eq!(
+        fs::read_dir(&x).unwrap().count(),
+        0,
+        "nothing published, no temp left"
+    );
+    // Intact: the first file is published once the block checked out.
+    let x = d.path().join("good-first");
+    fs::create_dir_all(&x).unwrap();
+    let r = extract(&good, &x, &ExtractOptions::default(), Some(&first), &ctx).unwrap();
+    assert_eq!(r.extracted, [x.join("a.txt")], "{r:?}");
+    assert_eq!(fs::read(x.join("a.txt")).unwrap(), b"aaaaaaaa");
+    // All three from the damaged block: none (the last one fails as it is read, the others
+    // as they wait); from the intact one, all.
+    let x = d.path().join("bad-all");
+    let r = extract_all(&bad, &x, None);
+    assert!(r.extracted.is_empty() && r.failed.len() == 3, "{r:?}");
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 0);
+    let x = d.path().join("good-all");
+    let r = extract_all(&good, &x, None);
+    assert_eq!(r.extracted.len(), 3, "{r:?}");
+    assert_eq!(fs::read(x.join("c.txt")).unwrap(), b"cccccccc");
+    // The test says the same.
+    let t = test_archive(&bad, None, &ExtractLimits::default(), &ctx).unwrap();
+    assert_eq!(t.failures().count(), 3, "{t:?}");
+    assert!(
+        test_archive(&good, None, &ExtractLimits::default(), &ctx)
+            .unwrap()
+            .is_ok()
+    );
+}
+
+#[test]
+fn cancel_while_files_wait_for_their_block_leaves_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let good = write_raw(d.path(), "good.7z", &block_crc_only_7z(&BLOCK_DATA));
+    let x = d.path().join("x");
+    fs::create_dir_all(&x).unwrap();
+    let c = CancelToken::new();
+    let p = Progress::default();
+    let ctx = JobCtx::new(&c, &p);
+    // Cancel as soon as the first file is written (to its temp file).
+    let token = c.clone();
+    ops::AFTER_CHUNK.with(|h| *h.borrow_mut() = Some(Box::new(move |_, _| token.cancel())));
+    let r = extract(&good, &x, &ExtractOptions::default(), None, &ctx);
+    ops::AFTER_CHUNK.with(|h| *h.borrow_mut() = None);
+    let r = r.unwrap();
+    assert!(r.cancelled && r.extracted.is_empty(), "{r:?}");
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 0, "no file, no temp");
+}
+
+#[test]
+fn self_extracting_zips_are_not_edited() {
+    let d = tempfile::tempdir().unwrap();
+    let src = sample_tree(d.path());
+    let zip = d.path().join("plain.zip");
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    create(
+        std::slice::from_ref(&src),
+        &zip,
+        &CreateOptions::default(),
+        &ctx,
+    )
+    .unwrap();
+    let mut bytes = b"MZ\x90\x00 pretend self-extractor stub ".to_vec();
+    bytes.extend(fs::read(&zip).unwrap());
+    let sfx = write_raw(d.path(), "setup.zip", &bytes);
+    let extra = d.path().join("extra.txt");
+    fs::write(&extra, b"new").unwrap();
+    for edit in [
+        ArchiveEdit {
+            add: vec![(extra.clone(), String::new())],
+            delete: vec![],
+        },
+        ArchiveEdit {
+            add: vec![],
+            delete: vec!["src/a.txt".into()],
+        },
+    ] {
+        let e = update(&sfx, &edit, &CreateOptions::default(), &ctx).unwrap_err();
+        assert!(matches!(e, CoreError::Unsupported(_)), "{e}");
+        assert!(
+            e.to_string()
+                .contains("Self-extracting archives can't be edited"),
+            "{e}"
+        );
+        assert_eq!(fs::read(&sfx).unwrap(), bytes, "untouched");
+    }
+    // It can still be listed and extracted.
+    assert!(list(&sfx).is_ok());
+}
+
+#[test]
+fn a_test_under_an_unproven_password_does_not_say_all_ok() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write_raw(
+        d.path(),
+        "nocrc.7z",
+        &raw_7z(
+            &[0x42; 16],
+            &file_header(16, &[0x06, 0xF1, 0x07, 0x01], &[0x01], 16),
+        ),
+    );
+    let (c, pr) = ctx_parts();
+    let t = test_archive(
+        &p,
+        Some(&Password::new("anything")),
+        &ExtractLimits::default(),
+        &JobCtx::new(&c, &pr),
+    )
+    .unwrap();
+    assert_eq!(t.failures().count(), 0, "{t:?}");
+    assert_eq!(t.unverified().count(), 1, "{t:?}");
+    assert!(!t.is_ok());
+}

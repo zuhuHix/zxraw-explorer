@@ -144,6 +144,7 @@ fn to_entry<R: Read>(index: usize, f: &zip::read::ZipFile<'_, R>) -> ArchiveEntr
         solid: false,
         block_offset: 0,
         unchecked: false,
+        checked_by_block: false,
     }
 }
 
@@ -493,6 +494,28 @@ impl ArchiveBackend for ZipBackend {
 /// Temp files of an update cut short by a crash are removed by the next update of an
 /// archive in the same folder once they are this old.
 const STALE_PARTIAL_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Shown when an edit is refused because the zip has something in front of it.
+pub const SFX_NOT_EDITABLE: &str = "Self-extracting archives can't be edited; extract them instead";
+
+/// Refuse a zip with a prefix (a self-extractor stub): its first local header is not at the
+/// start, or its directory places the archive further in. A rebuild would drop the stub.
+pub(crate) fn check_no_prefix(archive: &Path, file: &mut File) -> Result<()> {
+    let mut head = [0u8; 4];
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.read_exact(&mut head))
+        .map_err(|e| CoreError::io(archive, e))?;
+    let starts_right = head == *b"PK\x03\x04" || head == *b"PK\x05\x06";
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| CoreError::io(archive, e))?;
+    let offset = ZipArchive::new(BufReader::new(&mut *file))
+        .map(|za| za.offset())
+        .map_err(|e| zip_err(archive, e))?;
+    if !starts_right || offset > 0 {
+        return Err(CoreError::Unsupported(SFX_NOT_EDITABLE.into()));
+    }
+    Ok(())
+}
 
 /// Whether `file` has a ZIP end-of-central-directory record where one can be: in its last
 /// 22 + 65,535 bytes (the record plus the longest comment).

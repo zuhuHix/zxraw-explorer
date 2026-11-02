@@ -173,6 +173,11 @@ pub struct ArchiveEntry {
     /// is proven (see [`ExtractOptions::allow_unchecked_encrypted`]).
     #[serde(default)]
     pub unchecked: bool,
+    /// Its only checksum is its solid block's (no CRC of its own): it is decoded to temp and
+    /// published only once the whole block decoded and matched (see
+    /// [`ArchiveBackend::read_entries_checked`]).
+    #[serde(default)]
+    pub checked_by_block: bool,
 }
 
 impl ArchiveEntry {
@@ -198,6 +203,13 @@ impl ArchiveListing {
 /// Called for every wanted entry in archive order, with a reader of its decoded data or the
 /// error that prevented opening it (a missing or wrong password, an unsupported method...).
 pub type EntryVisitor<'a> = dyn FnMut(&ArchiveEntry, Result<&mut dyn Read>) -> Result<()> + 'a;
+
+/// Told the outcome of a block's checksum (see [`ArchiveBackend::read_entries_checked`]).
+pub type BlockEnd<'a> = dyn FnMut(Result<()>) -> Result<()> + 'a;
+
+/// Why files waiting for their solid block's checksum were not extracted.
+pub const BLOCK_CHECK_FAILED: &str =
+    "damaged data or wrong password: its solid block's checksum doesn't match";
 
 /// One archive format. Implementations list entries and stream their data; everything
 /// else (safety checks, conflicts, progress, MOTW) is shared in this module.
@@ -239,6 +251,22 @@ pub trait ArchiveBackend: Sync {
         ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()>;
+    /// [`read_entries`](Self::read_entries), plus `block_end` after every block holding a
+    /// wanted [`ArchiveEntry::checked_by_block`] entry, once the block was decoded to its end:
+    /// `Ok` when its checksum matched, the error when it didn't (or the block failed). The
+    /// default (no such blocks) is `read_entries`.
+    fn read_entries_checked(
+        &self,
+        archive: &Path,
+        wanted: &dyn Fn(&ArchiveEntry) -> bool,
+        password: Option<&Password>,
+        ctx: Option<&JobCtx<'_>>,
+        visit: &mut EntryVisitor<'_>,
+        block_end: &mut BlockEnd<'_>,
+    ) -> Result<()> {
+        let _ = block_end;
+        self.read_entries(archive, wanted, password, ctx, visit)
+    }
     /// Check `password` against the encrypted entries among `entries` before anything is
     /// extracted: [`CoreError::PasswordRequired`] / [`CoreError::WrongPassword`] when it can't
     /// open them, else whether a checksum proved it. The default opens the cheapest one to
@@ -742,17 +770,21 @@ pub fn extract(
         .map(|(i, p)| (p.entry.index, i))
         .collect();
     let mut remaining = limits.max_total_bytes;
+    // What reports show: the same item beneath the destination as the user named it.
+    let shown = |path: &Path| match path.strip_prefix(root) {
+        Ok(rel) => dest_dir.join(rel),
+        Err(_) => path.to_path_buf(),
+    };
+    // Files waiting for their solid block's checksum (temp files, deleted if dropped), with
+    // their folder inside the destination; and what became of them.
+    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, PathBuf)>> = Default::default();
+    let settled: std::cell::RefCell<(Vec<PathBuf>, Vec<OpIssue>)> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
         ctx.cancel.check()?;
         let p = &planned[by_index[&entry.index]];
         ctx.progress.add_items(1);
         ctx.progress.set_current(entry.name.clone());
         let target = root.join(&p.rel);
-        // What reports show: the same item beneath the destination as the user named it.
-        let shown = |path: &Path| match path.strip_prefix(root) {
-            Ok(rel) => dest_dir.join(rel),
-            Err(_) => path.to_path_buf(),
-        };
         let parent_rel = if p.entry.is_dir {
             p.rel.as_path()
         } else {
@@ -812,6 +844,24 @@ pub fn extract(
             ..Default::default()
         };
         let label = PathBuf::from(&p.entry.name);
+        if p.entry.checked_by_block {
+            return match ops::write_stream_held(reader, &label, &dest, sopts, keep_both, ctx) {
+                Ok((out, file)) => {
+                    remaining = remaining.saturating_sub(out.bytes);
+                    report.bytes += out.bytes;
+                    held.borrow_mut()
+                        .push((file, shown(&dest), parent_rel.to_path_buf()));
+                    Ok(())
+                }
+                Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
+                Err(e) => {
+                    report
+                        .failed
+                        .push(OpIssue::new(shown(&dest), data_error(&p.entry, e)));
+                    Ok(())
+                }
+            };
+        }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
             Ok((out, placed)) => {
                 remaining = remaining.saturating_sub(out.bytes);
@@ -833,8 +883,47 @@ pub fn extract(
             }
         }
     };
+    // The block decoded to its end: publish what waited for it, or drop it all.
+    let mut block_end = |outcome: Result<()>| -> Result<()> {
+        let waiting = std::mem::take(&mut *held.borrow_mut());
+        let mut settled = settled.borrow_mut();
+        for (file, label, parent_rel) in waiting {
+            if outcome.is_err() {
+                drop(file); // deletes the temp file
+                settled.1.push(OpIssue::new(label, BLOCK_CHECK_FAILED));
+                continue;
+            }
+            // Pinned again while it is renamed into place, as when it was written.
+            let published = safety::pin_dirs(&base, &parent_rel).and_then(|_pinned| file.publish());
+            match published {
+                Ok(placed) => {
+                    if let Some(zone) = &zone
+                        && let Err(e) = motw::write_zone(&placed, zone, archive)
+                    {
+                        tracing::warn!("could not mark {} as downloaded: {e}", placed.display());
+                    }
+                    settled.0.push(shown(&placed));
+                }
+                Err(e) => settled.1.push(OpIssue::new(label, e.to_string())),
+            }
+        }
+        Ok(())
+    };
     let wanted = |e: &ArchiveEntry| by_index.contains_key(&e.index);
-    match backend.read_entries(archive, &wanted, password, Some(ctx), &mut visit) {
+    let result = backend.read_entries_checked(
+        archive,
+        &wanted,
+        password,
+        Some(ctx),
+        &mut visit,
+        &mut block_end,
+    );
+    // Anything still waiting (cancelled mid-block) is dropped: nothing of it is published.
+    held.borrow_mut().clear();
+    let (published, failed) = settled.into_inner();
+    report.extracted.extend(published);
+    report.failed.extend(failed);
+    match result {
         Ok(()) => {}
         Err(CoreError::Cancelled) => report.cancelled = true,
         Err(e) => return Err(e),
@@ -1068,6 +1157,10 @@ pub struct EntryTest {
     pub size: u64,
     /// `None` when the entry's data decoded and its checksum matched.
     pub error: Option<String>,
+    /// It decoded, but nothing can confirm it: an encrypted file without any checksum and a
+    /// password no checksum proved. Neither OK nor failed.
+    #[serde(default)]
+    pub unverified: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1081,10 +1174,20 @@ impl TestReport {
     pub fn failures(&self) -> impl Iterator<Item = &EntryTest> {
         self.entries.iter().filter(|e| e.error.is_some())
     }
+    /// Files that decoded but can't be verified (see [`EntryTest::unverified`]).
+    pub fn unverified(&self) -> impl Iterator<Item = &EntryTest> {
+        self.entries
+            .iter()
+            .filter(|e| e.error.is_none() && e.unverified)
+    }
+    /// Everything decoded and was verified.
     pub fn is_ok(&self) -> bool {
-        !self.cancelled && self.failures().next().is_none()
+        !self.cancelled && self.failures().next().is_none() && self.unverified().next().is_none()
     }
 }
+
+/// Why a tested file is neither OK nor failed.
+pub const CANT_VERIFY: &str = "can't be verified (no checksum)";
 
 /// Decode every file entry and verify its checksum, reporting per entry. Structural
 /// problems (overlapping entries, unsafe names are *not* one: they are reported per entry)
@@ -1100,14 +1203,18 @@ pub fn test_archive(
     let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
     backend.preflight(archive, &indices, password, limits)?;
-    // Testing writes nothing: every file is decoded, and one without a checksum is reported
-    // as such below only if decoding fails.
-    backend.check_password(archive, &files, password)?;
+    // Testing writes nothing: every file is decoded. Under a password no checksum proved,
+    // an encrypted file without any checksum is reported as unverifiable, not OK.
+    let proof = backend.check_password(archive, &files, password)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
         .add_total_bytes(files.iter().fold(0u64, |a, e| a.saturating_add(e.size)));
     let mut report = TestReport::default();
     let mut buf = vec![0u8; 256 * 1024];
+    // Files whose only checksum is their solid block's, by their place in the report, until
+    // the block's end says whether they are fine.
+    let pending: std::cell::RefCell<Vec<usize>> = Default::default();
+    let bad: std::cell::RefCell<Vec<usize>> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
         ctx.cancel.check()?;
         ctx.progress.add_items(1);
@@ -1144,15 +1251,48 @@ pub fn test_archive(
                 report.bytes += total;
             }
         }
+        if error.is_none() && entry.checked_by_block {
+            pending.borrow_mut().push(report.entries.len());
+        }
         report.entries.push(EntryTest {
             name: entry.name.clone(),
             size: entry.size,
+            unverified: error.is_none()
+                && entry.encrypted
+                && entry.unchecked
+                && proof == PasswordProof::Unverified,
             error,
         });
         Ok(())
     };
+    let mut block_end = |outcome: Result<()>| -> Result<()> {
+        let waiting = std::mem::take(&mut *pending.borrow_mut());
+        if outcome.is_err() {
+            bad.borrow_mut().extend(waiting);
+        }
+        Ok(())
+    };
     let wanted = |e: &ArchiveEntry| !e.is_dir;
-    match backend.read_entries(archive, &wanted, password, Some(ctx), &mut visit) {
+    let result = backend.read_entries_checked(
+        archive,
+        &wanted,
+        password,
+        Some(ctx),
+        &mut visit,
+        &mut block_end,
+    );
+    for i in bad.into_inner() {
+        if let Some(e) = report.entries.get_mut(i) {
+            e.error = Some(BLOCK_CHECK_FAILED.to_owned());
+        }
+    }
+    // Decoded, but the block's checksum was never reached (cancelled): not verified.
+    for i in pending.into_inner() {
+        if let Some(e) = report.entries.get_mut(i) {
+            e.unverified = true;
+        }
+    }
+    match result {
         Ok(()) => {}
         Err(CoreError::Cancelled) => report.cancelled = true,
         Err(e) => return Err(e),
@@ -1355,6 +1495,7 @@ pub fn update(
         // Before anything reads the directory: a split zip can't be rebuilt as one file.
         let mut file = fs::File::open(archive).map_err(|e| CoreError::io(archive, e))?;
         zip_merge::check_single_disk(archive, &mut file)?;
+        zip_backend::check_no_prefix(archive, &mut file)?;
     }
     let warnings = check_update_password(backend, archive, edit, opts)?;
     let result = backend.update(archive, edit, opts, ctx).map(|mut report| {

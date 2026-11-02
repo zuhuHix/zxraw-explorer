@@ -477,6 +477,7 @@ pub fn copy_file_atomic(
             still_ok: None,
             still_ok_message: None,
             replace: None,
+            hold: None,
         },
     )
 }
@@ -505,6 +506,7 @@ pub fn copy_file_atomic_guarded(
             still_ok: Some(still_ok),
             still_ok_message: Some("destination changed since preview; it was not overwritten"),
             replace: None,
+            hold: None,
         },
     )
 }
@@ -576,9 +578,78 @@ pub(crate) fn write_stream_placed<R: Read>(
         still_ok: None,
         still_ok_message: None,
         replace: None,
+        hold: None,
     };
     let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
     Ok((out, placed))
+}
+
+/// A finished temp file not published yet (see [`write_stream_held`]). Dropping it deletes
+/// the temp file.
+pub(crate) struct HeldFile {
+    tmp: TempGuard,
+    dest: PathBuf,
+    overwrite: bool,
+    keep_both: bool,
+}
+
+impl HeldFile {
+    /// Publish it as [`write_stream_placed`] would have; returns where it went.
+    pub(crate) fn publish(mut self) -> Result<PathBuf> {
+        let tmp = self.tmp.0.clone().expect("held temp");
+        place_retrying(&tmp, &mut self.dest, self.overwrite, self.keep_both)?;
+        self.tmp.disarm();
+        Ok(self.dest)
+    }
+}
+
+/// [`write_stream_placed`], but the finished temp file is held, not published: the caller
+/// publishes it once something else checked out (a solid 7z block's CRC).
+pub(crate) fn write_stream_held<R: Read>(
+    reader: R,
+    label: &Path,
+    dest: &Path,
+    opts: StreamOptions,
+    keep_both: bool,
+    ctx: &JobCtx<'_>,
+) -> Result<(CopyOutcome, HeldFile)> {
+    let mut counted = 0;
+    let mut placed = dest.to_path_buf();
+    let slot = std::cell::RefCell::new(None);
+    let overwrite = opts.overwrite;
+    let publish = Publish {
+        keep_both,
+        still_ok: None,
+        still_ok_message: None,
+        replace: None,
+        hold: Some(&slot),
+    };
+    let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
+    let tmp = slot.into_inner().expect("held temp");
+    Ok((
+        out,
+        HeldFile {
+            tmp: TempGuard(Some(tmp)),
+            dest: placed,
+            overwrite,
+            keep_both,
+        },
+    ))
+}
+
+/// Rename `tmp` to `dest`; with `keep_both`, to the next free name when `dest` is taken.
+fn place_retrying(tmp: &Path, dest: &mut PathBuf, overwrite: bool, keep_both: bool) -> Result<()> {
+    for _ in 0..1024 {
+        match place(tmp, dest, overwrite) {
+            Ok(()) => return Ok(()),
+            Err(CoreError::AlreadyExists(_)) if keep_both && !overwrite => {
+                let dir = dest.parent().unwrap_or(Path::new(""));
+                *dest = paths::unique_name(dir, &paths::name_of(dest));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(CoreError::AlreadyExists(dest.clone()))
 }
 
 /// How a finished temp file is published: under the next free name when the destination
@@ -591,6 +662,8 @@ struct Publish<'a> {
     /// checking `still_ok` and renaming over it. The cell receives the previous version's
     /// path when it could not be deleted afterwards.
     replace: Option<(&'a ReplaceState, &'a Cell<Option<PathBuf>>)>,
+    /// Don't publish: hand the finished temp file over in this cell (see [`HeldFile`]).
+    hold: Option<&'a std::cell::RefCell<Option<PathBuf>>>,
 }
 
 fn stream_into_place<R: Read>(
@@ -607,6 +680,7 @@ fn stream_into_place<R: Read>(
         still_ok,
         still_ok_message,
         replace,
+        hold,
     } = publish;
     let dir = dest
         .parent()
@@ -694,6 +768,14 @@ fn stream_into_place<R: Read>(
         }
     }
     ctx.cancel.check()?;
+    if let Some(slot) = hold {
+        guard.disarm();
+        *slot.borrow_mut() = Some(tmp);
+        return Ok(CopyOutcome {
+            bytes: total,
+            source_hash,
+        });
+    }
     if let Some((state, leftover)) = replace {
         let kept = replace_guarded(&tmp, dest, state).map_err(|refused| {
             CoreError::Invalid(format!("{}: {}", dest.display(), refused.message()))
@@ -707,23 +789,7 @@ fn stream_into_place<R: Read>(
                 .unwrap_or("destination changed while it was being copied; it was not overwritten");
             return Err(CoreError::Invalid(format!("{}: {message}", dest.display())));
         }
-        let mut placed = false;
-        for _ in 0..1024 {
-            match place(&tmp, dest, opts.overwrite) {
-                Ok(()) => {
-                    placed = true;
-                    break;
-                }
-                Err(CoreError::AlreadyExists(_)) if keep_both && !opts.overwrite => {
-                    let dir = dest.parent().unwrap_or(Path::new(""));
-                    *dest = paths::unique_name(dir, &paths::name_of(dest));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if !placed {
-            return Err(CoreError::AlreadyExists(dest.clone()));
-        }
+        place_retrying(&tmp, dest, opts.overwrite, keep_both)?;
     }
     guard.disarm();
     if opts.readonly
@@ -2174,6 +2240,7 @@ impl Executor<'_, '_, '_> {
                     .as_ref()
                     .filter(|_| overwrite)
                     .map(|state| (state, &replace_leftover)),
+                hold: None,
             },
         );
         self.ctx.progress.add_items(1);
