@@ -637,3 +637,51 @@ fn encrypted_entries_are_held_to_the_decoder_memory_limit() {
         assert!(matches!(test, Err(CoreError::UnsafePath(_))), "{test:?}");
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn a_destination_through_a_junction_is_resolved_and_pinned_for_the_job() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let real = d.path().join("real");
+    fs::create_dir_all(real.join("dest")).unwrap();
+    let link = d.path().join("link");
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&real)
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !made {
+        eprintln!("mklink unavailable; skipping");
+        return;
+    }
+    let mut zw = ZipWriter::new(File::create(d.path().join("a.zip")).unwrap());
+    zw.start_file("sub/x.txt", SimpleFileOptions::default())
+        .unwrap();
+    zw.write_all(b"inside").unwrap();
+    zw.finish().unwrap();
+
+    // While the job creates `sub`, the real destination's folders can't be moved.
+    let moved = Arc::new(AtomicBool::new(true));
+    let probe = Arc::clone(&moved);
+    let (real_hook, d_hook) = (real.clone(), d.path().to_path_buf());
+    super::safety::BEFORE_PARENT_CREATE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |_| {
+            let renamed = fs::rename(&real_hook, d_hook.join("elsewhere")).is_ok();
+            probe.store(renamed, Ordering::SeqCst);
+        }))
+    });
+    let dest = link.join("dest");
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    super::safety::BEFORE_PARENT_CREATE.with(|hook| *hook.borrow_mut() = None);
+    let report = report.unwrap();
+    assert!(!moved.load(Ordering::SeqCst), "an ancestor was renamed during the job");
+    assert!(report.failed.is_empty(), "{report:?}");
+    // Written to the real folder, reported beneath the path the user chose.
+    assert_eq!(report.extracted, vec![dest.join("sub").join("x.txt")]);
+    assert_eq!(fs::read(real.join("dest/sub/x.txt")).unwrap(), b"inside");
+    // Released after the job.
+    fs::rename(&real, d.path().join("elsewhere")).unwrap();
+}
