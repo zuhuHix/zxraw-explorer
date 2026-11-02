@@ -141,6 +141,8 @@ fn to_entry<R: Read>(index: usize, f: &zip::read::ZipFile<'_, R>) -> ArchiveEntr
         crc32: f.crc32(),
         method: method_name(f.compression()),
         name,
+        solid: false,
+        block_offset: 0,
     }
 }
 
@@ -157,7 +159,12 @@ impl ArchiveBackend for ZipBackend {
         head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06")
     }
 
-    fn list(&self, archive: &Path, max_entries: usize) -> Result<ArchiveListing> {
+    fn list(
+        &self,
+        archive: &Path,
+        max_entries: usize,
+        _password: Option<&Password>,
+    ) -> Result<ArchiveListing> {
         let mut za = open_zip(archive)?;
         if za.len() > max_entries {
             return Err(CoreError::Invalid(format!(
@@ -273,6 +280,7 @@ impl ArchiveBackend for ZipBackend {
         archive: &Path,
         wanted: &dyn Fn(&ArchiveEntry) -> bool,
         password: Option<&Password>,
+        _ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()> {
         let mut za = open_zip(archive)?;

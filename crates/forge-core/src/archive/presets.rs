@@ -3,10 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::Password;
+use super::{ArchiveFormat, Password};
 
-/// The choices of the compress dialog. The first three write standard Deflate, which every
-/// unzip tool (and Windows Explorer) opens; the advanced ones trade compatibility for size.
+/// The choices of the compress dialog. For ZIP the first three write standard Deflate, which
+/// every unzip tool (and Windows Explorer) opens; the advanced ones trade compatibility for
+/// size. For 7z every preset is LZMA2 (see [`Preset::sevenzip`]); Ultra is the advanced one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Preset {
     /// Deflate level 1.
@@ -49,6 +50,83 @@ impl Preset {
         matches!(self, Preset::Zstd | Preset::Ultra)
     }
 
+    /// The presets offered for a format (7z has no Zstandard preset: 7-Zip can't read it).
+    pub fn for_format(format: ArchiveFormat) -> &'static [Preset] {
+        match format {
+            ArchiveFormat::Zip => &Preset::ALL,
+            ArchiveFormat::SevenZip => &[Preset::Fast, Preset::Balanced, Preset::Max, Preset::Ultra],
+        }
+    }
+
+    /// The label for a format's dialog.
+    pub fn label_for(self, format: ArchiveFormat) -> &'static str {
+        match (format, self) {
+            (ArchiveFormat::SevenZip, Preset::Ultra) => "Ultra (LZMA2, 256 MB dictionary)",
+            (ArchiveFormat::SevenZip, Preset::Max) => "Max (slow)",
+            _ => self.label(),
+        }
+    }
+
+    /// Readers that can open the result, for a format's dialog.
+    pub fn compatibility_for(self, format: ArchiveFormat) -> &'static str {
+        match format {
+            ArchiveFormat::Zip => self.compatibility(),
+            ArchiveFormat::SevenZip => {
+                "LZMA2 7z: opens in 7-Zip, NanaZip, WinRAR and Windows 11 Explorer (23H2+)."
+            }
+        }
+    }
+
+    /// A rough time and memory estimate for a format's dialog.
+    pub fn estimate_for(self, format: ArchiveFormat) -> String {
+        match format {
+            ArchiveFormat::Zip => self.estimate().to_owned(),
+            ArchiveFormat::SevenZip => {
+                let info = self.sevenzip();
+                let speed = match self.for_sevenzip() {
+                    Preset::Fast => "Fast (~20 MB/s per core)",
+                    Preset::Balanced => "Medium (~4 MB/s per core)",
+                    Preset::Max => "Slow (~2 MB/s per core)",
+                    _ => "Very slow (~1.5 MB/s per core)",
+                };
+                format!(
+                    "{speed}; compressing needs ~{} MB per thread, opening ~{} MB",
+                    info.compress_memory.div_ceil(1 << 20),
+                    info.decompress_memory.div_ceil(1 << 20)
+                )
+            }
+        }
+    }
+
+    /// The 7z preset this one stands for (Zstandard has none; it means Balanced).
+    pub fn for_sevenzip(self) -> Preset {
+        match self {
+            Preset::Zstd => Preset::Balanced,
+            p => p,
+        }
+    }
+
+    /// LZMA2 settings and memory of the preset for 7z.
+    pub fn sevenzip(self) -> SevenZipPresetInfo {
+        let (level, dictionary): (u32, u32) = match self.for_sevenzip() {
+            Preset::Fast => (3, 4 << 20),
+            Preset::Balanced => (6, 16 << 20),
+            Preset::Max => (9, 64 << 20),
+            _ => (9, 256 << 20),
+        };
+        let mut lzma = lzma_rust2::LzmaOptions::with_preset(level);
+        lzma.dict_size = dictionary;
+        SevenZipPresetInfo {
+            level,
+            dictionary,
+            compress_memory: u64::from(lzma.get_memory_usage()) * 1024,
+            decompress_memory: u64::from(lzma_rust2::lzma2_get_memory_usage(dictionary)) * 1024,
+            // Big enough for a good ratio, small enough that opening one file decodes at
+            // most this much of its block.
+            solid_block: (u64::from(dictionary) * 16).clamp(64 << 20, 2 << 30),
+        }
+    }
+
     /// Readers that can open the result, for the dialog.
     pub fn compatibility(self) -> &'static str {
         if self.is_advanced() {
@@ -80,6 +158,21 @@ impl Preset {
             Preset::Ultra => (Method::Zstd, Some(19)),
         }
     }
+}
+
+/// LZMA2 settings of a preset for 7z, with the memory they need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SevenZipPresetInfo {
+    /// LZMA2 level, 0-9.
+    pub level: u32,
+    /// Dictionary size in bytes.
+    pub dictionary: u32,
+    /// Memory one compressing thread needs.
+    pub compress_memory: u64,
+    /// Memory needed to open (decompress) the archive.
+    pub decompress_memory: u64,
+    /// Default largest solid block (bytes of input).
+    pub solid_block: u64,
 }
 
 /// Compression methods that can be written.
@@ -121,6 +214,13 @@ impl Encryption {
     pub fn is_none(&self) -> bool {
         matches!(self, Encryption::None)
     }
+
+    pub fn password(&self) -> Option<&Password> {
+        match self {
+            Encryption::None => None,
+            Encryption::Aes256(p) | Encryption::ZipCryptoLegacy(p) => Some(p),
+        }
+    }
 }
 
 /// Options for creating or updating an archive.
@@ -133,7 +233,15 @@ pub struct CreateOptions {
     pub auto_store: bool,
     pub encryption: Encryption,
     /// Worker threads compressing small files in parallel (`0`: one per core, at most 8).
+    /// For 7z, the LZMA2 threads of a block (fewer when their memory would be too much).
     pub threads: usize,
+    /// 7z: compress files together in solid blocks (smaller; opening one file decodes its
+    /// block up to it). Already-compressed files always get blocks of their own.
+    pub solid: bool,
+    /// 7z: the largest solid block, in bytes of input (`None`: the preset's default).
+    pub solid_block_size: Option<u64>,
+    /// 7z with a password: encrypt the file names too, so listing needs the password.
+    pub encrypt_names: bool,
 }
 
 impl Default for CreateOptions {
@@ -144,6 +252,9 @@ impl Default for CreateOptions {
             auto_store: true,
             encryption: Encryption::None,
             threads: 0,
+            solid: true,
+            solid_block_size: None,
+            encrypt_names: true,
         }
     }
 }
@@ -201,6 +312,24 @@ mod tests {
         assert_eq!(Preset::Ultra.method_for(10).0, Method::Zstd);
         assert!(Preset::Zstd.is_advanced() && !Preset::Max.is_advanced());
         assert_eq!(Preset::default(), Preset::Balanced);
+    }
+
+    #[test]
+    fn sevenzip_presets_grow_and_state_their_memory() {
+        let presets = Preset::for_format(ArchiveFormat::SevenZip);
+        assert!(!presets.contains(&Preset::Zstd));
+        let infos: Vec<_> = presets.iter().map(|p| p.sevenzip()).collect();
+        for w in infos.windows(2) {
+            assert!(w[0].dictionary < w[1].dictionary);
+            assert!(w[0].compress_memory < w[1].compress_memory);
+        }
+        let balanced = Preset::Balanced.sevenzip();
+        assert_eq!(balanced.dictionary, 16 << 20);
+        assert!(balanced.decompress_memory >= 16 << 20 && balanced.decompress_memory < 20 << 20);
+        assert!(Preset::Max.sevenzip().compress_memory < 1 << 30);
+        assert!(Preset::Ultra.is_advanced());
+        assert_eq!(Preset::Zstd.for_sevenzip(), Preset::Balanced);
+        assert!(Preset::Fast.estimate_for(ArchiveFormat::SevenZip).contains("MB"));
     }
 
     #[test]
