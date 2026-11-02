@@ -265,7 +265,7 @@ Explorer is a file manager designed around that workflow:
 ### Zip archives
 
 - **Open a zip like a folder.** Double-click or press <kbd>Enter</kbd> on a `.zip` and browse
-  it in the pane: the path reads `D:\Photos	rip.zip\day 1\`, Back and Up lead out again, and
+  it in the pane: the path reads `D:\Photos\trip.zip\day 1\`, Back and Up lead out again, and
   the Details view adds Compressed, Ratio and Method columns. Opening a file inside extracts
   just that file to a temporary folder; small images get thumbnails and a preview without
   unpacking the rest. A zip inside a zip opens only when you open it.
@@ -288,7 +288,7 @@ Explorer is a file manager designed around that workflow:
   a wrong password is told apart from a damaged file, and the password is kept for the session
   only, never saved or logged. *Test archive* checks every file's checksum.
 - **Safe with zips from strangers.** Names that would escape the destination (`..\`, `C:\`,
-  `\server\`), Windows device names and hidden streams are refused before anything is written;
+  `\\server\`), Windows device names and hidden streams are refused before anything is written;
   links are never created and planted junctions never followed; zip bombs (overlapping entries,
   absurd ratios or sizes, huge decoder memory) are stopped. Files from a downloaded zip keep the
   "downloaded from the internet" mark, as with Explorer. Reads zips made with Deflate,
