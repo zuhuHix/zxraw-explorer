@@ -93,7 +93,11 @@ impl ZipCryptoKeys {
 fn crc32_byte(crc: u32, b: u8) -> u32 {
     let mut c = (crc ^ u32::from(b)) & 0xFF;
     for _ in 0..8 {
-        c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        c = if c & 1 != 0 {
+            0xEDB8_8320 ^ (c >> 1)
+        } else {
+            c >> 1
+        };
     }
     (crc >> 8) ^ c
 }
