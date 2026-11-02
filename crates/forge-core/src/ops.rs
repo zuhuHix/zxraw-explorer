@@ -477,7 +477,6 @@ pub fn copy_file_atomic(
             still_ok: None,
             still_ok_message: None,
             replace: None,
-            hold: None,
         },
     )
 }
@@ -506,7 +505,6 @@ pub fn copy_file_atomic_guarded(
             still_ok: Some(still_ok),
             still_ok_message: Some("destination changed since preview; it was not overwritten"),
             replace: None,
-            hold: None,
         },
     )
 }
@@ -578,62 +576,161 @@ pub(crate) fn write_stream_placed<R: Read>(
         still_ok: None,
         still_ok_message: None,
         replace: None,
-        hold: None,
     };
     let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
     Ok((out, placed))
 }
 
-/// A finished temp file not published yet (see [`write_stream_held`]). Dropping it deletes
-/// the temp file.
+/// A finished temp file not published yet (see [`write_stream_held`]). Its handle stays
+/// open from creation until it is published or discarded, shared for reading only: nothing
+/// else can write to it, rename it or delete it meanwhile. It is published by renaming that
+/// handle, and discarded (when dropped unpublished) by deleting through it.
 pub(crate) struct HeldFile {
-    tmp: TempGuard,
+    /// `None` once published.
+    file: Option<File>,
+    tmp: PathBuf,
     dest: PathBuf,
     overwrite: bool,
     keep_both: bool,
 }
 
 impl HeldFile {
-    /// Publish it as [`write_stream_placed`] would have; returns where it went.
+    /// Publish it as [`write_stream_placed`] would have, by renaming its open handle; returns
+    /// where it went. On failure it is discarded.
     pub(crate) fn publish(mut self) -> Result<PathBuf> {
-        let tmp = self.tmp.0.clone().expect("held temp");
-        place_retrying(&tmp, &mut self.dest, self.overwrite, self.keep_both)?;
-        self.tmp.disarm();
-        Ok(self.dest)
+        let file = self.file.as_ref().expect("held file");
+        if self.overwrite
+            && fs::symlink_metadata(&self.dest).is_ok_and(|m| m.permissions().readonly())
+        {
+            clear_readonly(&self.dest).map_err(|e| CoreError::io(&self.dest, e))?;
+        }
+        for _ in 0..1024 {
+            match rename_open(file, &self.tmp, &self.dest, self.overwrite) {
+                Ok(()) => {
+                    self.file = None; // closed: the file is in place
+                    return Ok(std::mem::take(&mut self.dest));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && self.keep_both => {
+                    let dir = self.dest.parent().unwrap_or(Path::new(""));
+                    self.dest = paths::unique_name(dir, &paths::name_of(&self.dest));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    return Err(CoreError::AlreadyExists(self.dest.clone()));
+                }
+                Err(e) => return Err(CoreError::io(&self.dest, e)),
+            }
+        }
+        Err(CoreError::AlreadyExists(self.dest.clone()))
+    }
+
+    /// The temp file's path (tests).
+    #[cfg(test)]
+    pub(crate) fn temp_path(&self) -> &Path {
+        &self.tmp
     }
 }
 
-/// [`write_stream_placed`], but the finished temp file is held, not published: the caller
-/// publishes it once something else checked out (a solid 7z block's CRC).
+impl Drop for HeldFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take()
+            && let Err(e) = delete_open(&file, &self.tmp)
+        {
+            tracing::warn!("could not remove held file {}: {e}", self.tmp.display());
+        }
+    }
+}
+
+/// [`write_stream_placed`], but the finished temp file is held open, not published: the
+/// caller publishes it once something else checked out (a solid 7z block's CRC).
 pub(crate) fn write_stream_held<R: Read>(
-    reader: R,
+    mut reader: R,
     label: &Path,
     dest: &Path,
     opts: StreamOptions,
     keep_both: bool,
     ctx: &JobCtx<'_>,
 ) -> Result<(CopyOutcome, HeldFile)> {
-    let mut counted = 0;
-    let mut placed = dest.to_path_buf();
-    let slot = std::cell::RefCell::new(None);
-    let overwrite = opts.overwrite;
-    let publish = Publish {
+    let dir = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| CoreError::Invalid(format!("{} has no parent folder", dest.display())))?;
+    let tmp = dir.join(partial_name());
+    let mut oo = OpenOptions::new();
+    oo.read(true).write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // GENERIC_READ | GENERIC_WRITE | DELETE; others may only read it.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        oo.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = oo.open(&tmp).map_err(|e| CoreError::io(dest, e))?;
+    // Owned from here: an error or cancel below discards it.
+    let mut held = HeldFile {
+        file: Some(file),
+        tmp,
+        dest: dest.to_path_buf(),
+        overwrite: opts.overwrite,
         keep_both,
-        still_ok: None,
-        still_ok_message: None,
-        replace: None,
-        hold: Some(&slot),
     };
-    let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
-    let tmp = slot.into_inner().expect("held temp");
+    let out = held.file.as_mut().expect("just opened");
+    let mut buf = vec![0u8; COPY_CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        ctx.cancel.check()?;
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(CoreError::io(label, e)),
+        };
+        total += n as u64;
+        if let Some(limit) = opts.limit
+            && total > limit
+        {
+            return Err(CoreError::Invalid(format!(
+                "{}: data exceeds the allowed size",
+                label.display()
+            )));
+        }
+        out.write_all(&buf[..n])
+            .map_err(|e| CoreError::io(dest, e))?;
+        ctx.progress.add_bytes(n as u64);
+        #[cfg(test)]
+        AFTER_CHUNK.with(|h| {
+            if let Some(f) = &*h.borrow() {
+                f(label, total);
+            }
+        });
+    }
+    if let Some(exact) = opts.exact
+        && total != exact
+    {
+        return Err(CoreError::Invalid(format!(
+            "{}: {total} bytes of data, {exact} declared (damaged or truncated)",
+            label.display()
+        )));
+    }
+    if let Some(m) = opts.modified
+        && let Err(e) = out.set_modified(m)
+    {
+        ctx.log(format!(
+            "{}: could not preserve modified time: {e}",
+            dest.display()
+        ));
+    }
+    out.sync_all().map_err(|e| CoreError::io(dest, e))?;
+    ctx.cancel.check()?;
     Ok((
-        out,
-        HeldFile {
-            tmp: TempGuard(Some(tmp)),
-            dest: placed,
-            overwrite,
-            keep_both,
+        CopyOutcome {
+            bytes: total,
+            source_hash: None,
         },
+        held,
     ))
 }
 
@@ -652,6 +749,139 @@ fn place_retrying(tmp: &Path, dest: &mut PathBuf, overwrite: bool, keep_both: bo
     Err(CoreError::AlreadyExists(dest.clone()))
 }
 
+/// Rename the file open as `file` (at `from`) to `to`, through its handle: POSIX semantics,
+/// replacing only with `replace`. Falls back to the plain rename class where the extended
+/// one isn't supported.
+#[cfg(windows)]
+fn rename_open(file: &File, _from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, FileRenameInfoEx, SetFileInformationByHandle,
+    };
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    let name: Vec<u16> = paths::long_path_if_needed(to)
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let size = name_offset + (name.len() + 1) * 2;
+    let attempt = |extended: bool| -> windows::core::Result<()> {
+        // u64 words keep the buffer 8-byte aligned, as FILE_RENAME_INFO requires; zeroed, so
+        // RootDirectory is null and the NUL terminator is present.
+        let mut buf = vec![0u64; size.div_ceil(8)];
+        let base = buf.as_mut_ptr().cast::<u8>();
+        // SAFETY: `buf` is zeroed and holds `size` bytes; fields are written through raw
+        // pointers and the name is copied to FileName's byte offset, within `size`.
+        unsafe {
+            let info = base.cast::<FILE_RENAME_INFO>();
+            if extended {
+                let mut flags = FILE_RENAME_FLAG_POSIX_SEMANTICS;
+                if replace {
+                    flags |= FILE_RENAME_FLAG_REPLACE_IF_EXISTS;
+                }
+                (&raw mut (*info).Anonymous.Flags).write(flags);
+            } else {
+                (&raw mut (*info).Anonymous.ReplaceIfExists).write(replace);
+            }
+            (&raw mut (*info).FileNameLength).write((name.len() * 2) as u32);
+            std::ptr::copy_nonoverlapping(
+                name.as_ptr(),
+                base.add(name_offset).cast::<u16>(),
+                name.len(),
+            );
+        }
+        let class = if extended {
+            FileRenameInfoEx
+        } else {
+            FileRenameInfo
+        };
+        // SAFETY: `file` is a live handle opened with DELETE access; `buf` outlives the call.
+        unsafe {
+            SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                class,
+                base.cast(),
+                size as u32,
+            )
+        }
+    };
+    let code_of = |e: &windows::core::Error| (e.code().0 as u32) & 0xFFFF;
+    let result = match attempt(true) {
+        // ERROR_INVALID_PARAMETER (87) / ERROR_NOT_SUPPORTED (50) / ERROR_INVALID_FUNCTION (1):
+        // no FileRenameInfoEx here.
+        Err(e) if matches!(code_of(&e), 1 | 50 | 87) => attempt(false),
+        other => other,
+    };
+    result.map_err(|e| {
+        let code = code_of(&e);
+        // ERROR_ALREADY_EXISTS (183) / ERROR_FILE_EXISTS (80) -> AlreadyExists.
+        if code == 183 || code == 80 {
+            io::Error::new(io::ErrorKind::AlreadyExists, "destination already exists")
+        } else {
+            io::Error::from_raw_os_error(code as i32)
+        }
+    })
+}
+
+#[cfg(not(windows))]
+fn rename_open(_file: &File, from: &Path, to: &Path, replace: bool) -> io::Result<()> {
+    if replace {
+        fs::rename(from, to)
+    } else {
+        paths::rename_no_replace(from, to)
+    }
+}
+
+/// Delete the file open as `file` (at `from`) through its handle (POSIX semantics where
+/// supported); it goes when the handle closes.
+#[cfg(windows)]
+fn delete_open(file: &File, _from: &Path) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+    let handle = HANDLE(file.as_raw_handle());
+    let ex = FILE_DISPOSITION_INFO_EX {
+        Flags: windows::Win32::Storage::FileSystem::FILE_DISPOSITION_INFO_EX_FLAGS(
+            FILE_DISPOSITION_FLAG_DELETE.0 | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS.0,
+        ),
+    };
+    // SAFETY: a live handle opened with DELETE access; the structs outlive the calls.
+    let done = unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfoEx,
+            (&raw const ex).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if done.is_ok() {
+        return Ok(());
+    }
+    let plain = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: as above.
+    unsafe {
+        SetFileInformationByHandle(
+            handle,
+            FileDispositionInfo,
+            (&raw const plain).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|e| io::Error::from_raw_os_error((e.code().0 as u32 & 0xFFFF) as i32))
+}
+
+#[cfg(not(windows))]
+fn delete_open(_file: &File, from: &Path) -> io::Result<()> {
+    fs::remove_file(from)
+}
+
 /// How a finished temp file is published: under the next free name when the destination
 /// is taken (`keep_both`), and only if `still_ok` (when given) agrees at that moment.
 struct Publish<'a> {
@@ -662,8 +892,6 @@ struct Publish<'a> {
     /// checking `still_ok` and renaming over it. The cell receives the previous version's
     /// path when it could not be deleted afterwards.
     replace: Option<(&'a ReplaceState, &'a Cell<Option<PathBuf>>)>,
-    /// Don't publish: hand the finished temp file over in this cell (see [`HeldFile`]).
-    hold: Option<&'a std::cell::RefCell<Option<PathBuf>>>,
 }
 
 fn stream_into_place<R: Read>(
@@ -680,7 +908,6 @@ fn stream_into_place<R: Read>(
         still_ok,
         still_ok_message,
         replace,
-        hold,
     } = publish;
     let dir = dest
         .parent()
@@ -768,14 +995,6 @@ fn stream_into_place<R: Read>(
         }
     }
     ctx.cancel.check()?;
-    if let Some(slot) = hold {
-        guard.disarm();
-        *slot.borrow_mut() = Some(tmp);
-        return Ok(CopyOutcome {
-            bytes: total,
-            source_hash,
-        });
-    }
     if let Some((state, leftover)) = replace {
         let kept = replace_guarded(&tmp, dest, state).map_err(|refused| {
             CoreError::Invalid(format!("{}: {}", dest.display(), refused.message()))
@@ -2240,7 +2459,6 @@ impl Executor<'_, '_, '_> {
                     .as_ref()
                     .filter(|_| overwrite)
                     .map(|state| (state, &replace_leftover)),
-                hold: None,
             },
         );
         self.ctx.progress.add_items(1);
@@ -3995,7 +4213,11 @@ mod tests {
         let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| false);
         assert!(r.is_err());
         assert_eq!(fs::read(&dest).unwrap(), b"the user's edit");
-        assert_eq!(fs::read_dir(&f.dst).unwrap().count(), 1, "the temp file is removed");
+        assert_eq!(
+            fs::read_dir(&f.dst).unwrap().count(),
+            1,
+            "the temp file is removed"
+        );
         let r = copy_file_atomic_guarded(&src, &dest, opts, &ctx, &|| true);
         assert!(r.is_ok());
         assert_eq!(fs::read(&dest).unwrap(), b"source bytes");
