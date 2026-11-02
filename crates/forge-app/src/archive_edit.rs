@@ -9,9 +9,12 @@
 //! * Delete: Delete and Shift+Delete in an archive pane remove the entries after a
 //!   confirmation, with the same kind of job.
 //!
-//! Ctrl+C in an archive pane cannot put the entries on the Windows clipboard (they are not
-//! files), so the app keeps an [`ArchiveCopy`] record that Ctrl+V uses while nothing newer
-//! was copied (see [`archive_copy_is_newest`]).
+//! Ctrl+C and Ctrl+X in an archive pane put the entries on the Windows clipboard as virtual
+//! files (see `archive_out`), for Explorer and other apps. The app also keeps an
+//! [`ArchiveCopy`] record that Ctrl+V here uses while nothing newer was copied (see
+//! [`archive_copy_is_newest`]): it extracts with the job below rather than reading the
+//! virtual files back. A move out (Ctrl+X, F6, a Shift-drag) extracts, then removes the
+//! items only once all of them were extracted, after a confirmation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,6 +41,8 @@ pub struct ArchiveCopy {
     pub selection: archive::Selection,
     /// The Windows clipboard's sequence number when copied: a later copy anywhere changes it.
     pub baseline_sequence: u32,
+    /// Ctrl+X: what a paste removes from the archive once everything was extracted.
+    pub move_out: Option<crate::archive_out::MoveOut>,
 }
 
 /// An edit of an archive to run as a job (after a confirmation when it replaces or deletes).
@@ -76,7 +81,7 @@ pub fn items(n: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// The archive view of a pane that lists `path` (a path inside an archive, not the archive).
-fn view_listing(app: &ZxrawApp, path: &Path) -> Option<ArchiveView> {
+pub(crate) fn view_listing(app: &ZxrawApp, path: &Path) -> Option<ArchiveView> {
     panes(app)
         .filter_map(|p| p.archive.as_ref())
         .find(|v| path != v.archive && path.starts_with(&v.archive))
@@ -156,8 +161,16 @@ pub fn transfer(
 ) -> bool {
     let from_archive = paths.iter().any(|p| view_listing(app, p).is_some());
     let into = archive_folder(app, target);
+    let source = paths.iter().find_map(|p| view_listing(app, p));
     match (from_archive, into) {
         (false, None) => false,
+        // Into the archive the items come from (a drag back onto its pane): nothing to do.
+        (true, Some(Ok((view, _))))
+            if source
+                .is_some_and(|s| forge_core::paths::paths_equal(&s.archive, &view.archive)) =>
+        {
+            true
+        }
         (true, Some(_)) => {
             app.toast(format!(
                 "{what}: from one archive into another is not available yet"
@@ -195,10 +208,9 @@ fn copy_out(app: &mut ZxrawApp, paths: &[PathBuf], target: &Path, copy: bool) {
         app.toast("Nothing to copy: the items are no longer in the archive");
         return;
     };
-    if !copy {
-        app.toast("Items can't be moved out of an archive: copying them instead");
-    }
-    extract_selection(app, view.archive, selection, target.to_path_buf());
+    let then_remove =
+        (!copy).then(|| crate::archive_out::MoveOut::in_app(&view, selection.names.clone()));
+    extract_selection(app, view.archive, selection, target.to_path_buf(), then_remove);
 }
 
 fn extract_selection(
@@ -206,6 +218,7 @@ fn extract_selection(
     archive: PathBuf,
     selection: archive::Selection,
     dest: PathBuf,
+    then_remove: Option<crate::archive_out::MoveOut>,
 ) {
     crate::archive_extract::start_extract(
         app,
@@ -216,26 +229,56 @@ fn extract_selection(
             selection: Some(selection),
             policy: None,
             allow_unchecked: false,
+            then_remove,
         },
     );
 }
 
-/// Ctrl+C in an archive pane: remember the selected entries for Ctrl+V in a folder.
+/// Ctrl+C in an archive pane: offer the selected entries on the Windows clipboard, and
+/// remember them for Ctrl+V in a folder here.
 pub fn copy(app: &mut ZxrawApp) {
-    let Some(view) = app.pane().archive.clone() else {
+    let targets = app.pane().action_targets();
+    copy_paths(app, &targets, false);
+}
+
+/// Ctrl+X in an archive pane: as [`copy`], and a paste moves the entries out.
+pub fn cut(app: &mut ZxrawApp) {
+    let targets = app.pane().action_targets();
+    copy_paths(app, &targets, true);
+}
+
+/// Copy or cut listed archive `paths` (see [`copy`]).
+pub fn copy_paths(app: &mut ZxrawApp, paths: &[PathBuf], cut: bool) {
+    let Some(view) = paths.first().and_then(|p| view_listing(app, p)) else {
         return;
     };
-    let targets = app.pane().action_targets();
-    let Some(selection) = selection_of(&view, &targets) else {
+    let Some(selection) = selection_of(&view, paths) else {
         return;
     };
     let n = selection.names.len();
+    let move_out = match crate::archive_out::publish(app, paths, cut) {
+        crate::archive_out::Published::Asking => return,
+        crate::archive_out::Published::Yes(moved) => cut.then_some(moved),
+        crate::archive_out::Published::No => {
+            cut.then(|| crate::archive_out::MoveOut::in_app(&view, selection.names.clone()))
+        }
+    };
+    // Newer than any file list copied before: that one no longer pastes.
+    app.ops.supersede_file_clipboard();
     app.ops.archive.copied = Some(ArchiveCopy {
         archive: view.archive,
         selection,
         baseline_sequence: forge_win::clipboard_sequence(),
+        move_out,
     });
-    app.toast(format!("Copied {} from the archive", items(n)));
+    app.toast(if cut {
+        format!(
+            "Cut {} from the archive: paste in a folder (here or in Explorer) to move them out",
+            items(n)
+        )
+    } else {
+        format!("Copied {} from the archive", items(n))
+    });
 }
 
 /// Whether Ctrl+V should paste the archive copy rather than a file list: nothing else was
@@ -257,7 +300,7 @@ pub fn paste_archive_copy(app: &mut ZxrawApp, copied: ArchiveCopy, dest: PathBuf
         app.toast("Paste: from one archive into another is not available yet");
         return;
     }
-    extract_selection(app, copied.archive, copied.selection, dest);
+    extract_selection(app, copied.archive, copied.selection, dest, copied.move_out);
 }
 
 /// Whether `dest` is inside an archive some pane shows (a paste there adds to it).
