@@ -12,11 +12,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   never finished, and Zstandard, Brotli, LZ4 or Deflate64 blocks (7-Zip forks) are not read;
   the last are reported per file as an unsupported method. New 7z archives use LZMA2 with the
   x86 BCJ filter for executables; BCJ2 and the ARM filters are read but never written.
-* 7z AES has no password check of its own. ZXraw decodes the start of the encrypted blocks
-  before extracting, which catches a wrong password for compressed data; for stored (Copy)
-  data in an archive with visible names it can't, and a wrong password then shows as a CRC
-  failure, "damaged data or wrong password". With encrypted names the header's checksum
-  settles it.
+* 7z AES has no password check of its own. A password counts as proven only when a file
+  decodes in full and matches its CRC (ZXraw decodes at most 4 MB of each encrypted block from
+  its start looking for one), or when encrypted names pass their checksum. A password that
+  fails to decode is refused before anything is written. One that can't be proven (big stored
+  files, an archive without CRCs) still lets you extract, because every file is checked against
+  its CRC and one that fails, "damaged data or wrong password", is never written; but files are
+  not added to such an archive.
 * The 7z library (`sevenz-rust2`) keeps its own UTF-16 copy of the password during an
   operation (freed, not wiped, afterwards) and keeps the last AES key it derived in memory
   until it derives another. ZXraw's own copies are wiped.
