@@ -7,7 +7,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Formats and media
 
-* Archive support is ZIP only. There is no 7z, RAR, or TAR reader (`forge-core/src/archive.rs`).
+* Archive support is ZIP only. There is no 7z, RAR, or TAR reader yet (`forge-core/src/archive/`).
+* ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
+  caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
+  "damaged data or wrong password". AES archives always tell the two apart.
 * ZXraw does not develop RAW files. RAW preview support extracts an embedded JPEG preview;
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF

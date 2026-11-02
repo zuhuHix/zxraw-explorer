@@ -14,7 +14,7 @@ project's working name; it never appears in the UI.
 | Images | `image` crate (JPEG/PNG/TIFF/WebP/GIF/BMP) + WIC fallback (Phase 3) | Pure Rust decoders for the common path; WIC adds HEIC/AVIF/RAW codecs the user has installed. |
 | RAW | Embedded JPEG previews extracted via EXIF/TIFF IFD parsing (`kamadak-exif`) | Every mainstream RAW embeds a full-size or large JPEG preview. We do not develop RAWs (explicit non-goal). |
 | Video | **External `ffprobe`/`ffmpeg` executables**, discovered on PATH or configured | No linking → no LGPL/GPL redistribution obligations in our binary, crash isolation (a codec crash kills a child process, not the app), hard timeouts. ZXraw Explorer works fully without them; video metadata/thumbnails degrade gracefully. |
-| Archives | `zip` crate for browse/extract/create; path traversal checked | 7z/RAR: not yet (documented limitation). |
+| Archives | `forge-core::archive`: an `ArchiveBackend` trait (list / stream entries / create / update) with the `zip` crate as the first backend (Deflate via zlib-rs and Zopfli, Deflate64, bzip2, LZMA, XZ, Zstandard, PPMd, AES and ZipCrypto); safety checks, conflicts, progress and Mark-of-the-Web are shared by all formats | 7z, tar and RAR are later backends. |
 | Windows shell | `windows` crate 0.62 | Recycle Bin and shell deletes (`IFileOperation` with a progress sink), ShellExecute/"Open with", drive enumeration, Properties dialog. |
 
 ## Crates
@@ -78,7 +78,11 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
    that states the count and that it cannot be undone. An item the Recycle Bin refuses (too
    big, or no Recycle Bin on its drive) is never deleted permanently without that question.
 5. Ingest never modifies the source; verification re-reads the *destination* from disk.
-6. Archive extraction rejects absolute paths, `..` components, and drive prefixes.
+6. Archive extraction validates every entry name before writing (absolute, `..`, drive/UNC/device
+   prefixes, `:` streams, NUL, reserved device names), never creates links or writes through a
+   junction, enforces entry count, size, ratio and decoder memory limits while streaming, rejects
+   overlapping entries and local/central header mismatches, and copies the archive's
+   Mark-of-the-Web to what it extracts.
 7. External tools are launched with argument vectors, never through a shell string.
 8. Metadata edits (ratings/labels/tags) are stored in the DB and/or XMP sidecars; original
    media files are not rewritten.
