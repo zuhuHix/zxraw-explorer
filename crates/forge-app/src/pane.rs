@@ -54,6 +54,11 @@ struct ChildLoad {
 /// Folders opened in place are listed by a small shared pool of workers, so opening many
 /// folders never starts one thread each.
 const SUBDIR_WORKERS: usize = 4;
+/// Rows per listing batch, for folders on disk and inside archives alike.
+const LIST_BATCH: usize = 2048;
+/// Rows a frame takes in from listings at most: an archive's folder of 100,000 entries
+/// arrives at once and must not stall a frame (the full sort runs when it is complete).
+const ROWS_PER_FRAME: usize = 16 * 1024;
 /// Listing messages a pane may have waiting; a worker waits when its pane is this far behind.
 const SUBDIR_BACKLOG: usize = 64;
 
@@ -85,8 +90,13 @@ fn subdir_queue() -> &'static Sender<ListJob> {
                         if let Some(listed) = crate::archive_ui::list_archive_path(&job.dir) {
                             let msg = match listed {
                                 ArchiveListing::Folder { entries, .. } => {
-                                    let batch = ListMsg::Batch(entries);
-                                    let _ = job.tx.send((job.id, job.dir.clone(), batch));
+                                    for batch in batches(entries) {
+                                        if job.cancel.is_cancelled() {
+                                            break;
+                                        }
+                                        let batch = ListMsg::Batch(batch);
+                                        let _ = job.tx.send((job.id, job.dir.clone(), batch));
+                                    }
                                     ListMsg::Done { errors: 0 }
                                 }
                                 ArchiveListing::File => ListMsg::Failed("not a folder".into()),
@@ -95,7 +105,7 @@ fn subdir_queue() -> &'static Sender<ListJob> {
                             let _ = job.tx.send((job.id, job.dir, msg));
                             continue;
                         }
-                        let r = listing::list_dir_streaming(&job.dir, 2048, &job.cancel, |b| {
+                        let r = listing::list_dir_streaming(&job.dir, LIST_BATCH, &job.cancel, |b| {
                             let _ = job.tx.send((job.id, job.dir.clone(), ListMsg::Batch(b)));
                         });
                         if job.cancel.is_cancelled() {
@@ -117,6 +127,19 @@ fn subdir_queue() -> &'static Sender<ListJob> {
 /// contents, so an operation must not get both (a copy would duplicate the child, a move or
 /// delete would fail on it). Compared per component, ignoring case, as Windows does, so
 /// `C:\a\b` covers `C:\a\b\c` but not `C:\a\bc`.
+/// Split a listing into [`LIST_BATCH`]-sized batches.
+fn batches(entries: Vec<FileEntry>) -> Vec<Vec<FileEntry>> {
+    let mut out = Vec::with_capacity(entries.len().div_ceil(LIST_BATCH));
+    let mut rows = entries.into_iter();
+    loop {
+        let batch: Vec<FileEntry> = rows.by_ref().take(LIST_BATCH).collect();
+        if batch.is_empty() {
+            return out;
+        }
+        out.push(batch);
+    }
+}
+
 pub fn without_covered(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     fn key(path: &Path) -> Vec<String> {
         path.components()
@@ -592,7 +615,12 @@ impl Pane {
                     let _ = match listed {
                         ArchiveListing::Folder { view, entries } => {
                             let _ = tx.send(ListMsg::Archive(Some(view)));
-                            let _ = tx.send(ListMsg::Batch(entries));
+                            for batch in batches(entries) {
+                                if cancel.is_cancelled() {
+                                    return;
+                                }
+                                let _ = tx.send(ListMsg::Batch(batch));
+                            }
                             tx.send(ListMsg::Done { errors: 0 })
                         }
                         ArchiveListing::File => tx.send(ListMsg::IsFile),
@@ -601,7 +629,7 @@ impl Pane {
                     return;
                 }
                 let _ = tx.send(ListMsg::Archive(None));
-                let r = listing::list_dir_streaming(&path, 2048, &cancel, |b| {
+                let r = listing::list_dir_streaming(&path, LIST_BATCH, &cancel, |b| {
                     let _ = tx.send(ListMsg::Batch(b));
                 });
                 let _ = tx.send(match r {
@@ -662,12 +690,18 @@ impl Pane {
         let mut is_file = false;
         let mut open = Vec::new();
         // Bound the work per frame so a giant folder can't stall a frame.
+        let mut rows = 0;
         for _ in 0..64 {
+            if rows >= ROWS_PER_FRAME {
+                break;
+            }
             match rx.try_recv() {
                 Ok(ListMsg::Batch(b)) if self.staged.is_some() => {
+                    rows += b.len();
                     self.staged.as_mut().unwrap().extend(b);
                 }
                 Ok(ListMsg::Batch(b)) => {
+                    rows += b.len();
                     if self.view == ViewMode::Details && !self.expanded.is_empty() {
                         open.extend(
                             b.iter()
@@ -1499,8 +1533,15 @@ impl Pane {
         let mut listed = Vec::new();
         // Listings of open folders that finished, and whether each was complete.
         let mut refreshed = Vec::new();
+        let mut rows = 0;
         for _ in 0..64 {
+            if rows >= ROWS_PER_FRAME {
+                break;
+            }
             let Ok((id, dir, msg)) = self.child_rx.try_recv() else { break };
+            if let ListMsg::Batch(b) = &msg {
+                rows += b.len();
+            }
             let Some(load) = self.children.get_mut(&dir).filter(|l| l.id == id) else {
                 continue;
             };
@@ -3364,6 +3405,38 @@ mod tests {
         assert_eq!((one.kind, one.ext.as_str()), (EntryKind::File, "txt"));
         // Nothing inside is handed to the folder size service.
         assert!(pane.listed_folders().is_empty());
+    }
+
+    #[test]
+    fn a_big_archive_folder_arrives_in_bounded_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("big.zip");
+        let n = ROWS_PER_FRAME * 2 + 100;
+        let names: Vec<String> = (0..n).rev().map(|i| format!("f{i:06}.txt")).collect();
+        let files: Vec<(&str, &[u8])> = names.iter().map(|s| (s.as_str(), &b""[..])).collect();
+        write_zip(&zip, &files);
+        let mut pane = Pane::new(zip.clone(), SortSpec::default(), ViewMode::Details);
+        // Wait until the listing thread has sent everything, then count rows per poll.
+        let deadline = Instant::now() + std::time::Duration::from_secs(20);
+        while pane.rx.as_ref().is_some_and(|rx| rx.len() < n.div_ceil(LIST_BATCH) + 1) {
+            assert!(Instant::now() < deadline, "listing timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let mut polls = 0;
+        let mut before = pane.entries.len();
+        while pane.is_busy() {
+            pane.poll();
+            polls += 1;
+            assert!(pane.entries.len() - before <= ROWS_PER_FRAME + LIST_BATCH);
+            before = pane.entries.len();
+            assert!(polls < 100);
+        }
+        assert!(polls >= 3, "{polls} polls");
+        settle(&mut pane);
+        assert_eq!(pane.visible.len(), n);
+        // Sorted once complete.
+        assert_eq!(pane.entries[pane.visible[0]].name, "f000000.txt");
+        assert_eq!(batches(Vec::new()).len(), 0);
     }
 
     #[test]
