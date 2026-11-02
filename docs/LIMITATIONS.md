@@ -53,7 +53,8 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * Windows' own `tar.exe` (bsdtar) can't read or write names outside the ANSI code page (it fails
   on Cyrillic or Chinese names whoever made the archive); ZXraw reads and writes them as UTF-8
   PAX names, which GNU tar, 7-Zip and Python read.
-* 7z: split archives (`.7z.001`), self-extracting `.exe` archives, archives whose header was
+* 7z: split archives (`.7z.001`), self-extracting `.exe` archives (detected, but not opened yet:
+  the 7z reader needs a start offset first), archives whose header was
   never finished, and Zstandard, Brotli, LZ4 or Deflate64 blocks (7-Zip forks) are not read;
   the last are reported per file as an unsupported method. New 7z archives use LZMA2 with the
   x86 BCJ filter for executables; BCJ2 and the ARM filters are read but never written.
@@ -77,8 +78,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   the end. *Test archive* reports encrypted files without any checksum under an unproven
   password as "can't be verified", never as OK.
 * Self-extracting zips (a program stub in front of the archive) can be opened and extracted
-  but not edited: an edit would drop the stub. Only archives with a zip, 7z or archive-like
-  extension open as folders; a self-extracting `.exe` doesn't.
+  but not edited: an edit would drop the stub. A self-extracting `.exe` never opens on
+  double-click (it still runs); right-click › *Open as archive* opens it as a folder. That
+  choice lasts until ZXraw closes (up to 32 files). Detection reads the program's PE header and
+  searches at most 16 MB after its image for the archive, keeping only a structure that checks
+  out (a 7z signature inside the program loses to a valid zip after it). A self-extracting zip64
+  is found only by its end record, as before. A self-extracting 7z is recognised, but opening it
+  reports "can't be opened yet", and editing it is refused like a zip's.
 * Editing a 7z recompresses the solid blocks that lose a file. Those blocks are held to the
   extraction limits (decoder memory, total size), and their kept files are spilled to a temp
   file next to the archive, so that much free space is needed there; otherwise the edit is
@@ -105,6 +111,28 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * UnRAR itself turns `:` in RAR names into `_` (such files extract under that name) and blanks a
   name with `..` in it; a blanked name counts as unsafe, so the archive refuses extraction, as
   other formats do with unsafe names.
+* **Extraction destination.** The destination is resolved once when the job starts (before the
+  archive is planned), and every folder from the volume root down stays open until the job
+  ends, so none can be renamed, deleted or replaced by a junction meanwhile. A folder the
+  extraction makes (*Extract to `<name>\`*, smart, selections) is held from the moment it is
+  made, and taking back a cancelled extraction happens while it is still held. Not covered:
+  changes before the job starts (a junction or mapped drive in the chosen path is followed, as
+  it is then); in the instant between making a new folder and holding it, someone allowed to
+  rename in its parent can swap it for another real folder (never a link), and files then still
+  land at the chosen path; on a network share the hold depends on the server enforcing Windows
+  sharing rules; a volume mounted in an NTFS folder (no drive letter) is refused as a link; the
+  *Extract them anyway* rerun makes its folder by path.
+* Temp files left by a crash or an older version (exactly `.forge-partial-<32 hex>.tmp`, or the
+  old `.forge-partial-<16 hex>`) are removed from an extraction's destination and the existing
+  folders it writes into when a job starts, once over an hour old. A file in use, a folder, a
+  link or a hard-linked file with such a name is always kept. Leftovers in folders ZXraw never
+  extracts into again stay until it does. At startup `%TEMP%\ZXraw Archive Temp` loses folders
+  (and stray temp files) over a day old, except the drag-out folders of a ZXraw still running;
+  links there are removed as links, never followed.
+* Archives are told apart by a stamp of their size, modified time, file identity and their
+  first 4 KB and last 64 KB. A replacement with the same size and time that differs only in the
+  middle, in place (same file, an unusual edit that leaves the archive's directory alone), is
+  still taken for the old one: its listing and thumbnails stay until it changes again.
 * Inside an open zip, 7z or tar, rename and new folder are not available, and copying between two
   archives is refused. Photos inside a zip open with their default app, not the built-in viewer.
 * Items dragged or copied out of an archive to other apps are virtual files
