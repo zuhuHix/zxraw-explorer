@@ -1223,40 +1223,62 @@ mod imp {
         Os(windows::core::Error),
     }
 
+    /// How one overlapped operation ended, with the bytes it transferred as the system counted
+    /// them: also when it failed, or was cancelled after its wait ran out (a cancel can race
+    /// with completion, so a "cancelled" write may still have transferred everything).
+    pub(super) struct Transfer {
+        pub(super) bytes: u32,
+        /// `Ok` when it completed; else its error (`ERROR_OPERATION_ABORTED` when cancelled).
+        pub(super) end: windows::core::Result<()>,
+        /// The wait ran out and the operation was cancelled (it may still have completed).
+        pub(super) timed_out: bool,
+    }
+
+    /// Runs one overlapped read or write on `handle`, cancelling it after `timeout`, and
+    /// reports everything about how it ended.
+    fn transfer(
+        handle: HANDLE,
+        timeout: Duration,
+        start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
+    ) -> Transfer {
+        let event = match unsafe { CreateEventW(None, true, false, PCWSTR::null()) } {
+            Ok(event) => Owned(event),
+            Err(e) => return Transfer { bytes: 0, end: Err(e), timed_out: false },
+        };
+        let mut ov = OVERLAPPED { hEvent: event.0, ..Default::default() };
+        match start(&mut ov) {
+            Ok(()) => {}
+            Err(e) if is(&e, ERROR_IO_PENDING) => {}
+            // Failed when issued: nothing was queued, so nothing was transferred.
+            Err(e) => return Transfer { bytes: 0, end: Err(e), timed_out: false },
+        }
+        let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+        let timed_out = unsafe { WaitForSingleObject(event.0, ms) } != WAIT_OBJECT_0;
+        let mut n = 0;
+        let end = unsafe {
+            if timed_out {
+                let _ = CancelIoEx(handle, Some(&ov));
+            }
+            // Waits for the (possibly cancelled) operation to settle.
+            GetOverlappedResult(handle, &ov, &mut n, timed_out)
+        };
+        // The count the system recorded for the operation, success or not.
+        let bytes = n.max(ov.InternalHigh as u32);
+        Transfer { bytes, end, timed_out }
+    }
+
     /// Runs one overlapped read or write on `handle`, cancelling it after `timeout`.
     fn overlapped(
         handle: HANDLE,
         timeout: Duration,
         start: impl FnOnce(*mut OVERLAPPED) -> windows::core::Result<()>,
     ) -> std::result::Result<u32, IoError> {
-        let event = Owned(unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(IoError::Os)?);
-        let mut ov = OVERLAPPED { hEvent: event.0, ..Default::default() };
-        match start(&mut ov) {
-            Ok(()) => {}
-            Err(e) if is(&e, ERROR_IO_PENDING) => {}
-            Err(e) if is(&e, ERROR_MORE_DATA) => return Err(IoError::MoreData),
-            Err(e) => return Err(IoError::Os(e)),
-        }
-        let ms = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
-        if unsafe { WaitForSingleObject(event.0, ms) } != WAIT_OBJECT_0 {
-            let mut n = 0;
-            // The operation may complete between the wait running out and the cancel: then it
-            // happened (a write was delivered), and the caller must know.
-            let settled = unsafe {
-                let _ = CancelIoEx(handle, Some(&ov));
-                GetOverlappedResult(handle, &ov, &mut n, true)
-            };
-            return match settled {
-                Ok(()) => Ok(n),
-                Err(e) if is(&e, ERROR_OPERATION_ABORTED) => Err(IoError::TimedOut),
-                Err(e) if is(&e, ERROR_MORE_DATA) => Err(IoError::MoreData),
-                Err(e) => Err(IoError::Os(e)),
-            };
-        }
-        let mut n = 0;
-        match unsafe { GetOverlappedResult(handle, &ov, &mut n, false) } {
-            Ok(()) => Ok(n),
+        let Transfer { bytes, end, timed_out } = transfer(handle, timeout, start);
+        match end {
+            // Also when it completed between the wait running out and the cancel.
+            Ok(()) => Ok(bytes),
             Err(e) if is(&e, ERROR_MORE_DATA) => Err(IoError::MoreData),
+            Err(e) if timed_out && is(&e, ERROR_OPERATION_ABORTED) => Err(IoError::TimedOut),
             Err(e) => Err(IoError::Os(e)),
         }
     }
@@ -1273,26 +1295,44 @@ mod imp {
     /// Whether a commit message reached the receiver's end of the pipe.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum CommitOutcome {
+        /// The whole commit message was transferred: the receiver can read it and run the
+        /// action, so this end must not.
         Delivered,
-        /// Provably not: the write was cancelled before it completed, or the receiver's end
-        /// was already closed, so the receiver drops the action.
+        /// Provably not: no byte of it was transferred, and the write ended in a way that
+        /// cannot transfer one later.
         NotDelivered,
-        /// Neither can be shown (a partial write, an unexpected error).
+        /// Neither can be shown (part of it transferred, or an unexpected end).
         Unknown,
     }
 
-    /// Classifies the commit write: `Ok(n)` is the number of bytes written.
-    pub(super) fn commit_outcome(written: std::result::Result<u32, &IoError>) -> CommitOutcome {
-        match written {
-            Ok(n) if n as usize == COMMIT.len() => CommitOutcome::Delivered,
-            Ok(_) => CommitOutcome::Unknown,
-            Err(IoError::TimedOut) => CommitOutcome::NotDelivered,
-            Err(IoError::Os(e))
-                if is(e, ERROR_BROKEN_PIPE) || is(e, ERROR_NO_DATA) || is(e, ERROR_PIPE_NOT_CONNECTED) =>
+    /// Classifies the commit write from the bytes it transferred and how it ended.
+    ///
+    /// * All of [`COMMIT`] transferred: delivered, whatever the error says (a cancel that
+    ///   raced with completion, or a broken pipe reported after the receiver read it).
+    /// * Nothing transferred, and the write was cancelled (`ERROR_OPERATION_ABORTED`) or the
+    ///   receiver's end is gone (broken pipe, not connected, being closed): not delivered.
+    ///   That is safe even though the receiver is still waiting: it commits only when it reads
+    ///   the complete 8-byte `COMMIT` message (`handle` compares the whole message), and on a
+    ///   message-mode pipe a message no byte of which was accepted can never be read, so it
+    ///   drops the action when this end closes the pipe.
+    /// * Anything else (a partial write, a zero-byte "success", another error): unknown.
+    pub(super) fn commit_outcome(bytes: u32, end: Result<(), &windows::core::Error>) -> CommitOutcome {
+        if bytes as usize == COMMIT.len() {
+            return CommitOutcome::Delivered;
+        }
+        if bytes != 0 {
+            return CommitOutcome::Unknown;
+        }
+        match end {
+            Err(e)
+                if is(e, ERROR_OPERATION_ABORTED)
+                    || is(e, ERROR_BROKEN_PIPE)
+                    || is(e, ERROR_PIPE_NOT_CONNECTED)
+                    || is(e, ERROR_NO_DATA) =>
             {
                 CommitOutcome::NotDelivered
             }
-            Err(_) => CommitOutcome::Unknown,
+            _ => CommitOutcome::Unknown,
         }
     }
 
@@ -1304,10 +1344,11 @@ mod imp {
     }
 
     fn write_commit(handle: HANDLE) -> CommitOutcome {
-        let written = overlapped(handle, Duration::from_secs(2), |ov| unsafe {
+        let written = transfer(handle, Duration::from_secs(2), |ov| unsafe {
             WriteFile(handle, Some(&COMMIT), None, Some(ov))
         });
-        let outcome = commit_outcome(written.as_ref().map(|n| *n));
+        let outcome = commit_outcome(written.bytes, written.end.as_ref().map(|_| ()));
+
         #[cfg(test)]
         if COMMIT_UNKNOWN.with(|c| c.replace(false)) {
             return CommitOutcome::Unknown;
@@ -2162,19 +2203,43 @@ mod tests {
 
         #[test]
         fn a_commit_is_delivered_only_when_provably_written() {
-            use imp::{CommitOutcome, IoError, commit_outcome};
-            use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_INVALID_HANDLE, ERROR_NO_DATA};
-            let os = |code| IoError::Os(windows::core::Error::from(code));
-            assert_eq!(commit_outcome(Ok(COMMIT.len() as u32)), CommitOutcome::Delivered);
-            // A partial write or an unexpected error: maybe delivered, maybe not.
-            assert_eq!(commit_outcome(Ok(3)), CommitOutcome::Unknown);
-            assert_eq!(commit_outcome(Err(&os(ERROR_INVALID_HANDLE))), CommitOutcome::Unknown);
-            assert_eq!(commit_outcome(Err(&IoError::MoreData)), CommitOutcome::Unknown);
-            // Cancelled before completing, or the receiver's end is gone.
-            assert_eq!(commit_outcome(Err(&IoError::TimedOut)), CommitOutcome::NotDelivered);
-            assert_eq!(commit_outcome(Err(&os(ERROR_BROKEN_PIPE))), CommitOutcome::NotDelivered);
-            assert_eq!(commit_outcome(Err(&os(ERROR_NO_DATA))), CommitOutcome::NotDelivered);
+            use imp::{CommitOutcome, commit_outcome};
+            use windows::Win32::Foundation::{
+                ERROR_BROKEN_PIPE, ERROR_INVALID_HANDLE, ERROR_NO_DATA, ERROR_OPERATION_ABORTED,
+                ERROR_PIPE_NOT_CONNECTED, ERROR_SEM_TIMEOUT,
+            };
+            use CommitOutcome::{Delivered, NotDelivered, Unknown};
+            let error = |code| windows::core::Error::from(code);
+            let full = COMMIT.len() as u32;
+            let gone_or_cancelled = [
+                ERROR_OPERATION_ABORTED,
+                ERROR_BROKEN_PIPE,
+                ERROR_PIPE_NOT_CONNECTED,
+                ERROR_NO_DATA,
+            ];
+            // The whole message transferred: delivered, whatever the end says (a cancel that
+            // raced with completion, a broken pipe after the receiver read it).
+            assert_eq!(commit_outcome(full, Ok(())), Delivered);
+            for code in gone_or_cancelled.into_iter().chain([ERROR_INVALID_HANDLE, ERROR_SEM_TIMEOUT]) {
+                assert_eq!(commit_outcome(full, Err(&error(code))), Delivered, "{code:?}");
+            }
+            // Nothing transferred and cancelled, or the receiver's end gone: not delivered.
+            for code in gone_or_cancelled {
+                assert_eq!(commit_outcome(0, Err(&error(code))), NotDelivered, "{code:?}");
+            }
+            // Nothing transferred but another end, or a zero-byte "success": unknown.
+            assert_eq!(commit_outcome(0, Err(&error(ERROR_INVALID_HANDLE))), Unknown);
+            assert_eq!(commit_outcome(0, Err(&error(ERROR_SEM_TIMEOUT))), Unknown);
+            assert_eq!(commit_outcome(0, Ok(())), Unknown);
+            // Part of it transferred: unknown, whatever the end.
+            for bytes in [1, 3, full - 1, full + 1] {
+                assert_eq!(commit_outcome(bytes, Ok(())), Unknown, "{bytes}");
+                for code in gone_or_cancelled {
+                    assert_eq!(commit_outcome(bytes, Err(&error(code))), Unknown, "{bytes} {code:?}");
+                }
+            }
         }
+
 
         /// The ambiguous case: the commit got through, but the sender cannot tell. The window
         /// runs the action once and the sender must not run it as well.

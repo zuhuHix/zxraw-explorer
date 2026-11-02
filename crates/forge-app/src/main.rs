@@ -134,6 +134,11 @@ fn read_launch() -> Option<instance::Launch> {
         return Some(instance::Launch::from_env());
     };
     match forge_win::shell_verb_server::serve_drop(verb, MENU_DROP_WAIT) {
+        Ok(dropped) if dropped.failure.is_some() => {
+            let why = dropped.failure.unwrap_or_default();
+            instance::report_error(&shell_actions::drop_failure_message(verb, &why));
+            None
+        }
         Ok(dropped) if !dropped.unresolved.is_empty() => {
             // Running on the other items alone would quietly make, say, an archive of only
             // part of the selection.
