@@ -1666,6 +1666,7 @@ dependencies = [
  "tracing",
  "windows",
  "windows-core",
+ "zip",
 ]
 
 [[package]]
