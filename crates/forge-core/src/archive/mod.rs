@@ -597,10 +597,14 @@ pub fn extract(
         } else {
             p.rel.parent().unwrap_or(Path::new(""))
         };
-        if let Err(e) = safety::ensure_dirs_no_links(dest_dir, parent_rel) {
-            report.failed.push(OpIssue::new(&target, e.to_string()));
-            return Ok(());
-        }
+        // Held until the entry is in place: the folders it is written into can't be swapped.
+        let _pinned = match safety::pin_dirs(dest_dir, parent_rel) {
+            Ok(pinned) => pinned,
+            Err(e) => {
+                report.failed.push(OpIssue::new(&target, e.to_string()));
+                return Ok(());
+            }
+        };
         if p.entry.is_dir {
             return Ok(());
         }
@@ -640,12 +644,6 @@ pub fn extract(
             ..Default::default()
         };
         let label = PathBuf::from(&p.entry.name);
-        // Entry data can take a while to stream. Recheck every parent immediately before
-        // write_stream_placed creates its temp file beneath them.
-        if let Err(e) = safety::ensure_dirs_no_links(dest_dir, parent_rel) {
-            report.failed.push(OpIssue::new(&dest, e.to_string()));
-            return Ok(());
-        }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
             Ok((out, placed)) => {
                 remaining = remaining.saturating_sub(out.bytes);

@@ -41,14 +41,26 @@ pub fn collision_key(rel: &Path) -> String {
     paths::to_slash(rel).to_lowercase()
 }
 
-/// Create `base/rel` one component at a time, refusing to pass through links or files.
-pub(crate) fn ensure_dirs_no_links(base: &Path, rel: &Path) -> Result<()> {
-    verify_real_directory(base)?;
+/// Folders of the destination held open from the base down to the folder an entry is
+/// written into. Each one was opened without following reparse points and checked by
+/// handle to be a real folder; the handles deny `FILE_SHARE_DELETE`, so while this lives
+/// none of them can be renamed, deleted or replaced by a junction, and a path through
+/// them (the temp file, its rename into place) resolves to the folders that were checked.
+pub(crate) struct PinnedDirs {
+    #[allow(dead_code)] // held for their effect
+    handles: Vec<fs::File>,
+}
+
+/// Create `base/rel` one component at a time, refusing to pass through links, junctions
+/// or files, and return the chain pinned (see [`PinnedDirs`]). Keep it alive while
+/// anything is written beneath.
+pub(crate) fn pin_dirs(base: &Path, rel: &Path) -> Result<PinnedDirs> {
+    let mut handles = vec![open_pinned(base)?];
     let mut cur = base.to_path_buf();
     for c in rel.components() {
         cur.push(c);
         match fs::symlink_metadata(&cur) {
-            Ok(_) => verify_real_directory(&cur)?,
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 #[cfg(test)]
                 BEFORE_PARENT_CREATE.with(|hook| {
@@ -61,13 +73,61 @@ pub(crate) fn ensure_dirs_no_links(base: &Path, rel: &Path) -> Result<()> {
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                     Err(error) => return Err(CoreError::io(&cur, error)),
                 }
-                // `AlreadyExists` may mean that a link or junction won the race.
-                verify_real_directory(&cur)?;
             }
             Err(error) => return Err(CoreError::io(&cur, error)),
         }
+        // Whatever is there now (a link or junction may have won a race) is checked through
+        // the handle that then pins it.
+        handles.push(open_pinned(&cur)?);
     }
-    Ok(())
+    Ok(PinnedDirs { handles })
+}
+
+/// Open a folder itself (not what a reparse point leads to), deny delete sharing, and
+/// check through the handle that it is a real folder.
+#[cfg(windows)]
+fn open_pinned(path: &Path) -> Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    // List access, not just attributes: opens asking only for attributes are left out of
+    // the sharing check, so their share mode would not keep anyone from renaming the folder.
+    const FILE_LIST_DIRECTORY: u32 = 0x1;
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_SHARE_WRITE: u32 = 0x2;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|e| CoreError::io(path, e))?;
+    // GetFileInformationByHandle: the attributes of the opened object itself.
+    let attrs = file
+        .metadata()
+        .map_err(|e| CoreError::io(path, e))?
+        .file_attributes();
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(CoreError::UnsafePath(format!(
+            "{} is a link; refusing to extract through it",
+            path.display()
+        )));
+    }
+    if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 {
+        return Err(CoreError::Invalid(format!(
+            "{} exists and is not a folder",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_pinned(path: &Path) -> Result<fs::File> {
+    verify_real_directory(path)?;
+    fs::File::open(path).map_err(|e| CoreError::io(path, e))
 }
 
 pub(crate) fn verify_real_directory(path: &Path) -> Result<()> {
@@ -247,6 +307,44 @@ mod tests {
         let b = validate_entry_name("dir\\file.txt").unwrap();
         assert_eq!(collision_key(&a), collision_key(&b));
         assert_eq!(normalize_entry_name("a\\b\\"), "a/b/");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pinned_folders_cannot_be_swapped_while_held() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("dest");
+        fs::create_dir(&base).unwrap();
+        let pinned = pin_dirs(&base, Path::new("a/b")).unwrap();
+        // Neither a folder of the chain nor the base can be renamed or removed, so none can
+        // be replaced by a junction while an entry is written beneath them.
+        assert!(fs::rename(base.join("a"), d.path().join("moved")).is_err());
+        assert!(fs::rename(base.join("a/b"), base.join("a/c")).is_err());
+        assert!(fs::remove_dir(base.join("a/b")).is_err());
+        assert!(fs::rename(&base, d.path().join("dest2")).is_err());
+        // Writing beneath them still works.
+        fs::write(base.join("a/b/x.txt"), b"x").unwrap();
+        fs::rename(base.join("a/b/x.txt"), base.join("a/b/y.txt")).unwrap();
+        drop(pinned);
+        fs::remove_file(base.join("a/b/y.txt")).unwrap();
+        fs::rename(base.join("a"), d.path().join("moved")).unwrap();
+
+        // A junction planted in the destination is refused, and nothing is created through it.
+        let outside = d.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(base.join("j"))
+            .arg(&outside)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("mklink unavailable; skipping the junction assertion");
+            return;
+        }
+        let err = pin_dirs(&base, Path::new("j/sub")).err().expect("refused");
+        assert!(matches!(err, CoreError::UnsafePath(_)), "{err:?}");
+        assert!(!outside.join("sub").exists());
     }
 
     #[test]
