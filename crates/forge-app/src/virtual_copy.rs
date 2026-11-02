@@ -102,7 +102,7 @@ fn run(
     let job_ctx = JobCtx::from_job(job);
     let extracted = match forge_win::virtual_files::with_virtual_files(source, |files| {
         let extracted = extract(files, &staging.path, dest, &job_ctx);
-        scrub(&staging.path, &extracted.failed_targets);
+        scrub(&extracted.discard);
         extracted
     }) {
         Ok(extracted) => extracted,
@@ -141,9 +141,10 @@ struct Extracted {
     bytes: u64,
     failed: Vec<OpIssue>,
     skipped: Vec<OpIssue>,
-    /// Where the failed items would have been in the staging folder: whatever is there is
-    /// removed before anything is placed (see [`scrub`]).
-    failed_targets: Vec<PathBuf>,
+    /// Paths in the staging folder that must not be placed: where the failed items would
+    /// have been, and the temporary files this job made itself. Whatever is there is removed
+    /// before anything is placed (see [`scrub`]).
+    discard: Vec<PathBuf>,
     cancelled: bool,
 }
 
@@ -247,18 +248,18 @@ fn extract(files: &dyn Items, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) -> 
             continue;
         }
         ctx.progress.set_current(shown.display().to_string());
-        match write_item(files, index, item, &shown, &target, ctx) {
+        match write_item(files, index, item, &shown, &target, ctx, &mut out.discard) {
             Ok(bytes) => {
                 out.bytes += bytes;
                 ctx.progress.add_items(1);
             }
             Err(_) if ctx.cancel.is_cancelled() => {
-                out.failed_targets.push(target);
+                out.discard.push(target);
                 out.cancelled = true;
                 break;
             }
             Err(why) => {
-                out.failed_targets.push(target);
+                out.discard.push(target);
                 out.failed.push(OpIssue::new(shown, why));
                 ctx.progress.add_error();
             }
@@ -278,6 +279,7 @@ fn write_item(
     shown: &Path,
     target: &Path,
     ctx: &JobCtx<'_>,
+    discard: &mut Vec<PathBuf>,
 ) -> Result<u64, String> {
     let attributes = item.attributes.unwrap_or(0);
     match files.open(index)? {
@@ -296,6 +298,8 @@ fn write_item(
             // Written under a temporary name and renamed when complete, like every copy: a
             // storage that fails half way never sits at the item's name.
             let temp = target.with_file_name(ops::partial_name());
+            // Known by its exact path: removed before placement if it is still there.
+            discard.push(temp.clone());
             let saved = save(&temp).and_then(|()| {
                 if let Some(modified) = item.modified {
                     let _ = filetime::set_file_mtime(
@@ -316,36 +320,18 @@ fn write_item(
     }
 }
 
-/// Makes sure nothing that failed is placed: removes whatever sits at a failed item's path
-/// and every temporary file left anywhere in the staging folder (it is new and ours alone,
-/// so nothing in it is a link).
-fn scrub(staging: &Path, failed: &[PathBuf]) {
-    for path in failed {
+/// Makes sure nothing that failed is placed: removes whatever sits at the `discard` paths
+/// (failed items and the job's own temporary files, each known by its exact path). Items
+/// that merely have a temporary-looking name are real items and stay. (The temporary files
+/// of streamed items are removed by the copy engine itself when a write fails.)
+fn scrub(discard: &[PathBuf]) {
+    for path in discard {
         if let Ok(md) = std::fs::symlink_metadata(path) {
             let _ = if md.is_dir() {
                 std::fs::remove_dir_all(path)
             } else {
                 std::fs::remove_file(path)
             };
-        }
-    }
-    let mut folders = vec![staging.to_path_buf()];
-    while let Some(folder) = folders.pop() {
-        let Ok(entries) = std::fs::read_dir(&folder) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if ops::is_partial_name(&entry.file_name().to_string_lossy()) {
-                let _ = if is_dir {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-            } else if is_dir {
-                folders.push(path);
-            }
         }
     }
 }
@@ -420,20 +406,7 @@ fn as_copy(mut report: OpReport, staging: &Path, dest: &Path) -> OpReport {
 /// The relative path an item named `name` gets, or why it is refused.
 pub(crate) fn item_path(name: &str) -> Result<PathBuf, String> {
     let trimmed = name.trim_end_matches(['\\', '/']);
-    forge_core::paths::validate_relative(trimmed)
-        .map_err(|e| e.to_string())
-        .and_then(|rel| {
-            let temporary = rel
-                .components()
-                .any(|c| ops::is_partial_name(&c.as_os_str().to_string_lossy()));
-            if temporary {
-                Err(format!(
-                    "{name:?} looks like one of this app's temporary files"
-                ))
-            } else {
-                Ok(rel)
-            }
-        })
+    forge_core::paths::validate_relative(trimmed).map_err(|e| e.to_string())
 }
 
 /// The hidden folder the items are first written into; deleted with all it still holds when
@@ -515,7 +488,7 @@ mod tests {
             forge_jobs::Progress::default(),
         );
         let extracted = extract(fake, staging, dest, &JobCtx::new(&cancel, &progress));
-        scrub(staging, &extracted.failed_targets);
+        scrub(&extracted.discard);
         extracted
     }
 
@@ -548,23 +521,52 @@ mod tests {
         assert!(names_in(&staging.join("sub")).is_empty());
     }
 
-    /// Leftovers of a write that failed (temporary files) and an item at a failed path are
-    /// removed before placement; everything else stays.
+    /// Only the listed paths are removed: an item at a failed path and the job's own
+    /// temporary file. A real item whose name merely starts like a temporary file stays.
     #[test]
-    fn scrub_removes_failed_items_and_temporary_files_only() {
+    fn scrub_removes_only_the_listed_paths() {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path();
         std::fs::create_dir_all(staging.join("sub")).unwrap();
         std::fs::write(staging.join("ok.txt"), b"x").unwrap();
         std::fs::write(staging.join("bad.txt"), b"partial").unwrap();
         std::fs::write(staging.join("sub").join(".forge-partial-1234"), b"t").unwrap();
-        std::fs::write(staging.join("sub").join("keep.txt"), b"x").unwrap();
-        scrub(
-            staging,
-            &[staging.join("bad.txt"), staging.join("missing.txt")],
-        );
+        std::fs::write(
+            staging.join("sub").join(".forge-partial-notes.txt"),
+            b"real",
+        )
+        .unwrap();
+        scrub(&[
+            staging.join("bad.txt"),
+            staging.join("missing.txt"),
+            staging.join("sub").join(".forge-partial-1234"),
+        ]);
         assert_eq!(names_in(staging), ["ok.txt", "sub"]);
-        assert_eq!(names_in(&staging.join("sub")), ["keep.txt"]);
+        assert_eq!(names_in(&staging.join("sub")), [".forge-partial-notes.txt"]);
+    }
+
+    /// An item whose name starts like this app's temporary files is an ordinary item.
+    #[test]
+    fn an_item_named_like_a_temporary_file_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, dest) = (dir.path().join("staging"), dir.path().join("dest"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let fake = Fake::new(vec![
+            (".forge-partial-notes.txt", false, Some(b"notes")),
+            (".forge-partial-dir", true, None),
+            (r".forge-partial-dir\inner.txt", false, Some(b"inner")),
+        ]);
+        let extracted = run_extract(&fake, &staging, &dest);
+        assert!(extracted.failed.is_empty(), "{:?}", extracted.failed);
+        assert!(extracted.skipped.is_empty(), "{:?}", extracted.skipped);
+        assert_eq!(
+            std::fs::read(staging.join(".forge-partial-notes.txt")).unwrap(),
+            b"notes"
+        );
+        assert_eq!(
+            std::fs::read(staging.join(".forge-partial-dir").join("inner.txt")).unwrap(),
+            b"inner"
+        );
     }
 
     /// Names that Windows takes as the same (letter case, as the file system folds it) are
@@ -634,8 +636,6 @@ mod tests {
             r"\",
             "a\u{1}b.txt",
             "trailing. ",
-            r"sub\.forge-partial-1234\x",
-            ".forge-partial-1234",
         ] {
             assert!(item_path(bad).is_err(), "{bad:?} was accepted");
         }
