@@ -32,6 +32,8 @@
 //!   shell copies on its threads while the script keeps running, so wait for the files.
 //! - `touch <path>`: set a sandboxed file's modified time one hour ahead (an archive changed
 //!   after it was copied, for instance).
+//! - `replace-with-copy <path>`: put an identical copy (same bytes, size and modified time)
+//!   in place of a sandboxed file, by renaming it over the file: only the file id differs.
 //! - `wait-toast <text>`: wait (30 s) until a toast, error or not, containing `<text>` was
 //!   raised. Checks what was raised since the start, like `assert-toast`.
 //! - `clipboard-files cut|copy <path>, <path>, …`: put the files on the clipboard as another
@@ -137,6 +139,19 @@ pub(super) fn step(
                 .open(&path)
                 .and_then(|file| file.set_modified(later))
                 .map_err(|e| format!("could not change {}: {e}", path.display()))?;
+            Ok(Flow::Done)
+        }
+        "replace-with-copy" => {
+            let path = super::sandboxed(Path::new(args.trim()))?;
+            let copy = path.with_extension("copy");
+            let modified = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+            std::fs::copy(&path, &copy)
+                .and_then(|_| std::fs::File::options().write(true).open(&copy))
+                .and_then(|file| file.set_modified(modified))
+                .and_then(|()| std::fs::rename(&copy, &path))
+                .map_err(|e| format!("could not replace {}: {e}", path.display()))?;
             Ok(Flow::Done)
         }
         "wait-toast" => {
