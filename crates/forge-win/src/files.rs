@@ -131,6 +131,50 @@ pub fn path_identity(_path: &Path) -> Result<HandleIdentity> {
     Err(WinError::Unsupported)
 }
 
+/// Renames the file `file` has open (with `DELETE` access) to `target`, replacing what is
+/// there, with POSIX semantics (`SetFileInformationByHandle(FileRenameInfoEx)`): the file
+/// moved is the one held, whatever its old path names meanwhile. A file at `target` that is
+/// open elsewhere is replaced only if those handles share deleting.
+#[cfg(windows)]
+pub fn rename_open_file_over(file: &std::fs::File, target: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfoEx, SetFileInformationByHandle,
+    };
+
+    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+    let name: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let bytes = header + (name.len() + 1) * 2;
+    // u64 words: aligned for FILE_RENAME_INFO.
+    let mut buf = vec![0u64; bytes.div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buf` holds `bytes` bytes, aligned; the name and its NUL fit after the header.
+    unsafe {
+        (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*info).FileNameLength = (name.len() * 2) as u32;
+        let dst = std::ptr::addr_of_mut!((*info).FileName).cast::<u16>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+        *dst.add(name.len()) = 0;
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileRenameInfoEx,
+            info.cast(),
+            bytes as u32,
+        )
+    }
+    .map_err(|e| crate::api_err("SetFileInformationByHandle(FileRenameInfoEx)", e))
+}
+
+#[cfg(not(windows))]
+pub fn rename_open_file_over(_file: &std::fs::File, _target: &Path) -> Result<()> {
+    Err(WinError::Unsupported)
+}
+
 /// Number of hard links to the file (1 for a normal file). Directories report their
 /// link count too.
 #[cfg(windows)]

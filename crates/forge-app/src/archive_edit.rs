@@ -57,52 +57,50 @@ pub struct UpdateRequest {
     /// files' password is typed twice, as for a new encrypted archive.
     pub confirm_password: bool,
     pub title: String,
-    /// The end of a move out of the archive: the archive file the items were read from. In
-    /// the job, under the edit lock, the archive is held open against writers and checked to
-    /// be that file, unchanged, and the names to delete are checked against it again (see
-    /// [`removal_update`]); otherwise nothing is changed.
+    /// The end of a move out of the archive: the archive file the items were read from. The
+    /// job edits only a verified copy of it, and nothing if it changed (see
+    /// [`removal_update`]).
     pub expect: Option<crate::archive_identity::ArchiveIdentity>,
 }
 
-/// How long the removal of moved items waits for another program writing to the archive.
-const WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The archive edit of `request`; for the end of a move (`request.expect`), only on the very
-/// archive file the items were read from, unchanged:
+/// The archive edit of `request`; for the end of a move (`request.expect`), only ever on a
+/// verified copy of the very archive file the items were read from (see `archive_identity`):
 ///
-/// * The archive is opened once, sharing only reading and deleting, and kept open until the
-///   edit has replaced it: from the check on, no other program can write to it (one already
-///   writing is waited for, then the removal is refused).
-/// * An archive holding names that differ only in case is refused: its rewrite would keep
-///   only the first of each.
-/// * On that handle, its identity (file id, size, write time, directory hash) must be the
-///   one recorded when the items were read.
-/// * It is listed again, and a name that more than one entry answers to (names are matched
-///   ignoring case, a file and a folder alike) is not deleted.
-/// * Right before the edit opens the path, the path must still name the held file (nothing
-///   renamed over it). After the edit, the held file must be the one it replaced.
+/// 1. Under the edit lock, the original is opened sharing only reading (no other program can
+///    write, rename or delete it; one already writing is waited for, then the removal is
+///    refused), and its identity (file id, size, write time, directory hash) must be the one
+///    recorded when the items were read.
+/// 2. It is copied through that handle to a private temp file next to it, then closed.
+/// 3. The copy is listed: an archive holding names that differ only in case is refused (its
+///    rewrite would keep only the first of each), and a name more than one entry answers to
+///    (ignoring case, a file or a folder) is not deleted.
+/// 4. The edit runs on the copy.
+/// 5. The original is opened again, sharing reading and deleting, and checked again.
+/// 6. The edited copy is renamed over it through the copy's own handle.
+///
+/// A failure or a cancel anywhere leaves the original as it was, and the copy is removed.
 fn removal_update(
     request: &UpdateRequest,
     password: Option<&archive::Password>,
     opts: &CreateOptions,
     ctx: &JobCtx<'_>,
 ) -> forge_core::Result<CreateReport> {
+    use crate::archive_identity::{Replaced, WRITER_WAIT, hold_unchanged};
+
     let Some(expected) = &request.expect else {
         return archive::update(&request.archive, &request.edit, opts, ctx);
     };
     let refuse = |why: String| CoreError::Invalid(format!("{why}; nothing was removed"));
-    let held = crate::archive_identity::hold_unchanged(&request.archive, expected, WRITER_WAIT)
+    let copy = hold_unchanged(&request.archive, expected, WRITER_WAIT)
+        .and_then(|held| held.copy_to_private())
         .map_err(|why| refuse(format!("the archive {why}")))?;
-    let listing = archive::list_with_password(&request.archive, password)?;
-    // Rewriting an archive keeps only the first of entries whose names differ just in case:
-    // removing anything from it would lose the others too.
+    let listing = archive::list_with_password(copy.path(), password)?;
     if archive::stage::has_shared_names(&listing) {
         return Err(refuse(
             "the archive holds names that differ only in case, which an edit would merge".into(),
         ));
     }
-    let (delete, ambiguous) =
-        archive::stage::unambiguous_names(&listing, &request.edit.delete);
+    let (delete, ambiguous) = archive::stage::unambiguous_names(&listing, &request.edit.delete);
     if delete.is_empty() {
         return Err(refuse(
             "every name moved is shared by another entry of the archive".into(),
@@ -112,19 +110,23 @@ fn removal_update(
         add: request.edit.add.clone(),
         delete,
     };
-    held.still_at(&request.archive)
-        .map_err(|why| refuse(format!("the archive changed: {why}")))?;
-    let mut report = archive::update(&request.archive, &edit, opts, ctx)?;
+    let mut report = archive::update(copy.path(), &edit, opts, ctx)?;
     if ambiguous > 0 {
         report.warnings.push(format!(
             "{} kept in the archive: another entry has the same name",
             items(ambiguous)
         ));
     }
-    if !held.replaced() {
-        report.warnings.push(
-            "the archive file was moved or replaced while it was edited: check it".into(),
-        );
+    match copy
+        .replace(&request.archive, expected)
+        .map_err(|why| refuse(format!("the archive {why}")))?
+    {
+        Replaced::Original => {}
+        Replaced::MovedAway => report.warnings.push(
+            "the archive was moved away at the last moment: its edited copy was put at its \
+             path, and the moved file is unchanged"
+                .into(),
+        ),
     }
     Ok(report)
 }
