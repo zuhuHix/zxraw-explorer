@@ -305,7 +305,10 @@ struct State {
 }
 
 type Events = Box<dyn Fn(StageEvent) + Send + Sync>;
-type StillSame = Box<dyn Fn() -> bool + Send + Sync>;
+/// What [`Stage::new`]'s `hold` returns while the archive may be read: kept until the stage
+/// has finished reading it.
+pub type ArchiveHold = Box<dyn Send>;
+type Hold = Box<dyn Fn() -> Option<ArchiveHold> + Send + Sync>;
 
 struct Inner {
     archive: PathBuf,
@@ -313,7 +316,7 @@ struct Inner {
     password: Option<Password>,
     limits: ExtractLimits,
     dir: PathBuf,
-    still_same: StillSame,
+    hold: Hold,
     events: Events,
     cancel: CancelToken,
     state: Mutex<State>,
@@ -327,16 +330,17 @@ pub struct Stage {
 }
 
 impl Stage {
-    /// Nothing is read or written until the first [`open`](Self::open). `still_same` is
-    /// asked first (off the caller's thread): when it says the archive changed since it was
-    /// listed, every file fails. `dir` must be a new folder only this stage uses.
+    /// Nothing is read or written until the first [`open`](Self::open). `hold` is called
+    /// first (off the caller's thread): `None` when the archive changed since it was listed
+    /// (every file fails), else a guard kept until the stage stopped reading the archive (a
+    /// handle that keeps writers out, say). `dir` must be a new folder only this stage uses.
     pub fn new(
         archive: PathBuf,
         files: Vec<ArchiveEntry>,
         password: Option<Password>,
         limits: ExtractLimits,
         dir: PathBuf,
-        still_same: impl Fn() -> bool + Send + Sync + 'static,
+        hold: impl Fn() -> Option<ArchiveHold> + Send + Sync + 'static,
         events: impl Fn(StageEvent) + Send + Sync + 'static,
     ) -> Self {
         let n = files.len();
@@ -347,7 +351,7 @@ impl Stage {
                 password,
                 limits,
                 dir,
-                still_same: Box::new(still_same),
+                hold: Box::new(hold),
                 events: Box::new(events),
                 cancel: CancelToken::new(),
                 state: Mutex::new(State {
@@ -479,11 +483,12 @@ impl Inner {
 
     fn extract(&self) -> Result<()> {
         self.cancel.check()?;
-        if !(self.still_same)() {
+        // Held through every read of the archive below.
+        let Some(_hold) = (self.hold)() else {
             return Err(CoreError::Invalid(
                 "the archive changed since it was listed; open it again".into(),
             ));
-        }
+        };
         let backend = backend_for_file(&self.archive)?;
         let indices: Vec<usize> = self.files.iter().map(|e| e.index).collect();
         let password = self.password.as_ref();
@@ -743,7 +748,7 @@ mod tests {
             password,
             ExtractLimits::default(),
             dir,
-            || true,
+            || Some(Box::new(()) as ArchiveHold),
             move |e| events.lock().unwrap().push(e),
         );
         (stage, log)
@@ -1025,7 +1030,7 @@ mod tests {
             None,
             ExtractLimits::default(),
             tmp.path().join("stage"),
-            || false,
+            || None,
             move |e| events.lock().unwrap().push(e),
         );
         for k in 0..staged.files.len() {

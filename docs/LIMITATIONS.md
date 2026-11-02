@@ -109,15 +109,18 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   reported a successful move *and* read every file to its end, the archive is the same file,
   unchanged, as when the items began to be read, and you confirm. "The same file, unchanged"
   is its volume and 128-bit file id, size, write time and a hash of its directory region
-  (a zip's end records and central directory, a 7z's headers, else its first and last
-  64 KiB). The removal job opens the archive once, sharing only reading and deleting, checks
-  that identity on the handle and keeps it open until the rebuilt archive replaced it: no
-  other program can write to the archive meanwhile (one already writing is waited for, up to
-  10 s, then the removal is refused). Deleting stays shared, as the rebuild renames its result
-  over the file: the job checks that the path still names the held file right before the edit
-  opens it, which leaves a window of microseconds in which another program could rename a
-  different file into place unnoticed beforehand (it is reported afterwards, as the held file
-  then isn't the one replaced). Once the target copies asynchronously, only the end of its operation counts:
+  (a zip's zip64 and end records and central directory, a 7z's headers, else its first and
+  last 64 KiB), recorded from a handle that shares only reading and is kept while the items
+  are read, so nothing can write, rename or delete the archive meanwhile. The removal job
+  opens the archive the same way, checks that identity on the handle, copies the archive
+  through it to a private temp file next to it, and edits only that copy. It then opens the
+  original again (sharing reading and deleting), checks it again, and renames the edited copy
+  over it through the copy's own handle. Entries are only ever removed from a verified copy:
+  if another program moves the original away and puts a file in its place between that last
+  check and the rename, that file is replaced by the edited copy (nothing is removed from
+  it, and the moved original is unchanged; the job says so). A program already writing to
+  the archive is waited for, up to 10 s, then the removal is refused. Once the target copies
+  asynchronously, only the end of its operation counts:
   a failed end cancels the move whatever it said before. Anything less (a copy, a skipped
   file, an error) leaves the archive as it was. A target that never reports the result (some
   apps don't) leaves it as a copy. Exactly the entries that were handed out are removed, never

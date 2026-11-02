@@ -67,17 +67,26 @@ impl MoveOut {
         }
     }
 
-    /// Records the archive's identity as its items begin to be read (off the UI thread),
-    /// once: false when it can't be read or the archive changed since it was listed.
-    pub fn record_identity(&self) -> bool {
+    /// Holds the archive while its items are read (off the UI thread): no other program can
+    /// write, rename or delete it until the hold is dropped. Records its identity, read from
+    /// the held handle, the first time. `None` when it can't be held, changed since it was
+    /// listed, or isn't the file an earlier hold recorded.
+    pub fn hold_for_reading(&self) -> Option<crate::archive_identity::ReadHold> {
         if crate::archive_ui::archive_version(&self.archive) != self.version {
-            return false;
+            return None;
         }
+        let (hold, identity) = crate::archive_identity::hold_for_reading(
+            &self.archive,
+            crate::archive_identity::WRITER_WAIT,
+        )
+        .ok()?;
         let mut slot = self.identity.lock();
-        if slot.is_none() {
-            *slot = crate::archive_identity::read(&self.archive).ok();
+        match *slot {
+            None => *slot = Some(identity),
+            Some(recorded) if recorded != identity => return None,
+            Some(_) => {}
         }
-        slot.is_some()
+        Some(hold)
     }
 
     fn recorded(&self) -> Option<ArchiveIdentity> {
@@ -278,7 +287,11 @@ fn offer(
             password,
             limits,
             dir,
-            move || reading.record_identity(),
+            move || {
+                reading
+                    .hold_for_reading()
+                    .map(|hold| Box::new(hold) as archive::stage::ArchiveHold)
+            },
             move |event| {
                 let _ = tx.send(OutMsg::Stage {
                     archive: archive.clone(),
