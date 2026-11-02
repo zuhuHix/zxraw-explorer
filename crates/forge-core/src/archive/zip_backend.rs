@@ -415,7 +415,8 @@ impl ArchiveBackend for ZipBackend {
             } else if names.insert(key) {
                 kept.push(record);
             }
-            // else: the first of duplicate names is kept
+            // else: a name given twice. `archive::update` refuses such archives before this
+            // (see `name_collision`), so nothing is ever dropped here.
         }
         drop(za);
 

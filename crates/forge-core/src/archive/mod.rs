@@ -53,6 +53,8 @@ mod tests_sevenz_fixtures;
 #[cfg(test)]
 mod tests_sevenz_hostile;
 #[cfg(test)]
+mod tests_name_collision;
+#[cfg(test)]
 mod tests_tar;
 #[cfg(test)]
 mod tests_tar_hostile;
@@ -1768,6 +1770,7 @@ pub fn update(
         zip_merge::check_single_disk(archive, &mut file)?;
         zip_backend::check_no_prefix(archive, &mut file)?;
     }
+    check_editable_names(backend, archive, opts)?;
     let warnings = check_update_password(backend, archive, edit, opts)?;
     let result = backend.update(archive, edit, opts, ctx).map(|mut report| {
         report.warnings.extend(warnings);
@@ -1775,6 +1778,95 @@ pub fn update(
     });
     invalidate_cached(archive);
     result
+}
+
+/// Why an archive whose names collide isn't edited (see [`has_colliding_names`]).
+pub const CASE_COLLISION: &str = "This archive has names that differ only in capitals \
+     (e.g. A.txt and a.txt); ZXraw can't edit it safely. Extract it instead.";
+/// The same, for a file and a folder of one name, or one name given twice.
+pub const NAME_COLLISION: &str = "This archive has a file and a folder of the same name, or \
+     the same name twice; ZXraw can't edit it safely. Extract it instead.";
+
+/// How two names of an archive collide (see [`name_collision`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameCollision {
+    /// Names that differ only in capitals (`A.txt` and `a.txt`).
+    Case,
+    /// A file and a folder of the same name (`docs` and `docs/`, or `docs/x.txt`).
+    FileAndFolder,
+    /// The same name twice.
+    Duplicate,
+}
+
+/// Whether two entries of `entries` would be one path on Windows (see [`NameCollision`]);
+/// folders named only by the paths inside them count. Edits keep or drop entries by name,
+/// so an archive like this is never edited: an edit could lose an entry it wasn't asked to
+/// delete.
+pub fn name_collision(entries: &[ArchiveEntry]) -> Option<NameCollision> {
+    // Lowercase name -> (the name as written, a folder?).
+    let mut seen: HashMap<String, (&str, bool)> = HashMap::with_capacity(entries.len());
+    let mut folders: HashSet<String> = HashSet::new();
+    for e in entries {
+        let name = e.name.trim_end_matches(['/', '\\']);
+        if name.is_empty() {
+            continue;
+        }
+        let key = name.replace('\\', "/").to_lowercase();
+        let is_dir = e.is_dir || e.name.ends_with(['/', '\\']);
+        if let Some(&(first, first_dir)) = seen.get(&key) {
+            return Some(if first != name {
+                NameCollision::Case
+            } else if first_dir != is_dir {
+                NameCollision::FileAndFolder
+            } else {
+                NameCollision::Duplicate
+            });
+        }
+        let mut parent = key.as_str();
+        while let Some((p, _)) = parent.rsplit_once('/') {
+            if !folders.insert(p.to_owned()) {
+                break;
+            }
+            parent = p;
+        }
+        seen.insert(key, (name, is_dir));
+    }
+    seen.iter()
+        .any(|(key, (_, is_dir))| !is_dir && folders.contains(key))
+        .then_some(NameCollision::FileAndFolder)
+}
+
+/// Whether two entries of `entries` would be one path on Windows (see [`name_collision`]).
+pub fn has_colliding_names(entries: &[ArchiveEntry]) -> bool {
+    name_collision(entries).is_some()
+}
+
+/// Refuse to edit an archive with colliding names (or, for a tar, a name given twice: only
+/// the last one is listed), before anything is written.
+fn check_editable_names(
+    backend: &dyn ArchiveBackend,
+    archive: &Path,
+    opts: &CreateOptions,
+) -> Result<()> {
+    let listing = backend.list(
+        archive,
+        DEFAULT_MAX_ARCHIVE_ENTRIES,
+        opts.encryption.password(),
+    )?;
+    let collision = match name_collision(&listing.entries) {
+        Some(c) => Some(c),
+        None => match backend.format() {
+            ArchiveFormat::Tar(codec) if tar_backend::has_superseded(archive, codec)? => {
+                Some(NameCollision::Duplicate)
+            }
+            _ => None,
+        },
+    };
+    match collision {
+        None => Ok(()),
+        Some(NameCollision::Case) => Err(CoreError::Unsupported(CASE_COLLISION.into())),
+        Some(_) => Err(CoreError::Unsupported(NAME_COLLISION.into())),
+    }
 }
 
 /// Shown when the password given for new files opens some encrypted entries but not others.

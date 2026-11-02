@@ -98,6 +98,10 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * New AES-encrypted entries follow WinZip's recommendation, as the `zip` crate writes them:
   AE-1 (with a CRC check) for files of 20 bytes or more, AE-2 (no CRC, so tiny contents can't be
   guessed from it) below that. Both are AES-256.
+* Archives whose names collide on Windows (names that differ only in capitals, such as `A.txt`
+  and `a.txt`; a file and a folder of one name; one name given twice, which tar allows) can't
+  be edited: deleting or adding files is refused before anything is written, as an edit keeps
+  and drops entries by name and could lose one it wasn't asked to delete. Extract them instead.
 * Editing a zip copies the entries it keeps exactly as stored, so it needs no password unless
   files are added to an encrypted zip. New files then use the password you enter; if the zip's
   entries use several passwords, you're told, and the new files get the one you entered.
