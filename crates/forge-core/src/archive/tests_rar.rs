@@ -480,3 +480,24 @@ fn rar_reads_in_parallel() {
         h.join().unwrap();
     }
 }
+
+#[test]
+fn rar_first_volume_names_keep_non_ascii_stems() {
+    use super::rar_backend::first_volume_name;
+    // Lowercasing `İ` changes its length: names are matched on their own bytes.
+    assert_eq!(
+        first_volume_name(Path::new(r"C:\d\İx.part02.rar")),
+        Some(PathBuf::from(r"C:\d\İx.part01.rar"))
+    );
+    assert_eq!(
+        first_volume_name(Path::new(r"C:\d\Проект.PART3.RAR")),
+        Some(PathBuf::from(r"C:\d\Проект.PART1.RAR"))
+    );
+    assert_eq!(
+        first_volume_name(Path::new(r"C:\d\İİİ.R05")),
+        Some(PathBuf::from(r"C:\d\İİİ.rar"))
+    );
+    assert_eq!(first_volume_name(Path::new(r"C:\d\İx.part.rar")), None);
+    assert_eq!(first_volume_name(Path::new(r"C:\d\x.r1")), None);
+    assert_eq!(first_volume_name(Path::new(r"C:\d\ç.rar")), None);
+}

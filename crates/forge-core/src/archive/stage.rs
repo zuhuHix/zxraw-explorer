@@ -998,6 +998,30 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_rar_file_is_never_served_in_full() {
+        // UnRAR reports a bad CRC only after the file's last data: a reader taking exactly
+        // the listed size must not get it all before that.
+        let archive =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/archive/fixtures/rar5-badcrc.rar");
+        let tmp = tempfile::tempdir().unwrap();
+        let staged = plan(
+            &list(&archive).unwrap(),
+            &Selection::new("", vec!["hello.txt".into()]),
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(staged.files.len(), 1);
+        assert!(staged.files[0].checked_by_block);
+        let (stage, log) = stage_of(&archive, &staged, tmp.path().join("stage"), None);
+        let mut exact = vec![0u8; staged.files[0].size as usize];
+        let read = stage.open(0).and_then(|mut r| r.read_exact(&mut exact));
+        assert!(read.is_err(), "a damaged file was served in full");
+        wait_until("the stage to finish", || finished(&log).is_some());
+        let (failed, _) = finished(&log).unwrap();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+    }
+
+    #[test]
     fn plan_refuses_a_selection_over_the_total_size_limit() {
         let tmp = tempfile::tempdir().unwrap();
         let archive = tmp.path().join("big.zip");
