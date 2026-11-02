@@ -24,8 +24,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use forge_core::ops::{
-    self, ConflictPolicy, JobCtx, OpIssue, OpKind, OpOptions, OpReport, StreamOptions,
-    UndoRecord,
+    self, ConflictPolicy, JobCtx, OpIssue, OpKind, OpOptions, OpReport, StreamOptions, UndoRecord,
 };
 use forge_jobs::JobHandle;
 use forge_win::virtual_files::{VirtualContent, VirtualFiles, VirtualSource};
@@ -92,24 +91,24 @@ fn run(
     ctx: &egui::Context,
     title: String,
 ) -> Result<(), String> {
-    job.progress.set_current("Reading the items from the other application");
+    job.progress
+        .set_current("Reading the items from the other application");
     let staging = Staging::create(dest).map_err(|e| {
         let message = format!("Could not copy into {}: {e}", dest.display());
         let _ = tx.send(Event::Error(message.clone()));
         message
     })?;
     let job_ctx = JobCtx::from_job(job);
-    let extracted =
-        match forge_win::virtual_files::with_virtual_files(source, |files| {
-            extract(files, &staging.path, dest, &job_ctx)
-        }) {
-            Ok(extracted) => extracted,
-            Err(e) => {
-                let message = format!("Could not read the items to paste: {e}");
-                let _ = tx.send(Event::Error(message.clone()));
-                return Err(message);
-            }
-        };
+    let extracted = match forge_win::virtual_files::with_virtual_files(source, |files| {
+        extract(files, &staging.path, dest, &job_ctx)
+    }) {
+        Ok(extracted) => extracted,
+        Err(e) => {
+            let message = format!("Could not read the items to paste: {e}");
+            let _ = tx.send(Event::Error(message.clone()));
+            return Err(message);
+        }
+    };
     let mut report = if extracted.cancelled || job.cancel.is_cancelled() {
         OpReport {
             cancelled: true,
@@ -159,8 +158,10 @@ fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) 
         let rel = match item_path(&item.name) {
             Ok(rel) => rel,
             Err(why) => {
-                out.failed
-                    .push(OpIssue::new(PathBuf::from(&item.name), format!("not copied: {why}")));
+                out.failed.push(OpIssue::new(
+                    PathBuf::from(&item.name),
+                    format!("not copied: {why}"),
+                ));
                 continue;
             }
         };
@@ -296,9 +297,14 @@ fn as_copy(mut report: OpReport, staging: &Path, dest: &Path) -> OpReport {
     report.undo = std::mem::take(&mut report.undo)
         .into_iter()
         .filter_map(|record| match record {
-            UndoRecord::Moved { to, .. } => ops::fingerprint(&to)
-                .ok()
-                .map(|fingerprint| UndoRecord::Copied { path: to, fingerprint }),
+            UndoRecord::Moved { to, .. } => {
+                ops::fingerprint(&to)
+                    .ok()
+                    .map(|fingerprint| UndoRecord::Copied {
+                        path: to,
+                        fingerprint,
+                    })
+            }
             other => Some(other),
         })
         .collect();
@@ -311,13 +317,13 @@ pub(crate) fn item_path(name: &str) -> Result<PathBuf, String> {
     forge_core::paths::validate_relative(trimmed)
         .map_err(|e| e.to_string())
         .and_then(|rel| {
-            let first = rel
+            let temporary = rel
                 .components()
-                .next()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if ops::is_partial_name(&first) {
-                Err(format!("{name:?} looks like one of this app's temporary files"))
+                .any(|c| ops::is_partial_name(&c.as_os_str().to_string_lossy()));
+            if temporary {
+                Err(format!(
+                    "{name:?} looks like one of this app's temporary files"
+                ))
             } else {
                 Ok(rel)
             }
@@ -358,7 +364,10 @@ mod tests {
             item_path(r"sub\deeper\b.txt").unwrap(),
             PathBuf::from("sub").join("deeper").join("b.txt")
         );
-        assert_eq!(item_path("sub/b.txt").unwrap(), PathBuf::from("sub").join("b.txt"));
+        assert_eq!(
+            item_path("sub/b.txt").unwrap(),
+            PathBuf::from("sub").join("b.txt")
+        );
         assert_eq!(item_path("sub\\").unwrap(), PathBuf::from("sub"));
     }
 

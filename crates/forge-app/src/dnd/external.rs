@@ -29,13 +29,24 @@ pub struct External {
     keys: Option<(bool, bool)>,
     /// Set instead of `paths` when virtual files were dropped (items of a zip folder).
     pub virtual_files: Option<VirtualDrop>,
+    /// What our drop target told the source the drop does (`None` for the automation
+    /// hook's drops, which have no source).
+    told: Option<DropEffect>,
 }
 
 impl External {
-    /// Ctrl and Shift held at the drop.
+    /// Ctrl and Shift held at the drop. A drop the source was told is a copy counts as one
+    /// with Ctrl (a source that allows no move, or a cursor that showed a copy).
     pub fn keys(&self, ctx: &egui::Context) -> (bool, bool) {
-        self.keys
-            .unwrap_or_else(|| ctx.input(|i| (i.modifiers.command, i.modifiers.shift)))
+        let (ctrl, shift) = self
+            .keys
+            .unwrap_or_else(|| ctx.input(|i| (i.modifiers.command, i.modifiers.shift)));
+        (ctrl || self.told == Some(DropEffect::Copy), shift)
+    }
+
+    /// The source was told nothing happens (the cursor showed "no drop"), so nothing does.
+    pub fn refused_to_source(&self) -> bool {
+        self.told == Some(DropEffect::None)
     }
 }
 
@@ -92,7 +103,9 @@ impl OsDrop {
     }
 
     fn is_dragging(&self) -> bool {
-        self.handle.as_ref().is_some_and(DropTargetHandle::is_dragging)
+        self.handle
+            .as_ref()
+            .is_some_and(DropTargetHandle::is_dragging)
     }
 
     /// Called once per frame after the UI ran: works out what a drop onto the hovered folder
@@ -138,6 +151,7 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
         .collect();
     let mut keys = None;
     let mut virtual_files = None;
+    let mut told = None;
     let events = os
         .handle
         .as_ref()
@@ -152,10 +166,11 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
                 virtual_source,
                 ctrl,
                 shift,
-                answered: _,
+                answered,
             } => {
                 os.drag = None;
                 keys = Some((ctrl, shift));
+                told = Some(answered);
                 if !info.files.is_empty() {
                     paths = info.files;
                 } else if let Some(source) = virtual_source {
@@ -181,6 +196,7 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
         paths,
         keys,
         virtual_files,
+        told,
     });
     ctx.data_mut(|d| {
         d.insert_temp(

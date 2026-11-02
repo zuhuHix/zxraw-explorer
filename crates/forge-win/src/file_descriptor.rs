@@ -89,7 +89,9 @@ pub fn parse_file_group_descriptor_w(bytes: &[u8]) -> crate::Result<Vec<FileDesc
         .and_then(|body| body.checked_add(COUNT_SIZE as u64))
         .ok_or_else(|| invalid("file group descriptor size overflows"))?;
     if (bytes.len() as u64) < needed {
-        return Err(invalid("file group descriptor is shorter than its item count"));
+        return Err(invalid(
+            "file group descriptor is shorter than its item count",
+        ));
     }
 
     // The count was checked against MAX_ITEMS, so this conversion cannot truncate.
@@ -138,7 +140,10 @@ fn read_name(entry: &[u8]) -> String {
     let units: Vec<u16> = (0..NAME_UNITS)
         .map(|index| read_u16(entry, OFF_NAME + index * 2))
         .collect();
-    let end = units.iter().position(|&unit| unit == 0).unwrap_or(NAME_UNITS);
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(NAME_UNITS);
     String::from_utf16_lossy(&units[..end])
 }
 
@@ -214,7 +219,14 @@ mod tests {
     }
 
     /// Encodes one `FILEDESCRIPTORW` with the given fields and UTF-16 name.
-    fn entry(flags: u32, attributes: u32, size: u64, created: u64, written: u64, name: &[u16]) -> [u8; FILE_DESCRIPTOR_SIZE] {
+    fn entry(
+        flags: u32,
+        attributes: u32,
+        size: u64,
+        created: u64,
+        written: u64,
+        name: &[u16],
+    ) -> [u8; FILE_DESCRIPTOR_SIZE] {
         let mut out = [0u8; FILE_DESCRIPTOR_SIZE];
         out[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
         out[OFF_ATTRIBUTES..OFF_ATTRIBUTES + 4].copy_from_slice(&attributes.to_le_bytes());
@@ -249,7 +261,14 @@ mod tests {
     #[test]
     fn parses_folder_and_large_file() {
         let all = FD_ATTRIBUTES | FD_FILESIZE | FD_CREATETIME | FD_WRITESTIME | FD_UNICODE;
-        let folder = entry(FD_ATTRIBUTES | FD_UNICODE, FILE_ATTRIBUTE_DIRECTORY, 0, 0, 0, &utf16("sub"));
+        let folder = entry(
+            FD_ATTRIBUTES | FD_UNICODE,
+            FILE_ATTRIBUTE_DIRECTORY,
+            0,
+            0,
+            0,
+            &utf16("sub"),
+        );
         let file = entry(
             all,
             0x20,
@@ -281,7 +300,14 @@ mod tests {
     #[test]
     fn missing_flags_give_none_fields() {
         // Every field is filled in, but no flags say so: the parser must ignore them.
-        let item = entry(0, FILE_ATTRIBUTE_DIRECTORY, 99, ft(1_577_836_800), ft(1_577_836_800), &utf16("x"));
+        let item = entry(
+            0,
+            FILE_ATTRIBUTE_DIRECTORY,
+            99,
+            ft(1_577_836_800),
+            ft(1_577_836_800),
+            &utf16("x"),
+        );
         let parsed = parse_file_group_descriptor_w(&block(1, &[item])).unwrap();
         assert_eq!(parsed[0].name, "x");
         assert!(!parsed[0].is_dir);
@@ -314,7 +340,10 @@ mod tests {
         let one_day_before = ft(-86_400);
         let item = entry(FD_WRITESTIME, 0, 0, 0, one_day_before, &utf16("old"));
         let parsed = parse_file_group_descriptor_w(&block(1, &[item])).unwrap();
-        assert_eq!(parsed[0].modified, Some(UNIX_EPOCH - Duration::from_secs(86_400)));
+        assert_eq!(
+            parsed[0].modified,
+            Some(UNIX_EPOCH - Duration::from_secs(86_400))
+        );
     }
 
     #[test]

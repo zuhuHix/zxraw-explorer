@@ -23,6 +23,9 @@ pub fn folder_drop(resp: &egui::Response, target: &Path) -> (bool, Option<(Vec<P
     } else if from_outside {
         external::note_hover_target(&resp.ctx, target);
         external::take(&resp.ctx).and_then(|drop| {
+            if drop.refused_to_source() {
+                return None;
+            }
             if drop.virtual_files.is_some() {
                 // Copied out by the app (`ZxrawApp::unclaimed_external_drop`).
                 external::claim(&resp.ctx, drop, target);

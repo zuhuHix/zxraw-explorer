@@ -1378,7 +1378,7 @@ impl ZxrawApp {
         if let Some((drop, target)) = crate::dnd::external::take_claimed(ctx) {
             self.virtual_drop(&drop, target);
         }
-        let drop = crate::dnd::external::take(ctx);
+        let drop = crate::dnd::external::take(ctx).filter(|d| !d.refused_to_source());
         if let Some(drop) = drop.as_ref().filter(|d| d.virtual_files.is_some()) {
             self.virtual_drop(drop, fallback);
             return;
