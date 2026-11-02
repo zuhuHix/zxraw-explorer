@@ -20,6 +20,10 @@ const CENTRAL_SIG: &[u8; 4] = b"PK\x01\x02";
 const LOCAL_SIG: &[u8; 4] = b"PK\x03\x04";
 const ZIP64_EXTRA: u16 = 0x0001;
 
+/// Why a split archive is not edited (copying its records would make a broken one-disk zip).
+pub(crate) const SPLIT_ARCHIVE: &str =
+    "Split (multi-part) zip archives can't be edited; extract them instead";
+
 /// One entry as stored: where its local record lies in the archive, and its central record.
 #[derive(Debug, Clone)]
 pub(crate) struct RawRecord {
@@ -55,6 +59,7 @@ pub(crate) fn raw_records(
     za: &mut ZipArchive<BufReader<File>>,
 ) -> Result<Vec<RawRecord>> {
     let io = io_err(archive);
+    check_single_disk(archive, file)?;
     let mut found = Vec::with_capacity(za.len());
     for i in 0..za.len() {
         let f = za
@@ -105,6 +110,9 @@ pub(crate) fn raw_records(
             + u16_at(&central, 32) as usize;
         central.resize(46 + rest, 0);
         file.read_exact(&mut central[46..]).map_err(&io)?;
+        if disk_start(&central) != Some(0) {
+            return Err(CoreError::Unsupported(SPLIT_ARCHIVE.into()));
+        }
         records.push(RawRecord {
             start,
             end,
@@ -112,6 +120,84 @@ pub(crate) fn raw_records(
         });
     }
     Ok(records)
+}
+
+/// Refuse archives that span several disks (split or spanned zips): the end-of-directory
+/// record's disk numbers, the zip64 locator's and zip64 record's, must all say one disk.
+pub(crate) fn check_single_disk(archive: &Path, file: &mut File) -> Result<()> {
+    let io = io_err(archive);
+    let split = || CoreError::Unsupported(SPLIT_ARCHIVE.into());
+    let len = file.seek(SeekFrom::End(0)).map_err(&io)?;
+    // The end record (22 bytes plus a comment of up to 65,535) and the zip64 locator before it.
+    let tail_len = len.min(22 + 0xFFFF + 20);
+    file.seek(SeekFrom::Start(len - tail_len)).map_err(&io)?;
+    let mut tail = vec![0u8; tail_len as usize];
+    file.read_exact(&mut tail).map_err(&io)?;
+    // The last end record whose comment reaches exactly to the end of the file.
+    let eocd = (0..tail.len().saturating_sub(21))
+        .rev()
+        .find(|&i| {
+            &tail[i..i + 4] == b"PK\x05\x06"
+                && i + 22 + u16_at(&tail, i + 20) as usize == tail.len()
+        })
+        .ok_or_else(|| bad(archive, "end of central directory not found"))?;
+    let (this_disk, cd_disk) = (u16_at(&tail, eocd + 4), u16_at(&tail, eocd + 6));
+    let locator = eocd
+        .checked_sub(20)
+        .filter(|&l| &tail[l..l + 4] == b"PK\x06\x07");
+    let Some(l) = locator else {
+        return if this_disk == 0 && cd_disk == 0 {
+            Ok(())
+        } else {
+            Err(split())
+        };
+    };
+    // Zip64: the end record may hold 0xFFFF placeholders; the zip64 records hold the numbers.
+    if !matches!(this_disk, 0 | 0xFFFF) || !matches!(cd_disk, 0 | 0xFFFF) {
+        return Err(split());
+    }
+    let zip64_disk = u32_at(&tail, l + 4);
+    let total_disks = u32_at(&tail, l + 16);
+    if zip64_disk != 0 || total_disks > 1 {
+        return Err(split());
+    }
+    let record_at = u64::from_le_bytes(tail[l + 8..l + 16].try_into().unwrap());
+    let mut record = [0u8; 56];
+    file.seek(SeekFrom::Start(record_at)).map_err(&io)?;
+    file.read_exact(&mut record).map_err(&io)?;
+    // A self-extracting stub may shift offsets; the record is then not where it says, and
+    // its disk numbers can't be checked here: refuse rather than guess.
+    if &record[..4] != b"PK\x06\x06" {
+        return Err(bad(archive, "zip64 end of central directory not found"));
+    }
+    if u32_at(&record, 16) != 0 || u32_at(&record, 20) != 0 {
+        return Err(split());
+    }
+    Ok(())
+}
+
+/// The disk a central record's entry starts on: the 16-bit field, or the zip64 field when
+/// that holds 0xFFFF. `None` when the zip64 field is missing.
+fn disk_start(central: &[u8]) -> Option<u32> {
+    let disk16 = u16_at(central, 34);
+    if disk16 != 0xFFFF {
+        return Some(u32::from(disk16));
+    }
+    // In the zip64 field after the sizes and offset the record left to it.
+    let skip = 8 * usize::from(u32_at(central, 24) == u32::MAX)
+        + 8 * usize::from(u32_at(central, 20) == u32::MAX)
+        + 8 * usize::from(u32_at(central, 42) == u32::MAX);
+    let extra_at = 46 + u16_at(central, 28) as usize;
+    let extra_end = extra_at + u16_at(central, 30) as usize;
+    let mut at = extra_at;
+    while at + 4 <= extra_end {
+        let (id, len) = (u16_at(central, at), u16_at(central, at + 2) as usize);
+        if id == ZIP64_EXTRA {
+            return (skip + 4 <= len).then(|| u32_at(central, at + 4 + skip));
+        }
+        at += 4 + len;
+    }
+    None
 }
 
 /// The central record `central` with its local-header offset set to `offset`.
@@ -277,6 +363,25 @@ mod tests {
         c.push(b'x');
         c.extend_from_slice(extra);
         c
+    }
+
+    #[test]
+    fn disk_starts_are_read_from_the_record_or_its_zip64_field() {
+        assert_eq!(disk_start(&central(10, 10, 7, &[])), Some(0));
+        let mut c = central(10, 10, 7, &[]);
+        c[34] = 1;
+        assert_eq!(disk_start(&c), Some(1));
+        // 0xFFFF: the zip64 field holds it, after the offset the record left to it.
+        let mut extra = vec![0x01, 0x00, 12, 0x00];
+        extra.extend(9u64.to_le_bytes());
+        extra.extend(2u32.to_le_bytes());
+        let mut c = central(10, 10, u32::MAX, &extra);
+        c[34..36].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert_eq!(disk_start(&c), Some(2));
+        // 0xFFFF without the zip64 field: unknown, so refused by the caller.
+        let mut c = central(10, 10, 7, &[]);
+        c[34..36].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        assert_eq!(disk_start(&c), None);
     }
 
     #[test]

@@ -1199,6 +1199,11 @@ pub fn update(
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
     let backend = backend_for_file(archive)?;
+    if backend.format() == ArchiveFormat::Zip {
+        // Before anything reads the directory: a split zip can't be rebuilt as one file.
+        let mut file = fs::File::open(archive).map_err(|e| CoreError::io(archive, e))?;
+        zip_merge::check_single_disk(archive, &mut file)?;
+    }
     let warnings = check_update_password(backend, archive, edit, opts)?;
     let result = backend.update(archive, edit, opts, ctx).map(|mut report| {
         report.warnings.extend(warnings);

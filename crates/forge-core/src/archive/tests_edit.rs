@@ -880,3 +880,53 @@ fn the_password_probe_keeps_the_decoder_memory_limit() {
     }
     assert_eq!(fs::read(&archive).unwrap(), bytes);
 }
+
+#[test]
+fn split_archives_are_not_edited() {
+    let d = tempfile::tempdir().unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let new = d.path().join("new.txt");
+    write(&new, "new");
+    let edits = [
+        ArchiveEdit {
+            add: vec![edit_add(new, "")],
+            delete: vec![],
+        },
+        ArchiveEdit {
+            add: vec![],
+            delete: vec!["a.txt".into()],
+        },
+    ];
+    let base = d.path().join("base.zip");
+    make_zip(&base, &[("a.txt", "a"), ("b.txt", "b")]);
+    let good = fs::read(&base).unwrap();
+    let central = good.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    let eocd = good.windows(4).rposition(|w| w == b"PK\x05\x06").unwrap();
+    // One central record starting on disk 1; the end record on disk 1; the directory on
+    // disk 1.
+    let patches: [(&str, usize); 3] = [
+        ("record", central + 34),
+        ("this disk", eocd + 4),
+        ("directory disk", eocd + 6),
+    ];
+    for (what, at) in patches {
+        let archive = d
+            .path()
+            .join(format!("split-{}.zip", what.replace(' ', "-")));
+        let mut bytes = good.clone();
+        bytes[at] = 1;
+        fs::write(&archive, &bytes).unwrap();
+        for edit in &edits {
+            match update(&archive, edit, &CreateOptions::default(), &ctx) {
+                Err(CoreError::Unsupported(msg)) => {
+                    assert!(msg.contains("Split (multi-part)"), "{what}: {msg}")
+                }
+                other => panic!("{what}: expected a refusal, got {other:?}"),
+            }
+            assert_eq!(fs::read(&archive).unwrap(), bytes, "{what}");
+        }
+    }
+    // A one-disk archive still edits.
+    update(&base, &edits[1], &CreateOptions::default(), &ctx).unwrap();
+}
