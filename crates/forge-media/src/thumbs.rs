@@ -431,10 +431,7 @@ impl ThumbnailService {
         };
         let inner = self.inner.clone();
         let priority = req.priority;
-        let task = move || {
-            let _guard = guard;
-            inner.run(req, size, token);
-        };
+        let task = move || inner.run(req, size, token, guard);
         match pool.submit(priority, task) {
             Ok(()) => RequestStatus::Queued,
             // The rejected closure (and its guard) is dropped → in-flight entry removed.
@@ -489,7 +486,10 @@ impl Inner {
         generation < self.gen_state.lock().current
     }
 
-    fn run(&self, req: ThumbRequest, size: u32, token: CancelToken) {
+    /// Runs one request. `guard` (its in-flight entry) is released before the result is
+    /// sent: a client that receives the result and asks again at once queues new work,
+    /// never `AlreadyInFlight` for work whose one result it already has.
+    fn run(&self, req: ThumbRequest, size: u32, token: CancelToken, guard: InflightGuard) {
         if token.is_cancelled() || self.is_stale(req.generation) {
             self.cancelled.fetch_add(1, Ordering::Relaxed);
             return;
@@ -502,6 +502,7 @@ impl Inner {
         if res.is_err() {
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
+        drop(guard);
         let _ = self.tx.send(ThumbResult {
             path: req.path,
             size,

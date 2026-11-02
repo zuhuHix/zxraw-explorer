@@ -893,6 +893,24 @@ fn background_thumbnails_never_read_online_only_files() {
     assert_eq!(s.stats().generated, 1);
 }
 
+/// The in-flight entry is gone before the result is sent: asking again right after receiving
+/// a result queues new work, never `AlreadyInFlight` for work that will send nothing more.
+#[test]
+fn asking_again_right_after_a_result_queues_new_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = write(dir.path(), "again.jpg", &jpeg(64, 48, 5));
+    let md = std::fs::metadata(&p).unwrap();
+    let req = || ThumbRequest::new(&p, 64).stat(md.modified().ok(), md.len());
+    // Online-only: each request fails fast and caches nothing, so every one runs a task.
+    forge_core::cloud::simulate_online_only(&p);
+    let s = service(None, 2);
+    for round in 0..500 {
+        assert_eq!(s.request(req()), RequestStatus::Queued, "round {round}");
+        assert!(matches!(recv(&s).image, Err(MediaError::OnlineOnly)));
+    }
+    forge_core::cloud::clear_simulated_online_only(&p);
+}
+
 #[test]
 fn background_metadata_skips_an_online_only_sidecar() {
     let dir = tempfile::tempdir().unwrap();
