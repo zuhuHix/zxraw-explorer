@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod app_icon;
+mod archive_ui;
 mod batch_export;
 mod batch_rename;
 mod breadcrumb;

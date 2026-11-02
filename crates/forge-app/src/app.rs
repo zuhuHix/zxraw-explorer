@@ -201,12 +201,15 @@ impl SelectionSummary {
                 .iter()
                 .map(|&i| {
                     let e = &p.entries[i];
-                    let media = !e.is_dir()
+                    // Nothing inside an archive is a file to probe or a folder to measure.
+                    let real = !p.in_archive();
+                    let media = real
+                        && !e.is_dir()
                         && matches!(
                             forge_core::model::media_kind_for_ext(&e.ext),
                             forge_core::model::MediaKind::Video | forge_core::model::MediaKind::Audio
                         );
-                    (e.path.clone(), (e.size, e.modified, media, e.is_dir()))
+                    (e.path.clone(), (e.size, e.modified, media, real && e.is_dir()))
                 })
                 .collect();
             self.listing = Some(listing);
@@ -497,8 +500,11 @@ impl ZxrawApp {
         // A network path is never probed here: an offline share would block the UI thread.
         // It is listed as a folder, and if it turns out to be a file the listing worker says
         // so and the pane opens its folder with the file selected (see `Pane::poll`).
-        if !forge_core::netpath::is_network_path(&path) && path.is_file() {
-            // Navigating to a file opens its folder and selects it.
+        if !forge_core::netpath::is_network_path(&path)
+            && path.is_file()
+            && !forge_core::archive::is_archive_name(&path)
+        {
+            // Navigating to a file opens its folder and selects it (an archive is browsed).
             if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
                 let name = name.to_string_lossy().into_owned();
                 let pane = self.pane_mut();
@@ -516,7 +522,10 @@ impl ZxrawApp {
         crate::export_assoc::invalidate_cache();
         for t in &mut self.tabs {
             for pane in std::iter::once(&mut t.left).chain(t.right.as_mut()) {
-                if pane.path == dir {
+                // A pane in an archive is refreshed when the archive's folder changes (the
+                // archive may have; its index is read again only if it did).
+                let archive_dir = pane.archive.as_ref().and_then(|a| a.archive.parent());
+                if pane.path == dir || archive_dir == Some(dir) {
                     pane.refresh();
                 } else if pane.shows_children_of(dir) {
                     // A folder opened in place.
@@ -610,6 +619,8 @@ impl ZxrawApp {
             ThumbsBigger => self.settings.thumb_size = (self.settings.thumb_size * 1.2).min(512.0),
             ThumbsSmaller => self.settings.thumb_size = (self.settings.thumb_size / 1.2).max(64.0),
             CommandPalette => self.palette = Some(crate::palette::Palette::default()),
+            CullMode | CompareImages | BookmarkFolder | PinToQuickAccess | AddToNetwork
+                if crate::archive_ui::block_in_archive(self, cmd.label()) => {}
             CullMode => crate::viewer_host::open(self, crate::viewer::ViewerMode::Cull),
             CompareImages => crate::viewer_host::open(self, crate::viewer::ViewerMode::Compare),
             BookmarkFolder => {
@@ -667,8 +678,16 @@ impl ZxrawApp {
 
     pub fn open_entry(&mut self, e: &forge_core::FileEntry) {
         use forge_core::EntryKind;
+        // A file inside an archive is extracted to temp first.
+        if e.kind != EntryKind::Dir && self.pane().archive.is_some() {
+            return crate::archive_ui::open_entry(self, e, crate::archive_ui::OpenHow::Default);
+        }
         match e.kind {
             EntryKind::Dir => self.pane_mut().navigate(e.path.clone()),
+            // An archive opens like a folder; "Open with…" still offers its apps.
+            EntryKind::File if forge_core::archive::is_archive_name(&e.path) => {
+                self.pane_mut().navigate(e.path.clone())
+            }
             EntryKind::Link if forge_core::listing::link_targets_dir(&e.path) => {
                 // Explicit user action: following a junction/symlink is fine here.
                 self.pane_mut().navigate(e.path.clone())
@@ -1156,6 +1175,15 @@ impl ZxrawApp {
                         }
                     });
                     Vec::new()
+                }
+                // Nothing inside an archive is a file the thumbnail, Git or size services
+                // could read.
+                None if pane.in_archive() => {
+                    let mut none = crate::archive_ui::NoFileServices;
+                    match pane.view {
+                        ViewMode::Details => views::details(ui, pane, focused, id, &none),
+                        ViewMode::Grid => views::grid(ui, pane, focused, id, thumb_size, &mut none),
+                    }
                 }
                 None => match pane.view {
                     ViewMode::Details => views::details(ui, pane, focused, id, &ops.grid_provider()),

@@ -3,6 +3,9 @@
 //! In details view, folders can be opened in place: an expanded folder's children are
 //! listed (streamed, like the folder itself) into the same `entries`, and `visible` holds
 //! the flattened tree, each level sorted, with `depth` giving the indent of every row.
+//!
+//! A path inside an archive (`D:\x\a.zip\sub`) is listed from the archive's index (see
+//! `archive_ui`); [`Pane::archive`] then says which archive the rows belong to.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,6 +17,7 @@ use forge_core::listing::{self, SortKey, SortSpec};
 use forge_core::query::Query;
 use forge_jobs::CancelToken;
 
+use crate::archive_ui::{ArchiveListing, ArchiveView};
 use crate::folder_sizes::{FolderSize, FolderSizes};
 use crate::selection::{Selection, removal_successors};
 use crate::settings::ViewMode;
@@ -30,6 +34,8 @@ enum ListMsg {
     /// The path being listed is a file (a network path typed or clicked without being probed
     /// on the UI thread): open its folder and select it.
     IsFile,
+    /// Sent first by the pane's own listing: the archive the path is inside, or `None`.
+    Archive(Option<ArchiveView>),
 }
 
 /// Listing of a folder opened in place. Its messages carry `id`, so a superseded listing
@@ -73,6 +79,20 @@ fn subdir_queue() -> &'static Sender<ListJob> {
                     for job in rx {
                         // A folder closed (or relisted) while its job waited is skipped.
                         if job.cancel.is_cancelled() {
+                            continue;
+                        }
+                        // A folder inside an archive is listed from the archive's index.
+                        if let Some(listed) = crate::archive_ui::list_archive_path(&job.dir) {
+                            let msg = match listed {
+                                ArchiveListing::Folder { entries, .. } => {
+                                    let batch = ListMsg::Batch(entries);
+                                    let _ = job.tx.send((job.id, job.dir.clone(), batch));
+                                    ListMsg::Done { errors: 0 }
+                                }
+                                ArchiveListing::File => ListMsg::Failed("not a folder".into()),
+                                ArchiveListing::Failed(e) => ListMsg::Failed(e),
+                            };
+                            let _ = job.tx.send((job.id, job.dir, msg));
                             continue;
                         }
                         let r = listing::list_dir_streaming(&job.dir, 2048, &job.cancel, |b| {
@@ -221,6 +241,11 @@ pub struct Pane {
     /// A size change was held back by `SIZE_APPLY_GAP`; see [`Pane::folder_sizes_retry_in`].
     size_retry: bool,
     pending_removal: Option<PendingRemoval>,
+    /// The archive whose contents are listed, when the path is inside one. Set by the
+    /// listing; kept while navigating within the same archive.
+    pub archive: Option<ArchiveView>,
+    /// The path may be inside an archive (by its name) and the listing has not said yet.
+    archive_pending: bool,
 }
 
 /// Whether typing in the file list filters it (Settings › Browsing). The app publishes the
@@ -291,6 +316,8 @@ impl Pane {
             last_size_apply: None,
             size_retry: false,
             pending_removal: None,
+            archive: None,
+            archive_pending: false,
         };
         p.load_path(path);
         p
@@ -305,6 +332,12 @@ impl Pane {
 
     pub fn is_loading(&self) -> bool {
         matches!(self.load, LoadState::Loading { .. })
+    }
+
+    /// The pane shows (or is about to show) the contents of an archive: its paths are
+    /// virtual, so nothing may read or change them as files.
+    pub fn in_archive(&self) -> bool {
+        self.archive.is_some() || self.archive_pending
     }
 
     /// Navigate to `path`, pushing the current folder onto the back stack.
@@ -384,6 +417,10 @@ impl Pane {
     /// is asked to measure. Cached against [`Pane::listing_rev`], so the walk over a
     /// 50,000-entry listing happens once per change, not every frame.
     pub fn listed_folders(&mut self) -> &[PathBuf] {
+        // Folders inside an archive have their totals from the archive's index.
+        if self.in_archive() {
+            return &[];
+        }
         let key = (self.listing_rev, self.viewport);
         let cached = matches!(&self.listed_folders, Some((cached, _)) if *cached == key);
         if !cached {
@@ -436,6 +473,9 @@ impl Pane {
     /// the entries are walked at most once per [`SIZE_APPLY_GAP`]; a held-back change is
     /// reported by [`Pane::folder_sizes_retry_in`] so the caller can come back for it.
     pub fn apply_folder_sizes(&mut self, sizes: &FolderSizes) -> bool {
+        if self.in_archive() {
+            return false;
+        }
         let rev = sizes.revision();
         if self.applied_sizes == Some((rev, self.listing_rev)) {
             self.size_retry = false;
@@ -525,6 +565,16 @@ impl Pane {
         }
         if path != self.path {
             self.pending_removal = None;
+            // Within the same archive the view stays until the listing replaces it.
+            if self
+                .archive
+                .as_ref()
+                .is_some_and(|a| !path.starts_with(&a.archive))
+            {
+                self.archive = None;
+            }
+            self.archive_pending =
+                self.archive.is_none() && crate::archive_ui::maybe_in_archive(&path);
         }
         self.path = path.clone();
         self.pending_select = None;
@@ -538,6 +588,19 @@ impl Pane {
         let spawned = std::thread::Builder::new()
             .name("list-dir".into())
             .spawn(move || {
+                if let Some(listed) = crate::archive_ui::list_archive_path(&path) {
+                    let _ = match listed {
+                        ArchiveListing::Folder { view, entries } => {
+                            let _ = tx.send(ListMsg::Archive(Some(view)));
+                            let _ = tx.send(ListMsg::Batch(entries));
+                            tx.send(ListMsg::Done { errors: 0 })
+                        }
+                        ArchiveListing::File => tx.send(ListMsg::IsFile),
+                        ArchiveListing::Failed(e) => tx.send(ListMsg::Failed(e)),
+                    };
+                    return;
+                }
+                let _ = tx.send(ListMsg::Archive(None));
                 let r = listing::list_dir_streaming(&path, 2048, &cancel, |b| {
                     let _ = tx.send(ListMsg::Batch(b));
                 });
@@ -633,6 +696,13 @@ impl Pane {
                 Ok(ListMsg::IsFile) => {
                     is_file = true;
                     break;
+                }
+                Ok(ListMsg::Archive(view)) => {
+                    self.archive = view;
+                    self.archive_pending = false;
+                    // Field-level update: `rx` is still borrowed from `self`.
+                    self.listing_rev = next_listing_rev();
+                    changed = true;
                 }
                 Err(_) => break,
             }
@@ -1477,8 +1547,8 @@ impl Pane {
                     load.error = Some(e);
                     refreshed.push((dir.clone(), false));
                 }
-                // Only the pane's own listing sends this; a folder opened in place is a folder.
-                ListMsg::IsFile => load.loading = false,
+                // Only the pane's own listing sends these; a folder opened in place is a folder.
+                ListMsg::IsFile | ListMsg::Archive(_) => load.loading = false,
             }
             self.dirty_sort = true;
             changed = true;
@@ -3249,5 +3319,129 @@ mod tests {
         assert!(pane.pending_removal.is_none());
         assert_eq!(pane.cursor_entry().map(|e| e.name.as_str()), Some("c.txt"));
         assert!(pane.selected.contains(&files[2]));
+    }
+
+    /// Writes a zip at `path` with the given files (inner paths, contents).
+    fn write_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, data) in files {
+            w.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut w, data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// `a.zip` holding `top.txt` (5 bytes), `sub/one.txt` (3) and `sub/deep/two.txt` (4).
+    fn zip_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        write_zip(
+            &zip,
+            &[
+                ("top.txt", b"hello"),
+                ("sub/one.txt", b"one"),
+                ("sub/deep/two.txt", b"two!"),
+            ],
+        );
+        (dir, zip)
+    }
+
+    #[test]
+    fn a_folder_inside_a_zip_is_listed_from_the_archive() {
+        let (_dir, zip) = zip_fixture();
+        let sub = zip.join("sub");
+        let mut pane = open_tree_pane(&sub);
+        assert!(pane.in_archive());
+        let view = pane.archive.as_ref().expect("archive view");
+        assert_eq!(view.archive, zip);
+        assert_eq!(view.inner, "sub");
+        assert_eq!(visible_names(&pane), ["deep", "one.txt"]);
+        // Folders carry the total of their contents from the index.
+        assert_eq!(entry_size(&pane, &sub.join("deep")), 4);
+        assert_eq!(entry_size(&pane, &sub.join("one.txt")), 3);
+        let one = pane.entries.iter().find(|e| e.name == "one.txt").unwrap();
+        assert_eq!((one.kind, one.ext.as_str()), (EntryKind::File, "txt"));
+        // Nothing inside is handed to the folder size service.
+        assert!(pane.listed_folders().is_empty());
+    }
+
+    #[test]
+    fn up_back_and_forward_move_through_an_archive() {
+        let (dir, zip) = zip_fixture();
+        let mut pane = open_tree_pane(&zip.join("sub"));
+        pane.up();
+        settle(&mut pane);
+        assert_eq!(pane.path, zip);
+        assert!(pane.in_archive());
+        assert_eq!(pane.archive.as_ref().unwrap().inner, "");
+        assert_eq!(visible_names(&pane), ["sub", "top.txt"]);
+        assert!(pane.selected.contains(&zip.join("sub")));
+
+        // Up from the archive's root: the folder holding it, with the archive selected.
+        pane.up();
+        settle(&mut pane);
+        assert_eq!(pane.path, dir.path());
+        assert!(!pane.in_archive());
+        assert!(pane.archive.is_none());
+        assert!(pane.selected.contains(&zip));
+
+        pane.back();
+        settle(&mut pane);
+        assert_eq!(pane.path, zip);
+        assert!(pane.archive.is_some());
+        pane.forward();
+        settle(&mut pane);
+        assert_eq!(pane.path, dir.path());
+        assert!(!pane.in_archive());
+    }
+
+    #[test]
+    fn a_file_inside_a_zip_opens_its_folder_with_the_file_selected() {
+        let (_dir, zip) = zip_fixture();
+        let mut pane = open_tree_pane(&zip);
+        let two = zip.join("sub").join("deep").join("two.txt");
+        pane.navigate(two.clone());
+        settle(&mut pane);
+        assert_eq!(pane.path, zip.join("sub").join("deep"));
+        assert!(pane.selected.contains(&two));
+    }
+
+    #[test]
+    fn folders_inside_a_zip_open_in_place() {
+        let (_dir, zip) = zip_fixture();
+        let mut pane = open_tree_pane(&zip);
+        pane.set_expanded(&zip.join("sub"), true);
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["sub", "deep", "one.txt", "top.txt"]);
+        pane.set_expanded(&zip.join("sub").join("deep"), true);
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["sub", "deep", "two.txt", "one.txt", "top.txt"]);
+    }
+
+    #[test]
+    fn a_changed_archive_is_listed_again_and_a_broken_one_fails() {
+        let (_dir, zip) = zip_fixture();
+        let mut pane = open_tree_pane(&zip);
+        write_zip(&zip, &[("new.txt", b"fresh contents"), ("top.txt", b"hello")]);
+        pane.refresh();
+        settle(&mut pane);
+        assert_eq!(visible_names(&pane), ["new.txt", "top.txt"]);
+
+        std::fs::write(&zip, b"not a zip at all").unwrap();
+        pane.refresh();
+        settle(&mut pane);
+        assert!(matches!(pane.load, LoadState::Failed(_)));
+        assert!(pane.in_archive(), "a broken archive's paths stay virtual");
+    }
+
+    #[test]
+    fn leaving_an_archive_for_a_plain_folder_clears_the_archive_at_once() {
+        let (dir, zip) = zip_fixture();
+        let mut pane = open_tree_pane(&zip);
+        pane.navigate(dir.path().to_path_buf());
+        assert!(!pane.in_archive());
+        settle(&mut pane);
+        assert!(pane.archive.is_none());
     }
 }

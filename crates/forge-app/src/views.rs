@@ -294,7 +294,8 @@ fn handle_drop(resp: &egui::Response, target_dir: &Path, out: &mut Vec<ViewEvent
 }
 
 fn begin_drag(resp: &egui::Response, pane: &Pane, entry: &FileEntry) {
-    if resp.drag_started() {
+    // Items inside an archive are not files yet: nothing to drag.
+    if resp.drag_started() && !pane.in_archive() {
         let paths = if pane.is_selected(entry) {
             // A selected folder already carries the selected items inside it.
             pane.selected_roots()
@@ -639,6 +640,7 @@ fn details_columns(
     widths: [f32; 5],
     show_created: bool,
     show_rating: bool,
+    archive: bool,
 ) -> Vec<DetailsColumn> {
     let mut columns = vec![
         DetailsColumn {
@@ -681,6 +683,17 @@ fn details_columns(
             width_index: Some(4),
             width: widths[4],
         });
+    }
+    if archive {
+        // Inside an archive (fixed widths: the persisted widths are for the usual columns).
+        for (label, width) in [("Compressed", 90.0), ("Ratio", 56.0), ("Method", 84.0)] {
+            columns.push(DetailsColumn {
+                label,
+                sort: None,
+                width_index: None,
+                width,
+            });
+        }
     }
     let fixed_width: f32 = columns.iter().skip(1).map(|column| column.width).sum();
     columns[0].width = (available_width - fixed_width).max(140.0);
@@ -1140,7 +1153,14 @@ pub fn details(
         .ctx()
         .data_mut(|data| data.get_persisted::<[bool; 2]>(visibility_key))
         .unwrap_or([false, false]);
-    let columns = details_columns(width, widths, visible_columns[0], visible_columns[1]);
+    let archive = pane.archive.clone();
+    let columns = details_columns(
+        width,
+        widths,
+        visible_columns[0],
+        visible_columns[1],
+        archive.is_some(),
+    );
 
     if let LoadState::Failed(error) = &pane.load {
         ui.label(format!("Folder listing failed: {error}"));
@@ -1171,7 +1191,7 @@ pub fn details(
         } else {
             ""
         };
-        let right_aligned = matches!(column.label, "Size" | "Rating");
+        let right_aligned = matches!(column.label, "Size" | "Rating" | "Compressed" | "Ratio");
         let text_x = if right_aligned {
             rect.right() - 10.0
         } else {
@@ -1324,7 +1344,13 @@ pub fn details(
             );
         }
     }
-    let columns = details_columns(width, widths, visible_columns[0], visible_columns[1]);
+    let columns = details_columns(
+        width,
+        widths,
+        visible_columns[0],
+        visible_columns[1],
+        archive.is_some(),
+    );
     let table_width = width.max(columns.iter().map(|column| column.width).sum());
 
     let n = pane.visible.len();
@@ -1400,6 +1426,8 @@ pub fn details(
             };
             let entry = &pane.entries[entry_index];
             let annotation = thumbs.annotation(&entry.path);
+            // Inside an archive: the row's entry (only the painted rows are looked up).
+            let node = archive.as_ref().and_then(|a| a.node_of(&entry.path));
             let selected = pane.is_selected(entry);
             let (rect, response) =
                 ui.allocate_exact_size(vec2(table_width, row_h), Sense::click_and_drag());
@@ -1522,6 +1550,16 @@ pub fn details(
                 );
                 name_left += 14.0;
             }
+            if node.is_some_and(|n| n.encrypted) {
+                painter.text(
+                    pos2(name_left + 6.0, cy),
+                    Align2::CENTER_CENTER,
+                    LOCK_GLYPH,
+                    FontId::proportional(11.0),
+                    text_color,
+                );
+                name_left += 15.0;
+            }
             let mut name_width = (name_column.width - (name_left - col_x) - 10.0).max(0.0);
             if let Some(badge) = git.filter(|_| name_width > 40.0) {
                 let right = pos2(col_x + name_column.width - 8.0, cy);
@@ -1561,7 +1599,10 @@ pub fn details(
                 let text = match column.label {
                     "Date modified" => format_time(entry.modified),
                     "Type" => type_label(entry),
-                    "Size" if entry.kind == EntryKind::File => format_size(entry.size),
+                    // Folders inside an archive have their totals from its index.
+                    "Size" if entry.kind == EntryKind::File || archive.is_some() => {
+                        format_size(entry.size)
+                    }
                     "Size" => match folder_size_text(&folder_size) {
                         Some((text, weak)) => {
                             // A selected row keeps the selection colour for its sizes too.
@@ -1581,6 +1622,14 @@ pub fn details(
                         }
                     }
                     "Rating" => String::new(),
+                    "Compressed" => {
+                        node.map_or_else(String::new, |n| format_size(n.compressed_size))
+                    }
+                    "Ratio" => node
+                        .filter(|n| !n.is_dir)
+                        .and_then(|n| n.ratio_percent())
+                        .map_or_else(String::new, |r| format!("{r}%")),
+                    "Method" => node.map_or_else(String::new, |n| n.method.clone()),
                     _ => String::new(),
                 };
                 if column.label == "Rating" {
@@ -1602,7 +1651,7 @@ pub fn details(
                         small.clone(),
                         color,
                     );
-                } else if column.label == "Size" {
+                } else if matches!(column.label, "Size" | "Compressed" | "Ratio") {
                     painter
                         .with_clip_rect(Rect::from_min_size(
                             pos2(col_x + 4.0, rect.top()),
@@ -2038,8 +2087,9 @@ pub fn grid(
     thumbs: &mut dyn ThumbProvider,
 ) -> Vec<ViewEvent> {
     let mut out = Vec::new();
-    pane.similar
-        .tick(&pane.entries, !pane.is_loading(), ui.ctx());
+    // Nothing inside an archive can be read for grouping (yet).
+    let groupable: &[FileEntry] = if pane.in_archive() { &[] } else { &pane.entries };
+    pane.similar.tick(groupable, !pane.is_loading(), ui.ctx());
     ui.horizontal(|ui| {
         let response = ui
             .selectable_label(pane.similar.enabled(), "Group bursts & similar")
@@ -2401,7 +2451,7 @@ pub fn grid(
                     };
                     let resp = resp.on_hover_text_at_pointer(tip);
                     if let Some(members) = &item.members {
-                        if resp.drag_started() {
+                        if resp.drag_started() && !pane.in_archive() {
                             resp.dnd_set_drag_payload(DragPaths::from_pane(pane, members.clone()));
                         }
                         if !badge_clicked {
@@ -2533,6 +2583,8 @@ pub fn draw_cloud_badge(p: &egui::Painter, c: egui::Pos2, s: f32, color: Color32
 /// Marks a file that has a note. U+270E is in Segoe UI Symbol, which `fonts::install` loads as a
 /// fallback (the same font as the pick and reject marks).
 const NOTE_GLYPH: &str = "✎";
+/// Marks an encrypted entry inside an archive.
+const LOCK_GLYPH: &str = "\u{1F512}";
 
 pub fn draw_annotation(p: &egui::Painter, img_rect: Rect, a: Annotation) {
     if a.rating > 0 {
