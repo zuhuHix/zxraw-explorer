@@ -467,7 +467,10 @@ fn temp_copies_of_same_named_entries_stay_apart() {
     let zip = d.path().join("cfg.zip");
     {
         let mut zw = zip::ZipWriter::new(fs::File::create(&zip).unwrap());
-        for (name, data) in [("a/config.json", b"{\"a\":1}"), ("b/config.json", b"{\"b\":2}")] {
+        for (name, data) in [
+            ("a/config.json", b"{\"a\":1}"),
+            ("b/config.json", b"{\"b\":2}"),
+        ] {
             zw.start_file(name, zip::write::SimpleFileOptions::default())
                 .unwrap();
             std::io::Write::write_all(&mut zw, data).unwrap();

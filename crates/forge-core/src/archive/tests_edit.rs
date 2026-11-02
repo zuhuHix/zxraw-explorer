@@ -516,9 +516,13 @@ fn index_cached_is_refreshed_after_update() {
 #[test]
 fn stale_partials_beside_an_archive_are_removed_unless_in_use() {
     let d = tempfile::tempdir().unwrap();
-    let old = d.path().join(format!("{}stale", crate::ops::PARTIAL_PREFIX));
+    let old = d
+        .path()
+        .join(format!("{}stale", crate::ops::PARTIAL_PREFIX));
     let busy = d.path().join(format!("{}busy", crate::ops::PARTIAL_PREFIX));
-    let fresh = d.path().join(format!("{}fresh", crate::ops::PARTIAL_PREFIX));
+    let fresh = d
+        .path()
+        .join(format!("{}fresh", crate::ops::PARTIAL_PREFIX));
     for p in [&old, &busy, &fresh] {
         fs::write(p, b"partial").unwrap();
     }
