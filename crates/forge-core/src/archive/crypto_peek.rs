@@ -51,17 +51,32 @@ fn ctr<C: KeyInit + BlockCipherEncrypt + BlockSizeUser>(key: &[u8], data: &mut [
 }
 
 /// The first `n` bytes of a ZipCrypto entry's data. `raw` starts with the 12-byte
-/// encryption header.
-pub(crate) fn zipcrypto_head(raw: &[u8], password: &[u8], n: usize) -> Vec<u8> {
+/// encryption header, whose last byte decrypts to `check` (the high byte of the CRC, or of
+/// the DOS modified time for entries with a data descriptor) when `password` is right.
+/// `None` when it doesn't: the entry has another password, and nothing decrypted with this
+/// one may be read as its compression header.
+pub(crate) fn zipcrypto_head(raw: &[u8], password: &[u8], check: u8, n: usize) -> Option<Vec<u8>> {
+    let header = raw.get(..12)?;
     let mut keys = ZipCryptoKeys::new(password);
-    raw.iter()
-        .take(12 + n)
-        .map(|&c| keys.decrypt(c))
-        .skip(12)
-        .collect()
+    let mut last = 0;
+    for &c in header {
+        last = keys.decrypt(c);
+    }
+    if last != check {
+        return None;
+    }
+    Some(raw[12..].iter().take(n).map(|&c| keys.decrypt(c)).collect())
 }
 
+/// The ZipCrypto key state, derived from the password: wiped when dropped.
 struct ZipCryptoKeys([u32; 3]);
+
+impl Drop for ZipCryptoKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
 
 impl ZipCryptoKeys {
     fn new(password: &[u8]) -> Self {
@@ -117,6 +132,14 @@ mod tests {
         raw
     }
 
+    /// The check byte of entry 0: the zip crate writes ZipCrypto entries with a data
+    /// descriptor, so it is the high byte of the DOS modified time.
+    fn zipcrypto_check(bytes: &[u8]) -> u8 {
+        let mut za = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let f = za.by_index_raw(0).unwrap();
+        (f.last_modified().unwrap().timepart() >> 8) as u8
+    }
+
     #[test]
     fn heads_decrypt_like_the_zip_crate_writes_them() {
         let plain = b"PLAINTEXT header bytes, then more and more data......";
@@ -133,14 +156,21 @@ mod tests {
             let bytes = zw.finish().unwrap().into_inner();
             let raw = raw_of(&bytes);
             let head = if legacy {
-                zipcrypto_head(&raw, b"pw", 16)
+                let check = zipcrypto_check(&bytes);
+                // A wrong password fails the check byte (1 in 256 passes it by chance: of
+                // these, nearly all must fail).
+                let wrong = (0..20)
+                    .filter(|i| {
+                        zipcrypto_head(&raw, format!("x{i}").as_bytes(), check, 16).is_none()
+                    })
+                    .count();
+                assert!(wrong >= 17, "{wrong}");
+                zipcrypto_head(&raw, b"pw", check, 16).unwrap()
             } else {
+                assert!(aes_head(&raw, AesMode::Aes256, b"wrong", 16).is_none());
                 aes_head(&raw, AesMode::Aes256, b"pw", 16).unwrap()
             };
             assert_eq!(head, plain[..16], "legacy {legacy}");
-            if !legacy {
-                assert!(aes_head(&raw, AesMode::Aes256, b"wrong", 16).is_none());
-            }
         }
     }
 }

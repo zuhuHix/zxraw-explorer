@@ -618,7 +618,9 @@ pub fn extract(
         let _pinned = match safety::pin_dirs(&base, parent_rel) {
             Ok(pinned) => pinned,
             Err(e) => {
-                report.failed.push(OpIssue::new(shown(&target), e.to_string()));
+                report
+                    .failed
+                    .push(OpIssue::new(shown(&target), e.to_string()));
                 return Ok(());
             }
         };
@@ -628,7 +630,9 @@ pub fn extract(
         let reader = match reader {
             Ok(r) => r,
             Err(e) => {
-                report.failed.push(OpIssue::new(shown(&target), e.to_string()));
+                report
+                    .failed
+                    .push(OpIssue::new(shown(&target), e.to_string()));
                 ctx.progress.add_bytes(p.entry.size);
                 return Ok(());
             }
