@@ -218,6 +218,7 @@ impl DropTargetHandle {
                 &data,
                 format.ok()?,
                 "IDataObject::GetData(drop effect)",
+                4,
             )
             .ok()?;
             Some(u32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?))
@@ -335,7 +336,7 @@ fn read_drag(obj: &windows::Win32::System::Com::IDataObject) -> Option<CurrentDr
     if !crate::virtual_files::data_object_has_virtual_files(obj) {
         return None;
     }
-    let count = crate::virtual_files::read_descriptors(obj).ok()?.len();
+    let count = crate::virtual_files::read_descriptor_count(obj).ok()?;
     (count > 0).then(|| CurrentDrag {
         info: DragInfo {
             files: Vec::new(),

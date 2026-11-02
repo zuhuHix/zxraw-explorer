@@ -75,8 +75,14 @@ const NAME_UNITS: usize = 260;
 const UNIX_EPOCH_TICKS: u64 = 11_644_473_600 * 10_000_000;
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
-/// Parses a whole `FILEGROUPDESCRIPTORW` block.
-pub fn parse_file_group_descriptor_w(bytes: &[u8]) -> crate::Result<Vec<FileDescriptor>> {
+/// The item count of a `FILEGROUPDESCRIPTORW` block, checked against the block's length and
+/// the item limit. Reads only the header: cheap enough for a drag entering the window.
+pub fn descriptor_count(bytes: &[u8]) -> crate::Result<usize> {
+    group_len(bytes).map(|(count, _)| count)
+}
+
+/// `(cItems, bytes the block needs)`, or why the block is unusable.
+fn group_len(bytes: &[u8]) -> crate::Result<(usize, usize)> {
     if bytes.len() < COUNT_SIZE {
         return Err(invalid("file group descriptor is shorter than its count"));
     }
@@ -84,18 +90,20 @@ pub fn parse_file_group_descriptor_w(bytes: &[u8]) -> crate::Result<Vec<FileDesc
     if count > MAX_ITEMS {
         return Err(invalid("file group descriptor lists too many items"));
     }
-    let needed = count
-        .checked_mul(FILE_DESCRIPTOR_SIZE as u64)
-        .and_then(|body| body.checked_add(COUNT_SIZE as u64))
-        .ok_or_else(|| invalid("file group descriptor size overflows"))?;
-    if (bytes.len() as u64) < needed {
+    // The count was checked against MAX_ITEMS, so these cannot overflow or truncate.
+    let count = count as usize;
+    let needed = COUNT_SIZE + count * FILE_DESCRIPTOR_SIZE;
+    if bytes.len() < needed {
         return Err(invalid(
             "file group descriptor is shorter than its item count",
         ));
     }
+    Ok((count, needed))
+}
 
-    // The count was checked against MAX_ITEMS, so this conversion cannot truncate.
-    let count = count as usize;
+/// Parses a whole `FILEGROUPDESCRIPTORW` block.
+pub fn parse_file_group_descriptor_w(bytes: &[u8]) -> crate::Result<Vec<FileDescriptor>> {
+    let (count, _) = group_len(bytes)?;
     let mut entries = Vec::with_capacity(count);
     for index in 0..count {
         let start = COUNT_SIZE + index * FILE_DESCRIPTOR_SIZE;
@@ -359,6 +367,21 @@ mod tests {
             parse_file_group_descriptor_w(&bytes),
             Err(crate::WinError::Invalid(_))
         ));
+    }
+
+    /// The drag-enter path only needs the count: it is checked like a full parse (length and
+    /// limit) but no entry is read, and trailing bytes (an oversized block) are ignored.
+    #[test]
+    fn descriptor_count_reads_only_the_header() {
+        let item = entry(0, 0, 0, 0, 0, &utf16("a"));
+        let mut bytes = block(2, &[item, item]);
+        bytes.extend(std::iter::repeat_n(0xAB, 1 << 20));
+        assert_eq!(descriptor_count(&bytes).unwrap(), 2);
+        assert!(descriptor_count(&block(2, &[item])).is_err());
+        assert!(descriptor_count(&u32::MAX.to_le_bytes()).is_err());
+        assert!(descriptor_count(&(MAX_ITEMS as u32 + 1).to_le_bytes()).is_err());
+        assert!(descriptor_count(&[1, 0]).is_err());
+        assert_eq!(descriptor_count(&block(0, &[])).unwrap(), 0);
     }
 
     #[test]

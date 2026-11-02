@@ -24,18 +24,23 @@ pub struct VirtualSource {
 
 #[cfg(windows)]
 enum SourceKind {
-    /// `OleGetClipboard` on the reading thread.
-    Clipboard,
+    /// `OleGetClipboard` on the reading thread, but only while the clipboard is still at the
+    /// sequence number it had when the paste looked at it.
+    Clipboard { sequence: u32 },
     /// A dropped data object, marshalled for another thread.
     Marshalled(MarshalStream),
 }
 
 impl VirtualSource {
-    /// The data object on the Windows clipboard, read when the files are opened.
-    pub fn clipboard() -> Self {
+    /// The data object on the Windows clipboard, read when the files are opened, provided
+    /// the clipboard is still at `sequence` (see [`crate::clipboard_sequence`]): if anything
+    /// was copied since, opening fails rather than pasting the newer content.
+    pub fn clipboard(sequence: u32) -> Self {
+        #[cfg(not(windows))]
+        let _ = sequence;
         Self {
             #[cfg(windows)]
-            kind: SourceKind::Clipboard,
+            kind: SourceKind::Clipboard { sequence },
             #[cfg(not(windows))]
             _private: (),
         }
@@ -69,8 +74,15 @@ impl VirtualSource {
 
         match &mut self.kind {
             // SAFETY: COM is initialized on this thread (see `with_virtual_files`).
-            SourceKind::Clipboard => {
-                unsafe { OleGetClipboard() }.map_err(|e| crate::api_err("OleGetClipboard", e))
+            SourceKind::Clipboard { sequence } => {
+                let data = unsafe { OleGetClipboard() }
+                    .map_err(|e| crate::api_err("OleGetClipboard", e))?;
+                // Checked after taking the data object: if the number still matches, it is
+                // the content the paste saw.
+                if crate::clipboard_sequence() != *sequence {
+                    return Err(crate::WinError::Invalid(CLIPBOARD_CHANGED.into()));
+                }
+                Ok(data)
             }
             SourceKind::Marshalled(stream) => {
                 let stream = stream.0.take().ok_or_else(|| {
@@ -85,6 +97,10 @@ impl VirtualSource {
         }
     }
 }
+
+/// Why a paste of virtual files did nothing when the clipboard changed in the meantime.
+pub const CLIPBOARD_CHANGED: &str =
+    "the clipboard changed after Paste was pressed, so nothing was pasted; copy the items again";
 
 /// The marshal data of a dropped data object. Released cleanly if never unmarshalled; for
 /// an object in this process that release calls into its thread, which must be pumping
@@ -342,21 +358,51 @@ pub(crate) fn data_object_has_virtual_files(
 pub(crate) fn read_descriptors(
     obj: &windows::Win32::System::Com::IDataObject,
 ) -> crate::Result<Vec<FileDescriptor>> {
-    let bytes = read_hglobal_bytes(
+    // Parsed in place: the block is never copied whole (its size is the source's to pick).
+    with_hglobal(
         obj,
         descriptor_format()?,
         "IDataObject::GetData(FileGroupDescriptorW)",
-    )?;
-    crate::file_descriptor::parse_file_group_descriptor_w(&bytes)
+        crate::file_descriptor::parse_file_group_descriptor_w,
+    )?
 }
 
-/// Copies out the bytes of `format` from `obj` (global memory, `lindex` -1).
+/// How many virtual files `obj` offers. Reads only the descriptor header, so it is cheap
+/// enough for `DragEnter` on the window thread.
+#[cfg(windows)]
+pub(crate) fn read_descriptor_count(
+    obj: &windows::Win32::System::Com::IDataObject,
+) -> crate::Result<usize> {
+    with_hglobal(
+        obj,
+        descriptor_format()?,
+        "IDataObject::GetData(FileGroupDescriptorW)",
+        crate::file_descriptor::descriptor_count,
+    )?
+}
+
+/// Copies out at most `max` bytes of `format` from `obj` (global memory, `lindex` -1).
 #[cfg(windows)]
 pub(crate) fn read_hglobal_bytes(
     obj: &windows::Win32::System::Com::IDataObject,
     format: u16,
     op: &'static str,
+    max: usize,
 ) -> crate::Result<Vec<u8>> {
+    with_hglobal(obj, format, op, |bytes| {
+        bytes[..bytes.len().min(max)].to_vec()
+    })
+}
+
+/// Runs `f` on the locked bytes of `format` from `obj` (global memory, `lindex` -1),
+/// without copying them.
+#[cfg(windows)]
+pub(crate) fn with_hglobal<R>(
+    obj: &windows::Win32::System::Com::IDataObject,
+    format: u16,
+    op: &'static str,
+    f: impl FnOnce(&[u8]) -> R,
+) -> crate::Result<R> {
     use windows::Win32::System::Com::TYMED_HGLOBAL;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize};
 
@@ -378,7 +424,9 @@ pub(crate) fn read_hglobal_bytes(
     }
     let _locked = LockedGlobal(global);
     // SAFETY: the block is locked and at least `size` bytes long.
-    Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec())
+    Ok(f(unsafe {
+        std::slice::from_raw_parts(ptr.cast::<u8>(), size)
+    }))
 }
 
 /// A `FORMATETC` for `format` in global memory, whole content.
@@ -734,6 +782,53 @@ mod tests {
             vec![("sub".to_string(), true), ("sub\\b.txt".to_string(), false)]
         );
         assert_eq!(text, "world");
+    }
+
+    /// A paste reads the clipboard it looked at, or nothing: once something else was
+    /// copied, opening the source fails instead of pasting the newer content.
+    #[test]
+    fn a_clipboard_source_refuses_a_clipboard_changed_since_the_paste() {
+        use crate::clipboard_test_support::{ClipboardLock, Snapshot};
+
+        let _lock = ClipboardLock::acquire();
+        let saved = match Snapshot::save() {
+            Ok(saved) => saved,
+            Err(why) => {
+                eprintln!("skipped: the clipboard holds {why}, which this test can't restore");
+                return;
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let zip = write_test_zip(dir.path());
+        let _ole = OleApartment::new().unwrap();
+        let item = format!("{}\\sub", zip.display());
+        set_clipboard_to_shell_item(&item, &dir.path().display().to_string()).unwrap();
+        let sequence = crate::clipboard_sequence();
+        let read = |sequence: u32| {
+            let reader = std::thread::spawn(move || {
+                with_virtual_files(VirtualSource::clipboard(sequence), |files| {
+                    files.items().len()
+                })
+            });
+            // This thread owns the clipboard's data object: serve the reader's calls.
+            pump_until(|| reader.is_finished());
+            reader.join().unwrap()
+        };
+
+        let unchanged = read(sequence);
+        Snapshot::of_text("copied meanwhile")
+            .restore_if(|| true)
+            .unwrap();
+        let changed = read(sequence);
+        if let Err(e) = saved.restore_if(|| true) {
+            eprintln!("warning: could not restore the clipboard: {e}");
+        }
+
+        assert_eq!(unchanged.unwrap(), 2);
+        let error = changed
+            .expect_err("a changed clipboard was pasted")
+            .to_string();
+        assert!(error.contains("clipboard changed"), "{error}");
     }
 
     #[test]

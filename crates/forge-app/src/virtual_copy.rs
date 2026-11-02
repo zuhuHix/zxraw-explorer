@@ -19,7 +19,7 @@
 //! paths, no `:` streams, no reserved device names), and an item that fails is reported and
 //! skipped, so nothing is written outside the destination.
 
-use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -27,6 +27,7 @@ use forge_core::ops::{
     self, ConflictPolicy, JobCtx, OpIssue, OpKind, OpOptions, OpReport, StreamOptions, UndoRecord,
 };
 use forge_jobs::JobHandle;
+use forge_win::file_descriptor::FileDescriptor;
 use forge_win::virtual_files::{VirtualContent, VirtualFiles, VirtualSource};
 
 use crate::actions::Event;
@@ -100,11 +101,20 @@ fn run(
     })?;
     let job_ctx = JobCtx::from_job(job);
     let extracted = match forge_win::virtual_files::with_virtual_files(source, |files| {
-        extract(files, &staging.path, dest, &job_ctx)
+        let extracted = extract(files, &staging.path, dest, &job_ctx);
+        scrub(&staging.path, &extracted.failed_targets);
+        extracted
     }) {
         Ok(extracted) => extracted,
         Err(e) => {
-            let message = format!("Could not read the items to paste: {e}");
+            let why = e.to_string();
+            let message = if why.contains(forge_win::virtual_files::CLIPBOARD_CHANGED) {
+                "Nothing was pasted: the clipboard changed after Paste was pressed. Copy the \
+                 items again."
+                    .to_string()
+            } else {
+                format!("Could not read the items to paste: {why}")
+            };
             let _ = tx.send(Event::Error(message.clone()));
             return Err(message);
         }
@@ -131,12 +141,50 @@ struct Extracted {
     bytes: u64,
     failed: Vec<OpIssue>,
     skipped: Vec<OpIssue>,
+    /// Where the failed items would have been in the staging folder: whatever is there is
+    /// removed before anything is placed (see [`scrub`]).
+    failed_targets: Vec<PathBuf>,
     cancelled: bool,
+}
+
+/// The items to copy: the opened data object, or a stand-in in tests.
+trait Items {
+    fn items(&self) -> &[FileDescriptor];
+    fn open(&self, index: usize) -> Result<Content<'_>, String>;
+}
+
+/// Writes a structured storage to the given path.
+type SaveStorage<'a> = Box<dyn FnOnce(&Path) -> Result<(), String> + 'a>;
+
+/// One item's contents.
+enum Content<'a> {
+    Stream(Box<dyn Read + 'a>),
+    /// Writes a structured storage (an Outlook message) to the given path.
+    Storage(SaveStorage<'a>),
+}
+
+impl Items for VirtualFiles {
+    fn items(&self) -> &[FileDescriptor] {
+        VirtualFiles::items(self)
+    }
+
+    fn open(&self, index: usize) -> Result<Content<'_>, String> {
+        Ok(
+            match VirtualFiles::open(self, index).map_err(|e| e.to_string())? {
+                VirtualContent::Stream(reader) => Content::Stream(reader),
+                VirtualContent::Storage(storage) => {
+                    Content::Storage(Box::new(move |path: &Path| {
+                        storage.save_as(path).map_err(|e| e.to_string())
+                    }))
+                }
+            },
+        )
+    }
 }
 
 /// Writes every item of `files` into `staging`. Issues are reported under the path the item
 /// would have had in `dest`.
-fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) -> Extracted {
+fn extract(files: &dyn Items, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) -> Extracted {
     let items = files.items();
     let mut out = Extracted::default();
     ctx.progress
@@ -148,7 +196,6 @@ fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) 
             .filter_map(|d| d.size)
             .sum(),
     );
-    let mut seen = HashSet::new();
     let mut folders: Vec<(PathBuf, SystemTime)> = Vec::new();
     for (index, item) in items.iter().enumerate() {
         if ctx.cancel.is_cancelled() {
@@ -166,17 +213,31 @@ fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) 
             }
         };
         let shown = dest.join(&rel);
-        if !seen.insert(rel.to_string_lossy().to_lowercase()) {
-            out.skipped
-                .push(OpIssue::new(shown, "offered twice, copied once"));
+        let target = staging.join(&rel);
+        // Two items with one name, as Windows compares names (the staging folder's file
+        // system decides, case folding included): the first one is kept.
+        let existing = std::fs::symlink_metadata(&target).ok();
+        if item.is_dir {
+            match existing {
+                Some(md) if md.is_dir() => {}
+                Some(_) => {
+                    out.skipped
+                        .push(OpIssue::new(shown, "offered twice, copied once"));
+                    continue;
+                }
+                None => {
+                    if let Err(e) = std::fs::create_dir_all(&target) {
+                        out.failed.push(OpIssue::new(shown, e.to_string()));
+                        continue;
+                    }
+                }
+            }
+            folders.extend(item.modified.map(|t| (target, t)));
             continue;
         }
-        let target = staging.join(&rel);
-        if item.is_dir {
-            match std::fs::create_dir_all(&target) {
-                Ok(()) => folders.extend(item.modified.map(|t| (target, t))),
-                Err(e) => out.failed.push(OpIssue::new(shown, e.to_string())),
-            }
+        if existing.is_some() {
+            out.skipped
+                .push(OpIssue::new(shown, "offered twice, copied once"));
             continue;
         }
         if let Some(parent) = target.parent()
@@ -192,10 +253,12 @@ fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) 
                 ctx.progress.add_items(1);
             }
             Err(_) if ctx.cancel.is_cancelled() => {
+                out.failed_targets.push(target);
                 out.cancelled = true;
                 break;
             }
             Err(why) => {
+                out.failed_targets.push(target);
                 out.failed.push(OpIssue::new(shown, why));
                 ctx.progress.add_error();
             }
@@ -209,16 +272,16 @@ fn extract(files: &VirtualFiles, staging: &Path, dest: &Path, ctx: &JobCtx<'_>) 
 }
 
 fn write_item(
-    files: &VirtualFiles,
+    files: &dyn Items,
     index: usize,
-    item: &forge_win::file_descriptor::FileDescriptor,
+    item: &FileDescriptor,
     shown: &Path,
     target: &Path,
     ctx: &JobCtx<'_>,
 ) -> Result<u64, String> {
     let attributes = item.attributes.unwrap_or(0);
-    match files.open(index).map_err(|e| e.to_string())? {
-        VirtualContent::Stream(reader) => {
+    match files.open(index)? {
+        Content::Stream(reader) => {
             let opts = StreamOptions {
                 modified: item.modified,
                 readonly: attributes & FILE_ATTRIBUTE_READONLY != 0,
@@ -229,17 +292,60 @@ fn write_item(
                 .map(|outcome| outcome.bytes)
                 .map_err(|e| e.to_string())
         }
-        VirtualContent::Storage(storage) => {
-            storage.save_as(target).map_err(|e| e.to_string())?;
-            if let Some(modified) = item.modified {
-                let _ = filetime::set_file_mtime(
-                    target,
-                    filetime::FileTime::from_system_time(modified),
-                );
+        Content::Storage(save) => {
+            // Written under a temporary name and renamed when complete, like every copy: a
+            // storage that fails half way never sits at the item's name.
+            let temp = target.with_file_name(ops::partial_name());
+            let saved = save(&temp).and_then(|()| {
+                if let Some(modified) = item.modified {
+                    let _ = filetime::set_file_mtime(
+                        &temp,
+                        filetime::FileTime::from_system_time(modified),
+                    );
+                }
+                forge_core::paths::rename_no_replace(&temp, target).map_err(|e| e.to_string())
+            });
+            if let Err(why) = saved {
+                let _ = std::fs::remove_file(&temp);
+                return Err(why);
             }
             let bytes = std::fs::metadata(target).map(|m| m.len()).unwrap_or(0);
             ctx.progress.add_bytes(bytes);
             Ok(bytes)
+        }
+    }
+}
+
+/// Makes sure nothing that failed is placed: removes whatever sits at a failed item's path
+/// and every temporary file left anywhere in the staging folder (it is new and ours alone,
+/// so nothing in it is a link).
+fn scrub(staging: &Path, failed: &[PathBuf]) {
+    for path in failed {
+        if let Ok(md) = std::fs::symlink_metadata(path) {
+            let _ = if md.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+        }
+    }
+    let mut folders = vec![staging.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if ops::is_partial_name(&entry.file_name().to_string_lossy()) {
+                let _ = if is_dir {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            } else if is_dir {
+                folders.push(path);
+            }
         }
     }
 }
@@ -356,6 +462,140 @@ impl Drop for Staging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Items held in memory: a file's contents, or `None` for a storage that fails half way
+    /// (it writes a little, then reports an error).
+    struct Fake(
+        Vec<(FileDescriptor, Option<&'static [u8]>)>,
+        Vec<FileDescriptor>,
+    );
+
+    impl Fake {
+        fn new(items: Vec<(&str, bool, Option<&'static [u8]>)>) -> Self {
+            let list = items
+                .iter()
+                .map(|(name, is_dir, _)| FileDescriptor {
+                    name: name.to_string(),
+                    is_dir: *is_dir,
+                    attributes: None,
+                    size: None,
+                    created: None,
+                    modified: None,
+                    flags: 0,
+                })
+                .collect::<Vec<_>>();
+            let pairs = list
+                .iter()
+                .cloned()
+                .zip(items.into_iter().map(|(_, _, data)| data))
+                .collect();
+            Self(pairs, list)
+        }
+    }
+
+    impl Items for Fake {
+        fn items(&self) -> &[FileDescriptor] {
+            &self.1
+        }
+
+        fn open(&self, index: usize) -> Result<Content<'_>, String> {
+            Ok(match self.0[index].1 {
+                Some(bytes) => Content::Stream(Box::new(bytes)),
+                None => Content::Storage(Box::new(|path: &Path| {
+                    std::fs::write(path, b"half a message").unwrap();
+                    Err("the storage could not be copied".into())
+                })),
+            })
+        }
+    }
+
+    fn run_extract(fake: &Fake, staging: &Path, dest: &Path) -> Extracted {
+        let (cancel, progress) = (
+            forge_jobs::CancelToken::default(),
+            forge_jobs::Progress::default(),
+        );
+        let extracted = extract(fake, staging, dest, &JobCtx::new(&cancel, &progress));
+        scrub(staging, &extracted.failed_targets);
+        extracted
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A storage item that fails half way is reported and leaves nothing behind that the
+    /// placement step could move into the destination.
+    #[test]
+    fn a_failed_item_is_never_left_to_be_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, dest) = (dir.path().join("staging"), dir.path().join("dest"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let fake = Fake::new(vec![
+            ("good.txt", false, Some(b"fine")),
+            ("mail.msg", false, None),
+            ("sub", true, None),
+            (r"sublso.msg", false, None),
+        ]);
+        let extracted = run_extract(&fake, &staging, &dest);
+        assert_eq!(extracted.failed.len(), 2);
+        assert_eq!(extracted.failed[0].path, dest.join("mail.msg"));
+        assert_eq!(names_in(&staging), ["good.txt", "sub"]);
+        assert!(names_in(&staging.join("sub")).is_empty());
+    }
+
+    /// Leftovers of a write that failed (temporary files) and an item at a failed path are
+    /// removed before placement; everything else stays.
+    #[test]
+    fn scrub_removes_failed_items_and_temporary_files_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path();
+        std::fs::create_dir_all(staging.join("sub")).unwrap();
+        std::fs::write(staging.join("ok.txt"), b"x").unwrap();
+        std::fs::write(staging.join("bad.txt"), b"partial").unwrap();
+        std::fs::write(staging.join("sub").join(".forge-partial-1234"), b"t").unwrap();
+        std::fs::write(staging.join("sub").join("keep.txt"), b"x").unwrap();
+        scrub(
+            staging,
+            &[staging.join("bad.txt"), staging.join("missing.txt")],
+        );
+        assert_eq!(names_in(staging), ["ok.txt", "sub"]);
+        assert_eq!(names_in(&staging.join("sub")), ["keep.txt"]);
+    }
+
+    /// Names that Windows takes as the same (letter case, as the file system folds it) are
+    /// copied once, the first one offered.
+    #[test]
+    fn names_windows_takes_as_equal_are_copied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, dest) = (dir.path().join("staging"), dir.path().join("dest"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let fake = Fake::new(vec![
+            ("a.txt", false, Some(b"first")),
+            ("A.TXT", false, Some(b"second")),
+            ("\u{3a3}.txt", false, Some(b"sigma")),
+            ("\u{3c3}.txt", false, Some(b"small sigma")),
+            ("Sub", true, None),
+            (r"sub\b.txt", false, Some(b"b")),
+            ("SUB", false, Some(b"a file named like the folder")),
+        ]);
+        let extracted = run_extract(&fake, &staging, &dest);
+        assert!(extracted.failed.is_empty(), "{:?}", extracted.failed);
+        assert_eq!(extracted.skipped.len(), 3, "{:?}", extracted.skipped);
+        assert_eq!(std::fs::read(staging.join("a.txt")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(staging.join("\u{3a3}.txt")).unwrap(),
+            b"sigma"
+        );
+        assert_eq!(
+            std::fs::read(staging.join("Sub").join("b.txt")).unwrap(),
+            b"b"
+        );
+    }
 
     #[test]
     fn nested_names_keep_their_folders() {
