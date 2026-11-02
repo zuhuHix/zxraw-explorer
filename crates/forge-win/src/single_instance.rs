@@ -26,11 +26,17 @@
 //!
 //! Races: the pipe always has a listening instance while the owner runs (the next one is
 //! created before a connected one is handled), so a second launch never sees "no owner"
-//! while one exists. Requests that arrive before the window takes its first batch are
-//! queued and acknowledged. After that, a request the window does not take within
-//! [`UI_WAIT`] is withdrawn and answered "busy", so a hung window makes the sender fall back
-//! to a window of its own instead of losing the request; [`Inbox::close`] makes a closing
-//! window answer "closing" at once. The sender gives up after its timeout in every case.
+//! while one exists. A request is answered "accepted" only once the window has taken it:
+//! the receiver holds the answer while the window is still starting, for as long as the
+//! sender said it would wait (minus [`REPLY_MARGIN`]), and for at most [`UI_WAIT`] once the
+//! window is up. A request not taken by then is withdrawn and answered "busy" (or "closing"
+//! when the window began closing, see [`Inbox::close`]), so the sender opens a window of its
+//! own and the path opens exactly once: never in both windows, never in neither.
+//!
+//! Identity: the sender also checks that the pipe's owner runs the same executable file as
+//! itself (volume serial and file index), so another program of the same user that creates
+//! the pipe first cannot silently swallow launches. Same-user processes are otherwise outside
+//! the threat model: they can already do far more to this user than receive a folder path.
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf, Prefix};
@@ -51,8 +57,16 @@ pub const MAX_PATHS: usize = 64;
 pub const MAX_PATH_UNITS: usize = 32_767;
 /// How long the receiver waits for a ready window to take a request before answering busy.
 pub const UI_WAIT: Duration = Duration::from_millis(1500);
-/// How long a sender waits in total before starting a window of its own.
-pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2500);
+/// How long a sender waits in total before starting a window of its own. Covers a window
+/// that is still starting (its first frame), which the receiver waits for.
+pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(4000);
+/// The receiver answers this long before the sender's stated wait runs out, so the answer
+/// arrives while the sender still listens.
+pub const REPLY_MARGIN: Duration = Duration::from_millis(500);
+/// Upper bound on the wait a sender may ask for.
+const MAX_REPLY_WAIT: Duration = Duration::from_secs(10);
+/// Byte offset of the sender's wait (`u32` milliseconds) in a request.
+const WAIT_OFFSET: usize = 8;
 
 const REQUEST_MAGIC: [u8; 4] = *b"ZXOR";
 const REPLY_MAGIC: [u8; 4] = *b"ZXRP";
@@ -98,8 +112,10 @@ impl std::error::Error for PayloadError {}
 /// Encodes an open request: the sender's working directory (for relative paths) and the
 /// paths as given on its command line. No paths means "just bring the window forward".
 ///
-/// Layout, little-endian: magic `ZXOR`, `u32` version, the working directory, a `u32` path
-/// count, then each path. A string is a `u32` count of UTF-16 units followed by the units.
+/// Layout, little-endian: magic `ZXOR`, `u32` version, `u32` milliseconds the sender waits
+/// for the answer (filled in when sending, see [`set_reply_wait`]), the working directory, a
+/// `u32` path count, then each path. A string is a `u32` count of UTF-16 units followed by
+/// the units.
 pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<u8>, PayloadError> {
     if paths.len() > MAX_PATHS {
         return Err(PayloadError::TooManyPaths(paths.len()));
@@ -107,6 +123,7 @@ pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<
     let mut out = Vec::new();
     out.extend_from_slice(&REQUEST_MAGIC);
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
     put_string(&mut out, cwd.as_os_str())?;
     out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
     for path in paths {
@@ -116,6 +133,14 @@ pub fn encode_request(cwd: &Path, paths: &[PathBuf]) -> std::result::Result<Vec<
         return Err(PayloadError::TooLarge(out.len()));
     }
     Ok(out)
+}
+
+/// Sets how long the sender of `request` (from [`encode_request`]) waits for the answer.
+pub fn set_reply_wait(request: &mut [u8], wait: Duration) {
+    if let Some(field) = request.get_mut(WAIT_OFFSET..WAIT_OFFSET + 4) {
+        let ms = wait.as_millis().min(u128::from(u32::MAX)) as u32;
+        field.copy_from_slice(&ms.to_le_bytes());
+    }
 }
 
 fn put_string(out: &mut Vec<u8>, s: &std::ffi::OsStr) -> std::result::Result<(), PayloadError> {
@@ -141,9 +166,18 @@ fn wide_units(s: &std::ffi::OsStr) -> Vec<u16> {
     s.to_string_lossy().encode_utf16().collect()
 }
 
-/// Decodes and validates a request into the absolute paths to open (empty: only bring the
-/// window forward). Relative paths are resolved against the sender's working directory.
-pub fn decode_request(bytes: &[u8]) -> std::result::Result<Vec<PathBuf>, PayloadError> {
+/// A validated request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    /// Absolute paths to open; empty = only bring the window forward.
+    pub paths: Vec<PathBuf>,
+    /// How long the sender waits for the answer (at most 10 s).
+    pub reply_within: Duration,
+}
+
+/// Decodes and validates a request. Relative paths are resolved against the sender's
+/// working directory.
+pub fn decode_request(bytes: &[u8]) -> std::result::Result<Request, PayloadError> {
     if bytes.len() > MAX_PAYLOAD {
         return Err(PayloadError::TooLarge(bytes.len()));
     }
@@ -155,6 +189,7 @@ pub fn decode_request(bytes: &[u8]) -> std::result::Result<Vec<PathBuf>, Payload
     if version != PROTOCOL_VERSION {
         return Err(PayloadError::WrongVersion(version));
     }
+    let reply_within = Duration::from_millis(u64::from(r.u32()?)).min(MAX_REPLY_WAIT);
     let cwd = r.string()?;
     let count = r.u32()? as usize;
     if count > MAX_PATHS {
@@ -173,9 +208,11 @@ pub fn decode_request(bytes: &[u8]) -> std::result::Result<Vec<PathBuf>, Payload
     {
         return Err(PayloadError::NotAbsolute(cwd.display().to_string()));
     }
-    raw.into_iter()
+    let paths = raw
+        .into_iter()
         .map(|p| resolve(cwd.as_deref(), &p))
-        .collect()
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(Request { paths, reply_within })
 }
 
 /// `path` as an absolute path: kept if it already is one, else joined to `cwd`.
@@ -336,7 +373,8 @@ impl Inbox {
     }
 
     /// From now on, requests are answered [`Reply::Closing`] so their senders start their
-    /// own window. Requests already queued stay (the window may still take them).
+    /// own window. Requests queued but not taken yet are withdrawn by their pipe threads and
+    /// answered the same; what the window already took is its own.
     pub fn close(&self) {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).closing = true;
         self.taken.notify_all();
@@ -346,8 +384,10 @@ impl Inbox {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).closing
     }
 
-    /// Queues `paths` and answers for the window: see [`Reply`].
-    pub fn deliver(&self, paths: Vec<PathBuf>, ui_wait: Duration) -> Reply {
+    /// Queues `paths` and answers for the window once it took them, or withdraws them: see
+    /// [`Reply`]. Waits at most `wait` while the window is starting and at most `ui_wait`
+    /// (and `wait`) once it is up.
+    pub fn deliver(&self, paths: Vec<PathBuf>, wait: Duration, ui_wait: Duration) -> Reply {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.closing {
             return Reply::Closing;
@@ -361,14 +401,13 @@ impl Inbox {
             wake();
         }
         self.bring_to_front();
-        if !ready {
-            // Still starting: held until the window takes its first batch.
-            return Reply::Accepted;
-        }
+        // A starting window gets the sender's whole wait; a running one that does not take a
+        // request within `ui_wait` is not responding.
+        let limit = if ready { wait.min(ui_wait) } else { wait };
         let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let (mut state, _) = self
             .taken
-            .wait_timeout_while(state, ui_wait, |s| {
+            .wait_timeout_while(state, limit, |s| {
                 !s.closing && s.queue.iter().any(|(queued, _)| *queued == id)
             })
             .unwrap_or_else(|p| p.into_inner());
@@ -540,7 +579,10 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
     use windows::core::{HRESULT, PCWSTR, PWSTR};
 
-    use super::{ForwardError, Inbox, MAX_PAYLOAD, Reply, UI_WAIT, decode_request};
+    use super::{
+        ForwardError, Inbox, MAX_PAYLOAD, REPLY_MARGIN, Reply, UI_WAIT, decode_request,
+        set_reply_wait,
+    };
     use crate::{Result, WinError};
 
     /// How long the receiver waits for a connected client's request, and for its own reply
@@ -605,6 +647,23 @@ mod imp {
         }
     }
 
+    /// The full Win32 path of the executable process `pid` runs.
+    fn image_path(pid: u32) -> Result<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+        use windows::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+        let process = Owned(
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+                .map_err(|e| crate::api_err("OpenProcess", e))?,
+        );
+        let mut buf = vec![0u16; 32_768];
+        let mut len = buf.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(process.0, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len)
+        }
+        .map_err(|e| crate::api_err("QueryFullProcessImageNameW", e))?;
+        Ok(std::ffi::OsString::from_wide(&buf[..len as usize]).into())
+    }
+
     /// A token information block, in a buffer aligned for the structure it holds.
     unsafe fn token_info(
         token: HANDLE,
@@ -626,6 +685,8 @@ mod imp {
         name: Vec<u16>,
         display: String,
         me: Identity,
+        /// The executable the pipe's owner must run: this process's own.
+        exe: std::path::PathBuf,
     }
 
     impl Channel {
@@ -643,7 +704,42 @@ mod imp {
                 r"\\.\pipe\ZXrawExplorer-{}-{}-{:x}-{tag}",
                 me.sid, me.session, me.integrity
             );
-            Ok(Self { name: crate::to_wide(&display), display, me })
+            let exe = std::env::current_exe().map_err(|source| WinError::Io {
+                op: "current_exe",
+                path: std::path::PathBuf::new(),
+                source,
+            })?;
+            Ok(Self { name: crate::to_wide(&display), display, me, exe })
+        }
+
+        /// Tests: expect the pipe's owner to run `exe` instead of this process's executable.
+        #[cfg(test)]
+        pub(crate) fn expecting_exe(mut self, exe: std::path::PathBuf) -> Self {
+            self.exe = exe;
+            self
+        }
+
+        /// The owner `pid` runs the same executable file as this process: same volume serial
+        /// and file index, or (when those cannot be read) the same full path, ignoring case.
+        /// Keeps another program of this user that took the pipe name from swallowing launches.
+        pub(crate) fn check_exe(&self, pid: u32) -> std::result::Result<(), String> {
+            let theirs = image_path(pid).map_err(|e| format!("process {pid}: {e}"))?;
+            let same = match (crate::files::file_id(&theirs), crate::files::file_id(&self.exe)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => theirs
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&self.exe.as_os_str().to_string_lossy()),
+            };
+            if same {
+                Ok(())
+            } else {
+                Err(format!(
+                    "process {pid} runs {}, not {}",
+                    theirs.display(),
+                    self.exe.display()
+                ))
+            }
         }
 
         pub fn pipe_name(&self) -> &str {
@@ -961,9 +1057,17 @@ mod imp {
         }
         let reply = match read_message(pipe.0, MAX_PAYLOAD, READ_TIMEOUT) {
             Ok(bytes) => match decode_request(&bytes) {
-                Ok(paths) => {
-                    tracing::info!("received a launch with {} path(s) from process {pid}", paths.len());
-                    inbox.deliver(paths, UI_WAIT)
+                Ok(request) => {
+                    tracing::info!(
+                        "received a launch with {} path(s) from process {pid}",
+                        request.paths.len()
+                    );
+                    let wait = request.reply_within.saturating_sub(REPLY_MARGIN);
+                    let reply = inbox.deliver(request.paths, wait, UI_WAIT);
+                    if reply != Reply::Accepted {
+                        tracing::warn!("a launch from process {pid} was withdrawn: {reply:?}");
+                    }
+                    reply
                 }
                 Err(e) => {
                     tracing::warn!("instance pipe: invalid request from process {pid}: {e}");
@@ -1034,6 +1138,8 @@ mod imp {
         unsafe { GetNamedPipeServerProcessId(pipe.0, &mut server_pid) }
             .map_err(|e| ForwardError::Failed(crate::api_err("GetNamedPipeServerProcessId", e)))?;
         channel.check(server_pid).map_err(ForwardError::Untrusted)?;
+        // Checked before anything is sent or any foreground right is handed on.
+        channel.check_exe(server_pid).map_err(ForwardError::Untrusted)?;
         // This process was just started by the user, so it may hand the foreground on.
         if let Err(e) = unsafe { AllowSetForegroundWindow(server_pid) } {
             tracing::debug!("AllowSetForegroundWindow({server_pid}) failed: {e}");
@@ -1043,7 +1149,11 @@ mod imp {
             IoError::MoreData => ForwardError::Failed(WinError::Invalid("oversized reply".into())),
             IoError::Os(e) => ForwardError::Failed(crate::api_err("pipe I/O", e)),
         };
-        write_message(pipe.0, request, remaining()).map_err(|e| io(e, "sending"))?;
+        // The owner answers within this, so the answer always arrives while this end listens
+        // and a request this end gave up on is never also opened there.
+        let mut request = request.to_vec();
+        set_reply_wait(&mut request, remaining());
+        write_message(pipe.0, &request, remaining()).map_err(|e| io(e, "sending"))?;
         let answer = read_message(pipe.0, 64, remaining()).map_err(|e| io(e, "waiting for the answer"))?;
         match Reply::decode(&answer) {
             Some(Reply::Accepted) => Ok(()),
@@ -1137,6 +1247,7 @@ mod tests {
     fn raw(version: u32, cwd: &[u8], paths: &[Vec<u8>]) -> Vec<u8> {
         let mut out = REQUEST_MAGIC.to_vec();
         out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(cwd);
         out.extend_from_slice(&(paths.len() as u32).to_le_bytes());
         for p in paths {
@@ -1160,7 +1271,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let paths = decode_request(&bytes).unwrap();
+        let paths = decode_request(&bytes).unwrap().paths;
         assert_eq!(
             paths,
             vec![
@@ -1177,7 +1288,7 @@ mod tests {
     #[test]
     fn no_paths_means_focus_only() {
         let bytes = encode_request(Path::new(""), &[]).unwrap();
-        assert_eq!(decode_request(&bytes).unwrap(), Vec::<PathBuf>::new());
+        assert_eq!(decode_request(&bytes).unwrap().paths, Vec::<PathBuf>::new());
     }
 
     #[cfg(windows)]
@@ -1200,7 +1311,7 @@ mod tests {
             );
         }
         let bytes = raw(1, &units(r"D:\work"), &[units(r"\\?\C:\long\path")]);
-        assert_eq!(decode_request(&bytes).unwrap(), vec![PathBuf::from(r"\\?\C:\long\path")]);
+        assert_eq!(decode_request(&bytes).unwrap().paths, vec![PathBuf::from(r"\\?\C:\long\path")]);
     }
 
     #[test]
@@ -1277,21 +1388,71 @@ mod tests {
     }
 
     #[test]
-    fn inbox_holds_requests_until_the_window_is_ready() {
-        let inbox = Inbox::new();
-        assert_eq!(inbox.deliver(vec![PathBuf::from("a")], Duration::ZERO), Reply::Accepted);
-        assert_eq!(inbox.deliver(vec![PathBuf::from("b")], Duration::ZERO), Reply::Accepted);
-        assert_eq!(inbox.take(), vec![vec![PathBuf::from("a")], vec![PathBuf::from("b")]]);
+    fn the_sender_wait_travels_in_the_request_and_is_capped() {
+        let mut bytes = encode_request(Path::new(""), &[]).unwrap();
+        assert_eq!(decode_request(&bytes).unwrap().reply_within, Duration::ZERO);
+        set_reply_wait(&mut bytes, Duration::from_millis(3210));
+        assert_eq!(decode_request(&bytes).unwrap().reply_within, Duration::from_millis(3210));
+        set_reply_wait(&mut bytes, Duration::from_secs(3600));
+        assert_eq!(decode_request(&bytes).unwrap().reply_within, MAX_REPLY_WAIT);
+    }
+
+    /// Delivers `paths` on another thread, as a pipe thread does.
+    fn deliver_async(
+        inbox: &std::sync::Arc<Inbox>,
+        name: &str,
+        wait: Duration,
+    ) -> std::thread::JoinHandle<Reply> {
+        let (inbox, name) = (inbox.clone(), name.to_string());
+        std::thread::spawn(move || inbox.deliver(vec![PathBuf::from(name)], wait, UI_WAIT))
+    }
+
+    #[test]
+    fn a_request_during_startup_is_accepted_only_once_the_window_takes_it() {
+        let inbox = std::sync::Arc::new(Inbox::new());
+        let pending = deliver_async(&inbox, "a", Duration::from_secs(10));
+        // Longer than UI_WAIT: a starting window gets the sender's whole wait.
+        std::thread::sleep(UI_WAIT + Duration::from_millis(200));
+        assert!(!pending.is_finished(), "no answer before the window took the request");
+        let mut taken = Vec::new();
+        while !pending.is_finished() {
+            taken.extend(inbox.take());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(pending.join().unwrap(), Reply::Accepted);
+        assert_eq!(taken, vec![vec![PathBuf::from("a")]]);
+    }
+
+    #[test]
+    fn a_startup_past_the_sender_wait_gets_busy_and_never_opens_it() {
+        let inbox = std::sync::Arc::new(Inbox::new());
+        let reply = deliver_async(&inbox, "a", Duration::from_millis(100)).join().unwrap();
+        assert_eq!(reply, Reply::Busy);
+        assert!(inbox.take().is_empty(), "the sender opens it, so this window must not");
+    }
+
+    #[test]
+    fn a_window_closing_before_its_first_frame_answers_closing_and_never_opens_it() {
+        let inbox = std::sync::Arc::new(Inbox::new());
+        let pending = deliver_async(&inbox, "a", Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(100));
+        inbox.close();
+        assert_eq!(pending.join().unwrap(), Reply::Closing);
+        assert!(inbox.take().is_empty());
+        assert_eq!(inbox.deliver(vec![], Duration::from_secs(1), UI_WAIT), Reply::Closing);
     }
 
     #[test]
     fn a_ready_window_that_never_takes_a_request_gets_busy_and_the_request_is_withdrawn() {
         let inbox = Inbox::new();
         inbox.take();
-        assert_eq!(inbox.deliver(vec![PathBuf::from("a")], Duration::from_millis(50)), Reply::Busy);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            inbox.deliver(vec![PathBuf::from("a")], Duration::from_secs(10), Duration::from_millis(50)),
+            Reply::Busy
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "a running window gets only ui_wait");
         assert!(inbox.take().is_empty(), "a withdrawn request must not open later as well");
-        inbox.close();
-        assert_eq!(inbox.deliver(vec![], Duration::ZERO), Reply::Closing);
     }
 
     #[cfg(windows)]
@@ -1380,15 +1541,80 @@ mod tests {
         }
 
         #[test]
-        fn requests_sent_while_the_owner_is_starting_are_queued_not_dropped() {
+        fn a_request_sent_while_the_owner_is_starting_is_accepted_once_taken() {
             let channel = Channel::current(&unique_tag("start")).unwrap();
             let inbox = Arc::new(Inbox::new());
             let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
-            // The window has not taken anything yet (still starting), for longer than UI_WAIT.
             let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
-            assert!(forward(&channel, &request, Instant::now() + FORWARD_TIMEOUT).is_ok());
-            std::thread::sleep(UI_WAIT + Duration::from_millis(100));
-            assert_eq!(inbox.take(), vec![vec![PathBuf::from(r"C:\Users")]]);
+            let sender = {
+                let channel = channel.clone();
+                std::thread::spawn(move || forward(&channel, &request, Instant::now() + FORWARD_TIMEOUT))
+            };
+            // The window takes its first batch only after UI_WAIT (a slow start).
+            std::thread::sleep(UI_WAIT + Duration::from_millis(200));
+            assert!(!sender.is_finished(), "the sender is answered only once the window took it");
+            let (stop, window) = window(inbox.clone());
+            assert!(sender.join().unwrap().is_ok());
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(window.join().unwrap(), vec![vec![PathBuf::from(r"C:\Users")]]);
+        }
+
+        #[test]
+        fn an_owner_starting_past_the_timeout_or_closing_first_lets_the_sender_open_it_alone() {
+            let channel = Channel::current(&unique_tag("slow")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
+            // Never takes anything: a start slower than the sender's timeout.
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("not responding"), "{why}"),
+                _ => panic!("a window that never took the request must not have it"),
+            }
+            assert!(started.elapsed() < Duration::from_millis(1500) + Duration::from_millis(300));
+            assert!(inbox.take().is_empty(), "no double open: the sender opens it");
+
+            let channel = Channel::current(&unique_tag("closing")).unwrap();
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let sender = {
+                let channel = channel.clone();
+                std::thread::spawn(move || {
+                    claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(300));
+            // Closed before its first frame took anything.
+            inbox.close();
+            match sender.join().unwrap() {
+                Startup::Standalone(why) => assert!(why.contains("closing"), "{why}"),
+                _ => panic!("a closing window must not have the request"),
+            }
+            assert!(inbox.take().is_empty());
+        }
+
+        #[test]
+        fn an_owner_running_another_executable_is_refused_before_anything_is_sent() {
+            let tag = unique_tag("exe");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&Channel::current(&tag).unwrap(), inbox.clone())
+                .unwrap()
+                .expect("owner");
+            let (stop, window) = window(inbox.clone());
+            // The sender expects another executable than the one the owner (this test) runs.
+            let other = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
+            let sender = Channel::current(&tag).unwrap().expecting_exe(other);
+            let request = encode_request(Path::new(r"C:\"), &[PathBuf::from(r"C:\Users")]).unwrap();
+            match claim_or_forward(&sender, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Standalone(why) => assert!(why.contains("cmd.exe"), "{why}"),
+                _ => panic!("an owner running another program must not get the request"),
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(window.join().unwrap().is_empty(), "nothing may reach the impostor");
+            // The same executable is accepted.
+            let same = Channel::current(&tag).unwrap();
+            assert!(same.check_exe(std::process::id()).is_ok());
         }
 
         #[test]
@@ -1397,6 +1623,8 @@ mod tests {
             let senders = 6;
             let barrier = Arc::new(std::sync::Barrier::new(senders));
             let inboxes: Vec<_> = (0..senders).map(|_| Arc::new(Inbox::new())).collect();
+            // Every launch's window takes requests; only the owner's ever gets any.
+            let windows: Vec<_> = inboxes.iter().map(|inbox| window(inbox.clone())).collect();
             let threads: Vec<_> = (0..senders)
                 .map(|i| {
                     let (channel, barrier, inbox) = (channel.clone(), barrier.clone(), inboxes[i].clone());
@@ -1419,7 +1647,13 @@ mod tests {
             let owners: Vec<usize> = (0..senders).filter(|&i| results[i].is_some()).collect();
             assert_eq!(owners.len(), 1, "exactly one launch owns the pipe");
             let owner = owners[0];
-            let mut received: Vec<PathBuf> = inboxes[owner].take().into_iter().flatten().collect();
+            let mut received: Vec<PathBuf> = Vec::new();
+            for (i, (stop, window)) in windows.into_iter().enumerate() {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                let got: Vec<PathBuf> = window.join().unwrap().into_iter().flatten().collect();
+                assert!(i == owner || got.is_empty(), "only the owner receives");
+                received.extend(got);
+            }
             received.sort();
             let mut expected: Vec<PathBuf> = (0..senders)
                 .filter(|&i| i != owner)

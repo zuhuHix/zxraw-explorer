@@ -353,9 +353,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   selected defaults.
 * A launch with a path is handed to the running window (see [FEATURES.md](FEATURES.md)). Elevated
   (administrator) and normal windows are separate groups, so a launch from the other level opens its
-  own window. If the running window is hung or closing, the launch waits about 2.5 s and then opens its
-  own window (logged). Bringing the window to the front relies on Windows' foreground rules
-  (`AllowSetForegroundWindow`), which no automated test covers.
+  own window. If the running window is hung, the launch waits about 1.5 s and then opens its own
+  window (logged); while the running window is still starting, it waits up to about 3.5 s for its
+  first frame; a closing window sends it on at once. Bringing the window to the front relies on
+  Windows' foreground rules (`AllowSetForegroundWindow`), which no automated test covers.
+* The hand-off pipe only trusts a process of the same user, session and integrity level that runs
+  the same executable file. Another program of the same user is otherwise outside the threat model:
+  it can already do far more to that user than receive a folder path. Creating the pipe first
+  could stop launches from reaching ZXraw's window (each would open its own window), never more.
 
 ## Installer, packaging, and licences
 
