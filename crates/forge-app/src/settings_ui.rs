@@ -1325,7 +1325,7 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     page_heading(
         ui,
         "Default app",
-        "Choose whether photos, RAW files, and filesystem folders open in ZXraw Explorer.",
+        "Choose whether photos, RAW files, archives and filesystem folders open in ZXraw Explorer, and whether Explorer shows the ZXraw menu.",
     );
     ui.add_space(10.0);
     let mut action = None;

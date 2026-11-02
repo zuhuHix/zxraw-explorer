@@ -379,6 +379,16 @@ Explorer is a file manager designed around that workflow:
   FIFOs are listed but not extracted. When a name appears twice the last copy wins, as with
   `tar`. Extension headers, long names, sparse maps and every number in a header are bounded
   and checked, and a truncated or damaged archive is reported as such.
+- **Archives in Windows.** Tick *Offer ZXraw Explorer for archives* in Settings › Default app and
+  ZIP, 7z, RAR (extract only), tar and the compressed tar and single-file formats get their own file
+  types, with a friendly name, the compressed-folder icon and an entry in *Open with*. Double-clicking
+  one opens it in a new tab of the running window. Windows asks you to confirm each type in its own
+  Settings page: ZXraw cannot set those defaults itself, and it never forges them.
+- **A ZXraw menu in Explorer.** An optional cascading *ZXraw* submenu (Settings › Default app, or an
+  installer task) offers *Open in ZXraw*, *Extract here*, *Extract to a folder named after the
+  archive* and *Extract to…* on archives, and *Add to archive…* on files and folders. Select fifty
+  files and choose *Add to archive…*: Explorer starts one ZXraw for the whole selection and makes one
+  archive. On Windows 11 the menu is under *Show more options*.
 
 ### Batch work on a selection
 
@@ -459,7 +469,7 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 Requirements: Windows 10 or 11 (64-bit).
 
 - **Installer:** `ZXraw-Explorer-<version>-Setup-x64.exe`. Installs for your user only, so no
-  admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus, with *Open in new ZXraw window* on Shift+right-click.
+  admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus, with *Open in new ZXraw window* on Shift+right-click. Two more opt-in tasks register the archive types and add the ZXraw archive menu to Explorer's right-click menu; the uninstaller removes both.
 - **Portable:** `ZXraw-Explorer-<version>-x64.zip`. Unzip anywhere and run `zxraw.exe`.
 
 Builds will be published on the [Releases](../../releases) page. The app isn't code-signed yet,

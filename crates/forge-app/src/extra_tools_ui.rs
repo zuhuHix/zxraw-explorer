@@ -590,6 +590,48 @@ pub fn create_archive(app: &mut ZxrawApp) {
     ));
 }
 
+/// The create dialog for `sources` chosen outside the app (the Explorer menu's "Add to
+/// archive…"): the archive goes into `directory` as `name` unless the user changes it.
+pub(crate) fn open_create_dialog(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    directory: PathBuf,
+    name: String,
+) {
+    forget_create_passwords(&app.ops.ctx);
+    app.ops.extra_tools.create_archive = Some(CreateArchiveWindow::new(sources, directory, name));
+}
+
+/// Creates `name` in `directory` from `sources` at once with the default options (the
+/// Explorer menu's "Add to <name>.zip"), showing its progress in the create window. A name
+/// that is taken gets the next free one when the archive is published.
+pub(crate) fn quick_create_archive(
+    app: &mut ZxrawApp,
+    sources: Vec<PathBuf>,
+    directory: PathBuf,
+    name: String,
+    format: ArchiveFormat,
+) {
+    let jobs = app.ops.jobs.clone();
+    let event_tx = app.ops.tx.clone();
+    let app_ctx = app.ops.ctx.clone();
+    let job = start_create_archive(
+        &jobs,
+        &event_tx,
+        &app_ctx,
+        sources.clone(),
+        directory.clone(),
+        name.clone(),
+        format,
+        CreateOptions::default(),
+    );
+    forget_create_passwords(&app.ops.ctx);
+    let mut window = CreateArchiveWindow::new(sources, directory, name);
+    switch_format(&mut window, format);
+    window.job = Some(job);
+    app.ops.extra_tools.create_archive = Some(window);
+}
+
 /// Open the split dialog for the selected file.
 pub fn split_file(app: &mut ZxrawApp) {
     let Some(source) = pane_action_target(app) else {

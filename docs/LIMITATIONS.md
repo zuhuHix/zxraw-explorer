@@ -353,6 +353,22 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   readers (thumbnails, metadata, duplicate scans) still check the attributes and then open
   the file separately.
 
+## Archive file types and the Explorer menu
+
+* On Windows 11 the ZXraw menu is under *Show more options* (the classic menu). A top-level entry in
+  the new menu needs an `IExplorerCommand` with package identity (a sparse MSIX package, signed), which
+  is not done.
+* Static menu verbs cannot show the selected item's name, so the menu says `Add to "<name>.zip"`
+  literally and *Extract to a folder named after the archive* instead of the actual names.
+* Archive defaults must be confirmed by the user in Windows Settings; ZXraw cannot set them itself
+  (Windows protects the `UserChoice` of archive types and ZXraw does not forge it).
+* `.rar` is registered for the menu and file types, but the extract commands open it only once
+  ZXraw reads RAR (extract only: no creating `.rar`). Until then they report it as not an archive.
+* A selection of more than 8192 items, or over 4 MiB of paths, cannot be handed to the running window
+  and runs in a new window instead.
+* Elevated (administrator) Explorer windows ignore per-user COM registrations, so the menu commands do
+  nothing there.
+
 ## Default apps and folder opening
 
 * After the user clicks **Make ZXraw Explorer my default**, the app registers its photo ProgIDs and
@@ -376,7 +392,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * A launch is never lost, but it is not guaranteed to open exactly once: when in doubt the new
   launch opens its own window. Under rare scheduling delays (the running window took the launch but
   its answer arrived after the new process stopped waiting) the launch opens both as a tab and in a
-  window of its own. This extra window is accepted rather than adding a commit protocol.
+  window of its own. This extra window is accepted for folder and file launches, which have no commit
+  step. Explorer menu commands do have one (protocol v3), so they run once, except that a sender stalled
+  for 60 s between reading the answer and confirming can lose one.
 * The protocol version is part of the pipe name. While an update overlaps (the old version's window
   still open, the new version launched), launches of the new version open their own window.
 * A handed-over path that no longer exists when the running window gets to it is treated like a cold
