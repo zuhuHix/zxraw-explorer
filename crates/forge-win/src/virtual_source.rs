@@ -61,20 +61,29 @@ pub struct TargetReport {
     pub async_end: Option<(bool, u32)>,
     /// What the modal drag returned, when the target was not still copying.
     pub drag_returned: Option<u32>,
-    /// Every file was read to its end without an error.
+    /// The target started an asynchronous operation (async mode on, `StartOperation`): then
+    /// only its `EndOperation` decides.
+    pub async_started: bool,
+    /// Every file was read to its end without an error (and, through `CopyTo`, written in
+    /// full to the target's stream).
     pub all_served: bool,
 }
 
 const EFFECT_COPY: u32 = 1;
 const EFFECT_MOVE: u32 = 2;
 
-/// Whether `report` confirms a finished move: the target said Move, and it read every file.
+/// Whether `report` confirms a finished move: the target read every file and said Move. Once
+/// an asynchronous operation started, only its end counts: it must have succeeded with Move,
+/// whatever "Paste Succeeded" or the drag said before (a failed end cancels the move).
 pub fn move_confirmed(report: &TargetReport) -> bool {
     let moved = |effect: u32| effect & EFFECT_MOVE != 0;
-    report.all_served
-        && (report.paste_succeeded.is_some_and(moved)
-            || report.async_end.is_some_and(|(ok, effect)| ok && moved(effect))
-            || (report.async_end.is_none() && report.drag_returned.is_some_and(moved)))
+    if !report.all_served {
+        return false;
+    }
+    if report.async_started {
+        return report.async_end.is_some_and(|(ok, effect)| ok && moved(effect));
+    }
+    report.paste_succeeded.is_some_and(moved) || report.drag_returned.is_some_and(moved)
 }
 
 /// The paths a data object made by this process offers its own drop target, from the bytes
@@ -209,7 +218,7 @@ mod imp {
     use windows::Win32::Foundation::{
         DATA_S_SAMEFORMATETC, DV_E_DVASPECT, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_FAIL,
         E_INVALIDARG, E_NOTIMPL, E_POINTER, FILETIME, GlobalFree, HGLOBAL, OLE_E_ADVISENOTSUPPORTED,
-        S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION,
+        S_OK, STG_E_ACCESSDENIED, STG_E_INVALIDFUNCTION, STG_E_MEDIUMFULL,
     };
     use windows::Win32::System::Com::{
         DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
@@ -247,7 +256,8 @@ mod imp {
         async_mode: AtomicBool,
         in_operation: AtomicBool,
         report: Mutex<TargetReport>,
-        moved_told: AtomicBool,
+        /// The move decision was made (see `decide`).
+        decided: AtomicBool,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -261,12 +271,19 @@ mod imp {
             report
         }
 
-        /// Tells the provider once the target confirmed a move.
-        fn check_move(&self) {
-            if move_confirmed(&self.snapshot()) && !self.moved_told.swap(true, Ordering::SeqCst)
-            {
+        /// The target's final word on this transfer: decided once (later reports change
+        /// nothing), and the provider is told if it confirms a move.
+        fn decide(&self) {
+            if self.decided.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if move_confirmed(&self.snapshot()) {
                 self.provider.moved();
             }
+        }
+
+        fn async_started(&self) -> bool {
+            lock(&self.report).async_started
         }
 
         fn hglobal_bytes(&self, format: u16) -> Option<Vec<u8>> {
@@ -488,8 +505,9 @@ mod imp {
                 stored.retain(|(cf, _)| *cf != format);
                 stored.push((format, bytes));
             }
-            if format == s.formats.paste_succeeded {
-                s.check_move();
+            // Final for a synchronous paste; an asynchronous one is decided at its end.
+            if format == s.formats.paste_succeeded && !s.async_started() {
+                s.decide();
             }
             Ok(())
         }
@@ -556,7 +574,11 @@ mod imp {
             &self,
             _pbcreserved: Ref<windows::Win32::System::Com::IBindCtx>,
         ) -> windows::core::Result<()> {
-            self.shared.in_operation.store(true, Ordering::SeqCst);
+            let s = &self.shared;
+            if s.async_mode.load(Ordering::SeqCst) {
+                lock(&s.report).async_started = true;
+            }
+            s.in_operation.store(true, Ordering::SeqCst);
             Ok(())
         }
 
@@ -572,8 +594,13 @@ mod imp {
         ) -> windows::core::Result<()> {
             let s = &self.shared;
             s.in_operation.store(false, Ordering::SeqCst);
-            lock(&s.report).async_end = Some((hresult.is_ok(), dweffects));
-            s.check_move();
+            {
+                let mut report = lock(&s.report);
+                report.async_end = Some((hresult.is_ok(), dweffects));
+                // An end is the operation's result even without a StartOperation seen.
+                report.async_started = true;
+            }
+            s.decide();
             Ok(())
         }
     }
@@ -600,8 +627,10 @@ mod imp {
             self.shared.items[self.index].size
         }
 
-        /// Fills `buf` from the current position; fewer bytes only at the end.
-        fn read_into(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        /// Fills `buf` from the current position; fewer bytes only at the end. With `mark`,
+        /// reaching the end counts the file as served (a `Read` caller took the bytes; for
+        /// `CopyTo` that is known only once they were written).
+        fn read_into(&self, buf: &mut [u8], mark: bool) -> std::io::Result<usize> {
             let mut st = lock(&self.state);
             if st.failed {
                 return Err(std::io::Error::other("an earlier read failed"));
@@ -609,12 +638,20 @@ mod imp {
             let result = self.read_locked(&mut st, buf);
             match &result {
                 Err(_) => st.failed = true,
-                Ok(n) if *n < buf.len() && st.at == self.size() => {
+                Ok(n) if mark && *n < buf.len() && st.at == self.size() => {
                     lock(&self.shared.served)[self.index] = true;
                 }
                 Ok(_) => {}
             }
             result
+        }
+
+        /// Counts the file as served if the stream was read to its end without an error.
+        fn mark_if_at_end(&self) {
+            let st = lock(&self.state);
+            if !st.failed && st.reader.is_some() && st.at == self.size() {
+                lock(&self.shared.served)[self.index] = true;
+            }
         }
 
         fn read_locked(&self, st: &mut StreamState, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -660,7 +697,7 @@ mod imp {
             }
             // SAFETY: the caller gives a buffer of `cb` bytes.
             let buf = unsafe { std::slice::from_raw_parts_mut(pv.cast::<u8>(), cb as usize) };
-            let (n, hr) = match self.read_into(buf) {
+            let (n, hr) = match self.read_into(buf, true) {
                 Ok(n) => (n, S_OK),
                 Err(e) => {
                     tracing::debug!("virtual file {} failed: {e}", self.index);
@@ -730,25 +767,38 @@ mod imp {
             let target = pstm.ok()?;
             let mut buf = vec![0u8; 256 * 1024];
             let (mut read, mut written) = (0u64, 0u64);
-            let result = loop {
+            let result: windows::core::Result<()> = 'copy: loop {
                 let want = (cb - read).min(buf.len() as u64) as usize;
                 if want == 0 {
                     break Ok(());
                 }
-                let n = match self.read_into(&mut buf[..want]) {
+                let n = match self.read_into(&mut buf[..want], false) {
                     Ok(0) => break Ok(()),
                     Ok(n) => n,
                     Err(_) => break Err(E_FAIL.into()),
                 };
                 read += n as u64;
-                let mut done = 0u32;
-                // SAFETY: `buf` holds `n` bytes.
-                let hr = unsafe { target.Write(buf.as_ptr().cast(), n as u32, Some(&mut done)) };
-                written += u64::from(done);
-                if hr.is_err() {
-                    break Err(hr.into());
+                // Every byte read goes to the target, however many writes that takes.
+                let mut sent = 0usize;
+                while sent < n {
+                    let mut done = 0u32;
+                    let rest = &buf[sent..n];
+                    // SAFETY: `rest` holds `rest.len()` bytes.
+                    let hr = unsafe { target.Write(rest.as_ptr().cast(), rest.len() as u32, Some(&mut done)) };
+                    let done = (done as usize).min(rest.len());
+                    sent += done;
+                    written += done as u64;
+                    if hr.is_err() {
+                        break 'copy Err(hr.into());
+                    }
+                    if done == 0 {
+                        break 'copy Err(STG_E_MEDIUMFULL.into());
+                    }
                 }
             };
+            if result.is_ok() {
+                self.mark_if_at_end();
+            }
             // SAFETY: optional out pointers.
             unsafe {
                 if let Some(out) = pcbread.as_mut() {
@@ -856,7 +906,7 @@ mod imp {
                 async_mode: AtomicBool::new(true),
                 in_operation: AtomicBool::new(false),
                 report: Mutex::new(TargetReport::default()),
-                moved_told: AtomicBool::new(false),
+                decided: AtomicBool::new(false),
             });
             let obj: IDataObject = DataObject {
                 shared: shared.clone(),
@@ -919,9 +969,11 @@ mod imp {
 
         /// The modal drag returned `effect`.
         pub fn drag_returned(&self, effect: u32) {
-            if !self.shared.in_operation.load(Ordering::SeqCst) {
-                lock(&self.shared.report).drag_returned = Some(effect);
-                self.shared.check_move();
+            let s = &self.shared;
+            // An asynchronous operation still running (or one that ran) decides at its end.
+            if !s.in_operation.load(Ordering::SeqCst) && !s.async_started() {
+                lock(&s.report).drag_returned = Some(effect);
+                s.decide();
             }
         }
 
@@ -970,13 +1022,33 @@ mod tests {
             performed: Some(EFFECT_MOVE),
             ..served
         }));
+        let started = TargetReport {
+            async_started: true,
+            ..served
+        };
         assert!(move_confirmed(&TargetReport {
             async_end: Some((true, EFFECT_MOVE)),
-            ..served
+            ..started
         }));
         assert!(!move_confirmed(&TargetReport {
             async_end: Some((false, EFFECT_MOVE)),
-            ..served
+            ..started
+        }));
+        // Once asynchronous, only the end decides: a failed or copying end cancels the move
+        // whatever "Paste Succeeded" said, and no end yet is no move.
+        assert!(!move_confirmed(&TargetReport {
+            paste_succeeded: Some(EFFECT_MOVE),
+            async_end: Some((false, EFFECT_MOVE)),
+            ..started
+        }));
+        assert!(!move_confirmed(&TargetReport {
+            paste_succeeded: Some(EFFECT_MOVE),
+            async_end: Some((true, EFFECT_COPY)),
+            ..started
+        }));
+        assert!(!move_confirmed(&TargetReport {
+            paste_succeeded: Some(EFFECT_MOVE),
+            ..started
         }));
         assert!(move_confirmed(&TargetReport {
             drag_returned: Some(EFFECT_MOVE),
@@ -986,7 +1058,7 @@ mod tests {
         assert!(!move_confirmed(&TargetReport {
             drag_returned: Some(EFFECT_MOVE),
             async_end: Some((false, EFFECT_MOVE)),
-            ..served
+            ..started
         }));
     }
 

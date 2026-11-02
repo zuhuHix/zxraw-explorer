@@ -31,21 +31,32 @@ pub struct MoveOut {
     /// [`crate::archive_ui::archive_version`] when the items were listed: nothing is removed
     /// from an archive that changed since.
     pub version: u64,
-    /// Selection names (a folder ends with `/` and covers what is inside).
+    /// The exact entry names the move removes (see `StagePlan::move_names`): no trailing
+    /// `/`, so nothing is deleted with a folder that wasn't moved itself.
     pub names: Vec<String>,
+    /// Covered entries that were not moved (links, names that clash on Windows): they stay.
+    pub left_out: usize,
     /// The data object it came from, if any (taken off the clipboard after the move).
     offer: Option<u64>,
 }
 
 impl MoveOut {
-    /// The move of `names` out of the archive `view` shows, done inside this app.
-    pub fn in_app(view: &ArchiveView, names: Vec<String>) -> Self {
+    fn of_plan(view: &ArchiveView, plan: &archive::stage::StagePlan, offer: Option<u64>) -> Self {
         Self {
             archive: view.archive.clone(),
             version: view.version,
-            names,
-            offer: None,
+            names: plan.move_names(),
+            left_out: plan.left_out.len(),
+            offer,
         }
+    }
+
+    /// The move of `selection` out of the archive `view` shows, done inside this app by an
+    /// extraction. `None` when the selection can't be planned (the extraction then fails too).
+    pub fn in_app(view: &ArchiveView, selection: &archive::Selection) -> Option<Self> {
+        archive::stage::plan(&view.index.listing, selection, &ExtractLimits::default())
+            .ok()
+            .map(|plan| Self::of_plan(view, &plan, None))
     }
 }
 
@@ -117,12 +128,17 @@ impl OutSender {
     }
 }
 
-/// Whether an extraction left nothing behind: no failure, skip, held-back file or cancel.
+/// Whether an extraction took everything a move removes: no failure, held-back file or
+/// cancel, and nothing skipped but what a move leaves in the archive anyway (links, names
+/// that clash on Windows: see `MoveOut::names`). A file skipped as existing blocks it.
 pub fn move_extracted_everything(report: &ExtractReport) -> bool {
     !report.cancelled
         && report.failed.is_empty()
-        && report.skipped.is_empty()
         && report.unchecked.is_empty()
+        && report
+            .skipped
+            .iter()
+            .all(|s| archive::stage::is_left_out_reason(&s.reason))
 }
 
 /// Reads the staged files of one offer.
@@ -204,12 +220,7 @@ fn offer(
         ));
     }
     let id = NEXT_OFFER.fetch_add(1, Ordering::Relaxed);
-    let moved = MoveOut {
-        archive: view.archive.clone(),
-        version: view.version,
-        names: selection.names.clone(),
-        offer: Some(id),
-    };
+    let moved = MoveOut::of_plan(&view, &plan, Some(id));
     let items: Vec<VirtualItem> = plan
         .items
         .iter()
@@ -396,16 +407,14 @@ fn finish_move(app: &mut ZxrawApp, moved: MoveOut, unchanged: bool) {
         ));
         return;
     }
-    let n = moved.names.len();
+    if moved.names.is_empty() {
+        return;
+    }
     app.ops.modal = Some(Modal::Confirm(Confirm {
-        body: format!(
-            "{} moved out of {name}. Remove {} from the archive now? This can't be undone.",
-            if n == 1 { "1 item was" } else { "The items were" },
-            if n == 1 { "it" } else { "them" }
-        ),
+        body: move_prompt(&name, moved.names.len(), moved.left_out),
         kind: ConfirmKind::ArchiveUpdate(UpdateRequest {
             archive: moved.archive.clone(),
-            title: format!("Removing {} from {name}", items(n)),
+            title: format!("Removing {} from {name}", items(moved.names.len())),
             edit: archive::ArchiveEdit {
                 add: Vec::new(),
                 delete: moved.names,
@@ -413,11 +422,31 @@ fn finish_move(app: &mut ZxrawApp, moved: MoveOut, unchanged: bool) {
             // Kept entries are copied as stored: deleting needs no password.
             encrypted: false,
             confirm_password: false,
+            // Checked again in the job, under the edit lock, right before the rebuild.
+            expect_version: Some(moved.version),
         }),
         title: "Finish the move".into(),
         confirm_label: "Remove".into(),
         danger: true,
     }));
+}
+
+/// The "Finish the move" question: `n` entries moved, `left_out` that stay.
+fn move_prompt(name: &str, n: usize, left_out: usize) -> String {
+    let mut body = format!(
+        "{} moved out of {name}. Remove {} from the archive now? This can't be undone.",
+        if n == 1 { "1 item was" } else { "The items were" },
+        if n == 1 { "it" } else { "them" }
+    );
+    if left_out > 0 {
+        body.push_str(&format!(
+            "\n\n{} couldn't be moved (links, or names that clash on Windows) and {} in the \
+             archive.",
+            items(left_out),
+            if left_out == 1 { "stays" } else { "stay" }
+        ));
+    }
+    body
 }
 
 fn stage_event(app: &mut ZxrawApp, archive: &Path, event: StageEvent) {
@@ -493,5 +522,19 @@ mod tests {
         ] {
             assert!(!move_extracted_everything(&report), "{report:?}");
         }
+        // A link or a clashing name is left in the archive by the move anyway.
+        assert!(move_extracted_everything(&ExtractReport {
+            skipped: vec![OpIssue::new("a", archive::stage::LEFT_OUT_LINK)],
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn the_move_prompt_says_what_stays_in_the_archive() {
+        let all = move_prompt("a.zip", 3, 0);
+        assert!(all.contains("moved out of a.zip") && !all.contains("couldn't"), "{all}");
+        let partial = move_prompt("a.zip", 1, 2);
+        assert!(partial.contains("2 items couldn't be moved"), "{partial}");
+        assert!(partial.contains("stay in the"), "{partial}");
     }
 }
