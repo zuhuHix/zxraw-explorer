@@ -21,9 +21,9 @@ use sevenz_rust2 as sz;
 
 use super::sevenz_guard::{self, ID_AES, decoder_memory};
 use super::{
-    ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, CreateOptions,
-    CreateReport, EntryEncryption, EntryVisitor, ExtractLimits, Password, PasswordProof,
-    archive_stem, normalize_entry_name, validate_entry_name,
+    ArchiveBackend, ArchiveEdit, ArchiveEntry, ArchiveFormat, ArchiveListing, BLOCK_CHECK_FAILED,
+    BlockEnd, CreateOptions, CreateReport, EntryEncryption, EntryVisitor, ExtractLimits, Password,
+    PasswordProof, archive_stem, normalize_entry_name, validate_entry_name,
 };
 use crate::error::{CoreError, Result};
 use crate::ops::JobCtx;
@@ -141,11 +141,16 @@ fn describe(e: &sz::Error) -> String {
 }
 
 /// Entry data for visitors, with the library's data errors in words.
-struct Friendly<R>(R);
+/// Entry data for visitors, with the library's data errors in words; `failed` is set when
+/// any read fails (the block is then bad, whatever the visitor made of it).
+struct Friendly<'f, R>(R, &'f std::cell::Cell<bool>);
 
-impl<R: Read> Read for Friendly<R> {
+impl<R: Read> Read for Friendly<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf).map_err(|e| {
+            if !is_cancel(&e) {
+                self.1.set(true);
+            }
             let text = match e
                 .get_ref()
                 .and_then(|inner| inner.downcast_ref::<sz::Error>())
@@ -327,9 +332,13 @@ pub(super) fn entries_of(path: &Path, a: &sz::Archive) -> Vec<Option<ArchiveEntr
                 solid: info.is_some_and(|b| b.files > 1),
                 block_offset,
                 // A block's own CRC checks a file only when the file is all of it.
-                unchecked: has_data(f)
+                // No CRC at any level.
+                unchecked: has_data(f) && !f.has_crc && !info.is_some_and(|b| b.has_crc),
+                // A block's CRC checks a file of several only when the block is decoded to
+                // its end (a lone file's end is the block's end, checked as it is read).
+                checked_by_block: has_data(f)
                     && !f.has_crc
-                    && !info.is_some_and(|b| b.has_crc && b.files == 1),
+                    && info.is_some_and(|b| b.has_crc && b.files > 1),
             })
         })
         .collect()
@@ -572,6 +581,7 @@ impl SevenZipBackend {
         wanted: &dyn Fn(&ArchiveEntry) -> bool,
         ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
+        block_end: &mut BlockEnd<'_>,
     ) -> Result<()> {
         let label = || paths::display_path(path);
         // Entries without data (folders, empty files) first: folders exist before their files.
@@ -589,6 +599,22 @@ impl SevenZipBackend {
         let blocks = block_infos(&o.archive);
         // The wanted files with data of each block, in order.
         let mut wanted_by_block: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+        // The last file with data of each block.
+        let mut last_data: Vec<usize> = vec![0; blocks.len()];
+        for (i, f) in o.archive.files.iter().enumerate() {
+            if let Some(b) = o
+                .archive
+                .stream_map
+                .file_block_index
+                .get(i)
+                .copied()
+                .flatten()
+                && has_data(f)
+                && let Some(l) = last_data.get_mut(b)
+            {
+                *l = i;
+            }
+        }
         for (i, f) in o.archive.files.iter().enumerate() {
             if let Some(b) = o
                 .archive
@@ -611,6 +637,14 @@ impl SevenZipBackend {
                 continue;
             };
             let entry = |i: usize| entries[i].as_ref().expect("wanted entries exist");
+            // Files relying on the block's CRC: decode to its end so that CRC is checked.
+            let check_block = wanted_here.iter().any(|&i| entry(i).checked_by_block);
+            let stop = if check_block {
+                last_data[b].max(last)
+            } else {
+                last
+            };
+            let data_failed = std::cell::Cell::new(false);
             let mut visited = 0usize;
             let mut stored: Option<CoreError> = None;
             let mut called = false;
@@ -630,7 +664,7 @@ impl SevenZipBackend {
                     called = true;
                     let i = file_index(files_ptr, f);
                     if !has_data(f) {
-                        return Ok(i < last);
+                        return Ok(i < stop);
                     }
                     let is_wanted = wanted_here.binary_search(&i).is_ok();
                     // The block's first data: test the password before handing anything out.
@@ -648,8 +682,11 @@ impl SevenZipBackend {
                     if !is_wanted {
                         if !noted && let Some(ctx) = ctx {
                             noted = true;
-                            ctx.progress
-                                .set_note("Decoding the solid block up to the selected files");
+                            ctx.progress.set_note(if i > last {
+                                "Decoding the rest of the solid block to check its checksum"
+                            } else {
+                                "Decoding the solid block up to the selected files"
+                            });
                         }
                         return match drain(r, ctx, &mut buf) {
                             Ok(()) => Ok(true),
@@ -665,12 +702,20 @@ impl SevenZipBackend {
                         ctx.progress.set_note("");
                     }
                     visited += 1;
-                    let mut chained = Friendly(io::Cursor::new(head).chain(r));
+                    let mut chained = Friendly(io::Cursor::new(head).chain(r), &data_failed);
                     if let Err(e) = visit(entry(i), Ok(&mut chained)) {
                         stored = Some(e);
                         return Err(visitor_stop());
                     }
-                    Ok(i < last)
+                    // What the visitor left unread is decoded here (checked, cancellable).
+                    if let Err(e) = drain(&mut chained, ctx, &mut buf) {
+                        if is_cancel(&e) {
+                            stored = Some(CoreError::Cancelled);
+                            return Err(visitor_stop());
+                        }
+                        return Err(sz::Error::from(e));
+                    }
+                    Ok(i < stop)
                 })
             };
             if noted && let Some(ctx) = ctx {
@@ -695,6 +740,7 @@ impl SevenZipBackend {
                     }),
                 }
             };
+            let block_failed = failure.is_some();
             if let Some(err) = failure {
                 // Every wanted entry of the block not handed out yet gets the error.
                 for &i in &wanted_here[visited.min(wanted_here.len())..] {
@@ -707,6 +753,14 @@ impl SevenZipBackend {
                     };
                     visit(entry(i), Err(e))?;
                 }
+            }
+            if check_block {
+                let checked = !block_failed && !data_failed.get();
+                block_end(if checked {
+                    Ok(())
+                } else {
+                    Err(CoreError::Invalid(BLOCK_CHECK_FAILED.into()))
+                })?;
             }
         }
         Ok(())
@@ -775,7 +829,23 @@ impl ArchiveBackend for SevenZipBackend {
     ) -> Result<()> {
         let mut o = open(archive, password, usize::MAX)?;
         let entries = entries_of(archive, &o.archive);
-        self.read_opened(archive, &mut o, &entries, wanted, ctx, visit)
+        self.read_opened(archive, &mut o, &entries, wanted, ctx, visit, &mut |_| {
+            Ok(())
+        })
+    }
+
+    fn read_entries_checked(
+        &self,
+        archive: &Path,
+        wanted: &dyn Fn(&ArchiveEntry) -> bool,
+        password: Option<&Password>,
+        ctx: Option<&JobCtx<'_>>,
+        visit: &mut EntryVisitor<'_>,
+        block_end: &mut BlockEnd<'_>,
+    ) -> Result<()> {
+        let mut o = open(archive, password, usize::MAX)?;
+        let entries = entries_of(archive, &o.archive);
+        self.read_opened(archive, &mut o, &entries, wanted, ctx, visit, block_end)
     }
 
     fn check_password(
