@@ -8,10 +8,14 @@ use crate::{Result, WinError};
 const ROOT: &str = "Software\\Classes";
 #[cfg(windows)]
 const VERB: &str = "ZXrawExplorer";
+/// Shift-only companion verb that forces a separate window (`--new-window`).
+#[cfg(windows)]
+const NEW_WINDOW_VERB: &str = "ZXrawExplorerNewWindow";
 #[cfg(windows)]
 const FOLDER_STATE: &str = "Software\\ZXrawExplorerDefaultState\\Folder";
 
-/// Register "Open in ZXraw Explorer" for folders, drives, and directory backgrounds.
+/// Register "Open in ZXraw Explorer" and the Shift-only "Open in new ZXraw window" for folders,
+/// drives, and directory backgrounds.
 ///
 /// Only the current user's `HKCU\Software\Classes` tree is modified.
 pub fn register_context_menu(exe: impl AsRef<Path>) -> Result<()> {
@@ -26,7 +30,7 @@ pub fn register_context_menu(exe: impl AsRef<Path>) -> Result<()> {
     }
 }
 
-/// Remove ZXraw Explorer's folder, drive, and directory-background context menu entries.
+/// Remove ZXraw Explorer's folder, drive, and directory-background context menu entries, both verbs.
 pub fn unregister_context_menu() -> Result<()> {
     #[cfg(windows)]
     {
@@ -38,7 +42,7 @@ pub fn unregister_context_menu() -> Result<()> {
     }
 }
 
-/// Return whether all three current-user context menu entries point at the executable.
+/// Return whether both current-user verbs (at all three locations) point at the executable.
 pub fn is_registered(exe: impl AsRef<Path>) -> Result<bool> {
     #[cfg(windows)]
     {
@@ -53,7 +57,8 @@ pub fn is_registered(exe: impl AsRef<Path>) -> Result<bool> {
 
 /// Refreshes the registered command if the user opted in and this executable moved.
 ///
-/// Returns true only when a stale command was rewritten.
+/// Returns true only when a stale command was rewritten or a missing verb was added.
+/// Only installs whose main verb exists are touched, so an opt-out stays opted out.
 pub fn refresh_if_registered(current_exe: impl AsRef<Path>) -> Result<bool> {
     #[cfg(windows)]
     {
@@ -75,27 +80,59 @@ const LOCATIONS: [&str; 3] = [
 
 #[cfg(windows)]
 fn menu_key(root: &str, location: &str) -> String {
-    format!("{root}\\{location}\\{VERB}")
+    menu_key_for(root, location, VERB)
+}
+
+#[cfg(windows)]
+fn menu_key_for(root: &str, location: &str, verb: &str) -> String {
+    format!("{root}\\{location}\\{verb}")
 }
 
 #[cfg(windows)]
 fn command_key(root: &str, location: &str) -> String {
-    format!("{}\\command", menu_key(root, location))
+    command_key_for(root, location, VERB)
+}
+
+#[cfg(windows)]
+fn command_key_for(root: &str, location: &str, verb: &str) -> String {
+    format!("{}\\command", menu_key_for(root, location, verb))
+}
+
+/// `%V` passes the folder for the directory background; `%1` passes the selected item otherwise.
+#[cfg(windows)]
+fn placeholder(location: &str) -> &'static str {
+    if location == "Directory\\Background\\shell" {
+        "%V"
+    } else {
+        "%1"
+    }
 }
 
 #[cfg(windows)]
 fn command_line(exe: &Path, location: &str) -> Result<Vec<u16>> {
-    let placeholder = if location == "Directory\\Background\\shell" {
-        "%V"
-    } else {
-        "%1"
-    };
-    shell_command(exe, placeholder)
+    shell_command(exe, placeholder(location))
+}
+
+#[cfg(windows)]
+fn new_window_command_line(exe: &Path, location: &str) -> Result<Vec<u16>> {
+    shell_command_new_window(exe, placeholder(location))
 }
 
 /// `"<exe>" "<placeholder>"`, NUL-terminated, for a `shell\<verb>\command` default value.
 #[cfg(windows)]
 pub(crate) fn shell_command(exe: &Path, placeholder: &str) -> Result<Vec<u16>> {
+    shell_command_with_flag(exe, "", placeholder)
+}
+
+/// `"<exe>" --new-window "<placeholder>"`, NUL-terminated, for the Shift-only verb's command.
+#[cfg(windows)]
+fn shell_command_new_window(exe: &Path, placeholder: &str) -> Result<Vec<u16>> {
+    shell_command_with_flag(exe, " --new-window", placeholder)
+}
+
+/// `flag` is empty or starts with a space; it sits between the quoted executable and the placeholder.
+#[cfg(windows)]
+fn shell_command_with_flag(exe: &Path, flag: &str, placeholder: &str) -> Result<Vec<u16>> {
     use std::os::windows::ffi::OsStrExt;
 
     // A quote cannot occur in a valid Windows file name. Keeping the path as UTF-16 avoids
@@ -106,7 +143,7 @@ pub(crate) fn shell_command(exe: &Path, placeholder: &str) -> Result<Vec<u16>> {
     }
     let mut result = vec![b'"' as u16];
     result.extend(executable);
-    result.extend(format!("\" \"{placeholder}\"").encode_utf16());
+    result.extend(format!("\"{flag} \"{placeholder}\"").encode_utf16());
     result.push(0);
     Ok(result)
 }
@@ -115,10 +152,21 @@ pub(crate) fn shell_command(exe: &Path, placeholder: &str) -> Result<Vec<u16>> {
 fn register_context_menu_at(root: &str, exe: &Path) -> Result<()> {
     for location in LOCATIONS {
         let command = command_line(exe, location)?;
+        let new_window_command = new_window_command_line(exe, location)?;
         let key_path = menu_key(root, location);
-        if let Err(error) = registry::set_default_string(&key_path, "Open in ZXraw Explorer")
+        let new_window_key = menu_key_for(root, location, NEW_WINDOW_VERB);
+        let written = registry::set_default_string(&key_path, "Open in ZXraw Explorer")
             .and_then(|_| registry::set_default_wide(&command_key(root, location), &command))
-        {
+            .and_then(|_| registry::set_default_string(&new_window_key, "Open in new ZXraw window"))
+            // An empty "Extended" value makes Explorer show this verb only on Shift+right-click.
+            .and_then(|_| registry::set_string(&new_window_key, Some("Extended"), ""))
+            .and_then(|_| {
+                registry::set_default_wide(
+                    &command_key_for(root, location, NEW_WINDOW_VERB),
+                    &new_window_command,
+                )
+            });
+        if let Err(error) = written {
             let _ = unregister_context_menu_at(root);
             return Err(error);
         }
@@ -129,7 +177,9 @@ fn register_context_menu_at(root: &str, exe: &Path) -> Result<()> {
 #[cfg(windows)]
 fn unregister_context_menu_at(root: &str) -> Result<()> {
     for location in LOCATIONS {
-        registry::delete_tree(&menu_key(root, location))?;
+        for verb in [VERB, NEW_WINDOW_VERB] {
+            registry::delete_tree(&menu_key_for(root, location, verb))?;
+        }
     }
     Ok(())
 }
@@ -137,13 +187,19 @@ fn unregister_context_menu_at(root: &str) -> Result<()> {
 #[cfg(windows)]
 fn is_registered_at(root: &str, exe: &Path) -> Result<bool> {
     for location in LOCATIONS {
-        let expected = command_line(exe, location)?;
-        let expected = &expected[..expected.len().saturating_sub(1)];
-        let Some(actual) = registry::default_wide(&command_key(root, location))? else {
-            return Ok(false);
-        };
-        if actual != expected {
-            return Ok(false);
+        let expected = [
+            (VERB, command_line(exe, location)?),
+            (NEW_WINDOW_VERB, new_window_command_line(exe, location)?),
+        ];
+        for (verb, expected) in expected {
+            let expected = &expected[..expected.len().saturating_sub(1)];
+            let Some(actual) = registry::default_wide(&command_key_for(root, location, verb))?
+            else {
+                return Ok(false);
+            };
+            if actual != expected {
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -1134,6 +1190,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn new_window_command_line_adds_the_switch_and_keeps_the_quote_check() {
+        let exe = std::path::Path::new(r"C:\Test Folder\zxraw.exe");
+        let command = super::new_window_command_line(exe, "Directory\\Background\\shell").unwrap();
+        let command = String::from_utf16(&command[..command.len() - 1]).unwrap();
+        assert_eq!(command, r#""C:\Test Folder\zxraw.exe" --new-window "%V""#);
+        let command = super::new_window_command_line(exe, "Drive\\shell").unwrap();
+        let command = String::from_utf16(&command[..command.len() - 1]).unwrap();
+        assert_eq!(command, r#""C:\Test Folder\zxraw.exe" --new-window "%1""#);
+        let quoted = std::path::Path::new(r#"C:\bad"name\zxraw.exe"#);
+        assert!(super::shell_command_new_window(quoted, "%1").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn registration_lifecycle_uses_an_isolated_hkcu_test_root() {
         use std::{path::Path, time::SystemTime};
 
@@ -1159,11 +1229,88 @@ mod tests {
         super::register_context_menu_at(&root, original).unwrap();
         assert!(super::is_registered_at(&root, original).unwrap());
         assert!(!super::is_registered_at(&root, moved).unwrap());
+        for location in super::LOCATIONS {
+            let new_window = super::menu_key_for(&root, location, super::NEW_WINDOW_VERB);
+            assert_eq!(
+                super::registry::string_value(&new_window, None)
+                    .unwrap()
+                    .as_deref(),
+                Some("Open in new ZXraw window")
+            );
+            assert_eq!(
+                super::registry::string_value(&new_window, Some("Extended")).unwrap(),
+                Some(String::new())
+            );
+            assert!(
+                super::registry::key_exists(&super::command_key_for(
+                    &root,
+                    location,
+                    super::NEW_WINDOW_VERB
+                ))
+                .unwrap()
+            );
+        }
         assert!(super::refresh_if_registered_at(&root, moved).unwrap());
         assert!(super::is_registered_at(&root, moved).unwrap());
         assert!(!super::refresh_if_registered_at(&root, moved).unwrap());
         super::unregister_context_menu_at(&root).unwrap();
         assert!(!super::is_registered_at(&root, moved).unwrap());
+        for location in super::LOCATIONS {
+            for verb in [super::VERB, super::NEW_WINDOW_VERB] {
+                assert!(
+                    !super::registry::key_exists(&super::menu_key_for(&root, location, verb))
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_with_only_the_original_verb_is_completed_by_refresh() {
+        use std::{path::Path, time::SystemTime};
+
+        let root = format!(
+            "Software\\Classes\\ZXrawExplorer-OldInstall-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = super::unregister_context_menu_at(&self.0);
+                let _ = super::registry::delete_tree(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+
+        let exe = Path::new(r"C:\Test Folder\zxraw.exe");
+        super::register_context_menu_at(&root, exe).unwrap();
+        // An install from before the Shift-only verb existed has only the original verb.
+        for location in super::LOCATIONS {
+            super::registry::delete_tree(&super::menu_key_for(
+                &root,
+                location,
+                super::NEW_WINDOW_VERB,
+            ))
+            .unwrap();
+        }
+        assert!(!super::is_registered_at(&root, exe).unwrap());
+        assert!(super::refresh_if_registered_at(&root, exe).unwrap());
+        assert!(super::is_registered_at(&root, exe).unwrap());
+        for location in super::LOCATIONS {
+            assert!(
+                super::registry::key_exists(&super::menu_key_for(
+                    &root,
+                    location,
+                    super::NEW_WINDOW_VERB
+                ))
+                .unwrap()
+            );
+        }
     }
 
     #[cfg(not(windows))]

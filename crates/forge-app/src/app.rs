@@ -157,6 +157,9 @@ pub struct ZxrawApp {
     /// path, which is never probed on this thread: the viewer opens only if the listing shows
     /// a file there (a folder named `x.jpg` is just listed).
     launch_photo: Option<LaunchPhoto>,
+    /// Launches handed over by other processes (see `instance`); `None` when this window
+    /// takes no part.
+    pub instance: Option<std::sync::Arc<forge_win::single_instance::Inbox>>,
     applied_theme: Option<(bool, settings::Accent, f32)>,
     /// Icon the window was opened with or last switched to (`main.rs` sets it at startup).
     applied_icon: settings::AppIcon,
@@ -312,6 +315,7 @@ impl ZxrawApp {
             viewer: None,
             notices: Default::default(),
             launch_photo: None,
+            instance: None,
             settings,
         };
         app.notices = crate::notices::Notices::new(
@@ -329,56 +333,61 @@ impl ZxrawApp {
             // Re-applied each start: reinstalling recreates the shortcuts with the default.
             crate::app_icon::apply_to_shortcuts(*app.settings.app_icon);
         }
-        // `zxraw.exe <folder>` opens that folder in a new tab; `zxraw.exe <photo>` opens its
-        // folder with the photo selected and shows it in the viewer.
-        if let Some(arg) = std::env::args_os().nth(1) {
-            let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
-            let kind = forge_core::model::media_kind_for_ext(
-                &p.extension()
-                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                    .unwrap_or_default(),
-            );
-            // A network path is not probed here: an offline share would hold the window
-            // before it first appears. A media extension means a file and anything else a
-            // folder; the listing sorts out a wrong guess (see `navigate`).
-            let network = forge_core::netpath::is_network_path(&p);
-            let is_file = if network {
-                matches!(
-                    kind,
-                    forge_core::MediaKind::Image
-                        | forge_core::MediaKind::Raw
-                        | forge_core::MediaKind::Video
-                        | forge_core::MediaKind::Audio
-                )
-            } else {
-                p.is_file()
-            };
-            let folder = if is_file { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
-            if let Some(folder) = folder.filter(|folder| network || folder.exists()) {
-                // Reuse a restored tab already showing this folder instead of piling up tabs.
-                let existing = app
-                    .tabs
-                    .iter()
-                    .position(|t| forge_core::paths::paths_equal(&t.left.path, &folder));
-                match existing {
-                    Some(i) => app.active = i,
-                    None => app.run(Cmd::NewTab, &cc.egui_ctx),
-                }
-                if is_file {
-                    app.tab_mut().focus = Side::Left;
-                    if matches!(kind, forge_core::MediaKind::Image | forge_core::MediaKind::Raw) {
-                        app.launch_photo = Some(LaunchPhoto {
-                            path: p.clone(),
-                            confirm: network,
-                        });
-                    }
-                    app.navigate(p);
-                } else if existing.is_none() {
-                    app.navigate(p);
-                }
-            }
+        if let Some(arg) = crate::instance::launch_path() {
+            app.open_launch_path(&cc.egui_ctx, &arg);
         }
         app
+    }
+
+    /// Opens a path from a command line, a cold start's or one another launch handed over
+    /// (see `instance`). `zxraw.exe <folder>` opens that folder in a new tab;
+    /// `zxraw.exe <photo>` opens its folder with the photo selected and shows it in the viewer.
+    pub(crate) fn open_launch_path(&mut self, ctx: &egui::Context, arg: &std::ffi::OsStr) {
+        let p = forge_core::paths::normalize_user_path(&arg.to_string_lossy());
+        let kind = forge_core::model::media_kind_for_ext(
+            &p.extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default(),
+        );
+        // A network path is not probed here: an offline share would hold the window
+        // before it first appears. A media extension means a file and anything else a
+        // folder; the listing sorts out a wrong guess (see `navigate`).
+        let network = forge_core::netpath::is_network_path(&p);
+        let is_file = if network {
+            matches!(
+                kind,
+                forge_core::MediaKind::Image
+                    | forge_core::MediaKind::Raw
+                    | forge_core::MediaKind::Video
+                    | forge_core::MediaKind::Audio
+            )
+        } else {
+            p.is_file()
+        };
+        let folder = if is_file { p.parent().map(Path::to_path_buf) } else { Some(p.clone()) };
+        if let Some(folder) = folder.filter(|folder| network || folder.exists()) {
+            // Reuse a restored tab already showing this folder instead of piling up tabs.
+            let existing = self
+                .tabs
+                .iter()
+                .position(|t| forge_core::paths::paths_equal(&t.left.path, &folder));
+            match existing {
+                Some(i) => self.active = i,
+                None => self.run(Cmd::NewTab, ctx),
+            }
+            if is_file {
+                self.tab_mut().focus = Side::Left;
+                if matches!(kind, forge_core::MediaKind::Image | forge_core::MediaKind::Raw) {
+                    self.launch_photo = Some(LaunchPhoto {
+                        path: p.clone(),
+                        confirm: network,
+                    });
+                }
+                self.navigate(p);
+            } else if existing.is_none() {
+                self.navigate(p);
+            }
+        }
     }
 
     fn home() -> PathBuf {
@@ -1261,6 +1270,7 @@ impl eframe::App for ZxrawApp {
         changed |= crate::actions::poll(self);
         crate::updater::tick(self);
         crate::layouts::tick(self, ctx);
+        crate::instance::tick(self, ctx);
         if !self.pane().is_loading()
             && let Some(photo) = self.launch_photo.take()
             && (!photo.confirm || launch_confirmed(self.pane(), &photo.path))
@@ -1410,6 +1420,7 @@ impl eframe::App for ZxrawApp {
     }
 
     fn on_exit(&mut self) {
+        crate::instance::close(self);
         self.save_all();
         crate::actions::shutdown(self);
     }

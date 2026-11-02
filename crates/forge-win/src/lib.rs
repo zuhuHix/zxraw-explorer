@@ -41,6 +41,7 @@ pub mod recycle;
 pub mod restart;
 pub mod shell;
 pub mod shell_notify;
+pub mod single_instance;
 mod user_choice;
 pub mod virtual_files;
 pub mod virtual_source;

@@ -70,6 +70,11 @@ is based on those suites.
 * `ZXRAW_SCREENSHOT` saves an egui-rendered PNG and then closes the app. The screenshot is
   requested on the first frame after frame 90 counted from startup, not 90 frames after the
   commands ran. The PNG is written a few frames later.
+* `ZXRAW_INSTANCE_NAME=<tag>` (debug and `automation` builds) gives the run its own single-instance
+  pipe. Automated runs take no part in single-window hand-off without it. Debug builds otherwise use a
+  `-dev` pipe, so a dev run never forwards to or receives from the installed copy.
+* `ZXRAW_FORWARD_ONLY=1` (debug and `automation` builds) makes a launch exit with code 3 instead of
+  opening a window when it cannot hand over. Tests use it.
 
 The hook has **no timeout**: if a listing never finishes, the app waits indefinitely. Wrap
 runs in a watchdog (as in the example below).
@@ -294,6 +299,9 @@ Area verbs live next to the code they drive, in `crates/forge-app/src/testhook/<
 verification report), `library` (index, search, tags, collections, resume), `tools` (zip,
 split/join, duplicates, compare/sync, external filesystem changes), `perf` (frame timing),
 `browser`, `media`, `related`, `sidebar` and `system`. Each file's `step` function documents its verbs.
+`ui system wait-tabs <n> [| seconds]` waits until the window has `n` tabs. The hand-off e2e
+(`system::a_second_launch_opens_its_folder_in_a_new_tab_of_the_running_window`) uses it; the unit and
+IPC tests are in `forge-win` `single_instance` (`cargo test -p forge-win single_instance`).
 
 `ui perf begin` starts recording per-frame work time (from the raw-input hook to the end of the
 frame) and frame interval; `ui perf end <json>` writes count, mean, p50, p95, p99 and max for both.
