@@ -1385,3 +1385,220 @@ fn verify_backup_can_be_cancelled() {
         "a cancelled check changes nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Archive panes: browsing, copying out, adding and deleting
+// ---------------------------------------------------------------------------
+
+/// `<dir>\a.zip` with `top.txt`, `sub/inner.txt` and `sub/deep/x.txt` (no folder entries:
+/// the folders are implied by the names).
+fn pane_zip(dir: &Path) -> PathBuf {
+    let zip = dir.join("a.zip");
+    write_file(
+        &zip,
+        &raw_zip(&[
+            ("top.txt", b"top of the archive"),
+            ("sub/inner.txt", b"inner text"),
+            ("sub/deep/x.txt", b"deep x"),
+        ]),
+    );
+    zip
+}
+
+/// Entry names of an archive, as the engine lists them.
+fn zip_names(zip: &Path) -> Vec<String> {
+    let mut names: Vec<String> = forge_core::archive::list(zip)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn archive_pane_lists_folders_and_up_returns_to_the_zip() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let dir = sandbox.path().join("zips");
+    let zip = pane_zip(&dir);
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         ui browser assert-archive {zip} | /\n\
+         assert-entry top.txt\n\
+         double-click-entry sub\n\
+         wait-entry inner.txt\n\
+         ui browser assert-archive {zip} | sub\n\
+         assert-entry deep\n\
+         assert-no-entry top.txt\n\
+         cmd Up\n\
+         wait-entry top.txt\n\
+         assert-path {zip}\n\
+         ui browser assert-archive {zip} | /\n\
+         cmd Up\n\
+         wait-entry a.zip\n\
+         assert-path {dir}\n\
+         ui browser assert-cursor a.zip\n\
+         assert-selected 1\n\
+         exit\n",
+        zip = shown(&zip),
+        dir = shown(&dir),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}
+
+#[test]
+fn archive_items_copied_to_a_folder_are_extracted() {
+    // Ctrl+V reads the Windows clipboard to find the newest copy: nothing else may write
+    // to it meanwhile.
+    let _clipboard = crate::core::clipboard_lock();
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = dual_pane_script(
+        &zip,
+        &dest,
+        &[
+            "wait-entry sub",
+            // F5: the selection, folders with everything inside them.
+            "select top.txt, sub",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            // Ctrl+C in a subfolder, Ctrl+V in the folder: the item without its parent.
+            "double-click-entry sub",
+            "wait-entry inner.txt",
+            "select inner.txt",
+            "cmd Copy",
+            "ui browser assert-archive-copy 1",
+            "focus right",
+            "cmd Paste",
+            "wait-jobs 30",
+            // F6 out of an archive copies.
+            "focus left",
+            "select deep",
+            "cmd MoveToOtherPane",
+            "assert-toast copying them instead",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    let files = |pairs: &[(&str, &[u8])]| -> Vec<(String, Vec<u8>)> {
+        pairs
+            .iter()
+            .map(|(n, b)| (n.to_string(), b.to_vec()))
+            .collect()
+    };
+    assert_eq!(
+        tree(&dest),
+        files(&[
+            ("deep/x.txt", b"deep x"),
+            ("inner.txt", b"inner text"),
+            ("sub/deep/x.txt", b"deep x"),
+            ("sub/inner.txt", b"inner text"),
+            ("top.txt", b"top of the archive"),
+        ])
+    );
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
+        "a move out of an archive leaves it as it was"
+    );
+}
+
+#[test]
+fn files_added_to_an_archive_pane_and_entries_deleted_from_it() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let src = sandbox.path().join("src");
+    write_file(&src.join("new.txt"), b"added from a folder");
+    write_file(&src.join("top.txt"), b"a newer top");
+    let script = dual_pane_script(
+        &src,
+        &zip,
+        &[
+            "wait-entry new.txt",
+            "select new.txt",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            // A name the archive has: asked once, then replaced.
+            "select top.txt",
+            "cmd CopyToOtherPane",
+            "accept",
+            "wait-jobs 30",
+            "focus right",
+            "wait-entry new.txt",
+            "select sub",
+            "cmd DeletePermanently",
+            "accept",
+            "wait-jobs 30",
+            "wait-no-entry sub",
+            "assert-entry top.txt",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(zip_names(&zip), ["new.txt", "top.txt"]);
+    let listing = forge_core::archive::list(&zip).unwrap();
+    let size = |name: &str| {
+        listing
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.size)
+    };
+    assert_eq!(
+        size("top.txt"),
+        Some(b"a newer top".len() as u64),
+        "replaced"
+    );
+    assert_eq!(size("new.txt"), Some(b"added from a folder".len() as u64));
+    // The sources are copied, never moved into the archive.
+    assert!(src.join("new.txt").exists() && src.join("top.txt").exists());
+}
+
+#[test]
+fn small_images_in_an_archive_get_thumbnails() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(96, 64, |x, y| {
+        image::Rgb([(x * 2) as u8, (y * 3) as u8, 90])
+    }))
+    .write_to(&mut png, image::ImageFormat::Png)
+    .unwrap();
+    let zip = sandbox.path().join("pics.zip");
+    write_file(&zip, &raw_zip(&[("photos/pic.png", png.get_ref())]));
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry photos\n\
+         double-click-entry photos\n\
+         wait-entry pic.png\n\
+         cmd ViewGrid\n\
+         ui browser wait-archive-thumb pic.png | 30\n\
+         exit\n",
+        zip = shown(&zip),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+}

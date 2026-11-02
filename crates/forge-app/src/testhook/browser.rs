@@ -26,6 +26,14 @@
 //!   "Group bursts & similar" toggle). Waits until it is on screen.
 //! - `assert-grouping on|off`: whether burst grouping is on in the focused pane.
 //! - `assert-cursor <name>`: the focused pane's cursor is on this entry.
+//! - `assert-archive <archive> | <folder>`: the focused pane lists this archive file's folder
+//!   (`/`-separated inner path, `/` for the root), from the archive's index.
+//! - `assert-archive-copy <count>`: Ctrl+C in an archive pane recorded this many entries
+//!   (`0`: no archive copy is kept).
+//! - `wait-archive-thumb <name> [| <seconds>]`: waits (30 s default) until the focused
+//!   archive pane's image `<name>` has its temp copy and a decoded thumbnail of it. The grid
+//!   view or the preview panel must be showing the entry (they ask for both). Fails if the
+//!   temp copy could not be made or the thumbnail failed.
 //! - `assert-depths <name>=<depth>, …`: assert the tree depth of listed rows.
 //! - `assert-expanded-folder <name>` / `assert-collapsed-folder <name>`: whether a listed
 //!   folder is open in place.
@@ -265,6 +273,95 @@ pub(super) fn step(
                 Some(e) if e.name.eq_ignore_ascii_case(name) => Ok(Flow::Done),
                 Some(e) => Err(format!("the cursor is on `{}`, expected `{name}`", e.name)),
                 None => Err(format!("there is no cursor, expected `{name}`")),
+            }
+        }
+        "assert-archive" => {
+            let (archive, folder) = args
+                .split_once('|')
+                .ok_or("expected `<archive> | <folder>`")?;
+            let (archive, folder) = (archive.trim(), folder.trim().trim_matches('/'));
+            let Some(view) = &app.pane().archive else {
+                return Err(format!(
+                    "the focused pane is not in an archive ({})",
+                    app.pane().path.display()
+                ));
+            };
+            if !forge_core::paths::paths_equal(&view.archive, std::path::Path::new(archive))
+                || !view.inner.eq_ignore_ascii_case(folder)
+            {
+                return Err(format!(
+                    "the pane shows `{}` in {}, expected `{folder}` in {archive}",
+                    view.inner,
+                    view.archive.display()
+                ));
+            }
+            Ok(Flow::Done)
+        }
+        "assert-archive-copy" => {
+            let want: usize = args
+                .trim()
+                .parse()
+                .map_err(|_| format!("expected a count, got `{}`", args.trim()))?;
+            let have = app
+                .ops
+                .archive
+                .copied
+                .as_ref()
+                .map_or(0, |c| c.selection.names.len());
+            if have == want {
+                Ok(Flow::Done)
+            } else {
+                Err(format!(
+                    "the archive copy holds {have} entries, expected {want}"
+                ))
+            }
+        }
+        "wait-archive-thumb" => {
+            let (name, secs) = match args.split_once('|') {
+                Some((n, s)) => (n.trim(), s.trim()),
+                None => (args.trim(), ""),
+            };
+            let limit = timeout(secs)?;
+            let started = *st.started.get_or_insert_with(Instant::now);
+            let pane = app.pane();
+            let view = pane
+                .archive
+                .clone()
+                .ok_or("the focused pane is not in an archive")?;
+            let Some(e) = pane
+                .entries
+                .iter()
+                .find(|e| e.name.eq_ignore_ascii_case(name))
+                .cloned()
+            else {
+                return Err(format!("`{name}` is not listed"));
+            };
+            let state = match app.ops.archive.materialize.state(&e.path) {
+                Some(false) => return Err(format!("no temp copy of `{name}` could be made")),
+                None => "no temp copy yet".to_string(),
+                Some(true) => {
+                    let archive = &mut app.ops.archive;
+                    let real = crate::archive_ui::temp_copy_of(
+                        &mut archive.materialize,
+                        &archive.passwords,
+                        &view,
+                        &e,
+                        ctx,
+                    )
+                    .ok_or("the temp copy went missing")?;
+                    if app.ops.thumbs.failed_path(&real.path) {
+                        return Err(format!("the thumbnail of `{name}` failed"));
+                    }
+                    if app.ops.thumbs.largest_cached(&real).is_some() {
+                        return Ok(Flow::Done);
+                    }
+                    "a temp copy but no thumbnail yet".to_string()
+                }
+            };
+            if started.elapsed() >= limit {
+                Err(format!("`{name}` has {state} after {} s", limit.as_secs()))
+            } else {
+                Ok(Flow::Wait(format!("`{name}` has {state}")))
             }
         }
         "assert-no-dialog" => {

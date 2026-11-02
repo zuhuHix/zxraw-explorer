@@ -50,6 +50,11 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let kinds = payload.1.clone();
     egui::DragAndDrop::clear_payload(ctx);
     ctx.data_mut(|d| d.remove::<egui::Pos2>(last_id));
+    // Items inside an archive are not files other apps could take.
+    if paths.iter().any(|p| crate::archive_ui::is_virtual(app, p)) {
+        app.toast("Dragging out of an archive to other apps is not available yet: drop the items on a folder here, or extract them");
+        return;
+    }
     if paths.len() > MAX_DRAG_OUT_ITEMS {
         app.toast_err(format!(
             "Drag out at most {MAX_DRAG_OUT_ITEMS} items at a time ({} selected); \

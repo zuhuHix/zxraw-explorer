@@ -426,14 +426,20 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::NewFolder if crate::archive_ui::block_in_archive(app, "New folder") => {}
         Cmd::NewFile if crate::archive_ui::block_in_archive(app, "New file") => {}
         Cmd::Rename if crate::archive_ui::block_in_archive(app, "Rename") => {}
+        Cmd::DeletePermanently | Cmd::Recycle if app.pane().archive.is_some() => {
+            crate::archive_edit::ask_delete(app)
+        }
         Cmd::DeletePermanently | Cmd::Recycle
             if crate::archive_ui::block_in_archive(app, "Delete") => {}
         Cmd::Properties if crate::archive_ui::block_in_archive(app, "Properties") => {}
         Cmd::OpenTerminal | Cmd::OpenTerminalAdmin
             if crate::archive_ui::block_in_archive(app, "Open terminal") => {}
+        Cmd::Copy if app.pane().archive.is_some() => crate::archive_edit::copy(app),
         Cmd::Copy if crate::archive_ui::block_in_archive(app, "Copy") => {}
         Cmd::Cut if crate::archive_ui::block_in_archive(app, "Cut") => {}
-        Cmd::Paste if crate::archive_ui::block_in_archive(app, "Paste") => {}
+        Cmd::Paste
+            if app.pane().archive.is_none()
+                && crate::archive_ui::block_in_archive(app, "Paste") => {}
         Cmd::BatchRename if crate::archive_ui::block_in_archive(app, "Batch rename") => {}
         Cmd::NewFolder => {
             let name = unique_listed_name(app, &dir, "New folder");
@@ -563,6 +569,8 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             let paths = app.pane().action_targets();
             if !paths.is_empty() {
                 let cut = cmd == Cmd::Cut;
+                // A copy of files is newer than any copy made inside an archive.
+                app.ops.archive.copied = None;
                 app.toast(format!(
                     "{} {} item(s)",
                     if cut { "Cut" } else { "Copied" },
@@ -618,6 +626,10 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 return;
             };
             let paths = app.pane().action_targets();
+            let copy = cmd == Cmd::CopyToOtherPane;
+            if crate::archive_edit::transfer(app, &paths, &other, copy, cmd.label()) {
+                return;
+            }
             if crate::archive_ui::block_paths(app, cmd.label(), &paths, &other) {
                 return;
             }
@@ -1393,6 +1405,24 @@ fn paste_with(
         (None, None) => SystemFiles::NoFiles,
         (None, Some(_)) => SystemFiles::Unreadable,
     };
+    // Entries copied inside an archive (not on the Windows clipboard) while nothing newer
+    // was copied: extracted here.
+    if let Some(copied) = app.ops.archive.copied.as_ref()
+        && crate::archive_edit::archive_copy_is_newest(
+            copied.baseline_sequence,
+            sequence,
+            owner.is_some_and(forge_win::ClipboardToken::is_from_this_process),
+            match system {
+                SystemFiles::Files => Some(true),
+                SystemFiles::NoFiles => Some(false),
+                SystemFiles::Unreadable => None,
+            },
+        )
+    {
+        let copied = copied.clone();
+        return crate::archive_edit::paste_archive_copy(app, copied, dest);
+    }
+    let into_archive = crate::archive_edit::is_archive_target(app, &dest);
     match choose_paste_source(app.ops.clipboard.as_ref(), sequence, owner, system) {
         PasteSource::Empty => app.toast("Nothing to paste: the clipboard has no files"),
         PasteSource::Stale => app.toast("Nothing to paste: those items were moved already"),
@@ -1412,6 +1442,10 @@ fn paste_with(
                 app.toast_err("Could not read the files on the clipboard");
                 return;
             };
+            if into_archive {
+                let copy = effect != forge_win::ClipboardEffect::Move;
+                return crate::archive_edit::paste_into(app, paths, &dest, copy);
+            }
             if effect == forge_win::ClipboardEffect::Move {
                 if !crate::ops_ui::start_clipboard_move(app, paths, dest, None, Some(sequence)) {
                     app.toast("Nothing to move: the items are already in this folder");
@@ -1425,6 +1459,11 @@ fn paste_with(
                 app.toast("Nothing to paste: the clipboard has no files");
                 return;
             };
+            if into_archive {
+                // Archives take copies: a cut stays on the clipboard, its items in place.
+                let (paths, copy) = (cb.paths.clone(), !cb.cut);
+                return crate::archive_edit::paste_into(app, paths, &dest, copy);
+            }
             if !cb.cut {
                 let paths = cb.paths.clone();
                 crate::ops_ui::start_transfer(app, paths, dest, OpKind::Copy);
@@ -1501,6 +1540,9 @@ pub fn recycle(app: &mut ZxrawApp, targets: Vec<PathBuf>) {
 
 pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: bool) {
     let what = if copy { "Copy" } else { "Move" };
+    if crate::archive_edit::transfer(app, &paths, &target, copy, what) {
+        return;
+    }
     if crate::archive_ui::block_paths(app, what, &paths, &target) {
         return;
     }
@@ -2113,6 +2155,7 @@ pub(crate) fn accept(app: &mut ZxrawApp, m: Modal) -> Option<Modal> {
                 ConfirmKind::DeletePermanently(t) => delete_permanently(app, t),
                 ConfirmKind::DeleteWithWindows(t) => crate::ops_ui::delete_with_windows(app, t),
                 ConfirmKind::DownloadFfmpeg => crate::ffmpeg_setup::start(app),
+                ConfirmKind::ArchiveUpdate(r) => crate::archive_edit::start_update(app, r),
                 ConfirmKind::DownloadCloudFiles {
                     sources,
                     dest,
@@ -2153,9 +2196,38 @@ pub fn preview_panel(app: &mut ZxrawApp, ui: &mut Ui) {
     };
     preview::header(ui, &e);
     ui.separator();
-    if let Some(view) = &app.pane().archive {
-        // Inside an archive: what the archive's index says (a later task previews files).
-        crate::archive_ui::info_grid(ui, &e, view);
+    if let Some(view) = app.pane().archive.clone() {
+        // Inside an archive: small images from a temp copy, then what the index says.
+        let archive = &mut app.ops.archive;
+        let temp = crate::archive_ui::temp_copy_of(
+            &mut archive.materialize,
+            &archive.passwords,
+            &view,
+            &e,
+            ui.ctx(),
+        );
+        let node = view.node_of(&e.path);
+        let wanted = node.is_some_and(|n| {
+            let known = app.ops.archive.passwords.get(&view.archive).is_some();
+            crate::archive_ui::wants_temp_copy(&e, n, known)
+        });
+        if wanted {
+            let w = ui.available_width().min(512.0);
+            match temp.and_then(|real| app.ops.thumbs.thumb(ui, &real, w as u32)) {
+                Some(tex) => {
+                    let sz = tex.size_vec2();
+                    let scale = (w / sz.x).min(w / sz.y);
+                    ui.vertical_centered(|ui| ui.image((tex.id(), sz * scale)));
+                }
+                None if app.ops.archive.materialize.state(&e.path) == Some(false) => {}
+                None => {
+                    ui.add_space(8.0);
+                    ui.vertical_centered(|ui| ui.spinner());
+                }
+            }
+            ui.add_space(6.0);
+        }
+        crate::archive_ui::info_grid(ui, &e, &view);
         return;
     }
     if preview::is_media(&e) {

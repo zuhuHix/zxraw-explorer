@@ -1267,7 +1267,7 @@ use clipboard_test_support::{ClipboardLock, Snapshot};
 /// Scenarios that use the real Windows clipboard run one at a time, also against other
 /// test processes (forge-win's clipboard unit tests, e2e runs in other worktrees): see
 /// [`ClipboardLock`].
-fn clipboard_lock() -> ClipboardLock {
+pub(crate) fn clipboard_lock() -> ClipboardLock {
     ClipboardLock::acquire()
 }
 

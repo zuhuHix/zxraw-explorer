@@ -1985,7 +1985,9 @@ const POPUP_MAX_JOBS: usize = 3;
 
 /// Whether a job of this kind gets the progress popup: the ones that change files.
 fn popup_kind(kind: &str) -> bool {
-    matches!(kind, "delete" | "transfer" | "undo") || kind == crate::archive_extract::EXTRACT_KIND
+    matches!(kind, "delete" | "transfer" | "undo")
+        || kind == crate::archive_extract::EXTRACT_KIND
+        || kind == crate::archive_edit::UPDATE_KIND
 }
 
 /// A small window in front of the app with the progress of copies, moves and deletes that
