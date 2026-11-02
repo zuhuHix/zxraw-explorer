@@ -105,6 +105,9 @@ fn top_level_classifies_the_archive_root() {
         (vec![("note.txt", "n")], TopLevel::File("note.txt".into())),
         (vec![("a.txt", "a"), ("b.txt", "b")], TopLevel::Many),
         (vec![("proj/", ""), ("other.txt", "o")], TopLevel::Many),
+        // A file and a folder with the same top-level name are two items.
+        (vec![("foo", "f"), ("foo/bar.txt", "b")], TopLevel::Many),
+        (vec![("Foo/bar.txt", "b"), ("foo", "f")], TopLevel::Many),
         (vec![], TopLevel::Empty),
     ];
     let d = tempfile::tempdir().unwrap();
