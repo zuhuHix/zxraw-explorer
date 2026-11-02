@@ -37,6 +37,9 @@ const SIGNATURE: [u8; 6] = [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C];
 
 /// Bytes of an encrypted block decoded to test the password before its data is handed out.
 const PASSWORD_PEEK: usize = 64 * 1024;
+/// Bytes of an encrypted block decoded at most looking for a file whose CRC proves the
+/// password (see [`verify_password`]).
+pub(super) const PASSWORD_PROOF_BUDGET: u64 = 4 * 1024 * 1024;
 /// Encrypted blocks tested by [`SevenZipBackend::check_password`].
 const PASSWORD_BLOCKS: usize = 8;
 
@@ -46,6 +49,8 @@ pub(super) struct Opened {
     pub file: BufReader<File>,
     pub password: sz::Password,
     pub header_encrypted: bool,
+    /// The encrypted header passed its checksum with the password.
+    pub header_verified: bool,
 }
 
 pub(super) fn sz_password(password: Option<&Password>) -> sz::Password {
@@ -80,6 +85,7 @@ pub(super) fn open(path: &Path, password: Option<&Password>, max_entries: usize)
         file,
         password: sz_password(password),
         header_encrypted: info.encrypted,
+        header_verified: info.verified,
     })
 }
 
@@ -240,7 +246,7 @@ pub(super) fn block_infos(a: &sz::Archive) -> Vec<BlockInfo> {
             let end = firsts.get(i + 1).copied().unwrap_or(pack_sizes.len());
             let pack_size = pack_sizes
                 .get(start.min(end)..end)
-                .map_or(0, |s| s.iter().sum());
+                .map_or(0, |s| s.iter().fold(0u64, |a, &b| a.saturating_add(b)));
             let names: Vec<&str> = block
                 .coders
                 .iter()
@@ -384,36 +390,127 @@ fn is_compressed(a: &sz::Archive, b: usize) -> bool {
     })
 }
 
-/// Test `password` on block `b`: decode its first bytes (a small first file in full,
-/// against its CRC). `Some(false)` when that fails; `None` when it passed but proves
-/// nothing: stored (Copy) data decrypts to *something* with any key, and only a CRC tells.
-fn peek_block(o: &mut Opened, b: usize) -> Result<Option<bool>> {
+/// What testing a password on encrypted data found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PasswordCheck {
+    /// A file decoded in full and matched its CRC (or the encrypted header did).
+    Proven,
+    /// The data decoded as far as it was read, but no CRC confirmed it: data that decrypts
+    /// to *something* with any key (stored data, a decoder that met no error yet) proves
+    /// nothing. Every file is still checked against its CRC when it is extracted.
+    Unverified,
+    /// Decoding failed: the password is wrong (or the data damaged, which AES can't tell).
+    Failed,
+    /// Nothing that was asked about is encrypted.
+    NotEncrypted,
+}
+
+/// Test `password` on block `b`: decode files from its start, at most
+/// [`PASSWORD_PROOF_BUDGET`] bytes, until one with a CRC is decoded in full.
+fn peek_block(o: &mut Opened, b: usize) -> Result<PasswordCheck> {
     let Opened {
         archive,
         file,
         password,
         ..
     } = o;
-    let compressed = is_compressed(archive, b);
-    let mut outcome = None;
+    let mut outcome = PasswordCheck::Unverified;
+    let mut used = 0u64;
     let dec = sz::BlockDecoder::new(1, b, archive, password, file);
     let res = dec.for_each_entries(&mut |f, r| {
         if !has_data(f) {
             return Ok(true);
         }
-        let ok = read_up_to(r, PASSWORD_PEEK).is_ok();
-        // A first file read in full was checked against its CRC.
-        let verified = compressed || f.size <= PASSWORD_PEEK as u64;
-        outcome = (!ok || verified).then_some(ok);
-        Ok(false)
+        let room = PASSWORD_PROOF_BUDGET - used;
+        // Read to its end when it fits: the end is where its CRC is checked.
+        match read_up_to(r, room as usize) {
+            Err(_) => {
+                outcome = PasswordCheck::Failed;
+                Ok(false)
+            }
+            Ok(data) => {
+                used += data.len() as u64;
+                if data.len() as u64 == f.size && f.has_crc {
+                    outcome = PasswordCheck::Proven;
+                    Ok(false)
+                } else {
+                    // Out of budget, or a file without a CRC: keep looking while there's room.
+                    Ok(data.len() as u64 == f.size && used < PASSWORD_PROOF_BUDGET)
+                }
+            }
+        }
     });
     match res {
         Ok(_) => Ok(outcome),
         Err(sz::Error::PasswordRequired) => Err(CoreError::PasswordRequired(String::new())),
         // Building the decoders failed after the key was derived: bad data, as a wrong key
         // gives.
-        Err(_) => Ok(Some(false)),
+        Err(_) => Ok(PasswordCheck::Failed),
     }
+}
+
+/// Test `password` on the encrypted ones of `entries` (up to [`PASSWORD_BLOCKS`] of their
+/// blocks, compressed ones first): proven by any block, failed when every block failed,
+/// unverified otherwise. An encrypted header that passed its checksum proves it.
+pub(super) fn verify_password(
+    archive: &Path,
+    entries: &[&ArchiveEntry],
+    password: Option<&Password>,
+) -> Result<PasswordCheck> {
+    let label = || paths::display_path(archive);
+    if !entries.iter().any(|e| e.encrypted && !e.is_dir) {
+        return Ok(PasswordCheck::NotEncrypted);
+    }
+    let Some(password) = password else {
+        return Err(CoreError::PasswordRequired(label()));
+    };
+    let mut o = open(archive, Some(password), usize::MAX)?;
+    if o.header_verified {
+        return Ok(PasswordCheck::Proven);
+    }
+    let mut blocks: Vec<usize> = entries
+        .iter()
+        .filter(|e| e.encrypted && !e.is_dir && e.size > 0)
+        .filter_map(|e| {
+            o.archive
+                .stream_map
+                .file_block_index
+                .get(e.index)
+                .copied()
+                .flatten()
+        })
+        .collect();
+    blocks.sort_unstable();
+    blocks.dedup();
+    if blocks.is_empty() {
+        return Ok(PasswordCheck::NotEncrypted);
+    }
+    // Compressed blocks first: a wrong key makes their decoder fail early.
+    blocks.sort_by_key(|&b| !is_compressed(&o.archive, b));
+    blocks.truncate(PASSWORD_BLOCKS);
+    let (mut proven, mut failed, mut tried) = (false, 0, 0);
+    for b in blocks {
+        tried += 1;
+        match peek_block(&mut o, b) {
+            Ok(PasswordCheck::Proven) => proven = true,
+            Ok(PasswordCheck::Failed) => failed += 1,
+            Ok(_) => {}
+            Err(CoreError::PasswordRequired(_)) => {
+                return Err(CoreError::PasswordRequired(label()));
+            }
+            Err(e) => return Err(e),
+        }
+        if proven {
+            break;
+        }
+    }
+    Ok(if proven {
+        PasswordCheck::Proven
+    } else if failed == tried {
+        PasswordCheck::Failed
+    } else {
+        PasswordCheck::Unverified
+    })
 }
 
 impl SevenZipBackend {
@@ -663,53 +760,11 @@ impl ArchiveBackend for SevenZipBackend {
         entries: &[&ArchiveEntry],
         password: Option<&Password>,
     ) -> Result<()> {
-        let label = || paths::display_path(archive);
-        if !entries.iter().any(|e| e.encrypted && !e.is_dir) {
-            return Ok(());
-        }
-        let Some(password) = password else {
-            return Err(CoreError::PasswordRequired(label()));
-        };
-        let mut o = open(archive, Some(password), usize::MAX)?;
-        if o.header_encrypted {
-            // The header decoded and passed its CRC with this password.
-            return Ok(());
-        }
-        let mut blocks: Vec<usize> = entries
-            .iter()
-            .filter(|e| e.encrypted && !e.is_dir && e.size > 0)
-            .filter_map(|e| {
-                o.archive
-                    .stream_map
-                    .file_block_index
-                    .get(e.index)
-                    .copied()
-                    .flatten()
-            })
-            .collect();
-        blocks.sort_unstable();
-        blocks.dedup();
-        // Compressed blocks first: they prove a password, stored ones mostly can't.
-        blocks.sort_by_key(|&b| !is_compressed(&o.archive, b));
-        blocks.truncate(PASSWORD_BLOCKS);
-        // Passes only when some block proves the password (or none can prove anything).
-        let mut proven = false;
-        let mut failed = false;
-        for b in blocks {
-            match peek_block(&mut o, b) {
-                Ok(Some(true)) => proven = true,
-                Ok(Some(false)) => failed = true,
-                Ok(None) => {}
-                Err(CoreError::PasswordRequired(_)) => {
-                    return Err(CoreError::PasswordRequired(label()));
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        if proven || !failed {
-            Ok(())
-        } else {
-            Err(CoreError::WrongPassword(label()))
+        // Unverified goes ahead: each file is checked against its CRC as it is extracted,
+        // and one that fails is never published.
+        match verify_password(archive, entries, password)? {
+            PasswordCheck::Failed => Err(CoreError::WrongPassword(paths::display_path(archive))),
+            _ => Ok(()),
         }
     }
 
