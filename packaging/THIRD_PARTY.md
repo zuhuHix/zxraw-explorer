@@ -12,6 +12,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | accesskit_windows | 0.32.1 | MIT OR Apache-2.0 | https://github.com/AccessKit/accesskit | Permissive |
 | accesskit_winit | 0.32.2 | Apache-2.0 | https://github.com/AccessKit/accesskit | Permissive |
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | https://github.com/oyvindln/adler2 | Permissive |
+| aes | 0.9.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/block-ciphers | Permissive |
 | ahash | 0.8.12 | MIT OR Apache-2.0 | https://github.com/tkaitchuck/ahash | Permissive |
 | aho-corasick | 1.1.5 | Unlicense OR MIT | https://github.com/BurntSushi/aho-corasick | Permissive |
 | allocator-api2 | 0.2.21 | MIT OR Apache-2.0 | https://github.com/zakarumych/allocator-api2 | Permissive |
@@ -31,6 +32,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | bit-vec | 0.9.1 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-vec | Permissive |
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | https://github.com/BLAKE3-team/BLAKE3 | Permissive |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
+| block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | bstr | 1.13.1 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr | Permissive |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | https://github.com/fitzgen/bumpalo | Permissive |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck | Permissive |
@@ -38,34 +40,44 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | byteorder | 1.5.0 | Unlicense OR MIT | https://github.com/BurntSushi/byteorder | Permissive |
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | https://github.com/image-rs/byteorder-lite | Permissive |
 | bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes | Permissive |
+| bzip2 | 0.6.1 | MIT OR Apache-2.0 | https://github.com/trifectatechfoundation/bzip2-rs | Permissive |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if | Permissive |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | https://github.com/chronotope/chrono | Permissive |
+| cipher | 0.5.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
 | clap | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap | Permissive |
 | clap_builder | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap | Permissive |
 | clap_derive | 4.6.7 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap | Permissive |
 | clap_lex | 1.1.1 | MIT OR Apache-2.0 | https://github.com/clap-rs/clap | Permissive |
 | clipboard-win | 5.4.1 | BSL-1.0 | https://github.com/DoumanAsh/clipboard-win | Permissive |
 | clru | 0.6.3 | MIT | https://github.com/marmeladema/clru-rs | Permissive |
+| cmov | 0.5.4 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils | Permissive |
 | codespan-reporting | 0.13.1 | Apache-2.0 | https://github.com/brendanzab/codespan | Permissive |
 | color | 0.3.3 | Apache-2.0 OR MIT | https://github.com/linebender/color | Permissive |
 | color_quant | 1.1.0 | MIT | https://github.com/image-rs/color_quant.git | Permissive |
 | colorchoice | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-cli/anstyle.git | Permissive |
 | constant_time_eq | 0.4.2 | CC0-1.0 OR MIT-0 OR Apache-2.0 | https://github.com/cesarb/constant_time_eq | Permissive |
+| constant_time_eq | 0.6.1 | CC0-1.0 OR MIT-0 OR Apache-2.0 | https://codeberg.org/cesarb/constant_time_eq | Permissive |
+| const-oid | 0.10.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats | Permissive |
 | core_detect | 1.0.0 | MIT/Apache-2.0 | https://github.com/thomcc/core_detect | Permissive |
+| cpubits | 0.1.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | cpufeatures | 0.2.17 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | cpufeatures | 0.3.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | crc32fast | 1.5.2 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast | Permissive |
 | crossbeam-channel | 0.5.17 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam | Permissive |
 | crossbeam-utils | 0.8.23 | MIT OR Apache-2.0 | https://github.com/crossbeam-rs/crossbeam | Permissive |
 | crypto-common | 0.1.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
+| crypto-common | 0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
 | ctrlc | 3.5.2 | MIT/Apache-2.0 | https://github.com/Detegr/rust-ctrlc.git | Permissive |
+| ctutils | 0.4.7 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils | Permissive |
 | cursor-icon | 1.2.0 | MIT OR Apache-2.0 OR Zlib | https://github.com/rust-windowing/cursor-icon | Permissive |
+| deflate64 | 0.1.12 | MIT | https://github.com/anatawa12/deflate64-rs | Permissive |
 | defmt | 0.3.100 | MIT OR Apache-2.0 | https://github.com/knurling-rs/defmt | Permissive |
 | defmt | 1.1.1 | MIT OR Apache-2.0 | https://github.com/knurling-rs/defmt | Permissive |
 | defmt-macros | 1.1.1 | MIT OR Apache-2.0 | https://github.com/knurling-rs/defmt | Permissive |
 | defmt-parser | 1.0.0 | MIT OR Apache-2.0 | https://github.com/knurling-rs/defmt | Permissive |
 | deranged | 0.5.8 | MIT OR Apache-2.0 | https://github.com/jhpratt/deranged | Permissive |
 | digest | 0.10.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
+| digest | 0.11.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
 | directories | 6.0.0 | MIT OR Apache-2.0 | https://github.com/soc/directories-rs | Permissive |
 | dirs-sys | 0.5.0 | MIT OR Apache-2.0 | https://github.com/dirs-dev/dirs-sys-rs | Permissive |
 | document-features | 0.2.12 | MIT OR Apache-2.0 | https://github.com/slint-ui/document-features | Permissive |
@@ -100,13 +112,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.5.8 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
@@ -171,9 +183,12 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | hashlink | 0.12.2 | MIT OR Apache-2.0 | https://github.com/djc/hashlink | Permissive |
 | heapless | 0.8.0 | MIT OR Apache-2.0 | https://github.com/rust-embedded/heapless | Permissive |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck | Permissive |
+| hmac | 0.13.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/MACs | Permissive |
+| hybrid-array | 0.4.15 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hybrid-array | Permissive |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image | Permissive |
 | image-webp | 0.2.4 | MIT OR Apache-2.0 | https://github.com/image-rs/image-webp | Permissive |
 | indexmap | 2.14.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap | Permissive |
+| inout | 0.2.5 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | https://github.com/polyfill-rs/is_terminal_polyfill | Permissive |
 | itertools | 0.15.0 | MIT OR Apache-2.0 | https://github.com/rust-itertools/itertools | Permissive |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | https://github.com/dtolnay/itoa | Permissive |
@@ -186,6 +201,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | khronos-egl | 6.0.0 | MIT/Apache-2.0 | https://github.com/timothee-haudebourg/khronos-egl | Permissive |
 | kurbo | 0.13.1 | Apache-2.0 OR MIT | https://github.com/linebender/kurbo | Permissive |
 | lazy_static | 1.5.1 | MIT OR Apache-2.0 | https://github.com/rust-lang-nursery/lazy-static.rs | Permissive |
+| libbz2-rs-sys | 0.2.6 | bzip2-1.0.6 | https://github.com/trifectatechfoundation/libbzip2-rs | FLAG: license review |
 | libc | 0.2.190 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc | Permissive |
 | libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ | Permissive |
 | libm | 0.2.16 | MIT | https://github.com/rust-lang/compiler-builtins | Permissive |
@@ -195,6 +211,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | lock_api | 0.4.14 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | Permissive |
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log | Permissive |
 | lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git | Permissive |
+| lzma-rust2 | 0.23.0 | Apache-2.0 | https://github.com/hasenbanck/lzma-rust2/ | Permissive |
 | matchers | 0.2.0 | MIT | https://github.com/hawkw/matchers | Permissive |
 | md-5 | 0.10.6 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr | Permissive |
@@ -222,6 +239,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | owned_ttf_parser | 0.25.1 | Apache-2.0 | https://github.com/alexheretic/owned-ttf-parser | Permissive |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | Permissive |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | Permissive |
+| pbkdf2 | 0.13.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes | Permissive |
 | peniko | 0.6.1 | Apache-2.0 OR MIT | https://github.com/linebender/peniko | Permissive |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-url/ | Permissive |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite | Permissive |
@@ -229,6 +247,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | pollster | 1.0.1 | Apache-2.0/MIT | https://github.com/zesterer/pollster | Permissive |
 | polycool | 0.4.0 | MIT OR Apache-2.0 | https://github.com/linebender/kurbo | Permissive |
 | powerfmt | 0.2.1 | MIT OR Apache-2.0 | https://github.com/jhpratt/powerfmt | Permissive |
+| ppmd-rust | 1.5.2 | CC0-1.0 OR MIT-0 | https://github.com/hasenbanck/ppmd-rust | Permissive |
 | presser | 0.3.1 | MIT OR Apache-2.0 | https://github.com/EmbarkStudios/presser | Permissive |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | https://github.com/dtolnay/proc-macro2 | Permissive |
 | prodash | 31.0.1 | MIT | https://github.com/GitoxideLabs/prodash | Permissive |
@@ -257,8 +276,10 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_json | 1.0.152 | MIT OR Apache-2.0 | https://github.com/serde-rs/json | Permissive |
+| sha1 | 0.11.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | sha1dc | 0.1.5 | MIT OR Apache-2.0 | https://github.com/srijs/sha1dc | Permissive |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
+| sha2 | 0.11.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | sharded-slab | 0.1.7 | MIT | https://github.com/hawkw/sharded-slab | Permissive |
 | simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 | Permissive |
 | simdutf8 | 0.1.5 | MIT OR Apache-2.0 | https://github.com/rusticstuff/simdutf8 | Permissive |
@@ -289,7 +310,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | tracing-log | 0.2.0 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | tracing-subscriber | 0.3.23 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | Permissive |
-| typed-path | 0.12.3 | MIT OR Apache-2.0 | https://github.com/chipsenkbeil/typed-path | Permissive |
+| typed-path | 0.13.0 | MIT OR Apache-2.0 | https://github.com/chipsenkbeil/typed-path | Permissive |
 | typeid | 1.0.3 | MIT OR Apache-2.0 | https://github.com/dtolnay/typeid | Permissive |
 | type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | https://github.com/paholg/typenum | Permissive |
@@ -336,10 +357,14 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | xxhash-rust | 0.8.19 | BSL-1.0 | https://github.com/DoumanAsh/xxhash-rust | Permissive |
 | zerocopy | 0.8.62 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy | Permissive |
 | zerocopy-derive | 0.8.62 | BSD-2-Clause OR Apache-2.0 OR MIT | https://github.com/google/zerocopy | Permissive |
-| zip | 9.0.1 | MIT | https://github.com/zip-rs/zip2 | Permissive |
+| zeroize | 1.9.1 | Apache-2.0 OR MIT | https://github.com/RustCrypto/utils | Permissive |
+| zip | 9.2.2 | MIT | https://github.com/zip-rs/zip2 | Permissive |
 | zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs | Permissive |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij | Permissive |
 | zopfli | 0.8.3 | Apache-2.0 | https://github.com/zopfli-rs/zopfli | Permissive |
+| zstd | 0.14.3 | BSD-3-Clause | https://github.com/gyscos/zstd-rs | Permissive |
+| zstd-safe | 8.2.0 | BSD-3-Clause | https://github.com/gyscos/zstd-rs | Permissive |
+| zstd-sys | 2.1.2+zstd.1.5.7 | BSD-3-Clause | https://github.com/gyscos/zstd-rs | Permissive |
 | zune-core | 0.5.3 | MIT OR Apache-2.0 OR Zlib | https://github.com/etemesi254/zune-image | Permissive |
 | zune-jpeg | 0.5.15 | MIT OR Apache-2.0 OR Zlib | https://github.com/etemesi254/zune-image/tree/dev/crates/zune-jpeg | Permissive |
 
@@ -347,5 +372,5 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 
 The report flags missing or non-permissive license expressions for release review. The allowlist recognizes MIT, MIT-0, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0-1.0, BSL-1.0, and Unlicense expressions. SPDX WITH exceptions are reported with their base license.
 MPL-2.0 is weak copyleft with file-level source and notice obligations; any dependency declaring it is flagged for review.
-Flagged dependencies: epaint_default_fonts 0.36.2 (FLAG: license review; (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0); option-ext 0.2.0 (FLAG: MPL-2.0 weak copyleft review; MPL-2.0); self_cell 1.3.0 (FLAG: license review; Apache-2.0 OR GPL-2.0-only)
+Flagged dependencies: epaint_default_fonts 0.36.2 (FLAG: license review; (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0); libbz2-rs-sys 0.2.6 (FLAG: license review; bzip2-1.0.6); option-ext 0.2.0 (FLAG: MPL-2.0 weak copyleft review; MPL-2.0); self_cell 1.3.0 (FLAG: license review; Apache-2.0 OR GPL-2.0-only)
 FFmpeg and ffprobe are optional external programs and are not bundled with ZXraw Explorer.
