@@ -305,6 +305,13 @@ fn selection_dest(place: Place, count: usize) -> SelectionDest {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: runs just before an extraction starts (after its planning).
+    static BEFORE_EXTRACT: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 enum Outcome {
     /// The report, and whether the extraction made its destination folder.
     Done(ExtractReport, bool),
@@ -389,15 +396,22 @@ fn run_extract(
         }
     }
     let named = parent.join(archive::archive_stem(archive));
-    let named_existed = fs::symlink_metadata(&named).is_ok();
+    // Whether this extraction made its folder: from the `create_dir` that made it (never a
+    // guess from looking first, which a folder made meanwhile would fool).
     let mut created = false;
+    #[cfg(test)]
+    BEFORE_EXTRACT.with(|h| {
+        if let Some(f) = &*h.borrow() {
+            f();
+        }
+    });
     let report = match &r.selection {
         None => match r.place {
             Place::Smart => archive::extract_to(archive, parent, ExtractTarget::Smart, &opts, ctx)
-                .inspect(|rep| created = rep.dest != *parent),
+                .inspect(|rep| created = rep.created_dest),
             Place::Named => {
-                created = !named_existed;
                 archive::extract_to(archive, parent, ExtractTarget::NamedFolder, &opts, ctx)
+                    .inspect(|rep| created = rep.created_dest)
             }
             Place::Into => archive::extract(archive, parent, &opts, None, ctx),
         },
@@ -1204,5 +1218,40 @@ mod tests {
             assert_eq!(fs::read(folder.join("b.txt")).unwrap().len(), 8);
             fs::remove_dir_all(&folder).unwrap();
         }
+    }
+    #[test]
+    fn a_folder_made_by_someone_else_meanwhile_is_never_cleaned_up() {
+        let d = tempfile::tempdir().unwrap();
+        let archive = d.path().join("secret.7z");
+        unchecked_7z(&archive);
+        let (cancel, progress) = (
+            forge_jobs::CancelToken::new(),
+            forge_jobs::Progress::default(),
+        );
+        let ctx = JobCtx::new(&cancel, &progress);
+        let folder = d.path().join("secret");
+        // The folder appears after the extraction was planned, before it makes its own.
+        let made = folder.clone();
+        BEFORE_EXTRACT
+            .with(|h| *h.borrow_mut() = Some(Box::new(move || fs::create_dir(&made).unwrap())));
+        let request = ExtractRequest {
+            archive: archive.clone(),
+            parent: d.path().to_path_buf(),
+            place: Place::Named,
+            selection: None,
+            policy: Some(ConflictPolicy::Skip),
+            allow_unchecked: false,
+        };
+        let outcome = run_extract(&request, Some(Password::new("whatever")), &ctx);
+        BEFORE_EXTRACT.with(|h| *h.borrow_mut() = None);
+        let Ok(Outcome::Done(report, created)) = outcome else {
+            panic!("no report");
+        };
+        assert!(!created && !report.created_dest, "{report:?}");
+        assert_eq!(report.unchecked.len(), 2);
+        let ask = unchecked_ask(&request, &report, created).unwrap();
+        assert!(ask.remove_if_declined.is_none());
+        decline_unchecked(&ask);
+        assert!(folder.is_dir(), "someone else's folder was removed");
     }
 }
