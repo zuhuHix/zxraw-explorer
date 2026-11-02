@@ -1,6 +1,7 @@
 //! Archives: browsing, safe extraction, integrity tests, creation and editing.
 //!
-//! Formats plug in through [`ArchiveBackend`]; ZIP is the first backend (see `zip_backend`).
+//! Formats plug in through [`ArchiveBackend`]: ZIP (see `zip_backend`) and 7z (see
+//! `sevenz_backend`).
 //! Everything format-independent lives here, so a new format only has to list entries and
 //! stream their data:
 //!
@@ -25,6 +26,9 @@ mod crypto_peek;
 mod motw;
 mod presets;
 mod safety;
+mod sevenz_backend;
+mod sevenz_guard;
+mod sevenz_writer;
 mod tree;
 mod zip_backend;
 mod zip_merge;
@@ -37,6 +41,8 @@ mod tests_codecs;
 mod tests_edit;
 #[cfg(test)]
 mod tests_hostile;
+#[cfg(test)]
+mod tests_sevenz;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -52,7 +58,10 @@ use crate::error::{CoreError, Result};
 use crate::ops::{self, ConflictPolicy, JobCtx, NodeKind, OpIssue, StreamOptions, node_kind};
 use crate::paths;
 
-pub use presets::{CreateOptions, Encryption, Method, Preset, ZOPFLI_MAX_FILE, is_precompressed};
+pub use presets::{
+    CreateOptions, Encryption, Method, Preset, SevenZipPresetInfo, ZOPFLI_MAX_FILE,
+    is_precompressed,
+};
 pub use safety::{collision_key, normalize_entry_name, validate_entry_name};
 pub use tree::{ArchiveIndex, ArchiveNode};
 
@@ -65,12 +74,22 @@ const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 100_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArchiveFormat {
     Zip,
+    SevenZip,
 }
 
 impl ArchiveFormat {
     pub fn name(self) -> &'static str {
         match self {
             ArchiveFormat::Zip => "ZIP",
+            ArchiveFormat::SevenZip => "7z",
+        }
+    }
+
+    /// The extension new archives of this format get (no dot).
+    pub fn extension(self) -> &'static str {
+        match self {
+            ArchiveFormat::Zip => "zip",
+            ArchiveFormat::SevenZip => "7z",
         }
     }
 }
@@ -103,9 +122,19 @@ impl std::fmt::Debug for Password {
 pub enum EntryEncryption {
     Aes,
     ZipCrypto,
+    /// 7z AES-256. It has no password check of its own: a wrong password shows up as bad
+    /// data (the 7z backend tests the start of each encrypted block before extracting).
+    SevenZipAes,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl EntryEncryption {
+    /// Whether a data error of an entry encrypted this way may be a wrong password.
+    pub fn ambiguous_errors(self) -> bool {
+        matches!(self, EntryEncryption::ZipCrypto | EntryEncryption::SevenZipAes)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ArchiveEntry {
     /// Position in the archive's directory.
     pub index: usize,
@@ -123,6 +152,22 @@ pub struct ArchiveEntry {
     pub method: String,
     /// Whether the name passes extraction safety checks.
     pub safe_name: bool,
+    /// The entry shares a compressed block with others (a solid 7z block): its
+    /// `compressed_size` is its share of the block, and reading it decodes the block from its
+    /// start.
+    #[serde(default)]
+    pub solid: bool,
+    /// Decoded bytes before this entry's data in its block, which reading it decodes and
+    /// discards first (0 unless `solid`).
+    #[serde(default)]
+    pub block_offset: u64,
+}
+
+impl ArchiveEntry {
+    /// Bytes decoded to read this entry: its block up to it, then its own data.
+    pub fn decode_cost(&self) -> u64 {
+        self.block_offset.saturating_add(self.size)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,8 +195,15 @@ pub trait ArchiveBackend: Sync {
     fn extensions(&self) -> &'static [&'static str];
     /// Whether the first bytes of a file look like this format.
     fn sniff(&self, head: &[u8]) -> bool;
-    /// Read the directory (no entry data). Fails if there are more than `max_entries`.
-    fn list(&self, archive: &Path, max_entries: usize) -> Result<ArchiveListing>;
+    /// Read the directory (no entry data). Fails if there are more than `max_entries`. A 7z
+    /// archive with encrypted names needs `password` to be listed at all: without one this is
+    /// [`CoreError::PasswordRequired`], with a wrong one [`CoreError::WrongPassword`].
+    fn list(
+        &self,
+        archive: &Path,
+        max_entries: usize,
+        password: Option<&Password>,
+    ) -> Result<ArchiveListing>;
     /// Structural checks before any data is extracted from the entries at `indices`:
     /// overlapping entries, decoder memory above `limits.max_decoder_memory` (for encrypted
     /// entries, read from their data decrypted with `password`)...
@@ -162,15 +214,37 @@ pub trait ArchiveBackend: Sync {
         password: Option<&Password>,
         limits: &ExtractLimits,
     ) -> Result<()>;
-    /// Stream the entries `wanted` accepts, in archive order, to `visit`. Implementations
-    /// must check local headers against the directory and verify checksums as they read.
+    /// Stream the entries `wanted` accepts to `visit`, in archive order (7z: entries without
+    /// data first, then block by block). Implementations must check local headers against
+    /// the directory and verify checksums as they read. `ctx`, when given, is checked for
+    /// cancel and pause while data that no entry wants has to be decoded anyway (the start of
+    /// a solid block).
     fn read_entries(
         &self,
         archive: &Path,
         wanted: &dyn Fn(&ArchiveEntry) -> bool,
         password: Option<&Password>,
+        ctx: Option<&JobCtx<'_>>,
         visit: &mut EntryVisitor<'_>,
     ) -> Result<()>;
+    /// Check `password` against the encrypted entries among `entries` before anything is
+    /// extracted: [`CoreError::PasswordRequired`] / [`CoreError::WrongPassword`] when it can't
+    /// open them. The default opens the cheapest one to read.
+    fn check_password(
+        &self,
+        archive: &Path,
+        entries: &[&ArchiveEntry],
+        password: Option<&Password>,
+    ) -> Result<()> {
+        match entries
+            .iter()
+            .filter(|e| e.encrypted && !e.is_dir)
+            .min_by_key(|e| e.block_offset)
+        {
+            Some(first) => open_one(self, archive, first.index, password),
+            None => Ok(()),
+        }
+    }
     fn can_write(&self) -> bool {
         false
     }
@@ -204,7 +278,7 @@ fn read_only(path: &Path, format: ArchiveFormat) -> CoreError {
     ))
 }
 
-static BACKENDS: &[&dyn ArchiveBackend] = &[&zip_backend::ZIP];
+static BACKENDS: &[&dyn ArchiveBackend] = &[&zip_backend::ZIP, &sevenz_backend::SEVEN_ZIP];
 
 /// Every registered backend.
 pub fn backends() -> &'static [&'static dyn ArchiveBackend] {
@@ -243,7 +317,12 @@ pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
 
 /// List an archive's entries without extracting anything.
 pub fn list(archive: &Path) -> Result<ArchiveListing> {
-    backend_for_file(archive)?.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES)
+    list_with_password(archive, None)
+}
+
+/// List an archive whose entry names may be encrypted (7z): see [`ArchiveBackend::list`].
+pub fn list_with_password(archive: &Path, password: Option<&Password>) -> Result<ArchiveListing> {
+    backend_for_file(archive)?.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES, password)
 }
 
 /// List the entries of a ZIP file (kept for existing callers; see [`list`]).
@@ -252,7 +331,7 @@ pub fn list_zip(path: &Path) -> Result<Vec<ArchiveEntry>> {
 }
 
 fn list_zip_with_limit(path: &Path, max_entries: usize) -> Result<Vec<ArchiveEntry>> {
-    Ok(zip_backend::ZIP.list(path, max_entries)?.entries)
+    Ok(zip_backend::ZIP.list(path, max_entries, None)?.entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +380,12 @@ fn cache() -> &'static IndexCache {
 /// The browsing index of an archive, cached while the file's size and modified time stay
 /// the same (the central directory is read once, not on every folder change).
 pub fn index_cached(archive: &Path) -> Result<Arc<ArchiveIndex>> {
+    index_cached_with(archive, None)
+}
+
+/// [`index_cached`] for an archive whose names may be encrypted (7z): `password` is used
+/// only when the index isn't cached yet. Errors as [`ArchiveBackend::list`].
+pub fn index_cached_with(archive: &Path, password: Option<&Password>) -> Result<Arc<ArchiveIndex>> {
     let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
     let key: CacheKey = (archive.to_path_buf(), md.len(), md.modified().ok());
     let lookup = paths::lexical_normalize(archive);
@@ -309,7 +394,7 @@ pub fn index_cached(archive: &Path) -> Result<Arc<ArchiveIndex>> {
     {
         return Ok(idx.clone());
     }
-    let idx = Arc::new(ArchiveIndex::build(list(archive)?));
+    let idx = Arc::new(ArchiveIndex::build(list_with_password(archive, password)?));
     cache().lock().put(lookup, (key, idx.clone()));
     Ok(idx)
 }
@@ -464,7 +549,7 @@ pub fn extract(
     }
     let backend = backend_for_file(archive)?;
     let limits = &opts.limits;
-    let listing = backend.list(archive, limits.max_entries)?;
+    let listing = backend.list(archive, limits.max_entries, opts.password.as_ref())?;
     let mut report = ExtractReport {
         dest: dest_dir.to_path_buf(),
         ..Default::default()
@@ -575,12 +660,8 @@ pub fn extract(
     // Limits first: checking the password opens an entry, which sets up its decoder. The
     // preflight reads encrypted headers only when the password passes their check.
     backend.preflight(archive, &indices, password, limits)?;
-    if let Some(first) = planned
-        .iter()
-        .find(|p| p.entry.encrypted && !p.entry.is_dir)
-    {
-        check_password(backend, archive, first.entry.index, password)?;
-    }
+    let planned_entries: Vec<&ArchiveEntry> = planned.iter().map(|p| &p.entry).collect();
+    backend.check_password(archive, &planned_entries, password)?;
     // The destination, resolved and pinned from the volume root for the whole job; entries
     // are written beneath its final path and reported beneath `dest_dir`.
     let base = safety::PinnedBase::open(dest_dir)?;
@@ -693,7 +774,7 @@ pub fn extract(
         }
     };
     let wanted = |e: &ArchiveEntry| by_index.contains_key(&e.index);
-    match backend.read_entries(archive, &wanted, password, &mut visit) {
+    match backend.read_entries(archive, &wanted, password, Some(ctx), &mut visit) {
         Ok(()) => {}
         Err(CoreError::Cancelled) => report.cancelled = true,
         Err(e) => return Err(e),
@@ -707,9 +788,11 @@ fn data_error(entry: &ArchiveEntry, e: CoreError) -> String {
         return e.to_string();
     }
     let text = e.to_string();
-    if entry.encryption == Some(EntryEncryption::ZipCrypto) && !matches!(e, CoreError::Io { .. }) {
+    if entry.encryption.is_some_and(EntryEncryption::ambiguous_errors)
+        && !matches!(e, CoreError::Io { .. })
+    {
         // ZipCrypto's password check is one byte: a wrong password passes it 1 time in 256
-        // and then fails as bad data.
+        // and then fails as bad data. 7z AES has no check at all.
         format!("{text} (damaged data or wrong password)")
     } else {
         text
@@ -717,8 +800,8 @@ fn data_error(entry: &ArchiveEntry, e: CoreError) -> String {
 }
 
 /// Open the encrypted entry `index` with `password` to check it before extracting anything.
-fn check_password(
-    backend: &dyn ArchiveBackend,
+fn open_one<B: ArchiveBackend + ?Sized>(
+    backend: &B,
     archive: &Path,
     index: usize,
     password: Option<&Password>,
@@ -728,6 +811,7 @@ fn check_password(
         archive,
         &|e| e.index == index,
         password,
+        None,
         &mut |_, reader| {
             if let Err(e) = reader
                 && is_password_error(&e)
@@ -834,7 +918,7 @@ pub fn extract_to(
     ctx: &JobCtx<'_>,
 ) -> Result<ExtractReport> {
     let backend = backend_for_file(archive)?;
-    let listing = backend.list(archive, opts.limits.max_entries)?;
+    let listing = backend.list(archive, opts.limits.max_entries, opts.password.as_ref())?;
     let nest = match target {
         ExtractTarget::NamedFolder => true,
         ExtractTarget::Smart => matches!(top_level(&listing), TopLevel::Many),
@@ -946,13 +1030,11 @@ pub fn test_archive(
     ctx: &JobCtx<'_>,
 ) -> Result<TestReport> {
     let backend = backend_for_file(archive)?;
-    let listing = backend.list(archive, limits.max_entries)?;
+    let listing = backend.list(archive, limits.max_entries, password)?;
     let files: Vec<&ArchiveEntry> = listing.entries.iter().filter(|e| !e.is_dir).collect();
     let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
     backend.preflight(archive, &indices, password, limits)?;
-    if let Some(first) = files.iter().find(|e| e.encrypted) {
-        check_password(backend, archive, first.index, password)?;
-    }
+    backend.check_password(archive, &files, password)?;
     ctx.progress.add_total_items(files.len() as u64);
     ctx.progress
         .add_total_bytes(files.iter().map(|e| e.size).sum());
@@ -1002,7 +1084,7 @@ pub fn test_archive(
         Ok(())
     };
     let wanted = |e: &ArchiveEntry| !e.is_dir;
-    match backend.read_entries(archive, &wanted, password, &mut visit) {
+    match backend.read_entries(archive, &wanted, password, Some(ctx), &mut visit) {
         Ok(()) => {}
         Err(CoreError::Cancelled) => report.cancelled = true,
         Err(e) => return Err(e),
@@ -1052,7 +1134,7 @@ pub fn extract_entry_to_temp(
         .file_name()
         .ok_or_else(|| CoreError::Invalid(format!("{entry_name}: not a file")))?
         .to_owned();
-    let index = index_cached(archive)?;
+    let index = index_cached_with(archive, password)?;
     let node = index
         .node(entry_name.trim_end_matches('/'))
         .filter(|n| !n.is_dir)
@@ -1238,7 +1320,11 @@ fn check_update_password(
     if edit.add.is_empty() {
         return Ok(Vec::new());
     }
-    let listing = backend.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES)?;
+    let listing = backend.list(
+        archive,
+        DEFAULT_MAX_ARCHIVE_ENTRIES,
+        opts.encryption.password(),
+    )?;
     if !listing.any_encrypted() {
         return Ok(Vec::new());
     }
@@ -1253,6 +1339,13 @@ fn check_update_password(
         .filter(|e| e.encrypted && !e.is_dir)
         .collect();
     if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if backend.format() == ArchiveFormat::SevenZip {
+        // 7z AES has no header check to sample: the backend decodes the start of the
+        // encrypted blocks (opening a file in the middle of a solid block would decode the
+        // block up to it).
+        backend.check_password(archive, &files, Some(password))?;
         return Ok(Vec::new());
     }
     files.sort_by_key(|e| e.size);
@@ -1270,6 +1363,7 @@ fn check_update_password(
         archive,
         &|e| sample.contains(&e.index),
         Some(password),
+        None,
         &mut |e, reader| {
             match reader {
                 Ok(_) => opened.push(e.clone()),
@@ -1290,6 +1384,7 @@ fn check_update_password(
             archive,
             &|e| e.index == probe.index,
             Some(password),
+            None,
             &mut |_, reader| {
                 if let Ok(r) = reader {
                     let limit = probe.size.saturating_add(1);

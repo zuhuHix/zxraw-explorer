@@ -207,6 +207,7 @@ mod tests {
             crc32: 0,
             method: "Deflate".into(),
             safe_name: !name.contains(".."),
+            ..Default::default()
         }
     }
 
