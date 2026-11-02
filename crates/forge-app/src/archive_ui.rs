@@ -554,9 +554,13 @@ impl Retry {
         match self {
             Retry::Open(r) => format!("{} in {archive} is encrypted.", r.name),
             Retry::Extract(_) | Retry::Test(_) => format!("{archive} is encrypted."),
-            Retry::Update(_) => format!(
-                "{archive} is encrypted. Its password is needed to change it (new files are                  encrypted with it)."
+            Retry::Update(r) if r.confirm_password => format!(
+                "{archive} has encrypted folders but no encrypted file to check a password \
+                 against. Choose the password for the new files (AES-256)."
             ),
+            Retry::Update(_) => {
+                format!("{archive} is encrypted. New files are encrypted with its password.")
+            }
         }
     }
 }
@@ -581,6 +585,9 @@ pub(crate) enum Msg {
 struct PasswordPrompt {
     retry: Retry,
     text: String,
+    /// The password typed again, when there is nothing to check it against (see
+    /// `UpdateRequest::confirm_password`).
+    confirm: Option<String>,
     wrong: bool,
     focused: bool,
 }
@@ -628,6 +635,9 @@ impl ArchiveUi {
 impl Drop for PasswordPrompt {
     fn drop(&mut self) {
         wipe(&mut self.text);
+        if let Some(confirm) = &mut self.confirm {
+            wipe(confirm);
+        }
     }
 }
 
@@ -740,9 +750,12 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
         if !wrong && ui.passwords.get(retry.archive()).is_some() {
             run_retry(app, retry);
         } else {
+            let confirm =
+                matches!(&retry, Retry::Update(r) if r.confirm_password).then(String::new);
             ui.prompt = Some(PasswordPrompt {
                 retry,
                 text: String::new(),
+                confirm,
                 wrong,
                 focused: false,
             });
@@ -788,6 +801,10 @@ fn password_field_id() -> egui::Id {
     egui::Id::new("archive-password-field")
 }
 
+fn confirm_field_id() -> egui::Id {
+    egui::Id::new("archive-password-confirm-field")
+}
+
 /// The password dialog for an encrypted entry (drawn every frame while open).
 pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
     let Some(mut prompt) = app.ops.archive.prompt.take() else {
@@ -820,9 +837,30 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
             r.request_focus();
             prompt.focused = true;
         }
+        let matching = match &mut prompt.confirm {
+            None => true,
+            Some(confirm) => {
+                ui.add(
+                    egui::TextEdit::singleline(confirm)
+                        .id(confirm_field_id())
+                        .password(true)
+                        .hint_text("Confirm password")
+                        .desired_width(f32::INFINITY),
+                );
+                let same = *confirm == prompt.text;
+                if !confirm.is_empty() && !same {
+                    ui.label(
+                        RichText::new("The passwords do not match")
+                            .color(ui.visuals().error_fg_color),
+                    );
+                }
+                same
+            }
+        };
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("OK").clicked() || (enter && !prompt.text.is_empty()) {
+            let ready = !prompt.text.is_empty() && matching;
+            if ui.add_enabled(ready, egui::Button::new("OK")).clicked() || (enter && ready) {
                 accept = true;
             }
             if ui.button("Cancel").clicked() || esc {
@@ -830,18 +868,24 @@ pub fn password_modal(app: &mut ZxrawApp, ctx: &egui::Context) {
             }
         });
     });
+    let forget_fields = |prompt: &mut PasswordPrompt| {
+        wipe(&mut prompt.text);
+        if let Some(confirm) = &mut prompt.confirm {
+            wipe(confirm);
+        }
+        forget_text_state(ctx, password_field_id());
+        forget_text_state(ctx, confirm_field_id());
+    };
     if accept && !prompt.text.is_empty() {
         let password = Password::new(&prompt.text);
-        wipe(&mut prompt.text);
-        forget_text_state(ctx, password_field_id());
+        forget_fields(&mut prompt);
         app.ops
             .archive
             .passwords
             .set(prompt.retry.archive(), password);
         run_retry(app, prompt.retry.clone());
     } else if cancel || resp.should_close() {
-        wipe(&mut prompt.text);
-        forget_text_state(ctx, password_field_id());
+        forget_fields(&mut prompt);
         // Other jobs of the same archive wait for the same password: give them up too.
         let archive = prompt.retry.archive().to_path_buf();
         app.ops
@@ -918,7 +962,11 @@ mod tests {
         assert_ne!(v1.version, v2.version);
         let second = made(&mut m, &listed, &v2).expect("copy");
         assert_eq!(std::fs::read(&second).unwrap(), b"the new picture");
-        assert_eq!(m.state(&listed, v1.version), None, "the old copy is forgotten");
+        assert_eq!(
+            m.state(&listed, v1.version),
+            None,
+            "the old copy is forgotten"
+        );
 
         // A copy still being made for an old version is dropped when it arrives.
         let ctx = egui::Context::default();
@@ -939,7 +987,7 @@ mod tests {
         let ctx = egui::Context::default();
         let id = password_field_id();
         let mut text = String::new();
-        let mut frame = |events: Vec<egui::Event>, text: &mut String| {
+        let frame = |events: Vec<egui::Event>, text: &mut String| {
             let input = egui::RawInput {
                 events,
                 ..Default::default()

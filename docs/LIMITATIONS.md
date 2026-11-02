@@ -14,6 +14,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
   caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
   "damaged data or wrong password". AES archives always tell the two apart.
+* New AES-encrypted entries follow WinZip's recommendation, as the `zip` crate writes them:
+  AE-1 (with a CRC check) for files of 20 bytes or more, AE-2 (no CRC, so tiny contents can't be
+  guessed from it) below that. Both are AES-256.
+* Editing a zip copies the entries it keeps exactly as stored, so it needs no password unless
+  files are added to an encrypted zip. New files then use the password you enter; if the zip's
+  entries use several passwords, you're told, and the new files get the one you entered.
 * ZXraw does not develop RAW files. RAW preview support extracts an embedded JPEG preview;
   it does not demosaic sensor data. A RAW with no usable embedded JPEG has no image preview.
 * Thumbnails use the Rust `image` pipeline for JPEG, PNG, TIFF, WebP, GIF, and BMP. HEIC/HEIF

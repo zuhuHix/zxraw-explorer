@@ -591,7 +591,10 @@ fn adding_to_an_encrypted_archive_needs_its_password() {
         // changes either.
         for wrong in ["nope", "pw2", "PW", "x", "secret", "1234"] {
             let err = update(&archive, &edit, &with(wrong), &ctx).unwrap_err();
-            assert!(matches!(err, CoreError::WrongPassword(_)), "{wrong}: {err:?}");
+            assert!(
+                matches!(err, CoreError::WrongPassword(_)),
+                "{wrong}: {err:?}"
+            );
             assert_eq!(fs::read(&archive).unwrap(), original);
         }
         assert!(
@@ -604,7 +607,11 @@ fn adding_to_an_encrypted_archive_needs_its_password() {
         // The right password: the new entry is encrypted with it.
         update(&archive, &edit, &with("pw"), &ctx).unwrap();
         let listing = list(&archive).unwrap();
-        let added = listing.entries.iter().find(|e| e.name == "fresh.txt").unwrap();
+        let added = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "fresh.txt")
+            .unwrap();
         assert!(added.encrypted && added.encryption.is_some(), "{added:?}");
         let dest = d.path().join(format!("dest-{legacy}"));
         fs::create_dir(&dest).unwrap();
@@ -618,19 +625,12 @@ fn adding_to_an_encrypted_archive_needs_its_password() {
         assert!(r.failed.is_empty(), "{r:?}");
         assert_eq!(fs::read(dest.join("fresh.txt")).unwrap(), b"fresh data");
 
-        // Deleting copies AES entries as they are, so it needs no password; ZipCrypto
-        // entries are encrypted again, which does.
+        // Deleting copies the other entries as they are: no password needed.
         let del = ArchiveEdit {
             add: vec![],
             delete: vec!["fresh.txt".into()],
         };
-        if legacy {
-            let err = update(&archive, &del, &CreateOptions::default(), &ctx).unwrap_err();
-            assert!(matches!(err, CoreError::PasswordRequired(_)), "{err:?}");
-            update(&archive, &del, &with("pw"), &ctx).unwrap();
-        } else {
-            update(&archive, &del, &CreateOptions::default(), &ctx).unwrap();
-        }
+        update(&archive, &del, &CreateOptions::default(), &ctx).unwrap();
         let listing = list(&archive).unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert!(listing.entries[0].encrypted);
@@ -642,3 +642,241 @@ fn adding_to_an_encrypted_archive_needs_its_password() {
     }
 }
 
+/// Each entry's stored local record (header, data, descriptor) and central record with the
+/// local-header offset blanked, by name.
+fn records_by_name(path: &Path) -> std::collections::HashMap<String, (Vec<u8>, Vec<u8>)> {
+    let bytes = fs::read(path).unwrap();
+    let mut file = File::open(path).unwrap();
+    let mut za = zip::ZipArchive::new(std::io::BufReader::new(File::open(path).unwrap())).unwrap();
+    let records = super::zip_merge::raw_records(path, &mut file, &mut za).unwrap();
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let name = za.by_index_raw(i).unwrap().name().unwrap().into_owned();
+            let local = bytes[r.start as usize..r.end as usize].to_vec();
+            let mut central = r.central.clone();
+            central[42..46].fill(0);
+            (name, (local, central))
+        })
+        .collect()
+}
+
+fn seven_zip() -> Option<PathBuf> {
+    let p = PathBuf::from(r"C:\Program Files\7-Zip\7z.exe");
+    p.exists().then_some(p)
+}
+
+/// Edit `archive` (delete `gone`, add a file with `password`) and check every other entry
+/// kept its stored bytes, then that it all opens, in 7-Zip too when it is installed.
+fn edit_keeps_records(archive: &Path, gone: &str, password: &str) {
+    let d = archive.parent().unwrap();
+    let before = records_by_name(archive);
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let added = d.join("added.txt");
+    write(&added, "added later");
+    let edit = ArchiveEdit {
+        add: vec![edit_add(added, "")],
+        delete: vec![gone.to_owned()],
+    };
+    let opts = CreateOptions {
+        encryption: Encryption::Aes256(Password::new(password)),
+        ..Default::default()
+    };
+    let rep = update(archive, &edit, &opts, &ctx).unwrap();
+    assert!(rep.warnings.is_empty(), "{rep:?}");
+    let after = records_by_name(archive);
+    assert!(!after.contains_key(gone));
+    for (name, record) in &before {
+        if name != gone {
+            assert_eq!(after.get(name), Some(record), "{name} changed");
+        }
+    }
+    assert!(after["added.txt"].1.len() > 46);
+    // Everything opens with the password.
+    let rep = test_archive(
+        archive,
+        Some(&Password::new(password)),
+        &ExtractLimits::default(),
+        &ctx,
+    )
+    .unwrap();
+    assert!(rep.is_ok(), "{:?}", rep.entries);
+    if let Some(seven) = seven_zip() {
+        let out = std::process::Command::new(seven)
+            .arg("t")
+            .arg(format!("-p{password}"))
+            .arg(archive)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "7-Zip: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+#[test]
+fn editing_a_zipcrypto_zip_keeps_other_entries_byte_for_byte() {
+    let d = tempfile::tempdir().unwrap();
+    // One made by 7-Zip (ZipCrypto, Store and Deflate, NTFS times, a folder entry)...
+    let fixture = d.path().join("seven.zip");
+    fs::write(&fixture, include_bytes!("fixtures/zipcrypto-7zip.zip")).unwrap();
+    edit_keeps_records(&fixture, "notes.txt", "fixture");
+    // ... and one of ours (ZipCrypto entries with data descriptors).
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let src = d.path().join("src");
+    write(&src.join("one.txt"), &"one ".repeat(100));
+    write(&src.join("two.txt"), "two");
+    write(&src.join("sub/three.bin"), "three");
+    let ours = d.path().join("ours.zip");
+    let opts = CreateOptions {
+        encryption: Encryption::ZipCryptoLegacy(Password::new("pw")),
+        threads: 1,
+        ..Default::default()
+    };
+    create(std::slice::from_ref(&src), &ours, &opts, &ctx).unwrap();
+    edit_keeps_records(&ours, "src/two.txt", "pw");
+}
+
+/// Mark entry `name` encrypted (general-purpose bit 0) in its local and central headers.
+fn mark_encrypted(bytes: &mut [u8], name: &[u8]) {
+    let mut marked = 0;
+    for (sig, name_at, flags_at) in [(b"PK\x03\x04", 30, 6), (b"PK\x01\x02", 46, 8)] {
+        let mut i = 0;
+        while let Some(p) = bytes[i..].windows(4).position(|w| w == sig) {
+            let at = i + p;
+            if bytes.get(at + name_at..at + name_at + name.len()) == Some(name) {
+                bytes[at + flags_at] |= 1;
+                marked += 1;
+            }
+            i = at + 4;
+        }
+    }
+    assert_eq!(marked, 2);
+}
+
+#[test]
+fn an_archive_with_only_encrypted_folders_takes_only_encrypted_additions() {
+    let d = tempfile::tempdir().unwrap();
+    let archive = d.path().join("dirs.zip");
+    make_zip(&archive, &[("locked/", ""), ("plain.txt", "p")]);
+    let mut bytes = fs::read(&archive).unwrap();
+    mark_encrypted(&mut bytes, b"locked/");
+    fs::write(&archive, &bytes).unwrap();
+    assert!(list(&archive).unwrap().any_encrypted());
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let new = d.path().join("new.txt");
+    write(&new, "new data");
+    let edit = ArchiveEdit {
+        add: vec![edit_add(new, "locked/")],
+        delete: vec![],
+    };
+    // Fails closed without a password: never a plaintext addition.
+    let err = update(&archive, &edit, &CreateOptions::default(), &ctx).unwrap_err();
+    assert!(matches!(err, CoreError::PasswordRequired(_)), "{err:?}");
+    assert_eq!(fs::read(&archive).unwrap(), bytes);
+    // With one (asked twice by the app: nothing to check it against), new files are AES-256.
+    let opts = CreateOptions {
+        encryption: Encryption::Aes256(Password::new("fresh pw")),
+        ..Default::default()
+    };
+    update(&archive, &edit, &opts, &ctx).unwrap();
+    let listing = list(&archive).unwrap();
+    let added = listing
+        .entries
+        .iter()
+        .find(|e| e.name == "locked/new.txt")
+        .unwrap();
+    assert_eq!(added.encryption, Some(EntryEncryption::Aes));
+}
+
+#[test]
+fn several_passwords_warn_and_a_wrong_one_changes_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let archive = d.path().join("mixed.zip");
+    {
+        let mut zw = ZipWriter::new(File::create(&archive).unwrap());
+        for (name, pw) in [("a.txt", "one"), ("b.txt", "two")] {
+            let o = SimpleFileOptions::default().with_aes_encryption(zip::AesMode::Aes256, pw);
+            zw.start_file(name, o).unwrap();
+            zw.write_all(format!("data of {name}").as_bytes()).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+    let original = fs::read(&archive).unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let new = d.path().join("c.txt");
+    write(&new, "third");
+    let edit = ArchiveEdit {
+        add: vec![edit_add(new, "")],
+        delete: vec![],
+    };
+    let with = |pw: &str| CreateOptions {
+        encryption: Encryption::Aes256(Password::new(pw)),
+        ..Default::default()
+    };
+    // A password that opens none of them: refused before anything is written.
+    let err = update(&archive, &edit, &with("three"), &ctx).unwrap_err();
+    assert!(matches!(err, CoreError::WrongPassword(_)), "{err:?}");
+    assert_eq!(fs::read(&archive).unwrap(), original);
+    // One that opens some: the update runs and says the archive has several passwords.
+    let rep = update(&archive, &edit, &with("one"), &ctx).unwrap();
+    assert_eq!(rep.warnings, vec![SEVERAL_PASSWORDS.to_owned()]);
+    let dest = d.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let opts = ExtractOptions {
+        password: Some(Password::new("one")),
+        ..Default::default()
+    };
+    let r = extract(&archive, &dest, &opts, None, &ctx).unwrap();
+    assert_eq!(fs::read(dest.join("c.txt")).unwrap(), b"third");
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"data of a.txt");
+    // b.txt has its own password: it fails, the rest extracts.
+    assert_eq!(r.failed.len(), 1, "{r:?}");
+}
+
+#[test]
+fn the_password_probe_keeps_the_decoder_memory_limit() {
+    use zip::unstable::write::FileOptionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let archive = d.path().join("bomb.zip");
+    // The only encrypted file declares LZMA with a 2 GiB dictionary.
+    let mut model = vec![5, 2, 5, 0, 0x5D, 0, 0, 0, 0x80];
+    model.extend([0u8; 64]);
+    let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let o = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .with_deprecated_encryption(b"pw")
+        .unwrap();
+    zw.start_file("model.bin", o).unwrap();
+    zw.write_all(&model).unwrap();
+    let mut bytes = zw.finish().unwrap().into_inner();
+    let central = bytes.windows(4).position(|w| w == b"PK\x01\x02").unwrap();
+    for at in [8, central + 10] {
+        bytes[at] = 14;
+    }
+    fs::write(&archive, &bytes).unwrap();
+    let (c, p) = ctx_parts();
+    let ctx = JobCtx::new(&c, &p);
+    let new = d.path().join("n.txt");
+    write(&new, "n");
+    let edit = ArchiveEdit {
+        add: vec![edit_add(new, "")],
+        delete: vec![],
+    };
+    let opts = CreateOptions {
+        encryption: Encryption::Aes256(Password::new("pw")),
+        ..Default::default()
+    };
+    match update(&archive, &edit, &opts, &ctx) {
+        Err(CoreError::UnsafePath(msg)) => assert!(msg.contains("decoder memory"), "{msg}"),
+        other => panic!("expected the decoder memory limit, got {other:?}"),
+    }
+    assert_eq!(fs::read(&archive).unwrap(), bytes);
+}

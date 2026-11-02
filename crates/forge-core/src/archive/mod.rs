@@ -27,6 +27,7 @@ mod presets;
 mod safety;
 mod tree;
 mod zip_backend;
+mod zip_merge;
 
 #[cfg(test)]
 mod tests;
@@ -1145,6 +1146,8 @@ pub struct CreateReport {
     pub replaced: u64,
     pub deleted: u64,
     pub skipped: Vec<OpIssue>,
+    /// Things the user should know about a finished update (one archive, several passwords).
+    pub warnings: Vec<String>,
 }
 
 /// Kept for existing callers.
@@ -1180,16 +1183,15 @@ pub fn create_zip(sources: &[PathBuf], out: &Path, ctx: &JobCtx<'_>) -> Result<C
 }
 
 /// Apply `edit` to `archive`: the archive is rebuilt into a temp file next to it (unchanged
-/// entries copied without recompressing) and atomically replaces the original when done.
+/// entries copied record by record, as stored) and atomically replaces the original when done.
 /// A cancelled or failed update leaves the original untouched.
 ///
-/// Files added to an archive that has encrypted entries must be encrypted with the
-/// archive's password, and ZipCrypto entries are decrypted and encrypted again (their raw
-/// copy would lose the encryption flag). So when files are added to an encrypted archive,
-/// or the archive has ZipCrypto entries, the password must come in `opts.encryption`:
-/// without one the update fails with [`CoreError::PasswordRequired`], and with one that
-/// doesn't decrypt an existing entry with [`CoreError::WrongPassword`], before anything
-/// is written.
+/// Kept entries are never decoded or decrypted, so deleting needs no password. Files added to
+/// an archive with encrypted entries must be encrypted, with the password in
+/// `opts.encryption`: without one the update fails with [`CoreError::PasswordRequired`].
+/// When the archive has encrypted files, the password must open at least one of them, or
+/// the update fails with [`CoreError::WrongPassword`]; both before anything is written. When
+/// it opens some but not others, the update goes ahead and says so in the report's warnings.
 pub fn update(
     archive: &Path,
     edit: &ArchiveEdit,
@@ -1197,63 +1199,110 @@ pub fn update(
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
     let backend = backend_for_file(archive)?;
-    check_update_password(backend, archive, edit, opts)?;
-    let result = backend.update(archive, edit, opts, ctx);
+    let warnings = check_update_password(backend, archive, edit, opts)?;
+    let result = backend.update(archive, edit, opts, ctx).map(|mut report| {
+        report.warnings.extend(warnings);
+        report
+    });
     invalidate_cached(archive);
     result
 }
 
-/// The password new entries of an encrypted archive will get must open its existing ones.
-/// The smallest encrypted file is decoded in full, so ZipCrypto's one-byte check (or AES's
-/// two-byte one) passing by chance is caught by the checksum.
+/// Shown when the password given for new files opens some encrypted entries but not others.
+pub const SEVERAL_PASSWORDS: &str =
+    "This archive uses more than one password; new files will use the one you entered.";
+
+/// Encrypted files whose password checks are tried (the smallest ones).
+const PASSWORD_SAMPLE: usize = 64;
+
+/// Largest entry decoded in full to confirm a password beyond its header check.
+const PASSWORD_PROBE_MAX: u64 = 64 * 1024 * 1024;
+
+/// The password new files of an encrypted archive will get must open its existing encrypted
+/// files: each sampled file's header check (no data decoded), then the smallest file that
+/// passed it decoded in full within the extraction limits, so a check passed by chance
+/// (1 in 256 for ZipCrypto, 1 in 65,536 for AES) is caught by the checksum. With only
+/// encrypted folders there is nothing to check against; the caller asked for the password
+/// twice. Returns warnings for the report.
 fn check_update_password(
     backend: &dyn ArchiveBackend,
     archive: &Path,
     edit: &ArchiveEdit,
     opts: &CreateOptions,
-) -> Result<()> {
-    let listing = backend.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES)?;
-    let zipcrypto = listing
-        .entries
-        .iter()
-        .any(|e| e.encryption == Some(EntryEncryption::ZipCrypto));
-    if edit.add.is_empty() && !zipcrypto {
-        return Ok(());
+) -> Result<Vec<String>> {
+    if edit.add.is_empty() {
+        return Ok(Vec::new());
     }
-    let Some(probe) = listing
-        .entries
-        .iter()
-        .filter(|e| e.encrypted && !e.is_dir)
-        .min_by_key(|e| e.size)
-    else {
-        return Ok(());
-    };
+    let listing = backend.list(archive, DEFAULT_MAX_ARCHIVE_ENTRIES)?;
+    if !listing.any_encrypted() {
+        return Ok(Vec::new());
+    }
     let label = || paths::display_path(archive);
     let password = match &opts.encryption {
         Encryption::None => return Err(CoreError::PasswordRequired(label())),
         Encryption::Aes256(p) | Encryption::ZipCryptoLegacy(p) => p,
     };
-    let mut outcome = Err(CoreError::WrongPassword(label()));
+    let mut files: Vec<&ArchiveEntry> = listing
+        .entries
+        .iter()
+        .filter(|e| e.encrypted && !e.is_dir)
+        .collect();
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    files.sort_by_key(|e| e.size);
+    files.truncate(PASSWORD_SAMPLE);
+    let sample: HashSet<usize> = files.iter().map(|e| e.index).collect();
+    // Opening an entry sets up its decoder: the same decoder-memory limits as extraction
+    // apply first (entries this password doesn't decrypt are left out by their header check).
+    let limits = ExtractLimits::default();
+    let indices: Vec<usize> = files.iter().map(|e| e.index).collect();
+    backend.preflight(archive, &indices, Some(password), &limits)?;
+    // Header checks only: the visitor reads nothing.
+    let mut opened = Vec::new();
+    let mut refused = 0;
     backend.read_entries(
         archive,
-        &|e| e.index == probe.index,
+        &|e| sample.contains(&e.index),
         Some(password),
-        &mut |_, reader| {
+        &mut |e, reader| {
             match reader {
-                Ok(r) => {
-                    let mut sink = io::sink();
-                    let limit = probe.size.saturating_add(1);
-                    if io::copy(&mut r.take(limit), &mut sink).is_ok_and(|n| n == probe.size) {
-                        outcome = Ok(());
-                    }
-                }
-                Err(e) if is_password_error(&e) => outcome = Err(CoreError::WrongPassword(label())),
-                Err(e) => outcome = Err(e),
+                Ok(_) => opened.push(e.clone()),
+                Err(err) if is_password_error(&err) => refused += 1,
+                Err(_) => {}
             }
             Ok(())
         },
     )?;
-    outcome
+    let Some(probe) = opened.iter().min_by_key(|e| e.size) else {
+        return Err(CoreError::WrongPassword(label()));
+    };
+    let bomb =
+        probe.size > 1024 * 1024 && probe.size / probe.compressed_size.max(1) > limits.max_ratio;
+    if probe.size <= PASSWORD_PROBE_MAX && !bomb {
+        let mut decoded = false;
+        backend.read_entries(
+            archive,
+            &|e| e.index == probe.index,
+            Some(password),
+            &mut |_, reader| {
+                if let Ok(r) = reader {
+                    let limit = probe.size.saturating_add(1);
+                    decoded = io::copy(&mut r.take(limit), &mut io::sink())
+                        .is_ok_and(|n| n == probe.size);
+                }
+                Ok(())
+            },
+        )?;
+        if !decoded {
+            return Err(CoreError::WrongPassword(label()));
+        }
+    }
+    Ok(if refused > 0 {
+        vec![SEVERAL_PASSWORDS.to_owned()]
+    } else {
+        Vec::new()
+    })
 }
 
 /// Source files and folders to add, flattened (folders walked, links reported).
