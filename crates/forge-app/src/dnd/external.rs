@@ -1,22 +1,34 @@
-//! Files dragged in from other applications (the Desktop, Explorer, a mail client).
+//! Files dragged in from other applications (the Desktop, Explorer, a zip folder, a mail
+//! client).
 //!
-//! winit's OLE drop target always answers the source with `DROPEFFECT_COPY`, so the source
-//! never deletes the originals itself: when a drop moves, the move is ours alone and cannot
-//! happen twice. (The drag cursor still shows the copy badge; changing it would need our own
-//! `IDropTarget`.)
+//! The window has our own OLE drop target ([`forge_win::drop_target`], in place of winit's),
+//! so drags that carry no file paths can drop too: the items of a zip folder opened in
+//! Explorer come as virtual files, which are copied out by [`crate::virtual_copy`]. The drop
+//! target answers the source as the drop will act: every frame the app works out what a
+//! drop onto the folder under the pointer would do ([`OsDrop::frame`]), so the cursor shows
+//! the move or copy badge, or "no drop" onto the items' own folder. When a drop moves, the
+//! move is ours alone: the source is told it was an optimized move (`DROPEFFECT_NONE`
+//! returned, "Performed DropEffect" = none), so it never deletes anything itself, and the
+//! move cannot happen twice.
 //!
 //! During an OLE drag the mouse belongs to the drag source, so the window gets no pointer
 //! moves. While files hover or drop, the cursor position is read from the OS and fed to egui
 //! as a pointer move, so the rows under it light up and take the drop like an in-app drag.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use forge_win::drop_target::{DragInfo, DropEffect, DropEvent, DropTargetHandle};
+use forge_win::virtual_files::VirtualSource;
 
 /// Files dropped onto the window this frame, with the keys held at the drop. `None` keys
 /// mean "use egui's modifiers" (the automation hook injects those).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct External {
     pub paths: Vec<PathBuf>,
     keys: Option<(bool, bool)>,
+    /// Set instead of `paths` when virtual files were dropped (items of a zip folder).
+    pub virtual_files: Option<VirtualDrop>,
 }
 
 impl External {
@@ -27,35 +39,159 @@ impl External {
     }
 }
 
+/// Dropped virtual files: how many, and the source to copy them from (taken once).
+#[derive(Clone)]
+pub struct VirtualDrop {
+    pub count: usize,
+    source: Arc<parking_lot::Mutex<Option<VirtualSource>>>,
+}
+
+impl VirtualDrop {
+    pub fn take_source(&self) -> Option<VirtualSource> {
+        self.source.lock().take()
+    }
+}
+
 #[derive(Clone, Default)]
 struct Slot {
     hovering: bool,
     dropped: Option<External>,
+    /// The folder of the first drop target under the pointer this frame.
+    hover_target: Option<PathBuf>,
+    /// A virtual-file drop taken by a folder drop target, with that folder.
+    claimed: Option<(External, PathBuf)>,
 }
 
 fn slot_id() -> egui::Id {
     egui::Id::new("dnd_external_slot")
 }
 
+/// The window's own drop target and what it answers the drag source.
+#[derive(Default)]
+pub struct OsDrop {
+    pub handle: Option<DropTargetHandle>,
+    /// What the current drag over the window carries (from `DragEnter`).
+    drag: Option<DragInfo>,
+    /// The automation hook's stand-in for a drag over the window, with its Ctrl and Shift.
+    pub simulated: Option<(DragInfo, bool, bool)>,
+    /// The last answer, and the target and keys it was worked out for.
+    answered: Option<(PathBuf, bool, bool, DropEffect)>,
+}
+
+impl OsDrop {
+    /// What the drop target answers now (the automation hook drops with it).
+    pub fn answer(&self) -> DropEffect {
+        self.answered.as_ref().map_or(DropEffect::None, |a| a.3)
+    }
+
+    fn dragging(&self) -> Option<&DragInfo> {
+        self.simulated
+            .as_ref()
+            .map(|(info, _, _)| info)
+            .or_else(|| self.drag.as_ref().filter(|_| self.is_dragging()))
+    }
+
+    fn is_dragging(&self) -> bool {
+        self.handle.as_ref().is_some_and(DropTargetHandle::is_dragging)
+    }
+
+    /// Called once per frame after the UI ran: works out what a drop onto the hovered folder
+    /// (or `fallback`, the focused pane's folder) would do, and tells the drop target.
+    pub fn frame(&mut self, ctx: &egui::Context, fallback: &Path) {
+        let Some(info) = self.dragging().cloned() else {
+            self.answered = None;
+            return;
+        };
+        let target = ctx
+            .data(|d| d.get_temp::<Slot>(slot_id()))
+            .and_then(|s| s.hover_target)
+            .unwrap_or_else(|| fallback.to_path_buf());
+        let (ctrl, shift) = match &self.simulated {
+            Some((_, ctrl, shift)) => (*ctrl, *shift),
+            None => self
+                .handle
+                .as_ref()
+                .map_or((false, false), DropTargetHandle::keys),
+        };
+        let fresh = self.answered.as_ref().is_some_and(|(t, c, s, _)| {
+            forge_core::paths::paths_equal(t, &target) && *c == ctrl && *s == shift
+        });
+        if !fresh {
+            let effect = crate::dnd::drop_effect(&info, &target, ctrl, shift);
+            self.answered = Some((target, ctrl, shift, effect));
+        }
+        if let Some(handle) = &self.handle {
+            handle.set_answer(self.answer());
+        }
+    }
+}
+
 /// Called from the raw input hook every frame. `from_os` is false when the automation hook
 /// drives the window: then its injected pointer and modifiers are used as they are.
-pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool) {
-    let hovering = !raw.hovered_files.is_empty();
-    let paths: Vec<PathBuf> = raw
+pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, os: &mut OsDrop) {
+    let mut hovering = !raw.hovered_files.is_empty() || os.simulated.is_some();
+    let mut paths: Vec<PathBuf> = raw
         .dropped_files
         .iter()
         .map(|f| f.path().to_path_buf())
         .filter(|p| !p.as_os_str().is_empty())
         .collect();
     let mut keys = None;
-    if from_os && (hovering || !paths.is_empty()) {
+    let mut virtual_files = None;
+    let events = os
+        .handle
+        .as_ref()
+        .map(DropTargetHandle::take_events)
+        .unwrap_or_default();
+    for event in events {
+        match event {
+            DropEvent::Enter(info) => os.drag = Some(info),
+            DropEvent::Leave => os.drag = None,
+            DropEvent::Drop {
+                info,
+                virtual_source,
+                ctrl,
+                shift,
+                answered: _,
+            } => {
+                os.drag = None;
+                keys = Some((ctrl, shift));
+                if !info.files.is_empty() {
+                    paths = info.files;
+                } else if let Some(source) = virtual_source {
+                    virtual_files = Some(VirtualDrop {
+                        count: info.virtual_count,
+                        source: Arc::new(parking_lot::Mutex::new(Some(source))),
+                    });
+                }
+            }
+        }
+    }
+    hovering |= os.is_dragging();
+    let dropping = !paths.is_empty() || virtual_files.is_some();
+    if from_os && (hovering || dropping) {
         if let Some(pos) = cursor_pos(ctx, raw) {
             raw.events.push(egui::Event::PointerMoved(pos));
         }
-        keys = os_keys();
+        if keys.is_none() {
+            keys = os_keys();
+        }
     }
-    let dropped = (!paths.is_empty()).then_some(External { paths, keys });
-    ctx.data_mut(|d| d.insert_temp(slot_id(), Slot { hovering, dropped }));
+    let dropped = dropping.then_some(External {
+        paths,
+        keys,
+        virtual_files,
+    });
+    ctx.data_mut(|d| {
+        d.insert_temp(
+            slot_id(),
+            Slot {
+                hovering,
+                dropped,
+                ..Slot::default()
+            },
+        )
+    });
 }
 
 /// Are files from another application over the window (or being dropped) this frame?
@@ -66,9 +202,32 @@ pub fn active(ctx: &egui::Context) -> bool {
     })
 }
 
+/// Notes `target` as the folder under the pointer, unless a drop target before it this
+/// frame already did (the first one gets the drop, see [`take`]).
+pub fn note_hover_target(ctx: &egui::Context, target: &Path) {
+    ctx.data_mut(|d| {
+        let slot = d.get_temp_mut_or_default::<Slot>(slot_id());
+        if slot.hover_target.is_none() {
+            slot.hover_target = Some(target.to_path_buf());
+        }
+    });
+}
+
 /// Takes this frame's drop, once: the first drop target under the pointer gets it.
 pub fn take(ctx: &egui::Context) -> Option<External> {
     ctx.data_mut(|d| d.get_temp_mut_or_default::<Slot>(slot_id()).dropped.take())
+}
+
+/// A folder drop target took a virtual-file drop: the app copies it into `target` (see
+/// [`take_claimed`]).
+pub fn claim(ctx: &egui::Context, drop: External, target: &Path) {
+    ctx.data_mut(|d| {
+        d.get_temp_mut_or_default::<Slot>(slot_id()).claimed = Some((drop, target.to_path_buf()))
+    });
+}
+
+pub fn take_claimed(ctx: &egui::Context) -> Option<(External, PathBuf)> {
+    ctx.data_mut(|d| d.get_temp_mut_or_default::<Slot>(slot_id()).claimed.take())
 }
 
 /// The OS cursor in window points.

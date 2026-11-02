@@ -182,22 +182,11 @@ impl DropTargetHandle {
         answer: DropEffect,
     ) -> crate::Result<SimulatedDrop> {
         use windows::Win32::Foundation::POINTL;
-        use windows::Win32::System::Com::{IBindCtx, IDataObject};
         use windows::Win32::System::Ole::DROPEFFECT;
         use windows::Win32::System::SystemServices::{
             MK_CONTROL, MK_LBUTTON, MK_SHIFT, MODIFIERKEYS_FLAGS,
         };
-        use windows::Win32::UI::Shell::{BHID_DataObject, IShellItem, SHCreateItemFromParsingName};
-        use windows::core::PCWSTR;
-
-        let wide = crate::to_wide(parsing_name);
-        // SAFETY: `wide` is NUL-terminated; OLE is initialized on the window thread.
-        let item: IShellItem =
-            unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>) }
-                .map_err(|e| crate::api_err("SHCreateItemFromParsingName", e))?;
-        // SAFETY: a plain call on a live shell item.
-        let data: IDataObject = unsafe { item.BindToHandler(None::<&IBindCtx>, &BHID_DataObject) }
-            .map_err(|e| crate::api_err("IShellItem::BindToHandler(BHID_DataObject)", e))?;
+        let data = crate::virtual_files::shell_item_data_object(parsing_name)?;
 
         let mut modifiers = 0;
         if ctrl {

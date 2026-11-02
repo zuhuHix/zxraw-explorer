@@ -257,7 +257,9 @@ fn main() -> eframe::Result {
                     .borrow_mut()
                     .take()
                     .expect("the app is created once per run");
-                Ok(Box::new(app::ZxrawApp::new(cc, paths, pending_crash)))
+                let mut app = app::ZxrawApp::new(cc, paths, pending_crash);
+                app.os_drop.handle = startup::register_drop_target(cc);
+                Ok(Box::new(app))
             }),
         )
     };

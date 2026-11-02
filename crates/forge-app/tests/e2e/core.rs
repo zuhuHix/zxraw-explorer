@@ -1061,6 +1061,164 @@ fn external_drop_on_empty_area_goes_to_the_pane_folder() {
     expect_ok(&drop_script_run(sandbox.path(), &script));
 }
 
+/// `t.zip` in `dir` as Explorer shows it: `a.txt`, and `sub` holding `b.txt` and
+/// `deeper/c.bin` (3 MB, so it is streamed in many reads). Every entry is dated 2020-05-06.
+fn zip_fixture(dir: &Path) -> (PathBuf, Vec<u8>) {
+    use std::io::Write;
+    let big = noise(3 << 20, 7);
+    let path = dir.join("t.zip");
+    fs::create_dir_all(dir).unwrap();
+    let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = zip::write::SimpleFileOptions::default().last_modified_time(
+        zip::DateTime::from_date_and_time(2020, 5, 6, 7, 8, 10).unwrap(),
+    );
+    zip.start_file("a.txt", options).unwrap();
+    zip.write_all(b"hello").unwrap();
+    zip.add_directory("sub/", options).unwrap();
+    zip.start_file("sub/b.txt", options).unwrap();
+    zip.write_all(b"world").unwrap();
+    zip.add_directory("sub/deeper/", options).unwrap();
+    zip.start_file("sub/deeper/c.bin", options).unwrap();
+    zip.write_all(&big).unwrap();
+    zip.finish().unwrap();
+    (path, big)
+}
+
+/// The `sub` folder of [`zip_fixture`] arrived in `dest` whole, with its date, and the
+/// staging folder is gone.
+fn assert_zip_sub_copied(dest: &Path, big: &[u8]) {
+    assert_eq!(fs::read(dest.join("sub").join("b.txt")).unwrap(), b"world");
+    assert_eq!(
+        fs::read(dest.join("sub").join("deeper").join("c.bin")).unwrap(),
+        big
+    );
+    let modified = fs::metadata(dest.join("sub").join("b.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let year_2020 = std::time::UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+    let year_2021 = std::time::UNIX_EPOCH + Duration::from_secs(1_609_459_200);
+    assert!(
+        modified > year_2020 && modified < year_2021,
+        "the file's date was not kept: {modified:?}"
+    );
+    let leftovers: Vec<_> = fs::read_dir(dest)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".forge-partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging left behind: {leftovers:?}");
+}
+
+/// The reported bug: items selected in a zip folder in Explorer and copied (virtual files:
+/// no file list on the clipboard) said "Nothing to paste". They are copied out instead, the
+/// folder structure kept, and the zip is left as it was.
+#[test]
+fn items_copied_in_an_explorer_zip_folder_paste_into_the_folder() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let (zip, big) = zip_fixture(&sandbox.path().join("downloads"));
+    let before = fs::read(&zip).unwrap();
+    let work = sandbox.path().join("work");
+    fs::create_dir_all(&work).unwrap();
+    let script = format!(
+        "navigate {work}\n\
+         click-empty\n\
+         ui system clipboard-shell-item {item}\n\
+         key ctrl+V\n\
+         wait-exists {last}\n\
+         wait-jobs 30\n\
+         assert-no-error-toast\n\
+         exit\n",
+        work = shown(&work),
+        item = shown(&zip.join("sub")),
+        last = shown(&work.join("sub").join("deeper").join("c.bin")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    assert_zip_sub_copied(&work, &big);
+    assert_eq!(fs::read(&zip).unwrap(), before, "the zip was changed");
+}
+
+/// The same items dragged out of the zip folder and dropped on a folder row: copied into
+/// that folder, and the source is told it was a copy.
+#[test]
+fn items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, _) = drop_sandbox(sandbox.path());
+    let (zip, big) = zip_fixture(&sandbox.path().join("downloads"));
+    let before = fs::read(&zip).unwrap();
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-shell-item Target | {item}\nassert-drop-reply copy copy\n\
+         wait-exists {last}\nwait-jobs 30\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        item = shown(&zip.join("sub")),
+        last = shown(&list.join("Target").join("sub").join("deeper").join("c.bin")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+    assert_zip_sub_copied(&list.join("Target"), &big);
+    assert_eq!(fs::read(&zip).unwrap(), before, "the zip was changed");
+}
+
+/// Bug 2: a file dragged from the Desktop onto a folder on the same volume is moved by us
+/// alone, by a rename, and the source is told so ("optimized move": `DROPEFFECT_NONE` back,
+/// "Performed DropEffect" none), so it neither deletes anything itself nor waits for its
+/// own file watcher to see that the item left.
+#[test]
+fn a_file_dropped_through_the_drop_target_moves_as_an_optimized_move() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-shell-item Target | {file}\nassert-drop-reply none none\n\
+         wait-exists {moved}\nwait-jobs\nassert-missing {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        moved = shown(&list.join("Target").join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+    assert_eq!(fs::read(list.join("Target").join("a.txt")).unwrap(), b"dropped");
+}
+
+/// With Ctrl the drop copies, and the source hears "copy".
+#[test]
+fn a_file_dropped_through_the_drop_target_with_ctrl_copies() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         drop-shell-item Target | {file} | ctrl\nassert-drop-reply copy copy\n\
+         wait-exists {copied}\nwait-jobs\nassert-exists {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        copied = shown(&list.join("Target").join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+/// Dropping an item into the folder it is already in does nothing, and the drag cursor said
+/// so: the source hears "none" and keeps the item.
+#[test]
+fn a_file_dropped_into_its_own_folder_is_refused_to_the_source() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, _) = drop_sandbox(sandbox.path());
+    write_file(&list.join("here.txt"), b"stays");
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry here.txt\nwait-frames 5\n\
+         drop-shell-item bg | {file}\nassert-drop-reply none\nwait-frames 10\nwait-jobs\n\
+         assert-exists {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&list.join("here.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
 /// Opens `list/Sub` in place (its child `inner.txt` is listed after the expansion).
 fn expanded_sub_script(list: &Path) -> String {
     format!(

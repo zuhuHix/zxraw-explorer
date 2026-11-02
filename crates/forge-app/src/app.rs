@@ -148,6 +148,8 @@ pub struct ZxrawApp {
     pub focus_filter: bool,
     pub ops: crate::actions::Actions,
     pub testhook: crate::testhook::TestHook,
+    /// The window's own OLE drop target (see `dnd::external`).
+    pub os_drop: crate::dnd::external::OsDrop,
     pub viewer: Option<crate::viewer::Viewer>,
     pub notices: crate::notices::Notices,
     /// A photo passed on the command line (a double-click when ZXraw Explorer is the default
@@ -299,6 +301,7 @@ impl ZxrawApp {
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
             testhook: crate::testhook::TestHook::from_env(),
+            os_drop: Default::default(),
             viewer: None,
             notices: Default::default(),
             launch_photo: None,
@@ -1185,7 +1188,8 @@ impl eframe::App for ZxrawApp {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         crate::testhook::raw_input(self, raw_input);
         crate::paste_key::restore_dropped(raw_input);
-        crate::dnd::external::raw_input(ctx, raw_input, !self.testhook.active());
+        let from_os = !self.testhook.active();
+        crate::dnd::external::raw_input(ctx, raw_input, from_os, &mut self.os_drop);
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -1369,7 +1373,16 @@ impl ZxrawApp {
     /// Also reports links that any drop this frame refused.
     fn unclaimed_external_drop(&mut self, ctx: &egui::Context) {
         let mut refused = crate::dnd::take_refused(ctx);
+        let fallback = self.pane().path.clone();
+        self.os_drop.frame(ctx, &fallback);
+        if let Some((drop, target)) = crate::dnd::external::take_claimed(ctx) {
+            self.virtual_drop(&drop, target);
+        }
         let drop = crate::dnd::external::take(ctx);
+        if let Some(drop) = drop.as_ref().filter(|d| d.virtual_files.is_some()) {
+            self.virtual_drop(drop, fallback);
+            return;
+        }
         let mut transfer = None;
         if let Some(drop) = drop {
             let target = self.pane().path.clone();
@@ -1389,6 +1402,16 @@ impl ZxrawApp {
         let (ctrl, shift) = drop.keys(ctx);
         let copy = crate::dnd::drop_is_copy(&paths, &target, ctrl, shift);
         crate::actions::transfer(self, paths, target, copy);
+    }
+
+    /// Copies dropped virtual files (items of a zip folder) into `target`.
+    fn virtual_drop(&mut self, drop: &crate::dnd::external::External, target: PathBuf) {
+        let Some(files) = &drop.virtual_files else {
+            return;
+        };
+        if let Some(source) = files.take_source() {
+            crate::virtual_copy::start(self, source, target, Some(files.count));
+        }
     }
 
     fn palette_ui(&mut self, ctx: &egui::Context) {
