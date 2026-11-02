@@ -1830,3 +1830,94 @@ fn renamed_archives_browse_as_what_they_are() {
     assert_no_crash(&profile);
     assert_eq!(tree(&dest), expected_7z_tree());
 }
+
+/// A `.tar.zst` of the same tree as [`pane_7z`] (without a password).
+fn pane_tar(dir: &Path, name: &str) -> PathBuf {
+    let src = dir.join("content");
+    write_file(&src.join("top.txt"), b"top of the archive");
+    write_file(&src.join("sub/inner.txt"), b"inner text");
+    write_file(&src.join("sub/deep/x.txt"), b"deep x");
+    let out = dir.join(name);
+    let (cancel, progress) = (forge_jobs::CancelToken::new(), forge_jobs::Progress::default());
+    let ctx = forge_core::ops::JobCtx::new(&cancel, &progress);
+    let sources = [src.join("top.txt"), src.join("sub")];
+    let opts = forge_core::archive::CreateOptions::default();
+    forge_core::archive::create(&sources, &out, &opts, &ctx).unwrap();
+    fs::remove_dir_all(&src).unwrap();
+    out
+}
+
+#[test]
+fn tar_zst_double_click_browses_the_tar_and_copies_out() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let zips = sandbox.path().join("zips");
+    let archive = pane_tar(&zips, "a.tar.zst");
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let assert_root = format!("ui browser assert-archive {} | /", shown(&archive));
+    let assert_sub = format!("ui browser assert-archive {} | sub", shown(&archive));
+    let script = dual_pane_script(
+        &zips,
+        &dest,
+        &[
+            "wait-entry a.tar.zst",
+            // Double-clicked, the compressed tar opens as its folders, not as one .tar.
+            "double-click-entry a.tar.zst",
+            "wait-entry sub",
+            &assert_root,
+            "assert-entry top.txt",
+            "double-click-entry sub",
+            "wait-entry inner.txt",
+            &assert_sub,
+            "assert-entry deep",
+            "cmd Up",
+            "wait-entry top.txt",
+            "select top.txt, sub",
+            "cmd CopyToOtherPane",
+            "wait-jobs 30",
+            "assert-no-error-toast",
+        ],
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), expected_7z_tree());
+}
+
+#[test]
+fn tar_zst_extract_to_folder_and_single_gz_extract_here() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let zips = sandbox.path().join("zips");
+    pane_tar(&zips, "pack.tar.zst");
+    // A single compressed file with its name in the gzip header.
+    let mut gz = flate2::GzBuilder::new()
+        .filename("notes.txt")
+        .write(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, b"compressed notes").unwrap();
+    fs::write(zips.join("notes.txt.gz"), gz.finish().unwrap()).unwrap();
+    let script = format!(
+        "navigate {zips}\n\
+         wait-entry pack.tar.zst\n\
+         select pack.tar.zst\n\
+         cmd ExtractToFolder\n\
+         wait-jobs 30\n\
+         select notes.txt.gz\n\
+         cmd ExtractHere\n\
+         wait-jobs 30\n\
+         assert-no-error-toast\n\
+         exit\n",
+        zips = shown(&zips),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    // `pack.tar.zst` extracts to `pack\`, not `pack.tar\`.
+    assert_eq!(tree(&zips.join("pack")), expected_7z_tree());
+    assert_eq!(fs::read(zips.join("notes.txt")).unwrap(), b"compressed notes");
+}

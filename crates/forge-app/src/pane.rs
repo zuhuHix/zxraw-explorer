@@ -87,7 +87,9 @@ fn subdir_queue() -> &'static Sender<ListJob> {
                             continue;
                         }
                         // A folder inside an archive is listed from the archive's index.
-                        if let Some(listed) = crate::archive_ui::list_archive_path(&job.dir) {
+                        if let Some(listed) =
+                            crate::archive_ui::list_archive_path_cancellable(&job.dir, &job.cancel)
+                        {
                             let msg = match listed {
                                 ArchiveListing::Folder { entries, .. } => {
                                     for batch in batches(entries) {
@@ -612,7 +614,9 @@ impl Pane {
         let spawned = std::thread::Builder::new()
             .name("list-dir".into())
             .spawn(move || {
-                if let Some(listed) = crate::archive_ui::list_archive_path(&path) {
+                if let Some(listed) =
+                    crate::archive_ui::list_archive_path_cancellable(&path, &cancel)
+                {
                     let _ = match listed {
                         ArchiveListing::Folder { view, entries } => {
                             let _ = tx.send(ListMsg::Archive(Some(view)));

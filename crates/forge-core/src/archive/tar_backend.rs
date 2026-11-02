@@ -616,7 +616,7 @@ impl ArchiveBackend for TarBackend {
     }
 
     fn can_write(&self) -> bool {
-        self.codec != Codec::Brotli
+        true
     }
 
     fn create(

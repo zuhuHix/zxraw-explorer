@@ -262,7 +262,7 @@ Explorer is a file manager designed around that workflow:
 - **Renames never overwrite.** If the new name is already taken, you're asked again instead of
   losing a file, even on a slow network drive.
 
-### Zip and 7z archives
+### Zip, 7z and tar archives
 
 - **Open a zip like a folder.** Double-click or press <kbd>Enter</kbd> on a `.zip` and browse
   it in the pane: the path reads `D:\Photos\trip.zip\day 1\`, Back and Up lead out again, and
@@ -319,6 +319,48 @@ Explorer is a file manager designed around that workflow:
 - **Editing a 7z** copies the blocks it keeps as they are. A solid block that loses or has a file
   replaced is decoded and recompressed (the job says "Recompressing N MB"); the original is
   replaced only when the new archive is complete.
+- **Tar, compressed or not.** `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2`/`.tbz2`, `.tar.xz`/`.txz`,
+  `.tar.zst`/`.tzst` and `.tar.lz4` open like folders (`.tar.br` is read too). Double-clicking a
+  `.tar.gz` shows the folders inside the tar, not a lone `.tar`; a file is recognised by what it
+  holds, whatever its name. Reads GNU tar, bsdtar, 7-Zip and Python archives: ustar, GNU (long
+  names and links, sparse files), PAX (UTF-8 names, big sizes, exact times, sparse files) and old
+  V7; names that aren't UTF-8 are read as Windows' tar.exe writes them. Gzip files with several
+  members and Zstandard files with several frames read as one.
+- **One listing per archive.** A tar has no table of contents, so opening a compressed one decodes
+  it to its end once (the status bar says how far) and remembers where each file is. A plain
+  `.tar` is then read by jumping straight to the file you open. A compressed tar's checksum
+  (gzip's CRC-32, the xz check, the Zstandard or LZ4 checksum) is at its very end, so extracted
+  and opened files are kept aside and published only when the whole stream checked out; opening
+  one file from a big compressed tar says how much it decodes, and thumbnails are made only for
+  compressed tars of up to 64 MB.
+- **Single compressed files.** A `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` or `.br` that holds no tar
+  shows its one file: the name stored in a gzip header when that's a plain file name, else the
+  file's own name without the extension. *Extract here* puts it next to the original; *Test
+  archive* checks its checksum (Brotli has none, so its test says "can't be verified").
+- **Create tar.** The compress dialog offers `tar.gz`, `tar.xz`, `tar.zst`, `tar.bz2`, `tar.lz4`
+  and plain `tar`, and for a single selected file `.gz`, `.xz`, `.zst` and `.br`:
+
+  | Format | Fast | Balanced | Max | Ultra (Advanced) |
+  |---|---|---|---|---|
+  | gzip | level 1 | level 6 | level 9 | |
+  | xz | level 1 | level 6 | level 9 | level 9e |
+  | Zstandard | level 3 | level 9 | level 19 | level 22, long mode (128 MB to open) |
+  | bzip2 | level 1 | level 9 | | |
+  | LZ4 | independent blocks | linked blocks | | |
+  | Brotli (`.br`) | quality 5 | quality 9 | quality 11 | |
+
+  xz and Zstandard compress on several threads, as many as fit in about 1.5 GB. Names that
+  aren't plain ASCII or don't fit the old header get a PAX header, times are kept, owners are
+  left out. Tar has no password: choose ZIP or 7z for one.
+- **Editing a tar** rewrites it: the files it keeps are copied as they are, the new ones added,
+  and a compressed tar is compressed again ("Recompressing N MB"). The original is decoded to its
+  end first, so a damaged one is never rewritten with a fresh checksum, and it is replaced only
+  when the new archive is complete.
+- **Safe with tars from strangers.** Everything the zip rules refuse is refused. Links (symbolic
+  and hard) are listed but never created, so nothing can be written through one; devices and
+  FIFOs are listed but not extracted. When a name appears twice the last copy wins, as with
+  `tar`. Extension headers, long names, sparse maps and every number in a header are bounded
+  and checked, and a truncated or damaged archive is reported as such.
 
 ### Batch work on a selection
 

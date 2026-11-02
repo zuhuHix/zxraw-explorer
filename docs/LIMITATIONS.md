@@ -7,7 +7,41 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 
 ## Formats and media
 
-* Archive support is ZIP and 7z. There is no RAR or TAR reader yet (`forge-core/src/archive/`).
+* Archive support is ZIP, 7z, tar (plain, gzip, bzip2, xz, Zstandard, LZ4, Brotli) and single
+  compressed files. There is no RAR reader yet (`forge-core/src/archive/`).
+* Tar: links (symbolic and hard) are never created, not even a hard link to a file in the same
+  archive: its entry is skipped and reported. Devices and FIFOs are skipped. Owners and
+  permission bits are ignored (a file with no write bit is not made read-only). A name given
+  twice extracts its last copy; an earlier copy can't be picked. Global PAX headers are checked
+  but not applied. Multi-volume tars are refused, and a tar ends at its first zero block
+  (`tar --ignore-zeros` archives, several tars glued together, read as the first one).
+* Tar limits: a PAX header of at most 1 MiB, GNU long names of at most 64 KiB, 32 extension
+  headers before one file, 100,000 regions in a sparse file's map, 100,000 entries, the usual
+  size, ratio and decoder-memory limits. Names that are not UTF-8 are read as code page 437
+  (what Windows' tar.exe writes in ustar headers), not in the code page of the computer that
+  made them.
+* Listing a compressed tar decodes it to its end (it has no table of contents), and the listing
+  is cached while the file's size and time stay the same. Opening, testing or extracting a file
+  of a compressed tar also decodes the whole stream: its only checksum is at the end, and files
+  are published only once it matched (as in a solid 7z block: up to 4,096 files are held aside;
+  with more, the stream is decoded once to check it, then again to extract). Empty files are
+  written without waiting. Thumbnails need the whole stream decoded, so they're made for
+  compressed tars of up to 64 MB only. A truncated or damaged compressed tar can't be listed at
+  all, so nothing can be salvaged from it here.
+* A plain `.tar` has no checksum: *Test archive* reports its files as "can't be verified".
+  Brotli streams have none either; Zstandard and LZ4 streams written without one, likewise.
+* A single compressed file's size comes from the xz index or the Zstandard frame headers when
+  they state it; gzip, bzip2, LZ4 and Brotli files are decoded once to learn it (gzip's stored
+  size is modulo 4 GiB and never used). The gzip name is used only when it is a plain, valid
+  file name (a path keeps its last part). Single compressed files can't be edited, and only a
+  gzip file stores the name of what it holds (when it is ASCII).
+* Editing a tar rewrites all of it; the new archive must fit next to the old one (its size plus
+  the files added plus 64 MB), and a compressed one is compressed again with its codec's
+  Balanced preset, whatever preset made it. `.tar.lz4` is written with the fast LZ4 compressor
+  only (no LZ4 HC: the pure-Rust `lz4_flex` has none).
+* Windows' own `tar.exe` (bsdtar) can't read or write names outside the ANSI code page (it fails
+  on Cyrillic or Chinese names whoever made the archive); ZXraw reads and writes them as UTF-8
+  PAX names, which GNU tar, 7-Zip and Python read.
 * 7z: split archives (`.7z.001`), self-extracting `.exe` archives, archives whose header was
   never finished, and Zstandard, Brotli, LZ4 or Deflate64 blocks (7-Zip forks) are not read;
   the last are reported per file as an unsupported method. New 7z archives use LZMA2 with the
@@ -44,7 +78,7 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * A 7z "update" archive (one with deletion markers, anti-items) can be opened and extracted
   (the markers are ignored) but not edited. A 7z entry name containing NUL makes the archive
   unreadable rather than listing that entry as unsafe.
-* Inside an open zip or 7z, rename, new folder and cut are not available, a move out of a zip is a copy,
+* Inside an open zip, 7z or tar, rename, new folder and cut are not available, a move out of a zip is a copy,
   copying between two zips is refused, and items can't be dragged from a zip to Windows Explorer
   (phase 4). Photos inside a zip open with their default app, not the built-in viewer.
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
