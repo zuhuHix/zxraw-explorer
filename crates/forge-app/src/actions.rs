@@ -1359,7 +1359,7 @@ fn paste_with(
                 if virtual_files {
                     // Always a copy, whatever the source asked for: the items are not
                     // deleted from where they were copied.
-                    let source = forge_win::virtual_files::VirtualSource::clipboard();
+                    let source = forge_win::virtual_files::VirtualSource::clipboard(sequence);
                     crate::virtual_copy::start(app, source, dest, None);
                     return;
                 }
