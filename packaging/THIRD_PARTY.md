@@ -33,6 +33,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | blake3 | 1.8.7 | CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception | https://github.com/BLAKE3-team/BLAKE3 | Permissive |
 | block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
+| block-padding | 0.4.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils | Permissive |
 | bstr | 1.13.1 | MIT OR Apache-2.0 | https://github.com/BurntSushi/bstr | Permissive |
 | bumpalo | 3.20.3 | MIT OR Apache-2.0 | https://github.com/fitzgen/bumpalo | Permissive |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck | Permissive |
@@ -41,6 +42,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | byteorder-lite | 0.1.0 | Unlicense OR MIT | https://github.com/image-rs/byteorder-lite | Permissive |
 | bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes | Permissive |
 | bzip2 | 0.6.1 | MIT OR Apache-2.0 | https://github.com/trifectatechfoundation/bzip2-rs | Permissive |
+| cbc | 0.2.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/block-modes | Permissive |
 | cfg-if | 1.0.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if | Permissive |
 | chrono | 0.4.45 | MIT OR Apache-2.0 | https://github.com/chronotope/chrono | Permissive |
 | cipher | 0.5.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits | Permissive |
@@ -112,13 +114,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.6.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.7.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
@@ -276,6 +278,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_derive | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde | Permissive |
 | serde_json | 1.0.152 | MIT OR Apache-2.0 | https://github.com/serde-rs/json | Permissive |
+| sevenz-rust2 | 0.24.2 | Apache-2.0 | https://github.com/hasenbanck/sevenz-rust | Permissive |
 | sha1 | 0.11.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
 | sha1dc | 0.1.5 | MIT OR Apache-2.0 | https://github.com/srijs/sha1dc | Permissive |
 | sha2 | 0.10.9 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes | Permissive |
