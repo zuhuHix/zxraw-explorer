@@ -128,13 +128,15 @@ pub fn list_archive_path_cancellable(
     let password = session_password(&file);
     let progress = Arc::new(forge_jobs::Progress::default());
     scans().lock().push((file.clone(), progress.clone()));
-    let listed = {
+    // One stamp for the whole listing: the view's version and the index are of the same file.
+    let listed = archive::archive_stamp(&file).and_then(|stamp| {
         let ctx = JobCtx::new(cancel, &progress);
-        archive::index_cached_progress(&file, password.as_ref(), Some(&ctx))
-    };
+        archive::index_cached_stamped(&file, stamp, password.as_ref(), Some(&ctx))
+            .map(|index| (stamp, index))
+    });
     scans().lock().retain(|(_, p)| !Arc::ptr_eq(p, &progress));
-    let index = match listed {
-        Ok(index) => index,
+    let (version, index) = match listed {
+        Ok(found) => found,
         Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
             let wrong = matches!(e, CoreError::WrongPassword(_));
             request_browse_password(&file, path, wrong);
@@ -154,7 +156,7 @@ pub fn list_archive_path_cancellable(
     };
     let entries = children.iter().map(|n| file_entry(&file, n)).collect();
     let view = ArchiveView {
-        version: archive_version(&file),
+        version,
         archive: file,
         inner,
         index: index.clone(),
@@ -162,19 +164,10 @@ pub fn list_archive_path_cancellable(
     Some(ArchiveListing::Folder { view, entries })
 }
 
-/// A number that changes when the archive file is replaced or written (size and modified
-/// time). Reads the file's metadata: call it off the UI thread.
+/// A number that changes when the archive file is replaced or written (see
+/// [`archive::archive_stamp`]). Reads a little of the file: call it off the UI thread.
 pub fn archive_version(archive: &Path) -> u64 {
-    let Ok(md) = std::fs::metadata(archive) else {
-        return 0;
-    };
-    let stamp = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let stamp = stamp as u64 ^ (stamp >> 64) as u64;
-    md.len().rotate_left(40) ^ stamp ^ 1
+    archive::archive_stamp(archive).unwrap_or(0)
 }
 
 /// The listing row of an archive node.
