@@ -156,7 +156,10 @@ impl ArchiveBackend for ZipBackend {
     }
 
     fn sniff(&self, head: &[u8]) -> bool {
-        head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06")
+        // A local header, an empty archive's end record, or a spanned archive's marker.
+        head.starts_with(b"PK\x03\x04")
+            || head.starts_with(b"PK\x05\x06")
+            || head.starts_with(b"PK\x07\x08")
     }
 
     fn list(
@@ -489,6 +492,23 @@ impl ArchiveBackend for ZipBackend {
 /// Temp files of an update cut short by a crash are removed by the next update of an
 /// archive in the same folder once they are this old.
 const STALE_PARTIAL_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether `file` has a ZIP end-of-central-directory record where one can be: in its last
+/// 22 + 65,535 bytes (the record plus the longest comment).
+pub(crate) fn has_end_record(file: &mut File) -> bool {
+    let Ok(len) = file.seek(SeekFrom::End(0)) else {
+        return false;
+    };
+    let tail = len.min(22 + 65_535);
+    if tail < 22 || file.seek(SeekFrom::Start(len - tail)).is_err() {
+        return false;
+    }
+    let mut buf = vec![0u8; tail as usize];
+    if file.read_exact(&mut buf).is_err() {
+        return false;
+    }
+    buf.windows(4).rev().any(|w| w == b"PK\x05\x06")
+}
 
 /// Remove our temp files in `dir` (exactly [`ops::is_partial_name`]) last written more than
 /// `age` ago that nothing has open. Each is opened exclusively (no sharing) without following
