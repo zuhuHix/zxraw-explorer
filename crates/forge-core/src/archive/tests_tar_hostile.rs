@@ -954,3 +954,78 @@ fn zstd_window_checks_match_the_decoder() {
     try_extract(&p, &x, limits).unwrap();
     assert_eq!(fs::read(x.join("w.txt")).unwrap(), b"window");
 }
+
+#[test]
+fn xz_padding_is_read_in_bounded_chunks() {
+    let d = tempfile::tempdir().unwrap();
+    let xz = |data: &[u8]| {
+        let mut w =
+            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+        w.write_all(data).unwrap();
+        w.finish().unwrap()
+    };
+    // A modest padding tail (128 KiB of zeros, two chunks and more) is walked and read.
+    let mut ok = xz(b"padded data");
+    ok.resize(ok.len() + (128 << 10) + 8, 0);
+    let p = write(d.path(), "padded.bin.xz", &ok);
+    let l = list(&p).unwrap();
+    assert_eq!(l.entries[0].size, 11);
+    // A 200 MiB zero tail (a sparse-looking file): refused by the 64 MiB header-read cap,
+    // after about 1,000 chunk reads, not 50 million 4-byte ones.
+    let p = d.path().join("huge-tail.bin.xz");
+    fs::write(&p, xz(b"data")).unwrap();
+    let f = fs::File::options().write(true).open(&p).unwrap();
+    f.set_len(f.metadata().unwrap().len() + (200 << 20))
+        .unwrap();
+    drop(f);
+    let started = std::time::Instant::now();
+    let err = list(&p).unwrap_err();
+    assert!(err.to_string().contains("more than 64 MiB"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// A Zstandard frame of `n` empty raw blocks.
+fn zstd_blocks(n: usize) -> Vec<u8> {
+    let mut zst = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00];
+    for i in 0..n {
+        zst.extend([u8::from(i + 1 == n), 0, 0]);
+    }
+    zst
+}
+
+#[test]
+fn header_walks_stop_on_cancel_and_report_progress() {
+    let d = tempfile::tempdir().unwrap();
+    let p = write(d.path(), "many.bin.zst", &zstd_blocks(20_000));
+    let len = fs::metadata(&p).unwrap().len();
+    // Progress moves while the blocks are walked (a report every 4,096 blocks), and ends at
+    // the file's length.
+    let (c, pr) = (CancelToken::new(), Progress::default());
+    let ctx = JobCtx::new(&c, &pr);
+    codec::stream_info(Codec::Zstd, &p, Some(&ctx)).unwrap();
+    let (blocks, reports) = codec::LAST_WALK.with(|w| w.get());
+    assert_eq!(blocks, 20_001);
+    assert!(reports >= 4, "{reports} progress reports");
+    let snap = pr.snapshot();
+    assert_eq!((snap.bytes_done, snap.bytes_total), (len, len));
+    // Cancelled: the walk stops at its first check, within 4,096 blocks.
+    let (c, pr) = (CancelToken::new(), Progress::default());
+    c.cancel();
+    let ctx = JobCtx::new(&c, &pr);
+    let err = codec::stream_info(Codec::Zstd, &p, Some(&ctx)).unwrap_err();
+    assert!(
+        err.get_ref()
+            .is_some_and(|e| e.is::<tar_backend::Cancelled>()),
+        "{err}"
+    );
+    let (blocks, _) = codec::LAST_WALK.with(|w| w.get());
+    assert!(blocks <= 4096, "{blocks} blocks walked after cancel");
+    // And through a listing (leaving the folder cancels it): `Cancelled`, nothing cached.
+    let t = write(d.path(), "many.tar.zst", &zstd_blocks(20_000));
+    let err = index_cached_progress(&t, None, Some(&ctx)).unwrap_err();
+    assert!(matches!(err, CoreError::Cancelled), "{err:?}");
+}

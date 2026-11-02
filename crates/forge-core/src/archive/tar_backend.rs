@@ -49,8 +49,13 @@ use crate::paths;
 
 /// The headers of a compressed archive, checked against `limits` before anything is
 /// decoded: the memory its decoders need must be within `max_decoder_memory`.
-fn checked_info(archive: &Path, codec: Codec, limits: &ExtractLimits) -> Result<codec::StreamInfo> {
-    let info = codec::stream_info(codec, archive).map_err(|e| stream_err(archive, e))?;
+fn checked_info(
+    archive: &Path,
+    codec: Codec,
+    limits: &ExtractLimits,
+    ctx: Option<&JobCtx<'_>>,
+) -> Result<codec::StreamInfo> {
+    let info = codec::stream_info(codec, archive, ctx).map_err(|e| stream_err(archive, e))?;
     check_memory(archive, info.memory, limits)?;
     Ok(info)
 }
@@ -99,7 +104,7 @@ fn metadata_budget() -> u64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct Cancelled;
+pub(super) struct Cancelled;
 
 impl std::fmt::Display for Cancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -410,7 +415,7 @@ fn walk(
         (file_size, false, 0)
     } else {
         // Before decoding anything: what the decoders will need, within the limit.
-        let info = checked_info(archive, codec, limits)?;
+        let info = checked_info(archive, codec, limits, ctx)?;
         let watched = Watched {
             inner: BufReader::with_capacity(256 * 1024, file),
             ctx,
@@ -931,7 +936,7 @@ pub(super) fn single_scan(
         .map_err(|e| CoreError::io(archive, e))?
         .len();
     // Before decoding anything: what the decoder will need, within the limit.
-    let info = checked_info(archive, codec, limits)?;
+    let info = checked_info(archive, codec, limits, ctx)?;
     let size = match info.size {
         Some(size) => size,
         None => {
@@ -1097,7 +1102,7 @@ pub(super) fn stream_backend(path: &Path, codec: Codec) -> &'static dyn super::A
     let mut head = Vec::with_capacity(512);
     // Peeked only when its headers can be read and its decoder fits the default limit;
     // otherwise its name decides (and listing it reports the problem).
-    let memory = codec::stream_info(codec, path)
+    let memory = codec::stream_info_with(codec, path, codec::WalkCaps::peek(), None)
         .ok()
         .map(|i| i.memory)
         .filter(|&m| m <= ExtractLimits::default().max_decoder_memory);

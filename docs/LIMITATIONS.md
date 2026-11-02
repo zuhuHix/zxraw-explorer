@@ -23,7 +23,9 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   anything is decoded; Zstandard windows over 128 MB and large-window Brotli are refused.
   Reading those headers walks every block header (Zstandard and LZ4 frames don't state their
   length), so a file of more than 4 million blocks in all is refused; that is hundreds of GB
-  for real files, and only crafted ones of many tiny blocks get there.
+  for real files, and only crafted ones of many tiny blocks get there. That walk reads at most
+  64 MB (xz stream padding is read in 64 KB chunks), can be cancelled, and moves the
+  "Reading the archive" progress; an xz file with more padding than that is refused.
   Cached listings are kept within 512 MB in all. Names that are not UTF-8 are read as code page 437
   (what Windows' tar.exe writes in ustar headers), not in the code page of the computer that
   made them.
