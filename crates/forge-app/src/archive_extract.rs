@@ -869,6 +869,7 @@ mod tests {
                 name: "a.txt".into(),
                 size: 1,
                 error: None,
+                unverified: false,
             }],
             bytes: 1,
             cancelled: false,
@@ -878,6 +879,7 @@ mod tests {
             name: "b.txt".into(),
             size: 1,
             error: Some("CRC mismatch".into()),
+            unverified: false,
         });
         assert_eq!(test_summary(&test), "1 of 2 file(s) failed");
     }
