@@ -1867,6 +1867,8 @@ fn tar_zst_double_click_browses_the_tar_and_copies_out() {
             "wait-entry sub",
             &assert_root,
             "assert-entry top.txt",
+            // Apart from the double-click before it, on the same row (not a triple-click).
+            "sleep 800",
             "double-click-entry sub",
             "wait-entry inner.txt",
             &assert_sub,

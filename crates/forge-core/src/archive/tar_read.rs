@@ -679,11 +679,9 @@ impl<R: Source> TarParser<R> {
                     continue;
                 }
                 b'V' => {
-                    // A volume label: not a member.
-                    self.skip(
-                        size.checked_add(padding(size))
-                            .ok_or_else(|| bad("tar: size out of range"))?,
-                    )?;
+                    // A volume label: not a member (its data kept with the headers, so a
+                    // member copied as it is stays whole).
+                    self.read_meta(size, MAX_LONG_NAME, "a volume label")?;
                     continue;
                 }
                 b'M' => return Err(bad("multi-volume tar archives are not supported")),

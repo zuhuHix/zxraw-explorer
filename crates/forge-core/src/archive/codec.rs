@@ -7,8 +7,10 @@
 //! CRC-32, bzip2 block CRCs, the xz check, the Zstandard and LZ4 content checksums when the
 //! frame has one. A checksum is only known to match once the stream was read to its end.
 
-use std::io::{self, BufReader, Read, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -133,22 +135,225 @@ pub(crate) fn by_name(name: &str) -> Option<(Codec, bool)> {
     Some((codec, tar_inside))
 }
 
-/// Whether the stream starting with `head` carries a checksum of its data (for xz,
-/// Zstandard and LZ4 a flag of the first stream or frame says).
-pub(crate) fn stream_has_checksum(codec: Codec, head: &[u8]) -> bool {
+/// Whether every stream or frame of the file carries a checksum of its data (gzip and bzip2
+/// always do; xz streams, Zstandard and LZ4 frames say so in their headers, which are all
+/// read: a file whose first frame is checked and the rest not is not counted as checked).
+pub(crate) fn every_frame_checked(codec: Codec, path: &Path) -> bool {
     match codec {
         Codec::Gzip | Codec::Bzip2 => true,
-        // Stream flags: the second byte's low nibble is the check type (0 = none).
-        Codec::Xz => head.get(7).is_some_and(|f| f & 0x0f != 0),
-        // Frame header descriptor bit 2: Content_Checksum_flag.
-        Codec::Zstd => head.get(4).is_some_and(|d| d & 0x04 != 0),
-        // FLG bit 2: content checksum (legacy frames have none).
-        Codec::Lz4 => {
-            head.starts_with(&[0x04, 0x22, 0x4d, 0x18])
-                && head.get(4).is_some_and(|f| f & 0x04 != 0)
-        }
+        Codec::Xz => xz_streams_checked(path).unwrap_or(false),
+        Codec::Zstd => zstd_frames(path).is_some_and(|f| f.checked),
+        Codec::Lz4 => lz4_frames_checked(path).unwrap_or(false),
         Codec::None | Codec::Brotli => false,
     }
+}
+
+/// What the frame headers of a Zstandard file say.
+pub(crate) struct ZstdFrames {
+    /// The total size, when every frame states its own.
+    pub size: Option<u64>,
+    /// Every frame has a content checksum.
+    pub checked: bool,
+}
+
+fn skip(f: &mut BufReader<File>, n: u64) -> Option<()> {
+    f.seek_relative(i64::try_from(n).ok()?).ok()
+}
+
+fn read_n<const N: usize>(f: &mut BufReader<File>) -> Option<[u8; N]> {
+    let mut b = [0u8; N];
+    f.read_exact(&mut b).ok()?;
+    Some(b)
+}
+
+/// Walk a Zstandard file's frame and block headers (blocks are skipped by their sizes).
+/// `None` when it isn't well-formed.
+pub(crate) fn zstd_frames(path: &Path) -> Option<ZstdFrames> {
+    let mut f = BufReader::new(File::open(path).ok()?);
+    let len = f.get_ref().metadata().ok()?.len();
+    let (mut pos, mut total, mut frames) = (0u64, Some(0u64), 0u32);
+    let mut checked = true;
+    while pos < len {
+        frames += 1;
+        if frames > 1_000_000 {
+            return None;
+        }
+        let m = u32::from_le_bytes(read_n::<4>(&mut f)?);
+        if (0x184d_2a50..=0x184d_2a5f).contains(&m) {
+            let n = u64::from(u32::from_le_bytes(read_n::<4>(&mut f)?));
+            skip(&mut f, n)?;
+            pos = pos.checked_add(8 + n)?;
+            continue;
+        }
+        if m != 0xfd2f_b528 {
+            return None;
+        }
+        let fhd = read_n::<1>(&mut f)?[0];
+        let single = fhd & 0x20 != 0;
+        checked &= fhd & 0x04 != 0;
+        let dict = [0u64, 1, 2, 4][usize::from(fhd & 3)];
+        let fcs_len: u64 = match (fhd >> 6, single) {
+            (0, false) => 0, // size not stated
+            (0, true) => 1,
+            (1, _) => 2,
+            (2, _) => 4,
+            _ => 8,
+        };
+        skip(&mut f, u64::from(!single) + dict)?;
+        let mut fcs = [0u8; 8];
+        f.read_exact(&mut fcs[..fcs_len as usize]).ok()?;
+        total = match fcs_len {
+            0 => None,
+            2 => total.and_then(|t| t.checked_add(u64::from_le_bytes(fcs) + 256)),
+            _ => total.and_then(|t| t.checked_add(u64::from_le_bytes(fcs))),
+        };
+        pos = pos.checked_add(5 + u64::from(!single) + dict + fcs_len)?;
+        loop {
+            let bh = read_n::<3>(&mut f)?;
+            let h = u32::from(bh[0]) | u32::from(bh[1]) << 8 | u32::from(bh[2]) << 16;
+            let stored = match (h >> 1) & 3 {
+                0 | 2 => u64::from(h >> 3),
+                1 => 1,
+                _ => return None,
+            };
+            skip(&mut f, stored)?;
+            pos = pos.checked_add(3 + stored)?;
+            if h & 1 != 0 {
+                break;
+            }
+        }
+        if fhd & 0x04 != 0 {
+            skip(&mut f, 4)?;
+            pos = pos.checked_add(4)?;
+        }
+    }
+    (pos == len).then_some(ZstdFrames {
+        size: total,
+        checked,
+    })
+}
+
+/// Whether every LZ4 frame has a content checksum or block checksums (legacy frames have
+/// none).
+fn lz4_frames_checked(path: &Path) -> Option<bool> {
+    let mut f = BufReader::new(File::open(path).ok()?);
+    let len = f.get_ref().metadata().ok()?.len();
+    let mut pos = 0u64;
+    let mut frames = 0u32;
+    while pos < len {
+        frames += 1;
+        if frames > 1_000_000 {
+            return None;
+        }
+        let m = u32::from_le_bytes(read_n::<4>(&mut f)?);
+        if (0x184d_2a50..=0x184d_2a5f).contains(&m) {
+            let n = u64::from(u32::from_le_bytes(read_n::<4>(&mut f)?));
+            skip(&mut f, n)?;
+            pos = pos.checked_add(8 + n)?;
+            continue;
+        }
+        if m != 0x184d_2204 {
+            return Some(false); // legacy frames carry no checksum
+        }
+        let [flg, _bd] = read_n::<2>(&mut f)?;
+        let block_sums = flg & 0x10 != 0;
+        if flg & 0x04 == 0 && !block_sums {
+            return Some(false);
+        }
+        let extra = 1 + if flg & 0x08 != 0 { 8 } else { 0 } + if flg & 0x01 != 0 { 4 } else { 0 };
+        skip(&mut f, extra)?;
+        pos = pos.checked_add(6 + extra)?;
+        loop {
+            let size = u32::from_le_bytes(read_n::<4>(&mut f)?);
+            pos = pos.checked_add(4)?;
+            if size == 0 {
+                break;
+            }
+            let n = u64::from(size & 0x7fff_ffff) + if block_sums { 4 } else { 0 };
+            skip(&mut f, n)?;
+            pos = pos.checked_add(n)?;
+        }
+        if flg & 0x04 != 0 {
+            skip(&mut f, 4)?;
+            pos = pos.checked_add(4)?;
+        }
+    }
+    Some(pos == len)
+}
+
+/// Whether every stream of an xz file has a check, read from its end: stream footers,
+/// indexes and headers (concatenated streams and stream padding allowed).
+fn xz_streams_checked(path: &Path) -> Option<bool> {
+    let mut f = File::open(path).ok()?;
+    let mut end = f.metadata().ok()?.len();
+    let at = |f: &mut File, pos: u64, buf: &mut [u8]| -> Option<()> {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        f.read_exact(buf).ok()
+    };
+    let mut streams = 0u32;
+    while end > 0 {
+        streams += 1;
+        if streams > 100_000 {
+            return None;
+        }
+        // Stream padding: groups of four zero bytes.
+        let mut word = [0u8; 4];
+        loop {
+            at(&mut f, end.checked_sub(4)?, &mut word)?;
+            if word != [0; 4] {
+                break;
+            }
+            end -= 4;
+        }
+        let mut footer = [0u8; 12];
+        at(&mut f, end.checked_sub(12)?, &mut footer)?;
+        if &footer[10..12] != b"YZ" || footer[8] != 0 {
+            return None;
+        }
+        if footer[9] & 0x0f == 0 {
+            return Some(false);
+        }
+        let backward = u64::from(u32::from_le_bytes(footer[4..8].try_into().ok()?));
+        let index_size = (backward + 1) * 4;
+        if index_size > 64 << 20 {
+            return None;
+        }
+        let index_start = end.checked_sub(12 + index_size)?;
+        let mut index = vec![0u8; index_size as usize];
+        at(&mut f, index_start, &mut index)?;
+        if index.first() != Some(&0) {
+            return None;
+        }
+        let mut p = 1usize;
+        let mut varint = || -> Option<u64> {
+            let mut v = 0u64;
+            for i in 0..9 {
+                let b = *index.get(p)?;
+                p += 1;
+                v |= u64::from(b & 0x7f) << (7 * i);
+                if b & 0x80 == 0 {
+                    return Some(v);
+                }
+            }
+            None
+        };
+        let records = varint()?;
+        let mut blocks = 0u64;
+        for _ in 0..records {
+            let unpadded = varint()?;
+            varint()?;
+            blocks = blocks.checked_add(unpadded.checked_add(3)? & !3)?;
+        }
+        let start = index_start.checked_sub(blocks)?.checked_sub(12)?;
+        let mut header = [0u8; 12];
+        at(&mut f, start, &mut header)?;
+        if !header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) || header[6..8] != footer[8..10]
+        {
+            return None;
+        }
+        end = start;
+    }
+    Some(true)
 }
 
 /// A decoder of `codec` over `r`. `mem_limit` bounds the memory a stream may make it
