@@ -617,6 +617,11 @@ pub(crate) fn automation_archive_listing(app: &mut ZxrawApp) -> Option<Result<us
     }
 }
 
+/// Whether the archive browser window is open.
+pub(crate) fn automation_archive_window_open(app: &ZxrawApp) -> bool {
+    app.ops.extra_tools.archive.is_some()
+}
+
 /// Names of the listed entries, for assertions.
 pub(crate) fn automation_archive_names(app: &ZxrawApp) -> Vec<String> {
     app.ops
@@ -1761,6 +1766,20 @@ fn open_archive_state(jobs: &JobRegistry, app_ctx: &egui::Context, path: PathBuf
                 ctx.request_repaint();
                 Ok(())
             }
+            // Encrypted names: ask for the password and list again (the dialog's Cancel
+            // closes the window).
+            Err(
+                error @ (forge_core::CoreError::PasswordRequired(_)
+                | forge_core::CoreError::WrongPassword(_)),
+            ) => {
+                let wrong = matches!(error, forge_core::CoreError::WrongPassword(_));
+                crate::archive_ui::request_window_password(&path_for_job, wrong);
+                let _ = result_tx_for_job.send(Err(
+                    "The file names are encrypted: enter the password to see them".into(),
+                ));
+                ctx.request_repaint();
+                Ok(())
+            }
             Err(error) => {
                 let error = error.to_string();
                 job.log(format!("listing failed: {error}"));
@@ -1782,6 +1801,44 @@ fn open_archive_state(jobs: &JobRegistry, app_ctx: &egui::Context, path: PathBuf
         destination,
         notice: None,
         open: true,
+    }
+}
+
+/// The password of `archive` was typed: list it again in the browse window, if that window
+/// still shows it.
+pub(crate) fn relist_archive_window(app: &mut ZxrawApp, archive: &Path) {
+    let showing = app
+        .ops
+        .extra_tools
+        .archive
+        .as_ref()
+        .is_some_and(|w| w.open && forge_core::paths::paths_equal(&w.path, archive));
+    if showing {
+        let jobs = app.ops.jobs.clone();
+        let app_ctx = app.ops.ctx.clone();
+        app.ops.extra_tools.archive =
+            Some(open_archive_state(&jobs, &app_ctx, archive.to_path_buf()));
+    }
+}
+
+/// The password question for `archive` was cancelled: close its browse window.
+pub(crate) fn close_archive_window(app: &mut ZxrawApp, archive: &Path) {
+    if app
+        .ops
+        .extra_tools
+        .archive
+        .as_ref()
+        .is_some_and(|w| forge_core::paths::paths_equal(&w.path, archive))
+    {
+        app.ops.extra_tools.archive = None;
+    }
+}
+
+/// Extraction options of the browse window: the archive's password, if it was typed.
+fn window_extract_options(archive: &Path) -> ExtractOptions {
+    ExtractOptions {
+        password: crate::archive_ui::session_password(archive),
+        ..ExtractOptions::default()
     }
 }
 
@@ -2015,8 +2072,12 @@ fn extract_all(
     ctx: &JobCtx<'_>,
 ) -> forge_core::Result<(usize, Vec<String>)> {
     ensure_output_root(destination)?;
-    let report =
-        forge_core::archive::extract_zip(archive, destination, &ExtractOptions::default(), ctx)?;
+    let report = forge_core::archive::extract_zip(
+        archive,
+        destination,
+        &window_extract_options(archive),
+        ctx,
+    )?;
     let mut failures: Vec<String> = report
         .skipped
         .into_iter()
@@ -2051,7 +2112,7 @@ fn extract_selected(
         archive,
         destination,
         &selected,
-        &ExtractOptions::default(),
+        &window_extract_options(archive),
         ctx,
     )?;
     if report.cancelled {

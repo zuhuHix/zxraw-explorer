@@ -37,6 +37,8 @@
 //! - `archive open <zip>` / `archive wait [secs]`: open the browser and wait for the listing.
 //! - `archive assert-entry <name>` / `archive assert-count <n>`: check the listed entries.
 //! - `archive extract <dest>`: "Extract all" into `dest`; follow it with `wait-jobs`.
+//! - `archive assert-closed`: the browser window is closed (as after cancelling its
+//!   password question).
 //! - `archive create <dir> | <name.zip> | <source> [| <source>…]`: create the archive; follow
 //!   it with `wait-jobs`. An existing archive name is never replaced (a number is added).
 //!
@@ -806,6 +808,13 @@ fn archive_step(app: &mut ZxrawApp, args: &str, st: &mut StepState) -> Result<Fl
                 Ok(Flow::Done)
             } else {
                 Err(format!("the archive has no entry `{name}`"))
+            }
+        }
+        "assert-closed" => {
+            if !extra_tools_ui::automation_archive_window_open(app) {
+                Ok(Flow::Done)
+            } else {
+                Err("the archive browser is still open".into())
             }
         }
         "assert-count" => {
