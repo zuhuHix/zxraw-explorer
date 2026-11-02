@@ -1691,6 +1691,105 @@ fn archive_cut_and_shell_pasted_asks_to_finish_the_move_and_removes_on_accept() 
     assert_eq!(zip_names(&zip), ["top.txt"]);
 }
 
+/// `a.zip` with a folder entry `docs/`, `docs/a.txt`, a link `docs/link` and `top.txt`.
+fn zip_with_link(dir: &Path) -> PathBuf {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join("a.zip");
+    let mut zw = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+    let options = SimpleFileOptions::default();
+    zw.add_directory("docs/", options).unwrap();
+    zw.start_file("docs/a.txt", options).unwrap();
+    zw.write_all(b"moved file").unwrap();
+    zw.add_symlink("docs/link", "a.txt", options).unwrap();
+    zw.start_file("top.txt", options).unwrap();
+    zw.write_all(b"top").unwrap();
+    zw.finish().unwrap();
+    path
+}
+
+#[test]
+fn a_folder_moved_out_keeps_its_link_and_itself_in_the_archive() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = zip_with_link(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry docs\n\
+         select docs\n\
+         cmd Cut\n\
+         ui system shell-paste {dest}\n\
+         ui browser wait-dialog Finish the move | 60\n\
+         ui browser assert-dialog-contains 1 item couldn't be moved\n\
+         accept\n\
+         wait-jobs 30\n\
+         assert-no-error-toast\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(tree(&dest), owned_tree(&[("docs/a.txt", b"moved file")]));
+    // Only the moved file went: the link it couldn't give out, and the folder holding it,
+    // stay; the untouched file too.
+    assert_eq!(zip_names(&zip), ["docs/", "docs/link", "top.txt"]);
+}
+
+#[test]
+fn an_archive_changed_while_the_move_prompt_is_open_keeps_every_entry() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let Some(_clipboard) = crate::core::clipboard_guard(sandbox.path()) else {
+        return;
+    };
+    let profile = sandbox.path().join("profile");
+    let zip = pane_zip(&sandbox.path().join("zips"));
+    let dest = sandbox.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let script = format!(
+        "navigate {zip}\n\
+         wait-entry sub\n\
+         select sub\n\
+         cmd Cut\n\
+         ui system shell-paste {dest}\n\
+         ui browser wait-dialog Finish the move | 60\n\
+         ui system touch {zip}\n\
+         accept\n\
+         wait-jobs 30\n\
+         ui system wait-toast nothing was removed\n\
+         exit\n",
+        zip = shown(&zip),
+        dest = shown(&dest),
+    );
+
+    let outcome = run_app(sandbox.path(), &profile, &script);
+
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(
+        tree(&dest),
+        owned_tree(&[
+            ("sub/deep/x.txt", b"deep x"),
+            ("sub/inner.txt", b"inner text"),
+        ])
+    );
+    assert_eq!(
+        zip_names(&zip),
+        ["sub/deep/x.txt", "sub/inner.txt", "top.txt"],
+        "the removal re-checks the archive in its job and removes nothing"
+    );
+}
+
 #[test]
 fn archive_cut_then_archive_changed_shell_paste_gives_out_and_removes_nothing() {
     let sandbox = tempfile::tempdir().unwrap();

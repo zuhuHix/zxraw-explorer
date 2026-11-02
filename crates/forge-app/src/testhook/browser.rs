@@ -22,6 +22,7 @@
 //! - `wait-dialog <title> [| seconds]`: waits (30 s default, 300 s maximum) until a
 //!   confirmation with exactly this title, or a report whose title contains it, is open
 //!   (e.g. `Finish the move`). Fails on timeout.
+//! - `assert-dialog-contains <text>`: an open confirmation's text contains `<text>`.
 //! - `assert-prompt-error <text>`: a name prompt is open and its error contains `<text>`.
 //! - `hold-name-lane <path> | <ms>`: keep the rename/new-item lane of `<path>` busy for
 //!   `<ms>` milliseconds, as a rename stuck on an unresponsive share would.
@@ -409,6 +410,17 @@ pub(super) fn step(
                     _ => "a dialog".to_string(),
                 };
                 Err(format!("{what} is open"))
+            }
+        }
+        "assert-dialog-contains" => {
+            let text = args.trim();
+            match &app.ops.modal {
+                Some(crate::modal::Modal::Confirm(c)) if c.body.contains(text) => Ok(Flow::Done),
+                Some(crate::modal::Modal::Confirm(c)) => Err(format!(
+                    "the confirmation says {:?}, without `{text}`",
+                    c.body
+                )),
+                _ => Err("no confirmation is open".into()),
             }
         }
         "wait-dialog" => {

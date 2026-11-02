@@ -57,7 +57,14 @@ pub struct UpdateRequest {
     /// files' password is typed twice, as for a new encrypted archive.
     pub confirm_password: bool,
     pub title: String,
+    /// The archive version (`archive_ui::archive_version`) the edit was decided on: checked
+    /// in the job under the edit lock, right before the rebuild, and nothing is changed if
+    /// the archive differs (the end of a move out of it).
+    pub expect_version: Option<u64>,
 }
+
+/// Why a move's removal did nothing: the archive changed after the items left it.
+pub const CHANGED_NOTHING_REMOVED: &str = "the archive changed; nothing was removed";
 
 /// Whether adding to an archive needs a password, and whether it must be typed twice: only
 /// folders are encrypted, so there is no file to check it against.
@@ -208,8 +215,11 @@ fn copy_out(app: &mut ZxrawApp, paths: &[PathBuf], target: &Path, copy: bool) {
         app.toast("Nothing to copy: the items are no longer in the archive");
         return;
     };
-    let then_remove =
-        (!copy).then(|| crate::archive_out::MoveOut::in_app(&view, selection.names.clone()));
+    let then_remove = if copy {
+        None
+    } else {
+        crate::archive_out::MoveOut::in_app(&view, &selection)
+    };
     extract_selection(app, view.archive, selection, target.to_path_buf(), then_remove);
 }
 
@@ -260,7 +270,11 @@ pub fn copy_paths(app: &mut ZxrawApp, paths: &[PathBuf], cut: bool) {
         crate::archive_out::Published::Asking => return,
         crate::archive_out::Published::Yes(moved) => cut.then_some(moved),
         crate::archive_out::Published::No => {
-            cut.then(|| crate::archive_out::MoveOut::in_app(&view, selection.names.clone()))
+            if cut {
+                crate::archive_out::MoveOut::in_app(&view, &selection)
+            } else {
+                None
+            }
         }
     };
     // Newer than any file list copied before: that one no longer pastes.
@@ -365,6 +379,7 @@ fn add_into(
         },
         encrypted: lock.0,
         confirm_password: lock.1,
+        expect_version: None,
     };
     if existing.is_empty() {
         return start_update(app, request);
@@ -425,6 +440,7 @@ pub fn ask_delete(app: &mut ZxrawApp) {
             // Kept entries are copied as stored: deleting needs no password.
             encrypted: false,
             confirm_password: false,
+            expect_version: None,
         }),
         title: "Delete from archive".into(),
         confirm_label: "Delete".into(),
@@ -479,7 +495,14 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
             job.progress.set_note("Waiting for another archive edit…");
             let _one = UPDATING.lock().unwrap_or_else(|p| p.into_inner());
             job.progress.set_note("");
-            archive::update(&request.archive, &request.edit, &opts, &job_ctx)
+            let changed = request
+                .expect_version
+                .is_some_and(|v| crate::archive_ui::archive_version(&request.archive) != v);
+            if changed {
+                Err(CoreError::Invalid(CHANGED_NOTHING_REMOVED.into()))
+            } else {
+                archive::update(&request.archive, &request.edit, &opts, &job_ctx)
+            }
         };
         let outcome = match result {
             Ok(report) => {

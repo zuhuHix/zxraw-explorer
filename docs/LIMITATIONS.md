@@ -107,9 +107,13 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   running app, so the clipboard is emptied on exit rather than flushed.
 * A move out of an archive (Ctrl+X, Shift-drag, F6) removes the items only when the target
   reported a successful move *and* read every file to its end, the archive is unchanged since
-  it was listed, and you confirm. Anything less (a copy, a skipped file, an error) leaves the
-  archive as it was. A target that never reports the result (some apps don't) leaves it as a
-  copy.
+  it was listed (checked again inside the removal job, just before the archive is rewritten),
+  and you confirm. Once the target copies asynchronously, only the end of its operation counts:
+  a failed end cancels the move whatever it said before. Anything less (a copy, a skipped
+  file, an error) leaves the archive as it was. A target that never reports the result (some
+  apps don't) leaves it as a copy. Exactly the entries that were handed out are removed, never
+  a folder with whatever it holds: links and names that clash on Windows are not handed out,
+  so they stay, and so does the folder holding them (the confirmation says how many).
 * ZipCrypto (legacy ZIP encryption) checks a password with one byte, so a wrong password is
   caught up front 255 times in 256; otherwise the entry fails its checksum and is reported as
   "damaged data or wrong password". AES archives always tell the two apart.

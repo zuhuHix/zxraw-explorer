@@ -57,13 +57,50 @@ pub struct StagePlan {
     pub skipped: Vec<OpIssue>,
     /// The file entries, in the order [`StageItem::file`] counts them.
     pub files: Vec<ArchiveEntry>,
+    /// Names of the folder entries the selection covers (folders with an entry of their own).
+    pub folder_entries: Vec<String>,
+    /// Names of the covered entries left out (those in `skipped`): a move leaves them, and
+    /// the folders holding them, in the archive.
+    pub left_out: Vec<String>,
 }
 
 impl StagePlan {
+    /// The exact entry names a confirmed move of every planned file removes: each file, and
+    /// each folder entry nothing left out sits under. Names carry no trailing `/`, so an
+    /// archive edit deletes just that entry, never a folder with whatever it holds by then.
+    pub fn move_names(&self) -> Vec<String> {
+        let left_out: Vec<String> = self.left_out.iter().map(|n| n.to_lowercase()).collect();
+        let mut names: Vec<String> = self
+            .files
+            .iter()
+            .map(|e| e.name.trim_end_matches('/').to_string())
+            .collect();
+        names.extend(self.folder_entries.iter().filter_map(|folder| {
+            let bare = folder.trim_end_matches('/');
+            let prefix = format!("{}/", bare.to_lowercase());
+            (!left_out.iter().any(|n| n.starts_with(&prefix))).then(|| bare.to_string())
+        }));
+        names
+    }
+
     /// Whether any planned file is encrypted (it needs the archive's password).
     pub fn any_encrypted(&self) -> bool {
         self.files.iter().any(|e| e.encrypted)
     }
+}
+
+/// Why [`plan`] (and [`extract`]) leave out a link entry.
+pub const LEFT_OUT_LINK: &str = "symbolic link entries are not extracted";
+/// Why a file named like a folder is left out.
+pub const LEFT_OUT_LIKE_FOLDER: &str = "a folder in the archive has the same name";
+/// Why a file named like an earlier one is left out.
+pub const LEFT_OUT_SAME_NAME: &str =
+    "another entry has the same name (names are not case-sensitive on Windows)";
+
+/// Whether `reason` is one of the rules that always leave an entry out (not a conflict, an
+/// error or a cancel).
+pub fn is_left_out_reason(reason: &str) -> bool {
+    [LEFT_OUT_LINK, LEFT_OUT_LIKE_FOLDER, LEFT_OUT_SAME_NAME].contains(&reason)
 }
 
 /// The files and folders `selection` covers in `listing`, checked as [`extract`] checks
@@ -111,10 +148,8 @@ pub fn plan(
             rest => validate_entry_name(rest)?,
         };
         if e.is_symlink {
-            plan.skipped.push(OpIssue::new(
-                &rel,
-                "symbolic link entries are not extracted",
-            ));
+            plan.skipped.push(OpIssue::new(&rel, LEFT_OUT_LINK));
+            plan.left_out.push(e.name.clone());
             continue;
         }
         if !e.is_dir {
@@ -149,6 +184,7 @@ pub fn plan(
     };
     for (rel, e) in &planned {
         let parent = if e.is_dir {
+            plan.folder_entries.push(e.name.clone());
             add_folder(rel, e.modified);
             rel.parent()
         } else {
@@ -166,14 +202,15 @@ pub fn plan(
     for (rel, e) in planned.into_iter().filter(|(_, e)| !e.is_dir) {
         let key = collision_key(&rel);
         let reason = if folder_at.contains_key(&key) {
-            "a folder in the archive has the same name"
+            LEFT_OUT_LIKE_FOLDER
         } else if !seen.insert(key) {
-            "another entry has the same name (names are not case-sensitive on Windows)"
+            LEFT_OUT_SAME_NAME
         } else {
             files.push((rel, e));
             continue;
         };
         plan.skipped.push(OpIssue::new(&rel, reason));
+        plan.left_out.push(e.name.clone());
     }
     folders.sort_by_key(|(rel, _)| rel.components().count());
     plan.items.extend(folders.into_iter().map(|(rel, modified)| StageItem {
@@ -1033,5 +1070,112 @@ mod tests {
             *log.lock().unwrap(),
             vec![StageEvent::Password { wrong: false }]
         );
+    }
+
+    /// `docs/` (an entry), `docs/a.txt`, a link `docs/link` and `top.txt`.
+    fn zip_with_link(path: &Path) {
+        let mut zw = ZipWriter::new(File::create(path).unwrap());
+        let options = SimpleFileOptions::default();
+        zw.add_directory("docs/", options).unwrap();
+        zw.start_file("docs/a.txt", options).unwrap();
+        zw.write_all(b"moved").unwrap();
+        zw.add_symlink("docs/link", "a.txt", options).unwrap();
+        zw.start_file("top.txt", options).unwrap();
+        zw.write_all(b"top").unwrap();
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn a_move_removes_only_what_was_offered_and_keeps_a_folder_with_a_link_left_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("l.zip");
+        zip_with_link(&zip);
+        let listing = list(&zip).unwrap();
+        let staged = plan(
+            &listing,
+            &Selection::new("", vec!["docs/".into(), "top.txt".into()]),
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(staged.left_out, ["docs/link"]);
+        assert_eq!(staged.folder_entries, ["docs/"]);
+        let mut names = staged.move_names();
+        names.sort();
+        // The file goes; the link stays, and so does the folder holding it. No name ends
+        // with `/`, so nothing is deleted recursively.
+        assert_eq!(names, ["docs/a.txt", "top.txt"]);
+
+        let whole = plan(
+            &listing,
+            &Selection::new("docs/", vec!["docs/a.txt".into()]),
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(whole.move_names(), ["docs/a.txt"]);
+    }
+
+    #[test]
+    fn a_folder_with_nothing_left_out_is_removed_by_its_own_entry_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("f.zip");
+        let mut zw = ZipWriter::new(File::create(&zip).unwrap());
+        let options = SimpleFileOptions::default();
+        zw.add_directory("docs/", options).unwrap();
+        zw.add_directory("docs/empty/", options).unwrap();
+        zw.start_file("docs/a.txt", options).unwrap();
+        zw.write_all(b"a").unwrap();
+        zw.finish().unwrap();
+        let staged = plan(
+            &list(&zip).unwrap(),
+            &Selection::new("", vec!["docs/".into()]),
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        let mut names = staged.move_names();
+        names.sort();
+        assert_eq!(names, ["docs", "docs/a.txt", "docs/empty"]);
+    }
+
+    #[test]
+    fn a_name_collision_stays_in_the_archive_with_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("c.zip");
+        let mut zw = ZipWriter::new(File::create(&zip).unwrap());
+        let options = SimpleFileOptions::default();
+        zw.add_directory("sub/", options).unwrap();
+        zw.start_file("sub/A.txt", options).unwrap();
+        zw.write_all(b"upper").unwrap();
+        zw.start_file("sub/a.txt", options).unwrap();
+        zw.write_all(b"lower").unwrap();
+        zw.finish().unwrap();
+        let staged = plan(
+            &list(&zip).unwrap(),
+            &Selection::new("", vec!["sub/".into()]),
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(staged.left_out, ["sub/a.txt"]);
+        assert_eq!(staged.move_names(), ["sub/A.txt"]);
+    }
+
+    #[test]
+    fn extraction_leaves_out_entries_for_the_same_reasons_as_the_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = tmp.path().join("l.zip");
+        zip_with_link(&zip);
+        let dest = tmp.path().join("out");
+        fs::create_dir_all(&dest).unwrap();
+        let (cancel, progress) = (CancelToken::new(), Progress::default());
+        let report = crate::archive::extract(
+            &zip,
+            &dest,
+            &crate::archive::ExtractOptions::default(),
+            None,
+            &JobCtx::new(&cancel, &progress),
+        )
+        .unwrap();
+        assert!(!report.skipped.is_empty());
+        assert!(report.skipped.iter().all(|s| is_left_out_reason(&s.reason)), "{:?}", report.skipped);
+        assert!(!is_left_out_reason("already exists"));
     }
 }
