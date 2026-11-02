@@ -123,6 +123,15 @@ impl CreateArchiveWindow {
     }
 }
 
+/// Ids of the compress dialog's password fields (their egui state is forgotten when done).
+const CREATE_PASSWORD_FIELDS: [&str; 2] = ["create-archive-password", "create-archive-confirm"];
+
+fn forget_create_passwords(ctx: &egui::Context) {
+    for id in CREATE_PASSWORD_FIELDS {
+        crate::archive_ui::forget_text_state(ctx, egui::Id::new(id));
+    }
+}
+
 impl Drop for CreateArchiveWindow {
     fn drop(&mut self) {
         crate::archive_ui::wipe(&mut self.password);
@@ -228,6 +237,7 @@ pub fn window(app: &mut ZxrawApp, ctx: &egui::Context) {
         render_create_archive(state, ctx, &mut actions);
         if !state.open {
             tools.create_archive = None;
+            forget_create_passwords(ctx);
         }
     }
 
@@ -445,6 +455,8 @@ pub fn create_archive(app: &mut ZxrawApp) {
     }
     let directory = app.pane().path.clone();
     let stem = app.pane().title();
+    // A window it replaces may hold typed passwords.
+    forget_create_passwords(&app.ops.ctx);
     app.ops.extra_tools.create_archive = Some(CreateArchiveWindow::new(
         sources,
         directory,
@@ -2063,6 +2075,7 @@ fn render_create_archive(
             {
                 crate::archive_ui::wipe(&mut state.password);
                 crate::archive_ui::wipe(&mut state.confirm);
+                forget_create_passwords(ui.ctx());
                 actions.push(UiAction::StartCreateArchive {
                     sources: state.sources.clone(),
                     directory: state.directory.clone(),
@@ -2109,12 +2122,14 @@ fn create_choices(ui: &mut Ui, state: &mut CreateArchiveWindow) {
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.password)
+                    .id(egui::Id::new(CREATE_PASSWORD_FIELDS[0]))
                     .password(true)
                     .hint_text("Password (optional)")
                     .desired_width(260.0),
             );
             ui.add(
                 egui::TextEdit::singleline(&mut state.confirm)
+                    .id(egui::Id::new(CREATE_PASSWORD_FIELDS[1]))
                     .password(true)
                     .hint_text("Confirm password")
                     .desired_width(260.0),
