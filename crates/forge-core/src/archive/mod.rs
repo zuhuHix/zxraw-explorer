@@ -952,7 +952,7 @@ fn extract_pinned(
         verify_crowded_blocks(backend, archive, password, ctx, &mut planned, &mut report)?;
     let root = base.root();
     // Leftovers of crashed or older runs; before any entry of this job is written.
-    remove_leftovers(&base, &planned);
+    remove_leftovers(base, &planned);
     let zone = if opts.mark_of_the_web {
         motw::read_zone(archive)
     } else {
