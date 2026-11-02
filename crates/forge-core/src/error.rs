@@ -24,6 +24,12 @@ pub enum CoreError {
     VerifyFailed { path: PathBuf, detail: String },
     #[error("operation cancelled")]
     Cancelled,
+    /// An archive entry is encrypted and no password was given.
+    #[error("{0}: a password is needed")]
+    PasswordRequired(String),
+    /// The password given for an encrypted archive entry is not the right one.
+    #[error("{0}: wrong password")]
+    WrongPassword(String),
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;

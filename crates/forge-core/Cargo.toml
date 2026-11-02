@@ -18,6 +18,8 @@ blake3.workspace = true
 xxhash-rust.workspace = true
 forge-jobs.workspace = true
 zip.workspace = true
+zeroize.workspace = true
+lru.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
