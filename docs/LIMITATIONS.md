@@ -26,6 +26,14 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * 7z limits: headers of at most 64 MB on disk and 128 MB decoded, at most 100,000 entries,
   1 GB of decoder memory per block (256 MB for the header). Anything over them is refused
   before memory is allocated. 7z entries are decoded on one thread.
+* In a solid 7z block whose only checksum is the block's (files without CRCs of their own),
+  extracted files are held as temp files and published only once the whole block has been
+  decoded and its checksum matched, so extracting even one such file decodes its block to
+  the end. *Test archive* reports encrypted files without any checksum under an unproven
+  password as "can't be verified", never as OK.
+* Self-extracting zips (a program stub in front of the archive) can be opened and extracted
+  but not edited: an edit would drop the stub. Only archives with a zip, 7z or archive-like
+  extension open as folders; a self-extracting `.exe` doesn't.
 * Editing a 7z recompresses the solid blocks that lose a file. Those blocks are held to the
   extraction limits (decoder memory, total size), and their kept files are spilled to a temp
   file next to the archive, so that much free space is needed there; otherwise the edit is
