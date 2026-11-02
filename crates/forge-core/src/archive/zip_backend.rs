@@ -231,7 +231,21 @@ impl ArchiveBackend for ZipBackend {
                     }
                 }
                 (true, Some(pw), None) => {
-                    decrypted = crypto_peek::zipcrypto_head(&head[..n], pw.as_bytes(), 64);
+                    // The header's check byte: the CRC's high byte, or the modified time's
+                    // with a data descriptor (bit 3).
+                    let check = if f.flags().matching(ZipFlags::UsingDataDescriptor) {
+                        f.last_modified().map(|t| (t.timepart() >> 8) as u8)
+                    } else {
+                        Some((f.crc32() >> 24) as u8)
+                    };
+                    // Another password than this entry's: it fails when read, as a wrong
+                    // password; nothing it decrypts is parsed here.
+                    let Some(h) = check.and_then(|check| {
+                        crypto_peek::zipcrypto_head(&head[..n], pw.as_bytes(), check, 64)
+                    }) else {
+                        continue;
+                    };
+                    decrypted = h;
                     &decrypted[..]
                 }
             };

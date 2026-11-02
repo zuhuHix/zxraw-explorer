@@ -677,11 +677,94 @@ fn a_destination_through_a_junction_is_resolved_and_pinned_for_the_job() {
     let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
     super::safety::BEFORE_PARENT_CREATE.with(|hook| *hook.borrow_mut() = None);
     let report = report.unwrap();
-    assert!(!moved.load(Ordering::SeqCst), "an ancestor was renamed during the job");
+    assert!(
+        !moved.load(Ordering::SeqCst),
+        "an ancestor was renamed during the job"
+    );
     assert!(report.failed.is_empty(), "{report:?}");
     // Written to the real folder, reported beneath the path the user chose.
     assert_eq!(report.extracted, vec![dest.join("sub").join("x.txt")]);
     assert_eq!(fs::read(real.join("dest/sub/x.txt")).unwrap(), b"inside");
     // Released after the job.
     fs::rename(&real, d.path().join("elsewhere")).unwrap();
+}
+
+/// Set the method of the entry `name` to `method` in its local and central headers.
+fn set_method(bytes: &mut [u8], name: &[u8], method: u16) {
+    let mut set = 0;
+    for (sig, name_at, method_at) in [(b"PK\x03\x04", 30, 8), (b"PK\x01\x02", 46, 10)] {
+        let mut i = 0;
+        while let Some(p) = bytes[i..].windows(4).position(|w| w == sig) {
+            let at = i + p;
+            if bytes.get(at + name_at..at + name_at + name.len()) == Some(name) {
+                bytes[at + method_at..at + method_at + 2].copy_from_slice(&method.to_le_bytes());
+                set += 1;
+            }
+            i = at + 4;
+        }
+    }
+    assert_eq!(set, 2);
+}
+
+#[test]
+fn zipcrypto_entries_with_another_password_are_not_parsed_with_this_one() {
+    use zip::unstable::write::FileOptionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let mut model = vec![5, 2, 5, 0, 0x5D, 0, 0, 0, 0x80];
+    model.extend([0u8; 64]);
+    // The second entry has another password. With the first one its header check byte
+    // fails 255 times in 256; build until it does, so the outcome is certain.
+    for attempt in 0..64 {
+        let mut zw = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let one = SimpleFileOptions::default()
+            .with_deprecated_encryption(b"one")
+            .unwrap();
+        zw.start_file("a.txt", one).unwrap();
+        zw.write_all(b"first entry").unwrap();
+        let two = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .with_deprecated_encryption(b"two")
+            .unwrap();
+        zw.start_file("model.bin", two).unwrap();
+        zw.write_all(&model).unwrap();
+        let mut bytes = zw.finish().unwrap().into_inner();
+        // Declare the second entry LZMA with a 2 GiB dictionary.
+        set_method(&mut bytes, b"model.bin", 14);
+        let (raw, check) = {
+            let mut za = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+            let mut f = za.by_index_raw(1).unwrap();
+            let check = (f.last_modified().unwrap().timepart() >> 8) as u8;
+            let mut raw = Vec::new();
+            std::io::Read::read_to_end(&mut f, &mut raw).unwrap();
+            (raw, check)
+        };
+        if super::crypto_peek::zipcrypto_head(&raw, b"one", check, 64).is_some() {
+            continue; // the 1 in 256: try another header
+        }
+        let z = write_archive(d.path(), &format!("mixed-{attempt}.zip"), &bytes);
+        let dest = fresh_dest(d.path(), &format!("dest-{attempt}"));
+        let opts = ExtractOptions {
+            password: Some(Password::new("one")),
+            ..Default::default()
+        };
+        // Not refused as a decoder-memory bomb: the second entry fails as a wrong password.
+        let report = ctx_run(&z, &dest, &opts).unwrap();
+        assert_eq!(report.extracted, vec![dest.join("a.txt")], "{report:?}");
+        assert_eq!(report.failed.len(), 1, "{report:?}");
+        assert!(report.failed[0].reason.contains("password"), "{report:?}");
+        assert!(!dest.join("model.bin").exists());
+        // With its own password the bomb header is read, and refused.
+        let own = ExtractOptions {
+            password: Some(Password::new("two")),
+            ..Default::default()
+        };
+        let other = fresh_dest(d.path(), &format!("other-{attempt}"));
+        // The first entry is checked first, and "two" is wrong for it.
+        assert!(matches!(
+            ctx_run(&z, &other, &own),
+            Err(CoreError::WrongPassword(_))
+        ));
+        return;
+    }
+    panic!("no header failed the check in 64 tries");
 }
