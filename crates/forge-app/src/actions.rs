@@ -78,6 +78,9 @@ pub enum Event {
         files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
         /// The owner token if the clipboard holds a publish of ours.
         owner: Option<forge_win::ClipboardToken>,
+        /// The clipboard offers virtual files (e.g. items copied from a zip folder in
+        /// Explorer), used when it has no file list.
+        virtual_files: bool,
         /// What is at the in-app cut's paths now, if there is a cut.
         cut: Option<CutCheck>,
     },
@@ -1155,6 +1158,7 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
             Ok(read) => (Ok(read.files), read.owner, read.sequence),
             Err(e) => (Err(e.to_string()), None, forge_win::clipboard_sequence()),
         };
+        let virtual_files = forge_win::virtual_files::clipboard_has_virtual_files();
         let cut = cut.map(|(generation, revision, items)| {
             check_cut(checker, generation, revision, &items)
         });
@@ -1163,6 +1167,7 @@ fn start_paste(app: &mut ZxrawApp, dir: PathBuf) {
             sequence,
             files,
             owner,
+            virtual_files,
             cut,
         });
         ctx.request_repaint();
@@ -1320,7 +1325,10 @@ fn paste_with(
     dest: PathBuf,
     sequence: u32,
     owner: Option<forge_win::ClipboardToken>,
-    files: Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
+    (files, virtual_files): (
+        Result<Option<(Vec<PathBuf>, forge_win::ClipboardEffect)>, String>,
+        bool,
+    ),
     cut: Option<CutCheck>,
 ) {
     // Every way out of here either starts a transfer or says why it did not.
@@ -1330,6 +1338,8 @@ fn paste_with(
     };
     let system = match (&files, &read_error) {
         (Some(_), _) => SystemFiles::Files,
+        // Without a file list, virtual files (items copied in a zip folder) are pasted.
+        (None, None) if virtual_files => SystemFiles::Files,
         (None, None) => SystemFiles::NoFiles,
         (None, Some(_)) => SystemFiles::Unreadable,
     };
@@ -1342,6 +1352,13 @@ fn paste_with(
         )),
         PasteSource::System => {
             let Some((paths, effect)) = files else {
+                if virtual_files {
+                    // Always a copy, whatever the source asked for: the items are not
+                    // deleted from where they were copied.
+                    let source = forge_win::virtual_files::VirtualSource::clipboard();
+                    crate::virtual_copy::start(app, source, dest, None);
+                    return;
+                }
                 app.toast_err("Could not read the files on the clipboard");
                 return;
             };
@@ -1706,8 +1723,9 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
                 sequence,
                 files,
                 owner,
+                virtual_files,
                 cut,
-            } => paste_with(app, destination, sequence, owner, files, cut),
+            } => paste_with(app, destination, sequence, owner, (files, virtual_files), cut),
             Event::MoveFinished {
                 sources,
                 ok,
