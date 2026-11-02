@@ -12,6 +12,8 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 use std::path::Path;
 
+use crate::ops::JobCtx;
+
 use serde::{Deserialize, Serialize};
 
 /// Largest Zstandard window a decoder accepts (2^27 = 128 MiB, the `--long` default).
@@ -165,118 +167,292 @@ fn bad_headers(what: &str) -> io::Error {
 /// blocks would make it long, so it stops here. A real file with this many blocks is at
 /// least hundreds of GB (Zstandard blocks are up to 128 KiB, LZ4 up to 4 MiB).
 const MAX_HEADER_BLOCKS: u64 = 4_000_000;
+/// Most bytes a header walk reads (headers, indexes, padding), whatever the codec.
+const MAX_HEADER_BYTES: u64 = 64 << 20;
+/// Most seeks a header walk makes (one or two per block).
+const MAX_HEADER_SEEKS: u64 = 2 * MAX_HEADER_BLOCKS + 4096;
+/// Blocks between two checks for cancel (and progress reports).
+const TICK_BLOCKS: u64 = 4096;
+/// Stream padding (xz) is read backwards in chunks of this size.
+const PADDING_CHUNK: usize = 64 << 10;
+
+/// Caps of a header walk: blocks, bytes read, seeks.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkCaps {
+    pub blocks: u64,
+    pub bytes: u64,
+    pub seeks: u64,
+}
+
+impl WalkCaps {
+    /// What reading an archive's headers may cost.
+    pub(crate) fn full() -> Self {
+        #[cfg(test)]
+        if let Some(blocks) = HEADER_BLOCKS_CAP.with(|c| c.get()) {
+            return Self {
+                blocks,
+                bytes: MAX_HEADER_BYTES,
+                seeks: 2 * blocks + 4096,
+            };
+        }
+        Self {
+            blocks: MAX_HEADER_BLOCKS,
+            bytes: MAX_HEADER_BYTES,
+            seeks: MAX_HEADER_SEEKS,
+        }
+    }
+
+    /// A quick look, to tell a tar inside from a single file: past it, the name decides.
+    pub(crate) fn peek() -> Self {
+        Self {
+            blocks: 65_536,
+            bytes: 1 << 20,
+            seeks: 2 * 65_536,
+        }
+    }
+}
 
 #[cfg(test)]
 thread_local! {
     /// Tests: a smaller [`MAX_HEADER_BLOCKS`].
     pub(crate) static HEADER_BLOCKS_CAP: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
+    /// Tests: blocks counted by the last walk, and its progress reports.
+    pub(crate) static LAST_WALK: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
-/// The work a header walk may do: block headers read, counted across all frames.
-struct Work {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Blocks,
+    Bytes,
+    Seeks,
+    Cancelled,
+}
+
+/// A header walk over one file: every read and seek goes through it and is charged against
+/// its caps; every [`TICK_BLOCKS`] blocks and every padding chunk it checks the job's cancel
+/// and reports how far it got (bytes of the file walked) as the job's progress.
+struct Work<'c> {
+    f: BufReader<File>,
+    len: u64,
+    caps: WalkCaps,
     blocks: u64,
-    max: u64,
-    exceeded: bool,
+    bytes: u64,
+    seeks: u64,
+    ctx: Option<&'c JobCtx<'c>>,
+    reported: u64,
+    reports: u64,
+    stop: Option<Stop>,
 }
 
-impl Work {
-    fn new() -> Self {
-        #[cfg(test)]
-        if let Some(max) = HEADER_BLOCKS_CAP.with(|c| c.get()) {
-            return Self {
-                blocks: 0,
-                max,
-                exceeded: false,
-            };
+impl<'c> Work<'c> {
+    fn open(path: &Path, caps: WalkCaps, ctx: Option<&'c JobCtx<'c>>) -> io::Result<Self> {
+        let f = File::open(path)?;
+        let len = f.metadata()?.len();
+        if let Some(ctx) = ctx {
+            ctx.progress.add_total_bytes(len);
+            ctx.progress.set_note("Reading the archive's headers");
         }
-        Self {
+        Ok(Self {
+            f: BufReader::with_capacity(64 << 10, f),
+            len,
+            caps,
             blocks: 0,
-            max: MAX_HEADER_BLOCKS,
-            exceeded: false,
-        }
+            bytes: 0,
+            seeks: 0,
+            ctx,
+            reported: 0,
+            reports: 0,
+            stop: None,
+        })
     }
 
-    /// Count `n` more blocks; `None` (and `exceeded`) past the budget.
-    fn blocks(&mut self, n: u64) -> Option<()> {
-        self.blocks = self.blocks.saturating_add(n);
-        if self.blocks > self.max {
-            self.exceeded = true;
-            return None;
+    fn halt(&mut self, why: Stop) -> Option<()> {
+        self.stop = Some(why);
+        None
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> Option<()> {
+        self.bytes = self.bytes.saturating_add(buf.len() as u64);
+        if self.bytes > self.caps.bytes {
+            return self.halt(Stop::Bytes);
+        }
+        self.f.read_exact(buf).ok()
+    }
+
+    fn read_n<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let mut b = [0u8; N];
+        self.read(&mut b)?;
+        Some(b)
+    }
+
+    fn sought(&mut self) -> Option<()> {
+        self.seeks += 1;
+        if self.seeks > self.caps.seeks {
+            return self.halt(Stop::Seeks);
         }
         Some(())
     }
 
-    /// The error for a walk that stopped: too many blocks, or damaged headers.
-    fn error(&self, what: &str) -> io::Error {
-        if self.exceeded {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "the {what} file has more than {} blocks; it is not read",
-                    self.max
-                ),
-            )
-        } else {
-            bad_headers(what)
+    /// Skip `n` bytes forward.
+    fn skip(&mut self, n: u64) -> Option<()> {
+        self.sought()?;
+        self.f.seek_relative(i64::try_from(n).ok()?).ok()
+    }
+
+    fn seek_to(&mut self, pos: u64) -> Option<()> {
+        self.sought()?;
+        self.f.seek(SeekFrom::Start(pos)).ok().map(|_| ())
+    }
+
+    /// Count one block header; every [`TICK_BLOCKS`], check cancel and report `walked`.
+    fn block(&mut self, walked: u64) -> Option<()> {
+        self.blocks += 1;
+        if self.blocks > self.caps.blocks {
+            return self.halt(Stop::Blocks);
+        }
+        if self.blocks.is_multiple_of(TICK_BLOCKS) {
+            self.tick(walked)?;
+        }
+        Some(())
+    }
+
+    /// Check cancel, and report `walked` bytes of the file as done.
+    fn tick(&mut self, walked: u64) -> Option<()> {
+        let Some(ctx) = self.ctx else {
+            return Some(());
+        };
+        if ctx.cancel.check().is_err() {
+            return self.halt(Stop::Cancelled);
+        }
+        let walked = walked.min(self.len);
+        if walked > self.reported {
+            ctx.progress.add_bytes(walked - self.reported);
+            self.reported = walked;
+            self.reports += 1;
+        }
+        Some(())
+    }
+
+    /// The walk is over: its progress is complete.
+    fn done(&mut self) {
+        #[cfg(test)]
+        LAST_WALK.with(|c| c.set((self.blocks, self.reports)));
+        if let Some(ctx) = self.ctx {
+            ctx.progress
+                .add_bytes(self.len.saturating_sub(self.reported));
+            self.reported = self.len;
+            ctx.progress.set_note("");
+        }
+    }
+
+    /// The error for a walk that stopped: a cap, cancel, or damaged headers.
+    fn error(&mut self, what: &str) -> io::Error {
+        #[cfg(test)]
+        LAST_WALK.with(|c| c.set((self.blocks, self.reports)));
+        let over = |text: String| io::Error::new(io::ErrorKind::InvalidData, text);
+        match self.stop {
+            Some(Stop::Cancelled) => io::Error::other(super::tar_backend::Cancelled),
+            Some(Stop::Blocks) => over(format!(
+                "the {what} file has more than {} blocks; it is not read",
+                self.caps.blocks
+            )),
+            Some(Stop::Bytes) => over(format!(
+                "reading the {what} file's headers takes more than {} MiB; it is not read",
+                self.caps.bytes >> 20
+            )),
+            Some(Stop::Seeks) => over(format!(
+                "reading the {what} file's headers takes more than {} seeks; it is not read",
+                self.caps.seeks
+            )),
+            None => bad_headers(what),
         }
     }
 }
 
-/// Read the headers of the compressed file at `path` (see [`StreamInfo`]). An error when they
-/// can't be read, or ask for something the decoders refuse (a large-window Brotli stream).
-pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
+/// Read the headers of the compressed file at `path` (see [`StreamInfo`]) within the walk
+/// caps of [`WalkCaps::full`], checking `ctx` for cancel and reporting progress to it. An
+/// error when they can't be read, go past the caps, or ask for something the decoders
+/// refuse (a large-window Brotli stream, a Zstandard window over 128 MiB).
+pub(crate) fn stream_info(
+    codec: Codec,
+    path: &Path,
+    ctx: Option<&JobCtx<'_>>,
+) -> io::Result<StreamInfo> {
+    stream_info_with(codec, path, WalkCaps::full(), ctx)
+}
+
+/// [`stream_info`] within `caps`.
+pub(crate) fn stream_info_with(
+    codec: Codec,
+    path: &Path,
+    caps: WalkCaps,
+    ctx: Option<&JobCtx<'_>>,
+) -> io::Result<StreamInfo> {
     let fixed = |checked, memory| StreamInfo {
         checked,
         memory,
         size: None,
     };
-    Ok(match codec {
+    let walk =
+        |what: &str, f: &dyn Fn(&mut Work) -> Option<StreamInfo>| -> io::Result<StreamInfo> {
+            let mut work = Work::open(path, caps, ctx)?;
+            match f(&mut work) {
+                Some(info) => {
+                    work.done();
+                    Ok(info)
+                }
+                None => Err(work.error(what)),
+            }
+        };
+    let info = match codec {
         Codec::None => fixed(false, 0),
         Codec::Gzip => fixed(true, GZIP_MEMORY),
         Codec::Bzip2 => fixed(true, BZIP2_MEMORY),
-        Codec::Xz => {
-            let mut work = Work::new();
-            let x = xz_streams(path, &mut work).ok_or_else(|| work.error("xz"))?;
-            let size = std::fs::File::open(path)
-                .ok()
-                .and_then(|f| lzma_rust2::xz_uncompressed_size(BufReader::new(f)).ok());
-            StreamInfo {
+        Codec::Xz => walk("xz", &|w| {
+            let x = xz_streams(w)?;
+            Some(StreamInfo {
                 checked: x.checked,
                 memory: u64::from(lzma_rust2::lzma2_get_memory_usage(x.dict)) * 1024,
-                size,
-            }
-        }
+                size: x.size,
+            })
+        })?,
         Codec::Zstd => {
-            let mut work = Work::new();
-            let z = zstd_frames(path, &mut work).ok_or_else(|| work.error("Zstandard"))?;
-            // The decoder's window limit is a power of two: the window rounded up to one.
-            let log = zstd_window_log(z.window);
+            let z = walk("Zstandard", &|w| {
+                let z = zstd_frames(w)?;
+                // `memory` holds the largest window until it is checked below.
+                Some(StreamInfo {
+                    checked: z.checked,
+                    memory: z.window,
+                    size: z.size,
+                })
+            })?;
+            // The decoder limits its window to a power of two: the window rounded up to one.
+            let log = zstd_window_log(z.memory);
             if log > ZSTD_WINDOW_LOG_MAX {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
                         "a Zstandard window of {} MiB (at most 128 MiB is supported)",
-                        z.window.div_ceil(1 << 20)
+                        z.memory.div_ceil(1 << 20)
                     ),
                 ));
             }
+            // The window, plus a block's buffers.
             StreamInfo {
-                checked: z.checked,
-                // The window, plus a block's buffers.
                 memory: (1u64 << log).saturating_add(1 << 20),
-                size: z.size,
+                ..z
             }
         }
-        Codec::Lz4 => {
-            let mut work = Work::new();
-            let l = lz4_frames(path, &mut work).ok_or_else(|| work.error("LZ4"))?;
+        Codec::Lz4 => walk("LZ4", &|w| {
+            let l = lz4_frames(w)?;
             // Compressed and decoded blocks, and a linked block's 64 KiB window.
-            fixed(
+            Some(fixed(
                 l.checked,
                 l.block.saturating_mul(3).saturating_add(64 << 10),
-            )
-        }
+            ))
+        })?,
         Codec::Brotli => {
             let mut head = [0u8; 2];
             let n = std::fs::File::open(path)?.read(&mut head)?;
@@ -288,7 +464,8 @@ pub(crate) fn stream_info(codec: Codec, path: &Path) -> io::Result<StreamInfo> {
             })?;
             fixed(false, window.saturating_add(256 << 10))
         }
-    })
+    };
+    Ok(info)
 }
 
 /// The smallest window log (power of two, at least Zstandard's 2^10) holding `window`.
@@ -326,47 +503,33 @@ fn brotli_window(head: &[u8]) -> Option<u64> {
 /// What the frame headers of a Zstandard file say.
 struct ZstdFrames {
     /// The total size, when every frame states its own.
-    pub size: Option<u64>,
+    size: Option<u64>,
     /// Every frame has a content checksum.
-    pub checked: bool,
+    checked: bool,
     /// The largest window a frame needs.
-    pub window: u64,
-}
-
-fn skip(f: &mut BufReader<File>, n: u64) -> Option<()> {
-    f.seek_relative(i64::try_from(n).ok()?).ok()
-}
-
-fn read_n<const N: usize>(f: &mut BufReader<File>) -> Option<[u8; N]> {
-    let mut b = [0u8; N];
-    f.read_exact(&mut b).ok()?;
-    Some(b)
+    window: u64,
 }
 
 /// Walk a Zstandard file's frame and block headers (blocks are skipped by their sizes).
-/// `None` when it isn't well-formed.
-fn zstd_frames(path: &Path, work: &mut Work) -> Option<ZstdFrames> {
-    let mut f = BufReader::new(File::open(path).ok()?);
-    let len = f.get_ref().metadata().ok()?.len();
-    let (mut pos, mut total, mut frames) = (0u64, Some(0u64), 0u32);
+/// `None` when it isn't well-formed or the walk stopped.
+fn zstd_frames(w: &mut Work) -> Option<ZstdFrames> {
+    let len = w.len;
+    let (mut pos, mut total) = (0u64, Some(0u64));
     let mut checked = true;
     let mut window = 0u64;
     while pos < len {
-        frames += 1;
-        if frames > 1_000_000 {
-            return None;
-        }
-        let m = u32::from_le_bytes(read_n::<4>(&mut f)?);
+        w.block(pos)?;
+        let m = u32::from_le_bytes(w.read_n::<4>()?);
         if (0x184d_2a50..=0x184d_2a5f).contains(&m) {
-            let n = u64::from(u32::from_le_bytes(read_n::<4>(&mut f)?));
-            skip(&mut f, n)?;
+            let n = u64::from(u32::from_le_bytes(w.read_n::<4>()?));
+            w.skip(n)?;
             pos = pos.checked_add(8 + n)?;
             continue;
         }
         if m != 0xfd2f_b528 {
             return None;
         }
-        let fhd = read_n::<1>(&mut f)?[0];
+        let fhd = w.read_n::<1>()?[0];
         let single = fhd & 0x20 != 0;
         checked &= fhd & 0x04 != 0;
         let dict = [0u64, 1, 2, 4][usize::from(fhd & 3)];
@@ -381,14 +544,14 @@ fn zstd_frames(path: &Path, work: &mut Work) -> Option<ZstdFrames> {
             None
         } else {
             // Window_Descriptor: exponent and mantissa.
-            let wd = read_n::<1>(&mut f)?[0];
+            let wd = w.read_n::<1>()?[0];
             let log = 10 + u32::from(wd >> 3);
             let base = 1u64 << log;
             Some(base + (base / 8) * u64::from(wd & 7))
         };
-        skip(&mut f, dict)?;
+        w.skip(dict)?;
         let mut fcs = [0u8; 8];
-        f.read_exact(&mut fcs[..fcs_len as usize]).ok()?;
+        w.read(&mut fcs[..fcs_len as usize])?;
         let content = match fcs_len {
             0 => None,
             2 => Some(u64::from_le_bytes(fcs) + 256),
@@ -399,22 +562,22 @@ fn zstd_frames(path: &Path, work: &mut Work) -> Option<ZstdFrames> {
         window = window.max(frame_window.or(content)?);
         pos = pos.checked_add(5 + u64::from(!single) + dict + fcs_len)?;
         loop {
-            work.blocks(1)?;
-            let bh = read_n::<3>(&mut f)?;
+            w.block(pos)?;
+            let bh = w.read_n::<3>()?;
             let h = u32::from(bh[0]) | u32::from(bh[1]) << 8 | u32::from(bh[2]) << 16;
             let stored = match (h >> 1) & 3 {
                 0 | 2 => u64::from(h >> 3),
                 1 => 1,
                 _ => return None,
             };
-            skip(&mut f, stored)?;
+            w.skip(stored)?;
             pos = pos.checked_add(3 + stored)?;
             if h & 1 != 0 {
                 break;
             }
         }
         if fhd & 0x04 != 0 {
-            skip(&mut f, 4)?;
+            w.skip(4)?;
             pos = pos.checked_add(4)?;
         }
     }
@@ -432,24 +595,19 @@ struct Lz4Frames {
     block: u64,
 }
 
-fn lz4_frames(path: &Path, work: &mut Work) -> Option<Lz4Frames> {
-    let mut f = BufReader::new(File::open(path).ok()?);
-    let len = f.get_ref().metadata().ok()?.len();
+fn lz4_frames(w: &mut Work) -> Option<Lz4Frames> {
+    let len = w.len;
     let mut pos = 0u64;
-    let mut frames = 0u32;
     let mut out = Lz4Frames {
         checked: true,
         block: 0,
     };
     while pos < len {
-        frames += 1;
-        if frames > 1_000_000 {
-            return None;
-        }
-        let m = u32::from_le_bytes(read_n::<4>(&mut f)?);
+        w.block(pos)?;
+        let m = u32::from_le_bytes(w.read_n::<4>()?);
         if (0x184d_2a50..=0x184d_2a5f).contains(&m) {
-            let n = u64::from(u32::from_le_bytes(read_n::<4>(&mut f)?));
-            skip(&mut f, n)?;
+            let n = u64::from(u32::from_le_bytes(w.read_n::<4>()?));
+            w.skip(n)?;
             pos = pos.checked_add(8 + n)?;
             continue;
         }
@@ -462,7 +620,7 @@ fn lz4_frames(path: &Path, work: &mut Work) -> Option<Lz4Frames> {
         if m != 0x184d_2204 {
             return None;
         }
-        let [flg, bd] = read_n::<2>(&mut f)?;
+        let [flg, bd] = w.read_n::<2>()?;
         let block_sums = flg & 0x10 != 0;
         out.checked &= flg & 0x04 != 0 || block_sums;
         let block: u64 = match (bd >> 4) & 7 {
@@ -474,21 +632,21 @@ fn lz4_frames(path: &Path, work: &mut Work) -> Option<Lz4Frames> {
         };
         out.block = out.block.max(block);
         let extra = 1 + if flg & 0x08 != 0 { 8 } else { 0 } + if flg & 0x01 != 0 { 4 } else { 0 };
-        skip(&mut f, extra)?;
+        w.skip(extra)?;
         pos = pos.checked_add(6 + extra)?;
         loop {
-            work.blocks(1)?;
-            let size = u32::from_le_bytes(read_n::<4>(&mut f)?);
+            w.block(pos)?;
+            let size = u32::from_le_bytes(w.read_n::<4>()?);
             pos = pos.checked_add(4)?;
             if size == 0 {
                 break;
             }
             let n = u64::from(size & 0x7fff_ffff) + if block_sums { 4 } else { 0 };
-            skip(&mut f, n)?;
+            w.skip(n)?;
             pos = pos.checked_add(n)?;
         }
         if flg & 0x04 != 0 {
-            skip(&mut f, 4)?;
+            w.skip(4)?;
             pos = pos.checked_add(4)?;
         }
     }
@@ -500,84 +658,107 @@ struct XzStreams {
     checked: bool,
     /// The largest LZMA2 dictionary of any block.
     dict: u32,
+    /// The decoded size, from the indexes.
+    size: Option<u64>,
 }
 
-/// Walk an xz file from its end: stream footers, indexes, stream headers and every block
-/// header (concatenated streams and stream padding allowed).
-fn xz_streams(path: &Path, work: &mut Work) -> Option<XzStreams> {
-    let mut f = File::open(path).ok()?;
-    let mut end = f.metadata().ok()?.len();
-    let at = |f: &mut File, pos: u64, buf: &mut [u8]| -> Option<()> {
-        f.seek(SeekFrom::Start(pos)).ok()?;
-        f.read_exact(buf).ok()
-    };
+/// The end of the xz data before `end`, past its stream padding (zero bytes, in groups of
+/// four), which is read backwards in [`PADDING_CHUNK`]s. `None` for a file of only padding.
+fn xz_unpadded_end(w: &mut Work, mut end: u64) -> Option<u64> {
+    if !end.is_multiple_of(4) {
+        return None;
+    }
+    let mut chunk = vec![0u8; PADDING_CHUNK];
+    while end > 0 {
+        w.tick(w.len - end)?;
+        let n = (end.min(PADDING_CHUNK as u64)) as usize;
+        let start = end - n as u64;
+        w.seek_to(start)?;
+        w.read(&mut chunk[..n])?;
+        if let Some(last) = chunk[..n].iter().rposition(|&b| b != 0) {
+            // The word holding the last non-zero byte ends the data.
+            return Some(start + (last as u64 / 4 + 1) * 4);
+        }
+        end = start;
+    }
+    None
+}
+
+fn varint(buf: &[u8], p: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    for i in 0..9 {
+        let b = *buf.get(*p)?;
+        *p += 1;
+        v |= u64::from(b & 0x7f) << (7 * i);
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Walk an xz file from its end: stream padding, footers, indexes, stream headers and every
+/// block header (concatenated streams allowed).
+fn xz_streams(w: &mut Work) -> Option<XzStreams> {
+    let len = w.len;
+    let mut end = len;
     let mut out = XzStreams {
         checked: true,
         dict: 0,
+        size: Some(0),
     };
     let mut streams = 0u32;
-    while end > 0 {
+    loop {
+        end = xz_unpadded_end(w, end)?;
         streams += 1;
         if streams > 100_000 {
             return None;
         }
-        // Stream padding: groups of four zero bytes.
-        let mut word = [0u8; 4];
-        loop {
-            at(&mut f, end.checked_sub(4)?, &mut word)?;
-            if word != [0; 4] {
-                break;
-            }
-            end -= 4;
-        }
         let mut footer = [0u8; 12];
-        at(&mut f, end.checked_sub(12)?, &mut footer)?;
+        w.seek_to(end.checked_sub(12)?)?;
+        w.read(&mut footer)?;
         if &footer[10..12] != b"YZ" || footer[8] != 0 {
             return None;
         }
         out.checked &= footer[9] & 0x0f != 0;
         let backward = u64::from(u32::from_le_bytes(footer[4..8].try_into().ok()?));
         let index_size = (backward + 1) * 4;
-        if index_size > 64 << 20 {
+        // Charged before it is allocated.
+        if w.bytes.saturating_add(index_size) > w.caps.bytes {
+            w.halt(Stop::Bytes);
             return None;
         }
         let index_start = end.checked_sub(12 + index_size)?;
         let mut index = vec![0u8; index_size as usize];
-        at(&mut f, index_start, &mut index)?;
+        w.seek_to(index_start)?;
+        w.read(&mut index)?;
         if index.first() != Some(&0) {
             return None;
         }
         // The records are read twice, never kept: once for the blocks' total size (where
-        // the stream starts), once for each block's header. Their count is checked first,
-        // against the work budget and what the index can hold (two bytes a record at least).
-        let varint = |p: &mut usize| -> Option<u64> {
-            let mut v = 0u64;
-            for i in 0..9 {
-                let b = *index.get(*p)?;
-                *p += 1;
-                v |= u64::from(b & 0x7f) << (7 * i);
-                if b & 0x80 == 0 {
-                    return Some(v);
-                }
-            }
-            None
-        };
+        // the stream starts) and the decoded size, once for each block's header. Their
+        // count is checked first, against the block cap and what the index can hold (two
+        // bytes a record at least).
         let mut p = 1usize;
-        let records = varint(&mut p)?;
-        if records > (index.len() as u64) / 2 {
+        let records = varint(&index, &mut p)?;
+        if records > (index.len() as u64) / 2 || w.blocks.saturating_add(records) > w.caps.blocks {
+            if records <= (index.len() as u64) / 2 {
+                w.halt(Stop::Blocks);
+            }
             return None;
         }
-        work.blocks(records)?;
         let first_record = p;
         let mut blocks = 0u64;
         for _ in 0..records {
-            let unpadded = varint(&mut p)?;
-            varint(&mut p)?;
+            let unpadded = varint(&index, &mut p)?;
+            let decoded = varint(&index, &mut p)?;
             blocks = blocks.checked_add(unpadded.checked_add(3)? & !3)?;
+            out.size = out.size.and_then(|s| s.checked_add(decoded));
         }
         let start = index_start.checked_sub(blocks)?.checked_sub(12)?;
         let mut header = [0u8; 12];
-        at(&mut f, start, &mut header)?;
+        w.seek_to(start)?;
+        w.read(&mut header)?;
         if !header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) || header[6..8] != footer[8..10]
         {
             return None;
@@ -586,51 +767,41 @@ fn xz_streams(path: &Path, work: &mut Work) -> Option<XzStreams> {
         let mut block_at = start + 12;
         let mut p = first_record;
         for _ in 0..records {
-            let unpadded = varint(&mut p)?;
-            varint(&mut p)?;
-            out.dict = out.dict.max(xz_block_dict(&mut f, block_at)?);
+            w.block(len - index_start + (block_at - start))?;
+            let unpadded = varint(&index, &mut p)?;
+            varint(&index, &mut p)?;
+            out.dict = out.dict.max(xz_block_dict(w, block_at)?);
             block_at = block_at.checked_add(unpadded.checked_add(3)? & !3)?;
         }
         end = start;
+        if end == 0 {
+            return Some(out);
+        }
     }
-    Some(out)
 }
 
 /// The LZMA2 dictionary size in the xz block header at `pos`.
-fn xz_block_dict(f: &mut File, pos: u64) -> Option<u32> {
-    let mut first = [0u8; 1];
-    f.seek(SeekFrom::Start(pos)).ok()?;
-    f.read_exact(&mut first).ok()?;
-    if first[0] == 0 {
+fn xz_block_dict(w: &mut Work, pos: u64) -> Option<u32> {
+    w.seek_to(pos)?;
+    let first = w.read_n::<1>()?[0];
+    if first == 0 {
         return None;
     }
-    let len = (usize::from(first[0]) + 1) * 4;
+    let len = (usize::from(first) + 1) * 4;
     let mut h = vec![0u8; len - 1];
-    f.read_exact(&mut h).ok()?;
+    w.read(&mut h)?;
     let flags = h[0];
     let mut p = 1usize;
-    let varint = |p: &mut usize| -> Option<u64> {
-        let mut v = 0u64;
-        for i in 0..9 {
-            let b = *h.get(*p)?;
-            *p += 1;
-            v |= u64::from(b & 0x7f) << (7 * i);
-            if b & 0x80 == 0 {
-                return Some(v);
-            }
-        }
-        None
-    };
     if flags & 0x40 != 0 {
-        varint(&mut p)?;
+        varint(&h, &mut p)?;
     }
     if flags & 0x80 != 0 {
-        varint(&mut p)?;
+        varint(&h, &mut p)?;
     }
     let mut dict = None;
     for _ in 0..(flags & 3) + 1 {
-        let id = varint(&mut p)?;
-        let props = usize::try_from(varint(&mut p)?).ok()?;
+        let id = varint(&h, &mut p)?;
+        let props = usize::try_from(varint(&h, &mut p)?).ok()?;
         let bytes = h.get(p..p.checked_add(props)?)?;
         if id == 0x21 {
             // LZMA2: one byte, the dictionary size.
