@@ -567,6 +567,7 @@ pub fn copy_file_atomic(
             still_ok: None,
             still_ok_message: None,
             replace: None,
+            identity: None,
         },
     )
 }
@@ -595,6 +596,7 @@ pub fn copy_file_atomic_guarded(
             still_ok: Some(still_ok),
             still_ok_message: Some("destination changed since preview; it was not overwritten"),
             replace: None,
+            identity: None,
         },
     )
 }
@@ -646,11 +648,12 @@ pub fn write_stream_atomic<R: Read>(
     opts: StreamOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<CopyOutcome> {
-    write_stream_placed(reader, label, dest, opts, false, ctx).map(|(out, _)| out)
+    write_stream_placed(reader, label, dest, opts, false, ctx).map(|(out, _, _)| out)
 }
 
 /// Like [`write_stream_atomic`], but when `keep_both` is set and `dest` is taken at publish
-/// time, the next free name is used. Returns the final path actually written.
+/// time, the next free name is used. Returns the final path actually written and the
+/// identity of the file published there (read from the handle that wrote it).
 pub(crate) fn write_stream_placed<R: Read>(
     reader: R,
     label: &Path,
@@ -658,17 +661,94 @@ pub(crate) fn write_stream_placed<R: Read>(
     opts: StreamOptions,
     keep_both: bool,
     ctx: &JobCtx<'_>,
-) -> Result<(CopyOutcome, PathBuf)> {
+) -> Result<(CopyOutcome, PathBuf, Option<FileIdentity>)> {
     let mut counted = 0;
     let mut placed = dest.to_path_buf();
+    let identity = Cell::new(None);
     let publish = Publish {
         keep_both,
         still_ok: None,
         still_ok_message: None,
         replace: None,
+        identity: Some(&identity),
     };
     let out = stream_into_place(reader, label, &mut placed, opts, ctx, &mut counted, publish)?;
-    Ok((out, placed))
+    Ok((out, placed, identity.get()))
+}
+
+/// What a file or folder is, independent of its name: a file written anew under the same
+/// name (deleted and re-created, or renamed over) is a different one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileIdentity {
+    /// The volume serial and 128-bit file id (`FILE_ID_INFO`).
+    Id { volume: u64, id: [u8; 16] },
+    /// Where the volume gives no file id (some FAT and network volumes): creation time,
+    /// last write time and size (both 0 for a folder, whose write time changes with its
+    /// contents). A replacement made with the same times and size is not told apart.
+    Weak {
+        created: u64,
+        modified: u64,
+        size: u64,
+    },
+}
+
+impl FileIdentity {
+    /// The identity of the open file, `None` when nothing can be read.
+    pub(crate) fn of(file: &File) -> Option<Self> {
+        Self::read(file, false)
+    }
+
+    /// [`FileIdentity::of`] for a folder.
+    pub(crate) fn of_dir(file: &File) -> Option<Self> {
+        Self::read(file, true)
+    }
+
+    #[cfg(windows)]
+    fn read(file: &File, dir: bool) -> Option<Self> {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: `info` is a FILE_ID_INFO of the size passed; the handle is open.
+        let read = unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if read.is_ok() && info.FileId.Identifier.iter().any(|b| *b != 0) {
+            return Some(Self::Id {
+                volume: info.VolumeSerialNumber,
+                id: info.FileId.Identifier,
+            });
+        }
+        let md = file.metadata().ok()?;
+        Some(Self::Weak {
+            created: md.creation_time(),
+            modified: if dir { 0 } else { md.last_write_time() },
+            size: if dir { 0 } else { md.file_size() },
+        })
+    }
+
+    #[cfg(not(windows))]
+    fn read(file: &File, dir: bool) -> Option<Self> {
+        let md = file.metadata().ok()?;
+        let nanos = |t: std::io::Result<SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64)
+        };
+        Some(Self::Weak {
+            created: nanos(md.created()),
+            modified: if dir { 0 } else { nanos(md.modified()) },
+            size: if dir { 0 } else { md.len() },
+        })
+    }
 }
 
 /// A finished temp file not published yet (see [`write_stream_held`]). Its handle stays
@@ -711,6 +791,11 @@ impl HeldFile {
             }
         }
         Err(CoreError::AlreadyExists(self.dest.clone()))
+    }
+
+    /// The identity of the held file, which publishing keeps.
+    pub(crate) fn identity(&self) -> Option<FileIdentity> {
+        self.file.as_ref().and_then(FileIdentity::of)
     }
 
     /// The temp file's path (tests).
@@ -928,7 +1013,7 @@ fn rename_open(_file: &File, from: &Path, to: &Path, replace: bool) -> io::Resul
 /// Delete the file open as `file` (at `from`) through its handle (POSIX semantics where
 /// supported); it goes when the handle closes.
 #[cfg(windows)]
-fn delete_open(file: &File, _from: &Path) -> io::Result<()> {
+pub(crate) fn delete_open(file: &File, _from: &Path) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
@@ -968,7 +1053,7 @@ fn delete_open(file: &File, _from: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn delete_open(_file: &File, from: &Path) -> io::Result<()> {
+pub(crate) fn delete_open(_file: &File, from: &Path) -> io::Result<()> {
     fs::remove_file(from)
 }
 
@@ -982,6 +1067,8 @@ struct Publish<'a> {
     /// checking `still_ok` and renaming over it. The cell receives the previous version's
     /// path when it could not be deleted afterwards.
     replace: Option<(&'a ReplaceState, &'a Cell<Option<PathBuf>>)>,
+    /// Receives the identity of the file written, read from its handle before it is closed.
+    identity: Option<&'a Cell<Option<FileIdentity>>>,
 }
 
 fn stream_into_place<R: Read>(
@@ -998,6 +1085,7 @@ fn stream_into_place<R: Read>(
         still_ok,
         still_ok_message,
         replace,
+        identity,
     } = publish;
     let dir = dest
         .parent()
@@ -1070,6 +1158,10 @@ fn stream_into_place<R: Read>(
     }
     out.sync_all()
         .map_err(|e| CoreError::io(dest.as_path(), e))?;
+    if let Some(cell) = identity {
+        // A rename keeps it: this is the file published below.
+        cell.set(FileIdentity::of(&out));
+    }
     drop(out);
 
     let source_hash = hasher.map(|h| *h.finalize().as_bytes());
@@ -2549,6 +2641,7 @@ impl Executor<'_, '_, '_> {
                     .as_ref()
                     .filter(|_| overwrite)
                     .map(|state| (state, &replace_leftover)),
+                identity: None,
             },
         );
         self.ctx.progress.add_items(1);

@@ -115,7 +115,12 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   archive is planned), and every folder from the volume root down stays open until the job
   ends, so none can be renamed, deleted or replaced by a junction meanwhile. A folder the
   extraction makes (*Extract to `<name>\`*, smart, selections) is held from the moment it is
-  made, and taking back a cancelled extraction happens while it is still held. Not covered:
+  made, and taking back a cancelled extraction happens while it is still held. Each folder is
+  opened relative to the one above it, and the last must be the folder the path resolved to, or
+  the job is refused. Taking back removes only what the job made that is still the same item
+  (Windows file ID; where a volume has none, some FAT and network volumes, its creation time,
+  write time and size): anything replaced meanwhile is left in place and reported. Without a
+  file ID, a replacement with the same times and size is not told apart. Not covered:
   changes before the job starts (a junction or mapped drive in the chosen path is followed, as
   it is then); in the instant between making a new folder and holding it, someone allowed to
   rename in its parent can swap it for another real folder (never a link), and files then still

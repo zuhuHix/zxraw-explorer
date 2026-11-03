@@ -940,6 +940,97 @@ fn taking_back_a_cancelled_extraction_stays_in_its_folder() {
     assert!(!made.exists());
 }
 
+#[cfg(windows)]
+#[test]
+fn taking_back_a_cancelled_extraction_leaves_a_replaced_file_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let archive = d.path().join("photos.zip");
+    zip_of(
+        &archive,
+        &[
+            ("a.txt", b"first"),
+            ("b.txt", b"second"),
+            ("sub/c.txt", b"third"),
+        ],
+    );
+    let made = parent.join("photos");
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    // Cancelled once `a.txt` and `b.txt` are in place, as `sub` is made.
+    let token = cancel.clone();
+    let cancel_hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |_| {
+        token.cancel()
+    });
+    // Before what it wrote is taken back, another program replaces `a.txt` with a file of
+    // its own under the same name (a different file, not the one extracted).
+    let made_h = made.clone();
+    let cleanup_hook = Hook::set(&super::safety::BEFORE_CREATED_CLEANUP, move |_| {
+        fs::remove_file(made_h.join("a.txt")).unwrap();
+        fs::write(made_h.join("a.txt"), b"not from the archive").unwrap();
+    });
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(
+        &archive,
+        &parent,
+        ExtractTarget::NamedFolder,
+        &ExtractOptions::default(),
+        &ctx,
+    );
+    drop((cancel_hook, cleanup_hook));
+    let report = report.unwrap();
+    assert!(report.cancelled, "{report:?}");
+    // The replacement survives byte for byte; what the job wrote is gone.
+    assert_eq!(
+        fs::read(made.join("a.txt")).unwrap(),
+        b"not from the archive"
+    );
+    assert!(!made.join("b.txt").exists());
+    assert!(!made.join("sub").exists());
+    let names: Vec<_> = fs::read_dir(&made)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("a.txt")]);
+    // And it is reported.
+    let issue = report
+        .failed
+        .iter()
+        .find(|i| i.path == made.join("a.txt"))
+        .unwrap_or_else(|| panic!("not reported: {report:?}"));
+    assert!(
+        issue.reason.contains("changed by another program"),
+        "{issue:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_destination_folder_swapped_while_it_is_pinned_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("a").join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    zip_of(&d.path().join("x.zip"), &[("x.txt", b"inside")]);
+    // Between resolving the destination and pinning its folders, another program moves a
+    // folder of its path away and puts a different real folder (with a `dest`) at its name.
+    let (a, d_h) = (d.path().join("a"), d.path().to_path_buf());
+    let hook = Hook::set(&super::safety::BEFORE_BASE_PIN, move |_| {
+        fs::rename(&a, d_h.join("a_old")).unwrap();
+        fs::create_dir_all(a.join("dest")).unwrap();
+    });
+    let result = ctx_run(&d.path().join("x.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    assert!(
+        matches!(result, Err(CoreError::UnsafePath(_))),
+        "{result:?}"
+    );
+    // Nothing was written to the substitute, nor to the original.
+    assert!(is_empty_dir(&dest), "{result:?}");
+    assert!(is_empty_dir(&d.path().join("a_old").join("dest")));
+    // Unhindered, the same destination works.
+    ctx_run(&d.path().join("x.zip"), &dest, &ExtractOptions::default()).unwrap();
+    assert_eq!(fs::read(dest.join("x.txt")).unwrap(), b"inside");
+}
+
 /// Set the method of the entry `name` to `method` in its local and central headers.
 fn set_method(bytes: &mut [u8], name: &[u8], method: u16) {
     let mut set = 0;

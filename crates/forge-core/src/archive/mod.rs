@@ -831,11 +831,20 @@ pub fn extract(
     // the (possibly long) planning: entries are written beneath its final path and reported
     // beneath `dest_dir`.
     let base = safety::PinnedBase::open(dest_dir)?;
-    extract_pinned(archive, &base, dest_dir, opts, selection, ctx)
+    extract_pinned(archive, &base, dest_dir, opts, selection, ctx, None)
+}
+
+/// Something an extraction put in place: a file it published or a folder it made, beneath
+/// its destination, with the identity it had then.
+struct Published {
+    rel: PathBuf,
+    identity: Option<ops::FileIdentity>,
+    dir: bool,
 }
 
 /// [`extract`] into `base`, a destination already pinned (with its ancestors, while the
-/// caller holds them); reports show paths beneath `dest_dir`.
+/// caller holds them); reports show paths beneath `dest_dir`. With `track`, every file
+/// published and folder made is recorded there as it happens (kept when the job fails).
 fn extract_pinned(
     archive: &Path,
     base: &safety::PinnedBase,
@@ -843,7 +852,19 @@ fn extract_pinned(
     opts: &ExtractOptions,
     selection: Option<&Selection>,
     ctx: &JobCtx<'_>,
+    track: Option<&std::cell::RefCell<Vec<Published>>>,
 ) -> Result<ExtractReport> {
+    let record = |path: &Path, identity: Option<ops::FileIdentity>, dir: bool| {
+        if let Some(track) = track
+            && let Ok(rel) = path.strip_prefix(base.root())
+        {
+            track.borrow_mut().push(Published {
+                rel: rel.to_path_buf(),
+                identity,
+                dir,
+            });
+        }
+    };
     #[cfg(test)]
     safety::run_hook(&safety::AFTER_DEST_PINNED, base.root());
     let backend = backend_for_file(archive)?;
@@ -1033,7 +1054,8 @@ fn extract_pinned(
             p.rel.parent().unwrap_or(Path::new(""))
         };
         // Held until the entry is in place: the folders it is written into can't be swapped.
-        let pinned = match safety::pin_dirs(base, parent_rel) {
+        let mut made = |rel: &Path, identity| record(&root.join(rel), identity, true);
+        let pinned = match safety::pin_dirs_with(base, parent_rel, &mut made) {
             Ok(pinned) => pinned,
             Err(e) => {
                 report
@@ -1105,7 +1127,8 @@ fn extract_pinned(
             };
         }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
-            Ok((out, placed)) => {
+            Ok((out, placed, identity)) => {
+                record(&placed, identity, false);
                 remaining = remaining.saturating_sub(out.bytes);
                 report.bytes += out.bytes;
                 if let Some(zone) = &zone
@@ -1136,10 +1159,12 @@ fn extract_pinned(
                 continue;
             }
             // Still pinned since it was written; renamed through its own handle.
+            let identity = file.identity();
             let published = file.publish();
             drop(pinned);
             match published {
                 Ok(placed) => {
+                    record(&placed, identity, false);
                     if let Some(zone) = &zone
                         && let Err(e) = motw::write_zone(&placed, zone, archive)
                     {
@@ -1460,9 +1485,10 @@ pub struct NewFolder<'a> {
 /// then until the job, including taking back what it wrote, is over. The report's
 /// `created_dest` says whether this call made the folder.
 ///
-/// When it did and `undo_if` holds for the result, the files the report lists as extracted,
-/// then empty folders inside and the folder itself (if empty) are removed again, all while
-/// still pinned.
+/// When it did and `undo_if` holds for the result, the files it published, then the folders
+/// it made (if empty) and the folder itself (if empty) are removed again, all while still
+/// pinned and each only if it is still the item the job made (see [`remove_created_tree`]);
+/// anything replaced meanwhile stays and is added to the report's `failed`.
 pub fn extract_into_folder(
     archive: &Path,
     folder: NewFolder<'_>,
@@ -1490,60 +1516,101 @@ pub fn extract_into_folder(
             return Err(e);
         }
     };
-    let result = extract_pinned(archive, &dest, &shown_dest, opts, selection, ctx).map(|mut r| {
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut result = extract_pinned(
+        archive,
+        &dest,
+        &shown_dest,
+        opts,
+        selection,
+        ctx,
+        Some(&published),
+    )
+    .map(|mut r| {
         r.created_dest = created;
         r
     });
     if created && undo_if(&result) {
         #[cfg(test)]
         safety::run_hook(&safety::BEFORE_CREATED_CLEANUP, dest.root());
-        remove_created_tree(dest, &shown_dest, result.as_ref().ok());
+        let left = remove_created_tree(&parent, dest, &shown_dest, published.into_inner());
+        match &mut result {
+            Ok(report) => report.failed.extend(left),
+            Err(_) => {
+                for issue in left {
+                    tracing::warn!("{}: {}", issue.path.display(), issue.reason);
+                }
+            }
+        }
     }
     drop(parent);
     result
 }
 
-/// Remove the files an extraction placed in the folder it created (`dest`, reported beneath
-/// `shown_dest`), then empty folders in it, deepest first, then the folder itself if nothing
-/// else is in it. Anything not ours stays. The caller still pins the folder's ancestors;
-/// the folders a file or folder is removed from are pinned (and refused if a link) first.
+/// Message for something the extraction wrote that was replaced before it was taken back.
+const CHANGED_AFTER_EXTRACTION: &str = "changed by another program after extraction; left in place";
+
+/// Take back what an extraction put in the folder it created (`dest`, inside `parent`,
+/// reported beneath `shown_dest`): the files it published, then the folders it made, deepest
+/// first, then the folder itself, each only if it is still the one the job put there (same
+/// identity) and a folder only if empty. Each is opened relative to its pinned parent folder
+/// (never through a link) and deleted through that handle. Returns what was left in place
+/// because it changed or could not be removed.
 fn remove_created_tree(
+    parent: &safety::PinnedBase,
     dest: safety::PinnedBase,
     shown_dest: &Path,
-    report: Option<&ExtractReport>,
-) {
-    let root = dest.root().to_path_buf();
-    let no_rel = Path::new("");
-    if let Some(r) = report {
-        for f in &r.extracted {
-            let Ok(rel) = f.strip_prefix(shown_dest) else {
-                continue;
-            };
-            if let Ok(_pins) = safety::pin_existing(&dest, rel.parent().unwrap_or(no_rel)) {
-                let _ = fs::remove_file(root.join(rel));
-            }
-        }
-    }
-    let mut dirs = Vec::new();
-    let _ = ops::walk_tree(&root, &forge_jobs::CancelToken::new(), |item| {
-        if let ops::WalkItem::Entry(e) = item
-            && e.kind == NodeKind::Dir
-        {
-            dirs.push(e.path.clone());
-        }
-    });
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    for d in dirs {
-        let Ok(rel) = d.strip_prefix(&root) else {
+    mut published: Vec<Published>,
+) -> Vec<OpIssue> {
+    let mut left = Vec::new();
+    // Files first, then folders deepest first (a folder only goes once it is empty).
+    published.sort_by_key(|p| (p.dir, std::cmp::Reverse(p.rel.components().count())));
+    for p in &published {
+        let Some(name) = p.rel.file_name() else {
             continue;
         };
-        if let Ok(_pins) = safety::pin_existing(&dest, rel.parent().unwrap_or(no_rel)) {
-            let _ = fs::remove_dir(&d);
+        let parent_rel = p.rel.parent().unwrap_or(Path::new(""));
+        let shown = shown_dest.join(&p.rel);
+        let pins = match safety::pin_existing(&dest, parent_rel) {
+            Ok(pins) => pins,
+            // Its folder is gone: so is it.
+            Err(CoreError::NotFound(_)) => continue,
+            Err(e) => {
+                if !p.dir {
+                    left.push(OpIssue::new(
+                        shown,
+                        format!("its folder changed after extraction; left in place ({e})"),
+                    ));
+                }
+                continue;
+            }
+        };
+        let folder = pins.last().unwrap_or_else(|| dest.handle());
+        match safety::remove_if_same(folder, name, p.dir, p.identity) {
+            safety::Removal::Removed | safety::Removal::Gone | safety::Removal::NotEmpty => {}
+            safety::Removal::Changed => left.push(OpIssue::new(shown, CHANGED_AFTER_EXTRACTION)),
+            safety::Removal::Failed(e) => left.push(OpIssue::new(
+                shown,
+                format!("could not be removed after the extraction stopped: {e}"),
+            )),
         }
     }
-    // Its own pin denies deleting it: let go of it (its ancestors stay pinned).
+    // Its own pin denies deleting it: let go of it (its ancestors stay pinned by `parent`).
+    let identity = dest.identity();
+    let name = dest.root().file_name().map(std::ffi::OsStr::to_os_string);
     drop(dest);
-    let _ = fs::remove_dir(&root);
+    if let Some(name) = name {
+        match safety::remove_if_same(parent.handle(), &name, true, identity) {
+            safety::Removal::Changed => {
+                left.push(OpIssue::new(shown_dest, CHANGED_AFTER_EXTRACTION));
+            }
+            safety::Removal::Failed(e) => {
+                tracing::warn!("could not remove {}: {e}", shown_dest.display());
+            }
+            _ => {}
+        }
+    }
+    left
 }
 
 // ---------------------------------------------------------------------------
