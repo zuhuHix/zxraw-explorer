@@ -32,7 +32,10 @@ mod safety;
 mod sevenz_backend;
 mod sevenz_guard;
 mod sevenz_writer;
+pub mod sfx;
+mod stamp;
 pub mod stage;
+pub use stamp::{ArchiveStamp, archive_stamp};
 mod tar_backend;
 mod tar_read;
 mod tar_write;
@@ -48,6 +51,8 @@ mod tests_codecs;
 mod tests_edit;
 #[cfg(test)]
 mod tests_hostile;
+#[cfg(all(test, windows))]
+mod tests_leftovers;
 #[cfg(test)]
 mod tests_name_collision;
 #[cfg(test)]
@@ -59,9 +64,13 @@ mod tests_sevenz_fixtures;
 #[cfg(test)]
 mod tests_sevenz_hostile;
 #[cfg(test)]
+mod tests_sfx;
+#[cfg(test)]
 mod tests_tar;
 #[cfg(test)]
 mod tests_tar_hostile;
+#[cfg(test)]
+mod tests_stamp;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -456,15 +465,23 @@ pub fn backend_for_name(path: &Path) -> Option<&'static dyn ArchiveBackend> {
         .find(|b| b.extensions().contains(&ext.as_str()))
 }
 
-/// Whether a file name has a browsable archive extension (no I/O).
+/// Whether a file name has a browsable archive extension (no I/O). A `.exe` is not one: it
+/// runs. See [`is_archive_path`] for the one the user opened as an archive.
 pub fn is_archive_name(path: &Path) -> bool {
     backend_for_name(path).is_some()
 }
 
+/// Whether a path may be browsed as an archive: a name with an archive extension, or a file
+/// the user opened as one (a self-extracting `.exe`, see [`sfx::mark_open_as_archive`]).
+pub fn is_archive_path(path: &Path) -> bool {
+    is_archive_name(path) || sfx::is_open_as_archive(path)
+}
+
 /// The backend for an archive file, by what it holds: its signature (a 7z renamed `.zip`
 /// is still read as 7z, and edited as 7z; a compression stream is a tar when a tar header
-/// starts its decoded data, else a single compressed file), then a tar header, then a ZIP
-/// end record near its end (a zip behind a self-extractor stub), then its extension.
+/// starts its decoded data, else a single compressed file), then a tar header, then a
+/// self-extractor's payload (a program stub in front: see [`sfx`]), then a ZIP end record
+/// near its end, then its extension.
 pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     let mut file = fs::File::open(path).map_err(|e| CoreError::io(path, e))?;
     let mut head = [0u8; 512];
@@ -486,6 +503,11 @@ pub fn backend_for_file(path: &Path) -> Result<&'static dyn ArchiveBackend> {
     // Before the end record: a tar whose last file is a zip has one near its end.
     if tar_read::looks_like_tar(&head[..n]) {
         return Ok(tar_backend::tar_backend(Codec::None));
+    }
+    if head[..n].starts_with(b"MZ") {
+        if let Some(b) = sfx::sfx_backend(path)? {
+            return Ok(b);
+        }
     }
     if zip_backend::has_end_record(&mut file) {
         return Ok(&zip_backend::ZIP);
@@ -529,7 +551,7 @@ pub fn split_archive_path(path: &Path) -> Option<(PathBuf, String)> {
     let mut prefix = PathBuf::new();
     for (i, c) in comps.iter().enumerate() {
         prefix.push(c);
-        if !matches!(c, Component::Normal(_)) || !is_archive_name(&prefix) {
+        if !matches!(c, Component::Normal(_)) || !is_archive_path(&prefix) {
             continue;
         }
         if fs::metadata(&prefix).is_ok_and(|m| m.is_file()) {
@@ -552,8 +574,9 @@ pub fn inner_path(archive: &Path, inner: &str) -> PathBuf {
     p
 }
 
-type CacheKey = (PathBuf, u64, Option<SystemTime>);
-type IndexCache = Mutex<lru::LruCache<PathBuf, (CacheKey, Arc<ArchiveIndex>, u64)>>;
+/// Cached indexes by archive path: the [`archive_stamp`] value they were built from, the index,
+/// and its weight. Only strong stamps are cached (see [`index_cached_stamped`]).
+type IndexCache = Mutex<lru::LruCache<PathBuf, (u64, Arc<ArchiveIndex>, u64)>>;
 
 /// Memory the cached indexes may take together (a big tar's names can be hundreds of MB):
 /// the least recently used go first, and one heavier than this isn't kept.
@@ -569,8 +592,8 @@ fn cache() -> &'static IndexCache {
     CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap())))
 }
 
-/// The browsing index of an archive, cached while the file's size and modified time stay
-/// the same (the central directory is read once, not on every folder change).
+/// The browsing index of an archive, cached while its [`archive_stamp`] stays the same (the
+/// central directory is read once, not on every folder change). A weak stamp is never cached.
 pub fn index_cached(archive: &Path) -> Result<Arc<ArchiveIndex>> {
     index_cached_with(archive, None)
 }
@@ -588,14 +611,29 @@ pub fn index_cached_progress(
     password: Option<&Password>,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Arc<ArchiveIndex>> {
-    let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
-    let key: CacheKey = (archive.to_path_buf(), md.len(), md.modified().ok());
+    index_cached_stamped(archive, archive_stamp(archive)?, password, ctx)
+}
+
+/// [`index_cached_progress`] for an archive whose `stamp` ([`archive_stamp`]) the caller took.
+///
+/// A weak stamp (no file id) can't tell a replaced archive from the old one, so its index is
+/// always listed again and not kept. The cost is one listing per call: a zip, 7z or rar reads
+/// its directory; a compressed tar is decoded to its end (the only format where this is slow).
+pub fn index_cached_stamped(
+    archive: &Path,
+    stamp: ArchiveStamp,
+    password: Option<&Password>,
+    ctx: Option<&JobCtx<'_>>,
+) -> Result<Arc<ArchiveIndex>> {
     let lookup = paths::lexical_normalize(archive);
-    if let Some((k, idx, _)) = cache().lock().get(&lookup)
-        && *k == key
+    if let Some((s, idx, _)) = cache().lock().get(&lookup)
+        && stamp.strong
+        && *s == stamp.value
     {
         return Ok(idx.clone());
     }
+    // The tar walk cache is keyed by size and time too: a replaced file must not get its walk.
+    tar_backend::forget(archive);
     let listing = backend_for_file(archive)?.list_progress(
         archive,
         &ExtractLimits::default(),
@@ -606,14 +644,14 @@ pub fn index_cached_progress(
     let weight = index_weight(&idx);
     let mut cache = cache().lock();
     cache.pop(&lookup);
-    if weight <= INDEX_CACHE_BUDGET {
+    if stamp.strong && weight <= INDEX_CACHE_BUDGET {
         let mut total = weight + cache.iter().map(|(_, (_, _, w))| *w).sum::<u64>();
         while total > INDEX_CACHE_BUDGET
             && let Some((_, (_, _, w))) = cache.pop_lru()
         {
             total -= w;
         }
-        cache.put(lookup, (key, idx.clone(), weight));
+        cache.put(lookup, (stamp.value, idx.clone(), weight));
     }
     Ok(idx)
 }
@@ -794,6 +832,49 @@ pub fn extract(
             dest_dir.display()
         )));
     }
+    // The destination, resolved and pinned from the volume root for the whole job, before
+    // the (possibly long) planning: entries are written beneath its final path and reported
+    // beneath `dest_dir`.
+    let base = safety::PinnedBase::open(dest_dir)?;
+    extract_pinned(archive, &base, dest_dir, opts, selection, ctx, None)
+}
+
+/// Something an extraction put in place: a file it published or a folder it made, beneath
+/// its destination, with the identity it had then.
+struct Published {
+    rel: PathBuf,
+    identity: Option<ops::FileIdentity>,
+    dir: bool,
+    /// It replaced a file that was already there: never taken back (the old one is gone).
+    replaced: bool,
+}
+
+/// [`extract`] into `base`, a destination already pinned (with its ancestors, while the
+/// caller holds them); reports show paths beneath `dest_dir`. With `track`, every file
+/// published and folder made is recorded there as it happens (kept when the job fails).
+fn extract_pinned(
+    archive: &Path,
+    base: &safety::PinnedBase,
+    dest_dir: &Path,
+    opts: &ExtractOptions,
+    selection: Option<&Selection>,
+    ctx: &JobCtx<'_>,
+    track: Option<&std::cell::RefCell<Vec<Published>>>,
+) -> Result<ExtractReport> {
+    let record = |path: &Path, identity: Option<ops::FileIdentity>, dir: bool, replaced: bool| {
+        if let Some(track) = track
+            && let Ok(rel) = path.strip_prefix(base.root())
+        {
+            track.borrow_mut().push(Published {
+                rel: rel.to_path_buf(),
+                identity,
+                dir,
+                replaced,
+            });
+        }
+    };
+    #[cfg(test)]
+    safety::run_hook(&safety::AFTER_DEST_PINNED, base.root());
     let backend = backend_for_file(archive)?;
     let limits = &opts.limits;
     let listing = list_cancellable(backend, archive, limits, opts.password.as_ref(), ctx)?;
@@ -929,10 +1010,9 @@ pub fn extract(
     // once to verify their checksum, after the preflight above), then extracted directly.
     let verified_blocks =
         verify_crowded_blocks(backend, archive, password, ctx, &mut planned, &mut report)?;
-    // The destination, resolved and pinned from the volume root for the whole job; entries
-    // are written beneath its final path and reported beneath `dest_dir`.
-    let base = safety::PinnedBase::open(dest_dir)?;
     let root = base.root();
+    // Leftovers of crashed or older runs; before any entry of this job is written.
+    remove_leftovers(base, &planned);
     let zone = if opts.mark_of_the_web {
         motw::read_zone(archive)
     } else {
@@ -958,7 +1038,8 @@ pub fn extract(
     // their folder inside the destination; and what became of them.
     // Each held file keeps its open handle and the pins of the folders it goes into until it
     // is published or dropped: neither it nor its folders can be swapped meanwhile.
-    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs)>> =
+    // Also whether it replaces a file already there.
+    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs, bool)>> =
         Default::default();
     let settled: std::cell::RefCell<(Vec<PathBuf>, Vec<OpIssue>)> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
@@ -982,7 +1063,8 @@ pub fn extract(
             p.rel.parent().unwrap_or(Path::new(""))
         };
         // Held until the entry is in place: the folders it is written into can't be swapped.
-        let pinned = match safety::pin_dirs(&base, parent_rel) {
+        let mut made = |rel: &Path, identity| record(&root.join(rel), identity, true, false);
+        let pinned = match safety::pin_dirs_with(base, parent_rel, &mut made) {
             Ok(pinned) => pinned,
             Err(e) => {
                 report
@@ -1041,7 +1123,8 @@ pub fn extract(
                 Ok((out, file)) => {
                     remaining = remaining.saturating_sub(out.bytes);
                     report.bytes += out.bytes;
-                    held.borrow_mut().push((file, shown(&dest), pinned));
+                    held.borrow_mut()
+                        .push((file, shown(&dest), pinned, overwrite));
                     Ok(())
                 }
                 Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
@@ -1054,7 +1137,9 @@ pub fn extract(
             };
         }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
-            Ok((out, placed)) => {
+            Ok((out, placed, identity)) => {
+                // `overwrite` only when a file had the name: else publishing never replaces.
+                record(&placed, identity, false, overwrite);
                 remaining = remaining.saturating_sub(out.bytes);
                 report.bytes += out.bytes;
                 if let Some(zone) = &zone
@@ -1078,17 +1163,19 @@ pub fn extract(
     let mut block_end = |outcome: Result<()>| -> Result<()> {
         let waiting = std::mem::take(&mut *held.borrow_mut());
         let mut settled = settled.borrow_mut();
-        for (file, label, pinned) in waiting {
+        for (file, label, pinned, replaced) in waiting {
             if outcome.is_err() {
                 drop(file); // deleted through its handle
                 settled.1.push(OpIssue::new(label, BLOCK_CHECK_FAILED));
                 continue;
             }
             // Still pinned since it was written; renamed through its own handle.
+            let identity = file.identity();
             let published = file.publish();
             drop(pinned);
             match published {
                 Ok(placed) => {
+                    record(&placed, identity, false, replaced);
                     if let Some(zone) = &zone
                         && let Err(e) = motw::write_zone(&placed, zone, archive)
                     {
@@ -1367,13 +1454,7 @@ pub fn extract_to(
     ctx: &JobCtx<'_>,
 ) -> Result<ExtractReport> {
     let backend = backend_for_file(archive)?;
-    let listing = list_cancellable(
-        backend,
-        archive,
-        &opts.limits,
-        opts.password.as_ref(),
-        ctx,
-    )?;
+    let listing = list_cancellable(backend, archive, &opts.limits, opts.password.as_ref(), ctx)?;
     let nest = match target {
         ExtractTarget::NamedFolder => true,
         ExtractTarget::Smart => matches!(top_level(&listing), TopLevel::Many),
@@ -1382,72 +1463,178 @@ pub fn extract_to(
         return extract(archive, parent, opts, None, ctx);
     }
     let stem = archive_stem(archive);
-    let dest = parent.join(&stem);
-    let created = match fs::create_dir(&dest) {
-        Ok(()) => true,
-        Err(e)
-            if e.kind() == io::ErrorKind::AlreadyExists && target == ExtractTarget::NamedFolder =>
-        {
-            safety::verify_real_directory(&dest)?;
-            false
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Smart: never merge into an unrelated folder; use the next free name.
-            let fresh = paths::unique_name(parent, &stem);
-            fs::create_dir(&fresh).map_err(|e| CoreError::io(&fresh, e))?;
-            return finish_created(archive, fresh, opts, ctx);
-        }
-        Err(e) => return Err(CoreError::io(&dest, e)),
+    let (name, reuse) = match target {
+        ExtractTarget::NamedFolder => (stem, true),
+        // Smart: never merge into an unrelated folder; use the next free name.
+        ExtractTarget::Smart => (paths::name_of(&paths::unique_name(parent, &stem)), false),
     };
-    if created {
-        finish_created(archive, dest, opts, ctx)
-    } else {
-        extract(archive, &dest, opts, None, ctx)
-    }
-}
-
-fn finish_created(
-    archive: &Path,
-    dest: PathBuf,
-    opts: &ExtractOptions,
-    ctx: &JobCtx<'_>,
-) -> Result<ExtractReport> {
-    let result = extract(archive, &dest, opts, None, ctx).map(|mut r| {
-        r.created_dest = true;
-        r
-    });
-    let failed_empty = match &result {
+    let folder = NewFolder {
+        parent,
+        name: &name,
+        reuse,
+    };
+    extract_into_folder(archive, folder, opts, None, ctx, |result| match result {
         Err(_) => true,
         Ok(r) => r.cancelled || r.extracted.is_empty() && !r.failed.is_empty(),
+    })
+}
+
+/// The folder [`extract_into_folder`] extracts into.
+#[derive(Debug, Clone, Copy)]
+pub struct NewFolder<'a> {
+    /// The existing folder it is made in.
+    pub parent: &'a Path,
+    /// Its name (one plain name, no separators).
+    pub name: &'a str,
+    /// Extract into it when it already exists (a real folder, not a link); else that fails.
+    pub reuse: bool,
+}
+
+/// Make the folder `folder.name` in `folder.parent` and extract `archive` (all of it, or
+/// `selection`) into it. `parent` (from the volume root down) is pinned before the folder is
+/// made, and the folder as soon as it is: neither can be renamed or swapped for a link from
+/// then until the job, including taking back what it wrote, is over. The report's
+/// `created_dest` says whether this call made the folder.
+///
+/// When it did and `undo_if` holds for the result, the files it published, then the folders
+/// it made (if empty) and the folder itself (if empty) are removed again, all while still
+/// pinned and each only if it is still the item the job made (see [`remove_created_tree`]);
+/// a file that replaced one already there, anything replaced meanwhile and anything only the
+/// weak identity (no file id) matched stay and are added to the report's `failed`.
+pub fn extract_into_folder(
+    archive: &Path,
+    folder: NewFolder<'_>,
+    opts: &ExtractOptions,
+    selection: Option<&Selection>,
+    ctx: &JobCtx<'_>,
+    undo_if: impl FnOnce(&Result<ExtractReport>) -> bool,
+) -> Result<ExtractReport> {
+    let name = std::ffi::OsStr::new(folder.name);
+    let shown_dest = folder.parent.join(name);
+    let parent = safety::PinnedBase::open(folder.parent)?;
+    let real = parent.root().join(name);
+    let created = match fs::create_dir(&real) {
+        Ok(()) => true,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.reuse => false,
+        Err(e) => return Err(CoreError::io(&shown_dest, e)),
     };
-    if failed_empty {
-        remove_created_tree(&dest, result.as_ref().ok());
+    // Checked by handle (not a link) and pinned from here on.
+    let dest = match parent.child(name) {
+        Ok(dest) => dest,
+        Err(e) => {
+            if created {
+                let _ = fs::remove_dir(&real); // only if nothing is in it
+            }
+            return Err(e);
+        }
+    };
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut result = extract_pinned(
+        archive,
+        &dest,
+        &shown_dest,
+        opts,
+        selection,
+        ctx,
+        Some(&published),
+    )
+    .map(|mut r| {
+        r.created_dest = created;
+        r
+    });
+    if created && undo_if(&result) {
+        #[cfg(test)]
+        safety::run_hook(&safety::BEFORE_CREATED_CLEANUP, dest.root());
+        let left = remove_created_tree(&parent, dest, &shown_dest, published.into_inner());
+        match &mut result {
+            Ok(report) => report.failed.extend(left),
+            Err(_) => {
+                for issue in left {
+                    tracing::warn!("{}: {}", issue.path.display(), issue.reason);
+                }
+            }
+        }
     }
+    drop(parent);
     result
 }
 
-/// Remove the files a cancelled extraction placed in the folder it created, then the folder
-/// itself if nothing else is in it.
-fn remove_created_tree(dest: &Path, report: Option<&ExtractReport>) {
-    if let Some(r) = report {
-        for f in &r.extracted {
-            let _ = fs::remove_file(f);
+/// Message for something the extraction wrote that was replaced before it was taken back.
+const CHANGED_AFTER_EXTRACTION: &str = "changed by another program after extraction; left in place";
+/// Message for something only the weak identity (no file id) matched: never taken back.
+const UNCONFIRMED: &str = "couldn't confirm it's the extracted copy; left in place";
+/// Message for a file the extraction wrote over an existing one: never taken back.
+const REPLACED_KEPT: &str = "replaced an existing file; the new copy is kept";
+
+/// Take back what an extraction put in the folder it created (`dest`, inside `parent`,
+/// reported beneath `shown_dest`): the files it published, then the folders it made, deepest
+/// first, then the folder itself, each only if it is still the one the job put there (same
+/// identity, proven by a file id) and a folder only if empty. A file that replaced one
+/// already there is kept (taking it back would leave nothing). Each is opened relative to its
+/// pinned parent folder (never through a link) and deleted through that handle. Returns what
+/// was left in place because it was a replacement, changed, couldn't be confirmed or could
+/// not be removed.
+fn remove_created_tree(
+    parent: &safety::PinnedBase,
+    dest: safety::PinnedBase,
+    shown_dest: &Path,
+    mut published: Vec<Published>,
+) -> Vec<OpIssue> {
+    let mut left = Vec::new();
+    // Files first, then folders deepest first (a folder only goes once it is empty).
+    published.sort_by_key(|p| (p.dir, std::cmp::Reverse(p.rel.components().count())));
+    for p in &published {
+        let Some(name) = p.rel.file_name() else {
+            continue;
+        };
+        let parent_rel = p.rel.parent().unwrap_or(Path::new(""));
+        let shown = shown_dest.join(&p.rel);
+        if p.replaced {
+            left.push(OpIssue::new(shown, REPLACED_KEPT));
+            continue;
+        }
+        let pins = match safety::pin_existing(&dest, parent_rel) {
+            Ok(pins) => pins,
+            // Its folder is gone: so is it.
+            Err(CoreError::NotFound(_)) => continue,
+            Err(e) => {
+                if !p.dir {
+                    left.push(OpIssue::new(
+                        shown,
+                        format!("its folder changed after extraction; left in place ({e})"),
+                    ));
+                }
+                continue;
+            }
+        };
+        let folder = pins.last().unwrap_or_else(|| dest.handle());
+        match safety::remove_if_same(folder, name, p.dir, p.identity) {
+            safety::Removal::Removed | safety::Removal::Gone | safety::Removal::NotEmpty => {}
+            safety::Removal::Changed => left.push(OpIssue::new(shown, CHANGED_AFTER_EXTRACTION)),
+            safety::Removal::Unconfirmed => left.push(OpIssue::new(shown, UNCONFIRMED)),
+            safety::Removal::Failed(e) => left.push(OpIssue::new(
+                shown,
+                format!("could not be removed after the extraction stopped: {e}"),
+            )),
         }
     }
-    // Empty folders only, deepest first: anything not ours stays.
-    let mut dirs = Vec::new();
-    let _ = ops::walk_tree(dest, &forge_jobs::CancelToken::new(), |item| {
-        if let ops::WalkItem::Entry(e) = item
-            && e.kind == NodeKind::Dir
-        {
-            dirs.push(e.path.clone());
+    // Its own pin denies deleting it: let go of it (its ancestors stay pinned by `parent`).
+    let identity = dest.identity();
+    let name = dest.root().file_name().map(std::ffi::OsStr::to_os_string);
+    drop(dest);
+    if let Some(name) = name {
+        match safety::remove_if_same(parent.handle(), &name, true, identity) {
+            safety::Removal::Changed => {
+                left.push(OpIssue::new(shown_dest, CHANGED_AFTER_EXTRACTION));
+            }
+            safety::Removal::Unconfirmed => left.push(OpIssue::new(shown_dest, UNCONFIRMED)),
+            safety::Removal::Failed(e) => {
+                tracing::warn!("could not remove {}: {e}", shown_dest.display());
+            }
+            _ => {}
         }
-    });
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
-    for d in dirs {
-        let _ = fs::remove_dir(d);
     }
-    let _ = fs::remove_dir(dest);
+    left
 }
 
 // ---------------------------------------------------------------------------
@@ -1619,7 +1806,9 @@ pub fn temp_root() -> PathBuf {
 
 /// Extract one file entry to a private temp folder and return its path, to open it with
 /// its app or preview it. The archive's Mark-of-the-Web is applied. A copy extracted
-/// earlier from the same unchanged archive is reused. Fails for entries over `max_bytes`.
+/// earlier from the same unchanged archive is reused, but only under a strong stamp: a weak
+/// one can't rule out a replaced archive, so the entry is always extracted again (one entry,
+/// read from the archive as it is now). Fails for entries over `max_bytes`.
 pub fn extract_entry_to_temp(
     archive: &Path,
     entry_name: &str,
@@ -1627,19 +1816,14 @@ pub fn extract_entry_to_temp(
     max_bytes: u64,
     ctx: &JobCtx<'_>,
 ) -> Result<PathBuf> {
-    let md = fs::metadata(archive).map_err(|e| CoreError::io(archive, e))?;
-    let stamp = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
+    let stamp = archive_stamp(archive)?;
     let key = format!(
-        "{}|{}|{stamp}",
+        "{}|{:016x}",
         paths::lexical_normalize(archive)
             .display()
             .to_string()
             .to_lowercase(),
-        md.len()
+        stamp.value
     );
     let dir = temp_root().join(format!(
         "{:016x}",
@@ -1650,7 +1834,7 @@ pub fn extract_entry_to_temp(
         .file_name()
         .ok_or_else(|| CoreError::Invalid(format!("{entry_name}: not a file")))?
         .to_owned();
-    let index = index_cached_with(archive, password)?;
+    let index = index_cached_stamped(archive, stamp, password, None)?;
     let node = index
         .node(entry_name.trim_end_matches('/'))
         .filter(|n| !n.is_dir)
@@ -1674,7 +1858,8 @@ pub fn extract_entry_to_temp(
     let target = dir.join(&file_name);
     // Reused only when it is still the file this extraction wrote: a plain file (not a link)
     // with the entry's size and modified time.
-    let reusable = node.modified.is_some()
+    let reusable = stamp.strong
+        && node.modified.is_some()
         && fs::symlink_metadata(&target).is_ok_and(|m| {
             m.is_file()
                 && !safety::is_link_or_reparse(&m)
@@ -1711,21 +1896,124 @@ pub fn extract_entry_to_temp(
     Ok(target)
 }
 
-/// Remove temp folders of opened entries that were last written more than `older_than` ago.
-pub fn prune_temp(older_than: Duration) {
-    let Ok(rd) = fs::read_dir(temp_root()) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for e in rd.flatten() {
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > older_than));
-        if old && e.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = fs::remove_dir_all(e.path());
+/// Leftover temp files older than this are removed from a folder an extraction writes into.
+/// A running job's files are always younger (they are written and renamed in seconds).
+const LEFTOVER_AGE: Duration = Duration::from_secs(3600);
+
+/// Remove the leftover temp files (see [`ops::remove_stale_partials`]) from the destination
+/// and from each folder of `planned` that files are written into, when the folder already
+/// exists. A missing folder is never created here. Each folder is pinned while it is cleaned.
+fn remove_leftovers(base: &safety::PinnedBase, planned: &[Planned]) {
+    ops::remove_stale_partials(base.root(), LEFTOVER_AGE);
+    let folders: HashSet<&Path> = planned
+        .iter()
+        .filter(|p| !p.entry.is_dir)
+        .filter_map(|p| p.rel.parent())
+        .filter(|rel| !rel.as_os_str().is_empty())
+        .collect();
+    for rel in folders {
+        let path = base.root().join(rel);
+        if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        // Held while cleaned: the folder cannot be swapped for a link meanwhile.
+        if let Ok(_pinned) = safety::pin_dirs(base, rel) {
+            ops::remove_stale_partials(&path, LEFTOVER_AGE);
         }
     }
+}
+
+/// Remove temp folders of opened entries that were last written more than `older_than` ago,
+/// and stray temp files older than that (see [`prune_dir`]).
+pub fn prune_temp(older_than: Duration) {
+    prune_dir(&temp_root(), older_than);
+}
+
+/// The startup prune, for `root`. Only top-level entries are touched:
+/// - A stage folder `out-<pid>-<id>` of a process still running is kept at any age.
+/// - A folder is removed only when it and every direct child were last written more than
+///   `older_than` ago, so a file still being written keeps its folder.
+/// - A link or junction is removed as the link itself, never followed.
+/// - Files in use fail to delete and are ignored.
+fn prune_dir(root: &Path, older_than: Duration) {
+    let Ok(rd) = fs::read_dir(root) else {
+        return;
+    };
+    ops::remove_stale_partials(root, older_than);
+    for e in rd.flatten() {
+        let path = e.path();
+        let Ok(md) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if safety::is_link_or_reparse(&md) {
+            if ops::is_older_than(md.modified(), older_than) {
+                let _ = fs::remove_dir(&path).or_else(|_| fs::remove_file(&path));
+            }
+            continue;
+        }
+        if !md.is_dir() || stage_owner_alive(&e.file_name().to_string_lossy()) {
+            continue;
+        }
+        if ops::is_older_than(md.modified(), older_than) && children_older_than(&path, older_than) {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Is every direct child of `dir` last written more than `age` ago? Unreadable counts as not.
+fn children_older_than(dir: &Path, age: Duration) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    rd.into_iter().all(|c| {
+        c.is_ok_and(|c| {
+            ops::is_older_than(
+                fs::symlink_metadata(c.path()).and_then(|m| m.modified()),
+                age,
+            )
+        })
+    })
+}
+
+/// Is `name` a stage folder `out-<pid>-<id>` whose process is still running?
+fn stage_owner_alive(name: &str) -> bool {
+    let Some((pid, id)) = name
+        .strip_prefix("out-")
+        .and_then(|rest| rest.split_once('-'))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(pid) && digits(id) && pid.parse::<u32>().is_ok_and(process_alive)
+}
+
+/// Is the process with this id still running? An id that cannot be opened is dead, except
+/// when access is denied (the process exists but is not ours to query).
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    // SAFETY: the handle is used and closed here only; the out value is a valid u32.
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) => {
+                let mut code = 0u32;
+                let alive =
+                    GetExitCodeProcess(handle, &mut code).is_ok() && code == STILL_ACTIVE.0 as u32;
+                let _ = CloseHandle(handle);
+                alive
+            }
+            Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        }
+    }
+}
+
+/// Without Windows process queries every stage folder is treated as live (never pruned early).
+#[cfg(not(windows))]
+fn process_alive(_: u32) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1798,6 +2086,7 @@ pub fn update(
     opts: &CreateOptions,
     ctx: &JobCtx<'_>,
 ) -> Result<CreateReport> {
+    sfx::refuse_edit_if_sfx(archive)?;
     let backend = backend_for_file(archive)?;
     if !backend.can_write() {
         // RAR: refused before anything is read.

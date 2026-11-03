@@ -281,6 +281,8 @@ Explorer is a file manager designed around that workflow:
   / <kbd>Ctrl</kbd>+<kbd>V</kbd>) to a real folder to extract only those. Existing files are
   asked about once: keep both, skip or replace. Every file is written under a temporary name
   first, so a cancelled extraction leaves no half-written files.
+- **Self-extracting archives.** A self-extracting `.exe` still runs on double-click; right-click
+  › *Open as archive* browses and extracts a self-extracting zip like any other.
 - **Straight into Explorer and other apps.** Drag entries of an open zip or 7z onto Explorer,
   the desktop or a mail window, or copy them with <kbd>Ctrl</kbd>+<kbd>C</kbd> and paste
   them there: folders come with everything inside. They are handed over the way Explorer's

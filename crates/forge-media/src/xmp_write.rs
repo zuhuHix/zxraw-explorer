@@ -766,9 +766,7 @@ fn verify(
     if let Some(creators) = &text_fields.creator
         && read_seq(&after_doc, out, after_desc, "creator")? != *creators
     {
-        return Err(corrupt(
-            "merged XMP creator did not verify; left untouched",
-        ));
+        return Err(corrupt("merged XMP creator did not verify; left untouched"));
     }
     if read_keywords(&after_doc, out, after_desc)? != keywords {
         return Err(corrupt(
@@ -2547,7 +2545,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&side).unwrap(), LR_ATTRS);
         drop(other_writer);
         update_sidecar(&img, &note).unwrap();
-        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("client proof"));
+        assert_eq!(
+            read_sidecar_fields(&img).note.as_deref(),
+            Some("client proof")
+        );
     }
 
     #[test]
@@ -2835,10 +2836,7 @@ mod tests {
         // The existing tolerant reader agrees on the fields it knows about.
         let xmp = read_xmp_sidecar(&img).unwrap().unwrap();
         assert_eq!(xmp.title.as_deref(), Some("Sunset over Lisbon"));
-        assert_eq!(
-            xmp.description.as_deref(),
-            Some("Golden hour on the Tagus")
-        );
+        assert_eq!(xmp.description.as_deref(), Some("Golden hour on the Tagus"));
         assert_eq!(xmp.creator.as_deref(), Some("Ana Silva"));
     }
 
@@ -3010,7 +3008,10 @@ mod tests {
         let side = write_file(dir.path(), "IMG_7.xmp", CAPTIONED);
         let before = read_sidecar_fields(&img);
         assert_eq!(before.note, None);
-        assert_eq!(before.description.as_deref(), Some("Caption  with   spaces"));
+        assert_eq!(
+            before.description.as_deref(),
+            Some("Caption  with   spaces")
+        );
 
         let outcome = update_sidecar(
             &img,
@@ -3031,7 +3032,9 @@ mod tests {
 
         let text = std::fs::read_to_string(&side).unwrap();
         assert!(text.contains(CAPTION_XML), "caption must be byte-identical");
-        assert!(text.contains("<dc:subject><rdf:Bag><rdf:li>beach</rdf:li><rdf:li>dog</rdf:li></rdf:Bag></dc:subject>"));
+        assert!(text.contains(
+            "<dc:subject><rdf:Bag><rdf:li>beach</rdf:li><rdf:li>dog</rdf:li></rdf:Bag></dc:subject>"
+        ));
         assert!(text.contains("<xmp:Label>Green</xmp:Label>"));
         assert!(text.contains("xmp:Rating=\"4\""));
         assert!(text.contains("xmlns:xmpDM=\"http://ns.adobe.com/xmp/1.0/DynamicMedia/\""));
@@ -3054,7 +3057,10 @@ mod tests {
         let text = std::fs::read_to_string(&side).unwrap();
         assert!(!text.contains("dc:description"));
         assert_eq!(read_sidecar_fields(&img).description, None);
-        assert_eq!(read_sidecar_fields(&img).note.as_deref(), Some("only a note"));
+        assert_eq!(
+            read_sidecar_fields(&img).note.as_deref(),
+            Some("only a note")
+        );
 
         update_sidecar(
             &img,
@@ -3122,7 +3128,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_sidecar_fields(&img2).note, None);
-        assert!(!std::fs::read_to_string(&side2).unwrap().contains("logComment"));
+        assert!(
+            !std::fs::read_to_string(&side2)
+                .unwrap()
+                .contains("logComment")
+        );
     }
 
     #[test]
@@ -3197,7 +3207,10 @@ mod tests {
         )
         .unwrap();
         let text2 = std::fs::read_to_string(&side2).unwrap();
-        assert!(text2.contains("&#xA;"), "newline must be a character reference");
+        assert!(
+            text2.contains("&#xA;"),
+            "newline must be a character reference"
+        );
         assert_eq!(read_sidecar_fields(&img2).note.as_deref(), Some(note));
 
         let img3 = dir.path().join("IMG_16.CR3");
@@ -3214,15 +3227,19 @@ mod tests {
 
     #[test]
     fn note_only_update_is_not_empty() {
-        assert!(!SidecarUpdate {
-            note: Some(Some("x".into())),
-            ..Default::default()
-        }
-        .is_empty());
-        assert!(!SidecarUpdate {
-            note: Some(None),
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(
+            !SidecarUpdate {
+                note: Some(Some("x".into())),
+                ..Default::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !SidecarUpdate {
+                note: Some(None),
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 }

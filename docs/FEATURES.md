@@ -608,6 +608,15 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `forge-app/src/archive_extract.rs`; e2e `tools::` extraction scenario (F5, Ctrl+C/Ctrl+V, move).
 * ✅ Add to and delete from an open zip, thumbnails of small images inside a zip —
   `forge-app/src/archive_edit.rs`; e2e `tools::` edit and thumbnail scenarios.
+* ✅ Self-extracting archives: PE-aware detection that keeps the structure that validates (zip SFX
+  opens, 7z SFX is recognised, editing refused), *Open as archive* for `.exe` while double-click
+  still runs it — `archive/tests_sfx.rs`; `forge-app` `an_exe_is_not_an_archive_until_it_is_opened_as_one`.
+* ✅ Extraction destination pinned before planning, new folders pinned from creation, cancelled
+  extractions undone through held folders — `archive/tests_hostile.rs`.
+* ✅ Leftover temp cleanup (exact current and legacy names, age, in-use, links, hard links; stage
+  folders of live processes kept) — `archive/tests_leftovers.rs`, `ops.rs` `leftover_tests`.
+* ✅ Archive stamp (file identity + both ends of the file) so a same-size, same-time replacement
+  gets a new listing, temp copies and thumbnails — `archive/stamp.rs`, `archive/tests_stamp.rs`.
 * 🟡 Compress dialog presets, Advanced (Zstandard/Ultra), auto-store, AES-256/ZipCrypto
   passwords, and the input → output progress line — unit tests only; the dialog is not automated.
 * 🟡 Archive, split/join, and contact-sheet UI workflows — `forge-app/src/extra_tools_ui.rs`.

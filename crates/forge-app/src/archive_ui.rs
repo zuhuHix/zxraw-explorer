@@ -46,8 +46,8 @@ pub struct ArchiveView {
     pub archive: PathBuf,
     pub inner: String,
     pub index: Arc<ArchiveIndex>,
-    /// The archive file's size and modified time when listed, hashed: anything derived
-    /// from its contents (temp copies for thumbnails) is kept per version.
+    /// The archive file's stamp when listed (see [`version_of`]): anything derived from its
+    /// contents (temp copies for thumbnails) is kept per version.
     pub version: u64,
 }
 
@@ -128,13 +128,15 @@ pub fn list_archive_path_cancellable(
     let password = session_password(&file);
     let progress = Arc::new(forge_jobs::Progress::default());
     scans().lock().push((file.clone(), progress.clone()));
-    let listed = {
+    // One stamp for the whole listing: the view's version and the index are of the same file.
+    let listed = archive::archive_stamp(&file).and_then(|stamp| {
         let ctx = JobCtx::new(cancel, &progress);
-        archive::index_cached_progress(&file, password.as_ref(), Some(&ctx))
-    };
+        archive::index_cached_stamped(&file, stamp, password.as_ref(), Some(&ctx))
+            .map(|index| (version_of(stamp), index))
+    });
     scans().lock().retain(|(_, p)| !Arc::ptr_eq(p, &progress));
-    let index = match listed {
-        Ok(index) => index,
+    let (version, index) = match listed {
+        Ok(found) => found,
         Err(e @ (CoreError::PasswordRequired(_) | CoreError::WrongPassword(_))) => {
             let wrong = matches!(e, CoreError::WrongPassword(_));
             request_browse_password(&file, path, wrong);
@@ -154,7 +156,7 @@ pub fn list_archive_path_cancellable(
     };
     let entries = children.iter().map(|n| file_entry(&file, n)).collect();
     let view = ArchiveView {
-        version: archive_version(&file),
+        version,
         archive: file,
         inner,
         index: index.clone(),
@@ -162,19 +164,23 @@ pub fn list_archive_path_cancellable(
     Some(ArchiveListing::Folder { view, entries })
 }
 
-/// A number that changes when the archive file is replaced or written (size and modified
-/// time). Reads the file's metadata: call it off the UI thread.
+/// A number that changes when the archive file is replaced or written (see
+/// [`archive::archive_stamp`]). Reads a little of the file: call it off the UI thread.
 pub fn archive_version(archive: &Path) -> u64 {
-    let Ok(md) = std::fs::metadata(archive) else {
-        return 0;
-    };
-    let stamp = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let stamp = stamp as u64 ^ (stamp >> 64) as u64;
-    md.len().rotate_left(40) ^ stamp ^ 1
+    archive::archive_stamp(archive).map_or(0, |stamp| stamp.value)
+}
+
+/// The version of a listing made from `stamp`. A strong stamp is the file's version. A weak
+/// one can't tell a replaced archive from the old one, so each listing gets a version of its
+/// own: copies made for an earlier listing are not reused, and a move out of the archive
+/// (which compares [`archive_version`]) is refused, as it is when the file id can't be read.
+fn version_of(stamp: archive::ArchiveStamp) -> u64 {
+    static LISTINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if stamp.strong {
+        return stamp.value;
+    }
+    let n = LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stamp.value ^ n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// The listing row of an archive node.
@@ -207,7 +213,29 @@ fn file_entry(archive: &Path, node: &ArchiveNode) -> FileEntry {
 /// archive extension. The listing finds out for sure.
 pub fn maybe_in_archive(path: &Path) -> bool {
     path.ancestors()
-        .any(|p| p.file_name().is_some() && archive::is_archive_name(p))
+        .any(|p| p.file_name().is_some() && archive::is_archive_path(p))
+}
+
+/// Whether a path is a `.exe`: a program that may also be a self-extracting archive.
+pub fn is_exe_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+}
+
+/// "Open as archive" on the `.exe` the focused pane selects: it is browsed as an archive
+/// folder from now on, and its listing (on a background thread) says whether it carries one.
+/// Double-clicking it still runs it.
+pub fn open_as_archive(app: &mut ZxrawApp) {
+    if app.pane().archive.is_some() || app.pane().in_archive() {
+        app.toast("Open as archive works on a file in a folder");
+        return;
+    }
+    let Some(exe) = app.pane().action_targets().into_iter().find(|p| is_exe_file(p)) else {
+        app.toast("Select a .exe first");
+        return;
+    };
+    archive::sfx::mark_open_as_archive(&exe);
+    app.pane_mut().navigate(exe);
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1306,21 @@ mod tests {
         assert!(maybe_in_archive(Path::new(r"C:\x\a.zip")));
         assert!(!maybe_in_archive(Path::new(r"C:\x\zip\sub")));
         assert!(!maybe_in_archive(Path::new(r"C:\")));
+    }
+
+    #[test]
+    fn an_exe_is_not_an_archive_until_it_is_opened_as_one() {
+        // Double-click (and Enter) on a program still runs it.
+        let exe = Path::new(r"C:\x\setup.exe");
+        assert!(!archive::is_archive_name(exe));
+        assert!(!archive::is_archive_path(exe));
+        assert!(!maybe_in_archive(exe));
+        assert!(is_exe_file(exe));
+        assert!(is_exe_file(Path::new(r"C:\x\SETUP.EXE")));
+        assert!(!is_exe_file(Path::new(r"C:\x\setup.zip")));
+        archive::sfx::mark_open_as_archive(exe);
+        assert!(!archive::is_archive_name(exe));
+        assert!(maybe_in_archive(&exe.join("sub")));
     }
 
     #[test]

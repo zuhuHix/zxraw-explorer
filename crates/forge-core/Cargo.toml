@@ -40,4 +40,5 @@ tempfile.workspace = true
 tar = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true }
+# Wdk: NtCreateFile, to open a folder or file relative to a pinned folder handle.
+windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem"] }

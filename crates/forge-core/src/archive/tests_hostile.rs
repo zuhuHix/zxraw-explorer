@@ -689,6 +689,468 @@ fn a_destination_through_a_junction_is_resolved_and_pinned_for_the_job() {
     fs::rename(&real, d.path().join("elsewhere")).unwrap();
 }
 
+fn zip_of(path: &Path, files: &[(&str, &[u8])]) {
+    let mut zw = ZipWriter::new(File::create(path).unwrap());
+    for (name, data) in files {
+        zw.start_file(*name, SimpleFileOptions::default()).unwrap();
+        zw.write_all(data).unwrap();
+    }
+    zw.finish().unwrap();
+}
+
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) -> bool {
+    std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[cfg(windows)]
+type HookKey =
+    std::thread::LocalKey<std::cell::RefCell<Option<super::safety::BeforeParentCreateHook>>>;
+
+/// Sets a safety hook for the life of the guard.
+#[cfg(windows)]
+struct Hook(&'static HookKey);
+
+#[cfg(windows)]
+impl Hook {
+    fn set(key: &'static HookKey, f: impl Fn(&Path) + 'static) -> Self {
+        key.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+        Self(key)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Hook {
+    fn drop(&mut self) {
+        self.0.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_destinations_grandparent_cannot_be_renamed_mid_job() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let top = d.path().join("top");
+    let dest = top.join("mid").join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    zip_of(&d.path().join("a.zip"), &[("sub/x.txt", b"inside")]);
+    // While the job creates `sub`: neither the parent nor the grandparent can be renamed.
+    let renamed = Arc::new(AtomicUsize::new(0));
+    let (probe, top_h, d_h) = (Arc::clone(&renamed), top.clone(), d.path().to_path_buf());
+    let hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |_| {
+        let moves = [
+            (top_h.join("mid"), top_h.join("mid2")),
+            (top_h.clone(), d_h.join("top2")),
+        ];
+        for (from, to) in moves {
+            if fs::rename(&from, &to).is_ok() {
+                probe.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    let report = report.unwrap();
+    assert_eq!(
+        renamed.load(Ordering::SeqCst),
+        0,
+        "an ancestor was renamed mid-job"
+    );
+    assert!(report.failed.is_empty(), "{report:?}");
+    assert_eq!(fs::read(dest.join("sub/x.txt")).unwrap(), b"inside");
+    // Released after the job.
+    fs::rename(&top, d.path().join("top2")).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn the_destination_is_pinned_before_the_archive_is_planned() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let dest = fresh_dest(d.path(), "dest");
+    let victim = fresh_dest(d.path(), "victim");
+    zip_of(&d.path().join("a.zip"), &[("x.txt", b"inside")]);
+    // Before listing and planning (which can take minutes for a big solid block), someone
+    // tries to move the destination away and put a junction to another folder in its place.
+    let swapped = Arc::new(AtomicBool::new(false));
+    let (probe, dest_h, d_h, victim_h) = (
+        Arc::clone(&swapped),
+        dest.clone(),
+        d.path().to_path_buf(),
+        victim.clone(),
+    );
+    let hook = Hook::set(&super::safety::AFTER_DEST_PINNED, move |_| {
+        if fs::rename(&dest_h, d_h.join("moved")).is_ok() {
+            probe.store(true, Ordering::SeqCst);
+            junction(&dest_h, &victim_h);
+        }
+    });
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    let report = report.unwrap();
+    assert!(
+        !swapped.load(Ordering::SeqCst),
+        "the destination was moved before writing"
+    );
+    assert!(is_empty_dir(&victim), "{report:?}");
+    assert_eq!(fs::read(dest.join("x.txt")).unwrap(), b"inside");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_folder_the_extraction_makes_is_pinned_from_its_creation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let victim = fresh_dest(d.path(), "victim");
+    let archive = d.path().join("photos.zip");
+    zip_of(&archive, &[("x.txt", b"inside")]);
+    let made = parent.join("photos");
+    // Before anything is written, someone swaps the new folder (or its parent) for a
+    // junction to another folder.
+    let swapped = Arc::new(AtomicBool::new(false));
+    let (probe, made_h, parent_h, d_h, victim_h) = (
+        Arc::clone(&swapped),
+        made.clone(),
+        parent.clone(),
+        d.path().to_path_buf(),
+        victim.clone(),
+    );
+    let hook = Hook::set(&super::safety::AFTER_DEST_PINNED, move |_| {
+        for (from, to) in [
+            (&made_h, d_h.join("moved")),
+            (&parent_h, d_h.join("moved2")),
+        ] {
+            if fs::rename(from, &to).is_ok() {
+                probe.store(true, Ordering::SeqCst);
+                junction(from, &victim_h);
+            }
+        }
+    });
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(
+        &archive,
+        &parent,
+        ExtractTarget::NamedFolder,
+        &ExtractOptions::default(),
+        &ctx,
+    );
+    drop(hook);
+    let report = report.unwrap();
+    assert!(
+        !swapped.load(Ordering::SeqCst),
+        "the new folder was swapped before writing"
+    );
+    assert!(report.created_dest);
+    assert!(is_empty_dir(&victim), "{report:?}");
+    assert_eq!(report.extracted, vec![made.join("x.txt")]);
+    assert_eq!(fs::read(made.join("x.txt")).unwrap(), b"inside");
+}
+
+#[cfg(windows)]
+#[test]
+fn an_existing_junction_named_like_the_folder_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let victim = fresh_dest(d.path(), "victim");
+    if !junction(&parent.join("photos"), &victim) {
+        eprintln!("mklink unavailable; skipping");
+        return;
+    }
+    let archive = d.path().join("photos.zip");
+    zip_of(&archive, &[("x.txt", b"inside")]);
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    let ctx = JobCtx::new(&cancel, &progress);
+    let folder = NewFolder {
+        parent: &parent,
+        name: "photos",
+        reuse: true,
+    };
+    let opts = ExtractOptions::default();
+    let result = extract_into_folder(&archive, folder, &opts, None, &ctx, |_| true);
+    assert!(
+        matches!(result, Err(CoreError::UnsafePath(_))),
+        "{result:?}"
+    );
+    assert!(is_empty_dir(&victim));
+    fs::remove_dir(parent.join("photos")).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn taking_back_a_cancelled_extraction_stays_in_its_folder() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let victim = fresh_dest(d.path(), "victim");
+    fs::write(victim.join("a.txt"), b"keep me").unwrap();
+    let archive = d.path().join("photos.zip");
+    zip_of(&archive, &[("a.txt", b"first"), ("sub/b.txt", b"second")]);
+    let made = parent.join("photos");
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    // Cancelled once `a.txt` is in place, as `sub` is made.
+    let token = cancel.clone();
+    let cancel_hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |_| {
+        token.cancel()
+    });
+    // Before what it wrote is taken back, someone swaps the folder for a junction to a
+    // folder holding a file of the same name.
+    let swapped = Arc::new(AtomicBool::new(false));
+    let (probe, made_h, d_h, victim_h) = (
+        Arc::clone(&swapped),
+        made.clone(),
+        d.path().to_path_buf(),
+        victim.clone(),
+    );
+    let cleanup_hook = Hook::set(&super::safety::BEFORE_CREATED_CLEANUP, move |_| {
+        if fs::rename(&made_h, d_h.join("moved")).is_ok() {
+            probe.store(true, Ordering::SeqCst);
+            junction(&made_h, &victim_h);
+        }
+    });
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(
+        &archive,
+        &parent,
+        ExtractTarget::NamedFolder,
+        &ExtractOptions::default(),
+        &ctx,
+    );
+    drop((cancel_hook, cleanup_hook));
+    let report = report.unwrap();
+    assert!(report.cancelled, "{report:?}");
+    assert_eq!(report.extracted, vec![made.join("a.txt")], "{report:?}");
+    assert!(
+        !swapped.load(Ordering::SeqCst),
+        "the folder was swapped before the clean-up"
+    );
+    assert_eq!(fs::read(victim.join("a.txt")).unwrap(), b"keep me");
+    // Everything it wrote, and the folder it made, are gone.
+    assert!(!made.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn taking_back_a_cancelled_extraction_leaves_a_replaced_file_alone() {
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let archive = d.path().join("photos.zip");
+    zip_of(
+        &archive,
+        &[
+            ("a.txt", b"first"),
+            ("b.txt", b"second"),
+            ("sub/c.txt", b"third"),
+        ],
+    );
+    let made = parent.join("photos");
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    // Cancelled once `a.txt` and `b.txt` are in place, as `sub` is made.
+    let token = cancel.clone();
+    let cancel_hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |_| {
+        token.cancel()
+    });
+    // Before what it wrote is taken back, another program replaces `a.txt` with a file of
+    // its own under the same name (a different file, not the one extracted).
+    let made_h = made.clone();
+    let cleanup_hook = Hook::set(&super::safety::BEFORE_CREATED_CLEANUP, move |_| {
+        fs::remove_file(made_h.join("a.txt")).unwrap();
+        fs::write(made_h.join("a.txt"), b"not from the archive").unwrap();
+    });
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(
+        &archive,
+        &parent,
+        ExtractTarget::NamedFolder,
+        &ExtractOptions::default(),
+        &ctx,
+    );
+    drop((cancel_hook, cleanup_hook));
+    let report = report.unwrap();
+    assert!(report.cancelled, "{report:?}");
+    // The replacement survives byte for byte; what the job wrote is gone.
+    assert_eq!(
+        fs::read(made.join("a.txt")).unwrap(),
+        b"not from the archive"
+    );
+    assert!(!made.join("b.txt").exists());
+    assert!(!made.join("sub").exists());
+    let names: Vec<_> = fs::read_dir(&made)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("a.txt")]);
+    // And it is reported.
+    let issue = report
+        .failed
+        .iter()
+        .find(|i| i.path == made.join("a.txt"))
+        .unwrap_or_else(|| panic!("not reported: {report:?}"));
+    assert!(
+        issue.reason.contains("changed by another program"),
+        "{issue:?}"
+    );
+}
+
+/// Makes the file id unavailable to [`crate::ops::FileIdentity`] on this thread while alive.
+#[cfg(windows)]
+struct WeakIdentity;
+
+#[cfg(windows)]
+impl WeakIdentity {
+    fn on() -> Self {
+        crate::ops::HIDE_FILE_ID.with(|h| h.set(true));
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WeakIdentity {
+    fn drop(&mut self) {
+        crate::ops::HIDE_FILE_ID.with(|h| h.set(false));
+    }
+}
+
+/// Extract `entries` into a new `photos` folder under `parent`, cancelled as the folder
+/// `other` is made (everything before it is in place).
+#[cfg(windows)]
+fn extract_cancelled_at_other(
+    d: &Path,
+    entries: &[(&str, &[u8])],
+    opts: &ExtractOptions,
+) -> (PathBuf, ExtractReport) {
+    let parent = fresh_dest(d, "parent");
+    let archive = d.join("photos.zip");
+    zip_of(&archive, entries);
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    let token = cancel.clone();
+    let hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |p| {
+        if p.ends_with("other") {
+            token.cancel();
+        }
+    });
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(&archive, &parent, ExtractTarget::NamedFolder, opts, &ctx);
+    drop(hook);
+    let report = report.unwrap();
+    assert!(report.cancelled, "{report:?}");
+    (parent.join("photos"), report)
+}
+
+#[cfg(windows)]
+fn reason_for<'a>(report: &'a ExtractReport, path: &Path) -> &'a str {
+    &report
+        .failed
+        .iter()
+        .find(|i| i.path == path)
+        .unwrap_or_else(|| panic!("{} not reported: {report:?}", path.display()))
+        .reason
+}
+
+#[cfg(windows)]
+#[test]
+fn without_a_file_id_a_cancelled_extraction_takes_nothing_back() {
+    let d = tempfile::tempdir().unwrap();
+    let entries: &[(&str, &[u8])] = &[
+        ("a.txt", b"first"),
+        ("sub/b.txt", b"second"),
+        ("other/c.txt", b"third"),
+    ];
+    let weak = WeakIdentity::on();
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &ExtractOptions::default());
+    drop(weak);
+    // Nothing is removed: the weak identity can't prove these are the extracted copies.
+    assert_eq!(fs::read(made.join("a.txt")).unwrap(), b"first");
+    assert_eq!(fs::read(made.join("sub").join("b.txt")).unwrap(), b"second");
+    assert!(made.join("other").is_dir());
+    for p in [
+        made.join("a.txt"),
+        made.join("sub").join("b.txt"),
+        made.join("sub"),
+        made.join("other"),
+        made.clone(),
+    ] {
+        assert!(
+            reason_for(&report, &p).contains("couldn't confirm it's the extracted copy"),
+            "{report:?}"
+        );
+    }
+
+    // The same with a file id: all of it is taken back.
+    let d = tempfile::tempdir().unwrap();
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &ExtractOptions::default());
+    assert!(!made.exists(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn taking_back_a_cancelled_extraction_keeps_a_file_it_replaced() {
+    let d = tempfile::tempdir().unwrap();
+    // Before the job writes anything, the new folder holds `x.txt` of its own.
+    let hook = Hook::set(&super::safety::AFTER_DEST_PINNED, |p| {
+        fs::write(p.join("x.txt"), b"old bytes").unwrap();
+    });
+    let opts = ExtractOptions {
+        policy: crate::ops::ConflictPolicy::Overwrite,
+        ..Default::default()
+    };
+    let entries: &[(&str, &[u8])] = &[
+        ("x.txt", b"new bytes"),
+        ("y.txt", b"made by the job"),
+        ("other/z.txt", b"never written"),
+    ];
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &opts);
+    drop(hook);
+    // The replacement stays (the old file is gone already); what the job made is taken back.
+    assert_eq!(fs::read(made.join("x.txt")).unwrap(), b"new bytes");
+    assert!(!made.join("y.txt").exists());
+    assert!(!made.join("other").exists());
+    assert!(
+        reason_for(&report, &made.join("x.txt")).contains("replaced an existing file"),
+        "{report:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_destination_folder_swapped_while_it_is_pinned_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("a").join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    zip_of(&d.path().join("x.zip"), &[("x.txt", b"inside")]);
+    // Between resolving the destination and pinning its folders, another program moves a
+    // folder of its path away and puts a different real folder (with a `dest`) at its name.
+    let (a, d_h) = (d.path().join("a"), d.path().to_path_buf());
+    let hook = Hook::set(&super::safety::BEFORE_BASE_PIN, move |_| {
+        fs::rename(&a, d_h.join("a_old")).unwrap();
+        fs::create_dir_all(a.join("dest")).unwrap();
+    });
+    let result = ctx_run(&d.path().join("x.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    assert!(
+        matches!(result, Err(CoreError::UnsafePath(_))),
+        "{result:?}"
+    );
+    // Nothing was written to the substitute, nor to the original.
+    assert!(is_empty_dir(&dest), "{result:?}");
+    assert!(is_empty_dir(&d.path().join("a_old").join("dest")));
+    // Unhindered, the same destination works.
+    ctx_run(&d.path().join("x.zip"), &dest, &ExtractOptions::default()).unwrap();
+    assert_eq!(fs::read(dest.join("x.txt")).unwrap(), b"inside");
+}
+
 /// Set the method of the entry `name` to `method` in its local and central headers.
 fn set_method(bytes: &mut [u8], name: &[u8], method: u16) {
     let mut set = 0;
