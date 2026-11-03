@@ -103,6 +103,111 @@ Without `ZXRAW_PROFILE_DIR`, automation uses a unique throwaway profile for this
 so the screenshot does not include the user's session-restore tabs. The screenshot hook is
 a smoke-test aid and does not assert visual correctness. Script mode (below) injects real key and pointer input.
 
+## Archive fuzzing
+
+Archives come from the internet, so every parser in `forge-core/src/archive/` is fuzzed. The
+targets are defined once, in `forge-core/src/archive/fuzz.rs` (`Target`, `run`). Two drivers
+use them: the libFuzzer targets in `fuzz/`, and the stable test
+`crates/forge-core/tests/archive_fuzz.rs`.
+
+| Target | What it feeds |
+|---|---|
+| `detect` | content detection (`backend_for_file`), then the full pipeline of whatever it picked |
+| `zip`, `sevenz`, `tar`, `rar` | the full pipeline under that extension: list, preflight, check password, `read_entries` into a sink, then *Test* (`read_entries_checked`); each with no password and with `secret` (the fixtures' password) |
+| `stream` | the same, for `.tar.<codec>` or a single `.<codec>` file (the first byte picks gz/bz2/xz/zst/lz4/br, tar or not) |
+| `zip_peek` | the ZIP encryption peek (`crypto_peek`: WinZip AES and ZipCrypto heads) |
+| `sevenz_guard` | the 7z header guard alone (`sevenz_guard::check`) |
+| `tar_walk` | the tar header walk over an in-memory slice (`TarParser`) |
+| `codec_walk` | a codec's header walk (`codec::stream_info`, full and peek caps) |
+
+Every target runs under tight limits (`fuzz::limits()`): 1,000 entries, 64 MiB in total,
+16 MiB per file and 64 MiB of decoder memory. Both drivers install a tracking allocator.
+A single allocation over 256 MiB (fuzz) or 512 MiB (test) aborts at once. The test also
+fails an input that keeps more than 512 MiB live, or that takes more than 20 s.
+libFuzzer's `-rss_limit_mb=2048` covers allocations in C code (zstd, UnRAR), and
+`-timeout=10` catches hangs.
+
+### Stable: part of `cargo test`
+
+```powershell
+cargo test -p forge-core --test archive_fuzz
+```
+
+* `replay_regressions` replays every input committed under `fuzz/regressions/<target>/`.
+  These are the minimised crashes and hangs the fuzzers found.
+* `mutation_smoke` is a fixed-seed mutation loop (xorshift: bit flips, interesting values,
+  deletes, duplicates, truncation, splices). It runs over seed archives: the committed
+  fixtures, plus zip/7z/tar/codec archives the engine writes. That is a few seconds per
+  target and about 20 s in total in a debug build. A failing input is saved under
+  `%TEMP%\zxraw-fuzz-failures\<target>\`.
+* `ZXRAW_FUZZ_TRACE=1` prints each pipeline step with its time and the listing, which helps
+  locate a hang.
+
+### libFuzzer (nightly, coverage-guided)
+
+One-time setup: `rustup toolchain install nightly` and `cargo install cargo-fuzz`, plus the
+Visual Studio C++ tools, which ship the ASan runtime DLL. Then, from the repository root:
+
+```powershell
+fuzz\run.ps1 -Seconds 1200 -Jobs 4                    # every target, 20 min each, 4 at a time
+fuzz\run.ps1 -Targets sevenz,zip -Seconds 300 -NoBuild
+```
+
+The script builds with `cargo +nightly fuzz build`, which uses AddressSanitizer. It puts
+`clang_rt.asan_dynamic-x86_64.dll` on `PATH` and runs each target for `-Seconds`. After a
+crash it restarts the target until that time is used up. Its outputs:
+
+* crashes, timeouts and OOMs go to `fuzz/artifacts/<target>/`;
+* logs go to `fuzz/logs/<target>.log`;
+* the corpus grows in `fuzz/corpus/<target>/`, seeded from `fuzz/seeds/<target>/`.
+
+Artifacts, logs and the corpus are not committed. Keep `-Jobs` under 5, because Defender
+adds heavy load to parallel builds. To regenerate the seeds:
+`cargo test -p forge-core --test archive_fuzz -- --ignored write_fuzz_seeds`.
+
+Two Windows quirks are handled by the setup:
+
+* sevenz-rust2 also builds a `cdylib`, which can't link with coverage instrumentation.
+  `run.ps1` copies the crate to `fuzz/vendor/` as an rlib only, and `fuzz/Cargo.toml`
+  patches it in.
+* `-s none` (no sanitizer) fails to link on MSVC (`__start___sancov_cntrs`), so keep the
+  default ASan.
+
+To replay one input: `fuzz\target\x86_64-pc-windows-msvc\release\<target>.exe <file>`.
+Then minimise it with `-minimize_crash=1 -runs=10000`, and commit it to
+`fuzz/regressions/<target>/` together with the fix.
+
+Running time so far (2026-11-03, i7-14700K, 4 targets at a time):
+
+| Target | Time | Executions | Findings |
+|---|---:|---:|---|
+| sevenz | 40 min | 41,778 | the LZMA2 hang below (8 inputs) |
+| detect | 40 min | 88,390 | none |
+| rar | 40 min | 28,585 | none |
+| stream | 40 min | 120,603 | none |
+| zip | 20 min | 104,821 | none |
+| tar | 20 min | 147,998 | none |
+| sevenz_guard | 20 min | 53,464 | none |
+| zip_peek | 20 min | 52,894 | none |
+| tar_walk | 20 min | 4,733,929 | none |
+| codec_walk | 20 min | 259,446 | none |
+
+Found and fixed: lzma-rust2 0.23's `Lzma2Reader` loops forever when it is read again after
+an LZMA2 chunk with an invalid properties byte. Fix: 7z entry readers, codec decoders and zip
+entry readers are now *fused*, so after their first error, later reads repeat it.
+
+### Archive benchmark
+
+```powershell
+cargo build -p forge-bench --release --bin archive-bench
+target\release\archive-bench.exe --samples 3 --out bench.md   # --scale 0.01 for a smoke run
+```
+
+It writes a synthetic corpus once to `%TEMP%\zxraw-archive-bench`, from a fixed seed: text,
+structured binary, already compressed (random .jpg/.mp4) and 10,000 small files. It times
+create and extract for zip Fast/Balanced/Max/Zstd, 7z and tar.zst, and compares with 7-Zip
+when `7z.exe` is installed. Results are in [BENCHMARKS.md](BENCHMARKS.md#archives).
+
 ## Reproducible benchmark data and harness
 
 Benchmarks use release mode and an isolated target directory. The generator refuses to

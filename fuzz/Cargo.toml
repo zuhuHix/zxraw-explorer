@@ -1,0 +1,97 @@
+[package]
+name = "zxraw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+forge-core = { path = "../crates/forge-core" }
+
+# Not part of the main workspace: built with nightly by `cargo fuzz` (see docs/TESTING.md).
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[[bin]]
+name = "detect"
+path = "fuzz_targets/detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip"
+path = "fuzz_targets/zip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sevenz"
+path = "fuzz_targets/sevenz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar"
+path = "fuzz_targets/tar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar"
+path = "fuzz_targets/rar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zip_peek"
+path = "fuzz_targets/zip_peek.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sevenz_guard"
+path = "fuzz_targets/sevenz_guard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tar_walk"
+path = "fuzz_targets/tar_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_walk"
+path = "fuzz_targets/codec_walk.rs"
+test = false
+doc = false
+bench = false
+
+# sevenz-rust2 also builds a cdylib, which fails to link with coverage instrumentation on
+# Windows: `setup.ps1` copies it here as an rlib only.
+[patch.crates-io]
+sevenz-rust2 = { path = "vendor/sevenz-rust2" }

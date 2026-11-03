@@ -237,3 +237,75 @@ time (see the scenario above), thumbnail decoding, grouping analysis, or folders
 drives. Before `f5708aa`, the status bar walked every entry each frame while anything was
 selected: in a debug build, paging this folder cost about 206 ms of work per frame (p50); the
 same debug scenario now measures about 3 ms. The debug e2e scenario fails above a 100 ms p95.
+
+## Archives
+
+Measured 2026-11-03 with `archive-bench` (see [TESTING.md](TESTING.md#archive-benchmark)):
+`targeteleaserchive-bench.exe --samples 3`. Each value is the median of 3 samples. The
+machine was otherwise idle: no fuzzers or builds were running.
+
+| Component | Value |
+|---|---|
+| CPU | Intel Core i7-14700K, 20 cores / 28 logical processors |
+| RAM | 64 GB |
+| Disk | Samsung SSD 9100 PRO 1 TB (NVMe); corpus and archives in `%TEMP%` on C: |
+| OS / build | Windows 11 Pro 10.0.26200, `rustc 1.99.0`, release profile |
+| Comparison | 7-Zip 26.03 (x64), `-mx=5` |
+
+Corpus (reproducible, fixed seed): `text` is 64 MiB of pseudo-English in 8 files.
+`binary` is 64 MiB of integer tables with small deltas plus random runs. `precompressed`
+is 64 MiB of random bytes named .jpg/.mp4, which ZXraw stores as is (`auto_store`).
+`small` is 10,000 files of 200-4,000 bytes in 100 folders. MiB/s is input bytes per
+second, for both create and extract. Ratio is archive size / input size. Extraction has
+Mark-of-the-Web off.
+
+| corpus | config | input MiB | archive MiB | ratio % | compress MiB/s | extract MiB/s |
+|---|---|---:|---:|---:|---:|---:|
+| text | zip Fast | 64.00 | 34.60 | 54.1 | 205.0 | 211.8 |
+| text | zip Balanced | 64.00 | 19.16 | 29.9 | 18.5 | 309.7 |
+| text | zip Max | 64.00 | 17.87 | 27.9 | 0.2 | 284.8 |
+| text | zip Zstd | 64.00 | 19.48 | 30.4 | 24.8 | 327.6 |
+| text | 7z | 64.00 | 15.74 | 24.6 | 1.8 | 77.9 |
+| text | tar.zst | 64.00 | 19.48 | 30.4 | 101.2 | 297.5 |
+| text | 7-Zip 7z mx5 | 64.00 | 15.62 | 24.4 | 1.1 | 186.4 |
+| text | 7-Zip zip mx5 | 64.00 | 17.82 | 27.8 | 60.2 | 300.9 |
+| binary | zip Fast | 64.00 | 62.17 | 97.1 | 103.6 | 239.0 |
+| binary | zip Balanced | 64.00 | 47.01 | 73.5 | 45.2 | 228.0 |
+| binary | zip Max | 64.00 | 31.94 | 49.9 | 0.7 | 222.9 |
+| binary | zip Zstd | 64.00 | 48.28 | 75.4 | 47.1 | 324.8 |
+| binary | 7z | 64.00 | 22.89 | 35.8 | 5.3 | 42.6 |
+| binary | tar.zst | 64.00 | 47.31 | 73.9 | 148.2 | 212.7 |
+| binary | 7-Zip 7z mx5 | 64.00 | 22.92 | 35.8 | 15.6 | 79.0 |
+| binary | 7-Zip zip mx5 | 64.00 | 32.02 | 50.0 | 323.5 | 195.2 |
+| precompressed | zip Fast | 64.00 | 64.00 | 100.0 | 909.1 | 673.6 |
+| precompressed | zip Balanced | 64.00 | 64.00 | 100.0 | 1290.6 | 895.8 |
+| precompressed | zip Max | 64.00 | 64.00 | 100.0 | 962.1 | 738.7 |
+| precompressed | zip Zstd | 64.00 | 64.00 | 100.0 | 950.5 | 762.8 |
+| precompressed | 7z | 64.00 | 64.00 | 100.0 | 597.9 | 734.4 |
+| precompressed | tar.zst | 64.00 | 64.01 | 100.0 | 570.6 | 635.8 |
+| precompressed | 7-Zip 7z mx5 | 64.00 | 64.00 | 100.0 | 23.8 | 875.9 |
+| precompressed | 7-Zip zip mx5 | 64.00 | 64.00 | 100.0 | 337.4 | 1337.3 |
+| small | zip Fast | 20.07 | 13.08 | 65.2 | 37.4 | 0.9 |
+| small | zip Balanced | 20.07 | 9.05 | 45.1 | 36.4 | 0.9 |
+| small | zip Max | 20.07 | 8.64 | 43.1 | 0.3 | 0.9 |
+| small | zip Zstd | 20.07 | 9.38 | 46.7 | 3.0 | 0.9 |
+| small | 7z | 20.07 | 5.03 | 25.1 | 0.9 | 1.0 |
+| small | tar.zst | 20.07 | 6.45 | 32.1 | 17.4 | 1.0 |
+| small | 7-Zip 7z mx5 | 20.07 | 5.04 | 25.1 | 1.9 | 8.1 |
+| small | 7-Zip zip mx5 | 20.07 | 9.20 | 45.9 | 72.7 | 7.5 |
+
+Observations (reported, not changed):
+
+* **Many small files extract at about 1 MiB/s, about 2 ms per file, in every format.**
+  7-Zip extracts the same archives at about 8 MiB/s. The cost is linear: 1,000 files take
+  2 ms each too, so it is a per-file overhead, not quadratic behaviour. Likely causes are
+  the per-file safety, conflict and rename steps, plus Defender scanning each new file.
+* **zip Zstd on small files compresses at 3 MiB/s.** Balanced manages 36 MiB/s on the same
+  files. That points at a per-entry Zstandard encoder setup cost (level 9).
+* **zip Balanced on large files is single-threaded per file.** On `text` it reaches
+  18.5 MiB/s, against 60 MiB/s for 7-Zip's zip. Only files under 4 MiB are compressed in
+  parallel, and these are 8 MiB each.
+* **Compression ratios match 7-Zip.** 7z (LZMA2) is within 1 % of 7-Zip's 7z. zip Max
+  (Zopfli) matches 7-Zip's zip `-mx=5` but is about 300 times slower.
+* **ZXraw's 7z extraction (LZMA2, pure Rust) runs at about 40-50 % of 7-Zip's speed** on
+  compressible data.

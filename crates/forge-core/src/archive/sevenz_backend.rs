@@ -140,27 +140,61 @@ fn describe(e: &sz::Error) -> String {
     }
 }
 
-/// Entry data for visitors, with the library's data errors in words.
 /// Entry data for visitors, with the library's data errors in words; `failed` is set when
 /// any read fails (the block is then bad, whatever the visitor made of it).
-struct Friendly<'f, R>(R, &'f std::cell::Cell<bool>);
+///
+/// Fused: once a read fails (other than a bare `Interrupted`), every later read repeats
+/// that error without touching the decoder again. lzma-rust2's `Lzma2Reader` is not safe
+/// to read after an error: a chunk header whose properties byte is invalid leaves it with
+/// a chunk size but no LZMA decoder, and the next `read` spins forever making no progress.
+struct Friendly<'f, R> {
+    inner: R,
+    failed: &'f std::cell::Cell<bool>,
+    /// The first error: its kind and text, or `None` for a cancel.
+    dead: Option<Option<(io::ErrorKind, String)>>,
+}
+
+impl<'f, R> Friendly<'f, R> {
+    fn new(inner: R, failed: &'f std::cell::Cell<bool>) -> Self {
+        Self {
+            inner,
+            failed,
+            dead: None,
+        }
+    }
+}
 
 impl<R: Read> Read for Friendly<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf).map_err(|e| {
-            if !is_cancel(&e) {
-                self.1.set(true);
+        match &self.dead {
+            Some(Some((kind, text))) => return Err(io::Error::new(*kind, text.clone())),
+            Some(None) => return Err(io::Error::new(io::ErrorKind::Interrupted, Cancelled)),
+            None => {}
+        }
+        let e = match self.inner.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none() => {
+                return Err(e);
             }
-            let text = match e
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<sz::Error>())
-            {
-                Some(sz::Error::ChecksumVerificationFailed) => "CRC mismatch".to_owned(),
-                Some(inner) => describe(inner),
-                None => return e,
-            };
-            io::Error::new(io::ErrorKind::InvalidData, text)
-        })
+            Err(e) => e,
+        };
+        if is_cancel(&e) {
+            self.dead = Some(None);
+            return Err(e);
+        }
+        self.failed.set(true);
+        let e = match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<sz::Error>())
+        {
+            Some(sz::Error::ChecksumVerificationFailed) => {
+                io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch")
+            }
+            Some(inner) => io::Error::new(io::ErrorKind::InvalidData, describe(inner)),
+            None => e,
+        };
+        self.dead = Some(Some((e.kind(), e.to_string())));
+        Err(e)
     }
 }
 
@@ -705,7 +739,7 @@ impl SevenZipBackend {
                         ctx.progress.set_note("");
                     }
                     visited += 1;
-                    let mut chained = Friendly(io::Cursor::new(head).chain(r), &data_failed);
+                    let mut chained = Friendly::new(io::Cursor::new(head).chain(r), &data_failed);
                     if let Err(e) = visit(entry(i), Ok(&mut chained)) {
                         stored = Some(e);
                         return Err(visitor_stop());
