@@ -25,6 +25,9 @@
 mod codec;
 mod cp437;
 mod crypto_peek;
+// Fuzzing entry points (`fuzz/`, `tests/archive_fuzz.rs`); not an API.
+#[doc(hidden)]
+pub mod fuzz;
 mod motw;
 mod presets;
 mod rar_backend;

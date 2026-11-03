@@ -820,9 +820,53 @@ fn xz_block_dict(w: &mut Work, pos: u64) -> Option<u32> {
     dict
 }
 
+/// A reader that stops at its first error: every later read repeats it without touching
+/// the inner reader again (a bare `Interrupted` is passed through, to be retried). Some
+/// decoders are not safe to read after an error: lzma-rust2's `Lzma2Reader` (xz, 7z LZMA2)
+/// spins forever on the read after an invalid chunk properties byte.
+pub(crate) struct Fused<R> {
+    inner: R,
+    dead: Option<(io::ErrorKind, String)>,
+}
+
+impl<R> Fused<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self { inner, dead: None }
+    }
+}
+
+impl<R: Read> Read for Fused<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some((kind, text)) = &self.dead {
+            return Err(io::Error::new(*kind, text.clone()));
+        }
+        match self.inner.read(buf) {
+            Err(e) if !(e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none()) => {
+                self.dead = Some((e.kind(), e.to_string()));
+                Err(e)
+            }
+            other => other,
+        }
+    }
+}
+
 /// A decoder of `codec` over `r`. `mem_limit` bounds the memory a stream may make it
-/// allocate (xz dictionaries, Zstandard windows).
+/// allocate (xz dictionaries, Zstandard windows). It stops at its first error (see
+/// [`Fused`]).
 pub(crate) fn decoder<'a, R: Read + 'a>(
+    codec: Codec,
+    r: R,
+    mem_limit: u64,
+) -> io::Result<Box<dyn Read + 'a>> {
+    let d = raw_decoder(codec, r, mem_limit)?;
+    Ok(if codec == Codec::None {
+        d
+    } else {
+        Box::new(Fused::new(d))
+    })
+}
+
+fn raw_decoder<'a, R: Read + 'a>(
     codec: Codec,
     r: R,
     mem_limit: u64,

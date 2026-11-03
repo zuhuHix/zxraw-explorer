@@ -304,7 +304,8 @@ impl ArchiveBackend for ZipBackend {
                 .password(password.map(Password::as_bytes))
                 .enforce_header_consistency(true);
             match za.by_index_with_options(i, options) {
-                Ok(mut f) => visit(&entry, Ok(&mut f))?,
+                // Fused: lzma-rust2 (LZMA, XZ) is not safe to read again after an error.
+                Ok(f) => visit(&entry, Ok(&mut super::codec::Fused::new(f)))?,
                 Err(e) => visit(&entry, Err(entry_err(archive, &entry.name, e)))?,
             }
         }
