@@ -25,7 +25,9 @@
 mod codec;
 mod cp437;
 mod crypto_peek;
-// Fuzzing entry points (`fuzz/`, `tests/archive_fuzz.rs`); not an API.
+// Fuzzing entry points (`fuzz/`, `tests/archive_fuzz.rs`), behind the `fuzz-harness`
+// feature; not an API.
+#[cfg(feature = "fuzz-harness")]
 #[doc(hidden)]
 pub mod fuzz;
 mod motw;

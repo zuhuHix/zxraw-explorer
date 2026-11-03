@@ -1759,6 +1759,7 @@ dependencies = [
  "crc32fast",
  "crossbeam-channel",
  "flate2",
+ "forge-core",
  "forge-jobs",
  "lru",
  "lz4_flex",

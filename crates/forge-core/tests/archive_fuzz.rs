@@ -15,7 +15,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use forge_core::archive::fuzz::{self, Target};
@@ -92,24 +93,42 @@ static ALLOC: Tracking = Tracking;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Run one input; `Err` describes what went wrong (panic, time, memory).
+/// Set once an input hung: its thread is still spinning, so the test stops there.
+static HUNG: AtomicBool = AtomicBool::new(false);
+
+fn hung() -> bool {
+    HUNG.load(Ordering::Relaxed)
+}
+
+/// Run one input on a thread of its own, waiting at most [`MAX_TIME`] for it; `Err`
+/// describes what went wrong (panic, hang, memory). A hung input's thread is left running
+/// (it can't be stopped; the test process ends soon after, as the test stops at it).
 fn check_one(target: Target, data: &[u8]) -> Result<(), String> {
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
-    let start = Instant::now();
-    let outcome = catch_unwind(AssertUnwindSafe(|| fuzz::run(target, data)));
-    let took = start.elapsed();
+    let input = data.to_vec();
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name(format!("fuzz-{}", target.name()))
+        .spawn(move || {
+            let outcome = catch_unwind(AssertUnwindSafe(|| fuzz::run(target, &input)));
+            let _ = tx.send(outcome.map_err(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                    .unwrap_or_default()
+            }));
+        })
+        .expect("spawn the input's thread");
+    match rx.recv_timeout(MAX_TIME) {
+        Ok(Ok(())) => {}
+        Ok(Err(msg)) => return Err(format!("panicked: {msg}")),
+        Err(_) => {
+            HUNG.store(true, Ordering::Relaxed);
+            return Err(format!("hung: no result after {MAX_TIME:?}"));
+        }
+    }
     let peak = PEAK.load(Ordering::Relaxed).saturating_sub(base);
-    if let Err(p) = outcome {
-        let msg = p
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-            .unwrap_or_default();
-        return Err(format!("panicked: {msg}"));
-    }
-    if took > MAX_TIME {
-        return Err(format!("took {took:?}"));
-    }
     if peak > MAX_PEAK {
         return Err(format!("peak allocation {} MiB", peak >> 20));
     }
@@ -343,6 +362,9 @@ fn replay_regressions() {
         let data = std::fs::read(path).unwrap();
         if let Err(what) = check_one(*t, &data) {
             failures.push(format!("{}: {what}", path.display()));
+            if hung() {
+                break;
+            }
         }
     }
     assert!(
@@ -443,7 +465,7 @@ fn mutation_smoke() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let seeds = seeds();
     let mut failures = Vec::new();
-    for t in Target::ALL {
+    'targets: for t in Target::ALL {
         let mine: Vec<&[u8]> = seeds
             .iter()
             .filter(|(s, _)| *s == t)
@@ -456,6 +478,9 @@ fn mutation_smoke() {
         for seed in &mine {
             if let Err(what) = check_one(t, seed) {
                 failures.push(keep_failure(t, seed, &format!("seed: {what}")));
+                if hung() {
+                    break 'targets;
+                }
             }
         }
         for _ in 0..iterations(t) {
@@ -464,6 +489,9 @@ fn mutation_smoke() {
             let input = mutate(&mut rng, seed, other, keep);
             if let Err(what) = check_one(t, &input) {
                 failures.push(keep_failure(t, &input, &what));
+                if hung() {
+                    break 'targets;
+                }
             }
         }
         eprintln!(

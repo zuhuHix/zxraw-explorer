@@ -143,8 +143,9 @@ fn describe(e: &sz::Error) -> String {
 /// Entry data for visitors, with the library's data errors in words; `failed` is set when
 /// any read fails (the block is then bad, whatever the visitor made of it).
 ///
-/// Fused: once a read fails (other than a bare `Interrupted`), every later read repeats
-/// that error without touching the decoder again. lzma-rust2's `Lzma2Reader` is not safe
+/// Fused: once a read fails, every later read repeats that error without touching the
+/// decoder again (a cancel is repeated as a cancel; `Interrupted`, whatever its source, is
+/// not a failure and is passed through to be retried). lzma-rust2's `Lzma2Reader` is not safe
 /// to read after an error: a chunk header whose properties byte is invalid leaves it with
 /// a chunk size but no LZMA decoder, and the next `read` spins forever making no progress.
 struct Friendly<'f, R> {
@@ -173,13 +174,14 @@ impl<R: Read> Read for Friendly<'_, R> {
         }
         let e = match self.inner.read(buf) {
             Ok(n) => return Ok(n),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none() => {
-                return Err(e);
-            }
             Err(e) => e,
         };
+        // A cancel stops reading for good; any other `Interrupted` is retried.
         if is_cancel(&e) {
             self.dead = Some(None);
+            return Err(e);
+        }
+        if e.kind() == io::ErrorKind::Interrupted {
             return Err(e);
         }
         self.failed.set(true);
@@ -922,5 +924,77 @@ impl ArchiveBackend for SevenZipBackend {
         ctx: &JobCtx<'_>,
     ) -> Result<CreateReport> {
         super::sevenz_writer::update(archive, edit, opts, ctx)
+    }
+}
+
+#[cfg(test)]
+mod friendly_tests {
+    use super::*;
+
+    struct Script(Vec<io::Result<usize>>, usize);
+
+    impl Read for Script {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.1 += 1;
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            self.0.remove(0)
+        }
+    }
+
+    #[test]
+    fn interrupted_is_retried_and_a_cancel_stays_a_cancel() {
+        let failed = std::cell::Cell::new(false);
+        let mut f = Friendly::new(
+            Script(
+                vec![
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "signal")),
+                    Ok(3),
+                    Err(io::Error::new(io::ErrorKind::Interrupted, Cancelled)),
+                    Ok(3),
+                ],
+                0,
+            ),
+            &failed,
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            f.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(f.read(&mut buf).unwrap(), 3);
+        for _ in 0..3 {
+            assert!(is_cancel(&f.read(&mut buf).unwrap_err()));
+        }
+        assert_eq!(f.inner.1, 3);
+        assert!(
+            !failed.get(),
+            "neither a retry nor a cancel is a data failure"
+        );
+    }
+
+    #[test]
+    fn a_data_error_is_repeated_without_reading_again() {
+        let failed = std::cell::Cell::new(false);
+        let mut f = Friendly::new(
+            Script(
+                vec![
+                    Err(io::Error::new(io::ErrorKind::InvalidData, "bad")),
+                    Ok(3),
+                ],
+                0,
+            ),
+            &failed,
+        );
+        let mut buf = [0u8; 8];
+        for _ in 0..3 {
+            assert_eq!(
+                f.read(&mut buf).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        assert_eq!(f.inner.1, 1);
+        assert!(failed.get());
     }
 }
