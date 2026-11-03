@@ -135,9 +135,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   (and stray temp files) over a day old, except the drag-out folders of a ZXraw still running;
   links there are removed as links, never followed.
 * Archives are told apart by a stamp of their size, modified time, file identity and their
-  first 4 KB and last 64 KB. A replacement with the same size and time that differs only in the
-  middle, in place (same file, an unusual edit that leaves the archive's directory alone), is
-  still taken for the old one: its listing and thumbnails stay until it changes again.
+  first 4 KB and last 64 KB. Where the file identity is read (local NTFS, most shares), any
+  replacement is seen. Where it isn't (some network shares, FAT-like volumes), the stamp can't
+  rule out a same-size, same-time replacement that differs only in the middle, so the archive is
+  listed again on each folder open and temp copies are made again. Replacements are seen there
+  too, at a cost: a compressed tar (decoded to list) opens slowly.
 * Inside an open zip, 7z or tar, rename and new folder are not available, and copying between two
   archives is refused. Photos inside a zip open with their default app, not the built-in viewer.
 * Items dragged or copied out of an archive to other apps are virtual files

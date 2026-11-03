@@ -35,7 +35,7 @@ mod sevenz_writer;
 pub mod sfx;
 mod stamp;
 pub mod stage;
-pub use stamp::archive_stamp;
+pub use stamp::{ArchiveStamp, archive_stamp};
 mod tar_backend;
 mod tar_read;
 mod tar_write;
@@ -574,8 +574,8 @@ pub fn inner_path(archive: &Path, inner: &str) -> PathBuf {
     p
 }
 
-/// Cached indexes by archive path: the [`archive_stamp`] they were built from, the index, and
-/// its weight.
+/// Cached indexes by archive path: the [`archive_stamp`] value they were built from, the index,
+/// and its weight. Only strong stamps are cached (see [`index_cached_stamped`]).
 type IndexCache = Mutex<lru::LruCache<PathBuf, (u64, Arc<ArchiveIndex>, u64)>>;
 
 /// Memory the cached indexes may take together (a big tar's names can be hundreds of MB):
@@ -592,8 +592,8 @@ fn cache() -> &'static IndexCache {
     CACHE.get_or_init(|| Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(8).unwrap())))
 }
 
-/// The browsing index of an archive, cached while the file's size and modified time stay
-/// the same (the central directory is read once, not on every folder change).
+/// The browsing index of an archive, cached while its [`archive_stamp`] stays the same (the
+/// central directory is read once, not on every folder change). A weak stamp is never cached.
 pub fn index_cached(archive: &Path) -> Result<Arc<ArchiveIndex>> {
     index_cached_with(archive, None)
 }
@@ -615,15 +615,20 @@ pub fn index_cached_progress(
 }
 
 /// [`index_cached_progress`] for an archive whose `stamp` ([`archive_stamp`]) the caller took.
+///
+/// A weak stamp (no file id) can't tell a replaced archive from the old one, so its index is
+/// always listed again and not kept. The cost is one listing per call: a zip, 7z or rar reads
+/// its directory; a compressed tar is decoded to its end (the only format where this is slow).
 pub fn index_cached_stamped(
     archive: &Path,
-    stamp: u64,
+    stamp: ArchiveStamp,
     password: Option<&Password>,
     ctx: Option<&JobCtx<'_>>,
 ) -> Result<Arc<ArchiveIndex>> {
     let lookup = paths::lexical_normalize(archive);
     if let Some((s, idx, _)) = cache().lock().get(&lookup)
-        && *s == stamp
+        && stamp.strong
+        && *s == stamp.value
     {
         return Ok(idx.clone());
     }
@@ -639,14 +644,14 @@ pub fn index_cached_stamped(
     let weight = index_weight(&idx);
     let mut cache = cache().lock();
     cache.pop(&lookup);
-    if weight <= INDEX_CACHE_BUDGET {
+    if stamp.strong && weight <= INDEX_CACHE_BUDGET {
         let mut total = weight + cache.iter().map(|(_, (_, _, w))| *w).sum::<u64>();
         while total > INDEX_CACHE_BUDGET
             && let Some((_, (_, _, w))) = cache.pop_lru()
         {
             total -= w;
         }
-        cache.put(lookup, (stamp, idx.clone(), weight));
+        cache.put(lookup, (stamp.value, idx.clone(), weight));
     }
     Ok(idx)
 }
@@ -1782,7 +1787,9 @@ pub fn temp_root() -> PathBuf {
 
 /// Extract one file entry to a private temp folder and return its path, to open it with
 /// its app or preview it. The archive's Mark-of-the-Web is applied. A copy extracted
-/// earlier from the same unchanged archive is reused. Fails for entries over `max_bytes`.
+/// earlier from the same unchanged archive is reused, but only under a strong stamp: a weak
+/// one can't rule out a replaced archive, so the entry is always extracted again (one entry,
+/// read from the archive as it is now). Fails for entries over `max_bytes`.
 pub fn extract_entry_to_temp(
     archive: &Path,
     entry_name: &str,
@@ -1792,11 +1799,12 @@ pub fn extract_entry_to_temp(
 ) -> Result<PathBuf> {
     let stamp = archive_stamp(archive)?;
     let key = format!(
-        "{}|{stamp:016x}",
+        "{}|{:016x}",
         paths::lexical_normalize(archive)
             .display()
             .to_string()
-            .to_lowercase()
+            .to_lowercase(),
+        stamp.value
     );
     let dir = temp_root().join(format!(
         "{:016x}",
@@ -1831,7 +1839,8 @@ pub fn extract_entry_to_temp(
     let target = dir.join(&file_name);
     // Reused only when it is still the file this extraction wrote: a plain file (not a link)
     // with the entry's size and modified time.
-    let reusable = node.modified.is_some()
+    let reusable = stamp.strong
+        && node.modified.is_some()
         && fs::symlink_metadata(&target).is_ok_and(|m| {
             m.is_file()
                 && !safety::is_link_or_reparse(&m)
