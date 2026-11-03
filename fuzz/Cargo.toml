@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-forge-core = { path = "../crates/forge-core" }
+forge-core = { path = "../crates/forge-core", features = ["fuzz-harness"] }
 
 # Not part of the main workspace: built with nightly by `cargo fuzz` (see docs/TESTING.md).
 [workspace]

@@ -108,7 +108,9 @@ a smoke-test aid and does not assert visual correctness. Script mode (below) inj
 Archives come from the internet, so every parser in `forge-core/src/archive/` is fuzzed. The
 targets are defined once, in `forge-core/src/archive/fuzz.rs` (`Target`, `run`). Two drivers
 use them: the libFuzzer targets in `fuzz/`, and the stable test
-`crates/forge-core/tests/archive_fuzz.rs`.
+`crates/forge-core/tests/archive_fuzz.rs`. The module is compiled only with forge-core's
+`fuzz-harness` feature, which the fuzz crate and forge-core's own tests enable (a
+dev-dependency on itself); the app never includes it.
 
 | Target | What it feeds |
 |---|---|
@@ -123,7 +125,9 @@ use them: the libFuzzer targets in `fuzz/`, and the stable test
 Every target runs under tight limits (`fuzz::limits()`): 1,000 entries, 64 MiB in total,
 16 MiB per file and 64 MiB of decoder memory. Both drivers install a tracking allocator.
 A single allocation over 256 MiB (fuzz) or 512 MiB (test) aborts at once. The test also
-fails an input that keeps more than 512 MiB live, or that takes more than 20 s.
+fails an input that keeps more than 512 MiB live. It runs each input on a thread of its
+own and waits at most 20 s for it: an input that hangs fails the test at once (the test
+stops there and leaves that thread spinning until the process ends).
 libFuzzer's `-rss_limit_mb=2048` covers allocations in C code (zstd, UnRAR), and
 `-timeout=10` catches hangs.
 
@@ -203,7 +207,10 @@ cargo build -p forge-bench --release --bin archive-bench
 target\release\archive-bench.exe --samples 3 --out bench.md   # --scale 0.01 for a smoke run
 ```
 
-It writes a synthetic corpus once to `%TEMP%\zxraw-archive-bench`, from a fixed seed: text,
+It writes a synthetic corpus once, from a fixed seed, to `<root>\zxraw-bench-corpus`
+(default root `%TEMP%\zxraw-archive-bench`). It writes and deletes only inside that
+folder, and it refuses to use an existing one that lacks the ownership marker it writes
+when it creates it. The corpus has: text,
 structured binary, already compressed (random .jpg/.mp4) and 10,000 small files. It times
 create and extract for zip Fast/Balanced/Max/Zstd, 7z and tar.zst, and compares with 7-Zip
 when `7z.exe` is installed. Results are in [BENCHMARKS.md](BENCHMARKS.md#archives).

@@ -34,7 +34,14 @@ pbkdf2.workspace = true
 sha1.workspace = true
 lru.workspace = true
 
+[features]
+# The archive fuzz harness (`archive::fuzz`): only for the fuzz targets in `fuzz/` and the
+# `archive_fuzz` test, never for the app.
+fuzz-harness = []
+
 [dev-dependencies]
+# Tests (`tests/archive_fuzz.rs`) get the fuzz harness; normal builds don't.
+forge-core = { path = ".", features = ["fuzz-harness"] }
 tempfile.workspace = true
 # An independent reader to check the tar files we write.
 tar = "0.4"

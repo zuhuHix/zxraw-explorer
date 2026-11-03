@@ -821,12 +821,19 @@ fn xz_block_dict(w: &mut Work, pos: u64) -> Option<u32> {
 }
 
 /// A reader that stops at its first error: every later read repeats it without touching
-/// the inner reader again (a bare `Interrupted` is passed through, to be retried). Some
-/// decoders are not safe to read after an error: lzma-rust2's `Lzma2Reader` (xz, 7z LZMA2)
-/// spins forever on the read after an invalid chunk properties byte.
+/// the inner reader again. Some decoders are not safe to read after an error: lzma-rust2's
+/// `Lzma2Reader` (xz, 7z LZMA2) spins forever on the read after an invalid chunk
+/// properties byte. `Interrupted` is not an error here (whatever its source): it is passed
+/// through, to be retried. A cancel (the job's, from the archive reader underneath) stops
+/// reading for good and is repeated as a cancel, so it is still recognised as one.
 pub(crate) struct Fused<R> {
     inner: R,
-    dead: Option<(io::ErrorKind, String)>,
+    dead: Option<Dead>,
+}
+
+enum Dead {
+    Cancelled(io::ErrorKind),
+    Failed(io::ErrorKind, String),
 }
 
 impl<R> Fused<R> {
@@ -837,16 +844,25 @@ impl<R> Fused<R> {
 
 impl<R: Read> Read for Fused<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let Some((kind, text)) = &self.dead {
-            return Err(io::Error::new(*kind, text.clone()));
-        }
-        match self.inner.read(buf) {
-            Err(e) if !(e.kind() == io::ErrorKind::Interrupted && e.get_ref().is_none()) => {
-                self.dead = Some((e.kind(), e.to_string()));
-                Err(e)
+        match &self.dead {
+            Some(Dead::Cancelled(kind)) => {
+                return Err(io::Error::new(*kind, super::tar_backend::Cancelled));
             }
-            other => other,
+            Some(Dead::Failed(kind, text)) => return Err(io::Error::new(*kind, text.clone())),
+            None => {}
         }
+        let e = match self.inner.read(buf) {
+            Err(e) => e,
+            ok => return ok,
+        };
+        if e.get_ref()
+            .is_some_and(|i| i.is::<super::tar_backend::Cancelled>())
+        {
+            self.dead = Some(Dead::Cancelled(e.kind()));
+        } else if e.kind() != io::ErrorKind::Interrupted {
+            self.dead = Some(Dead::Failed(e.kind(), e.to_string()));
+        }
+        Err(e)
     }
 }
 
@@ -1211,5 +1227,83 @@ mod tests {
         assert_eq!(gzip_name(&header(b"a:b")), None);
         assert_eq!(gzip_name(&header(b"caf\xe9")).as_deref(), Some("café"));
         assert_eq!(gzip_name(&header(&[b'a'; 300])), None);
+    }
+}
+
+#[cfg(test)]
+mod fused_tests {
+    use super::*;
+    use crate::archive::tar_backend::Cancelled;
+
+    /// Plays back a script of read outcomes, counting reads.
+    struct Script(Vec<io::Result<usize>>, usize);
+
+    impl Read for Script {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.1 += 1;
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            self.0.remove(0)
+        }
+    }
+
+    fn is_cancel(e: &io::Error) -> bool {
+        e.get_ref().is_some_and(|i| i.is::<Cancelled>())
+    }
+
+    #[test]
+    fn interrupted_is_retried_whatever_its_source() {
+        let mut f = Fused::new(Script(
+            vec![
+                Err(io::Error::from(io::ErrorKind::Interrupted)),
+                Err(io::Error::new(io::ErrorKind::Interrupted, "signal")),
+                Ok(5),
+            ],
+            0,
+        ));
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            f.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(
+            f.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(f.read(&mut buf).unwrap(), 5);
+        assert_eq!(f.inner.1, 3);
+    }
+
+    #[test]
+    fn an_error_is_repeated_without_reading_again() {
+        let mut f = Fused::new(Script(
+            vec![
+                Err(io::Error::new(io::ErrorKind::InvalidData, "bad chunk")),
+                Ok(5),
+            ],
+            0,
+        ));
+        let mut buf = [0u8; 8];
+        for _ in 0..3 {
+            let e = f.read(&mut buf).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            assert!(e.to_string().contains("bad chunk"));
+        }
+        assert_eq!(f.inner.1, 1);
+    }
+
+    #[test]
+    fn a_cancel_stops_reading_and_stays_a_cancel() {
+        for kind in [io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+            let mut f = Fused::new(Script(vec![Err(io::Error::new(kind, Cancelled)), Ok(5)], 0));
+            let mut buf = [0u8; 8];
+            for _ in 0..3 {
+                let e = f.read(&mut buf).unwrap_err();
+                assert_eq!(e.kind(), kind);
+                assert!(is_cancel(&e));
+            }
+            assert_eq!(f.inner.1, 1);
+        }
     }
 }

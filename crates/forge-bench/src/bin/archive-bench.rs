@@ -8,6 +8,10 @@
 //!     [--scale <f>] [--samples <n>] [--root <dir>] [--out <file.md>] \
 //!     [--sevenzip <path> | --no-7zip]
 //! ```
+//!
+//! Everything it writes or deletes is inside `<root>\zxraw-bench-corpus` (default root
+//! `%TEMP%\zxraw-archive-bench`). That folder is created with an ownership marker, and an
+//! existing one without it is refused, so `--root` can never make it delete anything else.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -23,6 +27,13 @@ use forge_jobs::{CancelToken, Progress};
 const MIB: f64 = 1024.0 * 1024.0;
 const CORPORA: [&str; 4] = ["text", "binary", "precompressed", "small"];
 const MARKER: &str = "corpus.marker";
+/// The folder under `--root` that the benchmark owns: it never deletes anything outside it.
+const BENCH_DIR: &str = "zxraw-bench-corpus";
+/// Proof that a [`BENCH_DIR`] was made by this tool (written when it creates the folder).
+const OWNER: &str = "zxraw-archive-bench.owner";
+const OWNER_TEXT: &str =
+    "Created by ZXraw archive-bench; everything in this folder may be deleted by it.
+";
 const SEVENZIP_DEFAULT: &str = r"C:\Program Files\7-Zip\7z.exe";
 const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -200,7 +211,29 @@ fn reset_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The benchmark's own folder under `root`: created (with its ownership marker) when
+/// missing; an existing one is used only when it carries that marker, since everything in
+/// it may be deleted.
+fn bench_dir(root: &Path) -> Result<PathBuf> {
+    let dir = root.join(BENCH_DIR);
+    let owner = dir.join(OWNER);
+    if dir.exists() {
+        if fs::read_to_string(&owner).ok().as_deref() != Some(OWNER_TEXT) {
+            bail!(
+                "{} exists but was not created by archive-bench (no {OWNER}); refusing to use it",
+                dir.display()
+            );
+        }
+    } else {
+        fs::create_dir_all(&dir).with_context(|| dir.display().to_string())?;
+        fs::write(&owner, OWNER_TEXT)?;
+    }
+    Ok(dir)
+}
+
+/// `root` is a folder from [`bench_dir`]: only folders inside it are deleted.
 fn ensure_corpus(root: &Path, scale: f64) -> Result<()> {
+    debug_assert!(root.join(OWNER).is_file());
     let want = format!("archive-bench corpus v1 scale={scale}");
     let marker = root.join(MARKER);
     let fresh = fs::read_to_string(&marker).ok().as_deref() == Some(want.as_str())
@@ -211,7 +244,6 @@ fn ensure_corpus(root: &Path, scale: f64) -> Result<()> {
     }
 
     eprintln!("generating corpus in {} (scale {scale})", root.display());
-    fs::create_dir_all(root)?;
     for c in CORPORA {
         let _ = fs::remove_dir_all(root.join(c));
     }
@@ -468,14 +500,15 @@ fn render(rows: &[Row]) -> String {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    ensure_corpus(&args.root, args.scale)?;
+    let base = bench_dir(&args.root)?;
+    ensure_corpus(&base, args.scale)?;
 
-    let work = args.root.join("work");
+    let work = base.join("work");
     reset_dir(&work)?;
 
     let mut rows = Vec::new();
     for corpus in CORPORA {
-        let src = args.root.join(corpus);
+        let src = base.join(corpus);
         let input = dir_bytes(&src)?;
 
         for cfg in configs() {
@@ -514,7 +547,7 @@ fn main() -> Result<()> {
                     extract_s: Vec::new(),
                 };
                 for s in 0..args.samples {
-                    let (size, c, x) = sevenzip_sample(exe, &args.root, corpus, &work, zip, s)?;
+                    let (size, c, x) = sevenzip_sample(exe, &base, corpus, &work, zip, s)?;
                     eprintln!(
                         "[{corpus}] {name} sample {}/{}: archive {:.2} MiB, create {c:.2} s, extract {x:.2} s",
                         s + 1,

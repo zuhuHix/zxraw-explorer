@@ -123,18 +123,32 @@ fn pick_codec(sel: u8) -> (Codec, bool) {
     )
 }
 
-/// A folder of its own for this process's input files.
-fn work_dir() -> PathBuf {
-    let base = std::env::var_os("ZXRAW_FUZZ_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("zxraw-fuzz"));
-    let dir = base.join(std::process::id().to_string());
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+/// A folder of its own for this thread's input files, removed when the thread ends.
+struct WorkDir(PathBuf);
+
+impl WorkDir {
+    fn new() -> Self {
+        let base = std::env::var_os("ZXRAW_FUZZ_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("zxraw-fuzz"));
+        // One per thread: a test runs each input on a thread of its own, and one that hung
+        // is left running.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = base.join(format!("{}-{n}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        Self(dir)
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 thread_local! {
-    static DIR: PathBuf = work_dir();
+    static DIR: WorkDir = WorkDir::new();
 }
 
 /// Feed `data` to `target`. Never panics on its own account: a panic is a bug found.
@@ -198,7 +212,7 @@ pub fn run(target: Target, data: &[u8]) {
 /// Write `data` to this process's input file `name`, run `f` on it, then forget anything
 /// cached about it (the next input reuses the name).
 fn with_file(data: &[u8], name: &str, f: impl FnOnce(&Path)) {
-    let path = DIR.with(|d| d.join(name));
+    let path = DIR.with(|d| d.0.join(name));
     super::invalidate_cached(&path);
     if std::fs::write(&path, data).is_err() {
         return;
