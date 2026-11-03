@@ -117,10 +117,11 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   extraction makes (*Extract to `<name>\`*, smart, selections) is held from the moment it is
   made, and taking back a cancelled extraction happens while it is still held. Each folder is
   opened relative to the one above it, and the last must be the folder the path resolved to, or
-  the job is refused. Taking back removes only what the job made that is still the same item
-  (Windows file ID; where a volume has none, some FAT and network volumes, its creation time,
-  write time and size): anything replaced meanwhile is left in place and reported. Without a
-  file ID, a replacement with the same times and size is not told apart. Not covered:
+  the job is refused. Taking back removes only files the job created at empty paths (a file it
+  wrote over an existing one keeps the new copy) and folders it made, and only when the Windows
+  file ID proves it is still the same item: anything replaced meanwhile is left in place and
+  reported. On volumes without a file ID (some FAT and network volumes) nothing is removed;
+  it is left and reported. Not covered:
   changes before the job starts (a junction or mapped drive in the chosen path is followed, as
   it is then); in the instant between making a new folder and holding it, someone allowed to
   rename in its parent can swap it for another real folder (never a link), and files then still

@@ -676,6 +676,12 @@ pub(crate) fn write_stream_placed<R: Read>(
     Ok((out, placed, identity.get()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: when set, [`FileIdentity`] reads no file id on this thread (the weak path).
+    pub(crate) static HIDE_FILE_ID: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What a file or folder is, independent of its name: a file written anew under the same
 /// name (deleted and re-created, or renamed over) is a different one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -684,7 +690,8 @@ pub(crate) enum FileIdentity {
     Id { volume: u64, id: [u8; 16] },
     /// Where the volume gives no file id (some FAT and network volumes): creation time,
     /// last write time and size (both 0 for a folder, whose write time changes with its
-    /// contents). A replacement made with the same times and size is not told apart.
+    /// contents). A replacement made with the same times and size is not told apart, so
+    /// this never proves an item is the same one (see [`FileIdentity::is_strong`]).
     Weak {
         created: u64,
         modified: u64,
@@ -696,6 +703,11 @@ impl FileIdentity {
     /// The identity of the open file, `None` when nothing can be read.
     pub(crate) fn of(file: &File) -> Option<Self> {
         Self::read(file, false)
+    }
+
+    /// Whether this identity proves an item is the same one (a file id, not the weak form).
+    pub(crate) fn is_strong(&self) -> bool {
+        matches!(self, Self::Id { .. })
     }
 
     /// [`FileIdentity::of`] for a folder.
@@ -721,7 +733,11 @@ impl FileIdentity {
                 std::mem::size_of::<FILE_ID_INFO>() as u32,
             )
         };
-        if read.is_ok() && info.FileId.Identifier.iter().any(|b| *b != 0) {
+        #[cfg(not(test))]
+        let read = read.is_ok();
+        #[cfg(test)]
+        let read = read.is_ok() && !HIDE_FILE_ID.with(std::cell::Cell::get);
+        if read && info.FileId.Identifier.iter().any(|b| *b != 0) {
             return Some(Self::Id {
                 volume: info.VolumeSerialNumber,
                 id: info.FileId.Identifier,

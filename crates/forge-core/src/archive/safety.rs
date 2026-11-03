@@ -411,6 +411,9 @@ pub(crate) enum Removal {
     Gone,
     /// What has that name now is not what was recorded (or could not be identified).
     Changed,
+    /// It matches, but only by the weak identity (no file id), which can't prove it is the
+    /// same item: never removed.
+    Unconfirmed,
     /// A folder still holding something.
     NotEmpty,
     Failed(io::Error),
@@ -419,7 +422,8 @@ pub(crate) enum Removal {
 /// Remove the file (or, with `dir`, the empty folder) `name` in the folder open as `parent`,
 /// but only when it is still the one recorded as `want`: it is opened relative to `parent`
 /// without following a reparse point, its identity checked through that handle, and deleted
-/// through the same handle.
+/// through the same handle. Only a file id proves that: with the weak identity nothing is
+/// removed.
 #[cfg(windows)]
 pub(crate) fn remove_if_same(
     parent: &fs::File,
@@ -458,8 +462,11 @@ pub(crate) fn remove_if_same(
     } else {
         FileIdentity::of(&file)
     };
-    if want.is_none() || now != want {
+    let Some(want) = want.filter(|w| now == Some(*w)) else {
         return Removal::Changed;
+    };
+    if !want.is_strong() {
+        return Removal::Unconfirmed;
     }
     match crate::ops::delete_open(&file, Path::new(name)) {
         Ok(()) => Removal::Removed,

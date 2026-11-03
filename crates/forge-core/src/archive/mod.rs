@@ -845,6 +845,8 @@ struct Published {
     rel: PathBuf,
     identity: Option<ops::FileIdentity>,
     dir: bool,
+    /// It replaced a file that was already there: never taken back (the old one is gone).
+    replaced: bool,
 }
 
 /// [`extract`] into `base`, a destination already pinned (with its ancestors, while the
@@ -859,7 +861,7 @@ fn extract_pinned(
     ctx: &JobCtx<'_>,
     track: Option<&std::cell::RefCell<Vec<Published>>>,
 ) -> Result<ExtractReport> {
-    let record = |path: &Path, identity: Option<ops::FileIdentity>, dir: bool| {
+    let record = |path: &Path, identity: Option<ops::FileIdentity>, dir: bool, replaced: bool| {
         if let Some(track) = track
             && let Ok(rel) = path.strip_prefix(base.root())
         {
@@ -867,6 +869,7 @@ fn extract_pinned(
                 rel: rel.to_path_buf(),
                 identity,
                 dir,
+                replaced,
             });
         }
     };
@@ -1035,7 +1038,8 @@ fn extract_pinned(
     // their folder inside the destination; and what became of them.
     // Each held file keeps its open handle and the pins of the folders it goes into until it
     // is published or dropped: neither it nor its folders can be swapped meanwhile.
-    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs)>> =
+    // Also whether it replaces a file already there.
+    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs, bool)>> =
         Default::default();
     let settled: std::cell::RefCell<(Vec<PathBuf>, Vec<OpIssue>)> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
@@ -1059,7 +1063,7 @@ fn extract_pinned(
             p.rel.parent().unwrap_or(Path::new(""))
         };
         // Held until the entry is in place: the folders it is written into can't be swapped.
-        let mut made = |rel: &Path, identity| record(&root.join(rel), identity, true);
+        let mut made = |rel: &Path, identity| record(&root.join(rel), identity, true, false);
         let pinned = match safety::pin_dirs_with(base, parent_rel, &mut made) {
             Ok(pinned) => pinned,
             Err(e) => {
@@ -1119,7 +1123,8 @@ fn extract_pinned(
                 Ok((out, file)) => {
                     remaining = remaining.saturating_sub(out.bytes);
                     report.bytes += out.bytes;
-                    held.borrow_mut().push((file, shown(&dest), pinned));
+                    held.borrow_mut()
+                        .push((file, shown(&dest), pinned, overwrite));
                     Ok(())
                 }
                 Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
@@ -1133,7 +1138,8 @@ fn extract_pinned(
         }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
             Ok((out, placed, identity)) => {
-                record(&placed, identity, false);
+                // `overwrite` only when a file had the name: else publishing never replaces.
+                record(&placed, identity, false, overwrite);
                 remaining = remaining.saturating_sub(out.bytes);
                 report.bytes += out.bytes;
                 if let Some(zone) = &zone
@@ -1157,7 +1163,7 @@ fn extract_pinned(
     let mut block_end = |outcome: Result<()>| -> Result<()> {
         let waiting = std::mem::take(&mut *held.borrow_mut());
         let mut settled = settled.borrow_mut();
-        for (file, label, pinned) in waiting {
+        for (file, label, pinned, replaced) in waiting {
             if outcome.is_err() {
                 drop(file); // deleted through its handle
                 settled.1.push(OpIssue::new(label, BLOCK_CHECK_FAILED));
@@ -1169,7 +1175,7 @@ fn extract_pinned(
             drop(pinned);
             match published {
                 Ok(placed) => {
-                    record(&placed, identity, false);
+                    record(&placed, identity, false, replaced);
                     if let Some(zone) = &zone
                         && let Err(e) = motw::write_zone(&placed, zone, archive)
                     {
@@ -1493,7 +1499,8 @@ pub struct NewFolder<'a> {
 /// When it did and `undo_if` holds for the result, the files it published, then the folders
 /// it made (if empty) and the folder itself (if empty) are removed again, all while still
 /// pinned and each only if it is still the item the job made (see [`remove_created_tree`]);
-/// anything replaced meanwhile stays and is added to the report's `failed`.
+/// a file that replaced one already there, anything replaced meanwhile and anything only the
+/// weak identity (no file id) matched stay and are added to the report's `failed`.
 pub fn extract_into_folder(
     archive: &Path,
     folder: NewFolder<'_>,
@@ -1554,13 +1561,19 @@ pub fn extract_into_folder(
 
 /// Message for something the extraction wrote that was replaced before it was taken back.
 const CHANGED_AFTER_EXTRACTION: &str = "changed by another program after extraction; left in place";
+/// Message for something only the weak identity (no file id) matched: never taken back.
+const UNCONFIRMED: &str = "couldn't confirm it's the extracted copy; left in place";
+/// Message for a file the extraction wrote over an existing one: never taken back.
+const REPLACED_KEPT: &str = "replaced an existing file; the new copy is kept";
 
 /// Take back what an extraction put in the folder it created (`dest`, inside `parent`,
 /// reported beneath `shown_dest`): the files it published, then the folders it made, deepest
 /// first, then the folder itself, each only if it is still the one the job put there (same
-/// identity) and a folder only if empty. Each is opened relative to its pinned parent folder
-/// (never through a link) and deleted through that handle. Returns what was left in place
-/// because it changed or could not be removed.
+/// identity, proven by a file id) and a folder only if empty. A file that replaced one
+/// already there is kept (taking it back would leave nothing). Each is opened relative to its
+/// pinned parent folder (never through a link) and deleted through that handle. Returns what
+/// was left in place because it was a replacement, changed, couldn't be confirmed or could
+/// not be removed.
 fn remove_created_tree(
     parent: &safety::PinnedBase,
     dest: safety::PinnedBase,
@@ -1576,6 +1589,10 @@ fn remove_created_tree(
         };
         let parent_rel = p.rel.parent().unwrap_or(Path::new(""));
         let shown = shown_dest.join(&p.rel);
+        if p.replaced {
+            left.push(OpIssue::new(shown, REPLACED_KEPT));
+            continue;
+        }
         let pins = match safety::pin_existing(&dest, parent_rel) {
             Ok(pins) => pins,
             // Its folder is gone: so is it.
@@ -1594,6 +1611,7 @@ fn remove_created_tree(
         match safety::remove_if_same(folder, name, p.dir, p.identity) {
             safety::Removal::Removed | safety::Removal::Gone | safety::Removal::NotEmpty => {}
             safety::Removal::Changed => left.push(OpIssue::new(shown, CHANGED_AFTER_EXTRACTION)),
+            safety::Removal::Unconfirmed => left.push(OpIssue::new(shown, UNCONFIRMED)),
             safety::Removal::Failed(e) => left.push(OpIssue::new(
                 shown,
                 format!("could not be removed after the extraction stopped: {e}"),
@@ -1609,6 +1627,7 @@ fn remove_created_tree(
             safety::Removal::Changed => {
                 left.push(OpIssue::new(shown_dest, CHANGED_AFTER_EXTRACTION));
             }
+            safety::Removal::Unconfirmed => left.push(OpIssue::new(shown_dest, UNCONFIRMED)),
             safety::Removal::Failed(e) => {
                 tracing::warn!("could not remove {}: {e}", shown_dest.display());
             }

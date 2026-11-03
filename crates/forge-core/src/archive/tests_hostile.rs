@@ -1003,6 +1003,126 @@ fn taking_back_a_cancelled_extraction_leaves_a_replaced_file_alone() {
     );
 }
 
+/// Makes the file id unavailable to [`crate::ops::FileIdentity`] on this thread while alive.
+#[cfg(windows)]
+struct WeakIdentity;
+
+#[cfg(windows)]
+impl WeakIdentity {
+    fn on() -> Self {
+        crate::ops::HIDE_FILE_ID.with(|h| h.set(true));
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WeakIdentity {
+    fn drop(&mut self) {
+        crate::ops::HIDE_FILE_ID.with(|h| h.set(false));
+    }
+}
+
+/// Extract `entries` into a new `photos` folder under `parent`, cancelled as the folder
+/// `other` is made (everything before it is in place).
+#[cfg(windows)]
+fn extract_cancelled_at_other(
+    d: &Path,
+    entries: &[(&str, &[u8])],
+    opts: &ExtractOptions,
+) -> (PathBuf, ExtractReport) {
+    let parent = fresh_dest(d, "parent");
+    let archive = d.join("photos.zip");
+    zip_of(&archive, entries);
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    let token = cancel.clone();
+    let hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |p| {
+        if p.ends_with("other") {
+            token.cancel();
+        }
+    });
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(&archive, &parent, ExtractTarget::NamedFolder, opts, &ctx);
+    drop(hook);
+    let report = report.unwrap();
+    assert!(report.cancelled, "{report:?}");
+    (parent.join("photos"), report)
+}
+
+#[cfg(windows)]
+fn reason_for<'a>(report: &'a ExtractReport, path: &Path) -> &'a str {
+    &report
+        .failed
+        .iter()
+        .find(|i| i.path == path)
+        .unwrap_or_else(|| panic!("{} not reported: {report:?}", path.display()))
+        .reason
+}
+
+#[cfg(windows)]
+#[test]
+fn without_a_file_id_a_cancelled_extraction_takes_nothing_back() {
+    let d = tempfile::tempdir().unwrap();
+    let entries: &[(&str, &[u8])] = &[
+        ("a.txt", b"first"),
+        ("sub/b.txt", b"second"),
+        ("other/c.txt", b"third"),
+    ];
+    let weak = WeakIdentity::on();
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &ExtractOptions::default());
+    drop(weak);
+    // Nothing is removed: the weak identity can't prove these are the extracted copies.
+    assert_eq!(fs::read(made.join("a.txt")).unwrap(), b"first");
+    assert_eq!(fs::read(made.join("sub").join("b.txt")).unwrap(), b"second");
+    assert!(made.join("other").is_dir());
+    for p in [
+        made.join("a.txt"),
+        made.join("sub").join("b.txt"),
+        made.join("sub"),
+        made.join("other"),
+        made.clone(),
+    ] {
+        assert!(
+            reason_for(&report, &p).contains("couldn't confirm it's the extracted copy"),
+            "{report:?}"
+        );
+    }
+
+    // The same with a file id: all of it is taken back.
+    let d = tempfile::tempdir().unwrap();
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &ExtractOptions::default());
+    assert!(!made.exists(), "{report:?}");
+    assert!(report.failed.is_empty(), "{report:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn taking_back_a_cancelled_extraction_keeps_a_file_it_replaced() {
+    let d = tempfile::tempdir().unwrap();
+    // Before the job writes anything, the new folder holds `x.txt` of its own.
+    let hook = Hook::set(&super::safety::AFTER_DEST_PINNED, |p| {
+        fs::write(p.join("x.txt"), b"old bytes").unwrap();
+    });
+    let opts = ExtractOptions {
+        policy: crate::ops::ConflictPolicy::Overwrite,
+        ..Default::default()
+    };
+    let entries: &[(&str, &[u8])] = &[
+        ("x.txt", b"new bytes"),
+        ("y.txt", b"made by the job"),
+        ("other/z.txt", b"never written"),
+    ];
+    let (made, report) = extract_cancelled_at_other(d.path(), entries, &opts);
+    drop(hook);
+    // The replacement stays (the old file is gone already); what the job made is taken back.
+    assert_eq!(fs::read(made.join("x.txt")).unwrap(), b"new bytes");
+    assert!(!made.join("y.txt").exists());
+    assert!(!made.join("other").exists());
+    assert!(
+        reason_for(&report, &made.join("x.txt")).contains("replaced an existing file"),
+        "{report:?}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn a_destination_folder_swapped_while_it_is_pinned_is_refused() {
