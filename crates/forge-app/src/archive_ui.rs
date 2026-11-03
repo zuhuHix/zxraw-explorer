@@ -46,8 +46,8 @@ pub struct ArchiveView {
     pub archive: PathBuf,
     pub inner: String,
     pub index: Arc<ArchiveIndex>,
-    /// The archive file's size and modified time when listed, hashed: anything derived
-    /// from its contents (temp copies for thumbnails) is kept per version.
+    /// The archive file's stamp when listed (see [`version_of`]): anything derived from its
+    /// contents (temp copies for thumbnails) is kept per version.
     pub version: u64,
 }
 
@@ -132,7 +132,7 @@ pub fn list_archive_path_cancellable(
     let listed = archive::archive_stamp(&file).and_then(|stamp| {
         let ctx = JobCtx::new(cancel, &progress);
         archive::index_cached_stamped(&file, stamp, password.as_ref(), Some(&ctx))
-            .map(|index| (stamp, index))
+            .map(|index| (version_of(stamp), index))
     });
     scans().lock().retain(|(_, p)| !Arc::ptr_eq(p, &progress));
     let (version, index) = match listed {
@@ -167,7 +167,20 @@ pub fn list_archive_path_cancellable(
 /// A number that changes when the archive file is replaced or written (see
 /// [`archive::archive_stamp`]). Reads a little of the file: call it off the UI thread.
 pub fn archive_version(archive: &Path) -> u64 {
-    archive::archive_stamp(archive).unwrap_or(0)
+    archive::archive_stamp(archive).map_or(0, |stamp| stamp.value)
+}
+
+/// The version of a listing made from `stamp`. A strong stamp is the file's version. A weak
+/// one can't tell a replaced archive from the old one, so each listing gets a version of its
+/// own: copies made for an earlier listing are not reused, and a move out of the archive
+/// (which compares [`archive_version`]) is refused, as it is when the file id can't be read.
+fn version_of(stamp: archive::ArchiveStamp) -> u64 {
+    static LISTINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if stamp.strong {
+        return stamp.value;
+    }
+    let n = LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    stamp.value ^ n.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 /// The listing row of an archive node.
