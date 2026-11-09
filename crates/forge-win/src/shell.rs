@@ -112,7 +112,13 @@ pub fn open_default(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux, opens `path` with `gio open` (or `xdg-open`) after checking that it exists.
+#[cfg(target_os = "linux")]
+pub fn open_default(path: &Path) -> Result<()> {
+    linux::open(path)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn open_default(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -135,7 +141,13 @@ pub fn open_folder_in_explorer(path: &Path) -> Result<()> {
         })
 }
 
-#[cfg(not(windows))]
+/// On Linux there is no separate folder opener: `gio open` opens a folder in the file manager.
+#[cfg(target_os = "linux")]
+pub fn open_folder_in_explorer(path: &Path) -> Result<()> {
+    linux::open(path)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn open_folder_in_explorer(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -214,7 +226,14 @@ pub fn open_with_dialog(path: &Path) -> Result<()> {
     unsafe { SHOpenWithDialog(None, &info) }.map_err(|e| crate::api_err("SHOpenWithDialog", e))
 }
 
-#[cfg(not(windows))]
+/// On Linux, asks the XDG desktop portal for its app chooser (approximates the Windows dialog);
+/// without a portal it opens `path` with its default application instead.
+#[cfg(target_os = "linux")]
+pub fn open_with_dialog(path: &Path) -> Result<()> {
+    linux::open_with(path)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn open_with_dialog(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -235,7 +254,14 @@ pub fn show_properties(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux, asks the file manager (FileManager1) for its properties dialog. No fallback: if the
+/// file manager cannot show it, the error is returned.
+#[cfg(target_os = "linux")]
+pub fn show_properties(path: &Path) -> Result<()> {
+    linux::show_properties(path)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn show_properties(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -261,7 +287,14 @@ pub fn reveal_in_explorer(path: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(windows))]
+/// On Linux, asks the file manager (FileManager1) to select `path`. If that fails, the parent
+/// folder is opened instead.
+#[cfg(target_os = "linux")]
+pub fn reveal_in_explorer(path: &Path) -> Result<()> {
+    linux::reveal(path)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn reveal_in_explorer(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -290,7 +323,12 @@ pub fn known_folders() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn known_folders() -> Vec<(String, PathBuf)> {
+    linux::known_folders()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn known_folders() -> Vec<(String, PathBuf)> {
     Vec::new()
 }
@@ -503,6 +541,495 @@ pub(crate) mod com {
         fn drop(&mut self) {
             if self.uninit {
                 unsafe { CoUninitialize() };
+            }
+        }
+    }
+}
+
+/// Linux desktop integration. Opening goes through `gio open` (or `xdg-open`); reveal and
+/// properties through the FileManager1 D-Bus interface, called with `gdbus` and falling back to
+/// `dbus-send`; the app chooser through the XDG desktop portal; known folders from
+/// `user-dirs.dirs`. Every external program is run directly, never through a shell, with its
+/// stdin closed.
+#[cfg(target_os = "linux")]
+pub(crate) mod linux {
+    use std::ffi::OsStr;
+    use std::fmt::Write as _;
+    use std::io;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    use crate::{Result, WinError};
+
+    const FILE_MANAGER: &str = "org.freedesktop.FileManager1";
+    const FILE_MANAGER_PATH: &str = "/org/freedesktop/FileManager1";
+    const PORTAL: &str = "org.freedesktop.portal.Desktop";
+    const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+    /// How long the file manager may take to answer a D-Bus call.
+    const FILE_MANAGER_TIMEOUT: Duration = Duration::from_secs(3);
+    /// The portal may first have to start its backend, so it gets longer.
+    const PORTAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn io_error(op: &'static str, path: &Path, source: io::Error) -> WinError {
+        WinError::Io {
+            op,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    /// `path` made absolute against the current folder, without resolving links.
+    fn absolute(path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_or_else(|_| path.to_path_buf(), |dir| dir.join(path))
+        }
+    }
+
+    /// The path must exist, as ShellExecute requires. A missing path is `NotFound`.
+    fn ensure_exists(op: &'static str, path: &Path) -> Result<()> {
+        std::fs::metadata(path)
+            .map(drop)
+            .map_err(|source| io_error(op, path, source))
+    }
+
+    /// Starts `program` detached: no stdin and no output. Returns once the program has been
+    /// started, not when it exits.
+    fn spawn_detached(
+        program: &'static str,
+        args: &[&OsStr],
+        dir: Option<&Path>,
+    ) -> io::Result<()> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        let child = command.spawn()?;
+        reap(child, program);
+        Ok(())
+    }
+
+    /// Waits for `child` on a background thread so it never stays a zombie.
+    fn reap(mut child: Child, program: &'static str) {
+        let thread = std::thread::Builder::new()
+            .name(format!("reap {program}"))
+            .spawn(move || match child.wait() {
+                Ok(status) if !status.success() => {
+                    tracing::debug!("{program} exited with {status}")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("could not wait for {program}: {e}"),
+            });
+        if let Err(e) = thread {
+            tracing::debug!("no thread to reap {program}: {e}");
+        }
+    }
+
+    /// Opens `path` with its default application: `gio open`, or `xdg-open` when gio cannot be
+    /// started. Returns `Io` when neither can be started.
+    pub(crate) fn open(path: &Path) -> Result<()> {
+        ensure_exists("open", path)?;
+        let dir = super::working_dir_for(path);
+        match spawn_detached("gio", &[OsStr::new("open"), path.as_os_str()], dir) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!("gio cannot open {}: {e}; trying xdg-open", path.display());
+                spawn_detached("xdg-open", &[path.as_os_str()], dir)
+                    .map_err(|source| io_error("open", path, source))
+            }
+        }
+    }
+
+    /// Runs `command` to the end with stdout discarded. The error is the first line of stderr,
+    /// or why the program could not run.
+    fn run(mut command: Command) -> std::result::Result<(), String> {
+        let program = command.get_program().to_string_lossy().into_owned();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match command.output() {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stderr);
+                let line = text.lines().map(str::trim).find(|line| !line.is_empty());
+                Err(line.map_or_else(
+                    || format!("{program} failed ({})", out.status),
+                    str::to_string,
+                ))
+            }
+            Err(e) => Err(format!("{program} could not run: {e}")),
+        }
+    }
+
+    /// Calls FileManager1 `method`, which takes one file URI and a startup id, through `gdbus`
+    /// (with its own timeout), then `dbus-send` if that fails.
+    fn file_manager_call(method: &str, uri: &str) -> std::result::Result<(), String> {
+        let mut gdbus = Command::new("gdbus");
+        gdbus
+            .args(["call", "--session", "--timeout"])
+            .arg(FILE_MANAGER_TIMEOUT.as_secs().to_string())
+            .args([
+                "--dest",
+                FILE_MANAGER,
+                "--object-path",
+                FILE_MANAGER_PATH,
+                "--method",
+            ])
+            .arg(format!("{FILE_MANAGER}.{method}"))
+            // GVariant text: an array of one string, then the empty startup id.
+            .arg(format!("[{}]", gvariant_string(uri)))
+            .arg("\"\"");
+        let gdbus_err = match run(gdbus) {
+            Ok(()) => return Ok(()),
+            Err(why) => why,
+        };
+
+        let mut dbus = Command::new("dbus-send");
+        dbus.args(["--session", "--print-reply"])
+            .arg(format!(
+                "--reply-timeout={}",
+                FILE_MANAGER_TIMEOUT.as_millis()
+            ))
+            .arg(format!("--dest={FILE_MANAGER}"))
+            .arg(FILE_MANAGER_PATH)
+            .arg(format!("{FILE_MANAGER}.{method}"))
+            // dbus-send splits array elements at commas; the URI is percent-encoded, so it has none.
+            .arg(format!("array:string:{uri}"))
+            .arg("string:");
+        run(dbus).map_err(|dbus_err| format!("{gdbus_err}; {dbus_err}"))
+    }
+
+    /// Selects `path` in the file manager. If the file manager cannot do that, its parent
+    /// folder is opened instead.
+    pub(crate) fn reveal(path: &Path) -> Result<()> {
+        let path = absolute(path);
+        ensure_exists("reveal in file manager", &path)?;
+        match file_manager_call("ShowItems", &file_uri(&path)) {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                tracing::debug!(
+                    "no file manager selection for {}: {why}; opening its folder",
+                    path.display()
+                );
+                open(path.parent().unwrap_or(path.as_path()))
+            }
+        }
+    }
+
+    /// Asks the file manager to show the properties of `path`. No fallback.
+    pub(crate) fn show_properties(path: &Path) -> Result<()> {
+        let path = absolute(path);
+        ensure_exists("show properties", &path)?;
+        file_manager_call("ShowItemProperties", &file_uri(&path))
+            .map_err(|why| io_error("show properties", &path, io::Error::other(why)))
+    }
+
+    /// Shows the portal's app chooser for `path` (`ask` = true). Without a working portal,
+    /// `path` opens with its default application.
+    pub(crate) fn open_with(path: &Path) -> Result<()> {
+        let path = absolute(path);
+        ensure_exists("open with", &path)?;
+        let mut portal = Command::new("gdbus");
+        portal
+            .args(["call", "--session", "--timeout"])
+            .arg(PORTAL_TIMEOUT.as_secs().to_string())
+            .args([
+                "--dest",
+                PORTAL,
+                "--object-path",
+                PORTAL_PATH,
+                "--method",
+                "org.freedesktop.portal.OpenURI.OpenURI",
+            ])
+            // parent window (none), the URI, and the options.
+            .arg("\"\"")
+            .arg(gvariant_string(&file_uri(&path)))
+            .arg("{'ask': <true>}");
+        match run(portal) {
+            Ok(()) => Ok(()),
+            Err(why) => {
+                tracing::debug!(
+                    "the portal could not show an app chooser: {why}; opening {}",
+                    path.display()
+                );
+                open(&path)
+            }
+        }
+    }
+
+    /// The XDG user folders that exist, in the Windows list's order: Desktop, Downloads,
+    /// Documents, Pictures, Videos, Music, then Home.
+    pub(crate) fn known_folders() -> Vec<(String, PathBuf)> {
+        let Some(home) = absolute_env("HOME") else {
+            return Vec::new();
+        };
+        let config = absolute_env("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
+        let contents = std::fs::read_to_string(config.join("user-dirs.dirs")).unwrap_or_default();
+        user_dir_candidates(&contents, &home)
+            .into_iter()
+            .filter(|(_, path)| path.is_dir())
+            .map(|(label, path)| (label.to_string(), path))
+            .collect()
+    }
+
+    fn absolute_env(name: &str) -> Option<PathBuf> {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    }
+
+    /// The XDG user directories the Windows list shows, with the XDG key each one comes from
+    /// and the folder name XDG uses when the file does not set it.
+    const USER_DIRS: &[(&str, &str, &str)] = &[
+        ("Desktop", "DESKTOP", "Desktop"),
+        ("Downloads", "DOWNLOAD", "Downloads"),
+        ("Documents", "DOCUMENTS", "Documents"),
+        ("Pictures", "PICTURES", "Pictures"),
+        ("Videos", "VIDEOS", "Videos"),
+        ("Music", "MUSIC", "Music"),
+    ];
+
+    /// The Windows-order list of `(label, path)` from the contents of `user-dirs.dirs`, with
+    /// `$HOME` taken from `home`. Missing keys get the XDG default under `home`. Nothing is
+    /// checked on disk; `Home` is always last.
+    pub(crate) fn user_dir_candidates(contents: &str, home: &Path) -> Vec<(&'static str, PathBuf)> {
+        let parsed = parse_user_dirs(contents, home);
+        let mut out: Vec<(&'static str, PathBuf)> = USER_DIRS
+            .iter()
+            .map(|(label, key, default)| {
+                let path = parsed
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map_or_else(|| home.join(default), |(_, path)| path.clone());
+                (*label, path)
+            })
+            .collect();
+        out.push(("Home", home.to_path_buf()));
+        out
+    }
+
+    /// The `XDG_<KEY>_DIR="value"` lines of `user-dirs.dirs` as `(KEY, path)`. `$HOME` is
+    /// expanded with `home`. Comments, other lines, and values that are not quoted or not
+    /// absolute (after `$HOME` expansion) are skipped.
+    pub(crate) fn parse_user_dirs(contents: &str, home: &Path) -> Vec<(String, PathBuf)> {
+        contents
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                let key = key.trim().strip_prefix("XDG_")?.strip_suffix("_DIR")?;
+                let value = unquote(value.trim())?;
+                let path = if value == "$HOME" {
+                    home.to_path_buf()
+                } else if let Some(rest) = value.strip_prefix("$HOME/") {
+                    home.join(rest)
+                } else if value.starts_with('/') {
+                    PathBuf::from(value)
+                } else {
+                    return None;
+                };
+                Some((key.to_string(), path))
+            })
+            .collect()
+    }
+
+    /// The inside of a double-quoted value, with `\"` and `\\` unescaped. `None` when the value
+    /// is not quoted.
+    fn unquote(value: &str) -> Option<String> {
+        let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                out.push(chars.next()?);
+            } else {
+                out.push(c);
+            }
+        }
+        Some(out)
+    }
+
+    /// `file://` URI of the absolute `path`. Every byte except the unreserved characters and
+    /// `/` is percent-encoded, so spaces, `%`, `#`, commas and non-ASCII names all survive
+    /// GVariant text and dbus-send's `array:string:` list.
+    pub(crate) fn file_uri(path: &Path) -> String {
+        format!(
+            "file://{}",
+            percent_encode(path.as_os_str().as_bytes(), true)
+        )
+    }
+
+    /// Percent-encodes `bytes`, leaving only the unreserved characters (and `/` when
+    /// `keep_slash`). Hex digits are upper case.
+    pub(crate) fn percent_encode(bytes: &[u8], keep_slash: bool) -> String {
+        let mut out = String::with_capacity(bytes.len());
+        for &byte in bytes {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(char::from(byte))
+                }
+                b'/' if keep_slash => out.push('/'),
+                _ => {
+                    let _ = write!(out, "%{byte:02X}");
+                }
+            }
+        }
+        out
+    }
+
+    /// `text` as a GVariant string literal, the syntax `gdbus call` reads its arguments in.
+    /// Backslashes and single quotes are escaped, and control characters too.
+    pub(crate) fn gvariant_string(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('\'');
+        for c in text.chars() {
+            match c {
+                '\\' => out.push_str(r"\\"),
+                '\'' => out.push_str(r"\'"),
+                '\n' => out.push_str(r"\n"),
+                '\r' => out.push_str(r"\r"),
+                '\t' => out.push_str(r"\t"),
+                c if c.is_control() => {
+                    let _ = write!(out, r"\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('\'');
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn file_uri_encodes_spaces_percent_and_unicode() {
+            assert_eq!(
+                file_uri(Path::new("/home/u/My File.txt")),
+                "file:///home/u/My%20File.txt"
+            );
+            assert_eq!(
+                file_uri(Path::new("/tmp/100%.txt")),
+                "file:///tmp/100%25.txt"
+            );
+            assert_eq!(
+                file_uri(Path::new("/tmp/Café 1.txt")),
+                "file:///tmp/Caf%C3%A9%201.txt"
+            );
+            assert_eq!(
+                file_uri(Path::new("/a/b,c#d?e+f[g]'h")),
+                "file:///a/b%2Cc%23d%3Fe%2Bf%5Bg%5D%27h"
+            );
+            assert_eq!(file_uri(Path::new("/a/keep-._~Z9")), "file:///a/keep-._~Z9");
+            let raw = OsStr::from_bytes(b"/x/\xff");
+            assert_eq!(file_uri(Path::new(raw)), "file:///x/%FF");
+        }
+
+        #[test]
+        fn gvariant_strings_escape_quotes_backslashes_and_controls() {
+            assert_eq!(gvariant_string("plain"), "'plain'");
+            assert_eq!(gvariant_string(r"it's \ here"), r"'it\'s \\ here'");
+            assert_eq!(gvariant_string("a\nb"), r"'a\nb'");
+            assert_eq!(gvariant_string("\u{1}"), r"'\u0001'");
+            assert_eq!(gvariant_string(""), "''");
+        }
+
+        #[test]
+        fn user_dirs_expand_home_and_skip_junk() {
+            let sample = "# comment\n\
+                XDG_DESKTOP_DIR=\"$HOME/Escritorio\"\n\
+                XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n\
+                XDG_DOCUMENTS_DIR=\"/data/docs\"\n\
+                XDG_MUSIC_DIR=\"$HOME\"\n\
+                XDG_TEMPLATES_DIR=\"$HOME/Templates\"\n\
+                XDG_PUBLICSHARE_DIR=\"relative/no\"\n\
+                XDG_PICTURES_DIR=unquoted\n\
+                not a line\n";
+            let parsed = parse_user_dirs(sample, Path::new("/home/u"));
+            assert_eq!(
+                parsed,
+                vec![
+                    ("DESKTOP".to_string(), PathBuf::from("/home/u/Escritorio")),
+                    ("DOWNLOAD".to_string(), PathBuf::from("/home/u/Downloads")),
+                    ("DOCUMENTS".to_string(), PathBuf::from("/data/docs")),
+                    ("MUSIC".to_string(), PathBuf::from("/home/u")),
+                    ("TEMPLATES".to_string(), PathBuf::from("/home/u/Templates")),
+                ]
+            );
+        }
+
+        #[test]
+        fn user_dirs_unescape_quotes_and_backslashes() {
+            let parsed = parse_user_dirs(r#"XDG_PICTURES_DIR="/x/a \"b\" \\c""#, Path::new("/h"));
+            assert_eq!(
+                parsed,
+                vec![("PICTURES".to_string(), PathBuf::from(r#"/x/a "b" \c"#))]
+            );
+        }
+
+        #[test]
+        fn candidates_follow_the_windows_order_with_xdg_defaults() {
+            let sample = "XDG_DESKTOP_DIR=\"$HOME/Escritorio\"\nXDG_MUSIC_DIR=\"$HOME\"\n";
+            let got = user_dir_candidates(sample, Path::new("/home/u"));
+            let labels: Vec<&str> = got.iter().map(|(label, _)| *label).collect();
+            assert_eq!(
+                labels,
+                [
+                    "Desktop",
+                    "Downloads",
+                    "Documents",
+                    "Pictures",
+                    "Videos",
+                    "Music",
+                    "Home"
+                ]
+            );
+            assert_eq!(got[0].1, PathBuf::from("/home/u/Escritorio"));
+            // Not in the file: the XDG defaults under home.
+            assert_eq!(got[1].1, PathBuf::from("/home/u/Downloads"));
+            assert_eq!(got[3].1, PathBuf::from("/home/u/Pictures"));
+            assert_eq!(got[5].1, PathBuf::from("/home/u"));
+            assert_eq!(got[6].1, PathBuf::from("/home/u"));
+        }
+
+        #[test]
+        fn candidates_without_a_file_are_the_defaults() {
+            let got = user_dir_candidates("", Path::new("/h"));
+            assert_eq!(got.len(), 7);
+            assert_eq!(got[2].1, PathBuf::from("/h/Documents"));
+            assert_eq!(got[6], ("Home", PathBuf::from("/h")));
+        }
+
+        /// The existence check runs before anything is spawned, so no program starts here.
+        #[test]
+        fn missing_paths_fail_with_not_found_before_anything_starts() {
+            let d = tempfile::tempdir().unwrap();
+            let missing = d.path().join("nope.txt");
+            for result in [
+                crate::shell::open_default(&missing),
+                crate::shell::reveal_in_explorer(&missing),
+                crate::shell::show_properties(&missing),
+                crate::shell::open_with_dialog(&missing),
+            ] {
+                match result {
+                    Err(WinError::Io { source, .. }) => {
+                        assert_eq!(source.kind(), io::ErrorKind::NotFound)
+                    }
+                    other => panic!("expected NotFound, got {other:?}"),
+                }
             }
         }
     }
