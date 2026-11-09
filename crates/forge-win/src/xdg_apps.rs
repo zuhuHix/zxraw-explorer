@@ -77,12 +77,7 @@ impl XdgDirs {
             config_dirs: list("XDG_CONFIG_DIRS", "/etc/xdg"),
             data_home: absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local/share")),
             data_dirs: list("XDG_DATA_DIRS", "/usr/local/share:/usr/share"),
-            desktops: std::env::var("XDG_CURRENT_DESKTOP")
-                .unwrap_or_default()
-                .split(':')
-                .filter(|d| !d.is_empty())
-                .map(str::to_ascii_lowercase)
-                .collect(),
+            desktops: desktops_from(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()),
         })
     }
 
@@ -141,6 +136,32 @@ impl XdgDirs {
         }
         None
     }
+}
+
+/// The `XDG_CURRENT_DESKTOP` entries that are safe in a file name, lowercased. Others
+/// (`../evil`, `/abs`) are skipped: each becomes part of a path ZXraw writes.
+fn desktops_from(value: &str) -> Vec<String> {
+    value
+        .split(':')
+        .map(str::to_ascii_lowercase)
+        .filter(|desktop| {
+            let safe = is_safe_desktop(desktop);
+            if !safe && !desktop.is_empty() {
+                tracing::warn!("XDG_CURRENT_DESKTOP entry {desktop:?} skipped: not a plain name");
+            }
+            safe
+        })
+        .collect()
+}
+
+/// Non-empty, only `[a-z0-9_.-]`, not `.` or `..`.
+fn is_safe_desktop(desktop: &str) -> bool {
+    !desktop.is_empty()
+        && desktop != "."
+        && desktop != ".."
+        && desktop
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c))
 }
 
 fn is_desktop_id(id: &str) -> bool {
@@ -243,11 +264,22 @@ pub fn set_defaults(dirs: &XdgDirs, mimes: &[&str], record: &Path) -> Result<()>
     let listed = listed_types(&fs::read_to_string(&entry).unwrap_or_default());
     let mut records = Records::load(record, dirs)?;
     let mut targets = vec![dirs.user_mimeapps()];
-    for desktop in &dirs.desktops {
+    for desktop in dirs.desktops.iter().filter(|d| is_safe_desktop(d)) {
         targets.push(dirs.config_home.join(format!("{desktop}-mimeapps.list")));
     }
     for (index, file) in targets.iter().enumerate() {
         let main = index == 0;
+        // The same check the restore applies to its record: only the user's own lists.
+        if !is_user_mimeapps(dirs, file) {
+            if main {
+                return Err(WinError::Invalid(format!(
+                    "{} is not the user's mimeapps.list",
+                    file.display()
+                )));
+            }
+            tracing::warn!("{} skipped: not the user's own mimeapps list", file.display());
+            continue;
+        }
         // A desktop-specific file is changed only where it would override ours.
         if !main && !file.exists() {
             continue;
@@ -329,6 +361,12 @@ pub fn restore_defaults(dirs: &XdgDirs, mimes: &[&str], record: &Path) -> Result
         }
     }
     for file in files {
+        if !is_user_mimeapps(dirs, &file) {
+            return Err(WinError::Invalid(format!(
+                "{} is not the user's mimeapps.list",
+                file.display()
+            )));
+        }
         if file.exists() {
             edit_file(
                 &file,
@@ -526,7 +564,16 @@ pub fn install_menu_entry(
         )));
     }
     for (size, png) in icons {
-        write_atomic(&icon_path(dirs, *size), png)?;
+        let icon = icon_path(dirs, *size);
+        // A file under our name that is none of our icons is someone else's: kept. The
+        // entry still has the other sizes, or the theme's fallback.
+        if let Ok(existing) = fs::read(&icon)
+            && !icons.iter().any(|(_, ours)| existing == *ours)
+        {
+            tracing::warn!("{} kept: it is not an icon ZXraw Explorer wrote", icon.display());
+            continue;
+        }
+        write_atomic(&icon, png)?;
     }
     write_atomic(&path, desktop_entry_text(exe, mime_types).as_bytes())?;
     refresh_caches(dirs);
@@ -853,6 +900,12 @@ impl Records {
                         .to_string(),
                 ),
             };
+            if entries
+                .iter()
+                .any(|r: &Record| r.kind == kind && r.mime == mime && r.file == file)
+            {
+                return Err(damaged(path, number, "duplicate record"));
+            }
             entries.push(Record {
                 kind,
                 mime: mime.to_string(),
@@ -923,13 +976,9 @@ fn is_user_mimeapps(dirs: &XdgDirs, file: &Path) -> bool {
         return false;
     };
     let named = name == "mimeapps.list"
-        || name.strip_suffix("-mimeapps.list").is_some_and(|desktop| {
-            !desktop.is_empty()
-                && desktop
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-                && !desktop.starts_with('.')
-        });
+        || name
+            .strip_suffix("-mimeapps.list")
+            .is_some_and(|desktop| is_safe_desktop(desktop) && !desktop.starts_with('.'));
     let resolve = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     named
         && file.is_absolute()
@@ -1194,6 +1243,7 @@ mod tests {
             format!("{good}default\timage/png\t{main}/../../x/mimeapps.list\t!\n"),
             format!("{good}default\timage/png\t{main}\tvalue-without-equals\n"),
             format!("{good}other\timage/png\t{main}\t!\n"),
+            format!("{good}{}", good.lines().nth(1).map(|line| format!("{line}\n")).unwrap()),
         ];
         let before = read(&d.user_mimeapps());
         for bad in damaged_records {
@@ -1260,6 +1310,47 @@ mod tests {
         fs::write(&image, b"x").unwrap();
         assert_eq!(launcher_from(Some(image.clone().into()), Some(mount)), Launcher::Path(image));
         assert_eq!(launcher_from(Some("".into()), None), Launcher::Unknown);
+    }
+
+    #[test]
+    fn unsafe_desktop_names_are_skipped_and_never_written() {
+        assert_eq!(desktops_from("../evil:/abs:X-Cinnamon"), vec!["x-cinnamon"]);
+        assert_eq!(desktops_from(".:..::GNOME:a/b:KDE"), vec!["gnome", "kde"]);
+        // Even a hand-built XdgDirs with such names writes only the user's own lists.
+        let e = env(&[]);
+        let mut dirs = e.dirs.clone();
+        dirs.desktops = vec!["../evil".into(), "/abs".into(), "..".into(), "x-cinnamon".into()];
+        zxraw(&dirs.data_home);
+        app(&dirs.data_dirs[1], "xviewer.desktop", "Image Viewer");
+        let evil = dirs.config_home.join("../evil-mimeapps.list");
+        let abs = PathBuf::from("/abs-mimeapps.list");
+        write(&evil, "[Default Applications]\nimage/jpeg=xviewer.desktop\n");
+        let cinnamon = dirs.config_home.join("x-cinnamon-mimeapps.list");
+        write(&cinnamon, "[Default Applications]\nimage/jpeg=xviewer.desktop\n");
+        set_defaults(&dirs, &["image/jpeg"], &e.record).unwrap();
+        assert_eq!(read(&evil), "[Default Applications]\nimage/jpeg=xviewer.desktop\n", "outside file untouched");
+        assert!(!abs.exists());
+        assert!(read(&cinnamon).contains("image/jpeg=zxraw.desktop;xviewer.desktop;"));
+        assert!(!read(&e.record).contains("evil"));
+        restore_defaults(&dirs, &["image/jpeg"], &e.record).unwrap();
+        assert_eq!(read(&cinnamon), "[Default Applications]\nimage/jpeg=xviewer.desktop\n");
+    }
+
+    #[test]
+    fn a_foreign_file_under_our_icon_name_is_kept() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        let foreign = d.data_home.join("icons/hicolor/48x48/apps/zxraw-appimage.png");
+        write(&foreign, "someone else's");
+        let exe = Path::new("/opt/ZXraw.AppImage");
+        let icons: [(u32, &[u8]); 2] = [(48, b"ours48"), (64, b"ours64")];
+        install_menu_entry(d, exe, &[], &icons).unwrap();
+        assert_eq!(read(&foreign), "someone else's");
+        assert_eq!(read(&d.data_home.join("icons/hicolor/64x64/apps/zxraw-appimage.png")), "ours64");
+        // Our own earlier icon (any of our sizes' content) is replaced as usual.
+        write(&foreign, "ours64");
+        install_menu_entry(d, exe, &[], &icons).unwrap();
+        assert_eq!(read(&foreign), "ours48");
     }
 
     #[test]
