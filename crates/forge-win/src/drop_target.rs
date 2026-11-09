@@ -132,6 +132,8 @@ pub(crate) struct Shared {
     pub(crate) events: Vec<DropEvent>,
     pub(crate) dragging: bool,
     pub(crate) keys: (bool, bool),
+    /// Linux: the pointer in the window's pixels at the latest `XdndPosition`.
+    pub(crate) pointer: Option<(i32, i32)>,
     pub(crate) answer: DropEffect,
     /// The app has called `set_answer` since this drag entered.
     pub(crate) answered_by_app: bool,
@@ -167,6 +169,11 @@ impl DropTargetHandle {
     /// Ctrl and Shift from the latest `DragEnter`/`DragOver`.
     pub fn keys(&self) -> (bool, bool) {
         lock(&self.shared).keys
+    }
+    /// The pointer relative to the window, in physical pixels, as the target last saw it
+    /// (Linux: read at each `XdndPosition`; `None` on Windows, where the app asks the OS).
+    pub fn pointer(&self) -> Option<(i32, i32)> {
+        lock(&self.shared).pointer
     }
     /// The effect for the pointer's current place, set every frame while dragging.
     pub fn set_answer(&self, effect: DropEffect) {

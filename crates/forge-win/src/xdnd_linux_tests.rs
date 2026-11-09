@@ -306,6 +306,16 @@ fn spawn_target(
     rect: (i16, i16, u16, u16),
     finish: Action,
 ) -> (Window, std::thread::JoinHandle<TargetLog>) {
+    spawn_target_finishing(display, rect, Some(finish))
+}
+
+/// [`spawn_target`] finishing with `finish`, or with `None` the action of the last position
+/// (as a file manager does what was suggested last).
+fn spawn_target_finishing(
+    display: &str,
+    rect: (i16, i16, u16, u16),
+    finish: Option<Action>,
+) -> (Window, std::thread::JoinHandle<TargetLog>) {
     let ctl = Ctl::new(display);
     let window = ctl.window(rect.0, rect.1, rect.2, rect.3, true);
     let thread = std::thread::spawn(move || {
@@ -354,7 +364,16 @@ fn spawn_target(
                     l[0],
                     l[0],
                     atoms.finished,
-                    [window, 1, atoms.action(finish), 0, 0],
+                    [
+                        window,
+                        1,
+                        finish.map_or_else(
+                            || log.positions.last().map_or(NONE, |(action, _)| *action),
+                            |finish| atoms.action(finish),
+                        ),
+                        0,
+                        0,
+                    ],
                 );
                 conn.sync().unwrap();
                 return log;
@@ -500,6 +519,38 @@ fn xdnd_drag_out_with_shift_offers_only_move() {
     }
     assert_eq!(log.data.as_deref(), Some(expected.as_slice()));
     // The target "moved" nothing and we delete nothing: the files stay.
+    assert!(paths.iter().all(|p| p.exists()));
+}
+
+#[test]
+#[ignore = "starts Xvfb"]
+fn xdnd_drag_out_shift_let_go_just_before_the_release_copies() {
+    let x = X::start();
+    let ctl = Ctl::new(x.name());
+    let (_target, log) = spawn_target_finishing(x.name(), (0, 0, 200, 300), None);
+    let own = ctl.window(200, 0, 200, 300, false);
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, expected) = test_files(dir.path());
+
+    ctl.motion(300, 150);
+    ctl.button1(true);
+    ctl.key(XK_SHIFT_L, true);
+    let session = start_drag_out_on(x.name(), own, &items(&paths)).unwrap();
+    ctl.motion(100, 100);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(session.feedback(), DragFeedback::Move);
+    // Shift up and the button up with no pointer move and no poll in between.
+    ctl.key(XK_SHIFT_L, false);
+    ctl.button1(false);
+    let result = wait_result(&session, Duration::from_secs(5));
+    assert_eq!(result.unwrap(), DropResult::Copy);
+
+    let log = log.join().unwrap();
+    let atoms = &ctl.atoms;
+    // The drop came after a position with the release's action (Copy), at the same spot.
+    assert_eq!(log.positions.last().map(|p| p.0), Some(atoms.copy), "{log:?}");
+    assert_eq!(log.drops, 1);
+    assert_eq!(log.data.as_deref(), Some(expected.as_slice()));
     assert!(paths.iter().all(|p| p.exists()));
 }
 
