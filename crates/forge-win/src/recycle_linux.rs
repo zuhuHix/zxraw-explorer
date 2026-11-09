@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -202,24 +202,25 @@ fn delete_all(
                 .extend(pending[k..].iter().map(|&j| paths[j].clone()));
             return;
         }
-        if !expected.is_empty() {
-            let same = match expected.get(i).cloned().flatten() {
-                Some(then) => ItemIdentity::of(p).as_ref() == Some(&then),
-                None => false,
-            };
-            if !same {
-                report.failed.push((p.clone(), DeleteFailure::Changed));
-                t.progress.items_done += 1;
-                continue;
+        // A confirmed delete must remove the very object that was confirmed: `destroy`
+        // checks the identity on the item it has pinned, not on the path.
+        let check = if expected.is_empty() {
+            Check::None
+        } else {
+            match expected.get(i).cloned().flatten() {
+                Some(then) => Check::Same(then),
+                None => Check::Unknown,
             }
-        }
-        let outcome = destroy(mode, p, &mut |inner| {
+        };
+        let outcome = destroy_checked(mode, p, &check, &mut |inner| {
             t.progress.work_done += 1;
             t.progress.current = Some(inner.to_path_buf());
             t.tell_if(false)
         });
         t.progress.items_done += 1;
-        if is_gone(p) {
+        if outcome.changed {
+            report.failed.push((p.clone(), DeleteFailure::Changed));
+        } else if outcome.gone {
             report.done.push(p.clone());
         } else if t.stopped {
             report.cancelled = true;
@@ -258,6 +259,10 @@ fn classify(e: &io::Error) -> DeleteFailure {
 // ---------------------------------------------------------------------------------------
 
 struct Destroyed {
+    /// The item itself was removed.
+    gone: bool,
+    /// The item at the path was not the confirmed one; nothing was removed.
+    changed: bool,
     /// Something inside the item was removed.
     removed_inside: bool,
     /// The first reason something was not removed.
@@ -268,22 +273,138 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
 }
 
+/// What a delete must check about the item before removing anything.
+enum Check {
+    /// Nothing: an unconfirmed delete.
+    None,
+    /// It must still be this object.
+    Same(ItemIdentity),
+    /// It was confirmed but had no identity then, so it can't be shown to be the same.
+    Unknown,
+}
+
 /// Deletes `path` and, for a folder, everything in it, without following any link (a link
 /// is removed, never what it points to). Works through directory handles, so a folder
 /// swapped for a link midway is not followed either. `tick` hears about each entry before
 /// it goes and stops the delete by returning false.
+#[cfg(test)]
 fn destroy(mode: Mode, path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> Destroyed {
+    destroy_checked(mode, path, &Check::None, tick)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs at the points named by [`Seam`], with the item's path.
+    static SEAM: std::cell::RefCell<Option<Box<dyn FnMut(Seam, &Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// Before the item is moved to its staging name (the item could still be swapped).
+    BeforeStage,
+    /// After it was staged and checked, before anything is removed.
+    AfterCheck,
+}
+
+fn seam(_at: &'static str, _path: &Path) {
+    #[cfg(test)]
+    SEAM.with(|s| {
+        if let Some(f) = s.borrow_mut().as_mut() {
+            let at = if _at == "stage" {
+                Seam::BeforeStage
+            } else {
+                Seam::AfterCheck
+            };
+            f(at, _path);
+        }
+    });
+}
+
+/// Unique private names for items being deleted, in the item's own folder.
+fn staging_name(parent: RawFd) -> io::Result<CString> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    cstring(format!(".zxraw-deleting-{}-{n}-{parent}", std::process::id()).as_bytes())
+}
+
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in the open folder `dir`.
+fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
+    // SAFETY: valid fd, NUL-terminated name, and a zeroed plain-data out value.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        (libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some(st)
+    }
+}
+
+/// `renameat2(RENAME_NOREPLACE)` within one folder handle.
+fn rename_at_noreplace(dir: RawFd, from: &CStr, to: &CStr) -> io::Result<()> {
+    // SAFETY: valid fd and NUL-terminated names.
+    let r =
+        unsafe { libc::renameat2(dir, from.as_ptr(), dir, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        // The file system cannot refuse to replace: check first, then rename.
+        Some(libc::EINVAL | libc::ENOSYS) => {
+            if stat_at(dir, to).is_some() {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            // SAFETY: as above.
+            if unsafe { libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+        _ => Err(e),
+    }
+}
+
+/// The identity of `name` inside the open folder `dir` (not following links). Read through
+/// `/proc/self/fd`, so the folder is the one we hold open, whatever its path names now.
+fn identity_at(dir: RawFd, name: &CStr) -> Option<ItemIdentity> {
+    let mut p = PathBuf::from(format!("/proc/self/fd/{dir}"));
+    p.push(OsStr::from_bytes(name.to_bytes()));
+    ItemIdentity::of(&p)
+}
+
+/// [`destroy`] with a check of what is being deleted. The item is first renamed to a
+/// private staging name in its own folder (through a handle on the folder), and only that
+/// staged object is checked and deleted: whatever is put at the old path meanwhile is never
+/// touched. If the staged object is not the expected one it is moved back and nothing is
+/// removed (`changed`); a delete that stops early moves what is left back as well.
+fn destroy_checked(
+    mode: Mode,
+    path: &Path,
+    check: &Check,
+    tick: &mut dyn FnMut(&Path) -> bool,
+) -> Destroyed {
     // Never destroy anything during a recycle (see `refuses_permanent_delete`).
     if refuses_permanent_delete(mode, 0) {
         return Destroyed {
+            gone: false,
+            changed: false,
             removed_inside: false,
             error: Some(DeleteFailure::NotRecyclable),
         };
     }
     let fail = |why| Destroyed {
+        gone: false,
+        changed: false,
         removed_inside: false,
         error: Some(why),
     };
+    if matches!(check, Check::Unknown) {
+        return Destroyed {
+            changed: true,
+            ..fail(DeleteFailure::Changed)
+        };
+    }
     let Some(name) = path.file_name() else {
         return fail(DeleteFailure::Other("this path cannot be deleted".into()));
     };
@@ -302,17 +423,55 @@ fn destroy(mode: Mode, path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> Dest
         Ok(fd) => fd,
         Err(e) => return fail(classify(&e)),
     };
+    let dir = parent_fd.as_raw_fd();
+
+    // Pin the object: move it to a private name, then check that name.
+    seam("stage", path);
+    let staged = match staging_name(dir) {
+        Ok(n) => n,
+        Err(e) => return fail(classify(&e)),
+    };
+    if let Err(e) = rename_at_noreplace(dir, &name_c, &staged) {
+        return fail(classify(&e));
+    }
+    let put_back = || {
+        if let Err(e) = rename_at_noreplace(dir, &staged, &name_c) {
+            tracing::warn!(
+                path = %path.display(),
+                staged = %String::from_utf8_lossy(staged.to_bytes()),
+                error = %e,
+                "could not move a partly deleted item back to its name"
+            );
+        }
+    };
+    if let Check::Same(then) = check
+        && identity_at(dir, &staged).as_ref() != Some(then)
+    {
+        put_back();
+        return Destroyed {
+            changed: true,
+            ..fail(DeleteFailure::Changed)
+        };
+    }
+    seam("check", path);
+
     let mut d = Destroyer {
         tick,
         removed: 0,
         error: None,
         stopped: false,
     };
-    let top_dir = fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-    d.remove_at(parent_fd.as_raw_fd(), &name_c, path, top_dir);
+    let top_dir =
+        stat_at(dir, &staged).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    d.remove_at(dir, &staged, path, top_dir);
+    let gone = stat_at(dir, &staged).is_none();
+    if !gone {
+        put_back();
+    }
     // The item itself counts once if it went; anything more was inside it.
-    let gone = is_gone(path);
     Destroyed {
+        gone,
+        changed: false,
         removed_inside: d.removed > usize::from(gone),
         error: d.error.as_ref().map(classify),
     }
@@ -470,16 +629,19 @@ fn count_tree(path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> u64 {
     n
 }
 
-/// The byte total of the files under `path` (links not followed, counted as themselves).
+/// The disk usage of `path` and everything under it, in bytes, as `du -B1` reports it
+/// (`st_blocks * 512` of each entry, folders included; links not followed, counted as
+/// themselves). Unlike `du`, a file with several hard links inside is counted each time.
 fn tree_size(path: &Path) -> u64 {
     let Ok(md) = fs::symlink_metadata(path) else {
         return 0;
     };
+    let own = md.blocks().saturating_mul(512);
     if !md.is_dir() {
-        return md.len();
+        return own;
     }
-    fs::read_dir(path)
-        .map(|rd| rd.flatten().map(|e| tree_size(&e.path())).sum())
+    own + fs::read_dir(path)
+        .map(|rd| rd.flatten().map(|e| tree_size(&e.path())).sum::<u64>())
         .unwrap_or(0)
 }
 
@@ -614,6 +776,20 @@ fn private_dir(dir: &Path, owner: Option<u32>, recursive: bool) -> io::Result<()
             io::ErrorKind::PermissionDenied,
             format!("{} belongs to another user", dir.display()),
         ));
+    }
+    // A trash others can write to could have entries planted or swapped in it. Ours gets
+    // its private mode back; someone else's is refused (the caller falls through).
+    if md.mode() & 0o022 != 0 {
+        // SAFETY: getuid cannot fail.
+        let me = owner.unwrap_or_else(|| unsafe { libc::getuid() });
+        if md.uid() != me {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is writable by others and not ours", dir.display()),
+            ));
+        }
+        tracing::warn!(dir = %dir.display(), mode = format!("{:o}", md.mode() & 0o7777), "trash folder was writable by others; made private");
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
 }
@@ -890,7 +1066,8 @@ fn deletion_date(at: std::time::SystemTime) -> String {
 /// The mount point of the file system holding `dir` (an absolute, resolved path), from
 /// `/proc/self/mountinfo`, or by walking up while the device stays the same.
 fn mount_point_of(dir: &Path) -> Option<PathBuf> {
-    if let Ok(text) = fs::read_to_string("/proc/self/mountinfo")
+    if let Ok(bytes) = fs::read("/proc/self/mountinfo")
+        && let Ok(text) = String::from_utf8(bytes)
         && let Some(top) = mount_point_in(&text, dir)
     {
         return Some(top);
@@ -1069,7 +1246,9 @@ mod tests {
         let mtime = fs::metadata(trash.join("info/tree.trashinfo"))
             .unwrap()
             .mtime();
-        assert_eq!(sizes, format!("123 {mtime} tree\n"));
+        let usage = tree_size(&trash.join("files/tree"));
+        assert!(usage >= 123, "disk usage, at least the bytes: {usage}");
+        assert_eq!(sizes, format!("{usage} {mtime} tree\n"));
         // A second folder keeps the first entry.
         fx.file("other dir/x", b"xyz");
         let other = fx.root().join("other dir");
@@ -1082,7 +1261,8 @@ mod tests {
         let lines: Vec<&str> = sizes.lines().collect();
         assert_eq!(lines.len(), 2, "{sizes}");
         assert!(
-            lines[1].starts_with("3 ") && lines[1].ends_with(" other%20dir"),
+            lines[1].starts_with(&format!("{} ", tree_size(&trash.join("files/other dir"))))
+                && lines[1].ends_with(" other%20dir"),
             "{sizes}"
         );
         // An entry whose folder left the trash is dropped at the next write.
@@ -1527,5 +1707,225 @@ mod tests {
             DeleteFailure::Other("it is read-only".into())
         );
         assert!(matches!(classify(&e(libc::EIO)), DeleteFailure::Other(_)));
+    }
+    /// Runs `body` with the delete seam set to `hook`, cleared afterwards.
+    fn with_seam(hook: impl FnMut(Seam, &Path) + 'static, body: impl FnOnce()) {
+        SEAM.with(|s| *s.borrow_mut() = Some(Box::new(hook)));
+        body();
+        SEAM.with(|s| *s.borrow_mut() = None);
+    }
+
+    fn no_staging_left(dir: &Path) {
+        let left: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".zxraw-deleting-")
+            })
+            .collect();
+        assert!(left.is_empty(), "staging names left: {left:?}");
+    }
+
+    #[test]
+    fn a_file_swapped_in_after_the_check_is_never_deleted() {
+        let fx = Fixture::new();
+        let a = fx.file("a", b"one");
+        let Some(id_a) = ItemIdentity::of(&a) else {
+            return; // no creation time on this file system
+        };
+        let kept = fx.root().join("a.original");
+        let (a2, kept2) = (a.clone(), kept.clone());
+        let mut report = None;
+        with_seam(
+            move |at, _| {
+                if at == Seam::BeforeStage {
+                    // The confirmed file moves away and a different one takes its name.
+                    fs::rename(&a2, &kept2).unwrap();
+                    fs::write(&a2, b"replacement").unwrap();
+                }
+            },
+            || {
+                report = Some(run_with(
+                    &[a.clone()],
+                    &[Some(id_a)],
+                    Mode::Permanent,
+                    quiet(),
+                    &fx.env(),
+                ));
+            },
+        );
+        let report = report.unwrap();
+        assert_eq!(report.failed, vec![(a.clone(), DeleteFailure::Changed)]);
+        assert!(report.done.is_empty());
+        assert_eq!(fs::read(&a).unwrap(), b"replacement");
+        assert_eq!(fs::read(&kept).unwrap(), b"one");
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn a_folder_swapped_in_after_the_check_is_never_deleted() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        fx.file("d/inner.txt", b"x");
+        let Some(id_d) = ItemIdentity::of(&d) else {
+            return;
+        };
+        let kept = fx.root().join("d.original");
+        let (d2, kept2) = (d.clone(), kept.clone());
+        let mut report = None;
+        with_seam(
+            move |at, _| {
+                if at == Seam::BeforeStage {
+                    fs::rename(&d2, &kept2).unwrap();
+                    fs::create_dir(&d2).unwrap();
+                    fs::write(d2.join("precious.txt"), b"keep me").unwrap();
+                }
+            },
+            || {
+                report = Some(run_with(
+                    &[d.clone()],
+                    &[Some(id_d)],
+                    Mode::Permanent,
+                    quiet(),
+                    &fx.env(),
+                ));
+            },
+        );
+        let report = report.unwrap();
+        assert_eq!(report.failed, vec![(d.clone(), DeleteFailure::Changed)]);
+        assert_eq!(fs::read(d.join("precious.txt")).unwrap(), b"keep me");
+        assert!(kept.join("inner.txt").exists());
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn a_new_item_at_the_path_after_staging_survives_and_the_confirmed_one_goes() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        fx.file("d/inner.txt", b"x");
+        let Some(id_d) = ItemIdentity::of(&d) else {
+            return;
+        };
+        let d2 = d.clone();
+        let mut report = None;
+        with_seam(
+            move |at, _| {
+                if at == Seam::AfterCheck {
+                    // The confirmed folder is staged; someone makes a new one at its path.
+                    fs::create_dir(&d2).unwrap();
+                    fs::write(d2.join("new.txt"), b"new").unwrap();
+                }
+            },
+            || {
+                report = Some(run_with(
+                    &[d.clone()],
+                    &[Some(id_d)],
+                    Mode::Permanent,
+                    quiet(),
+                    &fx.env(),
+                ));
+            },
+        );
+        let report = report.unwrap();
+        assert_eq!(report.done, vec![d.clone()], "{report:?}");
+        assert!(report.failed.is_empty());
+        assert_eq!(fs::read(d.join("new.txt")).unwrap(), b"new");
+        assert!(!d.join("inner.txt").exists());
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn a_stopped_delete_moves_what_is_left_back_to_its_name() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        for i in 0..5 {
+            fx.file(&format!("d/f{i}"), b"x");
+        }
+        let mut seen = 0;
+        let out = destroy(Mode::Permanent, &d, &mut |_| {
+            seen += 1;
+            seen < 3
+        });
+        assert!(!out.gone);
+        assert!(out.removed_inside);
+        assert!(d.is_dir());
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn a_trash_others_can_write_to_is_made_private() {
+        let fx = Fixture::new();
+        let trash = fx.trash();
+        for d in [trash.clone(), trash.join("files"), trash.join("info")] {
+            fs::create_dir_all(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let f = fx.file("f", b"x");
+        let report = recycle(&fx.env(), &[f.clone()]);
+        assert_eq!(report.done, vec![f]);
+        for d in [trash.clone(), trash.join("files"), trash.join("info")] {
+            let mode = fs::metadata(&d).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
+    }
+
+    #[test]
+    fn a_top_directory_trash_open_to_others_is_repaired_and_a_foreign_one_refused() {
+        // Only a mode check can be shown without another user: a trash that is ours and
+        // writable by others is repaired; ownership refusal is covered by `private_dir`.
+        let top = tempfile::tempdir().unwrap();
+        let own = top.path().join(format!(".Trash-{}", uid()));
+        fs::create_dir(&own).unwrap();
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o757)).unwrap();
+        let (trash, _) = topdir_trash(top.path(), uid()).unwrap();
+        assert_eq!(trash, own);
+        assert_eq!(fs::metadata(&own).unwrap().mode() & 0o777, 0o700);
+        // Owned by another uid: refused.
+        assert!(private_dir(&own, Some(uid().wrapping_add(1)), false).is_err());
+    }
+
+    #[test]
+    fn a_shared_trash_must_be_sticky_and_not_a_link() {
+        let top = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::set_permissions(elsewhere.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        symlink(elsewhere.path(), top.path().join(".Trash")).unwrap();
+        let (trash, _) = topdir_trash(top.path(), uid()).unwrap();
+        assert_eq!(
+            trash,
+            top.path().join(format!(".Trash-{}", uid())),
+            "a linked .Trash is not used"
+        );
+        assert!(!elsewhere.path().join(uid().to_string()).exists());
+    }
+
+    #[test]
+    fn directory_sizes_are_disk_usage() {
+        let fx = Fixture::new();
+        fx.file("d/a", &[1u8; 10]);
+        fx.file("d/sub/b", &[2u8; 5000]);
+        let d = fx.root().join("d");
+        let expected: u64 = ["d", "d/a", "d/sub", "d/sub/b"]
+            .iter()
+            .map(|r| fs::symlink_metadata(fx.root().join(r)).unwrap().blocks() * 512)
+            .sum();
+        assert_eq!(tree_size(&d), expected);
+        // Matches `du -B1 -s` where coreutils is around.
+        if let Ok(out) = std::process::Command::new("du")
+            .args(["-B1", "-s"])
+            .arg(&d)
+            .output()
+            && out.status.success()
+        {
+            let du: u64 = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert_eq!(tree_size(&d), du);
+        }
     }
 }

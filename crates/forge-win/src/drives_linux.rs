@@ -6,9 +6,9 @@
 //! network mount.
 
 use std::collections::{BTreeSet, HashSet};
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -63,30 +63,42 @@ pub(crate) struct Mount {
     pub(crate) source: String,
 }
 
-/// Parses `/proc/self/mountinfo` text. Lines that do not parse are skipped.
-pub(crate) fn parse_mountinfo(text: &str) -> Vec<Mount> {
-    text.lines().filter_map(parse_line).collect()
+/// Parses `/proc/self/mountinfo`. It is bytes, not text: the kernel escapes only space,
+/// tab, newline and backslash, so a mount point may hold any other byte, valid UTF-8 or
+/// not. Lines that do not parse are skipped.
+pub(crate) fn parse_mountinfo(text: impl AsRef<[u8]>) -> Vec<Mount> {
+    text.as_ref()
+        .split(|&b| b == b'\n')
+        .filter_map(parse_line)
+        .collect()
 }
 
 /// One line: `id parent maj:min root mount-point options [tags...] - fstype source superopts`.
-fn parse_line(line: &str) -> Option<Mount> {
-    let fields: Vec<&str> = line.split_whitespace().collect();
+fn parse_line(line: &[u8]) -> Option<Mount> {
+    let fields: Vec<&[u8]> = line
+        .split(|b| b.is_ascii_whitespace())
+        .filter(|f| !f.is_empty())
+        .collect();
     // The optional tags end with a lone `-`; searching from field 6 keeps a mount point
     // named `-` from being taken for it.
-    let sep = 6 + fields.get(6..)?.iter().position(|f| *f == "-")?;
-    let (major, minor) = fields[2].split_once(':')?;
+    let sep = 6 + fields.get(6..)?.iter().position(|f| *f == b"-")?;
+    let devno = std::str::from_utf8(fields[2]).ok()?;
+    let (major, minor) = devno.split_once(':')?;
     Some(Mount {
         mount_point: PathBuf::from(unescape(fields[4])),
         major: major.parse().ok()?,
         minor: minor.parse().ok()?,
-        fs_type: fields.get(sep + 1)?.to_string(),
-        source: unescape(fields.get(sep + 2)?),
+        fs_type: String::from_utf8_lossy(fields.get(sep + 1)?).into_owned(),
+        source: unescape(fields.get(sep + 2)?)
+            .to_string_lossy()
+            .into_owned(),
     })
 }
 
 /// Decodes `\ooo` octal escapes (space `\040`, tab `\011`, newline `\012`, backslash `\134`).
-pub(crate) fn unescape(s: &str) -> String {
-    let b = s.as_bytes();
+/// The result keeps every byte, so a non-UTF-8 mount point survives.
+pub(crate) fn unescape(s: impl AsRef<[u8]>) -> OsString {
+    let b = s.as_ref();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -106,7 +118,7 @@ pub(crate) fn unescape(s: &str) -> String {
         out.push(b[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    OsString::from_vec(out)
 }
 
 /// Decodes udev's `\xHH` escapes used in `/dev/disk/by-*` names (`My\x20Disk` is `My Disk`).
@@ -246,9 +258,34 @@ pub(crate) fn device_is_removable(sys_dev_block: &Path, major: u32, minor: u32) 
     })
 }
 
+/// Mount points with a `statvfs` still running, process-wide.
+static IN_FLIGHT: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+/// A mount point's place in [`IN_FLIGHT`], given up on drop (when its query returns, or
+/// when its thread could not be started).
+pub(crate) struct InFlight(PathBuf);
+
+impl InFlight {
+    /// `None` while an earlier query of `path` has not returned.
+    pub(crate) fn claim(path: &Path) -> Option<Self> {
+        let mut set = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(path.to_path_buf())
+            .then(|| Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
+}
+
 /// Reads the mount table now.
 fn read_mounts() -> io::Result<Vec<Mount>> {
-    Ok(parse_mountinfo(&std::fs::read_to_string(MOUNTINFO)?))
+    Ok(parse_mountinfo(std::fs::read(MOUNTINFO)?))
 }
 
 /// `(decoded name, device node)` for each link in a udev `/dev/disk/by-*` directory.
@@ -336,23 +373,34 @@ pub(crate) fn list_drives() -> Vec<DriveInfo> {
         .collect();
 
     // One thread per mount, one shared deadline. A mount that misses it is reported as
-    // unavailable with its space unknown; its thread is left to finish on its own.
+    // unavailable with its space unknown; its thread is left to finish on its own. A mount
+    // whose earlier query is still stuck (a dead network share) gets no new thread until
+    // that one returns, so repeated listings never pile up threads on it.
     let (tx, rx) = mpsc::channel::<(usize, io::Result<(u64, u64)>)>();
+    let mut asked = 0;
     for (i, m) in mounts.iter().enumerate() {
-        let tx = tx.clone();
         let path = m.mount_point.clone();
-        let _ = std::thread::Builder::new()
+        let Some(guard) = InFlight::claim(&path) else {
+            continue;
+        };
+        let tx = tx.clone();
+        let spawned = std::thread::Builder::new()
             .name("forge-statvfs".into())
             .spawn(move || {
+                let space = statvfs_space(&path);
+                drop(guard);
                 // The receiver may have given up already; that is fine.
-                let _ = tx.send((i, statvfs_space(&path)));
+                let _ = tx.send((i, space));
             });
+        if spawned.is_ok() {
+            asked += 1;
+        }
     }
     drop(tx);
     let deadline = Instant::now() + QUERY_TIMEOUT;
     let mut answered = vec![false; infos.len()];
     let mut received = 0;
-    while received < infos.len() {
+    while received < asked {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let Ok((i, space)) = rx.recv_timeout(remaining) else {
             break;
@@ -474,6 +522,8 @@ mod tests {
     #[test]
     fn unescape_decodes_octal_escapes_only() {
         assert_eq!(unescape(r"a\040b\011c\134d"), "a b\tc\\d");
+        // Non-UTF-8 bytes (raw and escaped) are kept as they are.
+        assert_eq!(unescape(b"caf\xe9\\040x").as_bytes(), b"caf\xe9 x");
         assert_eq!(unescape(r"no\escape\04"), r"no\escape\04");
         assert_eq!(
             unescape(r"\777"),
@@ -662,5 +712,29 @@ mod tests {
         // Lexical match: a missing path still resolves to its mount.
         let all = parse_mountinfo(SAMPLE);
         assert!(mount_for_path(&all, Path::new("/mnt/data/not/there")).is_some());
+    }
+    #[test]
+    fn a_mount_with_a_query_in_flight_gets_no_second_one() {
+        let p = Path::new("/zxraw-test/in-flight-mount");
+        let first = InFlight::claim(p).expect("first claim");
+        assert!(InFlight::claim(p).is_none(), "a second query must wait");
+        assert!(InFlight::claim(Path::new("/zxraw-test/other")).is_some());
+        drop(first);
+        assert!(
+            InFlight::claim(p).is_some(),
+            "free again once the query returned"
+        );
+    }
+
+    #[test]
+    fn non_utf8_mount_points_are_kept_byte_for_byte() {
+        let mut line = b"36 25 8:33 / /media/caf".to_vec();
+        line.extend_from_slice(b"\xe9\\040disk rw,nosuid shared:1 - vfat /dev/sdc1 rw\n");
+        let all = parse_mountinfo(&line);
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].mount_point.as_os_str().as_bytes(),
+            b"/media/caf\xe9 disk"
+        );
     }
 }
