@@ -651,7 +651,12 @@ or refuses with a message; nothing should crash for lack of it.
   `x-cinnamon-mimeapps.list` if that overrides a type), never `/usr` or `/etc`. Desktops that
   ignore `mimeapps.list` are not covered. The folder switch only affects apps that ask the MIME
   system to open a folder; a desktop's own *Files* launcher or shortcut may still open its file
-  manager. Turning a switch off restores the recorded apps, but not uninstalled ones.
+  manager. Turning a switch off restores the recorded apps, but not uninstalled ones. If the
+  record of the previous apps (`linux-default-apps.tsv` in the config folder) is damaged,
+  nothing is restored: set the defaults in the desktop's own settings. A `mimeapps.list` that
+  another program keeps changing while ZXraw saves it is left alone with "try again". An
+  AppImage moved while it runs has to be started again from its new place before the menu
+  entry can be updated.
 * Through the Linux backends in `forge-win` (see
   [Linux platform behaviour](#linux-platform-behaviour)): the Trash (freedesktop), the file
   clipboard, single instance (a second launch opens a tab in the running window), *Open with*

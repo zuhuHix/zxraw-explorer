@@ -14,8 +14,12 @@
 //! * [`set_defaults`] writes `$XDG_CONFIG_HOME/mimeapps.list` (and any user-level
 //!   `$desktop-mimeapps.list` that already sets the type, since that one would win). Before a
 //!   type is taken over, what each file said for it is recorded in a small file the caller
-//!   names, and [`restore_defaults`] puts exactly that back. Files are replaced atomically
-//!   (temp file + rename) and every other line is kept as it was.
+//!   names, and [`restore_defaults`] puts exactly that back. A record file that is not
+//!   exactly as written is refused whole. Files are replaced atomically (temp file + rename),
+//!   every other line is kept as it was, and a file another program saved in between is
+//!   edited again from its new content.
+//! * The generated menu entry uses its own icon name ([`ICON_NAME`]), so no `zxraw.png` of a
+//!   package or the user is replaced.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,7 +35,6 @@ pub const DESKTOP_ID: &str = "zxraw.desktop";
 const GENERATED_KEY: &str = "X-ZXraw-Generated";
 
 const DEFAULTS: &str = "Default Applications";
-#[cfg(test)]
 const ADDED: &str = "Added Associations";
 const REMOVED: &str = "Removed Associations";
 
@@ -149,11 +152,15 @@ fn is_desktop_id(id: &str) -> bool {
 pub struct DefaultHandler {
     pub desktop_id: String,
     pub name: String,
+    /// The app supports the type: its `MimeType` lists it, or an `[Added Associations]` entry
+    /// does. Some desktops skip a default that does not.
+    pub supports: bool,
 }
 
 impl DefaultHandler {
+    /// ZXraw Explorer is the default and supports the type.
     pub fn is_zxraw(&self) -> bool {
-        self.desktop_id == DESKTOP_ID
+        self.desktop_id == DESKTOP_ID && self.supports
     }
 }
 
@@ -161,6 +168,22 @@ impl DefaultHandler {
 /// then picks one itself from the apps that support the type).
 pub fn default_for(dirs: &XdgDirs, mime: &str) -> Option<DefaultHandler> {
     defaults_for(dirs, &[mime]).pop().flatten()
+}
+
+/// The `Name` and `MimeType` list of an installed desktop file.
+fn app_info(dirs: &XdgDirs, id: &str) -> Option<(String, Vec<String>)> {
+    let path = dirs.find_desktop_file(id)?;
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let name = entry_value(&text, "Name")
+        .map(|name| unescape(&name))
+        .unwrap_or_else(|| id.trim_end_matches(".desktop").to_string());
+    Some((name, listed_types(&text)))
+}
+
+fn listed_types(desktop_entry: &str) -> Vec<String> {
+    entry_value(desktop_entry, "MimeType")
+        .map(|value| split_ids(&value).map(str::to_string).collect())
+        .unwrap_or_default()
 }
 
 /// [`default_for`] for several types, reading each list once.
@@ -175,156 +198,206 @@ pub fn defaults_for(dirs: &XdgDirs, mimes: &[&str]) -> Vec<Option<DefaultHandler
         .filter_map(|file| fs::read_to_string(file).ok())
         .map(|text| KeyFile::parse(&text))
         .collect();
-    let mut found: BTreeMap<String, Option<DefaultHandler>> = BTreeMap::new();
-    let mut handler = |id: &str| -> Option<DefaultHandler> {
-        found
-            .entry(id.to_string())
-            .or_insert_with(|| {
-                let path = dirs.find_desktop_file(id)?;
-                let name = fs::read_to_string(&path)
-                    .ok()
-                    .and_then(|text| entry_value(&text, "Name"))
-                    .map(|name| unescape(&name))
-                    .unwrap_or_else(|| id.trim_end_matches(".desktop").to_string());
-                Some(DefaultHandler {
-                    desktop_id: id.to_string(),
-                    name,
-                })
-            })
-            .clone()
-    };
+    let mut apps: BTreeMap<String, Option<(String, Vec<String>)>> = BTreeMap::new();
     mimes
         .iter()
-        .map(|mime| {
+        .map(|&mime| {
             lists.iter().find_map(|list| {
                 let value = list.get(DEFAULTS, mime)?;
-                split_ids(&value).find_map(&mut handler)
+                split_ids(&value).find_map(|id| {
+                    let (name, types) = apps
+                        .entry(id.to_string())
+                        .or_insert_with(|| app_info(dirs, id))
+                        .clone()?;
+                    let added = lists.iter().any(|list| {
+                        list.get(ADDED, mime)
+                            .is_some_and(|value| split_ids(&value).any(|a| a == id))
+                    });
+                    Some(DefaultHandler {
+                        desktop_id: id.to_string(),
+                        name,
+                        supports: added || types.iter().any(|t| t == mime),
+                    })
+                })
             })
         })
         .collect()
 }
 
 /// Makes ZXraw Explorer the default for every type in `mimes`. Refuses while no
-/// `zxraw.desktop` is installed, so no type is ever pointed at a missing entry. What each
-/// changed file said before is added to `record` unless it already holds the value from
-/// before ZXraw took the type over.
+/// `zxraw.desktop` is installed, so no type is ever pointed at a missing entry.
+///
+/// In each changed file, and recorded first so [`restore_defaults`] can undo exactly that:
+/// * the `[Default Applications]` value becomes ZXraw first, then what was there;
+/// * a type the installed `zxraw.desktop` does not list (an older or a custom entry) gets
+///   ZXraw under `[Added Associations]`, so the default counts as supported;
+/// * ZXraw is taken out of the type's `[Removed Associations]`.
+///
+/// A value already recorded from before ZXraw took the type over is kept.
 pub fn set_defaults(dirs: &XdgDirs, mimes: &[&str], record: &Path) -> Result<()> {
-    if dirs.find_desktop_file(DESKTOP_ID).is_none() {
+    let Some(entry) = dirs.find_desktop_file(DESKTOP_ID) else {
         return Err(WinError::Invalid(
             "zxraw.desktop is not installed; add ZXraw Explorer to the applications menu first".into(),
         ));
-    }
-    let mut records = Records::load(record)?;
+    };
+    let listed = listed_types(&fs::read_to_string(&entry).unwrap_or_default());
+    let mut records = Records::load(record, dirs)?;
     let mut targets = vec![dirs.user_mimeapps()];
     for desktop in &dirs.desktops {
         targets.push(dirs.config_home.join(format!("{desktop}-mimeapps.list")));
     }
     for (index, file) in targets.iter().enumerate() {
         let main = index == 0;
-        let mut keys = match fs::read_to_string(file) {
-            Ok(text) => KeyFile::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if !main {
-                    continue;
-                }
-                KeyFile::default()
-            }
-            Err(source) => return Err(io_err("read mimeapps.list", file, source)),
-        };
-        let mut changed = false;
-        for &mime in mimes {
-            let current = keys.get(DEFAULTS, mime);
-            // A desktop-specific file is changed only where it would override ours.
-            if !main && current.is_none() {
-                continue;
-            }
-            let ours = current
-                .as_deref()
-                .is_some_and(|value| split_ids(value).next() == Some(DESKTOP_ID));
-            if !(ours && records.contains(mime, file)) {
-                records.insert(mime, file, current.clone());
-            }
-            let others = current.as_deref().map(split_ids).into_iter().flatten();
-            let value: String = std::iter::once(DESKTOP_ID)
-                .chain(others.filter(|id| *id != DESKTOP_ID))
-                .map(|id| format!("{id};"))
-                .collect();
-            if current.as_deref() != Some(value.as_str()) {
-                keys.set(DEFAULTS, mime, Some(&value));
-                changed = true;
-            }
-            // An explicit "not this app" for the type would hide the default in some desktops.
-            if let Some(removed) = keys.get(REMOVED, mime)
-                && split_ids(&removed).any(|id| id == DESKTOP_ID)
-            {
-                let rest = join_ids(split_ids(&removed).filter(|id| *id != DESKTOP_ID));
-                keys.set(REMOVED, mime, rest.as_deref());
-                changed = true;
-            }
+        // A desktop-specific file is changed only where it would override ours.
+        if !main && !file.exists() {
+            continue;
         }
-        // The record is saved first: a crash in between leaves a record for a value that was
-        // not written yet, which restore then ignores (the type is not ours).
-        records.save(record)?;
-        if changed {
-            write_atomic(file, keys.render().as_bytes())?;
+        let edited = edit_file(
+            file,
+            |keys| {
+                let mut recs = records.clone();
+                let mut changed = false;
+                for &mime in mimes {
+                    let current = keys.get(DEFAULTS, mime);
+                    if !main && current.is_none() {
+                        continue;
+                    }
+                    let ours = current
+                        .as_deref()
+                        .is_some_and(|value| split_ids(value).next() == Some(DESKTOP_ID));
+                    if !(ours && recs.get(Kind::Default, mime, file).is_some()) {
+                        recs.insert(Kind::Default, mime, file, current.clone());
+                    }
+                    let others = current.as_deref().map(split_ids).into_iter().flatten();
+                    let value = join_ids(
+                        std::iter::once(DESKTOP_ID).chain(others.filter(|id| *id != DESKTOP_ID)),
+                    );
+                    if current != value {
+                        keys.set(DEFAULTS, mime, value.as_deref());
+                        changed = true;
+                    }
+                    if !listed.iter().any(|t| t == mime) {
+                        let added = keys.get(ADDED, mime);
+                        if !added.as_deref().is_some_and(|v| split_ids(v).any(|id| id == DESKTOP_ID)) {
+                            if recs.get(Kind::Added, mime, file).is_none() {
+                                recs.insert(Kind::Added, mime, file, added.clone());
+                            }
+                            let ids = added.as_deref().map(split_ids).into_iter().flatten();
+                            keys.set(ADDED, mime, join_ids(ids.chain([DESKTOP_ID])).as_deref());
+                            changed = true;
+                        }
+                    }
+                    // An explicit "not this app" would hide the default in some desktops.
+                    if let Some(removed) = keys.get(REMOVED, mime)
+                        && split_ids(&removed).any(|id| id == DESKTOP_ID)
+                    {
+                        if recs.get(Kind::Removed, mime, file).is_none() {
+                            recs.insert(Kind::Removed, mime, file, Some(removed.clone()));
+                        }
+                        let rest = join_ids(split_ids(&removed).filter(|id| *id != DESKTOP_ID));
+                        keys.set(REMOVED, mime, rest.as_deref());
+                        changed = true;
+                    }
+                }
+                Ok(changed.then_some(recs))
+            },
+            // Recorded before the file is replaced: a crash in between leaves a record of a
+            // change not made, which restore ignores (the type is not ZXraw's).
+            |recs| recs.save(record),
+        )?;
+        if let Some(recs) = edited {
+            records = recs;
         }
     }
     Ok(())
 }
 
-/// Turns ZXraw Explorer off for every type in `mimes`: puts back what [`set_defaults`]
-/// recorded, leaving out apps that are no longer installed, or removes the entry when there
-/// was none (so the system default applies). A type the user has since given to another app
-/// is left alone. Types ZXraw opens without a record lose ZXraw from their entry.
+/// Turns ZXraw Explorer off for every type in `mimes`, undoing what [`set_defaults`]
+/// recorded: the previous default (leaving out apps that are no longer installed, or no entry
+/// at all so the system default applies), ZXraw's `[Added Associations]` addition, and its
+/// `[Removed Associations]` entry. A type the user has since given to another app keeps that
+/// app. A type ZXraw opens without a record loses ZXraw from its entry. A file's records are
+/// dropped only once that file was written. A damaged record file refuses the whole restore
+/// ([`is_damaged_record`]).
 pub fn restore_defaults(dirs: &XdgDirs, mimes: &[&str], record: &Path) -> Result<()> {
-    let mut records = Records::load(record)?;
-    let mut files: BTreeMap<PathBuf, Vec<(String, Option<Option<String>>)>> = BTreeMap::new();
-    for &mime in mimes {
-        let recorded = records.take(mime);
-        let main = dirs.user_mimeapps();
-        if !recorded.iter().any(|(file, _)| *file == main) {
-            files.entry(main).or_default().push((mime.to_string(), None));
-        }
-        for (file, previous) in recorded {
-            files.entry(file).or_default().push((mime.to_string(), Some(previous)));
+    let mut records = Records::load(record, dirs)?;
+    let main = dirs.user_mimeapps();
+    let mut files = vec![main.clone()];
+    for r in &records.entries {
+        if mimes.contains(&r.mime.as_str()) && !files.contains(&r.file) {
+            files.push(r.file.clone());
         }
     }
-    for (file, entries) in files {
-        let mut keys = match fs::read_to_string(&file) {
-            Ok(text) => KeyFile::parse(&text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(source) => return Err(io_err("read mimeapps.list", &file, source)),
-        };
-        let mut changed = false;
-        for (mime, previous) in entries {
-            let Some(current) = keys.get(DEFAULTS, &mime) else {
-                continue;
-            };
-            if split_ids(&current).next() != Some(DESKTOP_ID) {
-                continue;
+    for file in files {
+        if file.exists() {
+            edit_file(
+                &file,
+                |keys| {
+                    let mut changed = false;
+                    for &mime in mimes {
+                        changed |= restore_type(dirs, keys, &records, mime, &file, file == main);
+                    }
+                    Ok(changed.then_some(()))
+                },
+                |_| Ok(()),
+            )?;
+        }
+        records
+            .entries
+            .retain(|r| !(r.file == file && mimes.contains(&r.mime.as_str())));
+        records.save(record)?;
+    }
+    Ok(())
+}
+
+/// One type in one file for [`restore_defaults`]. Returns whether `keys` changed.
+fn restore_type(dirs: &XdgDirs, keys: &mut KeyFile, records: &Records, mime: &str, file: &Path, main: bool) -> bool {
+    let mut changed = false;
+    let recorded = records.get(Kind::Default, mime, file).map(|r| r.previous.clone());
+    if let Some(current) = keys.get(DEFAULTS, mime)
+        && split_ids(&current).next() == Some(DESKTOP_ID)
+        && (recorded.is_some() || main)
+    {
+        // Recorded: what was there. Unrecorded: the entry without ZXraw.
+        let base = recorded.clone().unwrap_or_else(|| Some(current.clone()));
+        let usable = |id: &&str| *id != DESKTOP_ID && dirs.find_desktop_file(id).is_some();
+        let restored = base.as_deref().and_then(|value| {
+            if recorded.is_some() && split_ids(value).all(|id| usable(&id)) {
+                // Everything recorded is still there: the line goes back as it was.
+                Some(value.to_string()).filter(|v| split_ids(v).next().is_some())
+            } else {
+                join_ids(split_ids(value).filter(usable))
             }
-            // Recorded: exactly what was there. Unrecorded: the entry without ZXraw.
-            let base = match &previous {
-                Some(previous) => previous.clone(),
-                None => Some(current.clone()),
+        });
+        keys.set(DEFAULTS, mime, restored.as_deref());
+        changed = true;
+    }
+    if records.get(Kind::Added, mime, file).is_some()
+        && let Some(added) = keys.get(ADDED, mime)
+        && split_ids(&added).any(|id| id == DESKTOP_ID)
+    {
+        let rest = join_ids(split_ids(&added).filter(|id| *id != DESKTOP_ID));
+        keys.set(ADDED, mime, rest.as_deref());
+        changed = true;
+    }
+    if let Some(r) = records.get(Kind::Removed, mime, file) {
+        let current = keys.get(REMOVED, mime);
+        if !current.as_deref().is_some_and(|v| split_ids(v).any(|id| id == DESKTOP_ID)) {
+            let previous = r.previous.as_deref().unwrap_or_default();
+            let written = join_ids(split_ids(previous).filter(|id| *id != DESKTOP_ID));
+            let now = current.as_deref().and_then(|v| join_ids(split_ids(v)));
+            let value = if now == written {
+                // Untouched since: the line goes back as it was.
+                r.previous.clone()
+            } else {
+                let ids = current.as_deref().map(split_ids).into_iter().flatten();
+                join_ids(ids.chain([DESKTOP_ID]))
             };
-            let usable = |id: &&str| *id != DESKTOP_ID && dirs.find_desktop_file(id).is_some();
-            let restored = base.as_deref().and_then(|value| {
-                if previous.is_some() && split_ids(value).all(|id| usable(&id)) {
-                    // Everything recorded is still there: put the line back as it was.
-                    Some(value.to_string()).filter(|v| split_ids(v).next().is_some())
-                } else {
-                    join_ids(split_ids(value).filter(usable))
-                }
-            });
-            keys.set(DEFAULTS, &mime, restored.as_deref());
+            keys.set(REMOVED, mime, value.as_deref());
             changed = true;
         }
-        if changed {
-            write_atomic(&file, keys.render().as_bytes())?;
-        }
     }
-    records.save(record)
+    changed
 }
 
 /// What the applications menu has for ZXraw Explorer.
@@ -339,7 +412,7 @@ pub enum MenuEntry {
     Ours { path: PathBuf, current: bool },
 }
 
-/// The menu entry for ZXraw Explorer, compared against `exe` (see [`launcher_path`]).
+/// The menu entry for ZXraw Explorer, compared against `exe` (see [`launcher`]).
 pub fn menu_entry(dirs: &XdgDirs, exe: &Path) -> MenuEntry {
     let Some(path) = dirs.find_desktop_file(DESKTOP_ID) else {
         return MenuEntry::Missing;
@@ -353,17 +426,38 @@ pub fn menu_entry(dirs: &XdgDirs, exe: &Path) -> MenuEntry {
     MenuEntry::Ours { path, current }
 }
 
-/// The program a menu entry should start: the AppImage file itself when running from one
-/// (`$APPIMAGE`, never the temporary mount the process runs from), else this executable.
-pub fn launcher_path() -> Option<PathBuf> {
-    std::env::var_os("APPIMAGE")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute() && p.is_file())
-        .or_else(|| std::env::current_exe().ok())
+/// The program a menu entry should start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launcher {
+    /// The AppImage file (`$APPIMAGE`), else this executable.
+    Path(PathBuf),
+    /// `$APPIMAGE` names a file that is no longer there: the AppImage was moved or deleted
+    /// while running. This executable is inside its temporary mount, so it is no answer.
+    AppImageGone(PathBuf),
+    /// No path at all.
+    Unknown,
 }
 
+/// The [`Launcher`] for this process.
+pub fn launcher() -> Launcher {
+    launcher_from(std::env::var_os("APPIMAGE"), std::env::current_exe().ok())
+}
+
+fn launcher_from(appimage: Option<std::ffi::OsString>, exe: Option<PathBuf>) -> Launcher {
+    match appimage.filter(|value| !value.is_empty()).map(PathBuf::from) {
+        Some(path) if path.is_absolute() && path.is_file() => Launcher::Path(path),
+        Some(path) => Launcher::AppImageGone(path),
+        None => exe.map_or(Launcher::Unknown, Launcher::Path),
+    }
+}
+
+/// The icon name of the generated entry. Not `zxraw`: the user's or a package's
+/// `zxraw.png` is never replaced or removed.
+pub const ICON_NAME: &str = "zxraw-appimage";
+
 /// The `zxraw.desktop` text for a copy that is started as `exe`: the packaged entry's
-/// fields, plus the marker that lets [`menu_entry`] recognise it.
+/// fields (with [`ICON_NAME`] as its icon), plus the marker that lets [`menu_entry`]
+/// recognise it.
 pub fn desktop_entry_text(exe: &Path, mime_types: &[&str]) -> String {
     let mimes: String = mime_types.iter().map(|m| format!("{m};")).collect();
     format!(
@@ -374,7 +468,7 @@ pub fn desktop_entry_text(exe: &Path, mime_types: &[&str]) -> String {
          GenericName=Photo and RAW browser\n\
          Comment=Browse, view and organise photos and RAW files\n\
          Exec={}\n\
-         Icon=zxraw\n\
+         Icon={ICON_NAME}\n\
          Terminal=false\n\
          StartupNotify=true\n\
          StartupWMClass=zxraw\n\
@@ -415,8 +509,9 @@ pub fn quote_exec_arg(arg: &str) -> String {
 }
 
 /// Writes the menu entry for `exe` and the icons (`(size, png)`, into
-/// `$XDG_DATA_HOME/icons/hicolor/<size>x<size>/apps/zxraw.png`), then refreshes the desktop
-/// and icon caches when their tools are there. Refuses to replace an entry it did not write.
+/// `$XDG_DATA_HOME/icons/hicolor/<size>x<size>/apps/zxraw-appimage.png`), then refreshes the
+/// desktop and icon caches when their tools are there. Refuses to replace an entry it did
+/// not write.
 pub fn install_menu_entry(
     dirs: &XdgDirs,
     exe: &Path,
@@ -424,41 +519,38 @@ pub fn install_menu_entry(
     icons: &[(u32, &[u8])],
 ) -> Result<PathBuf> {
     let path = dirs.user_applications().join(DESKTOP_ID);
-    if path.exists() && !matches!(menu_entry(dirs, exe), MenuEntry::Ours { .. }) {
-        let generated = fs::read_to_string(&path)
-            .is_ok_and(|text| entry_value(&text, GENERATED_KEY).is_some_and(|v| v.trim() == "true"));
-        if !generated {
-            return Err(WinError::Invalid(format!(
-                "{} exists and was not written by ZXraw Explorer",
-                path.display()
-            )));
-        }
+    if path.exists() && !is_generated(&path) {
+        return Err(WinError::Invalid(format!(
+            "{} exists and was not written by ZXraw Explorer",
+            path.display()
+        )));
     }
     for (size, png) in icons {
-        let icon = icon_path(dirs, *size);
-        write_atomic(&icon, png)?;
+        write_atomic(&icon_path(dirs, *size), png)?;
     }
     write_atomic(&path, desktop_entry_text(exe, mime_types).as_bytes())?;
     refresh_caches(dirs);
     Ok(path)
 }
 
-/// Removes the entry and icons [`install_menu_entry`] wrote. The caller restores the
-/// defaults first: a type left pointing at `zxraw.desktop` would point at nothing.
-pub fn remove_menu_entry(dirs: &XdgDirs, icon_sizes: &[u32]) -> Result<()> {
+fn is_generated(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .is_ok_and(|text| entry_value(&text, GENERATED_KEY).is_some_and(|v| v.trim() == "true"))
+}
+
+/// Removes the entry [`install_menu_entry`] wrote, and each icon whose content is still the
+/// one written (`icons`). The caller restores the defaults first: a type left pointing at
+/// `zxraw.desktop` would point at nothing.
+pub fn remove_menu_entry(dirs: &XdgDirs, icons: &[(u32, &[u8])]) -> Result<()> {
     let path = dirs.user_applications().join(DESKTOP_ID);
-    let generated = fs::read_to_string(&path)
-        .is_ok_and(|text| entry_value(&text, GENERATED_KEY).is_some_and(|v| v.trim() == "true"));
-    if !generated {
+    if !is_generated(&path) {
         return Ok(());
     }
     fs::remove_file(&path).map_err(|source| io_err("remove the menu entry", &path, source))?;
-    for size in icon_sizes {
+    for (size, png) in icons {
         let icon = icon_path(dirs, *size);
-        match fs::remove_file(&icon) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => return Err(io_err("remove the icon", &icon, source)),
+        if fs::read(&icon).is_ok_and(|bytes| bytes == *png) {
+            fs::remove_file(&icon).map_err(|source| io_err("remove the icon", &icon, source))?;
         }
     }
     refresh_caches(dirs);
@@ -467,7 +559,7 @@ pub fn remove_menu_entry(dirs: &XdgDirs, icon_sizes: &[u32]) -> Result<()> {
 
 fn icon_path(dirs: &XdgDirs, size: u32) -> PathBuf {
     dirs.data_home
-        .join(format!("icons/hicolor/{size}x{size}/apps/zxraw.png"))
+        .join(format!("icons/hicolor/{size}x{size}/apps/{ICON_NAME}.png"))
 }
 
 /// Best effort: menus pick the change up without these too, only later.
@@ -658,49 +750,134 @@ impl KeyFile {
     }
 }
 
-/// What each file said for a type before ZXraw took it over. One line per (type, file):
-/// `type<TAB>file<TAB>=value`, or `!` for "no entry".
-#[derive(Debug, Default)]
+/// Which part of a `mimeapps.list` a record undoes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// The `[Default Applications]` value before ZXraw took the type over.
+    Default,
+    /// ZXraw was added under `[Added Associations]` (the previous value is kept for reference).
+    Added,
+    /// ZXraw was taken out of `[Removed Associations]`; the value it had then.
+    Removed,
+}
+
+impl Kind {
+    fn tag(self) -> &'static str {
+        match self {
+            Kind::Default => "default",
+            Kind::Added => "added",
+            Kind::Removed => "removed",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        [Kind::Default, Kind::Added, Kind::Removed]
+            .into_iter()
+            .find(|kind| kind.tag() == tag)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Record {
+    kind: Kind,
+    mime: String,
+    file: PathBuf,
+    previous: Option<String>,
+}
+
+/// The first line of a record file.
+const RECORD_HEADER: &str = "# ZXraw Explorer: default apps to restore, version 2";
+
+/// Starts the message of a refused record file (see [`is_damaged_record`]).
+const DAMAGED: &str = "the record of the previous default apps is damaged";
+
+/// Starts the message of an edit given up because another program kept changing the file.
+const CHANGED: &str = "the default apps were changed by another program";
+
+/// The record file could not be trusted, so nothing was restored or changed.
+pub fn is_damaged_record(error: &WinError) -> bool {
+    matches!(error, WinError::Invalid(message) if message.starts_with(DAMAGED))
+}
+
+/// Another program changed a `mimeapps.list` twice while ZXraw was writing it.
+pub fn is_changed_by_another_program(error: &WinError) -> bool {
+    matches!(error, WinError::Invalid(message) if message.starts_with(CHANGED))
+}
+
+/// What ZXraw changed, one line per (kind, type, file): `kind<TAB>type<TAB>file<TAB>=value`,
+/// or `!` for "no entry", under [`RECORD_HEADER`].
+#[derive(Debug, Default, Clone)]
 struct Records {
-    entries: Vec<(String, PathBuf, Option<String>)>,
+    entries: Vec<Record>,
 }
 
 impl Records {
-    fn load(path: &Path) -> Result<Self> {
+    /// Reads the record. Any line that is not exactly as written, a type that is not
+    /// `type/subtype`, or a file other than the user's own `mimeapps.list` or
+    /// `<desktop>-mimeapps.list` refuses the whole file: a partly trusted record could put
+    /// back the wrong app or write somewhere else.
+    fn load(path: &Path, dirs: &XdgDirs) -> Result<Self> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(damaged(path, 0, "not UTF-8"));
+            }
             Err(source) => return Err(io_err("read the default-app record", path, source)),
         };
-        let entries = text
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(3, '\t');
-                let mime = parts.next()?.to_string();
-                let file = PathBuf::from(parts.next()?);
-                let previous = match parts.next()? {
-                    "!" => None,
-                    value => Some(value.strip_prefix('=')?.to_string()),
-                };
-                Some((mime, file, previous))
-            })
-            .collect();
+        let mut lines = text.lines();
+        if lines.next() != Some(RECORD_HEADER) {
+            return Err(damaged(path, 1, "unknown header"));
+        }
+        let mut entries = Vec::new();
+        for (index, line) in lines.enumerate() {
+            let number = index + 2;
+            let fields: Vec<&str> = line.split('\t').collect();
+            let [kind, mime, file, previous] = fields[..] else {
+                return Err(damaged(path, number, "not four fields"));
+            };
+            let kind = Kind::from_tag(kind).ok_or_else(|| damaged(path, number, "unknown kind"))?;
+            if !is_mime_type(mime) {
+                return Err(damaged(path, number, "not a MIME type"));
+            }
+            let file = PathBuf::from(file);
+            if !is_user_mimeapps(dirs, &file) {
+                return Err(damaged(path, number, "not the user's mimeapps.list"));
+            }
+            let previous = match previous {
+                "!" => None,
+                value => Some(
+                    value
+                        .strip_prefix('=')
+                        .ok_or_else(|| damaged(path, number, "bad value"))?
+                        .to_string(),
+                ),
+            };
+            entries.push(Record {
+                kind,
+                mime: mime.to_string(),
+                file,
+                previous,
+            });
+        }
         Ok(Self { entries })
     }
 
-    fn contains(&self, mime: &str, file: &Path) -> bool {
-        self.entries.iter().any(|(m, f, _)| m == mime && f == file)
+    fn get(&self, kind: Kind, mime: &str, file: &Path) -> Option<&Record> {
+        self.entries
+            .iter()
+            .find(|r| r.kind == kind && r.mime == mime && r.file == file)
     }
 
-    fn insert(&mut self, mime: &str, file: &Path, previous: Option<String>) {
-        self.entries.retain(|(m, f, _)| !(m == mime && f == file));
-        self.entries.push((mime.to_string(), file.to_path_buf(), previous));
-    }
-
-    fn take(&mut self, mime: &str) -> Vec<(PathBuf, Option<String>)> {
-        let (taken, kept) = self.entries.drain(..).partition(|(m, _, _)| m == mime);
-        self.entries = kept;
-        taken.into_iter().map(|(_, file, previous)| (file, previous)).collect()
+    fn insert(&mut self, kind: Kind, mime: &str, file: &Path, previous: Option<String>) {
+        self.entries
+            .retain(|r| !(r.kind == kind && r.mime == mime && r.file == file));
+        self.entries.push(Record {
+            kind,
+            mime: mime.to_string(),
+            file: file.to_path_buf(),
+            previous,
+        });
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -711,21 +888,131 @@ impl Records {
                 Err(source) => Err(io_err("remove the default-app record", path, source)),
             };
         }
-        let mut text = String::new();
-        for (mime, file, previous) in &self.entries {
-            let value = match previous {
+        let mut text = format!("{RECORD_HEADER}\n");
+        for r in &self.entries {
+            let value = match &r.previous {
                 Some(value) => format!("={value}"),
                 None => "!".to_string(),
             };
-            text.push_str(&format!("{mime}\t{}\t{value}\n", file.display()));
+            text.push_str(&format!("{}\t{}\t{}\t{value}\n", r.kind.tag(), r.mime, r.file.display()));
         }
         write_atomic(path, text.as_bytes())
     }
 }
 
+fn damaged(path: &Path, line: usize, why: &str) -> WinError {
+    WinError::Invalid(format!("{DAMAGED} ({}, line {line}: {why})", path.display()))
+}
+
+/// `type/subtype`, both RFC 6838 restricted names.
+fn is_mime_type(text: &str) -> bool {
+    let token = |part: &str| {
+        !part.is_empty()
+            && part.len() <= 127
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$&^_.+-".contains(c))
+    };
+    matches!(text.split_once('/'), Some((kind, sub)) if token(kind) && token(sub))
+}
+
+/// `$XDG_CONFIG_HOME/mimeapps.list` or `$XDG_CONFIG_HOME/<desktop>-mimeapps.list`, compared
+/// after resolving links and `..`.
+fn is_user_mimeapps(dirs: &XdgDirs, file: &Path) -> bool {
+    let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let named = name == "mimeapps.list"
+        || name.strip_suffix("-mimeapps.list").is_some_and(|desktop| {
+            !desktop.is_empty()
+                && desktop
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+                && !desktop.starts_with('.')
+        });
+    let resolve = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    named
+        && file.is_absolute()
+        && file
+            .parent()
+            .is_some_and(|parent| resolve(parent) == resolve(&dirs.config_home))
+}
+
+/// What tells one version of a file from the next: device, inode, size, modified time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stamp(u64, u64, u64, i64, i64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(Stamp(meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec()))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        Some(Stamp(0, 0, meta.len(), modified.as_secs() as i64, modified.subsec_nanos() as i64))
+    }
+}
+
+/// Reads the key file at `path` (empty when missing), lets `edit` change it, and replaces
+/// the file, unless it changed in between (another program saved its own default): then
+/// the edit runs again on the new content, and if the file changes once more it gives up
+/// with [`is_changed_by_another_program`]. `edit` returns `None` for "nothing to write";
+/// `commit` runs with its result right before the file is replaced.
+fn edit_file<R>(
+    path: &Path,
+    mut edit: impl FnMut(&mut KeyFile) -> Result<Option<R>>,
+    mut commit: impl FnMut(&R) -> Result<()>,
+) -> Result<Option<R>> {
+    for _attempt in 0..2 {
+        let before = stamp(path);
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(source) => return Err(io_err("read mimeapps.list", path, source)),
+        };
+        let mut keys = KeyFile::parse(&text);
+        let Some(result) = edit(&mut keys)? else {
+            return Ok(None);
+        };
+        commit(&result)?;
+        if write_atomic_if_unchanged(path, keys.render().as_bytes(), before.as_ref())? {
+            return Ok(Some(result));
+        }
+        tracing::info!("{} changed while it was being edited; reading it again", path.display());
+    }
+    Err(WinError::Invalid(format!(
+        "{CHANGED} while ZXraw was saving {}; try again",
+        path.display()
+    )))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: runs right before the rename, to change the file behind the writer's back.
+    static BEFORE_RENAME: std::cell::RefCell<Option<Box<dyn FnMut(&Path)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Replaces `path` with `bytes` through a temp file in the same folder and a rename, so a
 /// reader never sees half a file. Follows a symlinked `mimeapps.list` to its target.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_checked(path, bytes, None).map(|_| ())
+}
+
+/// [`write_atomic`], but only when the file still has the stamp `before` (`None`: missing).
+/// Returns false, writing nothing, when it changed.
+fn write_atomic_if_unchanged(path: &Path, bytes: &[u8], before: Option<&Stamp>) -> Result<bool> {
+    write_atomic_checked(path, bytes, Some(before))
+}
+
+fn write_atomic_checked(path: &Path, bytes: &[u8], expect: Option<Option<&Stamp>>) -> Result<bool> {
     let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = target
         .parent()
@@ -743,7 +1030,20 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         if let Ok(meta) = fs::metadata(&target) {
             fs::set_permissions(&temp, meta.permissions())?;
         }
-        fs::rename(&temp, &target)
+        #[cfg(test)]
+        BEFORE_RENAME.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&target);
+            }
+        });
+        if let Some(expected) = expect
+            && stamp(&target).as_ref() != expected
+        {
+            fs::remove_file(&temp)?;
+            return Ok(false);
+        }
+        fs::rename(&temp, &target)?;
+        Ok(true)
     })();
     result.map_err(|source| {
         let _ = fs::remove_file(&temp);
@@ -787,6 +1087,14 @@ mod tests {
         let path = dir.join("applications").join(id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, format!("[Desktop Entry]\nType=Application\nName={name}\nExec={name}\n")).unwrap();
+    }
+
+    /// A `zxraw.desktop` that lists the types the tests use.
+    fn zxraw(dir: &Path) {
+        write(
+            &dir.join("applications").join(DESKTOP_ID),
+            "[Desktop Entry]\nName=ZXraw\nExec=zxraw %f\nMimeType=image/jpeg;image/png;image/gif;image/tiff;inode/directory;\n",
+        );
     }
 
     fn write(path: &Path, text: &str) {
@@ -838,7 +1146,7 @@ mod tests {
         app(&d.data_dirs[1], "xviewer.desktop", "Image Viewer");
         app(&d.data_dirs[1], "nemo.desktop", "Files");
         assert!(set_defaults(d, &["image/jpeg"], &e.record).is_err(), "refused before zxraw.desktop exists");
-        app(&d.data_home, DESKTOP_ID, "ZXraw");
+        zxraw(&d.data_home);
         let original = "# my comment\n[Default Applications]\nimage/jpeg=xviewer.desktop;\ntext/plain=gedit.desktop\n\n[Added Associations]\nimage/jpeg=xviewer.desktop;gimp.desktop;\n\n[Removed Associations]\nimage/png=zxraw.desktop;\n";
         write(&d.user_mimeapps(), original);
         set_defaults(d, &["image/jpeg", "image/png", "inode/directory"], &e.record).unwrap();
@@ -858,15 +1166,164 @@ mod tests {
         assert_eq!(id(d, "inode/directory"), None);
         let text = read(&d.user_mimeapps());
         assert!(text.contains("[Default Applications]\nimage/jpeg=xviewer.desktop;\ntext/plain=gedit.desktop\n"), "{text}");
-        assert!(!text.contains("zxraw"), "{text}");
+        // The removed association ZXraw took out is back; nothing else names it.
+        assert!(text.ends_with("[Removed Associations]\nimage/png=zxraw.desktop;\n"), "{text}");
+        assert_eq!(text.matches("zxraw").count(), 1, "{text}");
         assert!(!e.record.exists(), "record removed once empty");
+    }
+
+    #[test]
+    fn a_damaged_record_refuses_restore_and_set() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        zxraw(&d.data_home);
+        app(&d.data_dirs[1], "xviewer.desktop", "Image Viewer");
+        write(&d.user_mimeapps(), "[Default Applications]\nimage/jpeg=xviewer.desktop;\n");
+        set_defaults(d, &["image/jpeg"], &e.record).unwrap();
+        let good = read(&e.record);
+        assert!(good.starts_with(RECORD_HEADER), "{good}");
+        let main = d.user_mimeapps().display().to_string();
+        let elsewhere = d.data_home.join("mimeapps.list").display().to_string();
+        let damaged_records = [
+            good.replace(RECORD_HEADER, "# something else"),
+            format!("{good}garbage line\n"),
+            format!("{good}default\timage/png\t{main}\n"),
+            format!("{good}default\tnot-a-type\t{main}\t!\n"),
+            format!("{good}default\timage/png\t{elsewhere}\t!\n"),
+            format!("{good}default\timage/png\t/etc/xdg/mimeapps.list\t!\n"),
+            format!("{good}default\timage/png\t{main}/../../x/mimeapps.list\t!\n"),
+            format!("{good}default\timage/png\t{main}\tvalue-without-equals\n"),
+            format!("{good}other\timage/png\t{main}\t!\n"),
+        ];
+        let before = read(&d.user_mimeapps());
+        for bad in damaged_records {
+            write(&e.record, &bad);
+            let error = restore_defaults(d, &["image/jpeg"], &e.record).unwrap_err();
+            assert!(is_damaged_record(&error), "{bad}: {error}");
+            assert!(is_damaged_record(&set_defaults(d, &["image/png"], &e.record).unwrap_err()));
+            assert_eq!(read(&d.user_mimeapps()), before, "nothing written for {bad}");
+            assert_eq!(read(&e.record), bad, "the record is kept for a look");
+        }
+        // A desktop-specific user file is a valid target.
+        write(&e.record, &format!("{good}default\timage/png\t{}\t!\n", d.config_home.join("kde-mimeapps.list").display()));
+        restore_defaults(d, &["image/jpeg"], &e.record).unwrap();
+        assert_eq!(id(d, "image/jpeg").as_deref(), Some("xviewer.desktop"));
+    }
+
+    #[test]
+    fn a_type_the_entry_does_not_list_is_associated_and_unassociated() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        // An older entry that does not list HEIF.
+        zxraw(&d.data_home);
+        write(&d.user_mimeapps(), "[Added Associations]\nimage/heif=gimp.desktop;\n");
+        set_defaults(d, &["image/heif", "image/jpeg"], &e.record).unwrap();
+        let text = read(&d.user_mimeapps());
+        assert!(text.contains("[Added Associations]\nimage/heif=gimp.desktop;zxraw.desktop;\n"), "{text}");
+        assert!(!text.contains("[Added Associations]\nimage/jpeg"), "a listed type gets no association: {text}");
+        assert!(default_for(d, "image/heif").unwrap().is_zxraw());
+        // Without the association the default alone does not count.
+        let unassociated = text.replace("gimp.desktop;zxraw.desktop;", "gimp.desktop;");
+        write(&d.user_mimeapps(), &unassociated);
+        let handler = default_for(d, "image/heif").unwrap();
+        assert_eq!(handler.desktop_id, DESKTOP_ID);
+        assert!(!handler.is_zxraw());
+        write(&d.user_mimeapps(), &text);
+        restore_defaults(d, &["image/heif", "image/jpeg"], &e.record).unwrap();
+        assert_eq!(read(&d.user_mimeapps()), "[Added Associations]\nimage/heif=gimp.desktop;\n\n[Default Applications]\n");
+    }
+
+    #[test]
+    fn a_removed_association_is_recorded_and_put_back() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        zxraw(&d.data_home);
+        write(&d.user_mimeapps(), "[Removed Associations]\nimage/gif=zxraw.desktop;gimp.desktop;\nimage/tiff=zxraw.desktop;\n");
+        set_defaults(d, &["image/gif", "image/tiff"], &e.record).unwrap();
+        let text = read(&d.user_mimeapps());
+        assert!(text.starts_with("[Removed Associations]\nimage/gif=gimp.desktop;\n\n[Default"), "tiff's line is gone: {text}");
+        // The user edits the gif line meanwhile; ZXraw is added back to it, not over it.
+        write(&d.user_mimeapps(), &text.replace("image/gif=gimp.desktop;", "image/gif=gimp.desktop;eog.desktop;"));
+        restore_defaults(d, &["image/gif", "image/tiff"], &e.record).unwrap();
+        let text = read(&d.user_mimeapps());
+        assert!(text.contains("[Removed Associations]\nimage/gif=gimp.desktop;eog.desktop;zxraw.desktop;\nimage/tiff=zxraw.desktop;\n"), "{text}");
+    }
+
+    #[test]
+    fn a_stale_appimage_path_never_falls_back_to_the_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let image = root.path().join("ZXraw.AppImage");
+        let mount = PathBuf::from("/tmp/.mount_ZXrawXYZ/usr/bin/zxraw");
+        assert_eq!(launcher_from(None, Some(mount.clone())), Launcher::Path(mount.clone()));
+        assert_eq!(launcher_from(Some(image.clone().into()), Some(mount.clone())), Launcher::AppImageGone(image.clone()));
+        assert_eq!(launcher_from(Some("relative.AppImage".into()), Some(mount.clone())), Launcher::AppImageGone("relative.AppImage".into()));
+        fs::write(&image, b"x").unwrap();
+        assert_eq!(launcher_from(Some(image.clone().into()), Some(mount)), Launcher::Path(image));
+        assert_eq!(launcher_from(Some("".into()), None), Launcher::Unknown);
+    }
+
+    #[test]
+    fn icons_never_replace_or_remove_someone_elses() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        let theirs = d.data_home.join("icons/hicolor/48x48/apps/zxraw.png");
+        write(&theirs, "their icon");
+        let exe = Path::new("/opt/ZXraw.AppImage");
+        install_menu_entry(d, exe, &[], &[(48, b"ours48"), (64, b"ours64")]).unwrap();
+        assert_eq!(read(&theirs), "their icon");
+        // Someone replaced our 64 px icon with their own: it stays.
+        let ours64 = d.data_home.join("icons/hicolor/64x64/apps/zxraw-appimage.png");
+        write(&ours64, "edited");
+        remove_menu_entry(d, &[(48, b"ours48"), (64, b"ours64")]).unwrap();
+        assert!(!d.data_home.join("icons/hicolor/48x48/apps/zxraw-appimage.png").exists());
+        assert_eq!(read(&ours64), "edited");
+        assert_eq!(read(&theirs), "their icon");
+    }
+
+    /// Changes the file `times` times right before ZXraw's rename, as another program would.
+    fn interfere(times: usize, line: &'static str) {
+        let mut left = times;
+        BEFORE_RENAME.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |path: &Path| {
+                if left > 0 && path.ends_with("mimeapps.list") {
+                    left -= 1;
+                    let mut text = fs::read_to_string(path).unwrap_or_default();
+                    text.push_str(line);
+                    fs::write(path, text).unwrap();
+                }
+            }));
+        });
+    }
+
+    #[test]
+    fn a_file_changed_between_read_and_write_is_edited_again_or_refused() {
+        let e = env(&[]);
+        let d = &e.dirs;
+        zxraw(&d.data_home);
+        write(&d.user_mimeapps(), "[Default Applications]\ntext/plain=gedit.desktop\n");
+        interfere(1, "text/html=firefox.desktop\n");
+        set_defaults(d, &["image/jpeg"], &e.record).unwrap();
+        let text = read(&d.user_mimeapps());
+        assert!(text.contains("text/html=firefox.desktop\n"), "the other program's change is kept: {text}");
+        assert!(text.contains("image/jpeg=zxraw.desktop;\n"), "{text}");
+        // Changed on every try: refused, and the other program's file is left as it saved it.
+        interfere(2, "text/css=gedit.desktop\n");
+        let error = restore_defaults(d, &["image/jpeg"], &e.record).unwrap_err();
+        assert!(is_changed_by_another_program(&error), "{error}");
+        let text = read(&d.user_mimeapps());
+        assert!(text.contains("image/jpeg=zxraw.desktop;\n") && text.matches("text/css").count() == 2, "{text}");
+        assert!(e.record.exists(), "a failed restore keeps its record");
+        BEFORE_RENAME.with(|hook| *hook.borrow_mut() = None);
+        restore_defaults(d, &["image/jpeg"], &e.record).unwrap();
+        assert!(!read(&d.user_mimeapps()).contains("zxraw"));
+        assert!(!e.record.exists());
     }
 
     #[test]
     fn missing_file_is_created_and_removed_entries_restore_to_system_default() {
         let e = env(&[]);
         let d = &e.dirs;
-        app(&d.data_home, DESKTOP_ID, "ZXraw");
+        zxraw(&d.data_home);
         app(&d.data_dirs[1], "nemo.desktop", "Files");
         write(&d.data_dirs[1].join("applications/mimeapps.list"), "[Default Applications]\ninode/directory=nemo.desktop\n");
         set_defaults(d, &["inode/directory"], &e.record).unwrap();
@@ -880,7 +1337,7 @@ mod tests {
     fn restore_never_points_at_an_uninstalled_app_or_undoes_a_later_choice() {
         let e = env(&[]);
         let d = &e.dirs;
-        app(&d.data_home, DESKTOP_ID, "ZXraw");
+        zxraw(&d.data_home);
         app(&d.data_dirs[1], "old.desktop", "Old");
         app(&d.data_dirs[1], "gimp.desktop", "GIMP");
         write(&d.user_mimeapps(), "[Default Applications]\nimage/jpeg=old.desktop;\nimage/png=old.desktop;gimp.desktop;\n");
@@ -900,7 +1357,7 @@ mod tests {
     fn a_desktop_specific_override_is_taken_over_and_restored() {
         let e = env(&["x-cinnamon"]);
         let d = &e.dirs;
-        app(&d.data_home, DESKTOP_ID, "ZXraw");
+        zxraw(&d.data_home);
         app(&d.data_dirs[1], "xviewer.desktop", "Image Viewer");
         let cinnamon = d.config_home.join("x-cinnamon-mimeapps.list");
         write(&cinnamon, "[Default Applications]\nimage/jpeg=xviewer.desktop\nimage/png=xviewer.desktop\n");
@@ -916,7 +1373,7 @@ mod tests {
     fn unrecorded_type_loses_only_zxraw() {
         let e = env(&[]);
         let d = &e.dirs;
-        app(&d.data_home, DESKTOP_ID, "ZXraw");
+        zxraw(&d.data_home);
         app(&d.data_dirs[1], "gimp.desktop", "GIMP");
         write(&d.user_mimeapps(), "[Default Applications]\nimage/tiff=zxraw.desktop;gimp.desktop;\n");
         restore_defaults(d, &["image/tiff"], &e.record).unwrap();
@@ -941,16 +1398,16 @@ mod tests {
         let text = read(&path);
         assert!(text.contains("Exec=\"/home/me/Apps/ZXraw Explorer.AppImage\" %f\n"), "{text}");
         assert!(text.contains("MimeType=image/jpeg;inode/directory;\n"));
-        assert!(text.contains("Icon=zxraw\n"));
-        assert_eq!(fs::read(d.data_home.join("icons/hicolor/48x48/apps/zxraw.png")).unwrap(), b"png48");
+        assert!(text.contains("Icon=zxraw-appimage\n"));
+        assert_eq!(fs::read(d.data_home.join("icons/hicolor/48x48/apps/zxraw-appimage.png")).unwrap(), b"png48");
         assert!(matches!(menu_entry(d, exe), MenuEntry::Ours { current: true, .. }));
         assert!(matches!(menu_entry(d, Path::new("/elsewhere/ZXraw.AppImage")), MenuEntry::Ours { current: false, .. }));
         // Update after a move.
         install_menu_entry(d, Path::new("/elsewhere/ZXraw.AppImage"), &["image/jpeg"], &[]).unwrap();
         assert!(matches!(menu_entry(d, Path::new("/elsewhere/ZXraw.AppImage")), MenuEntry::Ours { current: true, .. }));
-        remove_menu_entry(d, &[48, 256]).unwrap();
+        remove_menu_entry(d, &[(48, b"png48"), (256, b"png256")]).unwrap();
         assert!(!path.exists());
-        assert!(!d.data_home.join("icons/hicolor/256x256/apps/zxraw.png").exists());
+        assert!(!d.data_home.join("icons/hicolor/256x256/apps/zxraw-appimage.png").exists());
         assert_eq!(menu_entry(d, exe), MenuEntry::Missing);
         // A user's own entry, or a package's, is never replaced or removed.
         write(&path, "[Desktop Entry]\nName=Mine\nExec=zxraw %f\n");
