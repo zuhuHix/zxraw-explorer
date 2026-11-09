@@ -147,13 +147,13 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.11.2 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.11.3 | MIT OR Apache-2.0 | Not declared | Permissive |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs | Permissive |
 | futures-io | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs | Permissive |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT | https://github.com/smol-rs/futures-lite | Permissive |
