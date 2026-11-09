@@ -183,27 +183,37 @@ install_docs() {
     # depends on the system packages, whose own copyright files cover them.
     local doc="$1" kind="$2"
     mkdir -p "$doc"
+    local note
+    if [[ "$kind" == appimage ]] && ((${#bundled_sonames[@]})); then
+        note="This AppImage bundles the system libraries listed below, each with the copyright file of its Debian package under /usr/share/doc/zxraw/third-party/."
+    elif [[ "$kind" == appimage ]]; then
+        note="This AppImage bundles no system libraries. It uses the host's C and C++ runtimes, and loads the host's X11, Wayland, Vulkan and GL libraries."
+    else
+        note="This package bundles no system libraries. The libraries it links to are package dependencies ($depends_line); their licenses are in /usr/share/doc/<package>/copyright of those packages."
+    fi
     {
-        cat "$copyright_src"
-        echo
-        if [[ "$kind" == appimage ]] && ((${#bundled_sonames[@]})); then
+        # The note goes into the header paragraph (DEP-5 allows Comment there), after Source.
+        local line wrapped
+        while IFS= read -r line; do
+            printf '%s\n' "$line"
+            if [[ "$line" == Source:* ]]; then
+                wrapped="$(fold -s -w 90 <<<"$note" | sed 's/ *$//')"
+                printf 'Comment: %s\n' "$(head -n1 <<<"$wrapped")"
+                tail -n +2 <<<"$wrapped" | sed 's/^/ /'
+            fi
+        done < "$copyright_src"
+        if [[ "$kind" == appimage ]]; then
             local soname pkg
             for soname in "${bundled_sonames[@]}"; do
                 pkg="${pkg_of_soname[$soname]%%:*}"
+                echo
                 echo "Files: usr/lib/$soname"
                 echo "Copyright: see /usr/share/doc/zxraw/third-party/$pkg/copyright"
-                echo "License: see /usr/share/doc/zxraw/third-party/$pkg/copyright"
-                echo " Bundled from the Debian/Ubuntu package $pkg $(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo '(version unknown)')"
-                echo " on the build machine. Its copyright file is shipped unchanged next to this file."
-                echo
+                echo "License: other"
+                echo " As stated in /usr/share/doc/zxraw/third-party/$pkg/copyright, the unchanged"
+                echo " copyright file of the Debian/Ubuntu package $pkg"
+                echo " $(dpkg-query -W -f='${Version}' "${pkg_of_soname[$soname]}" 2>/dev/null || echo '(version unknown)'), from which the library was copied."
             done
-        elif [[ "$kind" == appimage ]]; then
-            echo "Comment: This AppImage bundles no system libraries. It uses the host's C and C++"
-            echo " runtimes, and loads the X11, Wayland, Vulkan and GL libraries of the host."
-        else
-            echo "Comment: This package bundles no system libraries. The libraries it links to are"
-            echo " package dependencies ($depends_line); their licenses are in"
-            echo " /usr/share/doc/<package>/copyright of those packages."
         fi
     } > "$doc/copyright"
     chmod 644 "$doc/copyright"
