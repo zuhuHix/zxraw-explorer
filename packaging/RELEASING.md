@@ -27,9 +27,11 @@ workflow makes a **draft** release. A person checks it and publishes it.
      `SHA256SUMS.txt`;
    * **Linux** (`ubuntu-24.04`): `packaging/linux/build-linux.sh`. Output:
      `ZXraw-Explorer-x.y.z-x86_64.AppImage`, `zxraw_x.y.z_amd64.deb`, `SHA256SUMS-linux.txt`;
-   * **Publish**: checks the six files against both checksum files, then creates the draft release
-     `vx.y.z` with them (or replaces the files of an existing draft). It refuses to touch a release
-     that is already published, and never creates a tag.
+   * **Verify** (read-only): checks the version again and the six files against both checksum
+     files, and that `SHA256SUMS.txt` lists the installer;
+   * **Publish** (the only job with `contents: write`): creates the draft release `vx.y.z` with the
+     six files (or replaces the files of an existing draft). It refuses to touch a release that is
+     already published, and never creates a tag.
 
    Release builds start from a clean cache (no `rust-cache`), so they take longer than CI.
 4. **Check the draft and publish it.** Download the files from the draft, check them, write the
@@ -47,16 +49,19 @@ workflow makes a **draft** release. A person checks it and publishes it.
 
 *Actions › Release › Run workflow* (or `gh workflow run release.yml`) takes:
 
-* `tag`: an existing `vx.y.z` tag. The workflow builds that tag and drafts its release, as a push
-  would.
-* `dry_run`: build the branch the workflow is run on instead of the tag. The version check still
-  compares `Cargo.toml` with `tag`, the files are kept only as run artifacts
-  (`release-windows`, `release-linux`, 14 days), and no release or tag is created or changed. Use
-  it to test the workflow:
+* `tag`: a `vx.y.z` tag.
+* `publish` (default off): when checked, the workflow builds the existing tag `tag` and drafts its
+  release, as a push would. When unchecked (a dry run), it builds the branch the workflow is run
+  on, checks its `Cargo.toml` version against `tag`, verifies the six files and keeps them only as
+  run artifacts (`release-windows`, `release-linux`, 14 days). The `publish` job, the only one with
+  write access, is skipped, so no release or tag is created or changed. Use it to test the
+  workflow:
 
   ```sh
-  gh workflow run release.yml --ref <branch> -f tag=v<version in Cargo.toml> -f dry_run=true
+  gh workflow run release.yml --ref <branch> -f tag=v<version in Cargo.toml>
   ```
+
+  `workflow_dispatch` works only once `release.yml` is on the default branch.
 
 ## Building locally instead
 
