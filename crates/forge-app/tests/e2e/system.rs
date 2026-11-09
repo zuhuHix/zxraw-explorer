@@ -378,15 +378,20 @@ fn fake_linux_release(genuine: &[u8], served: Vec<u8>) -> String {
     })
 }
 
+/// What the fake AppImage holds: the type 2 AppImage header, so the app accepts it.
+#[cfg(target_os = "linux")]
+const OLD_APPIMAGE: &[u8] = b"\x7fELF\x02\x01\x01\x00AI\x02 old AppImage";
+
 /// A fake AppImage in the sandbox (never the user's), and the environment that makes the
-/// app run as that AppImage against the fake release at `base`.
+/// app run as that AppImage against the fake release at `base`. `$APPDIR` is the test
+/// binary's folder, so the app sees itself as running from the AppImage's mount.
 #[cfg(target_os = "linux")]
 fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, RunOpts) {
     use std::os::unix::fs::PermissionsExt;
     let apps = root.join("Apps");
     std::fs::create_dir_all(&apps).unwrap();
     let appimage = apps.join("ZXraw-Explorer-1.0.0-x86_64.AppImage");
-    std::fs::write(&appimage, b"old AppImage").unwrap();
+    std::fs::write(&appimage, OLD_APPIMAGE).unwrap();
     std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = root.join("home");
     std::fs::create_dir_all(home.join("Downloads")).unwrap();
@@ -394,6 +399,10 @@ fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, RunOpts) {
         env: vec![
             ("ZXRAW_UPDATE_API".into(), format!("{base}/api")),
             ("APPIMAGE".into(), shown(&appimage)),
+            (
+                "APPDIR".into(),
+                shown(Path::new(env!("CARGO_BIN_EXE_zxraw")).parent().unwrap()),
+            ),
             ("HOME".into(), shown(&home)),
             ("XDG_CONFIG_HOME".into(), shown(&home.join(".config"))),
         ],
@@ -453,7 +462,7 @@ fn linux_appimage_update_with_a_tampered_download_is_refused() {
     let outcome = run_app_with(sandbox.path(), &profile, script, &opts);
     expect_ok(&outcome);
     assert_no_crash(&profile);
-    assert_eq!(std::fs::read(&appimage).unwrap(), b"old AppImage");
+    assert_eq!(std::fs::read(&appimage).unwrap(), OLD_APPIMAGE);
 }
 
 #[cfg(target_os = "linux")]
@@ -479,7 +488,7 @@ fn linux_appimage_in_a_read_only_folder_is_saved_to_downloads() {
     std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).unwrap();
     expect_ok(&outcome);
     assert_no_crash(&profile);
-    assert_eq!(std::fs::read(&appimage).unwrap(), b"old AppImage", "left alone");
+    assert_eq!(std::fs::read(&appimage).unwrap(), OLD_APPIMAGE, "left alone");
     let saved = sandbox
         .path()
         .join("home/Downloads/ZXraw-Explorer-99.0.0-x86_64.AppImage");

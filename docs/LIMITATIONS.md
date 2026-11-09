@@ -667,16 +667,26 @@ or refuses with a message; nothing should crash for lack of it.
   for an AppImage, which replaces itself with no password, and for the `zxraw` .deb, which asks
   for your password through the desktop's polkit agent. Any other copy (a build folder, a copied
   binary, an AppImage moved while it runs, a non-x86_64 PC) gets the release page, as before.
+  An AppImage counts only when the app runs from its mount (`$APPDIR`) and `$APPIMAGE` is a
+  regular file, not a symlink, owned by you, with the type 2 AppImage header; a symlinked
+  AppImage gets the release page.
   Nothing installs by itself. After an install, "Restart now" closes the window through the normal
   shutdown (settings and session are saved) and starts the new copy.
 * An AppImage is replaced by renaming the verified new file over the old path, which is atomic.
   No `.old` backup is kept. The file name keeps the old version number, but the path stays the
   same, so a menu entry made in Settings › Default app keeps working. If the folder is not
-  writable, the verified file is saved in Downloads (or your home folder) and the notice offers
-  to open that folder. Both installs check the download's SHA-256 again just before installing.
-  Accepted risk: apt opens the .deb by path after that check, so a program running as the same
-  user could swap the file during that short window. The download folder is private (0700), so
-  only that user can do it. Dismissing the password dialog keeps the .deb for opening by hand.
+  writable, or the AppImage belongs to another user or group, the verified file is saved in
+  Downloads (or your home folder) and the notice offers to open that folder.
+* The .deb is installed by a helper the package ships, `/usr/lib/zxraw/install-update`, run
+  through `pkexec` (the prompt says "Update ZXraw Explorer" where the desktop shows polkit
+  action messages). Before asking for the password, the app checks the download again (SHA-256)
+  and its package fields with `dpkg-deb` (`zxraw`, the offered version, amd64). As root, the
+  helper copies the file once into a new root-only folder, checks the copy's SHA-256 and fields
+  again, and installs only the copy with `apt-get install --no-remove`, so the file cannot be
+  swapped after the check. A .deb installed before the helper existed has no helper: its first
+  update opens the downloaded package in the Package Installer instead (finish it there, then
+  restart). Updates after that use the helper. Dismissing the password dialog keeps the .deb for
+  opening by hand.
 * Drag and drop works on X11 (see [Linux platform behaviour](#linux-platform-behaviour)).
   winit has no drag and drop on Wayland: turn on Settings › File operations › *Use XWayland
   (enables drag and drop)*, or start with `ZXRAW_X11=1`, and restart. The app then runs as an
