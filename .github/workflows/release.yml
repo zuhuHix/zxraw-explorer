@@ -1,10 +1,10 @@
 # Builds a release from a version tag and puts it in a DRAFT GitHub release.
 #
-#   git push origin vX.Y.Z      -> builds vX.Y.Z and creates or updates its draft release
-#   Actions > Release > Run     -> the same for an existing tag (input "tag")
-#   ... with dry_run checked    -> builds the branch you run it on, checks the version against
-#                                  the "tag" input, uploads the files as run artifacts, and does
-#                                  not touch any release or tag
+#   git push origin vX.Y.Z           -> builds vX.Y.Z and creates or updates its draft release
+#   Run workflow, publish checked    -> the same for an existing tag (input "tag")
+#   Run workflow, publish unchecked  -> dry run: builds the branch you run it on, checks the
+#                                       version against "tag", keeps the files as run artifacts,
+#                                       and touches no release or tag
 #
 # The draft is never published here. Check it, then publish it by hand:
 #   gh release edit vX.Y.Z --draft=false --notes-file notes.md
@@ -17,11 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Version tag to build, e.g. v0.11.0 (must exist unless dry_run is set)
+        description: Version tag, e.g. v0.11.0 (must exist when publish is checked)
         required: true
         type: string
-      dry_run:
-        description: Build the selected branch instead of the tag; no release, no tag
+      publish:
+        description: Build the tag and create or update its draft release (unchecked = dry run of the selected branch)
         required: false
         type: boolean
         default: false
@@ -54,16 +54,16 @@ jobs:
           EVENT: ${{ github.event_name }}
           PUSH_TAG: ${{ github.ref_name }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
-          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          PUBLISH_INPUT: ${{ github.event.inputs.publish }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           if [[ "$EVENT" == push ]]; then
             tag="$PUSH_TAG"; ref="refs/tags/$tag"; publish=true
-          elif [[ "$DRY_RUN" == true ]]; then
-            tag="$INPUT_TAG"; ref="$SHA"; publish=false
-          else
+          elif [[ "$PUBLISH_INPUT" == true ]]; then
             tag="$INPUT_TAG"; ref="refs/tags/$tag"; publish=true
+          else
+            tag="$INPUT_TAG"; ref="$SHA"; publish=false
           fi
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
             { echo "::error::tag must look like v1.2.3, got '$tag'"; exit 1; }
@@ -223,12 +223,12 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  publish:
-    name: Draft GitHub release
+  verify:
+    name: Verify release files
     needs: [prepare, windows, linux]
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -281,15 +281,39 @@ jobs:
             for f in "${files[@]}"; do echo "| \`$f\` | $(stat -c %s "$f") |"; done
             echo
             if [[ "$PUBLISH" == true ]]; then
-              echo "Draft release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG (check it, then publish it by hand)"
+              echo "The publish job creates or updates the draft release $TAG."
             else
               echo "Dry run: no release or tag was created or changed."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           ls -l "${files[@]}"
 
+  # The only job with write access. It runs for tag pushes and for runs with publish checked,
+  # i.e. exactly when prepare chose refs/tags/<tag> as the build ref. (A dispatch run from a tag
+  # ref with publish unchecked is a dry run of that commit and must not publish.)
+  publish:
+    name: Draft GitHub release
+    needs: [prepare, verify]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Re-check the checksums of the downloaded files
+        working-directory: dist
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          sha256sum -c SHA256SUMS-linux.txt
+
       - name: Create or update the draft release
-        if: needs.prepare.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -318,3 +342,4 @@ jobs:
             gh release create "$TAG" "${files[@]}" --draft --verify-tag \
               --title "ZXraw Explorer $VERSION" --generate-notes
           fi
+          echo "Draft release: https://github.com/$GH_REPO/releases/tag/$TAG (check it, then publish it by hand)" >> "$GITHUB_STEP_SUMMARY"
