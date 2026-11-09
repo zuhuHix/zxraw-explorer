@@ -5,8 +5,9 @@
 #   dist/SHA256SUMS-linux.txt
 #
 # The version is read from [workspace.package] in Cargo.toml. Nothing is installed system-wide:
-# appimagetool is cached under ${XDG_CACHE_HOME:-$HOME/.cache}/zxraw-packaging/. Nothing is
-# tagged, pushed or uploaded. See packaging/linux/README.md.
+# pinned releases of appimagetool and the AppImage runtime are cached under
+# ${XDG_CACHE_HOME:-$HOME/.cache}/zxraw-packaging/ and checked against the SHA-256 values below
+# before every use. Nothing is tagged, pushed or uploaded. See packaging/linux/README.md.
 #
 # Usage: packaging/linux/build-linux.sh [--skip-build]
 #   --skip-build  package the existing release binary without running cargo
@@ -32,9 +33,22 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
 cd "$repo"
 
-for tool in cargo python3 ldd dpkg dpkg-deb readlink sha256sum objdump strip curl install; do
+for tool in cargo python3 ldd dpkg dpkg-deb dpkg-query readlink sha256sum objdump strip curl install; do
     command -v "$tool" >/dev/null 2>&1 || die "missing required tool: $tool"
 done
+
+# The outputs are labelled x86_64 (AppImage) and amd64 (.deb), and the pinned tools below are
+# x86_64 builds.
+host_arch="$(uname -m)"
+[[ "$host_arch" == x86_64 ]] || die "this script builds x86_64/amd64 packages; the host is $host_arch"
+
+# Pinned packaging tools: exact releases, verified by SHA-256 before they run. To update, change
+# the URL and the hash together (GitHub shows each asset's sha256 digest on the release page).
+APPIMAGETOOL_URL="https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+# Passed to appimagetool with --runtime-file, so it does not download a runtime itself.
+RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
+RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
 
 VERSION="$(python3 -I -c '
 import tomllib
@@ -163,10 +177,46 @@ appimage_name="ZXraw-Explorer-$VERSION-x86_64.AppImage"
 deb_name="zxraw_${VERSION}_amd64.deb"
 
 install_docs() {
-    # Usage: install_docs <doc dir>
-    local doc="$1"
+    # Usage: install_docs <doc dir> appimage|deb
+    # The AppImage carries the bundled system libraries (if any) with their Debian copyright
+    # files under third-party/, and its copyright file lists them. The .deb bundles none: it
+    # depends on the system packages, whose own copyright files cover them.
+    local doc="$1" kind="$2"
     mkdir -p "$doc"
-    install -m644 "$copyright_src" "$doc/copyright"
+    {
+        cat "$copyright_src"
+        echo
+        if [[ "$kind" == appimage ]] && ((${#bundled_sonames[@]})); then
+            local soname pkg
+            for soname in "${bundled_sonames[@]}"; do
+                pkg="${pkg_of_soname[$soname]%%:*}"
+                echo "Files: usr/lib/$soname"
+                echo "Copyright: see /usr/share/doc/zxraw/third-party/$pkg/copyright"
+                echo "License: see /usr/share/doc/zxraw/third-party/$pkg/copyright"
+                echo " Bundled from the Debian/Ubuntu package $pkg $(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || echo '(version unknown)')"
+                echo " on the build machine. Its copyright file is shipped unchanged next to this file."
+                echo
+            done
+        elif [[ "$kind" == appimage ]]; then
+            echo "Comment: This AppImage bundles no system libraries. It uses the host's C and C++"
+            echo " runtimes, and loads the X11, Wayland, Vulkan and GL libraries of the host."
+        else
+            echo "Comment: This package bundles no system libraries. The libraries it links to are"
+            echo " package dependencies ($depends_line); their licenses are in"
+            echo " /usr/share/doc/<package>/copyright of those packages."
+        fi
+    } > "$doc/copyright"
+    chmod 644 "$doc/copyright"
+    if [[ "$kind" == appimage ]]; then
+        local soname pkg
+        for soname in "${bundled_sonames[@]}"; do
+            pkg="${pkg_of_soname[$soname]%%:*}"
+            [[ -f "/usr/share/doc/$pkg/copyright" ]] ||
+                die "no copyright file for bundled library $soname (package $pkg)"
+            mkdir -p "$doc/third-party/$pkg"
+            install -m644 "/usr/share/doc/$pkg/copyright" "$doc/third-party/$pkg/copyright"
+        done
+    fi
     install -m644 "$third_party_src" "$doc/THIRD_PARTY.md"
     install -m644 "$repo/LICENSE-MIT" "$doc/LICENSE-MIT"
     install -m644 "$repo/LICENSE-APACHE" "$doc/LICENSE-APACHE"
@@ -182,11 +232,31 @@ install_icons() {
     find "$1/icons" -type d -exec chmod 755 {} +
 }
 
+fetch_verified() {
+    # Usage: fetch_verified <url> <sha256> <file>
+    # Downloads <url> to <file> unless it is already there, then aborts unless its SHA-256 is
+    # <sha256>. A mismatching download is removed; a mismatching cached file is left for a look.
+    local url="$1" want="$2" file="$3" got
+    if [[ ! -f "$file" ]]; then
+        mkdir -p "$(dirname "$file")"
+        echo "Downloading $url ..."
+        curl -fL --retry 3 -o "$file.part" "$url"
+        got="$(sha256sum "$file.part" | cut -d' ' -f1)"
+        if [[ "$got" != "$want" ]]; then
+            rm -f "$file.part"
+            die "SHA-256 mismatch for $url: expected $want, got $got"
+        fi
+        mv "$file.part" "$file"
+    fi
+    got="$(sha256sum "$file" | cut -d' ' -f1)"
+    [[ "$got" == "$want" ]] || die "SHA-256 mismatch for cached $file: expected $want, got $got"
+}
+
 build_appimage() {
     local appdir="$work/AppDir"
     local tool_dir="${XDG_CACHE_HOME:-$HOME/.cache}/zxraw-packaging"
-    local tool="$tool_dir/appimagetool-x86_64.AppImage"
-    local url="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+    local tool="$tool_dir/appimagetool-1.9.1-x86_64.AppImage"
+    local runtime="$tool_dir/runtime-20251108-x86_64"
 
     mkdir -p "$appdir/usr/bin" "$appdir/usr/lib" "$appdir/usr/share/applications" \
         "$appdir/usr/share/doc/zxraw"
@@ -200,7 +270,7 @@ build_appimage() {
     install_icons "$appdir/usr/share"
     install -m644 "$icons_src/256x256/apps/zxraw.png" "$appdir/zxraw.png"
     ln -s zxraw.png "$appdir/.DirIcon"
-    install_docs "$appdir/usr/share/doc/zxraw"
+    install_docs "$appdir/usr/share/doc/zxraw" appimage
 
     {
         echo '#!/bin/sh'
@@ -216,14 +286,10 @@ build_appimage() {
     } > "$appdir/AppRun"
     chmod 755 "$appdir/AppRun"
 
-    # appimagetool: cached, downloaded once, never installed.
-    if [[ ! -x "$tool" ]]; then
-        mkdir -p "$tool_dir"
-        echo "Downloading appimagetool into $tool_dir ..."
-        curl -fL --retry 3 -o "$tool.part" "$url"
-        chmod 755 "$tool.part"
-        mv "$tool.part" "$tool"
-    fi
+    # Pinned and verified: cached, downloaded once, never installed, checked on every build.
+    fetch_verified "$APPIMAGETOOL_URL" "$APPIMAGETOOL_SHA256" "$tool"
+    fetch_verified "$RUNTIME_URL" "$RUNTIME_SHA256" "$runtime"
+    chmod 755 "$tool"
 
     # Without FUSE (or libfuse2) the tool cannot mount itself, so extract and run it instead.
     local tool_env=(env ARCH=x86_64)
@@ -232,7 +298,7 @@ build_appimage() {
     fi
     echo "Creating $appimage_name ..."
     rm -f "$dist/$appimage_name"
-    "${tool_env[@]}" "$tool" "$appdir" "$dist/$appimage_name"
+    "${tool_env[@]}" "$tool" --runtime-file "$runtime" "$appdir" "$dist/$appimage_name"
     chmod 755 "$dist/$appimage_name"
 }
 
@@ -245,7 +311,7 @@ build_deb() {
     install -m755 "$staged_cli" "$root/usr/bin/zxraw-cli"
     install -m644 "$desktop_src" "$root/usr/share/applications/zxraw.desktop"
     install_icons "$root/usr/share"
-    install_docs "$root/usr/share/doc/zxraw"
+    install_docs "$root/usr/share/doc/zxraw" deb
 
     maintainer="$(git -C "$repo" log --reverse --format='%an <%ae>' 2>/dev/null | head -n1 || true)"
     [[ -n "$maintainer" ]] || maintainer="ZXraw Explorer developers"

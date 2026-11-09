@@ -900,11 +900,19 @@ pub(crate) fn conflict_resolver(
 /// What a source path pointed at when a move was queued.
 #[derive(Debug, PartialEq)]
 enum SourceIdentity {
-    /// Volume serial and file index (Windows file ID); on Unix device, inode and birth time
-    /// (see [`crate::platform::FileKey`]).
+    /// Volume serial and file index (Windows file ID); on Unix device and inode, with the
+    /// birth time where the file system keeps one (see [`crate::platform::FileKey`]).
     Id {
         kind: std::fs::FileType,
         id: crate::platform::FileKey,
+        /// Unix only (`None` on Windows): the inode change time, seconds and nanoseconds.
+        /// Linux file systems give a freed inode number to the next new file at once, so a
+        /// file deleted and created again while the move waits has the same device and
+        /// inode, but a new ctime (which user space cannot set back). Unlike the birth time,
+        /// every file system reports it (NFS, some tmpfs and older kernels keep no birth
+        /// time). A source written to while it waits also gets a new ctime, and is then left
+        /// alone (fails closed).
+        ctime: Option<(i64, i64)>,
     },
     /// Fallback when the file ID cannot be read.
     Meta {
@@ -1170,16 +1178,58 @@ impl PendingIdentities {
 
 /// `None` if nothing is at `path`. Does not follow a link at the end.
 fn source_identity(path: &Path) -> Option<SourceIdentity> {
+    identity_with(path, key_for_identity)
+}
+
+/// [`source_identity`] with the file key read by `key` (tests use it to hide the birth time).
+fn identity_with(
+    path: &Path,
+    key: impl Fn(&Path, &std::fs::Metadata) -> Option<crate::platform::FileKey>,
+) -> Option<SourceIdentity> {
     let md = std::fs::symlink_metadata(path).ok()?;
     let kind = md.file_type();
-    Some(match crate::platform::file_key(path) {
-        Some(id) => SourceIdentity::Id { kind, id },
+    Some(match key(path, &md) {
+        Some(id) => SourceIdentity::Id {
+            kind,
+            id,
+            ctime: change_time(&md),
+        },
         None => SourceIdentity::Meta {
             kind,
             len: md.len(),
             modified: md.modified().ok(),
         },
     })
+}
+
+/// The item's [`crate::platform::FileKey`]. On Unix, where the file system keeps no birth
+/// time, device and inode alone: the ctime in [`SourceIdentity::Id`] tells a reused inode
+/// apart.
+fn key_for_identity(path: &Path, md: &std::fs::Metadata) -> Option<crate::platform::FileKey> {
+    crate::platform::file_key(path).or_else(|| key_without_birth_time(md))
+}
+
+#[cfg(unix)]
+fn key_without_birth_time(md: &std::fs::Metadata) -> Option<crate::platform::FileKey> {
+    use std::os::unix::fs::MetadataExt;
+    Some(crate::platform::FileKey::new(md.dev(), md.ino()))
+}
+
+#[cfg(not(unix))]
+fn key_without_birth_time(_md: &std::fs::Metadata) -> Option<crate::platform::FileKey> {
+    None
+}
+
+/// The inode change time on Unix (see [`SourceIdentity::Id`]); `None` elsewhere.
+#[cfg(unix)]
+fn change_time(md: &std::fs::Metadata) -> Option<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((md.ctime(), md.ctime_nsec()))
+}
+
+#[cfg(not(unix))]
+fn change_time(_md: &std::fs::Metadata) -> Option<(i64, i64)> {
+    None
 }
 
 /// Physical disks a transfer reads and writes, or `None` if any of them is unknown
@@ -3195,6 +3245,47 @@ mod tests {
         assert_eq!(keep, paths(&["known"]));
         assert!(changed.is_empty());
         assert_eq!(unverified, paths(&["then-unknown", "now-unknown"]));
+    }
+
+    #[test]
+    fn a_reused_file_id_with_a_new_change_time_counts_as_replaced() {
+        // Same device and inode, no birth time anywhere: only the ctime tells them apart.
+        let id = |ctime| SourceIdentity::Id {
+            kind: std::fs::symlink_metadata(".").unwrap().file_type(),
+            id: crate::platform::FileKey::new(7, 42),
+            ctime: Some(ctime),
+        };
+        let sources = paths(&["waited", "reused"]);
+        let identities = vec![Some(id((100, 5))), Some(id((100, 5)))];
+        let now = |p: &Path| match p.to_str().unwrap() {
+            "waited" => Some(id((100, 5))),
+            _ => Some(id((100, 6))),
+        };
+        let (keep, changed, _) = screen_queued_sources(sources, &identities, now);
+        assert_eq!(keep, paths(&["waited"]));
+        assert_eq!(changed, paths(&["reused"]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_deleted_and_created_again_has_another_identity() {
+        // As on a file system without birth times (NFS, some tmpfs): device and inode only.
+        let without_birth = |path: &Path| identity_with(path, |_, md| key_without_birth_time(md));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("y.txt");
+        std::fs::write(&file, b"the y the user picked").unwrap();
+        for identity in [source_identity, without_birth] {
+            let before = identity(&file).unwrap();
+            let again = identity(&file);
+            assert_eq!(again.as_ref(), Some(&before), "a waiting file keeps its identity");
+            // Past the coarse timestamp tick, as between two script steps or user actions.
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::remove_file(&file).unwrap();
+            std::fs::write(&file, vec![0u8; 4096]).unwrap();
+            let after = identity(&file).unwrap();
+            assert!(matches!(after, SourceIdentity::Id { ctime: Some(_), .. }));
+            assert_ne!(after, before, "the new file may reuse the inode, not the ctime");
+        }
     }
 
     #[test]
