@@ -54,13 +54,36 @@
 //! itself (volume serial and file index), so another program of the same user that creates
 //! the pipe first cannot silently swallow launches. Same-user processes are otherwise outside
 //! the threat model: they can already do far more to this user than receive a folder path.
+//!
+//! Unix (Linux): the same protocol over a Unix domain socket, `zxraw-explorer-<tag>-v<version>.sock`
+//! in `$XDG_RUNTIME_DIR` (or `/tmp/zxraw-explorer-<uid>/`, created 0700 and checked to be a real
+//! directory of ours that others cannot write to). Each message is a `u32` little-endian length
+//! and the bytes; the payload itself is byte-for-byte the same as on Windows. Claiming is a bind,
+//! done under an `flock` on a sibling `.lock` file: a bind that fails because the socket exists
+//! probes it, a live owner is left alone, and a socket nobody listens behind (a dead owner) is
+//! unlinked and bound again. The socket file is removed when the owner's [`Server`] drops, unless
+//! another claimant has replaced it since.
+//!
+//! The Windows identity checks map to Unix as follows:
+//!
+//! * user SID: `SO_PEERCRED` user id of the other end must be this process's effective uid
+//!   (both ends check it);
+//! * terminal session: no per-session pipe namespace exists; the socket lives in the login
+//!   session's runtime directory and the directory check refuses one that is not private to us;
+//! * integrity level: no equivalent on Linux; not checked;
+//! * same executable file (the sender checks the owner): the owner's `/proc/<pid>/exe` must have
+//!   the device and inode of this executable. This is the defence against another program of the
+//!   same user taking the socket name first; without it such a program would swallow launches.
+//!
+//! The socket is `0600`. Restoring and focusing the window does nothing off Windows: there is no
+//! foreground right to hand on, so the window is raised by the desktop as usual.
 
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Mutex;
 use std::time::Duration;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 use crate::Result;
 use crate::WinError;
 
@@ -1567,8 +1590,749 @@ mod imp {
     }
 }
 
-/// Off Windows there is no instance pipe: every launch opens its own window.
-#[cfg(not(windows))]
+/// Unix: the instance socket. See the module notes for the file layout and for which Windows
+/// check each Unix check replaces. The protocol (requests, replies, commits, timeouts, limits) is
+/// the one the Windows transport runs; only the transport differs.
+#[cfg(unix)]
+pub use imp_unix::{Channel, Server, forward};
+
+#[cfg(unix)]
+mod imp_unix {
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        COMMIT, COMMIT_WAIT, ForwardError, Handoff, Inbox, MAX_PAYLOAD, PROTOCOL_VERSION,
+        REPLY_MARGIN, Reply, UI_WAIT, decode_request, request_has_action, set_reply_wait,
+    };
+    use crate::{Result, WinError};
+
+    /// How long the receiver waits for a connected client's request, and for its own reply to
+    /// be read (the Windows `READ_TIMEOUT`).
+    const READ_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Connections handled at once; more are dropped (their senders fall back).
+    const MAX_HANDLERS: usize = 16;
+    /// Longest socket path the kernel takes: `sun_path` is 108 bytes with its NUL.
+    const MAX_SOCKET_PATH: usize = 107;
+    /// How long a sender may take to write its commit message.
+    const COMMIT_WRITE_WAIT: Duration = Duration::from_secs(2);
+
+    /// The receiver's waits. The defaults are the Windows constants; tests shorten them.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct Timing {
+        pub(super) read: Duration,
+        pub(super) ui_wait: Duration,
+        pub(super) commit_wait: Duration,
+    }
+
+    pub(super) const TIMING: Timing = Timing {
+        read: READ_TIMEOUT,
+        ui_wait: UI_WAIT,
+        commit_wait: COMMIT_WAIT,
+    };
+
+    /// The socket for one user, tag and protocol version.
+    #[derive(Debug, Clone)]
+    pub struct Channel {
+        path: PathBuf,
+        lock: PathBuf,
+        display: String,
+        /// The executable the owner must run, for messages; its identity is `exe_id`.
+        exe: PathBuf,
+        /// Device and inode of `exe`; `None` when they cannot be read (no owner is then trusted).
+        exe_id: Option<(u64, u64)>,
+    }
+
+    impl Channel {
+        /// The channel of the current process. `tag` separates builds (installed, dev, tests):
+        /// 1 to 48 characters from `A-Z a-z 0-9 . _ -`.
+        pub fn current(tag: &str) -> Result<Self> {
+            Self::for_version(tag, PROTOCOL_VERSION)
+        }
+
+        /// The socket name ends in `-v<version>`: launches of another protocol version never
+        /// find this one.
+        pub(crate) fn for_version(tag: &str, version: u32) -> Result<Self> {
+            let dir = socket_dir()?;
+            Self::in_dir(&dir, tag, version)
+        }
+
+        /// The channel for `tag` and `version` with its socket in `dir` (tests pass their own).
+        pub(crate) fn in_dir(dir: &Path, tag: &str, version: u32) -> Result<Self> {
+            validate_tag(tag)?;
+            let stem = format!("zxraw-explorer-{tag}-v{version}");
+            let path = dir.join(format!("{stem}.sock"));
+            if path.as_os_str().len() > MAX_SOCKET_PATH {
+                return Err(WinError::Invalid(format!(
+                    "socket path too long: {}",
+                    path.display()
+                )));
+            }
+            let exe = std::env::current_exe().map_err(|source| WinError::Io {
+                op: "current_exe",
+                path: PathBuf::new(),
+                source,
+            })?;
+            // Through /proc/self/exe, which still names the running file after an update
+            // has replaced it on disk.
+            let exe_id = file_id(Path::new("/proc/self/exe")).ok();
+            Ok(Self {
+                display: path.display().to_string(),
+                lock: dir.join(format!("{stem}.lock")),
+                path,
+                exe,
+                exe_id,
+            })
+        }
+
+        /// Tests: expect the socket's owner to run `exe` instead of this process's executable.
+        #[cfg(test)]
+        pub(crate) fn expecting_exe(mut self, exe: PathBuf) -> Self {
+            self.exe_id = file_id(&exe).ok();
+            self.exe = exe;
+            self
+        }
+
+        /// The owner `pid` runs the same executable file as this process: same device and inode
+        /// of `/proc/<pid>/exe`.
+        pub(crate) fn check_exe(&self, pid: u32) -> std::result::Result<(), String> {
+            let theirs = PathBuf::from(format!("/proc/{pid}/exe"));
+            match (file_id(&theirs), self.exe_id) {
+                (Ok(id), Some(mine)) if id == mine => Ok(()),
+                _ => {
+                    let running = fs::read_link(&theirs)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "another program".into());
+                    Err(format!(
+                        "process {pid} runs {running}, not {}",
+                        self.exe.display()
+                    ))
+                }
+            }
+        }
+
+        pub fn pipe_name(&self) -> &str {
+            &self.display
+        }
+
+        /// Whether some process accepts connections on the socket, without sending a request
+        /// (the probe connection is closed at once).
+        pub fn is_owned(&self) -> bool {
+            UnixStream::connect(&self.path).is_ok()
+        }
+    }
+
+    fn validate_tag(tag: &str) -> Result<()> {
+        if tag.is_empty()
+            || tag.len() > 48
+            || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        {
+            return Err(WinError::Invalid(format!("instance tag {tag:?}")));
+        }
+        Ok(())
+    }
+
+    fn io_err(op: &'static str, path: &Path, source: io::Error) -> WinError {
+        WinError::Io {
+            op,
+            path: path.to_path_buf(),
+            source,
+        }
+    }
+
+    fn euid() -> u32 {
+        unsafe { libc::geteuid() }
+    }
+
+    /// The directory of the sockets: `$XDG_RUNTIME_DIR` when it is a private directory of ours,
+    /// else `/tmp/zxraw-explorer-<uid>`, created 0700.
+    fn socket_dir() -> Result<PathBuf> {
+        if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            && check_private_dir(&run).is_ok()
+        {
+            return Ok(run);
+        }
+        let dir = PathBuf::from("/tmp").join(format!("zxraw-explorer-{}", euid()));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(io_err("create the socket directory", &dir, source)),
+        }
+        check_private_dir(&dir)?;
+        Ok(dir)
+    }
+
+    /// `dir` must be a real directory (not a symlink) of this user that others cannot write to:
+    /// otherwise another user could put a socket where this one goes.
+    pub(super) fn check_private_dir(dir: &Path) -> Result<()> {
+        // symlink_metadata: a symlink is not a directory here.
+        let meta = fs::symlink_metadata(dir)
+            .map_err(|source| io_err("inspect the socket directory", dir, source))?;
+        if !meta.is_dir() {
+            return Err(WinError::Invalid(format!(
+                "{} is not a real directory",
+                dir.display()
+            )));
+        }
+        if meta.uid() != euid() {
+            return Err(WinError::Invalid(format!(
+                "{} belongs to another user",
+                dir.display()
+            )));
+        }
+        if meta.mode() & 0o022 != 0 {
+            return Err(WinError::Invalid(format!(
+                "{} is writable by other users",
+                dir.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Device and inode of `path`, following symlinks.
+    fn file_id(path: &Path) -> io::Result<(u64, u64)> {
+        let meta = fs::metadata(path)?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    /// The `SO_PEERCRED` of the other end of `stream`: its pid and uid at connect time.
+    fn peer_cred(stream: &UnixStream) -> io::Result<libc::ucred> {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Ok(cred)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// The other end runs as this user (the Windows user-SID and session checks; see the
+    /// module notes).
+    pub(super) fn check_peer(pid: u32, peer_uid: u32, my_uid: u32) -> std::result::Result<(), String> {
+        if peer_uid == my_uid {
+            Ok(())
+        } else {
+            Err(format!("process {pid} runs as user {peer_uid}, not {my_uid}"))
+        }
+    }
+
+    /// Takes an exclusive `flock` on `file`, waiting for any other holder.
+    fn lock_exclusive(file: &File) -> io::Result<()> {
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(());
+            }
+            let e = io::Error::last_os_error();
+            if e.kind() != io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
+
+    /// The `.lock` file of a socket, opened without following a symlink.
+    fn open_lock(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+
+    /// Binds `path` and leaves the socket file readable and writable by this user only.
+    fn bind_private(path: &Path) -> io::Result<UnixListener> {
+        let listener = UnixListener::bind(path)?;
+        // The directory is private already; this keeps the file itself to this user as well.
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            tracing::debug!("could not restrict {}: {e}", path.display());
+        }
+        Ok(listener)
+    }
+
+    /// Becomes the socket's owner. `None`: a live owner has it. Otherwise binds it, first
+    /// replacing a stale socket file (one with no listener behind it). Done under the lock
+    /// file, so two claimants never both unlink and bind.
+    fn bind_owner(channel: &Channel) -> Result<Option<UnixListener>> {
+        let lock = open_lock(&channel.lock).map_err(|e| io_err("open the lock file", &channel.lock, e))?;
+        lock_exclusive(&lock).map_err(|e| io_err("lock", &channel.lock, e))?;
+        match bind_private(&channel.path) {
+            Ok(listener) => return Ok(Some(listener)),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => {}
+            Err(e) => return Err(io_err("bind", &channel.path, e)),
+        }
+        match UnixStream::connect(&channel.path) {
+            // Someone accepts connections there: a live owner.
+            Ok(_probe) => return Ok(None),
+            // Nothing listens behind the file (its owner died), or it just vanished.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) => {}
+            Err(e) => return Err(io_err("connect to", &channel.path, e)),
+        }
+        match fs::remove_file(&channel.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_err("remove the stale socket", &channel.path, e)),
+        }
+        match bind_private(&channel.path) {
+            Ok(listener) => Ok(Some(listener)),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => Ok(None),
+            Err(e) => Err(io_err("bind", &channel.path, e)),
+        }
+    }
+
+    /// The socket's owner: accepts connections on a background thread until dropped.
+    pub struct Server {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        name: String,
+        path: PathBuf,
+        lock: PathBuf,
+        /// Device and inode of the socket file this server bound.
+        bound: (u64, u64),
+    }
+
+    impl Server {
+        /// Creates the socket and starts accepting, or returns `None` when another process
+        /// already owns it.
+        pub fn claim(channel: &Channel, inbox: Arc<Inbox>) -> Result<Option<Server>> {
+            Self::claim_with(channel, inbox, Duration::ZERO, TIMING)
+        }
+
+        /// Tests: answers every request `reply_delay` late, and uses `timing` for the waits.
+        #[cfg(test)]
+        pub(super) fn claim_with_options(
+            channel: &Channel,
+            inbox: Arc<Inbox>,
+            reply_delay: Duration,
+            timing: Timing,
+        ) -> Result<Option<Server>> {
+            Self::claim_with(channel, inbox, reply_delay, timing)
+        }
+
+        fn claim_with(
+            channel: &Channel,
+            inbox: Arc<Inbox>,
+            reply_delay: Duration,
+            timing: Timing,
+        ) -> Result<Option<Server>> {
+            let Some(listener) = bind_owner(channel)? else {
+                return Ok(None);
+            };
+            let bound = file_id(&channel.path).map_err(|e| io_err("inspect the socket", &channel.path, e))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let stop = stop.clone();
+                std::thread::Builder::new()
+                    .name("instance-pipe".into())
+                    .spawn(move || accept_loop(listener, stop, inbox, reply_delay, timing))
+                    .map_err(|source| io_err("start the socket thread", &channel.path, source))?
+            };
+            Ok(Some(Server {
+                stop,
+                thread: Some(thread),
+                name: channel.display.clone(),
+                path: channel.path.clone(),
+                lock: channel.lock.clone(),
+                bound,
+            }))
+        }
+
+        pub fn pipe_name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+            // Remove the file only while it is still the one this server bound. Under the lock,
+            // so no claimant unlinks and binds in between.
+            let _guard = open_lock(&self.lock)
+                .ok()
+                .filter(|lock| lock_exclusive(lock).is_ok());
+            if file_id(&self.path).ok() == Some(self.bound) {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    /// Accepts connections until `stop`, handling each on its own thread (at most
+    /// [`MAX_HANDLERS`] at once).
+    fn accept_loop(
+        listener: UnixListener,
+        stop: Arc<AtomicBool>,
+        inbox: Arc<Inbox>,
+        reply_delay: Duration,
+        timing: Timing,
+    ) {
+        if let Err(e) = listener.set_nonblocking(true) {
+            tracing::warn!("instance socket: {e}");
+            return;
+        }
+        let handlers = Arc::new(AtomicUsize::new(0));
+        while !stop.load(Ordering::SeqCst) {
+            // Wakes for a connection, or every 100 ms to notice `stop`.
+            let mut fd = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut fd, 1, 100) } <= 0 {
+                continue;
+            }
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("instance socket: accepting failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = stream.set_nonblocking(false) {
+                tracing::warn!("instance socket: {e}");
+                continue;
+            }
+            if handlers.fetch_add(1, Ordering::SeqCst) >= MAX_HANDLERS {
+                handlers.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!("instance socket: too many connections at once; dropping one");
+                continue;
+            }
+            let (inbox, counter) = (inbox.clone(), handlers.clone());
+            let spawned = std::thread::Builder::new()
+                .name("instance-request".into())
+                .spawn(move || {
+                    handle(stream, &inbox, reply_delay, timing);
+                    counter.fetch_sub(1, Ordering::SeqCst);
+                });
+            if let Err(e) = spawned {
+                handlers.fetch_sub(1, Ordering::SeqCst);
+                tracing::warn!("instance socket: could not start a handler: {e}");
+            }
+        }
+    }
+
+    /// One connection: check the sender, read and validate its request, hand it to the window
+    /// and answer. Same steps and orders as the Windows handler.
+    fn handle(mut stream: UnixStream, inbox: &Inbox, reply_delay: Duration, timing: Timing) {
+        let cred = match peer_cred(&stream) {
+            Ok(cred) => cred,
+            Err(e) => {
+                tracing::warn!("instance socket: unknown sender: {e}");
+                return;
+            }
+        };
+        let pid = cred.pid as u32;
+        if let Err(why) = check_peer(pid, cred.uid, euid()) {
+            tracing::warn!("instance socket: refused a request: {why}");
+            return;
+        }
+        let (reply, ticket) = match read_frame(&mut stream, MAX_PAYLOAD, timing.read) {
+            Ok(bytes) => match decode_request(&bytes) {
+                Ok(request) => {
+                    tracing::info!(
+                        "received a launch with {} path(s) from process {pid} ({})",
+                        request.paths.len(),
+                        request.action.as_deref().unwrap_or("open")
+                    );
+                    let wait = request.reply_within.saturating_sub(REPLY_MARGIN);
+                    let handoff = Handoff {
+                        action: request.action,
+                        paths: request.paths,
+                    };
+                    let (reply, ticket) = inbox.deliver_handoff(handoff, wait, timing.ui_wait);
+                    if reply != Reply::Accepted {
+                        tracing::warn!("a launch from process {pid} was withdrawn: {reply:?}");
+                    }
+                    (reply, ticket)
+                }
+                Err(e) => {
+                    tracing::warn!("instance socket: invalid request from process {pid}: {e}");
+                    (Reply::Rejected, None)
+                }
+            },
+            Err(FrameError::MoreData) => {
+                tracing::warn!("instance socket: request from process {pid} is too large");
+                (Reply::Rejected, None)
+            }
+            Err(FrameError::TimedOut) => {
+                tracing::warn!("instance socket: process {pid} sent nothing");
+                return;
+            }
+            Err(FrameError::Io(e)) => {
+                // Also what a claim's probe connection looks like: it closes without a request.
+                tracing::debug!("instance socket: reading from process {pid} ended: {e}");
+                return;
+            }
+        };
+        if !reply_delay.is_zero() {
+            std::thread::sleep(reply_delay);
+        }
+        if write_frame(&mut stream, &reply.encode(), timing.read).is_err() {
+            if let Some(ticket) = ticket {
+                // The sender runs it itself.
+                inbox.abandon(ticket);
+                tracing::warn!("instance socket: could not answer process {pid}; dropped its action");
+            } else {
+                tracing::warn!("instance socket: could not answer process {pid}");
+            }
+            return;
+        }
+        if let Some(ticket) = ticket {
+            // An action runs only once its sender confirmed it read "accepted".
+            match read_frame(&mut stream, 16, timing.commit_wait) {
+                Ok(bytes) if bytes == COMMIT => inbox.commit(ticket),
+                _ => {
+                    inbox.abandon(ticket);
+                    tracing::warn!(
+                        "instance socket: process {pid} did not confirm its action; it runs it itself"
+                    );
+                }
+            }
+            return;
+        }
+        // Closing before the sender has read the answer could discard it: wait until the sender
+        // closes its end.
+        let _ = read_frame(&mut stream, 16, timing.read);
+    }
+
+    /// How a message could not be read or written in full.
+    #[derive(Debug)]
+    enum FrameError {
+        TimedOut,
+        /// Longer than the reader accepts (its bytes are drained when that is cheap).
+        MoreData,
+        Io(io::Error),
+    }
+
+    fn frame_error(e: io::Error) -> FrameError {
+        match e.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => FrameError::TimedOut,
+            _ => FrameError::Io(e),
+        }
+    }
+
+    /// `timeout` as a socket timeout: the kernel refuses zero.
+    fn socket_timeout(timeout: Duration) -> Duration {
+        timeout.max(Duration::from_millis(1))
+    }
+
+    /// Writes all of `bytes` within `timeout`. Returns how many bytes went out, and how the
+    /// write ended, so a commit can be classified (see [`commit_outcome`]).
+    fn write_counted(stream: &mut UnixStream, bytes: &[u8], timeout: Duration) -> (usize, io::Result<()>) {
+        if let Err(e) = stream.set_write_timeout(Some(socket_timeout(timeout))) {
+            return (0, Err(e));
+        }
+        let mut done = 0;
+        while done < bytes.len() {
+            match stream.write(&bytes[done..]) {
+                Ok(0) => return (done, Err(io::ErrorKind::WriteZero.into())),
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return (done, Err(e)),
+            }
+        }
+        (done, Ok(()))
+    }
+
+    /// Sends one message: a `u32` length, then `bytes`.
+    fn write_frame(stream: &mut UnixStream, bytes: &[u8], timeout: Duration) -> std::result::Result<(), FrameError> {
+        let mut frame = (bytes.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(bytes);
+        match write_counted(stream, &frame, timeout) {
+            (_, Ok(())) => Ok(()),
+            (_, Err(e)) => Err(frame_error(e)),
+        }
+    }
+
+    /// Reads one message of at most `max` bytes within `timeout`. A longer one is drained, when
+    /// it is at most twice `max`, so the sender's write completes, and reported as `MoreData`.
+    fn read_frame(stream: &mut UnixStream, max: usize, timeout: Duration) -> std::result::Result<Vec<u8>, FrameError> {
+        stream
+            .set_read_timeout(Some(socket_timeout(timeout)))
+            .map_err(FrameError::Io)?;
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).map_err(frame_error)?;
+        let len = u32::from_le_bytes(header) as usize;
+        if len > max {
+            if len <= max.saturating_mul(2) {
+                let mut rest = (&mut *stream).take(len as u64);
+                let _ = io::copy(&mut rest, &mut io::sink());
+            }
+            return Err(FrameError::MoreData);
+        }
+        let mut bytes = vec![0u8; len];
+        stream.read_exact(&mut bytes).map_err(frame_error)?;
+        Ok(bytes)
+    }
+
+    /// Whether a commit message reached the receiver's end of the socket.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CommitOutcome {
+        /// All of it was written: the receiver reads the whole commit and runs the action, so the
+        /// sender must not.
+        Delivered,
+        /// Provably not: nothing was written, and the write failed or timed out, or the receiver is
+        /// gone. The receiver accepts only a complete commit, so it drops the action.
+        NotDelivered,
+        /// Neither can be shown (part of it was written, or an unexpected error).
+        Unknown,
+    }
+
+    /// Classifies the commit write from the bytes it wrote and how it ended. The same rules as
+    /// the Windows commit write (see there): a whole commit is delivered whatever the end says;
+    /// an empty write that failed or timed out, or met a closed receiver, is not delivered; any
+    /// partial write is unknown.
+    pub(super) fn commit_outcome(bytes: usize, end: std::result::Result<(), &io::Error>) -> CommitOutcome {
+        if bytes == 4 + COMMIT.len() {
+            return CommitOutcome::Delivered;
+        }
+        if bytes != 0 {
+            return CommitOutcome::Unknown;
+        }
+        match end {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                CommitOutcome::NotDelivered
+            }
+            _ => CommitOutcome::Unknown,
+        }
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Tests: report the next commit as `Unknown` after actually writing it (the ambiguous
+        /// case: it got through, but this end cannot tell).
+        pub(super) static COMMIT_UNKNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn write_commit(stream: &mut UnixStream) -> CommitOutcome {
+        let mut frame = (COMMIT.len() as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&COMMIT);
+        let (bytes, end) = write_counted(stream, &frame, COMMIT_WRITE_WAIT);
+        let outcome = commit_outcome(bytes, end.as_ref().map(|_| ()));
+
+        #[cfg(test)]
+        if COMMIT_UNKNOWN.with(|c| c.replace(false)) {
+            return CommitOutcome::Unknown;
+        }
+        outcome
+    }
+
+    /// Sends `request` to the socket's owner and waits for its answer, until `deadline`.
+    pub fn forward(
+        channel: &Channel,
+        request: &[u8],
+        deadline: Instant,
+    ) -> std::result::Result<(), ForwardError> {
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let mut stream = match UnixStream::connect(&channel.path) {
+            Ok(stream) => stream,
+            // Nothing listens: gone, or stale. claim_or_forward claims the socket then.
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => {
+                return Err(ForwardError::NoServer);
+            }
+            Err(e) => return Err(ForwardError::Failed(io_err("connect to", &channel.path, e))),
+        };
+        let cred = peer_cred(&stream)
+            .map_err(|e| ForwardError::Failed(io_err("read the owner's credentials of", &channel.path, e)))?;
+        let pid = cred.pid as u32;
+        check_peer(pid, cred.uid, euid()).map_err(ForwardError::Untrusted)?;
+        // Checked before anything is sent.
+        channel.check_exe(pid).map_err(ForwardError::Untrusted)?;
+
+        let io = |e: FrameError, step: &'static str| match e {
+            FrameError::TimedOut => ForwardError::TimedOut(step),
+            FrameError::MoreData => ForwardError::Failed(WinError::Invalid("oversized reply".into())),
+            FrameError::Io(e) => ForwardError::Failed(io_err("pipe I/O with", &channel.path, e)),
+        };
+        let mut request = request.to_vec();
+        set_reply_wait(&mut request, remaining());
+        write_frame(&mut stream, &request, remaining()).map_err(|e| io(e, "sending"))?;
+        let answer = read_frame(&mut stream, 64, remaining()).map_err(|e| io(e, "waiting for the answer"))?;
+        match Reply::decode(&answer) {
+            Some(Reply::Accepted) => {
+                // Confirms that this end read the answer and will not run the launch itself.
+                let outcome = write_commit(&mut stream);
+                if !request_has_action(&request) {
+                    return Ok(());
+                }
+                match outcome {
+                    CommitOutcome::Delivered => Ok(()),
+                    // The owner drops it: this end runs it.
+                    CommitOutcome::NotDelivered => Err(ForwardError::Failed(WinError::Invalid(
+                        "could not confirm the action to the running window".into(),
+                    ))),
+                    // Running it here could run it twice: report instead.
+                    CommitOutcome::Unknown => Err(ForwardError::Unconfirmed(
+                        "the confirmation to the running window may not have arrived".into(),
+                    )),
+                }
+            }
+            Some(reply) => Err(ForwardError::Refused(reply)),
+            None => Err(ForwardError::Failed(WinError::Invalid("unreadable answer".into()))),
+        }
+    }
+
+    /// Tests: sends `bytes` as one message and returns the answer, if any.
+    #[cfg(test)]
+    pub(super) fn raw_send(channel: &Channel, bytes: &[u8]) -> Option<Reply> {
+        let mut stream = UnixStream::connect(&channel.path).ok()?;
+        write_frame(&mut stream, bytes, Duration::from_secs(2)).ok()?;
+        Reply::decode(&read_frame(&mut stream, 64, Duration::from_secs(3)).ok()?)
+    }
+
+    /// Tests: sends a request, takes the answer, then closes without any commit.
+    #[cfg(test)]
+    pub(super) fn raw_send_then_close(channel: &Channel, bytes: &[u8]) -> Option<Reply> {
+        let mut stream = UnixStream::connect(&channel.path).ok()?;
+        write_frame(&mut stream, bytes, Duration::from_secs(2)).ok()?;
+        let reply = Reply::decode(&read_frame(&mut stream, 64, Duration::from_secs(3)).ok()?);
+        drop(stream);
+        reply
+    }
+}
+
+/// Off Windows and Unix there is no instance transport: every launch opens its own window.
+#[cfg(not(any(windows, unix)))]
 mod imp_stub {
     use super::*;
 
@@ -1607,7 +2371,7 @@ mod imp_stub {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 pub use imp_stub::{Channel, Server, forward};
 
 #[cfg(test)]
@@ -1669,6 +2433,62 @@ mod tests {
     fn no_paths_means_focus_only() {
         let bytes = encode_request(Path::new(""), &[]).unwrap();
         assert_eq!(decode_request(&bytes).unwrap().paths, Vec::<PathBuf>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round_trip_keeps_absolute_paths_and_resolves_relative_ones_on_unix() {
+        let bytes = encode_request(
+            Path::new("/home/me/Desktop"),
+            &[
+                PathBuf::from("/mnt/photos"),
+                PathBuf::from("Trip"),
+                PathBuf::from("../Other/a.jpg"),
+                PathBuf::from("Ünïcödé 📷"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_request(&bytes).unwrap().paths,
+            vec![
+                PathBuf::from("/mnt/photos"),
+                PathBuf::from("/home/me/Desktop/Trip"),
+                PathBuf::from("/home/me/Desktop/../Other/a.jpg"),
+                PathBuf::from("/home/me/Desktop/Ünïcödé 📷"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_paths_need_an_absolute_working_directory_on_unix() {
+        let bytes = raw(PROTOCOL_VERSION, &units(""), &[units("Trip")]);
+        assert_eq!(decode_request(&bytes), Err(PayloadError::NoWorkingDirectory));
+        let bytes = raw(PROTOCOL_VERSION, &units("relative"), &[units("/x")]);
+        assert!(matches!(decode_request(&bytes), Err(PayloadError::NotAbsolute(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn actions_round_trip_and_bad_names_are_refused_on_unix() {
+        let bytes = encode_action_request(
+            Path::new("/work"),
+            &[PathBuf::from("a.zip"), PathBuf::from("/b.7z")],
+            Some("extract-here"),
+        )
+        .unwrap();
+        let request = decode_request(&bytes).unwrap();
+        assert_eq!(request.action.as_deref(), Some("extract-here"));
+        assert_eq!(request.paths, [PathBuf::from("/work/a.zip"), PathBuf::from("/b.7z")]);
+        assert!(request_has_action(&bytes));
+        assert!(!request_has_action(&encode_request(Path::new("/"), &[]).unwrap()));
+        for bad in ["", "Extract", "a b", "x/../y", &"a".repeat(MAX_ACTION_UNITS + 1)] {
+            assert_eq!(
+                encode_action_request(Path::new("/"), &[], Some(bad)),
+                Err(PayloadError::BadAction(bad.to_string())),
+                "{bad:?}"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -2347,6 +3167,439 @@ mod tests {
         fn bad_tags_are_refused() {
             for tag in ["", "a/b", "has space", &"x".repeat(49)] {
                 assert!(Channel::current(tag).is_err(), "{tag:?}");
+            }
+        }
+    }
+
+    /// The Unix transport: the same claims, forwards, commits and timeouts over a socket in a
+    /// temporary directory. Every wait is shortened through `imp_unix::Timing` where it matters.
+    #[cfg(unix)]
+    mod sock {
+        use std::io;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::path::Path;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        use super::super::*;
+
+        fn channel_in(dir: &tempfile::TempDir, tag: &str) -> Channel {
+            Channel::in_dir(dir.path(), tag, PROTOCOL_VERSION).unwrap()
+        }
+
+        /// Takes requests like a window would, until stopped.
+        fn window(inbox: Arc<Inbox>) -> (Arc<AtomicBool>, std::thread::JoinHandle<Vec<Vec<PathBuf>>>) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                while !flag.load(Ordering::SeqCst) {
+                    all.extend(inbox.take());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                all.extend(inbox.take());
+                all
+            });
+            (stop, thread)
+        }
+
+        /// Takes every handoff, actions included, like a window would, until stopped.
+        fn action_window(inbox: Arc<Inbox>) -> (Arc<AtomicBool>, std::thread::JoinHandle<Vec<Handoff>>) {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = stop.clone();
+            let thread = std::thread::spawn(move || {
+                let mut all = Vec::new();
+                while !flag.load(Ordering::SeqCst) {
+                    all.extend(inbox.take_handoffs());
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // A commit may still be on its way from the socket thread.
+                std::thread::sleep(Duration::from_millis(300));
+                all.extend(inbox.take_handoffs());
+                all
+            });
+            (stop, thread)
+        }
+
+        #[test]
+        fn the_first_claim_owns_the_socket_and_a_second_one_yields() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "own");
+            let first = Server::claim(&channel, Arc::new(Inbox::new())).unwrap();
+            assert!(first.is_some());
+            assert!(
+                Server::claim(&channel, Arc::new(Inbox::new())).unwrap().is_none(),
+                "a live owner was replaced"
+            );
+            assert!(channel.is_owned());
+            drop(first);
+            assert!(!channel.is_owned());
+            assert!(!Path::new(channel.pipe_name()).exists(), "the socket file was left behind");
+        }
+
+        #[test]
+        fn the_socket_is_readable_and_writable_by_this_user_only() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "mode");
+            let _server = Server::claim(&channel, Arc::new(Inbox::new())).unwrap().expect("owner");
+            let mode = std::fs::metadata(channel.pipe_name()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        #[test]
+        fn a_second_launch_forwards_its_paths_to_the_owner() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "fwd");
+            let owner_inbox = Arc::new(Inbox::new());
+            let Startup::Primary(server) =
+                claim_or_forward(&channel, owner_inbox.clone(), &[], FORWARD_TIMEOUT)
+            else {
+                panic!("the first claim must own the socket");
+            };
+            let (stop, window) = window(owner_inbox.clone());
+            let request = encode_request(Path::new("/home/me"), &[PathBuf::from("Public")]).unwrap();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Forwarded => {}
+                Startup::Primary(_) => panic!("a second owner was allowed"),
+                Startup::Standalone(why) => panic!("not forwarded: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
+            }
+            assert!(started.elapsed() < FORWARD_TIMEOUT);
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(window.join().unwrap(), vec![vec![PathBuf::from("/home/me/Public")]]);
+            drop(server);
+            // Once the owner is gone, the next launch owns the socket.
+            assert!(matches!(
+                claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT),
+                Startup::Primary(_)
+            ));
+        }
+
+        #[test]
+        fn simultaneous_launches_are_all_delivered_to_one_owner() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "race");
+            let senders = 6;
+            let barrier = Arc::new(std::sync::Barrier::new(senders));
+            let inboxes: Vec<_> = (0..senders).map(|_| Arc::new(Inbox::new())).collect();
+            let windows: Vec<_> = inboxes.iter().map(|inbox| window(inbox.clone())).collect();
+            let threads: Vec<_> = (0..senders)
+                .map(|i| {
+                    let (channel, barrier, inbox) = (channel.clone(), barrier.clone(), inboxes[i].clone());
+                    std::thread::spawn(move || {
+                        let request =
+                            encode_request(Path::new("/"), &[PathBuf::from(format!("/folder{i}"))]).unwrap();
+                        barrier.wait();
+                        match claim_or_forward(&channel, inbox, &request, FORWARD_TIMEOUT) {
+                            Startup::Primary(server) => Some(server),
+                            Startup::Forwarded => None,
+                            Startup::Standalone(why) => panic!("sender {i} fell back: {why}"),
+                            Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
+                        }
+                    })
+                })
+                .collect();
+            let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            let owners: Vec<usize> = (0..senders).filter(|&i| results[i].is_some()).collect();
+            assert_eq!(owners.len(), 1, "exactly one launch owns the socket");
+            let owner = owners[0];
+            let mut received: Vec<PathBuf> = Vec::new();
+            for (i, (stop, window)) in windows.into_iter().enumerate() {
+                stop.store(true, Ordering::SeqCst);
+                let got: Vec<PathBuf> = window.join().unwrap().into_iter().flatten().collect();
+                assert!(i == owner || got.is_empty(), "only the owner receives");
+                received.extend(got);
+            }
+            received.sort();
+            let mut expected: Vec<PathBuf> = (0..senders)
+                .filter(|&i| i != owner)
+                .map(|i| PathBuf::from(format!("/folder{i}")))
+                .collect();
+            expected.sort();
+            assert_eq!(received, expected, "every forwarded path arrives exactly once");
+        }
+
+        #[test]
+        fn a_stale_socket_file_is_replaced_and_its_owner_recovered() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "stale");
+            // The file a dead owner leaves behind: bound, with no listener.
+            drop(UnixListener::bind(channel.pipe_name()).unwrap());
+            assert!(Path::new(channel.pipe_name()).exists());
+            assert!(!channel.is_owned(), "a stale socket must not look owned");
+            let server = Server::claim(&channel, Arc::new(Inbox::new()))
+                .unwrap()
+                .expect("a stale socket is replaced");
+            assert!(channel.is_owned());
+            drop(server);
+        }
+
+        #[test]
+        fn oversized_and_junk_payloads_are_refused_and_never_queued() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "junk");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            assert_eq!(imp_unix::raw_send(&channel, b"definitely not a request"), Some(Reply::Rejected));
+            let mut wrong = encode_request(Path::new("/"), &[]).unwrap();
+            wrong[4] = 9;
+            assert_eq!(imp_unix::raw_send(&channel, &wrong), Some(Reply::Rejected));
+            // Over the size limit: refused, and its bytes are not kept.
+            assert_eq!(
+                imp_unix::raw_send(&channel, &vec![b'x'; MAX_PAYLOAD + 10]),
+                Some(Reply::Rejected)
+            );
+            assert!(inbox.take().is_empty());
+        }
+
+        #[test]
+        fn an_action_runs_once_after_its_commit_with_all_its_paths() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "act");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let paths: Vec<PathBuf> =
+                (0..50).map(|i| PathBuf::from(format!("/sel/file {i}.jpg"))).collect();
+            let request = encode_action_request(Path::new("/"), &paths, Some("add-zip")).unwrap();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Forwarded => {}
+                Startup::Primary(_) => panic!("a second owner was allowed"),
+                Startup::Standalone(why) => panic!("not forwarded: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(
+                window.join().unwrap(),
+                vec![Handoff {
+                    action: Some("add-zip".into()),
+                    paths
+                }]
+            );
+        }
+
+        #[test]
+        fn an_action_whose_sender_never_confirms_is_never_handed_out() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "noconfirm");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let mut request =
+                encode_action_request(Path::new("/"), &[PathBuf::from("/a.zip")], Some("extract-here")).unwrap();
+            // The owner must take it while the sender still waits for the answer.
+            set_reply_wait(&mut request, Duration::from_secs(3));
+            assert_eq!(imp_unix::raw_send_then_close(&channel, &request), Some(Reply::Accepted));
+            stop.store(true, Ordering::SeqCst);
+            assert!(window.join().unwrap().is_empty(), "an action without its commit ran");
+        }
+
+        #[test]
+        fn an_unconfirmable_commit_is_reported_and_never_run_by_the_sender() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "unknown-commit");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let paths = vec![PathBuf::from("/sel/a.jpg"), PathBuf::from("/sel/b.jpg")];
+            let request = encode_action_request(Path::new("/"), &paths, Some("add-zip")).unwrap();
+            imp_unix::COMMIT_UNKNOWN.with(|c| c.set(true));
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Unconfirmed(why) => assert!(why.contains("may not"), "{why}"),
+                Startup::Standalone(why) => panic!("the sender would run it a second time: {why}"),
+                _ => panic!("an unconfirmed commit must be reported"),
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(
+                window.join().unwrap(),
+                vec![Handoff { action: Some("add-zip".into()), paths }],
+                "the owner runs it, once"
+            );
+        }
+
+        #[test]
+        fn a_late_accepted_answer_never_runs_an_action_twice() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "late-act");
+            let inbox = Arc::new(Inbox::new());
+            // Answers 2.5 s late: the sender below gives up after 1.5 s.
+            let _server = Server::claim_with_options(
+                &channel,
+                inbox.clone(),
+                Duration::from_millis(2500),
+                imp_unix::TIMING,
+            )
+            .unwrap()
+            .expect("owner");
+            let (stop, window) = action_window(inbox.clone());
+            let request =
+                encode_action_request(Path::new("/"), &[PathBuf::from("/a.zip")], Some("extract-here"))
+                    .unwrap();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("in time"), "{why}"),
+                _ => panic!("a sender past its deadline runs the action itself"),
+            }
+            // The owner's late answer fails (the sender is gone), so the action is dropped.
+            std::thread::sleep(Duration::from_millis(2500));
+            stop.store(true, Ordering::SeqCst);
+            assert!(
+                window.join().unwrap().is_empty(),
+                "the owner must not run an action its sender runs as well"
+            );
+        }
+
+        #[test]
+        fn an_unresponsive_owner_makes_the_sender_fall_back_in_time() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "hung");
+            let inbox = Arc::new(Inbox::new());
+            let timing = imp_unix::Timing {
+                ui_wait: Duration::from_millis(200),
+                ..imp_unix::TIMING
+            };
+            let _server = Server::claim_with_options(&channel, inbox.clone(), Duration::ZERO, timing)
+                .unwrap()
+                .expect("owner");
+            // The window took one batch, then stopped taking: hung.
+            inbox.take();
+            let request = encode_request(Path::new("/"), &[PathBuf::from("/usr")]).unwrap();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("not responding"), "{why}"),
+                _ => panic!("a hung owner must not take the request"),
+            }
+            assert!(started.elapsed() < Duration::from_millis(2000));
+            assert!(inbox.take().is_empty(), "the withdrawn request must not open later");
+            // A closing owner answers at once.
+            inbox.close();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, Duration::from_millis(1500)) {
+                Startup::Standalone(why) => assert!(why.contains("closing"), "{why}"),
+                _ => panic!("a closing owner must not take the request"),
+            }
+            assert!(started.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn a_silent_client_does_not_block_the_owner() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "silent");
+            let inbox = Arc::new(Inbox::new());
+            let timing = imp_unix::Timing {
+                read: Duration::from_millis(200),
+                ..imp_unix::TIMING
+            };
+            let _server = Server::claim_with_options(&channel, inbox.clone(), Duration::ZERO, timing)
+                .unwrap()
+                .expect("owner");
+            let (stop, window) = window(inbox.clone());
+            // Connected, and never sends anything.
+            let silent = UnixStream::connect(channel.pipe_name()).unwrap();
+            let request = encode_request(Path::new("/"), &[PathBuf::from("/usr")]).unwrap();
+            let started = Instant::now();
+            match claim_or_forward(&channel, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Forwarded => {}
+                _ => panic!("a silent client must not stop a launch"),
+            }
+            assert!(started.elapsed() < FORWARD_TIMEOUT);
+            drop(silent);
+            stop.store(true, Ordering::SeqCst);
+            assert_eq!(window.join().unwrap(), vec![vec![PathBuf::from("/usr")]]);
+        }
+
+        #[test]
+        fn an_owner_running_another_executable_is_refused_before_anything_is_sent() {
+            let dir = tempfile::tempdir().unwrap();
+            let channel = channel_in(&dir, "exe");
+            let inbox = Arc::new(Inbox::new());
+            let _server = Server::claim(&channel, inbox.clone()).unwrap().expect("owner");
+            let (stop, window) = window(inbox.clone());
+            // The sender expects another file than the one the owner (this test) runs.
+            let other = dir.path().join("other-program");
+            std::fs::write(&other, b"not us").unwrap();
+            let sender = channel.clone().expecting_exe(other);
+            let request = encode_request(Path::new("/"), &[PathBuf::from("/usr")]).unwrap();
+            match claim_or_forward(&sender, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Standalone(why) => assert!(why.contains("runs"), "{why}"),
+                _ => panic!("an owner running another program must not get the request"),
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert!(window.join().unwrap().is_empty(), "nothing may reach the impostor");
+            assert!(channel.check_exe(std::process::id()).is_ok(), "the same executable is accepted");
+        }
+
+        #[test]
+        fn launches_of_another_protocol_version_never_reach_each_other() {
+            let dir = tempfile::tempdir().unwrap();
+            let old = Channel::in_dir(dir.path(), "ver", 1).unwrap();
+            let old_inbox = Arc::new(Inbox::new());
+            let _old = Server::claim(&old, old_inbox.clone()).unwrap().expect("v1 owner");
+            let (stop, window) = window(old_inbox.clone());
+            let new = Channel::in_dir(dir.path(), "ver", PROTOCOL_VERSION).unwrap();
+            assert!(old.pipe_name().ends_with("-v1.sock"), "{}", old.pipe_name());
+            assert!(new.pipe_name().ends_with(&format!("-v{PROTOCOL_VERSION}.sock")));
+            let request = encode_request(Path::new("/"), &[PathBuf::from("/usr")]).unwrap();
+            // During an update overlap the new launch becomes a window of its own.
+            match claim_or_forward(&new, Arc::new(Inbox::new()), &request, FORWARD_TIMEOUT) {
+                Startup::Primary(_) => {}
+                Startup::Forwarded => panic!("a v3 launch reached a v1 window"),
+                Startup::Standalone(why) => panic!("the new launch should own its own socket: {why}"),
+                Startup::Unconfirmed(why) => panic!("unconfirmed: {why}"),
+            }
+            stop.store(true, Ordering::SeqCst);
+            assert!(window.join().unwrap().is_empty(), "the v1 window was contacted");
+        }
+
+        #[test]
+        fn bad_tags_are_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            for tag in ["", "a/b", "has space", &"x".repeat(49)] {
+                assert!(Channel::in_dir(dir.path(), tag, PROTOCOL_VERSION).is_err(), "{tag:?}");
+            }
+        }
+
+        #[test]
+        fn a_peer_of_another_user_is_refused() {
+            assert!(imp_unix::check_peer(42, 1000, 1000).is_ok());
+            assert!(imp_unix::check_peer(42, 1001, 1000).is_err());
+        }
+
+        #[test]
+        fn socket_directories_must_be_private_real_directories() {
+            let dir = tempfile::tempdir().unwrap();
+            // tempfile's directories follow the umask (0775 here); a socket directory is 0700.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            imp_unix::check_private_dir(dir.path()).expect("a private directory of ours");
+            let lax = dir.path().join("lax");
+            std::fs::create_dir(&lax).unwrap();
+            std::fs::set_permissions(&lax, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(imp_unix::check_private_dir(&lax).is_err(), "writable by others");
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            assert!(imp_unix::check_private_dir(&link).is_err(), "a symlink");
+            assert!(imp_unix::check_private_dir(&dir.path().join("missing")).is_err());
+        }
+
+        #[test]
+        fn a_commit_is_delivered_only_when_provably_written() {
+            use imp_unix::CommitOutcome::{Delivered, NotDelivered, Unknown};
+            use imp_unix::commit_outcome;
+            let whole = 4 + COMMIT.len();
+            let err = |kind: io::ErrorKind| io::Error::from(kind);
+            use io::ErrorKind::{BrokenPipe, ConnectionReset, NotConnected, Other, TimedOut, WouldBlock};
+            assert_eq!(commit_outcome(whole, Ok(())), Delivered);
+            assert_eq!(commit_outcome(whole, Err(&err(BrokenPipe))), Delivered);
+            for kind in [TimedOut, WouldBlock, BrokenPipe, ConnectionReset, NotConnected] {
+                assert_eq!(commit_outcome(0, Err(&err(kind))), NotDelivered, "{kind:?}");
+            }
+            assert_eq!(commit_outcome(0, Err(&err(Other))), Unknown);
+            assert_eq!(commit_outcome(0, Ok(())), Unknown);
+            for bytes in [1, 3, whole - 1, whole + 1] {
+                assert_eq!(commit_outcome(bytes, Ok(())), Unknown, "{bytes}");
+                assert_eq!(commit_outcome(bytes, Err(&err(BrokenPipe))), Unknown, "{bytes}");
             }
         }
     }
