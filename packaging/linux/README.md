@@ -50,8 +50,8 @@ done: the AppImage would then carry drivers and libraries that must match the ho
 current build gives:
 
 ```
-Depends: libc6 (>= 2.39), libgcc-s1, libstdc++6
-Recommends: libvulkan1 | libgl1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, xdg-utils
+Depends: libc6 (>= 2.39), libgcc-s1, libstdc++6, libxkbcommon0, libxkbcommon-x11-0
+Recommends: libvulkan1 | libgl1, libwayland-client0, libx11-6, xdg-utils
 Suggests: ffmpeg
 ```
 

@@ -57,7 +57,8 @@ jobs:
             build-essential pkg-config \
             libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
             libxrandr-dev libxi-dev libgl1-mesa-dev \
-            xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1 ffmpeg
+            xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1 ffmpeg \
+            libxkbcommon-x11-0
 
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11-09
         with:
