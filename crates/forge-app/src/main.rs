@@ -76,6 +76,7 @@ mod viewer_host;
 mod virtual_copy;
 mod views;
 mod watcher;
+mod xwayland;
 
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -306,19 +307,32 @@ fn main() -> eframe::Result {
     // Taken when the app is created, so a retry can tell whether the app started.
     let app_args = std::rc::Rc::new(std::cell::RefCell::new(Some((paths, pending_crash))));
     let run = |dx12_only: bool| {
+    // winit's X11 backend under Wayland, for drag and drop (see `xwayland`). Applied in the event
+    // loop builder below. Read here, so a setting change takes effect at the next start.
+    let use_x11 = xwayland::wanted(startup.use_xwayland);
+    if use_x11 {
+        tracing::info!("starting through XWayland (winit X11 backend) for drag and drop");
+    }
         // A saved maximized state is applied after the window is created, not by winit, so the
         // hidden window never flashes on screen (see `startup`). Fresh for each attempt.
         let maximize = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let options = eframe::NativeOptions {
             // Sees Ctrl+V even when egui-winit drops it. See `paste_key`.
-            event_loop_builder: Some(Box::new(|builder| {
+            event_loop_builder: Some(Box::new(move |builder| {
                 #[cfg(windows)]
                 {
                     use winit::platform::windows::EventLoopBuilderExtWindows;
                     builder.with_msg_hook(paste_key::msg_hook);
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "linux")]
+                if use_x11 {
+                    use winit::platform::x11::EventLoopBuilderExtX11;
+                    builder.with_x11();
+                }
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let _ = builder;
+                #[cfg(not(target_os = "linux"))]
+                let _ = use_x11;
             })),
             viewport: viewport.clone(),
             persistence_path: persistence_path.clone(),

@@ -59,8 +59,8 @@ use super::{ClipboardEffect, ClipboardRead, ClipboardToken};
 use crate::{Result, WinError};
 
 pub(super) const OWNER_TARGET: &str = "application/x-zxraw-clipboard-owner";
-pub(super) const GNOME_TARGET: &str = "x-special/gnome-copied-files";
-pub(super) const URI_LIST_TARGET: &str = "text/uri-list";
+pub(crate) const GNOME_TARGET: &str = "x-special/gnome-copied-files";
+pub(crate) const URI_LIST_TARGET: &str = "text/uri-list";
 pub(super) const KDE_CUT_TARGET: &str = "application/x-kde-cutselection";
 /// Text targets of our own publishes, most specific first.
 pub(super) const TEXT_TARGETS: [&str; 4] = [
@@ -172,7 +172,7 @@ pub(super) fn parse_token(bytes: &[u8]) -> Option<ClipboardToken> {
 
 /// `file://` URI of an absolute path, every byte other than RFC 3986 unreserved and `/`
 /// percent-encoded.
-pub(super) fn encode_file_uri(path: &Path) -> String {
+pub(crate) fn encode_file_uri(path: &Path) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut uri = String::from("file://");
     for &byte in path.as_os_str().as_bytes() {
@@ -189,7 +189,7 @@ pub(super) fn encode_file_uri(path: &Path) -> String {
 
 /// The local path of a `file:` URI (`file:///p`, `file://localhost/p` or `file:/p`); `None` for
 /// other schemes, remote hosts, and values that do not decode to an absolute path.
-pub(super) fn decode_file_uri(uri: &str) -> Option<PathBuf> {
+pub(crate) fn decode_file_uri(uri: &str) -> Option<PathBuf> {
     let uri = uri.trim_matches(|c: char| c == '\r' || c == '\n' || c == ' ' || c == '\t');
     let (scheme, rest) = uri.split_once(':')?;
     if !scheme.eq_ignore_ascii_case("file") {
@@ -246,7 +246,7 @@ fn percent_decode(input: &[u8]) -> Vec<u8> {
 
 /// `x-special/gnome-copied-files`: `copy` or `cut`, then the URIs, newline separated, with no
 /// trailing newline.
-pub(super) fn gnome_copied_files(paths: &[PathBuf], effect: ClipboardEffect) -> Vec<u8> {
+pub(crate) fn gnome_copied_files(paths: &[PathBuf], effect: ClipboardEffect) -> Vec<u8> {
     let mut text = String::from(match effect {
         ClipboardEffect::Copy => "copy",
         ClipboardEffect::Move => "cut",
@@ -259,7 +259,7 @@ pub(super) fn gnome_copied_files(paths: &[PathBuf], effect: ClipboardEffect) -> 
 }
 
 /// `text/uri-list`: the URIs separated by CRLF.
-pub(super) fn uri_list(paths: &[PathBuf]) -> Vec<u8> {
+pub(crate) fn uri_list(paths: &[PathBuf]) -> Vec<u8> {
     paths
         .iter()
         .map(|path| encode_file_uri(path))
@@ -269,7 +269,7 @@ pub(super) fn uri_list(paths: &[PathBuf]) -> Vec<u8> {
 }
 
 /// The paths as text, one per line (lossy for paths that are not UTF-8).
-fn plain_text(paths: &[PathBuf]) -> Vec<u8> {
+pub(crate) fn plain_text(paths: &[PathBuf]) -> Vec<u8> {
     paths
         .iter()
         .map(|path| path.to_string_lossy())
@@ -292,7 +292,7 @@ pub(super) fn parse_gnome_copied_files(bytes: &[u8]) -> Option<(Vec<PathBuf>, Cl
 }
 
 /// Parses `text/uri-list` (CRLF or LF separated, `#` comments skipped), keeping local files.
-pub(super) fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
+pub(crate) fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
     String::from_utf8_lossy(bytes)
         .split('\n')
         .map(|line| line.trim_end_matches('\r'))

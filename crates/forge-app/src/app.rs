@@ -151,6 +151,9 @@ pub struct ZxrawApp {
     /// The window's own OLE drop target (see `dnd::external`).
     pub os_drop: crate::dnd::external::OsDrop,
     pub viewer: Option<crate::viewer::Viewer>,
+    /// The XDND drag-out running on Linux (see `dragout`); the UI keeps running meanwhile.
+    #[cfg(target_os = "linux")]
+    pub drag_out: Option<crate::dragout::LinuxDragOut>,
     pub notices: crate::notices::Notices,
     /// A photo passed on the command line (a double-click when ZXraw Explorer is the default
     /// app): shown in the viewer once its folder has loaded. `confirm` is set for a network
@@ -311,7 +314,9 @@ impl ZxrawApp {
             last_session_save: Instant::now(),
             selection_summary: SelectionSummary::default(),
             testhook: crate::testhook::TestHook::from_env(),
-            os_drop: Default::default(),
+            os_drop: crate::dnd::external::OsDrop::new(crate::startup::x11_window(cc)),
+            #[cfg(target_os = "linux")]
+            drag_out: None,
             viewer: None,
             notices: Default::default(),
             launch_photo: None,
@@ -1246,6 +1251,14 @@ impl eframe::App for ZxrawApp {
         crate::paste_key::restore_dropped(raw_input);
         let from_os = !self.testhook.active();
         crate::dnd::external::raw_input(ctx, raw_input, from_os, &mut self.os_drop);
+        // Esc during a drag-out cancels the drag (the XDND source reads the keyboard itself);
+        // it must not also clear the selection or close a panel here.
+        #[cfg(target_os = "linux")]
+        if self.drag_out.is_some() {
+            raw_input.events.retain(|event| {
+                !matches!(event, egui::Event::Key { key: egui::Key::Escape, .. })
+            });
+        }
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

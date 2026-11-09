@@ -8,7 +8,7 @@ use crate::Result;
 
 #[cfg(target_os = "linux")]
 #[path = "clipboard_linux.rs"]
-mod linux;
+pub(crate) mod linux;
 
 /// The operation the shell should use when the files are pasted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

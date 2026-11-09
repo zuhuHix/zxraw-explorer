@@ -108,7 +108,8 @@ through a shell, with timeouts.
 | `clipboard` | X11 through `x11rb` (no libxcb): an unmapped owner window and one thread serving `CLIPBOARD` requests (INCR for large values). Wayland through `wl-clipboard-rs` (data-control protocol), falling back to XWayland. Offers `x-special/gnome-copied-files`, `text/uri-list`, `application/x-kde-cutselection`, text, and our owner token. |
 | `network` | `gio mount smb://host/share` (60 s limit). |
 | `window` | `uncloak` is a no-op; `maximize_hidden` stays unsupported (the app maximizes through egui). |
-| `dragout`, `drop_target`, `virtual_files`, `desktop` | Unsupported (see LIMITATIONS). Drops *into* the app are left to `forge-app` (winit file-drop events, X11 only). |
+| `drop_target`, `dragout` | X11 drag and drop in `xdnd` (`xdnd_linux.rs`): `drop_target::register` is an XDND target behind an `XdndProxy` window; `xdnd::start_drag_out` is a grab-less XDND source on its own thread (the Windows `drag_out*` functions stay `Unsupported`). No Wayland drag and drop (XWayland setting). |
+| `virtual_files`, `desktop` | Unsupported (see LIMITATIONS). |
 | Registry/Explorer modules | `archive_menu`, `file_types`, `user_choice`, `integration`, `shell_verb_server`, `ext_search`, `shell_notify`: stubs; Windows-only helpers are `cfg`-gated. |
 
 `forge-media`'s `wic` module decodes HEIF/HEIC/AVIF on Linux through `libheif-rs` when the

@@ -14,6 +14,10 @@ const MAX_DRAG_OUT_ITEMS: usize = 500;
 
 /// Called every frame after the app has drawn its widgets.
 pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
+    #[cfg(target_os = "linux")]
+    if linux::tick(app, ctx) {
+        return;
+    }
     let Some(payload) = egui::DragAndDrop::payload::<crate::views::DragPaths>(ctx) else {
         return;
     };
@@ -98,6 +102,12 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     // network, forge-win builds a CF_HDROP-only data object from the path strings, with no
     // shell resolution, and uses the cached thumbnail or a stock icon as the drag image.
     let items = drag_items(&paths, &kinds);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = drag_thumbnail;
+        linux::start(app, items);
+    }
+    #[cfg(not(target_os = "linux"))]
     match forge_win::dragout::active_window() {
         Ok(hwnd) => {
             if let Err(error) =
@@ -112,6 +122,99 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
         Err(error) => tracing::warn!("could not find the app window for drag-out: {error}"),
     }
 }
+
+/// Drag-out on Linux (X11, also XWayland): `forge_win::xdnd` runs the XDND source on its own
+/// thread while the UI keeps drawing; it also sets the drag cursor from the target's answer.
+/// Ctrl+Shift links, Shift moves, anything else copies. A move is done by the target (a file
+/// manager moves the files itself); nothing here ever deletes a source file. When the drag
+/// ends, the panes showing the items' folders are re-listed, and a reported move whose items
+/// are still there is logged.
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::path::PathBuf;
+
+    use forge_win::dragout::{DragItem, DropResult};
+    use forge_win::xdnd::DragOutSession;
+
+    use crate::app::ZxrawApp;
+
+    pub struct LinuxDragOut {
+        session: DragOutSession,
+        paths: Vec<PathBuf>,
+    }
+
+    pub fn start(app: &mut ZxrawApp, items: Vec<DragItem>) {
+        if app.drag_out.is_some() {
+            return;
+        }
+        let Some(window) = app.os_drop.x11_window else {
+            // Wayland without XWayland: winit offers no drag and drop there.
+            app.toast_err(
+                "Dragging files out needs X11: turn on Settings › Use XWayland (enables drag and drop) and restart"
+                    .to_string(),
+            );
+            return;
+        };
+        match forge_win::xdnd::start_drag_out(window, &items) {
+            Ok(session) => {
+                app.drag_out = Some(LinuxDragOut {
+                    session,
+                    paths: items.into_iter().map(|item| item.path).collect(),
+                });
+            }
+            Err(error) => tracing::warn!("OS drag-out failed: {error}"),
+        }
+    }
+
+    /// Follows a running drag-out. True while one runs (the in-app drag is over then).
+    pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) -> bool {
+        let Some(drag) = &app.drag_out else {
+            return false;
+        };
+        let Some(result) = drag.session.poll() else {
+            // The source thread changes state without input events.
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            return true;
+        };
+        let Some(drag) = app.drag_out.take() else {
+            return false;
+        };
+        match result {
+            Ok(DropResult::Move) => {
+                let left: Vec<_> = drag
+                    .paths
+                    .iter()
+                    .filter(|path| std::fs::symlink_metadata(path).is_ok())
+                    .collect();
+                if !left.is_empty() {
+                    tracing::info!(
+                        "the drop target reported a move, but {} of {} item(s) are still in place",
+                        left.len(),
+                        drag.paths.len()
+                    );
+                }
+            }
+            Ok(other) => tracing::debug!("drag-out ended: {other:?}"),
+            Err(error) => tracing::warn!("OS drag-out failed: {error}"),
+        }
+        refresh_sources(app, &drag.paths);
+        true
+    }
+
+    /// Re-lists every pane showing a folder the items came from (a target may have moved,
+    /// renamed or added files there).
+    fn refresh_sources(app: &mut ZxrawApp, paths: &[PathBuf]) {
+        let mut folders: Vec<&std::path::Path> = paths.iter().filter_map(|p| p.parent()).collect();
+        folders.sort();
+        folders.dedup();
+        for folder in folders {
+            app.refresh_all_showing(folder);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::LinuxDragOut;
 
 /// Pairs each dragged path with the kind its listing showed and whether it is on the network.
 /// A symlink or junction counts as known (the listing saw it), so it is not statted either.

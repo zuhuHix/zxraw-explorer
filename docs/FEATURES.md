@@ -153,6 +153,19 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   `a_file_dropped_into_its_own_folder_is_refused_to_the_source`. The e2e drops call the drop
   target's own methods with the shell's data object; no test drives a real mouse drag from
   Explorer, and no test watches the real Desktop refresh.
+* ✅ Linux (X11, or XWayland with Settings › *Use XWayland (enables drag and drop)* /
+  `ZXRAW_X11=1`): files dragged in from a file manager drop into the folder under the pointer by
+  the same rules (pointer and Ctrl/Shift read with `QueryPointer`; the XDND target sits behind
+  an `XdndProxy` window in place of winit's, and a move is reported to the source as
+  `XdndActionPrivate`, so the source never deletes). Items dragged past the window edge are
+  offered to other apps as `text/uri-list`, `x-special/gnome-copied-files` and text: copy by
+  default, Shift moves (done by the target), Ctrl+Shift links — `forge-win/src/xdnd_linux_tests.rs`
+  (URI lists with spaces, `%` and non-UTF-8 bytes, action rules; on a private Xvfb: drag out to a
+  test XDND target with copy, Shift-move, Esc and cancel, `DELETE` refused; the drop target with
+  copy, move-as-private, Ctrl from the pointer, a source that dies), e2e
+  `xdnd_drop_onto_a_folder_row_moves_the_file`,
+  `xdnd_drop_with_ctrl_copies_into_the_folder_under_the_pointer` (a real XDND source on the
+  run's Xvfb). Checked by hand against Nemo on Cinnamon (X11).
 * ✅ Virtual files (`FileGroupDescriptorW` + `FileContents`, as Explorer's zip folders and mail
   clients offer them) paste and drop: they are streamed into a hidden staging folder in the
   destination and then moved into place like any paste (same conflict questions, report, undo

@@ -586,7 +586,9 @@ backend (GTK, GNOME or KDE) must be running; any desktop session has one. Video 
 Linux. *Open*, *Open with*, *Properties* and *Show in file manager* go through `xdg-open`, the
 XDG portal and the file manager's D-Bus interface; deleting moves items to the Trash. *Open terminal here* tries `$TERMINAL`, then
 `x-terminal-emulator`, GNOME Terminal, Konsole, Xfce Terminal and xterm. Settings and the index
-are kept in `~/.config/zxrawexplorer` and `~/.local/share/zxrawexplorer`. What isn't available
+are kept in `~/.config/zxrawexplorer` and `~/.local/share/zxrawexplorer`. Drag and drop in and
+out works on X11. winit has none on Wayland, so on a Wayland session turn on Settings › File
+operations › *Use XWayland (enables drag and drop)* (or start with `ZXRAW_X11=1`). What isn't available
 on Linux yet is listed under [Linux](docs/LIMITATIONS.md#linux) in the known limitations.
 
 ### Docs

@@ -178,25 +178,41 @@ mod tests {
     }
 }
 
-/// Puts our own OLE drop target on the main window in place of winit's, so drags that carry
-/// no file paths (items of a zip folder) can drop too. See `dnd::external`.
+/// Puts our own drop target on the main window in place of winit's (see `dnd::external`):
+/// on Windows an OLE drop target, so drags that carry no file paths (items of a zip folder)
+/// can drop too; on X11 an XDND target behind an `XdndProxy` window, so the drop goes to the
+/// folder under the pointer with copy or move told to the source.
 pub fn register_drop_target(
     cc: &eframe::CreationContext<'_>,
 ) -> Option<forge_win::drop_target::DropTargetHandle> {
-    if !cfg!(windows) {
-        return None;
-    }
-    let Ok(RawWindowHandle::Win32(handle)) = cc.window_handle().map(|handle| handle.as_raw())
-    else {
-        tracing::warn!("no Win32 window handle; drag and drop from other apps stays winit's");
+    let window = if cfg!(windows) {
+        let Ok(RawWindowHandle::Win32(handle)) = cc.window_handle().map(|handle| handle.as_raw())
+        else {
+            tracing::warn!("no Win32 window handle; drag and drop from other apps stays winit's");
+            return None;
+        };
+        handle.hwnd.get()
+    } else if cfg!(target_os = "linux") {
+        // Wayland: winit has no drag and drop there (see the XWayland setting).
+        isize::try_from(x11_window(cc)?).ok()?
+    } else {
         return None;
     };
     let ctx = cc.egui_ctx.clone();
-    match forge_win::drop_target::register(handle.hwnd.get(), Box::new(move || ctx.request_repaint())) {
+    match forge_win::drop_target::register(window, Box::new(move || ctx.request_repaint())) {
         Ok(target) => Some(target),
         Err(error) => {
             tracing::warn!("could not register the drop target ({error}); keeping winit's");
             None
         }
+    }
+}
+
+/// The X11 id of the main window when winit runs on X11 (also XWayland), else `None`.
+pub fn x11_window(cc: &eframe::CreationContext<'_>) -> Option<u32> {
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Xlib(handle) => u32::try_from(handle.window).ok(),
+        RawWindowHandle::Xcb(handle) => Some(handle.window.get()),
+        _ => None,
     }
 }

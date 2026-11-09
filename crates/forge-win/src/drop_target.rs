@@ -4,6 +4,10 @@
 //!
 //! The target never returns `DROPEFFECT_MOVE`, so a source never deletes anything itself.
 //! A move is done by the app and reported as an optimized move (see [`drop_reply`]).
+//!
+//! On Linux (X11) the same API is served by an XDND target on its own connection, through
+//! the window's `XdndProxy`: see [`crate::xdnd`]. There a move is reported to the source as
+//! `XdndActionPrivate`, for the same reason.
 
 use std::path::PathBuf;
 
@@ -18,11 +22,11 @@ pub enum DropEffect {
 }
 
 /// `DROPEFFECT` bits, kept here so the pure rules below compile everywhere.
-const EFFECT_NONE: u32 = 0;
-const EFFECT_COPY: u32 = 1;
-const EFFECT_MOVE: u32 = 2;
-#[cfg_attr(not(all(test, windows)), allow(dead_code))]
-const EFFECT_LINK: u32 = 4;
+pub(crate) const EFFECT_NONE: u32 = 0;
+pub(crate) const EFFECT_COPY: u32 = 1;
+pub(crate) const EFFECT_MOVE: u32 = 2;
+#[cfg_attr(not(any(all(test, windows), target_os = "linux")), allow(dead_code))]
+pub(crate) const EFFECT_LINK: u32 = 4;
 
 impl DropEffect {
     /// The `DROPEFFECT` value.
@@ -72,7 +76,7 @@ pub struct SimulatedDrop {
 /// The effect to show for the app's `answer`, limited to what the source `allowed`.
 /// Virtual files are only ever copied.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn resolve_effect(answer: DropEffect, allowed: u32, is_virtual: bool) -> DropEffect {
+pub(crate) fn resolve_effect(answer: DropEffect, allowed: u32, is_virtual: bool) -> DropEffect {
     let answer = match answer {
         DropEffect::Move if is_virtual => DropEffect::Copy,
         other => other,
@@ -93,7 +97,7 @@ fn resolve_effect(answer: DropEffect, allowed: u32, is_virtual: bool) -> DropEff
 
 /// The answer before the app has given one in this drag (it overrides within a frame).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn provisional_answer(is_virtual: bool, ctrl: bool, shift: bool) -> DropEffect {
+pub(crate) fn provisional_answer(is_virtual: bool, ctrl: bool, shift: bool) -> DropEffect {
     if !is_virtual && shift && !ctrl {
         DropEffect::Move
     } else {
@@ -116,23 +120,23 @@ fn drop_reply(answered: DropEffect) -> (u32, Option<u32>, Option<u32>) {
 
 /// The drag being hovered, as read at `DragEnter`.
 #[cfg_attr(not(windows), allow(dead_code))]
-struct CurrentDrag {
-    info: DragInfo,
-    is_virtual: bool,
+pub(crate) struct CurrentDrag {
+    pub(crate) info: DragInfo,
+    pub(crate) is_virtual: bool,
 }
 
 /// State shared by the COM object and the handle.
 #[derive(Default)]
 #[cfg_attr(not(windows), allow(dead_code))]
-struct Shared {
-    events: Vec<DropEvent>,
-    dragging: bool,
-    keys: (bool, bool),
-    answer: DropEffect,
+pub(crate) struct Shared {
+    pub(crate) events: Vec<DropEvent>,
+    pub(crate) dragging: bool,
+    pub(crate) keys: (bool, bool),
+    pub(crate) answer: DropEffect,
     /// The app has called `set_answer` since this drag entered.
-    answered_by_app: bool,
+    pub(crate) answered_by_app: bool,
     /// `None` when nothing is dragged over us, or it is nothing we take.
-    drag: Option<CurrentDrag>,
+    pub(crate) drag: Option<CurrentDrag>,
 }
 
 /// Registered on a window; revokes on drop. Lives on the window's thread.
@@ -142,9 +146,12 @@ pub struct DropTargetHandle {
     hwnd: isize,
     #[cfg(windows)]
     target: windows::Win32::System::Ole::IDropTarget,
+    /// The XDND target thread; dropping it removes `XdndProxy` and stops the thread.
+    #[cfg(target_os = "linux")]
+    xdnd: crate::xdnd::TargetThread,
 }
 
-fn lock(shared: &std::sync::Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+pub(crate) fn lock(shared: &std::sync::Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
     shared
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -164,8 +171,17 @@ impl DropTargetHandle {
     /// The effect for the pointer's current place, set every frame while dragging.
     pub fn set_answer(&self, effect: DropEffect) {
         let mut shared = lock(&self.shared);
+        #[cfg(target_os = "linux")]
+        let changed = shared.dragging && (!shared.answered_by_app || shared.answer != effect);
         shared.answer = effect;
         shared.answered_by_app = true;
+        // X sources only hear from us in reply to a pointer move: tell the target thread, so
+        // a new answer reaches the source's cursor while the pointer rests.
+        #[cfg(target_os = "linux")]
+        if changed {
+            drop(shared);
+            self.xdnd.answer_changed();
+        }
     }
 }
 
@@ -281,7 +297,33 @@ pub fn register(hwnd: isize, wake: Box<dyn Fn() + Send + Sync>) -> crate::Result
     })
 }
 
-#[cfg(not(windows))]
+/// Takes over XDND drops on the X11 toplevel `hwnd` (winit's window) on `$DISPLAY`: sets its
+/// `XdndProxy` to a window of ours, served by a background thread (see [`crate::xdnd`]).
+/// `wake` runs after every event and every pointer move of a drag (to request a repaint).
+/// [`WinError::Unsupported`](crate::WinError::Unsupported) without `DISPLAY` (Wayland).
+#[cfg(target_os = "linux")]
+pub fn register(hwnd: isize, wake: Box<dyn Fn() + Send + Sync>) -> crate::Result<DropTargetHandle> {
+    let display = crate::xdnd::display_name().ok_or(crate::WinError::Unsupported)?;
+    register_on(&display, hwnd, wake)
+}
+
+/// [`register`] on a named X display.
+#[cfg(target_os = "linux")]
+pub(crate) fn register_on(
+    display: &str,
+    hwnd: isize,
+    wake: Box<dyn Fn() + Send + Sync>,
+) -> crate::Result<DropTargetHandle> {
+    let window = u32::try_from(hwnd)
+        .ok()
+        .filter(|&w| w != 0)
+        .ok_or_else(|| crate::WinError::Invalid(format!("not an X11 window id: {hwnd}")))?;
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared::default()));
+    let xdnd = crate::xdnd::TargetThread::start(display, window, shared.clone(), wake)?;
+    Ok(DropTargetHandle { shared, xdnd })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn register(
     _hwnd: isize,
     _wake: Box<dyn Fn() + Send + Sync>,

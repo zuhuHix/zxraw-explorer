@@ -308,6 +308,10 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 ///                            drags it, through the window's own OLE drop target (its
 ///                            data object, its answer to the source); `path` may be an
 ///                            item inside a zip file, e.g. `t.zip\sub`
+/// xdnd-drop <target> | <path>[, <path>…] [| ctrl|shift] (Linux) files dropped through the
+///                            window's real XDND drop target by a test XDND source on the
+///                            same X display, at the target's spot; ctrl/shift are held with
+///                            XTEST so the target reads them as it would from a user
 /// assert-drop-reply <effect> [<performed>] the last `drop-shell-item` returned `effect`
 ///                            (none|copy|move) to the source and, if given, set its
 ///                            "Performed DropEffect" to `performed`
@@ -383,6 +387,12 @@ enum Step {
         shift: bool,
     },
     AssertDropReply(u32, Option<u32>),
+    /// Files dropped through the window's XDND drop target by a test source (Linux).
+    XdndDrop {
+        target: DropTarget,
+        paths: Vec<PathBuf>,
+        modifiers: egui::Modifiers,
+    },
     /// Files from another application dropped onto an entry or the empty area.
     DropFiles {
         target: DropTarget,
@@ -908,6 +918,18 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
                 modifiers: drop_modifiers(parts.get(2).copied())?,
             }
         }
+        "xdnd-drop" => match parse_step("drop-files", rest, verbatim, sandbox_root)? {
+            Step::DropFiles {
+                target,
+                paths,
+                modifiers,
+            } => Step::XdndDrop {
+                target,
+                paths,
+                modifiers,
+            },
+            _ => unreachable!("drop-files parses to DropFiles"),
+        },
         "drop-shell-item" => {
             let parts: Vec<&str> = rest.split(" | ").map(str::trim).collect();
             if !(2..=3).contains(&parts.len()) || parts[1].is_empty() {
@@ -1755,6 +1777,111 @@ fn drop_files(
     }
 }
 
+/// `xdnd-drop`: point at the target for two frames (the scripted pointer stands in for the
+/// real one, which the X server has elsewhere), then run a test XDND source on another
+/// thread that drops `paths` there through the window's XDND drop target, and wait for it to
+/// finish. The app answers the source's positions and takes the drop on its own frames.
+fn xdnd_drop(
+    app: &mut ZxrawApp,
+    ctx: &egui::Context,
+    st: &mut StepState,
+    target: &DropTarget,
+    paths: &[PathBuf],
+    modifiers: egui::Modifiers,
+) -> Result<Flow, String> {
+    type Source = std::thread::JoinHandle<Result<String, String>>;
+    struct Plan {
+        point: egui::Pos2,
+        source: Option<Source>,
+    }
+    if st.data.is_none() {
+        let Some(point) = target_point(app, ctx, target)? else {
+            return Ok(Flow::Wait("the drop target is not on screen".into()));
+        };
+        st.data = Some(Box::new(Plan {
+            point,
+            source: None,
+        }));
+    }
+    let plan = st.data.as_mut().unwrap().downcast_mut::<Plan>().unwrap();
+    let point = plan.point;
+    match st.frames {
+        0 | 1 => {
+            app.testhook.input.pointer = Some(point);
+            match inject(app, st, &[egui::Event::PointerMoved(point)]) {
+                Flow::Done => {
+                    st.frames += 1;
+                    st.phase = 0;
+                    Ok(Flow::Wait("hovering the drop target".into()))
+                }
+                other => Ok(other),
+            }
+        }
+        2 => {
+            let window = app
+                .os_drop
+                .x11_window
+                .ok_or("the window is not an X11 window")?;
+            if app.os_drop.handle.is_none() {
+                return Err("the window has no XDND drop target".into());
+            }
+            let ppp = ctx.pixels_per_point();
+            let (x, y) = ((point.x * ppp).round() as i32, (point.y * ppp).round() as i32);
+            let paths = paths.to_vec();
+            let (ctrl, shift) = (modifiers.command, modifiers.shift);
+            plan.source = Some(std::thread::spawn(move || {
+                xdnd_test_drop(window, x, y, &paths, ctrl, shift)
+            }));
+            st.frames = 3;
+            Ok(Flow::Wait("dragging over the window".into()))
+        }
+        _ => {
+            if !plan.source.as_ref().is_some_and(|s| s.is_finished()) {
+                // Keep frames coming: the drop target answers from the app's frames.
+                ctx.request_repaint();
+                return Ok(Flow::Wait("the XDND drop is not finished".into()));
+            }
+            let outcome = plan
+                .source
+                .take()
+                .unwrap()
+                .join()
+                .map_err(|_| "the test XDND source panicked".to_string())??;
+            tracing::info!("xdnd-drop finished: {outcome}");
+            Ok(Flow::Done)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn xdnd_test_drop(
+    window: u32,
+    x: i32,
+    y: i32,
+    paths: &[PathBuf],
+    ctrl: bool,
+    shift: bool,
+) -> Result<String, String> {
+    match forge_win::xdnd::test_drop_files(window, x, y, paths, ctrl, shift) {
+        Ok(forge_win::dragout::DropResult::None) => Err("the target refused the drop".into()),
+        Ok(result) => Ok(format!("{result:?}")),
+        Err(error) => Err(format!("the XDND drop failed: {error}")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn xdnd_test_drop(
+    _window: u32,
+    _x: i32,
+    _y: i32,
+    _paths: &[PathBuf],
+    _ctrl: bool,
+    _shift: bool,
+) -> Result<String, String> {
+    Err("xdnd-drop runs on Linux only".into())
+}
+
+
 /// `drop-shell-item`: hover the target for two frames as a drag of the item (so the app
 /// works out its answer), then drop the item's shell data object through the window's own
 /// drop target, which hands the drop to the next frame.
@@ -2160,6 +2287,11 @@ fn exec(
             paths,
             modifiers,
         } => drop_files(app, ctx, st, target, paths, *modifiers),
+        Step::XdndDrop {
+            target,
+            paths,
+            modifiers,
+        } => xdnd_drop(app, ctx, st, target, paths, *modifiers),
         Step::DropShellItem {
             target,
             item,
@@ -2481,6 +2613,12 @@ mod tests {
             one("drag a.txt pin:docs"),
             Ok(Step::Drag { to: DropTarget::Pin(p), .. }) if p == "docs"
         ));
+        assert!(matches!(
+            one("xdnd-drop Target | a.txt | ctrl"),
+            Ok(Step::XdndDrop { target: DropTarget::Entry(t), paths, modifiers })
+                if t == "Target" && paths == [in_temp("a.txt")] && modifiers.command
+        ));
+        assert!(one("xdnd-drop Target").is_err());
         assert!(one("drop-files pin: | a.txt").is_err());
         assert!(one("drop-files Target").is_err());
         assert!(one("drop-files Target |").is_err());

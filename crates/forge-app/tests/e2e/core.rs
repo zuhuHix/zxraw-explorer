@@ -1066,6 +1066,48 @@ fn external_drop_on_empty_area_goes_to_the_pane_folder() {
     expect_ok(&drop_script_run(sandbox.path(), &script));
 }
 
+/// A real XDND drop (a test source on the run's private Xvfb, through the window's XDND drop
+/// target) onto a folder row: the target folder takes it, and with nothing held a file on
+/// the same volume is moved.
+#[cfg(target_os = "linux")]
+#[test]
+fn xdnd_drop_onto_a_folder_row_moves_the_file() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    write_file(&list.join("other.txt"), b"other");
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         xdnd-drop Target | {file}\nwait-exists {moved}\nwait-jobs\n\
+         assert-missing {file}\nassert-missing {in_list}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        moved = shown(&list.join("Target").join("a.txt")),
+        in_list = shown(&list.join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
+/// The same real XDND drop with Ctrl held (through XTEST, read by the drop target from the
+/// pointer's modifier mask) copies into the folder under the pointer.
+#[cfg(target_os = "linux")]
+#[test]
+fn xdnd_drop_with_ctrl_copies_into_the_folder_under_the_pointer() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    let name = "two words 100%.txt";
+    write_file(&outside.join(name), b"spaced");
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry Target\nwait-frames 5\n\
+         xdnd-drop Target | {file} | ctrl\nwait-exists {copied}\nwait-jobs\n\
+         assert-exists {file}\nassert-missing {in_list}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join(name)),
+        copied = shown(&list.join("Target").join(name)),
+        in_list = shown(&list.join(name)),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
 /// `t.zip` in `dir` as Explorer shows it: `a.txt`, and `sub` holding `b.txt` and
 /// `deeper/c.bin` (3 MB, so it is streamed in many reads). Every entry is dated 2020-05-06.
 fn zip_fixture(dir: &Path) -> (PathBuf, Vec<u8>) {

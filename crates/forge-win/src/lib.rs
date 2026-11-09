@@ -19,6 +19,8 @@
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
 //! * [`window`] — window placement that never flashes on screen (hidden maximize).
 //! * [`xdg_apps`] — Linux default apps (`mimeapps.list`) and the applications menu entry.
+//! * `xdnd` (Linux only) — X11 drag and drop: the drop target behind [`drop_target`], the
+//!   pointer query for hovers, and the drag-out source.
 //! * Opt-in per-user integration: the folder context menu and photo file types
 //!   ("Open with" / Settings > Default apps).
 
@@ -54,6 +56,9 @@ pub mod virtual_source;
 pub mod watch;
 pub mod window;
 pub mod xdg_apps;
+#[cfg(target_os = "linux")]
+#[path = "xdnd_linux.rs"]
+pub mod xdnd;
 
 pub use clipboard::{
     ClipboardEffect, ClipboardRead, ClipboardToken, clear_if_owned_files, clear_if_token, clipboard_has_text,
