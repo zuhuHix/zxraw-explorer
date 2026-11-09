@@ -150,9 +150,41 @@ pub fn uncloak(hwnd: isize) -> Result<()> {
     Err(last_err)
 }
 
-#[cfg(not(windows))]
+/// On Linux there is no DWM cloak, so there is nothing to remove and this succeeds at once
+/// (after the same zero-handle check as on Windows). It is a no-op, not `Unsupported`, so the
+/// caller's "window may stay invisible" fallback is not reported for a window that cannot be
+/// invisible.
+#[cfg(target_os = "linux")]
+pub fn uncloak(hwnd: isize) -> Result<()> {
+    if hwnd == 0 {
+        return Err(WinError::Invalid(
+            "uncloak needs a window handle, got 0".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn uncloak(_hwnd: isize) -> Result<()> {
     Err(WinError::Unsupported)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn uncloak_is_a_noop_on_linux() {
+        assert!(uncloak(1).is_ok());
+        assert!(matches!(uncloak(0), Err(WinError::Invalid(_))));
+    }
+
+    #[test]
+    fn maximize_hidden_stays_unsupported_on_linux() {
+        // The caller then maximizes through egui instead. Returning Ok here would leave the
+        // window unmaximized.
+        assert!(matches!(maximize_hidden(1), Err(WinError::Unsupported)));
+    }
 }
 
 #[cfg(all(test, windows))]
