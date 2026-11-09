@@ -29,6 +29,56 @@ pub fn command_available(cmd: Cmd) -> bool {
     }
 }
 
+/// What tells an item from another one later created under the same name: on Windows the
+/// volume serial and file index (`forge_win::file_id`); on Unix `st_dev`, `st_ino` and the
+/// birth time, since an inode number is reused at once after a delete (`forge_win::file_id`
+/// alone would take a re-created file for the old one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileKey {
+    pub volume: u64,
+    pub index: u64,
+    /// Unix: birth time in nanoseconds since 1970; 0 on Windows.
+    pub born: u64,
+}
+
+impl FileKey {
+    /// A key from its volume and index alone (tests, and Windows file IDs).
+    pub const fn new(volume: u64, index: u64) -> FileKey {
+        FileKey {
+            volume,
+            index,
+            born: 0,
+        }
+    }
+}
+
+/// The [`FileKey`] of the item at `path`, not following a link at the end. `None` when it
+/// can't be read, or (Unix) the file system keeps no birth time.
+#[cfg(windows)]
+pub fn file_key(path: &Path) -> Option<FileKey> {
+    forge_win::file_id(path)
+        .ok()
+        .map(|(volume, index)| FileKey::new(u64::from(volume), index))
+}
+
+/// See the Windows version.
+#[cfg(unix)]
+pub fn file_key(path: &Path) -> Option<FileKey> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(path).ok()?;
+    let born = md.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(FileKey {
+        volume: md.dev(),
+        index: md.ino(),
+        born: born.as_nanos() as u64,
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn file_key(_path: &Path) -> Option<FileKey> {
+    None
+}
+
 /// The user's home folder.
 pub fn home_dir() -> PathBuf {
     forge_core::paths::home_dir()

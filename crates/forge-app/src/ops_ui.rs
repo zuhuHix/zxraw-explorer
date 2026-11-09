@@ -900,10 +900,11 @@ pub(crate) fn conflict_resolver(
 /// What a source path pointed at when a move was queued.
 #[derive(Debug, PartialEq)]
 enum SourceIdentity {
-    /// Volume serial and file index (Windows file ID).
+    /// Volume serial and file index (Windows file ID); on Unix device, inode and birth time
+    /// (see [`crate::platform::FileKey`]).
     Id {
         kind: std::fs::FileType,
-        id: (u32, u64),
+        id: crate::platform::FileKey,
     },
     /// Fallback when the file ID cannot be read.
     Meta {
@@ -1159,9 +1160,9 @@ impl PendingIdentities {
 fn source_identity(path: &Path) -> Option<SourceIdentity> {
     let md = std::fs::symlink_metadata(path).ok()?;
     let kind = md.file_type();
-    Some(match forge_win::file_id(path) {
-        Ok(id) => SourceIdentity::Id { kind, id },
-        Err(_) => SourceIdentity::Meta {
+    Some(match crate::platform::file_key(path) {
+        Some(id) => SourceIdentity::Id { kind, id },
+        None => SourceIdentity::Meta {
             kind,
             len: md.len(),
             modified: md.modified().ok(),
@@ -3078,7 +3079,7 @@ mod tests {
         use crate::cut_watch::{Identity, Observation};
         let id = |n| Identity::Id {
             dir: false,
-            id: (1, n),
+            id: crate::platform::FileKey::new(1, n),
         };
         let p = win;
         let cut = [

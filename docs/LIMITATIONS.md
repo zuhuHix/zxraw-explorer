@@ -642,16 +642,17 @@ The Linux build (X11 and Wayland) is new. Browsing, the viewer, culling, metadat
 the index, search, Git badges, copy, move and rename work. Everything Windows-only is hidden
 or refuses with a message; nothing should crash for lack of it.
 
-* Hidden on Linux: the Default apps page, Explorer menu and file type registration, app icon
-  shortcuts, *Properties*, *Open with*, *Open terminal as administrator*, network locations
-  (the Network section and *Add network location*), and the in-app updater and FFmpeg download
-  (install `ffmpeg` with the package manager; the Updates page links to the releases page).
-* Not available yet (each needs a Linux backend in `forge-win`): moving to the Recycle Bin
-  (freedesktop trash), the file clipboard (copy/cut/paste of files with other apps), dragging
-  files out of the app and dropping files in from other apps, single instance (a second launch
-  opens a second window), and drive listing beyond `/` and mounts under `/media`, `/run/media`
-  and `/mnt`. The command palette still lists some Windows-only commands, which then report
-  that they are unsupported.
+* Hidden on Linux (menus, command palette and shortcuts): the Default apps page, Explorer menu
+  and file type registration, app icon shortcuts, *Properties*, *Open with*, *Open terminal as
+  administrator*, network locations (the Network section and *Add network location*), and the
+  in-app updater and FFmpeg download (install `ffmpeg` with the package manager; the Updates
+  page links to the releases page). `forge-win` now has Linux backends for *Properties*, *Open
+  with* and network mounts (see [Linux platform behaviour](#linux-platform-behaviour)); the app
+  doesn't offer them on Linux yet.
+* The Recycle Bin (freedesktop trash), the file clipboard and single instance use the Linux
+  backends described under [Linux platform behaviour](#linux-platform-behaviour). Dragging files
+  out of the app is not available. The sidebar lists `/` and the mounts under `/media`,
+  `/run/media` and `/mnt`.
 * File dialogs need a running `xdg-desktop-portal` with a FileChooser backend; without one they
   don't open.
 * Names are case-sensitive: `IMG.jpg` and `img.jpg` are two files everywhere (index, notes,

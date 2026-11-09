@@ -27,8 +27,12 @@ const MAX_HELPERS: usize = 8;
 /// What a cut item is. Two different items at one path differ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Identity {
-    /// Volume serial and file index (Windows file ID).
-    Id { dir: bool, id: (u32, u64) },
+    /// Volume serial and file index (Windows file ID); on Unix device, inode and birth time
+    /// (see [`crate::platform::FileKey`]).
+    Id {
+        dir: bool,
+        id: crate::platform::FileKey,
+    },
     /// Without a file ID: every one of these must be known (see [`identity_of`]).
     Meta {
         dir: bool,
@@ -85,9 +89,9 @@ pub fn observe(path: &Path) -> Observation {
 /// complete: a missing field never matches.
 fn identity_of(path: &Path, md: &std::fs::Metadata) -> Option<Identity> {
     let dir = md.is_dir();
-    match forge_win::file_id(path) {
+    match crate::platform::file_key(path) {
         // Some network file systems report index 0 for everything.
-        Ok(id) if id.1 != 0 => Some(Identity::Id { dir, id }),
+        Some(id) if id.index != 0 => Some(Identity::Id { dir, id }),
         _ => meta_identity(dir, md.len(), md.created().ok(), md.modified().ok()),
     }
 }
@@ -549,11 +553,11 @@ mod tests {
 
     const A: Identity = Identity::Id {
         dir: false,
-        id: (1, 10),
+        id: crate::platform::FileKey::new(1, 10),
     };
     const B: Identity = Identity::Id {
         dir: false,
-        id: (1, 11),
+        id: crate::platform::FileKey::new(1, 11),
     };
 
     fn item(id: IdState) -> Item {
