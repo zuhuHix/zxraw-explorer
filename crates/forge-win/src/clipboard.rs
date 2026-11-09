@@ -1,8 +1,14 @@
 //! Windows file clipboard support (`CF_HDROP`, preferred drop effect, and text paths).
+//!
+//! On Linux the same API works on the X11 / Wayland clipboard: see `clipboard_linux.rs`.
 
 use std::path::PathBuf;
 
 use crate::Result;
+
+#[cfg(target_os = "linux")]
+#[path = "clipboard_linux.rs"]
+mod linux;
 
 /// The operation the shell should use when the files are pasted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,11 +45,11 @@ impl ClipboardToken {
 }
 
 /// Counter for [`ClipboardToken`]s. Starts at 1 so a token is never zero in its low half.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 static NEXT_TOKEN_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// A token unique per publish, and across processes: process id in the high half.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn next_token() -> ClipboardToken {
     use std::sync::atomic::Ordering;
 
@@ -86,7 +92,7 @@ pub fn set_files_if_unchanged(
     Ok(Some(token))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_files_if_unchanged(
     _paths: &[PathBuf],
     _effect: ClipboardEffect,
@@ -102,7 +108,7 @@ pub fn set_files_without_text(paths: &[PathBuf], effect: ClipboardEffect) -> Res
     set_files_impl(paths, effect, None)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_files_without_text(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<()> {
     Err(crate::WinError::Unsupported)
 }
@@ -242,6 +248,7 @@ fn write_payloads(payloads: &mut [ClipboardPayload]) -> Result<()> {
 }
 
 /// Runs `write` on each item in order; on the first failure runs `empty` and returns it.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn write_all_or_empty<T>(
     items: &mut [T],
     mut write: impl FnMut(&mut T) -> Result<()>,
@@ -279,7 +286,7 @@ fn owner_format() -> Result<u32> {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn set_files(_paths: &[PathBuf], _effect: ClipboardEffect) -> Result<ClipboardToken> {
     Err(crate::WinError::Unsupported)
 }
@@ -340,12 +347,12 @@ fn read_files_open() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
     Ok(Some((paths, effect)))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
     Err(crate::WinError::Unsupported)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn get_files_and_owner() -> Result<ClipboardRead> {
     Err(crate::WinError::Unsupported)
 }
@@ -356,7 +363,7 @@ pub fn clipboard_sequence() -> u32 {
     unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn clipboard_sequence() -> u32 {
     0
 }
@@ -370,7 +377,7 @@ pub fn clipboard_has_text() -> bool {
     unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32) }.is_ok()
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn clipboard_has_text() -> bool {
     false
 }
@@ -412,6 +419,7 @@ pub fn is_paste_keydown(_msg: *const std::ffi::c_void) -> bool {
 
 /// Exactly Ctrl+V or Shift+Insert for virtual key `vk` and the modifier state, and not an
 /// auto-repeat. Extra modifiers (Ctrl+Shift+V, AltGr+V) are other shortcuts or text input.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn paste_chord(vk: u16, ctrl: bool, shift: bool, alt: bool, repeat: bool) -> bool {
     const VK_V: u16 = b'V' as u16;
     const VK_INSERT: u16 = 0x2D;
@@ -457,7 +465,7 @@ pub fn clear_if_owned_files(paths: &[PathBuf], expected_sequence: Option<u32>) -
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn clear_if_owned_files(_paths: &[PathBuf], _expected_sequence: Option<u32>) -> Option<u32> {
     None
 }
@@ -497,7 +505,7 @@ pub fn clear_if_token(token: ClipboardToken) -> Result<bool> {
     Ok(true)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn clear_if_token(_token: ClipboardToken) -> Result<bool> {
     Err(crate::WinError::Unsupported)
 }
@@ -533,13 +541,95 @@ pub fn replace_files_if_token(
     Ok(Some(new_token))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn replace_files_if_token(
     _paths: &[PathBuf],
     _effect: ClipboardEffect,
     _token: ClipboardToken,
 ) -> Result<Option<ClipboardToken>> {
     Err(crate::WinError::Unsupported)
+}
+
+// Linux: the same contract on the X11 / Wayland clipboard (see `clipboard_linux.rs`).
+
+/// Places paths on the clipboard in formats understood by Linux file managers and text editors,
+/// marked with a fresh owner token so that [`get_files_and_owner`] reports it as ours.
+#[cfg(target_os = "linux")]
+pub fn set_files(paths: &[PathBuf], effect: ClipboardEffect) -> Result<ClipboardToken> {
+    let token = next_token();
+    linux::set_files(paths, effect, Some(token))?;
+    Ok(token)
+}
+
+/// Like [`set_files`], unless another app has put something on the clipboard since sequence
+/// `baseline` (our own content, from this process, does not count): then nothing changes and
+/// the result is `Ok(None)`.
+#[cfg(target_os = "linux")]
+pub fn set_files_if_unchanged(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    baseline: u32,
+) -> Result<Option<ClipboardToken>> {
+    let token = next_token();
+    Ok(linux::set_files_if_unchanged(paths, effect, baseline, token)?.then_some(token))
+}
+
+/// Places paths on the clipboard as a file manager's Copy and Cut do, with no text and no owner
+/// token. For tests that stand in for another app.
+#[cfg(target_os = "linux")]
+pub fn set_files_without_text(paths: &[PathBuf], effect: ClipboardEffect) -> Result<()> {
+    linux::set_files(paths, effect, None)
+}
+
+/// Retrieves the clipboard file list and effect, if the clipboard holds local files.
+#[cfg(target_os = "linux")]
+pub fn get_files() -> Result<Option<(Vec<PathBuf>, ClipboardEffect)>> {
+    get_files_and_owner().map(|read| read.files)
+}
+
+/// Like [`get_files`], and also returns the owner token of our own publish, if one is present.
+#[cfg(target_os = "linux")]
+pub fn get_files_and_owner() -> Result<ClipboardRead> {
+    linux::get_files_and_owner()
+}
+
+/// An approximate clipboard sequence number (see `clipboard_linux.rs`), zero without a display.
+#[cfg(target_os = "linux")]
+pub fn clipboard_sequence() -> u32 {
+    linux::clipboard_sequence()
+}
+
+/// Whether the clipboard offers text.
+#[cfg(target_os = "linux")]
+pub fn clipboard_has_text() -> bool {
+    linux::clipboard_has_text()
+}
+
+/// Empties the clipboard if its sequence (when provided) and ordered path list match.
+///
+/// Clipboard errors are ignored because this helper is intended for best-effort cut cleanup.
+#[cfg(target_os = "linux")]
+pub fn clear_if_owned_files(paths: &[PathBuf], expected_sequence: Option<u32>) -> Option<u32> {
+    linux::clear_if_owned_files(paths, expected_sequence)
+}
+
+/// Empties the clipboard if its owner token is `token`: `Ok(true)` when emptied, `Ok(false)`
+/// when the clipboard holds something else.
+#[cfg(target_os = "linux")]
+pub fn clear_if_token(token: ClipboardToken) -> Result<bool> {
+    linux::clear_if_token(token)
+}
+
+/// If the owner token is `token`, replaces the clipboard with `paths` as a new publish of ours
+/// and returns the new token. Empty `paths` clears the clipboard instead. If the token differs,
+/// nothing changes and the result is `Ok(None)`.
+#[cfg(target_os = "linux")]
+pub fn replace_files_if_token(
+    paths: &[PathBuf],
+    effect: ClipboardEffect,
+    token: ClipboardToken,
+) -> Result<Option<ClipboardToken>> {
+    linux::replace_files_if_token(paths, effect, token, next_token())
 }
 
 #[cfg(windows)]
