@@ -128,8 +128,14 @@ for pkg in "${depends[@]}"; do
     [[ "$pkg" == libc6 ]] && continue
     depends_line+=", $pkg"
 done
+# Loaded with dlopen, so ldd does not list them, but winit cannot start without them: the
+# keymap library on X11 and Wayland, and its X11 part (the app panics on X11 without it).
+for pkg in libxkbcommon0 libxkbcommon-x11-0; do
+    depends+=("$pkg")
+    depends_line+=", $pkg"
+done
 
-recommends_candidates=("libvulkan1 | libgl1" "libxkbcommon0" "libxkbcommon-x11-0" "libwayland-client0" "libx11-6" "xdg-utils")
+recommends_candidates=("libvulkan1 | libgl1" "libwayland-client0" "libx11-6" "xdg-utils")
 declare -a recommends=()
 for item in "${recommends_candidates[@]}"; do
     covered=0
