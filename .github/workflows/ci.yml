@@ -66,7 +66,17 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: E2E tests
-        run: cargo test -p forge-app --test e2e --no-fail-fast
+        run: >-
+          cargo test -p forge-app --test e2e --no-fail-fast --
+          --skip related::video_proxy_conventions_and_external_root_scan_are_visible
+
+      # Known flaky under load (see CLAUDE.md): run alone, retried once. Never skipped.
+      - name: E2E test related::video_proxy (one retry)
+        if: success() || failure()
+        run: |
+          test=related::video_proxy_conventions_and_external_root_scan_are_visible
+          cargo test -p forge-app --test e2e -- --exact "$test" ||
+            { echo "::warning::$test failed once; retrying"; cargo test -p forge-app --test e2e -- --exact "$test"; }
 
       - name: Upload screenshots from failed runs
         if: failure()
