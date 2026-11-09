@@ -30,7 +30,16 @@ pub fn decode_thumbnail_within(
     windows_impl::decode(path, Some(max_side.clamp(1, 4096)), max_pixels).map(|(image, _)| image)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", feature = "heif"))]
+pub fn decode_thumbnail_within(
+    path: &Path,
+    max_side: u32,
+    max_pixels: u64,
+) -> Result<image::RgbaImage> {
+    heif_impl::decode(path, Some(max_side.clamp(1, 4096)), max_pixels).map(|(image, _)| image)
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", feature = "heif"))))]
 pub fn decode_thumbnail_within(
     _path: &Path,
     _max_side: u32,
@@ -47,7 +56,12 @@ pub fn decode_full(path: &Path, max_pixels: u64) -> Result<image::RgbaImage> {
     windows_impl::decode(path, None, max_pixels).map(|(image, _)| image)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", feature = "heif"))]
+pub fn decode_full(path: &Path, max_pixels: u64) -> Result<image::RgbaImage> {
+    heif_impl::decode(path, None, max_pixels).map(|(image, _)| image)
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", feature = "heif"))))]
 pub fn decode_full(_path: &Path, _max_pixels: u64) -> Result<image::RgbaImage> {
     Err(MediaError::Unsupported(
         "Windows Imaging Component is only available on Windows".into(),
@@ -60,7 +74,12 @@ pub fn source_dimensions(path: &Path) -> Result<(u32, u32)> {
     windows_impl::source_dimensions(path)
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", feature = "heif"))]
+pub fn source_dimensions(path: &Path) -> Result<(u32, u32)> {
+    heif_impl::source_dimensions(path)
+}
+
+#[cfg(not(any(windows, all(target_os = "linux", feature = "heif"))))]
 pub fn source_dimensions(_path: &Path) -> Result<(u32, u32)> {
     Err(MediaError::Unsupported(
         "Windows Imaging Component is only available on Windows".into(),
@@ -82,6 +101,7 @@ pub fn encode_test_fixture(_path: &Path, _container: TestContainer) -> Result<()
     ))
 }
 
+#[cfg(any(windows, all(target_os = "linux", feature = "heif"), test))]
 fn check_dimensions(width: u32, height: u32, limit: u64) -> Result<u64> {
     if width == 0 || height == 0 {
         return Err(MediaError::corrupt("WIC reported zero image dimensions"));
@@ -501,9 +521,140 @@ mod windows_impl {
     }
 }
 
+/// Linux backend: libheif (system library, 1.17 API) decodes the primary image. libheif applies
+/// the container's `irot`/`imir`/crop transforms; EXIF orientation is applied here, as the WIC
+/// path does, so both backends return the same pixels for the same file.
+#[cfg(all(target_os = "linux", feature = "heif"))]
+mod heif_impl {
+    use std::path::Path;
+
+    use image::{DynamicImage, RgbaImage};
+    use libheif_rs::{
+        ColorSpace, HeifContext, HeifError, HeifErrorCode, ImageHandle, LibHeif, RgbChroma,
+    };
+
+    use crate::error::{MediaError, Result};
+    use crate::image_meta;
+
+    use super::check_dimensions;
+
+    /// Runs `op` on the primary image handle. The context stays alive for the whole call, so
+    /// the handle never outlives the file data it reads from.
+    fn with_primary<T>(path: &Path, op: impl FnOnce(&ImageHandle) -> Result<T>) -> Result<T> {
+        std::fs::metadata(path).map_err(|e| MediaError::io(path, e))?;
+        // libheif takes a UTF-8 file name; other paths are read into memory instead.
+        let bytes;
+        let context = match path.to_str() {
+            Some(name) => HeifContext::read_from_file(name),
+            None => {
+                bytes = std::fs::read(path).map_err(|e| MediaError::io(path, e))?;
+                HeifContext::read_from_bytes(&bytes)
+            }
+        }
+        .map_err(|e| decode_error(path, "open", e))?;
+        let handle = context
+            .primary_image_handle()
+            .map_err(|e| decode_error(path, "primary image", e))?;
+        op(&handle)
+    }
+
+    fn decode_error(path: &Path, op: &str, error: HeifError) -> MediaError {
+        match error.code {
+            // Missing AV1/HEVC decoder plugin, or a brand this libheif does not handle.
+            HeifErrorCode::UnsupportedFileType | HeifErrorCode::UnsupportedFeature => {
+                MediaError::Unsupported(format!(
+                    "libheif cannot decode {} ({op}): {error}; the AV1 (libaom/dav1d) or HEVC \
+                     decoder plugin may be missing",
+                    path.display()
+                ))
+            }
+            _ => MediaError::Decode(format!(
+                "libheif {op} failed for {}: {error}",
+                path.display()
+            )),
+        }
+    }
+
+    /// Dimensions after the EXIF orientation: 90/270 degree turns swap width and height.
+    fn oriented((width, height): (u32, u32), orientation: u16) -> (u32, u32) {
+        if matches!(orientation, 5..=8) {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    pub(super) fn source_dimensions(path: &Path) -> Result<(u32, u32)> {
+        // Handle dimensions already include the container's irot/crop transforms.
+        let size = with_primary(path, |handle| Ok((handle.width(), handle.height())))?;
+        if size.0 == 0 || size.1 == 0 {
+            return Err(MediaError::corrupt(
+                "libheif reported zero image dimensions",
+            ));
+        }
+        let orientation = image_meta::read_orientation(path).unwrap_or(1);
+        Ok(oriented(size, orientation))
+    }
+
+    pub(super) fn decode(
+        path: &Path,
+        max_side: Option<u32>,
+        max_pixels: u64,
+    ) -> Result<(RgbaImage, (u32, u32))> {
+        let orientation = image_meta::read_orientation(path).unwrap_or(1);
+        let decoded = with_primary(path, |handle| {
+            check_dimensions(handle.width(), handle.height(), max_pixels)?;
+            let image = LibHeif::new()
+                .decode(handle, ColorSpace::Rgb(RgbChroma::Rgba), None)
+                .map_err(|e| decode_error(path, "decode", e))?;
+            interleaved_rgba(&image)
+        })?;
+        let natural = oriented((decoded.width(), decoded.height()), orientation);
+
+        // Scale before rotating, as the WIC path does; the long side is orientation-invariant.
+        let mut pixels = match max_side {
+            Some(side) if decoded.width().max(decoded.height()) > side => {
+                crate::thumbs::fit(DynamicImage::ImageRgba8(decoded), side)
+            }
+            _ => decoded,
+        };
+        if let Some(o) = image::metadata::Orientation::from_exif(orientation as u8)
+            && orientation != 1
+        {
+            let mut image = DynamicImage::ImageRgba8(pixels);
+            image.apply_orientation(o);
+            pixels = image.into_rgba8();
+        }
+        Ok((pixels, natural))
+    }
+
+    /// Copies libheif's interleaved 8-bit RGBA plane into a tight buffer (dropping row padding).
+    fn interleaved_rgba(image: &libheif_rs::Image) -> Result<RgbaImage> {
+        let plane = image.planes().interleaved.ok_or_else(|| {
+            MediaError::Decode("libheif returned no interleaved RGBA plane".into())
+        })?;
+        let row = plane.width as usize * 4;
+        let mut rgba = Vec::new();
+        rgba.try_reserve_exact(row * plane.height as usize)
+            .map_err(|e| MediaError::Decode(format!("cannot reserve HEIF RGBA buffer: {e}")))?;
+        for y in 0..plane.height as usize {
+            let start = y * plane.stride;
+            let line = plane
+                .data
+                .get(start..start + row)
+                .ok_or_else(|| MediaError::corrupt("libheif plane is shorter than its size"))?;
+            rgba.extend_from_slice(line);
+        }
+        RgbaImage::from_raw(plane.width, plane.height, rgba)
+            .ok_or_else(|| MediaError::corrupt("libheif returned an invalid RGBA buffer size"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TestContainer, check_dimensions};
+    #[cfg(windows)]
+    use super::TestContainer;
+    use super::check_dimensions;
 
     #[test]
     fn huge_fabricated_frame_is_rejected_before_any_pixel_allocation() {
@@ -531,5 +682,106 @@ mod tests {
                 Err(error) => panic!("could not generate {extension} WIC fixture: {error}"),
             }
         }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(feature = "heif"), test))]
+mod linux_stub_tests {
+    #[test]
+    fn heif_pixels_are_unsupported_without_the_heif_feature() {
+        let path = std::path::Path::new("/nonexistent/generated.avif");
+        assert!(matches!(
+            super::decode_full(path, 10_000),
+            Err(crate::MediaError::Unsupported(_))
+        ));
+        assert!(matches!(
+            super::source_dimensions(path),
+            Err(crate::MediaError::Unsupported(_))
+        ));
+    }
+}
+
+/// libheif decoding on Linux. The AVIF fixture comes from ffmpeg (libaom encoder); the test
+/// skips with a note when ffmpeg or that encoder is missing. HEIC needs an HEVC encoder that
+/// this machine lacks, so that case reads a sample from `ZXRAW_HEIC_SAMPLE` when it is set.
+#[cfg(all(target_os = "linux", feature = "heif", test))]
+mod linux_heif_tests {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use image::RgbaImage;
+
+    use super::{decode_full, decode_thumbnail, source_dimensions};
+
+    fn make_avif(dir: &Path) -> Option<PathBuf> {
+        let out = dir.join("generated.avif");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "libaom-av1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&out)
+            .stdin(Stdio::null())
+            .status()
+            .ok()?;
+        (status.success() && out.is_file()).then_some(out)
+    }
+
+    fn assert_real_pixels(image: &RgbaImage) {
+        let distinct: std::collections::HashSet<[u8; 4]> = image.pixels().map(|p| p.0).collect();
+        assert!(
+            distinct.len() > 1,
+            "decoded image is blank ({} distinct pixel)",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn avif_fixture_decodes_full_size_and_thumbnail() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(path) = make_avif(dir.path()) else {
+            eprintln!("skipped AVIF libheif test: ffmpeg with libaom-av1 is not available");
+            return;
+        };
+        assert_eq!(source_dimensions(&path).unwrap(), (64, 48));
+
+        let full = decode_full(&path, 10_000).unwrap();
+        assert_eq!(full.dimensions(), (64, 48));
+        assert_real_pixels(&full);
+
+        let thumb = decode_thumbnail(&path, 16).unwrap();
+        assert_eq!(thumb.dimensions(), (16, 12));
+        assert_real_pixels(&thumb);
+
+        // Over the pixel budget: rejected before any pixel decode.
+        assert!(matches!(
+            decode_full(&path, 64 * 48 - 1),
+            Err(crate::MediaError::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn heic_sample_from_env_decodes() {
+        let Some(sample) = std::env::var_os("ZXRAW_HEIC_SAMPLE") else {
+            eprintln!("skipped HEIC libheif test: set ZXRAW_HEIC_SAMPLE to a .heic file");
+            return;
+        };
+        let path = PathBuf::from(sample);
+        let (w, h) = source_dimensions(&path).unwrap();
+        let full = decode_full(&path, u64::from(w) * u64::from(h)).unwrap();
+        assert_eq!(full.dimensions(), (w, h));
+        assert_real_pixels(&full);
     }
 }
