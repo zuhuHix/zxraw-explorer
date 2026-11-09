@@ -14,6 +14,14 @@
 //! During an OLE drag the mouse belongs to the drag source, so the window gets no pointer
 //! moves. While files hover or drop, the cursor position is read from the OS and fed to egui
 //! as a pointer move, so the rows under it light up and take the drop like an in-app drag.
+//!
+//! On Linux (X11, also XWayland) the same flow runs on `forge_win`'s XDND drop target: an
+//! `XdndProxy` window on its own connection takes every XDND message for our window, so
+//! winit's handler (one hover event, no position, always "private") never sees the drag. The
+//! XDND messages carry no modifiers and the drag source holds the pointer grab, so the pointer
+//! and Ctrl/Shift are read with `QueryPointer` on our window every frame ([`cursor_pos`],
+//! [`os_keys`]). The target answers XdndStatus with the copy or move worked out here, and a
+//! move is reported to the source as `XdndActionPrivate`, so it never deletes anything.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -87,9 +95,18 @@ pub struct OsDrop {
     pub simulated: Option<(DragInfo, bool, bool)>,
     /// The last answer, and the target and keys it was worked out for.
     answered: Option<(PathBuf, bool, bool, DropEffect)>,
+    /// Our X11 window (Linux on X11/XWayland), for reading the pointer during a drag.
+    pub x11_window: Option<u32>,
 }
 
 impl OsDrop {
+    pub fn new(x11_window: Option<u32>) -> Self {
+        Self {
+            x11_window,
+            ..Self::default()
+        }
+    }
+
     /// What the drop target answers now (the automation hook drops with it).
     pub fn answer(&self) -> DropEffect {
         self.answered.as_ref().map_or(DropEffect::None, |a| a.3)
@@ -185,11 +202,11 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
     hovering |= os.is_dragging();
     let dropping = !paths.is_empty() || virtual_files.is_some();
     if from_os && (hovering || dropping) {
-        if let Some(pos) = cursor_pos(ctx, raw) {
+        if let Some(pos) = cursor_pos(ctx, raw, os.x11_window) {
             raw.events.push(egui::Event::PointerMoved(pos));
         }
         if keys.is_none() {
-            keys = os_keys();
+            keys = os_keys(os.x11_window);
         }
     }
     let dropped = dropping.then_some(External {
@@ -248,7 +265,11 @@ pub fn take_claimed(ctx: &egui::Context) -> Option<(External, PathBuf)> {
 
 /// The OS cursor in window points.
 #[cfg(windows)]
-fn cursor_pos(ctx: &egui::Context, raw: &egui::RawInput) -> Option<egui::Pos2> {
+fn cursor_pos(
+    ctx: &egui::Context,
+    raw: &egui::RawInput,
+    _x11_window: Option<u32>,
+) -> Option<egui::Pos2> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
     let info = raw.viewports.get(&raw.viewport_id)?;
@@ -261,21 +282,64 @@ fn cursor_pos(ctx: &egui::Context, raw: &egui::RawInput) -> Option<egui::Pos2> {
     Some(egui::pos2(point.x as f32 / ppp, point.y as f32 / ppp) - inner.min.to_vec2())
 }
 
-#[cfg(not(windows))]
-fn cursor_pos(_ctx: &egui::Context, _raw: &egui::RawInput) -> Option<egui::Pos2> {
+/// The pointer in window points, from `QueryPointer` on our X11 window (relative to it, in
+/// physical pixels). Works while another client's drag holds the pointer grab.
+#[cfg(target_os = "linux")]
+fn cursor_pos(
+    ctx: &egui::Context,
+    raw: &egui::RawInput,
+    x11_window: Option<u32>,
+) -> Option<egui::Pos2> {
+    let state = forge_win::xdnd::pointer(x11_window?)?;
+    let native = raw
+        .viewports
+        .get(&raw.viewport_id)?
+        .native_pixels_per_point?;
+    Some(window_point(state.x, state.y, native * ctx.zoom_factor()))
+}
+
+/// Physical window pixels to egui points at `ppp` pixels per point.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn window_point(x: i32, y: i32, ppp: f32) -> egui::Pos2 {
+    egui::pos2(x as f32 / ppp, y as f32 / ppp)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn cursor_pos(
+    _ctx: &egui::Context,
+    _raw: &egui::RawInput,
+    _x11_window: Option<u32>,
+) -> Option<egui::Pos2> {
     None
 }
 
 /// Ctrl and Shift as the keyboard has them now (egui's modifiers go stale during an OLE drag).
 #[cfg(windows)]
-fn os_keys() -> Option<(bool, bool)> {
+fn os_keys(_x11_window: Option<u32>) -> Option<(bool, bool)> {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_SHIFT};
     // SAFETY: plain key state queries.
     let down = |vk: i32| unsafe { GetAsyncKeyState(vk) } < 0;
     Some((down(i32::from(VK_CONTROL.0)), down(i32::from(VK_SHIFT.0))))
 }
 
-#[cfg(not(windows))]
-fn os_keys() -> Option<(bool, bool)> {
+/// Ctrl and Shift from the X11 pointer's modifier mask (egui's go stale while another
+/// client's drag has the keyboard's attention).
+#[cfg(target_os = "linux")]
+fn os_keys(x11_window: Option<u32>) -> Option<(bool, bool)> {
+    let state = forge_win::xdnd::pointer(x11_window?)?;
+    Some((state.ctrl, state.shift))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn os_keys(_x11_window: Option<u32>) -> Option<(bool, bool)> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn window_pixels_become_points() {
+        assert_eq!(super::window_point(300, 150, 1.5), egui::pos2(200.0, 100.0));
+        assert_eq!(super::window_point(0, 0, 2.0), egui::pos2(0.0, 0.0));
+    }
 }

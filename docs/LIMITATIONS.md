@@ -665,8 +665,12 @@ or refuses with a message; nothing should crash for lack of it.
   error that says so: mount them once in the file manager).
 * Updates: the daily check works, but nothing is installed in place. A new version shows a
   notice with the release page and its AppImage and .deb downloads.
-* Dragging files out of the app is not available. The sidebar lists `/` and the mounts under
-  `/media`, `/run/media` and `/mnt`.
+* Drag and drop works on X11 (see [Linux platform behaviour](#linux-platform-behaviour)).
+  winit has no drag and drop on Wayland: turn on Settings › File operations › *Use XWayland
+  (enables drag and drop)*, or start with `ZXRAW_X11=1`, and restart. The app then runs as an
+  X11 client of XWayland (`ZXRAW_X11=0` turns it off again). Items inside an archive can't be
+  dragged out on Linux; copy and paste them.
+* The sidebar lists `/` and the mounts under `/media`, `/run/media` and `/mnt`.
 * File dialogs need a running `xdg-desktop-portal` with a FileChooser backend; without one they
   don't open.
 * Names are case-sensitive: `IMG.jpg` and `img.jpg` are two files everywhere (index, notes,
@@ -786,10 +790,26 @@ Windows in these ways:
   payload format is shared with Windows. Session and integrity-level checks have no equivalent.
 - **Downloads:** TLS trusts the bundled Mozilla roots, not the system store, so a corporate
   TLS-intercepting proxy's certificate is not trusted.
-- **Drag and drop out, virtual files, private desktop:** not implemented on Linux and return
-  `Unsupported`. XDND drag sources need toolkit support that winit doesn't provide. Drops *into*
-  the app are left to `forge-app`, which can use winit's file-drop events (X11 only: winit 0.30
-  has no drag-and-drop on Wayland).
+- **Drag and drop in (X11, XWayland):** `forge-win`'s XDND target replaces winit's. It sets
+  `XdndProxy` on the window to point to a window on its own X connection, so every XDND message
+  reaches it and winit never sees the drag. While files hover, the pointer and Ctrl/Shift are read
+  with `QueryPointer` each frame, so the folder under the pointer lights up and takes the drop,
+  with the same copy/move rule and conflict dialogs as on Windows. The source is told the real
+  copy or move in `XdndStatus`. A move is done by the app and reported in `XdndFinished` as
+  `XdndActionPrivate`, so the source never deletes anything. Only `text/uri-list` is read;
+  non-UTF-8 names and symlinks come through as they are. A source that offers no file URIs (a
+  browser image, text) is refused.
+- **Drag and drop out (X11, XWayland):** dragging items past the window edge starts an XDND
+  drag from a background thread, so the window keeps drawing. Copy is the default, Shift moves
+  and Ctrl+Shift links. winit holds the pointer grab while the button is down, so the source does
+  not grab: it polls the pointer, the button and Esc (`QueryPointer`, `QueryKeymap`). The cursor is a
+  cursor-font glyph set on our window, which X shows during the grab: a hand when the target
+  accepts, a circle when it refuses. It does not tell copy from move, and the desktop's cursor
+  theme isn't used. Offered: `text/uri-list`, `x-special/gnome-copied-files` and plain text.
+  A `DELETE` request is refused, so a move is always done by the target (a file manager
+  moves the files itself). Afterwards the panes showing the items' folders are re-listed.
+  Tested against Nemo. Dropping back onto ZXraw itself does nothing; use an in-app drag.
+- **Virtual files, private desktop:** not implemented on Linux and return `Unsupported`.
 - **Window placement:** `maximize_hidden` is unsupported; the app maximizes through egui.
 - **HEIF/HEIC/AVIF:** only with the `heif` cargo feature and libheif installed. Embedded HEIF
   thumbnails are not used (same as WIC). EXIF orientation on HEIF is applied but untested

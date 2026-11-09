@@ -21,7 +21,7 @@ libc = "0.2"
 # Pure-Rust HTTPS (rustls + webpki roots) in place of WinHTTP.
 ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 # File clipboard: X11 selections without libxcb, and the Wayland data-control protocol.
-x11rb = { version = "0.14", default-features = false }
+x11rb = { version = "0.14", default-features = false, features = ["xtest"] }
 wl-clipboard-rs = "0.9"
 
 [dev-dependencies]

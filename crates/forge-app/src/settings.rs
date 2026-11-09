@@ -255,6 +255,10 @@ pub struct Settings {
     /// Also measure folders on network drives. Off by default: every file's entry is read
     /// over the network, which is slow on a share and loads the server.
     pub folder_sizes_network: bool,
+    /// Linux, Wayland sessions: start through XWayland so drag and drop works (winit has no drag
+    /// and drop on Wayland). Takes effect at the next start. `ZXRAW_X11=1` does the same, see
+    /// `xwayland`.
+    pub use_xwayland: bool,
     /// Sidebar sections the user opened (`true`) or closed, by key ("layouts",
     /// "collections"). A section missing here starts open exactly when it has items.
     pub sidebar_sections: std::collections::BTreeMap<String, bool>,
@@ -305,6 +309,7 @@ impl Default for Settings {
             folder_sizes: true,
             folder_sizes_network: false,
             sidebar_sections: Default::default(),
+            use_xwayland: false,
             extra: Extra::new(),
         }
     }
@@ -786,5 +791,17 @@ mod tests {
         let settings: Settings = serde_json::from_str(r#"{"app_icon": 7, "accent": null}"#).unwrap();
         assert_eq!(*settings.app_icon, AppIcon::Graphite);
         assert_eq!(*settings.accent, Accent::Blue);
+    }
+
+    #[test]
+    fn xwayland_is_off_unless_turned_on() {
+        assert!(!Settings::default().use_xwayland);
+        let settings: Settings = serde_json::from_str(r#"{"verify_copies": true}"#).unwrap();
+        assert!(
+            !settings.use_xwayland,
+            "a settings file without the key gets the default"
+        );
+        let settings: Settings = serde_json::from_str(r#"{"use_xwayland": true}"#).unwrap();
+        assert!(settings.use_xwayland);
     }
 }

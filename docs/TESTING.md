@@ -473,6 +473,13 @@ reason above each test):
 Scenarios about missing FFmpeg run the app with `path_without_ffmpeg()`, a `PATH` without the
 folders that hold `ffmpeg`/`ffprobe`, since Linux machines usually have it in `/usr/bin`.
 
+The X11 drag and drop tests in `forge-win` (`xdnd::tests::xdnd_*`) and its clipboard tests
+start their own `Xvfb`, so they are `#[ignore]`d by default:
+`cargo test -p forge-win xdnd -- --ignored`. They run headless and have been stable (3 runs in
+a row). The e2e scenarios `core::xdnd_*` do a real XDND drop on the app's private display
+through the `xdnd-drop` automation step (a test XDND source; Ctrl and Shift are held with
+XTEST).
+
 ### Tests that touch the real system (opt-in)
 
 `forge-win`'s `recycle_removes_file_from_disk` sends a temporary file to the user's real

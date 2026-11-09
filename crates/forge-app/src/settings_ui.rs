@@ -767,6 +767,18 @@ fn file_operations_page(ui: &mut egui::Ui, settings: &mut Settings) {
         .weak()
         .small(),
     );
+    if cfg!(target_os = "linux") {
+        ui.add_space(12.0);
+        ui.checkbox(
+            &mut settings.use_xwayland,
+            "Use XWayland (enables drag and drop)",
+        )
+        .on_hover_text(
+            "Wayland sessions only. winit has no drag and drop on Wayland; with this on, \
+             ZXraw starts through XWayland so files can be dragged in and out. Takes effect \
+             after a restart. Same as starting with ZXRAW_X11=1.",
+        );
+    }
 }
 
 fn video_page(
