@@ -1,33 +1,31 @@
 //! Thin adapter between the UI and the operating system.
 //!
-//! On Windows every call goes to `forge-win` (Win32 shell, drives, Known Folders). Elsewhere
-//! (Linux and other Unix systems) the same questions are answered with what a freedesktop
-//! desktop provides: `xdg-open` for opening and revealing, the XDG user directories, and the
-//! mounted file systems under `/media`, `/run/media` and `/mnt` as removable drives.
+//! Opening, revealing and launching go to `forge-win` everywhere (on Linux: `xdg-open`, the
+//! XDG portal and the `org.freedesktop.FileManager1` interface). Drives and known folders come
+//! from `forge-win` on Windows; on Linux from the XDG user directories and the mounted file
+//! systems under `/media`, `/run/media` and `/mnt` (removable drives).
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 use crate::commands::Cmd;
 use crate::sidebar::Drive;
 
 
-/// Whether a command only exists on Windows (Explorer's Properties sheet, "Open with" dialog,
-/// the administrator terminal, "Add to Network…" with Windows' own sign-in, the FFmpeg
-/// download and the updater, which fetch Windows builds). Such commands are left out of the
-/// menus, the command palette and the shortcut list elsewhere, and their shortcuts do nothing.
+/// Whether a command exists on this system. Windows-only: the administrator terminal, and the
+/// FFmpeg download (a pinned, checksummed Windows build; Linux has no comparably stable
+/// static build to pin, so ffmpeg comes from the package manager there). Commands that aren't
+/// available are left out of the menus, the command palette and the shortcut list, and their
+/// shortcuts do nothing. Properties, Open with, network locations and the update check have
+/// Linux backends in `forge-win`.
 pub fn command_available(cmd: Cmd) -> bool {
     match cmd {
-        Cmd::Properties
-        | Cmd::OpenWith
-        | Cmd::OpenTerminalAdmin
-        | Cmd::AddToNetwork
-        | Cmd::DownloadFfmpeg
-        | Cmd::CheckForUpdates => cfg!(windows),
+        Cmd::OpenTerminalAdmin | Cmd::DownloadFfmpeg => cfg!(windows),
         _ => true,
     }
 }
+
+/// Where deleted items go: the Recycle Bin on Windows, the Trash (freedesktop) elsewhere.
+pub const TRASH: &str = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
 
 /// What tells an item from another one later created under the same name: on Windows the
 /// volume serial and file index (`forge_win::file_id`); on Unix `st_dev`, `st_ino` and the
@@ -43,6 +41,7 @@ pub struct FileKey {
 
 impl FileKey {
     /// A key from its volume and index alone (tests, and Windows file IDs).
+    #[cfg(any(windows, test))]
     pub const fn new(volume: u64, index: u64) -> FileKey {
         FileKey {
             volume,
@@ -107,36 +106,18 @@ pub fn known_folders() -> Vec<(String, PathBuf)> {
 
 /// Opens `path` with its default application (`xdg-open` on Linux).
 pub fn open_default(path: &Path) -> Result<(), forge_win::WinError> {
-    if cfg!(windows) {
-        forge_win::open_default(path)
-    } else {
-        spawn_detached("xdg-open", &[path.as_os_str()], None)
-    }
+    forge_win::open_default(path)
 }
 
-/// Opens the folder that holds `path` with `path` shown in it (Explorer's "Show in folder").
-/// Elsewhere there is no standard way to select an item, so the containing folder opens
-/// (a folder itself opens as it is).
+/// Opens the folder that holds `path` with `path` selected in it (Explorer's "Show in
+/// folder"; on Linux the file manager's `ShowItems`, else the containing folder opens).
 pub fn reveal(path: &Path) -> Result<(), forge_win::WinError> {
-    if cfg!(windows) {
-        forge_win::reveal_in_explorer(path)
-    } else {
-        let target = if path.is_dir() {
-            path
-        } else {
-            path.parent().unwrap_or(path)
-        };
-        spawn_detached("xdg-open", &[target.as_os_str()], None)
-    }
+    forge_win::reveal_in_explorer(path)
 }
 
 /// Opens a folder in the file manager.
 pub fn open_folder(path: &Path) -> Result<(), forge_win::WinError> {
-    if cfg!(windows) {
-        forge_win::open_folder_in_explorer(path)
-    } else {
-        spawn_detached("xdg-open", &[path.as_os_str()], None)
-    }
+    forge_win::open_folder_in_explorer(path)
 }
 
 /// Starts a program with separate arguments (no shell) in `cwd`, without waiting for it.
@@ -145,40 +126,7 @@ pub fn launch(
     args: &[std::ffi::OsString],
     cwd: Option<&Path>,
 ) -> Result<(), forge_win::WinError> {
-    if cfg!(windows) {
-        forge_win::launch(exe, args, cwd)
-    } else {
-        let args: Vec<&OsStr> = args.iter().map(|a| a.as_os_str()).collect();
-        spawn_detached(exe, &args, cwd)
-    }
-}
-
-/// Starts `program` and forgets it. The child is reaped on a helper thread so it does not
-/// linger as a zombie; its output is discarded.
-fn spawn_detached(
-    program: impl AsRef<OsStr>,
-    args: &[&OsStr],
-    cwd: Option<&Path>,
-) -> Result<(), forge_win::WinError> {
-    let program = program.as_ref();
-    let mut command = std::process::Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(dir) = cwd {
-        command.current_dir(dir);
-    }
-    let mut child = command.spawn().map_err(|source| forge_win::WinError::Io {
-        op: "start",
-        path: PathBuf::from(program),
-        source,
-    })?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
+    forge_win::launch(exe, args, cwd)
 }
 
 #[cfg(windows)]
@@ -337,19 +285,23 @@ mod tests {
 
     #[test]
     fn windows_only_commands_are_hidden() {
+        for cmd in [Cmd::OpenTerminalAdmin, Cmd::DownloadFfmpeg] {
+            assert!(!command_available(cmd), "{cmd:?}");
+        }
         for cmd in [
             Cmd::Properties,
             Cmd::OpenWith,
-            Cmd::OpenTerminalAdmin,
             Cmd::AddToNetwork,
-            Cmd::DownloadFfmpeg,
             Cmd::CheckForUpdates,
+            Cmd::OpenTerminal,
+            Cmd::Recycle,
+            Cmd::Copy,
+            Cmd::Paste,
         ] {
-            assert!(!command_available(cmd), "{cmd:?}");
+            assert!(command_available(cmd), "{cmd:?}");
         }
         let shown = Cmd::ALL.iter().filter(|c| command_available(**c)).count();
-        assert_eq!(shown, Cmd::ALL.len() - 6);
-        assert!(command_available(Cmd::OpenTerminal));
+        assert_eq!(shown, Cmd::ALL.len() - 2);
         assert_eq!(Cmd::RevealInExplorer.label(), "Show in file manager");
     }
 
@@ -412,9 +364,8 @@ mod tests {
     }
 
     #[test]
-    fn xdg_open_missing_is_an_error_not_a_panic() {
-        // Only checks the spawn path: a program that does not exist reports an error.
-        let missing = spawn_detached("/nonexistent/zxraw-no-such-program", &[], None);
+    fn a_missing_program_is_an_error_not_a_panic() {
+        let missing = launch(Path::new("/nonexistent/zxraw-no-such-program"), &[], None);
         assert!(missing.is_err());
     }
 }

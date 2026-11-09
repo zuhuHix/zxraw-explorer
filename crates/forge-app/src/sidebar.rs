@@ -302,11 +302,9 @@ pub fn show(app: &mut ZxrawApp, ui: &mut Ui) {
             ui.add_space(6.0);
             collections_section(app, ui);
 
-            // Saved shares are Windows UNC paths; Linux mounts show up under Drives instead.
-            if cfg!(windows) {
-                ui.add_space(6.0);
-                network::section(app, ui);
-            }
+            // Saved shares are UNC paths on Windows and GVfs-mounted SMB shares on Linux.
+            ui.add_space(6.0);
+            network::section(app, ui);
 
             ui.add_space(6.0);
             drives_section(app, ui);

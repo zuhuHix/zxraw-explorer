@@ -74,10 +74,151 @@ pub fn classify(found: Option<&Found>, timed_out: bool) -> NetStatus {
     }
 }
 
+/// Shown for a share that is not mounted on Linux (see [`unmounted_if_missing`]).
+const NOT_MOUNTED: &str = "not mounted, or this folder is not on the share. Right-click it and \
+    choose Connect… to mount the share";
+
+/// On Linux a location is checked at its GVfs mount folder, which exists only while the share
+/// is mounted. Without a mount the check finds nothing there and reports the folder as missing
+/// (the volume root `/` still answers), so "not found" here means the share may not be
+/// connected.
+fn unmounted_if_missing(status: NetStatus) -> NetStatus {
+    match status {
+        NetStatus::NotFound if !cfg!(windows) => NetStatus::Offline(NOT_MOUNTED.into()),
+        other => other,
+    }
+}
+
+/// Whether two paths name the same location. Server and share names are case-insensitive on
+/// both systems; Windows compares paths as it always did.
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        paths_equal(a, b)
+    } else {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+}
+
+/// The path a saved location is checked and opened at. On Linux that is its GVfs mount folder;
+/// without `XDG_RUNTIME_DIR` there is none, and the saved path is used as it is.
+#[cfg(target_os = "linux")]
+pub fn local_path(saved: &Path) -> PathBuf {
+    runtime_dir()
+        .and_then(|runtime| gvfs::mount_path(&runtime, saved))
+        .unwrap_or_else(|| saved.to_path_buf())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn local_path(saved: &Path) -> PathBuf {
+    saved.to_path_buf()
+}
+
+/// The `\\server\share[\folder]` path of a folder in a listing, for "Add to Network". On Linux
+/// a folder under a GVfs mount folder maps back to its share.
+#[cfg(target_os = "linux")]
+fn share_path_of(path: &Path) -> Option<PathBuf> {
+    runtime_dir()
+        .and_then(|runtime| gvfs::share_path(&runtime, path))
+        .or_else(|| netpath::is_unc(path).then(|| path.to_path_buf()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn share_path_of(path: &Path) -> Option<PathBuf> {
+    netpath::is_unc(path).then(|| path.to_path_buf())
+}
+
+/// Adds the GVfs folder to the network roots on Linux: checks under it can wait on a hung
+/// share, so they go to the network lane (see `path_probe::is_network`).
+#[cfg(target_os = "linux")]
+fn with_mount_root(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    if let Some(runtime) = runtime_dir() {
+        roots.push(runtime.join(gvfs::DIR));
+    }
+    roots
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_mount_root(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+/// What "Connect…" does, for its tooltip.
+fn connect_hint() -> &'static str {
+    if cfg!(windows) {
+        "Sign in with Windows"
+    } else {
+        "Mount the share (GVfs)"
+    }
+}
+
+/// Linux: where GVfs mounts SMB shares. `connect_share` mounts with `gio mount` and does not
+/// return the folder, so it is rebuilt here as `$XDG_RUNTIME_DIR/gvfs/smb-share:server=HOST,
+/// share=NAME`. Pure path mapping: nothing is read from disk.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod gvfs {
+    use std::path::{Path, PathBuf};
+
+    /// The folder under `$XDG_RUNTIME_DIR` that GVfs mounts shares in.
+    pub const DIR: &str = "gvfs";
+
+    /// `\\server\share\a\b` as (`server`, `share`, `["a", "b"]`). Forward slashes count as
+    /// separators and empty parts are skipped. `None` unless a server and a share are there.
+    fn split(saved: &Path) -> Option<(String, String, Vec<String>)> {
+        let text = saved.to_string_lossy().replace('/', "\\");
+        let rest = text.strip_prefix(r"\\")?;
+        let mut parts = rest
+            .split('\\')
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+        let server = parts.next()?;
+        let share = parts.next()?;
+        Some((server, share, parts.collect()))
+    }
+
+    /// The mount folder of the saved path: `\\nas\photos\2024` becomes
+    /// `<runtime>/gvfs/smb-share:server=nas,share=photos/2024`.
+    pub fn mount_path(runtime: &Path, saved: &Path) -> Option<PathBuf> {
+        let (server, share, rest) = split(saved)?;
+        let mut path = runtime
+            .join(DIR)
+            .join(format!("smb-share:server={server},share={share}"));
+        path.extend(rest);
+        Some(path)
+    }
+
+    /// The saved path of a folder under a mount folder (the inverse of [`mount_path`]). `None`
+    /// for anything else, including the GVfs folder itself.
+    pub fn share_path(runtime: &Path, mount: &Path) -> Option<PathBuf> {
+        let rel = mount.strip_prefix(runtime.join(DIR)).ok()?;
+        let parts: Vec<&str> = rel.iter().map(|p| p.to_str()).collect::<Option<_>>()?;
+        let (first, rest) = parts.split_first()?;
+        let names = first.strip_prefix("smb-share:server=")?;
+        let (server, share) = names.split_once(",share=")?;
+        if server.is_empty() || share.is_empty() || rest.iter().any(|p| matches!(*p, "." | "..")) {
+            return None;
+        }
+        let mut text = format!(r"\\{server}\{share}");
+        for part in rest {
+            text.push('\\');
+            text.push_str(part);
+        }
+        Some(PathBuf::from(text))
+    }
+}
+
 /// One row of the section.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// What is checked and opened: the saved path, or the drive root.
+    /// What is checked and opened: the saved path (on Linux its GVfs mount folder), or the
+    /// drive root.
     pub path: PathBuf,
     pub label: String,
     /// Index in `Settings::network_locations`; `None` for a mapped drive.
@@ -143,7 +284,7 @@ impl Connector {
     /// Starts signing in to `share` unless a sign-in is already running.
     pub fn request(&mut self, owner: isize, share: PathBuf) -> Request {
         if let Some(busy) = &self.busy {
-            return if paths_equal(busy, &share) {
+            return if same_path(busy, &share) {
                 Request::AlreadyRunning
             } else {
                 Request::Busy(busy.clone())
@@ -211,7 +352,7 @@ impl NetworkState {
     }
 
     pub fn status(&self, path: &Path) -> NetStatus {
-        classify(self.watch.found(path), self.watch.stalled(path))
+        unmounted_if_missing(classify(self.watch.found(path), self.watch.stalled(path)))
     }
 }
 
@@ -256,7 +397,7 @@ pub fn entries(app: &ZxrawApp) -> Vec<Entry> {
         .iter()
         .enumerate()
         .map(|(i, l)| Entry {
-            path: l.path.clone(),
+            path: local_path(&l.path),
             label: location_label(l),
             saved: Some(i),
             share: netpath::share_root(&l.path),
@@ -283,20 +424,21 @@ pub fn entries(app: &ZxrawApp) -> Vec<Entry> {
 /// Schedules due checks and applies finished checks and connections. Never blocks.
 pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
     let drives: Vec<PathBuf> = network_drives(app).into_iter().map(|d| d.root).collect();
+    let roots = with_mount_root(drives.clone());
     let paths: Vec<PathBuf> = app
         .settings
         .network_locations
         .iter()
-        .map(|l| l.path.clone())
+        .map(|l| local_path(&l.path))
         .chain(drives.iter().cloned())
         .collect();
-    app.sidebar.network.watch.tick_paths(&paths, &drives, Some(ctx));
+    app.sidebar.network.watch.tick_paths(&paths, &roots, Some(ctx));
     while let Some((share, result)) = app.sidebar.network.connector.poll() {
         match result {
             Ok(Connect::Connected) => {
                 // Every entry on this share: saved locations and mapped drives alike.
                 for e in entries(app) {
-                    if e.share.as_deref().is_some_and(|s| paths_equal(s, &share)) {
+                    if e.share.as_deref().is_some_and(|s| same_path(s, &share)) {
                         app.sidebar.network.watch.recheck(&e.path);
                     }
                 }
@@ -358,7 +500,7 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
     for (i, entry) in list.iter().enumerate() {
         let status = status_of(app, &entry.path);
         let connecting = is_connecting(app, entry);
-        let r = row(ui, entry, &status, connecting, paths_equal(&current, &entry.path));
+        let r = row(ui, entry, &status, connecting, same_path(&current, &entry.path));
         // A location the last check found online takes drops like the other sidebar folders.
         if matches!(status, NetStatus::Online) {
             super::folder_drop(app, ui, &r, &entry.path);
@@ -373,7 +515,7 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
             }
             if status.can_connect()
                 && !connecting
-                && ui.button("Connect…").on_hover_text("Sign in with Windows").clicked()
+                && ui.button("Connect…").on_hover_text(connect_hint()).clicked()
             {
                 edit = Some(Edit::Connect(i));
                 ui.close();
@@ -419,7 +561,7 @@ pub fn section(app: &mut ZxrawApp, ui: &mut Ui) {
 
 fn is_connecting(app: &ZxrawApp, entry: &Entry) -> bool {
     match (app.sidebar.network.connector.busy(), &entry.share) {
-        (Some(busy), Some(share)) => paths_equal(busy, share),
+        (Some(busy), Some(share)) => same_path(busy, share),
         _ => false,
     }
 }
@@ -546,7 +688,7 @@ pub fn accept_label(app: &mut ZxrawApp, p: Prompt) -> Option<Modal> {
 /// Sets the name of the saved location at `path`. Blank text (or the default name) clears
 /// it. Returns false when no location matches.
 pub fn rename_location(locations: &mut [NetworkLocation], path: &Path, text: &str) -> bool {
-    let Some(location) = locations.iter_mut().find(|l| paths_equal(&l.path, path)) else {
+    let Some(location) = locations.iter_mut().find(|l| same_path(&l.path, path)) else {
         return false;
     };
     let text = text.trim();
@@ -569,7 +711,7 @@ pub fn add_location(
     name: &str,
 ) -> Result<PathBuf, String> {
     let path = netpath::validate_share_path(path)?;
-    if locations.iter().any(|l| paths_equal(&l.path, &path)) {
+    if locations.iter().any(|l| same_path(&l.path, &path)) {
         return Err("This location is already in Network.".into());
     }
     let name = name.trim();
@@ -599,8 +741,8 @@ pub fn add_from_selection(app: &mut ZxrawApp) {
     let pane = app.pane();
     let selected = pane.action_targets();
     let candidate = match selected.as_slice() {
-        [one] if netpath::is_unc(one) && is_listed_folder(app, one) => Some(one.clone()),
-        _ => netpath::is_unc(&pane.path).then(|| pane.path.clone()),
+        [one] if is_listed_folder(app, one) && share_path_of(one).is_some() => share_path_of(one),
+        _ => share_path_of(&pane.path),
     };
     let text = candidate
         .map(|p| p.to_string_lossy().into_owned())
@@ -649,9 +791,14 @@ pub fn dialog(app: &mut ZxrawApp, ctx: &egui::Context) {
         ui.heading("Add network location");
         ui.add_space(6.0);
         ui.label("Folder on a NAS or shared computer");
+        let hint = if cfg!(windows) {
+            r"\\nas\photos"
+        } else {
+            "smb://nas/photos"
+        };
         let r = ui.add(
             egui::TextEdit::singleline(&mut dialog.path)
-                .hint_text(r"\\nas\photos")
+                .hint_text(hint)
                 .desired_width(f32::INFINITY),
         );
         if !dialog.focused {
@@ -667,14 +814,14 @@ pub fn dialog(app: &mut ZxrawApp, ctx: &egui::Context) {
         ui.add_space(4.0);
         ui.label("Name");
         ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY));
-        ui.label(
-            RichText::new(
-                "If the share needs a password, Windows asks for it when you connect. \
-                 ZXraw Explorer never sees or stores it.",
-            )
-            .weak()
-            .small(),
-        );
+        let note = if cfg!(windows) {
+            "If the share needs a password, Windows asks for it when you connect. \
+             ZXraw Explorer never sees or stores it."
+        } else {
+            "If the share needs a password, connect to it once from the file manager. \
+             ZXraw Explorer cannot ask for it and never stores it."
+        };
+        ui.label(RichText::new(note).weak().small());
         if let Some(e) = &dialog.error {
             ui.label(RichText::new(e).color(ui.visuals().error_fg_color));
         }
@@ -852,5 +999,97 @@ mod tests {
         assert!(rename_location(&mut locations, Path::new(r"\\nas\photos"), "  "));
         assert_eq!(locations[0].name, None);
         assert!(!rename_location(&mut locations, Path::new(r"\\other\x"), "y"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    #[test]
+    fn typed_share_forms_are_stored_as_unc_paths() {
+        // The same share however it is typed on Linux; the stored form is the UNC one.
+        for typed in ["smb://nas/photos", "SMB://nas/photos/", "//nas/photos", r"\\nas\photos"] {
+            assert_eq!(
+                netpath::validate_share_path(typed),
+                Ok(PathBuf::from(r"\\nas\photos")),
+                "{typed}"
+            );
+        }
+        assert!(netpath::validate_share_path("/home/user").is_err());
+    }
+
+    #[test]
+    fn the_same_share_in_another_case_is_a_duplicate() {
+        let mut locations = Vec::new();
+        add_location(&mut locations, "smb://nas/photos", "").unwrap();
+        assert!(add_location(&mut locations, "//NAS/Photos", "").is_err());
+        assert!(same_path(Path::new(r"\\NAS\Photos"), Path::new(r"\\nas\photos")));
+        assert!(!same_path(Path::new(r"\\nas\photos"), Path::new(r"\\nas\other")));
+    }
+
+    #[test]
+    fn saved_paths_map_to_gvfs_mount_folders() {
+        let runtime = Path::new("/run/user/1000");
+        let mount = |saved: &str| gvfs::mount_path(runtime, Path::new(saved));
+        assert_eq!(
+            mount(r"\\nas\photos"),
+            Some(PathBuf::from("/run/user/1000/gvfs/smb-share:server=nas,share=photos"))
+        );
+        assert_eq!(
+            mount(r"\\nas\photos\2024\x"),
+            Some(PathBuf::from(
+                "/run/user/1000/gvfs/smb-share:server=nas,share=photos/2024/x"
+            ))
+        );
+        assert_eq!(
+            mount(r"\\nas\My Share\"),
+            Some(PathBuf::from("/run/user/1000/gvfs/smb-share:server=nas,share=My Share"))
+        );
+        assert_eq!(mount("/home/user"), None);
+        assert_eq!(mount(r"\\nas"), None);
+    }
+
+    #[test]
+    fn mount_folders_map_back_to_saved_paths() {
+        let runtime = Path::new("/run/user/1000");
+        let back = |mount: &str| gvfs::share_path(runtime, Path::new(mount));
+        assert_eq!(
+            back("/run/user/1000/gvfs/smb-share:server=nas,share=photos/2024"),
+            Some(PathBuf::from(r"\\nas\photos\2024"))
+        );
+        assert_eq!(
+            back("/run/user/1000/gvfs/smb-share:server=nas,share=photos"),
+            Some(PathBuf::from(r"\\nas\photos"))
+        );
+        // Not a share: the GVfs folder itself, another GVfs backend, another folder.
+        assert_eq!(back("/run/user/1000/gvfs"), None);
+        assert_eq!(back("/run/user/1000/gvfs/sftp:host=nas"), None);
+        assert_eq!(back("/home/user/gvfs/smb-share:server=nas,share=x"), None);
+        assert_eq!(back("/run/user/1000/gvfs/smb-share:server=,share=x"), None);
+        assert_eq!(
+            back("/run/user/1000/gvfs/smb-share:server=nas,share=x/../y"),
+            None
+        );
+    }
+
+    #[test]
+    fn saved_paths_round_trip_through_their_mount_folder() {
+        let runtime = Path::new("/run/user/1000");
+        for saved in [r"\\nas\photos", r"\\192.168.1.5\C$\temp\a b"] {
+            let mount = gvfs::mount_path(runtime, Path::new(saved)).unwrap();
+            assert_eq!(gvfs::share_path(runtime, &mount), Some(PathBuf::from(saved)));
+        }
+    }
+
+    #[test]
+    fn a_share_that_is_not_mounted_is_offline_not_missing() {
+        // On Linux "not found" at the mount folder means nothing is mounted there.
+        assert_eq!(
+            unmounted_if_missing(NetStatus::NotFound),
+            NetStatus::Offline(NOT_MOUNTED.into())
+        );
+        assert_eq!(unmounted_if_missing(NetStatus::Online), NetStatus::Online);
+        assert_eq!(unmounted_if_missing(NetStatus::Checking), NetStatus::Checking);
     }
 }

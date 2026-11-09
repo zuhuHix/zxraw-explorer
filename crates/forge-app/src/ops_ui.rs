@@ -1539,8 +1539,8 @@ pub fn delete_with_windows(app: &mut ZxrawApp, targets: Vec<DeleteTarget>) {
 /// The title of a job that moves `n` items to the Recycle Bin.
 fn recycle_title(n: usize) -> String {
     match n {
-        1 => "Moving to Recycle Bin".into(),
-        n => format!("Moving {n} items to Recycle Bin"),
+        1 => format!("Moving to {}", crate::platform::TRASH),
+        n => format!("Moving {n} items to {}", crate::platform::TRASH),
     }
 }
 
@@ -1562,11 +1562,12 @@ fn show_delete_progress(progress: &forge_jobs::Progress, p: &forge_win::DeletePr
             0,
             0,
             format!(
-                "Moving {} items to the Recycle Bin…",
-                format_count(p.work_total as usize)
+                "Moving {} items to the {}…",
+                format_count(p.work_total as usize),
+                crate::platform::TRASH
             ),
         ),
-        DeleteStage::MovingWhole => (0, 0, "Moving to the Recycle Bin…".to_string()),
+        DeleteStage::MovingWhole => (0, 0, format!("Moving to the {}…", crate::platform::TRASH)),
         DeleteStage::Deleting if p.work_total > 0 => (p.work_done, p.work_total, String::new()),
         DeleteStage::Deleting => (p.items_done as u64, p.items_total as u64, String::new()),
     };
@@ -1600,7 +1601,10 @@ fn shell_observer(job: &JobHandle) -> forge_win::DeleteObserver {
 fn failure_text(path: &Path, why: &forge_win::DeleteFailure) -> String {
     use forge_win::DeleteFailure as F;
     match why {
-        F::NotRecyclable => "too big for the Recycle Bin, or its drive has no Recycle Bin".into(),
+        F::NotRecyclable => format!(
+            "too big for the {0}, or its drive has no {0}",
+            crate::platform::TRASH
+        ),
         F::NeedsAdmin => "access denied: needs administrator permission".into(),
         F::InUse => match forge_win::processes_using(path, 5_000).as_slice() {
             [] => "in use by another program; close it and try again".into(),
@@ -1675,17 +1679,18 @@ fn finish_shell_delete(
     }
     if !not_recyclable.is_empty() && !report.cancelled {
         let mut body = format!(
-            "{} item(s) cannot go to the Recycle Bin: they are too big for it, or their drive \
-             has no Recycle Bin. Nothing in them was deleted.\n\n{}\n\nDelete them \
+            "{} item(s) cannot go to the {trash}: they are too big for it, or their drive \
+             has no {trash}. Nothing in them was deleted.\n\n{}\n\nDelete them \
              permanently instead? This cannot be undone.",
             not_recyclable.len(),
-            modal::describe_items(&not_recyclable)
+            modal::describe_items(&not_recyclable),
+            trash = crate::platform::TRASH
         );
         if !other.is_empty() {
             body.push_str(&format!("\n\nAlso not deleted:\n{}", other.join("\n")));
         }
         let _ = tx.send(Event::AskConfirm(Confirm {
-            title: "Too big for the Recycle Bin".into(),
+            title: format!("Too big for the {}", crate::platform::TRASH),
             body,
             kind: ConfirmKind::DeleteWithWindows(DeleteTarget::capture_all(&not_recyclable)),
             confirm_label: "Delete permanently".into(),
@@ -1714,7 +1719,7 @@ fn finish_shell_delete(
             report.not_started.len()
         )));
     } else if recycled {
-        let _ = tx.send(Event::Toast(format!("Moved {n} item(s) to the Recycle Bin")));
+        let _ = tx.send(Event::Toast(format!("Moved {n} item(s) to the {}", crate::platform::TRASH)));
     } else {
         let _ = tx.send(Event::Toast(format!("Permanently deleted {n} item(s)")));
     }
@@ -2902,7 +2907,10 @@ mod tests {
         p.current = Some(PathBuf::from(r"C:\x\big"));
         show_delete_progress(&progress, &p);
         let snap = progress.snapshot();
-        assert_eq!(snap.note, "Moving 100,405 items to the Recycle Bin…");
+        assert_eq!(
+            snap.note,
+            format!("Moving 100,405 items to the {}…", crate::platform::TRASH)
+        );
         assert_eq!(snap.fraction(), None);
         assert_eq!(snap.current, r"C:\x\big");
 

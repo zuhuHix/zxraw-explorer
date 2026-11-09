@@ -146,8 +146,10 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
                     let label = if installed { "Update now" } else { "Download" };
                     let hover = if installed {
                         "Download, verify and install the update, then restart"
-                    } else {
+                    } else if cfg!(windows) {
                         "This is a portable copy: opens the release page to download the new zip"
+                    } else {
+                        "Opens the release page, with the AppImage and .deb packages"
                     };
                     if ui.button(RichText::new(label).strong()).on_hover_text(hover).clicked() {
                         action = Some(UpdateAction::Update);

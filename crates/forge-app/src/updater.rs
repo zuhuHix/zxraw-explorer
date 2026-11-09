@@ -23,6 +23,10 @@
 //! Automated runs never touch the network: the check runs there only when
 //! `ZXRAW_UPDATE_API` points it at a local test server (debug or `automation` builds),
 //! and a verified installer is never started.
+//!
+//! On Linux the check is the same (daily, switchable, same API and host rules), but nothing
+//! is downloaded or installed: an available release is reported with links to the release
+//! page and to its `.AppImage` / `.deb` packages, and "Update now" opens the release page.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -136,6 +140,20 @@ pub struct UpdateInfo {
     pub notes: String,
     pub installer: Option<Asset>,
     pub sums: Option<Asset>,
+    /// Linux packages (`.AppImage`, `.deb`) offered as links; empty when there are none.
+    pub packages: Vec<Asset>,
+}
+
+/// The Linux packages of `release` that may be linked to: names ending in `.AppImage` or
+/// `.deb`, with download URLs the update check accepts.
+pub fn linux_packages(release: &Release, test_server: bool) -> Vec<Asset> {
+    release
+        .assets
+        .iter()
+        .filter(|a| a.name.ends_with(".AppImage") || a.name.ends_with(".deb"))
+        .filter(|a| allowed_download_url(&a.browser_download_url, test_server))
+        .cloned()
+        .collect()
 }
 
 /// The release a `releases/latest` redirect landed on: `url` is `<tag_prefix><tag>` for a
@@ -196,6 +214,7 @@ pub fn offered_update(release: &Release, current: &str, test_server: bool) -> Op
     Some(UpdateInfo {
         installer: find(&wanted),
         sums: find(SUMS_NAME),
+        packages: linux_packages(release, test_server),
         version,
         page_url,
         notes: release.body.clone().unwrap_or_default().trim().to_string(),
@@ -274,8 +293,8 @@ fn unix_now() -> i64 {
 /// local test server). Debug and automation builds accept `ZXRAW_UPDATE_API` so tests can
 /// point the check at a local listener; release builds always ask GitHub.
 fn api_url(automated: bool) -> Option<String> {
-    // The check downloads through WinHTTP, which only Windows has (see `forge_win::http`).
-    if !cfg!(windows) {
+    // The check fetches through forge_win's HTTP client: WinHTTP on Windows, ureq on Linux.
+    if !cfg!(any(windows, target_os = "linux")) {
         return None;
     }
     #[cfg(any(debug_assertions, feature = "automation"))]
@@ -295,8 +314,12 @@ fn test_server() -> bool {
 }
 
 /// True when this exe was installed by the setup program (an uninstaller sits next to
-/// it); a portable copy from the zip gets the release page instead of the installer.
+/// it); a portable copy from the zip gets the release page instead of the installer. Never
+/// off Windows: there is no installer to run, only the release page with the packages.
 pub fn is_installed_copy() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     #[cfg(any(debug_assertions, feature = "automation"))]
     if std::env::var_os("ZXRAW_UPDATE_INSTALLED").is_some_and(|v| v == "1") {
         return true;
@@ -430,12 +453,6 @@ pub fn tick(app: &mut ZxrawApp) {
 /// "Check for updates" (Settings button and the command palette).
 pub fn check_now(app: &mut ZxrawApp) {
     if app.ops.updater.checking() {
-        return;
-    }
-    if !cfg!(windows) {
-        app.toast(format!(
-            "Update checks are not available on Linux; see {LATEST_PAGE_URL}"
-        ));
         return;
     }
     if api_url(app.testhook.active()).is_none() {
@@ -633,6 +650,11 @@ pub fn skip(app: &mut ZxrawApp, update: &UpdateInfo) {
 /// "Update now": download and verify the installer, or open the release page for a
 /// portable copy or a release without an installer.
 pub fn update_now(app: &mut ZxrawApp, update: &UpdateInfo) {
+    // Linux never downloads or runs an installer: the release page has the packages.
+    if !cfg!(windows) {
+        open_release_page(app, update);
+        return;
+    }
     if app.ops.updater.download_status().running {
         return;
     }
@@ -1329,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
+    #[cfg(any(windows, target_os = "linux"))] // Fetches through forge_win's HTTP client.
     fn only_a_rate_limited_api_uses_the_release_page() {
         let answer = |status: &str| {
             format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -1401,5 +1423,79 @@ mod tests {
             "{err}"
         );
         assert_eq!(leftovers(tmp.path()), 0);
+    }
+
+    #[test]
+    fn linux_packages_are_linked_only_from_the_projects_releases() {
+        let mut release = parse_release(FIXTURE.as_bytes()).unwrap();
+        let dl = "https://github.com/zuhuHix/zxraw-explorer/releases/download/v0.2.1/";
+        let asset = |name: &str, url: String| Asset {
+            name: name.into(),
+            browser_download_url: url,
+            size: 1,
+        };
+        release.assets = vec![
+            asset(
+                "ZXraw-Explorer-0.2.1-x86_64.AppImage",
+                format!("{dl}ZXraw-Explorer-0.2.1-x86_64.AppImage"),
+            ),
+            asset(
+                "zxraw-explorer_0.2.1_amd64.deb",
+                format!("{dl}zxraw-explorer_0.2.1_amd64.deb"),
+            ),
+            asset(
+                "ZXraw-Explorer-0.2.1-Setup-x64.exe",
+                format!("{dl}ZXraw-Explorer-0.2.1-Setup-x64.exe"),
+            ),
+            asset("evil.deb", "https://evil.example/evil.deb".into()),
+            asset("notes.zip", format!("{dl}notes.zip")),
+            asset("up.AppImage", format!("{dl}../up.AppImage")),
+        ];
+        let names: Vec<String> = linux_packages(&release, false)
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "ZXraw-Explorer-0.2.1-x86_64.AppImage",
+                "zxraw-explorer_0.2.1_amd64.deb"
+            ]
+        );
+        let update = offered_update(&release, "0.2.0", false).unwrap();
+        assert_eq!(update.packages.len(), 2);
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))] // Fetches through forge_win's HTTP client.
+    fn an_available_release_is_offered_as_links_without_an_installer() {
+        let dl = "https://github.com/zuhuHix/zxraw-explorer/releases/download/v9.0.0/";
+        let json = format!(
+            r#"{{
+                "tag_name": "v9.0.0",
+                "html_url": "https://github.com/zuhuHix/zxraw-explorer/releases/tag/v9.0.0",
+                "body": "Notes",
+                "assets": [
+                    {{"name": "ZXraw-Explorer-9.0.0-x86_64.AppImage", "size": 5,
+                      "browser_download_url": "{dl}ZXraw-Explorer-9.0.0-x86_64.AppImage"}},
+                    {{"name": "zxraw-explorer_9.0.0_amd64.deb", "size": 5,
+                      "browser_download_url": "{dl}zxraw-explorer_9.0.0_amd64.deb"}}
+                ]
+            }}"#
+        );
+        let base = serve(vec![("/api", json.into_bytes())]);
+        let release = fetch_release(&format!("{base}/api"), true).unwrap();
+        let update = offered_update(&release, "0.5.2", true).unwrap();
+        assert_eq!(update.version, "9.0.0");
+        assert_eq!(
+            update.page_url,
+            "https://github.com/zuhuHix/zxraw-explorer/releases/tag/v9.0.0"
+        );
+        assert!(update.installer.is_none() && update.sums.is_none());
+        assert_eq!(update.packages.len(), 2);
+        assert!(
+            offered_update(&release, "9.0.0", true).is_none(),
+            "nothing newer"
+        );
     }
 }

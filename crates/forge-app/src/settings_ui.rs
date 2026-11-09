@@ -390,12 +390,7 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
     let updates = UpdatesView {
         checking: app.ops.updater.checking(),
         last_result: app.ops.updater.last_result.clone(),
-        available: app
-            .ops
-            .updater
-            .available
-            .as_ref()
-            .map(|u| u.version.clone()),
+        available: app.ops.updater.available.clone(),
         downloading: app.ops.updater.download_status().running,
         ready: app.ops.updater.ready.is_some(),
         busy: app.ops.jobs.running_count() > 0,
@@ -609,7 +604,10 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
     );
     ui.checkbox(
         &mut settings.confirm_recycle,
-        "Confirm before moving items to the Recycle Bin",
+        format!(
+            "Confirm before moving items to the {}",
+            crate::platform::TRASH
+        ),
     );
     ui.checkbox(
         &mut settings.xmp_sidecar_sync,
@@ -1366,7 +1364,7 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
 struct UpdatesView {
     checking: bool,
     last_result: Option<crate::updater::CheckResult>,
-    available: Option<String>,
+    available: Option<crate::updater::UpdateInfo>,
     downloading: bool,
     ready: bool,
     busy: bool,
@@ -1390,20 +1388,6 @@ fn updates_page(
         crate::updater::CURRENT
     ));
     ui.add_space(6.0);
-    if !cfg!(windows) {
-        // No update check and no installer here: the releases page has the downloads.
-        ui.label(
-            RichText::new(
-                "On Linux ZXraw Explorer does not check for updates or install them. New releases, with a package for your system where one exists, are on the releases page.",
-            )
-            .weak(),
-        );
-        ui.add_space(6.0);
-        if ui.button("Open the releases page").clicked() {
-            intents.push(SettingsIntent::OpenReleasesPage);
-        }
-        return;
-    }
     ui.checkbox(
         &mut settings.check_updates,
         "Check for updates automatically",
@@ -1445,7 +1429,20 @@ fn updates_page(
             }
         }
     });
-    if view.available.is_some() {
+    if !cfg!(windows) {
+        // Linux: no in-place install. An available release is a link to its page and packages.
+        if let Some(update) = &view.available {
+            ui.add_space(6.0);
+            ui.hyperlink_to("Open the release page", &update.page_url);
+            for asset in &update.packages {
+                ui.hyperlink_to(format!("Download {}", asset.name), &asset.browser_download_url);
+            }
+        }
+        ui.add_space(6.0);
+        if ui.button("Open the releases page").clicked() {
+            intents.push(SettingsIntent::OpenReleasesPage);
+        }
+    } else if view.available.is_some() {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if view.ready {

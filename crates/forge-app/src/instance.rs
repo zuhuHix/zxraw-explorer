@@ -140,10 +140,6 @@ fn forward_only() -> bool {
 /// receives later launches.
 pub fn startup(launch: &Launch, settings: &crate::settings::Settings) -> Decision {
     let none = Decision::Run { inbox: None, server: None };
-    if !cfg!(windows) {
-        // Single-window launches go through a named pipe, which only Windows has here.
-        return none;
-    }
     let automated = crate::testhook::env_requests_automation();
     let Some(tag) = tag(automated) else {
         return none;
@@ -220,7 +216,15 @@ pub fn report_error(text: &str) {
     if forward_only() || crate::testhook::env_requests_automation() {
         return;
     }
+    #[cfg(windows)]
     forge_win::shell_verb_server::show_error(text);
+    // forge-win has no message box off Windows; rfd shows one through the desktop.
+    #[cfg(not(windows))]
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title("ZXraw Explorer")
+        .set_description(text)
+        .show();
 }
 
 /// Connects the inbox to the new window: a request repaints it (so an idle window takes it

@@ -643,16 +643,19 @@ the index, search, Git badges, copy, move and rename work. Everything Windows-on
 or refuses with a message; nothing should crash for lack of it.
 
 * Hidden on Linux (menus, command palette and shortcuts): the Default apps page, Explorer menu
-  and file type registration, app icon shortcuts, *Properties*, *Open with*, *Open terminal as
-  administrator*, network locations (the Network section and *Add network location*), and the
-  in-app updater and FFmpeg download (install `ffmpeg` with the package manager; the Updates
-  page links to the releases page). `forge-win` now has Linux backends for *Properties*, *Open
-  with* and network mounts (see [Linux platform behaviour](#linux-platform-behaviour)); the app
-  doesn't offer them on Linux yet.
-* The Recycle Bin (freedesktop trash), the file clipboard and single instance use the Linux
-  backends described under [Linux platform behaviour](#linux-platform-behaviour). Dragging files
-  out of the app is not available. The sidebar lists `/` and the mounts under `/media`,
-  `/run/media` and `/mnt`.
+  and file type registration, app icon shortcuts, *Open terminal as administrator*, and the
+  FFmpeg download. Install `ffmpeg` with the package manager: there is no versioned,
+  checksummed static Linux build to pin the way the Windows one is pinned.
+* Through the Linux backends in `forge-win` (see
+  [Linux platform behaviour](#linux-platform-behaviour)): the Trash (freedesktop), the file
+  clipboard, single instance (a second launch opens a tab in the running window), *Open with*
+  (XDG portal, else the default app), *Properties* (`FileManager1.ShowItemProperties`), *Show in
+  file manager*, and network locations (`gio mount`; shares that need a login fail with an
+  error that says so: mount them once in the file manager).
+* Updates: the daily check works, but nothing is installed in place. A new version shows a
+  notice with the release page and its AppImage and .deb downloads.
+* Dragging files out of the app is not available. The sidebar lists `/` and the mounts under
+  `/media`, `/run/media` and `/mnt`.
 * File dialogs need a running `xdg-desktop-portal` with a FileChooser backend; without one they
   don't open.
 * Names are case-sensitive: `IMG.jpg` and `img.jpg` are two files everywhere (index, notes,
