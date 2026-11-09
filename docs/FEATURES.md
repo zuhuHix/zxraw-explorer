@@ -855,6 +855,14 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   allow-list, the daily throttle and the release-page fallback (a local listener answering 403, then a redirect
   to a tag); e2e scenarios (`tests/e2e/system.rs`) serve a fake release from a local
   listener and check that a matching installer is accepted and a tampered one refused (no installer is run).
+* 🟡 Linux in-app update, per install type — `forge-app/src/updater/linux.rs`. An AppImage downloads the verified
+  file, copies it beside the old one, checks the hash again and renames it over the old path (no password). A `.deb`
+  is checked again and installed with `pkexec /usr/bin/apt-get install --no-remove` (the desktop asks for the password).
+  Other copies open the release page. "Restart now" starts the new copy. Unit tests cover AppImage detection, the atomic
+  replace (mode kept, a symlink keeps its target, a changed download or an unwritable folder leaves the old file), and
+  the `.deb` checks and pkexec outcomes (a stub pkexec). e2e (`system::linux_appimage_*`) updates a fake AppImage in the
+  sandbox against a local test server: replaced and restart offered, tampered download refused, read-only folder saved
+  to Downloads. All pass in this checkout; the `.deb` path with a real polkit agent has not been tried on a desktop.
 
 ## Recently hardened
 

@@ -8,6 +8,9 @@
 //! - `wait-update <version>`: wait until the "update available" notice offers `version`
 //!   (the check runs a few seconds after startup; needs `ZXRAW_UPDATE_API`).
 //! - `update-now`: press the notice's "Update now".
+//! - `update-restart`: press "Restart now" / "Restart and update" (automated runs only toast).
+//! - `assert-update-status <text>`: require that the last Linux update ended as `text`
+//!   (`installed`, `cancelled`, `failed`, `saved-instead`, `package-installer`).
 //! - `assert-no-update`: require that no update notice is showing.
 //! - `click-menu <label>`: real click on the open context menu's item `label`.
 //! - `wait-terminal <folder> [| seconds]`: wait until "Open terminal here" has (in automated
@@ -365,6 +368,27 @@ pub(super) fn step(
                 .ok_or("no update notice is showing")?;
             crate::updater::update_now(app, &update);
             Ok(Flow::Done)
+        }
+        "update-restart" => {
+            crate::updater::install_when_idle(app, ctx);
+            Ok(Flow::Done)
+        }
+        "assert-update-status" => {
+            use crate::updater::LinuxStatus;
+            let wanted = args.trim();
+            let actual = match &app.ops.updater.linux {
+                None => "none",
+                Some(LinuxStatus::Installed { .. }) => "installed",
+                Some(LinuxStatus::Cancelled { .. }) => "cancelled",
+                Some(LinuxStatus::Failed { .. }) => "failed",
+                Some(LinuxStatus::SavedInstead { .. }) => "saved-instead",
+                Some(LinuxStatus::PackageInstaller { .. }) => "package-installer",
+            };
+            if actual == wanted {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("the update status is {actual}, not {wanted}"))
+            }
         }
         "assert-no-update" => match &app.notices.update {
             None => Ok(Flow::Done),

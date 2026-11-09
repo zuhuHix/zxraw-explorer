@@ -24,9 +24,18 @@
 //! `ZXRAW_UPDATE_API` points it at a local test server (debug or `automation` builds),
 //! and a verified installer is never started.
 //!
-//! On Linux the check is the same (daily, switchable, same API and host rules), but nothing
-//! is downloaded or installed: an available release is reported with links to the release
-//! page and to its `.AppImage` / `.deb` packages, and "Update now" opens the release page.
+//! On Linux the check is the same (daily, switchable, same API and host rules). "Update now"
+//! depends on how the app was installed (`linux::detect`, run off the UI thread with the
+//! check): an AppImage downloads `SHA256SUMS-linux.txt` and the release's
+//! `ZXraw-Explorer-<version>-x86_64.AppImage` with the same host, size and checksum rules,
+//! then replaces itself in place (an atomic rename, no password); the `.deb` downloads
+//! `zxraw_<version>_amd64.deb` and installs it with `pkexec apt-get`, which asks for the
+//! password. The notice then offers "Restart now", which starts the new copy once this one
+//! has closed and saved its settings. Any other copy (a build folder, a copied binary) gets
+//! the release page with its packages, as before. See `linux.rs` for the install steps.
+
+#[cfg(target_os = "linux")]
+mod linux;
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -60,6 +69,8 @@ const DOWNLOAD_CDN_HOSTS: &[&str] = &[
     "release-assets.githubusercontent.com",
 ];
 const SUMS_NAME: &str = "SHA256SUMS.txt";
+/// The Linux packages' checksum list (`packaging/linux/build-linux.sh`).
+const LINUX_SUMS_NAME: &str = "SHA256SUMS-linux.txt";
 
 /// The automatic check runs at most this often.
 const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
@@ -142,6 +153,10 @@ pub struct UpdateInfo {
     pub sums: Option<Asset>,
     /// Linux packages (`.AppImage`, `.deb`) offered as links; empty when there are none.
     pub packages: Vec<Asset>,
+    /// This version's AppImage, .deb and their checksum list, for installing in place.
+    pub appimage: Option<Asset>,
+    pub deb: Option<Asset>,
+    pub linux_sums: Option<Asset>,
 }
 
 /// The Linux packages of `release` that may be linked to: names ending in `.AppImage` or
@@ -177,15 +192,29 @@ pub fn release_from_tag_url(url: &str, tag_prefix: &str, download_prefix: &str) 
         body: None,
         draft: false,
         prerelease: false,
-        assets: vec![
-            asset(installer_name(&format!("{major}.{minor}.{patch}"))),
-            asset(SUMS_NAME.to_string()),
-        ],
+        assets: {
+            let version = format!("{major}.{minor}.{patch}");
+            vec![
+                asset(installer_name(&version)),
+                asset(SUMS_NAME.to_string()),
+                asset(appimage_name(&version)),
+                asset(deb_name(&version)),
+                asset(LINUX_SUMS_NAME.to_string()),
+            ]
+        },
     })
 }
 
 pub fn installer_name(version: &str) -> String {
     format!("ZXraw-Explorer-{version}-Setup-x64.exe")
+}
+
+pub fn appimage_name(version: &str) -> String {
+    format!("ZXraw-Explorer-{version}-x86_64.AppImage")
+}
+
+pub fn deb_name(version: &str) -> String {
+    format!("zxraw_{version}_amd64.deb")
 }
 
 /// The update `release` offers over `current`, if any: drafts, pre-releases and tags that
@@ -215,6 +244,9 @@ pub fn offered_update(release: &Release, current: &str, test_server: bool) -> Op
         installer: find(&wanted),
         sums: find(SUMS_NAME),
         packages: linux_packages(release, test_server),
+        appimage: find(&appimage_name(&version)),
+        deb: find(&deb_name(&version)),
+        linux_sums: find(LINUX_SUMS_NAME),
         version,
         page_url,
         notes: release.body.clone().unwrap_or_default().trim().to_string(),
@@ -330,6 +362,93 @@ pub fn is_installed_copy() -> bool {
         .unwrap_or(false)
 }
 
+/// What "Update now" does for this copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum SelfUpdate {
+    /// Windows, installed by the setup program: download and run the installer.
+    Installer,
+    /// Linux AppImage: replace the file, no password.
+    AppImage,
+    /// Linux .deb: install with pkexec apt-get, which asks for the password.
+    Deb,
+    /// A portable or unpackaged copy: open the release page.
+    PageOnly,
+}
+
+impl SelfUpdate {
+    pub fn installs(self) -> bool {
+        self != Self::PageOnly
+    }
+}
+
+/// How this copy updates. On Linux it is known once the first update check has run
+/// ([`linux::detect`] runs on the check's thread); until then it is [`SelfUpdate::PageOnly`].
+pub fn self_update() -> SelfUpdate {
+    if cfg!(windows) {
+        return if is_installed_copy() {
+            SelfUpdate::Installer
+        } else {
+            SelfUpdate::PageOnly
+        };
+    }
+    #[cfg(target_os = "linux")]
+    match LINUX_KIND.get() {
+        Some(linux::InstallKind::AppImage(_)) => return SelfUpdate::AppImage,
+        Some(linux::InstallKind::Deb) => return SelfUpdate::Deb,
+        _ => {}
+    }
+    SelfUpdate::PageOnly
+}
+
+/// This process's install kind, found once off the UI thread.
+#[cfg(target_os = "linux")]
+static LINUX_KIND: std::sync::OnceLock<linux::InstallKind> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "linux")]
+fn linux_kind() -> &'static linux::InstallKind {
+    LINUX_KIND.get_or_init(|| {
+        let kind = linux::detect();
+        tracing::info!("update method: {kind:?}");
+        kind
+    })
+}
+
+/// The program to start once this process has closed ("Restart now"), set just before the
+/// window closes and taken by `main` after the event loop ends.
+static RELAUNCH: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Starts the program "Restart now" asked for, if any. Called by `main` once the window has
+/// closed and the settings are saved, after the single-instance pipe is gone.
+pub fn relaunch_after_exit() {
+    let Some(program) = RELAUNCH.lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    match linux::relaunch(&program) {
+        Ok(()) => tracing::info!("started the updated {}", program.display()),
+        Err(e) => tracing::warn!("could not start the updated {}: {e}", program.display()),
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = program;
+}
+
+/// Where a Linux update stands after its job ended, for the notice and Settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum LinuxStatus {
+    /// Installed; "Restart now" starts `restart`.
+    Installed { restart: PathBuf },
+    /// The password dialog was dismissed; the verified package is kept.
+    Cancelled { file: PathBuf },
+    /// apt-get failed with this output.
+    Failed { error: String, file: PathBuf },
+    /// The AppImage's folder is not writable: the verified AppImage was saved here instead.
+    SavedInstead { file: PathBuf, reason: String },
+    /// No pkexec or polkit agent: the package was opened in the desktop's package installer.
+    PackageInstaller { file: PathBuf },
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -363,6 +482,8 @@ pub struct Updater {
     /// (including the download job winding down) has ended shortly after; otherwise the
     /// notice offers "Restart and update".
     install_after: Option<Instant>,
+    /// Linux: how the last "Update now" ended.
+    pub linux: Option<LinuxStatus>,
 }
 
 impl Default for Updater {
@@ -376,6 +497,7 @@ impl Default for Updater {
             download: None,
             ready: None,
             install_after: None,
+            linux: None,
         }
     }
 }
@@ -385,7 +507,12 @@ impl Default for Updater {
 pub struct DownloadStatus {
     pub running: bool,
     pub fraction: Option<f32>,
+    /// The job is waiting for pkexec (the password dialog); it cannot be cancelled then.
+    pub waiting_for_password: bool,
 }
+
+/// What a Linux update job reports while pkexec runs.
+const WAITING_FOR_PASSWORD: &str = "Waiting for your password…";
 
 impl Updater {
     pub fn checking(&self) -> bool {
@@ -394,14 +521,23 @@ impl Updater {
 
     pub fn download_status(&self) -> DownloadStatus {
         match &self.download {
-            Some(job) if !job.state().is_finished() => DownloadStatus {
-                running: true,
-                fraction: (job.state() == JobState::Running)
-                    .then(|| job.progress.snapshot().fraction())
-                    .flatten(),
-            },
+            Some(job) if !job.state().is_finished() => {
+                let snapshot = job.progress.snapshot();
+                DownloadStatus {
+                    running: true,
+                    fraction: (job.state() == JobState::Running)
+                        .then(|| snapshot.fraction())
+                        .flatten(),
+                    waiting_for_password: snapshot.current == WAITING_FOR_PASSWORD,
+                }
+            }
             _ => DownloadStatus::default(),
         }
+    }
+
+    /// An installed update waits for "Restart now" (Windows: a verified installer waits).
+    pub fn restart_ready(&self) -> bool {
+        self.ready.is_some() || matches!(self.linux, Some(LinuxStatus::Installed { .. }))
     }
 
     pub fn cancel_download(&self) {
@@ -475,6 +611,8 @@ fn start_check(app: &mut ZxrawApp, manual: bool) {
         .name("update-check".into())
         .spawn(move || {
             sweep_stale(&std::env::temp_dir());
+            #[cfg(target_os = "linux")]
+            linux_kind();
             let result = fetch_release(&url, test_server());
             let _ = tx.send(Event::UpdateChecked(Checked { manual, result }));
             ctx.request_repaint();
@@ -636,6 +774,23 @@ pub fn open_release_page(app: &mut ZxrawApp, update: &UpdateInfo) {
         .spawn_shell("Open the release page", move || forge_win::open_url(&url));
 }
 
+/// "Open the file" (a kept .deb, in the package installer) or "Open download folder" (the
+/// saved AppImage, selected in the file manager).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn open_kept_file(app: &mut ZxrawApp, path: PathBuf, reveal: bool) {
+    if app.testhook.active() {
+        app.toast(format!("Would open {}", path.display()));
+        return;
+    }
+    if reveal {
+        app.ops
+            .spawn_shell("Open the download folder", move || forge_win::reveal_in_explorer(&path));
+    } else {
+        app.ops
+            .spawn_shell("Open the file", move || forge_win::open_default(&path));
+    }
+}
+
 pub fn skip(app: &mut ZxrawApp, update: &UpdateInfo) {
     app.settings.skipped_update = Some(update.version.clone());
     app.notices.update = None;
@@ -649,8 +804,11 @@ pub fn skip(app: &mut ZxrawApp, update: &UpdateInfo) {
 /// "Update now": download and verify the installer, or open the release page for a
 /// portable copy or a release without an installer.
 pub fn update_now(app: &mut ZxrawApp, update: &UpdateInfo) {
-    // Linux never downloads or runs an installer: the release page has the packages.
+    // Linux replaces the AppImage or installs the .deb; other copies get the release page.
     if !cfg!(windows) {
+        #[cfg(target_os = "linux")]
+        linux_update_now(app, update);
+        #[cfg(not(target_os = "linux"))]
         open_release_page(app, update);
         return;
     }
@@ -702,8 +860,13 @@ pub fn downloaded(app: &mut ZxrawApp, result: Result<PathBuf, String>) {
 }
 
 /// Starts the waiting installer unless file operations are still running (closing the app
-/// would cancel them); the notice then offers "Restart and update" once they finish.
+/// would cancel them); the notice then offers "Restart and update" once they finish. On
+/// Linux the update is already installed: this is "Restart now".
 pub fn install_when_idle(app: &mut ZxrawApp, ctx: &egui::Context) {
+    if !cfg!(windows) {
+        restart_now(app, ctx);
+        return;
+    }
     let Some(installer) = app.ops.updater.ready.clone() else {
         return;
     };
@@ -749,6 +912,198 @@ pub fn install_when_idle(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 }
 
+/// "Restart now" after a Linux update: closes the window through the normal shutdown path
+/// (settings and session saved), then `main` starts the new copy. Waits, like the
+/// installer, while file operations run.
+pub fn restart_now(app: &mut ZxrawApp, ctx: &egui::Context) {
+    let Some(LinuxStatus::Installed { restart }) = app.ops.updater.linux.clone() else {
+        return;
+    };
+    if app.ops.jobs.running_count() > 0 {
+        return;
+    }
+    if app.testhook.active() {
+        app.toast(format!("Update installed; would restart {}", restart.display()));
+        app.ops.updater.linux = None;
+        app.notices.update = None;
+        return;
+    }
+    tracing::info!("restarting into the updated {}", restart.display());
+    if let Ok(mut slot) = RELAUNCH.lock() {
+        *slot = Some(restart);
+    }
+    app.save_all();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+}
+
+/// "Update now" on Linux: download and verify this copy's package in a job, then install it.
+#[cfg(target_os = "linux")]
+fn linux_update_now(app: &mut ZxrawApp, update: &UpdateInfo) {
+    if app.ops.updater.download_status().running {
+        return;
+    }
+    let kind = linux_kind().clone();
+    let asset = match &kind {
+        linux::InstallKind::AppImage(_) => update.appimage.clone(),
+        linux::InstallKind::Deb => update.deb.clone(),
+        linux::InstallKind::Other => {
+            open_release_page(app, update);
+            return;
+        }
+    };
+    let (Some(asset), Some(sums)) = (asset, update.linux_sums.clone()) else {
+        app.toast_err(format!(
+            "ZXraw Explorer {} has no verifiable Linux package on GitHub; opening the release page",
+            update.version
+        ));
+        open_release_page(app, update);
+        return;
+    };
+    let automated = app.testhook.active();
+    app.ops.updater.linux = None;
+    let test = test_server();
+    let version = update.version.clone();
+    let tx = app.ops.tx.clone();
+    let ctx = app.ops.ctx.clone();
+    let title = format!("Downloading ZXraw Explorer {}", update.version);
+    let job = app.ops.jobs.spawn("update", title, move |job| {
+        let result = linux_install(&kind, &asset, &sums, &version, automated, test, job);
+        let event = match &result {
+            Err(_) if job.cancel.is_cancelled() => Event::Toast("Update download cancelled".into()),
+            Ok(None) => Event::Toast(format!(
+                "Update verified; would run pkexec {}",
+                linux::APT_GET
+            )),
+            _ => Event::LinuxUpdate(result.clone().map(|status| status.expect("checked above"))),
+        };
+        let _ = tx.send(event);
+        ctx.request_repaint();
+        result.map(|_| ())
+    });
+    app.ops.updater.download = Some(job);
+}
+
+/// The job behind [`linux_update_now`]. `Ok(None)`: an automated run stopped before pkexec.
+#[cfg(target_os = "linux")]
+fn linux_install(
+    kind: &linux::InstallKind,
+    asset: &Asset,
+    sums: &Asset,
+    version: &str,
+    automated: bool,
+    test: bool,
+    job: &JobHandle,
+) -> Result<Option<LinuxStatus>, String> {
+    let extension = match kind {
+        linux::InstallKind::AppImage(_) => ".AppImage",
+        _ => ".deb",
+    };
+    if let linux::InstallKind::AppImage(path) = kind
+        && automated
+        && !linux::inside_sandbox(path, std::env::var_os("ZXRAW_SCRIPT_SANDBOX"))
+    {
+        return Err(format!(
+            "automated runs only replace an AppImage inside the test sandbox, not {}",
+            path.display()
+        ));
+    }
+    let (file, digest) = download_checked(
+        asset,
+        sums,
+        LINUX_SUMS_NAME,
+        extension,
+        "package",
+        &std::env::temp_dir(),
+        test,
+        job,
+    )?;
+    let folder = file.parent().map(Path::to_path_buf);
+    let mut cleanup = RemoveOnDrop(folder.clone());
+    match kind {
+        linux::InstallKind::AppImage(appimage) => {
+            job.progress.set_current("Installing the new AppImage");
+            match linux::replace_appimage(&file, &digest, appimage) {
+                Ok(real) => {
+                    job.log(format!("replaced {}", real.display()));
+                    Ok(Some(LinuxStatus::Installed { restart: appimage.clone() }))
+                }
+                Err(linux::ReplaceError::NotWritable(reason)) => {
+                    tracing::info!("cannot replace the AppImage: {reason}");
+                    let downloads = forge_win::known_folders()
+                        .into_iter()
+                        .find(|(label, _)| label == "Downloads" || label == "Home")
+                        .map(|(_, path)| path)
+                        .ok_or("there is no Downloads or home folder to save the AppImage in")?;
+                    let saved = linux::save_copy(&file, &digest, &downloads, &asset.name, true)?;
+                    Ok(Some(LinuxStatus::SavedInstead { file: saved, reason }))
+                }
+                Err(linux::ReplaceError::Failed(error)) => Err(error),
+            }
+        }
+        _ if automated => Ok(None),
+        _ => {
+            // Kept until the user is done with it (opened, or retried); swept after a day.
+            cleanup.0 = None;
+            job.progress.set_current(WAITING_FOR_PASSWORD);
+            linux::check_deb(&file, &digest)?;
+            match linux::run_pkexec(Path::new(linux::PKEXEC), Path::new(linux::APT_GET), &file) {
+                linux::DebOutcome::Installed => {
+                    let installed = linux::installed_deb_version();
+                    if installed.as_deref().is_some_and(|v| v != version) {
+                        return Ok(Some(LinuxStatus::Failed {
+                            error: format!(
+                                "apt-get finished, but the installed version is {}, not {version}",
+                                installed.unwrap_or_default()
+                            ),
+                            file,
+                        }));
+                    }
+                    job.log(format!("installed {}", asset.name));
+                    cleanup.0 = folder;
+                    Ok(Some(LinuxStatus::Installed { restart: PathBuf::from(linux::DEB_EXE) }))
+                }
+                linux::DebOutcome::Cancelled => Ok(Some(LinuxStatus::Cancelled { file })),
+                linux::DebOutcome::NoAgent => match forge_win::open_default(&file) {
+                    Ok(()) => Ok(Some(LinuxStatus::PackageInstaller { file })),
+                    Err(e) => Ok(Some(LinuxStatus::Failed {
+                        error: format!(
+                            "there is no password prompt (pkexec and a polkit agent) and the package could not be opened: {e}"
+                        ),
+                        file,
+                    })),
+                },
+                linux::DebOutcome::Failed(error) => Ok(Some(LinuxStatus::Failed { error, file })),
+            }
+        }
+    }
+}
+
+/// A Linux update job ended (called from `actions::poll`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn linux_finished(app: &mut ZxrawApp, result: Result<LinuxStatus, String>) {
+    match result {
+        Ok(status) => {
+            match &status {
+                LinuxStatus::Installed { .. } => app.toast("Update installed; restart ZXraw Explorer to use it"),
+                LinuxStatus::Cancelled { .. } => app.toast("Update cancelled"),
+                LinuxStatus::Failed { .. } => app.toast_err("The update could not be installed"),
+                LinuxStatus::SavedInstead { file, .. } => {
+                    app.toast(format!("The new AppImage was saved as {}", file.display()))
+                }
+                LinuxStatus::PackageInstaller { .. } => {
+                    app.toast("Finish the install in the Package Installer, then restart ZXraw Explorer")
+                }
+            }
+            app.ops.updater.linux = Some(status);
+            // The notice shows what happened and what to do next.
+            if app.notices.update.is_none() {
+                app.notices.update = app.ops.updater.available.clone();
+            }
+        }
+        Err(error) => app.toast_err(format!("Could not update ZXraw Explorer: {error}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Download and verification
 // ---------------------------------------------------------------------------
@@ -763,6 +1118,24 @@ pub fn download_verified(
     test_server: bool,
     job: &JobHandle,
 ) -> Result<PathBuf, String> {
+    download_checked(installer, sums, SUMS_NAME, ".exe", "installer", temp, test_server, job)
+        .map(|(path, _)| path)
+}
+
+/// [`download_verified`] for any release file: `installer` must end in `extension` and be
+/// listed in the checksum list `sums_name`; `what` names it in messages. Returns the file
+/// and its SHA-256. The folder is private (0700) on Linux.
+#[allow(clippy::too_many_arguments)]
+fn download_checked(
+    installer: &Asset,
+    sums: &Asset,
+    sums_name: &str,
+    extension: &str,
+    what: &str,
+    temp: &Path,
+    test_server: bool,
+    job: &JobHandle,
+) -> Result<(PathBuf, String), String> {
     for asset in [installer, sums] {
         if !allowed_download_url(&asset.browser_download_url, test_server) {
             return Err(format!(
@@ -771,12 +1144,15 @@ pub fn download_verified(
             ));
         }
     }
-    if installer.name.contains(['/', '\\', ':']) || !installer.name.ends_with(".exe") {
-        return Err(format!("unexpected installer name {:?}", installer.name));
+    if installer.name.contains(['/', '\\', ':'])
+        || installer.name.starts_with('.')
+        || !installer.name.ends_with(extension)
+    {
+        return Err(format!("unexpected {what} name {:?}", installer.name));
     }
     if installer.size > MAX_INSTALLER_BYTES {
         return Err(format!(
-            "unexpected installer size ({} bytes)",
+            "unexpected {what} size ({} bytes)",
             installer.size
         ));
     }
@@ -785,15 +1161,20 @@ pub fn download_verified(
         .unwrap_or_default()
         .as_nanos();
     let dir = temp.join(format!("{TEMP_PREFIX}{}-{nanos}", std::process::id()));
-    fs::create_dir(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    // Private to this user (0700) on Linux: the .deb is handed to apt from here.
+    #[cfg(target_os = "linux")]
+    let created = linux::create_private_dir(&dir);
+    #[cfg(not(target_os = "linux"))]
+    let created = fs::create_dir(&dir);
+    created.map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let mut cleanup = RemoveOnDrop(Some(dir.clone()));
 
     job.progress.set_current("Downloading the checksum list");
-    let sums_text = fetch_small(&sums.browser_download_url, MAX_SUMS_BYTES, test_server, job)?;
+    let sums_text = fetch_small(&sums.browser_download_url, MAX_SUMS_BYTES, sums_name, test_server, job)?;
     let expected =
         checksum_for(&String::from_utf8_lossy(&sums_text), &installer.name).ok_or_else(|| {
             format!(
-                "{SUMS_NAME} has no checksum for {}; nothing was installed",
+                "{sums_name} has no checksum for {}; nothing was installed",
                 installer.name
             )
         })?;
@@ -807,18 +1188,19 @@ pub fn download_verified(
     let part = dir.join(format!("{}.part", installer.name));
     let digest = fetch_to_file(installer, &part, test_server, job)?;
     if digest != expected {
+        let not = if what == "installer" { "run" } else { "installed" };
         return Err(format!(
-            "the downloaded installer does not match its SHA-256 checksum, so it was not run \
+            "the downloaded {what} does not match its SHA-256 checksum, so it was not {not} \
              (expected {expected}, got {digest})"
         ));
     }
-    fs::rename(&part, &target).map_err(|e| format!("cannot save the installer: {e}"))?;
+    fs::rename(&part, &target).map_err(|e| format!("cannot save the {what}: {e}"))?;
     job.log(format!(
         "downloaded {}, SHA-256 {digest} verified",
         installer.name
     ));
     cleanup.0 = None;
-    Ok(target)
+    Ok((target, digest))
 }
 
 fn fetch_options<'a>(final_ok: &'a dyn Fn(&str) -> bool) -> forge_win::http::Options<'a> {
@@ -828,7 +1210,13 @@ fn fetch_options<'a>(final_ok: &'a dyn Fn(&str) -> bool) -> forge_win::http::Opt
     }
 }
 
-fn fetch_small(url: &str, limit: u64, test: bool, job: &JobHandle) -> Result<Vec<u8>, String> {
+fn fetch_small(
+    url: &str,
+    limit: u64,
+    name: &str,
+    test: bool,
+    job: &JobHandle,
+) -> Result<Vec<u8>, String> {
     let final_ok = |u: &str| allowed_final_url(u, test);
     let mut body = Vec::new();
     let mut stop = None;
@@ -838,7 +1226,7 @@ fn fetch_small(url: &str, limit: u64, test: bool, job: &JobHandle) -> Result<Vec
             return ControlFlow::Break(());
         }
         if body.len() as u64 + chunk.len() as u64 > limit {
-            stop = Some(format!("{SUMS_NAME} is unexpectedly large"));
+            stop = Some(format!("{name} is unexpectedly large"));
             return ControlFlow::Break(());
         }
         body.extend_from_slice(chunk);
@@ -1186,7 +1574,6 @@ mod tests {
         )
     }
 
-#[cfg_attr(not(windows), allow(dead_code))]
     fn sums_for(body: &[u8]) -> Vec<u8> {
         let hash: String = Sha256::digest(body)
             .iter()
@@ -1200,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
+    #[cfg(any(windows, target_os = "linux"))] // Downloads through forge_win's HTTP client.
     fn a_verified_installer_is_kept_and_a_tampered_one_refused() {
         let good = b"MZ pretend installer".to_vec();
         let mut tampered = good.clone();
@@ -1302,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
+    #[cfg(any(windows, target_os = "linux"))] // Downloads through forge_win's HTTP client.
     fn a_rate_limited_check_falls_back_to_the_release_page() {
         let good = b"MZ pretend installer".to_vec();
         let base = serve(vec![
@@ -1397,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
+    #[cfg(any(windows, target_os = "linux"))] // Downloads through forge_win's HTTP client.
     fn an_installer_of_unknown_size_still_needs_its_checksum() {
         let good = b"MZ pretend installer".to_vec();
         let mut tampered = good.clone();

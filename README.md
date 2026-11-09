@@ -501,8 +501,15 @@ glibc 2.39 or newer (Ubuntu 24.04, Linux Mint 22, Debian 13, Fedora 40 or later)
   page can add one to the applications menu, and remove it again.
 
 Video thumbnails and technical metadata need `ffmpeg` and `ffprobe` on `PATH`
-(`sudo apt install ffmpeg`). The daily update check works on Linux too, but nothing is installed
-in place: a new version shows a notice with links to its AppImage and .deb. Features that are Windows-only are listed under
+(`sudo apt install ffmpeg`).
+
+The daily update check works on Linux too. "Update now" installs the new version:
+
+- **AppImage:** the file replaces itself, with no password.
+- **Debian package:** the update runs `apt` through `pkexec`, so your desktop asks for your password.
+
+Then choose "Restart now". A copy that is neither (for example, one built from source) gets the
+release page instead. Features that are Windows-only are listed under
 [Linux](docs/LIMITATIONS.md#linux) in the known limitations.
 
 ---

@@ -89,9 +89,11 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
         return;
     };
     let download = app.ops.updater.download_status();
-    let ready = app.ops.updater.ready.is_some();
+    let ready = app.ops.updater.restart_ready();
     let busy = app.ops.jobs.running_count() > 0;
-    let installed = crate::updater::is_installed_copy();
+    let method = crate::updater::self_update();
+    let installed = method.installs();
+    let linux = app.ops.updater.linux.clone();
     let mut open = true;
     let mut dismiss = false;
     let mut action = None;
@@ -113,7 +115,13 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
                 });
             }
             ui.add_space(6.0);
-            if download.running {
+            if download.running && download.waiting_for_password {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Waiting for your password…");
+                });
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            } else if download.running {
                 ui.horizontal(|ui| {
                     match download.fraction {
                         Some(f) => {
@@ -130,8 +138,13 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
                 });
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             } else if ready {
-                ui.label("The update is downloaded and verified. ZXraw Explorer closes, updates and starts again.");
-                let restart = ui.add_enabled(!busy, egui::Button::new(RichText::new("Restart and update").strong()));
+                let (text, button) = if cfg!(windows) {
+                    ("The update is downloaded and verified. ZXraw Explorer closes, updates and starts again.", "Restart and update")
+                } else {
+                    ("The update is installed. Restart ZXraw Explorer to use it.", "Restart now")
+                };
+                ui.label(text);
+                let restart = ui.add_enabled(!busy, egui::Button::new(RichText::new(button).strong()));
                 if busy {
                     restart.on_disabled_hover_text("Wait for the running operations to finish");
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
@@ -139,17 +152,39 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
                     action = Some(UpdateAction::Install);
                 }
             } else {
-                if installed {
-                    ui.label(RichText::new("Update now downloads the installer, checks its SHA-256, then restarts ZXraw Explorer.").weak());
+                if let Some(status) = &linux {
+                    linux_status(ui, status, &mut action);
+                    ui.add_space(4.0);
+                }
+                let explain = match method {
+                    crate::updater::SelfUpdate::Installer => {
+                        Some("Update now downloads the installer, checks its SHA-256, then restarts ZXraw Explorer.")
+                    }
+                    crate::updater::SelfUpdate::AppImage => {
+                        Some("Update now downloads the new AppImage, checks its SHA-256 and puts it in place of this one. No password is needed.")
+                    }
+                    crate::updater::SelfUpdate::Deb => {
+                        Some("Update now downloads the .deb, checks its SHA-256 and installs it. You are asked for your password.")
+                    }
+                    crate::updater::SelfUpdate::PageOnly => None,
+                };
+                if let Some(explain) = explain.filter(|_| linux.is_none()) {
+                    ui.label(RichText::new(explain).weak());
                 }
                 ui.horizontal(|ui| {
-                    let label = if installed { "Update now" } else { "Download" };
+                    let label = if installed {
+                        "Update now"
+                    } else if cfg!(windows) {
+                        "Download"
+                    } else {
+                        "Open the release page"
+                    };
                     let hover = if installed {
                         "Download, verify and install the update, then restart"
                     } else if cfg!(windows) {
                         "This is a portable copy: opens the release page to download the new zip"
                     } else {
-                        "Opens the release page, with the AppImage and .deb packages"
+                        "This copy was not installed from the AppImage or the .deb: opens the release page with both"
                     };
                     if ui.button(RichText::new(label).strong()).on_hover_text(hover).clicked() {
                         action = Some(UpdateAction::Update);
@@ -171,6 +206,8 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
         Some(UpdateAction::Page) => crate::updater::open_release_page(app, &update),
         Some(UpdateAction::Skip) => crate::updater::skip(app, &update),
         Some(UpdateAction::Install) => crate::updater::install_when_idle(app, ctx),
+        Some(UpdateAction::OpenFile(path)) => crate::updater::open_kept_file(app, path, false),
+        Some(UpdateAction::Reveal(path)) => crate::updater::open_kept_file(app, path, true),
         None => {}
     }
     if !open || dismiss {
@@ -179,11 +216,50 @@ fn update_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
     }
 }
 
+/// How the last Linux "Update now" stopped short of "Restart now".
+fn linux_status(ui: &mut egui::Ui, status: &crate::updater::LinuxStatus, action: &mut Option<UpdateAction>) {
+    use crate::updater::LinuxStatus;
+    let warn = ui.visuals().warn_fg_color;
+    match status {
+        LinuxStatus::Installed { .. } => {}
+        LinuxStatus::Cancelled { file } => {
+            ui.label("Update cancelled. The verified package is kept; Update now asks for the password again.");
+            if ui.button("Open the file").on_hover_text("Opens the .deb in the package installer").clicked() {
+                *action = Some(UpdateAction::OpenFile(file.clone()));
+            }
+        }
+        LinuxStatus::Failed { error, file } => {
+            ui.label(RichText::new("The update could not be installed:").color(warn));
+            egui::ScrollArea::vertical().id_salt("update-error").max_height(120.0).show(ui, |ui| {
+                ui.add(egui::Label::new(RichText::new(error).small().monospace()).wrap());
+            });
+            if ui.button("Open the file").on_hover_text("Opens the verified .deb in the package installer").clicked() {
+                *action = Some(UpdateAction::OpenFile(file.clone()));
+            }
+        }
+        LinuxStatus::SavedInstead { file, reason } => {
+            ui.label(RichText::new(format!("ZXraw Explorer cannot replace its AppImage ({reason}).")).color(warn));
+            ui.label(format!(
+                "The verified new AppImage was saved as {}. Move it in place of the old one, or start it from there.",
+                file.display()
+            ));
+            if ui.button("Open download folder").clicked() {
+                *action = Some(UpdateAction::Reveal(file.clone()));
+            }
+        }
+        LinuxStatus::PackageInstaller { .. } => {
+            ui.label("Finish the install in the Package Installer, then restart ZXraw Explorer.");
+        }
+    }
+}
+
 enum UpdateAction {
     Update,
     Page,
     Skip,
     Install,
+    OpenFile(PathBuf),
+    Reveal(PathBuf),
 }
 
 fn crash_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
