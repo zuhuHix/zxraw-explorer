@@ -142,9 +142,11 @@ impl Viewer {
                 return;
             }
             Some(DecodeError::NoFfmpeg) => {
-                let mut body = String::from(
-                    "Install FFmpeg and make sure ffmpeg.exe is on PATH (or set its folder in \
+                let mut body = format!(
+                    "Install FFmpeg and make sure {} is on PATH (or set its folder in \
                      Settings). ZXraw Explorer then shows a representative frame here.",
+                    // Not `platform::exe_name`: the viewer demo example builds this file alone.
+                    if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" },
                 );
                 if let Some(sz) = self.meta.get(item).and_then(|m| m.file_size) {
                     body.push_str(&format!("\n\nFile size: {}", style::human_size(sz)));

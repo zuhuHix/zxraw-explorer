@@ -557,9 +557,8 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
         Cmd::RevealInExplorer if app.pane().archive.is_some() => {
             // Items inside an archive are not files Explorer could show: show the archive.
             if let Some(p) = app.pane().archive.as_ref().map(|a| a.archive.clone()) {
-                app.ops.spawn_shell("Show in Explorer", move || {
-                    forge_win::reveal_in_explorer(&p)
-                });
+                app.ops
+                    .spawn_shell("Show in Explorer", move || crate::platform::reveal(&p));
             }
         }
         Cmd::RevealInExplorer => {
@@ -569,9 +568,8 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
                 .into_iter()
                 .next()
                 .unwrap_or(dir);
-            app.ops.spawn_shell("Show in Explorer", move || {
-                forge_win::reveal_in_explorer(&p)
-            });
+            app.ops
+                .spawn_shell("Show in Explorer", move || crate::platform::reveal(&p));
         }
         Cmd::Copy | Cmd::Cut => {
             let paths = app.pane().action_targets();
@@ -1565,7 +1563,7 @@ pub fn transfer(app: &mut ZxrawApp, paths: Vec<PathBuf>, target: PathBuf, copy: 
 pub fn open_file(app: &mut ZxrawApp, path: &Path) {
     let p = path.to_path_buf();
     app.ops
-        .spawn_shell("Open", move || forge_win::open_default(&p));
+        .spawn_shell("Open", move || crate::platform::open_default(&p));
 }
 
 /// The folders the folder size service is asked to measure, kept between frames. It is
@@ -2106,9 +2104,8 @@ pub fn modals(app: &mut ZxrawApp, ui: &mut Ui) {
         Outcome::Cancel => {}
         Outcome::Reveal(path) => {
             app.ops.modal = Some(m);
-            app.ops.spawn_shell("Show in Explorer", move || {
-                forge_win::reveal_in_explorer(&path)
-            });
+            app.ops
+                .spawn_shell("Show in Explorer", move || crate::platform::reveal(&path));
         }
         Outcome::Accept => {
             if let Some(m) = accept(app, m) {
@@ -2488,6 +2485,7 @@ mod clipboard_tests {
 #[cfg(test)]
 mod name_job_tests {
     use super::*;
+    use crate::dnd::win;
 
     #[test]
     fn rename_moves_the_file_and_refuses_an_existing_name() {
@@ -2600,16 +2598,16 @@ mod name_job_tests {
     #[test]
     fn a_rename_conflict_reopens_the_prompt_for_that_item() {
         let job = NameJob::Rename {
-            from: PathBuf::from(r"C:\work\a.txt"),
-            to: PathBuf::from(r"C:\work\b.txt"),
+            from: win(r"C:\work\a.txt"),
+            to: win(r"C:\work\b.txt"),
         };
         let prompt = job.conflict_prompt("b.txt", "a file with that name already exists".into());
-        assert!(matches!(&prompt.kind, PromptKind::Rename { path } if path == Path::new(r"C:\work\a.txt")));
+        assert!(matches!(&prompt.kind, PromptKind::Rename { path } if *path == win(r"C:\work\a.txt")));
         assert_eq!(prompt.text, "b.txt");
         assert_eq!(prompt.error.as_deref(), Some("a file with that name already exists"));
-        let folder = NameJob::NewFolder(PathBuf::from(r"C:\work\Fresh"));
+        let folder = NameJob::NewFolder(win(r"C:\work\Fresh"));
         let prompt = folder.conflict_prompt("Fresh", "exists".into());
-        assert!(matches!(&prompt.kind, PromptKind::NewFolder { dir } if dir == Path::new(r"C:\work")));
+        assert!(matches!(&prompt.kind, PromptKind::NewFolder { dir } if *dir == win(r"C:\work")));
     }
 
     #[test]

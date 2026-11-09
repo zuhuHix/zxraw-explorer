@@ -30,6 +30,9 @@ pub fn defer_maximized(mut builder: egui::ViewportBuilder) -> (egui::ViewportBui
 /// Maximizes the hidden main window while it is cloaked, so the first shown frame is already
 /// maximized. Falls back to egui's own maximize command when the native call is not possible.
 pub fn maximize_hidden(cc: &eframe::CreationContext<'_>) {
+    if !cfg!(windows) {
+        return maximize_through_egui(cc);
+    }
     let hwnd = match cc.window_handle().map(|handle| handle.as_raw()) {
         Ok(RawWindowHandle::Win32(handle)) => handle.hwnd.get(),
         Ok(_) => {
@@ -53,6 +56,9 @@ pub fn maximize_hidden(cc: &eframe::CreationContext<'_>) {
 /// Makes the main window the owner of the shell dialogs ZXraw still shows (the
 /// administrator permission prompt of a delete), so they open in front of it.
 pub fn register_dialog_owner(cc: &eframe::CreationContext<'_>) {
+    if !cfg!(windows) {
+        return;
+    }
     match cc.window_handle().map(|handle| handle.as_raw()) {
         Ok(RawWindowHandle::Win32(handle)) => forge_win::set_dialog_owner(handle.hwnd.get()),
         _ => tracing::warn!("no Win32 window handle; shell dialogs will open without an owner"),
@@ -73,7 +79,7 @@ fn maximize_through_egui(cc: &eframe::CreationContext<'_>) {
 /// [`retry_with_default_backends`]). Probing for a hardware adapter first was measured at
 /// 350-650 ms, more than it saves.
 pub fn dx12_only_by_default() -> bool {
-    std::env::var_os("WGPU_BACKEND").is_none()
+    cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none()
 }
 
 /// The wgpu configuration for the main window: eframe's defaults, with the backends narrowed
@@ -177,6 +183,9 @@ mod tests {
 pub fn register_drop_target(
     cc: &eframe::CreationContext<'_>,
 ) -> Option<forge_win::drop_target::DropTargetHandle> {
+    if !cfg!(windows) {
+        return None;
+    }
     let Ok(RawWindowHandle::Win32(handle)) = cc.window_handle().map(|handle| handle.as_raw())
     else {
         tracing::warn!("no Win32 window handle; drag and drop from other apps stays winit's");

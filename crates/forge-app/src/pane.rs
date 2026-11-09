@@ -128,8 +128,8 @@ fn subdir_queue() -> &'static Sender<ListJob> {
 
 /// `paths` without the ones inside another of them: a selected folder already covers its
 /// contents, so an operation must not get both (a copy would duplicate the child, a move or
-/// delete would fail on it). Compared per component, ignoring case, as Windows does, so
-/// `C:\a\b` covers `C:\a\b\c` but not `C:\a\bc`.
+/// delete would fail on it). Compared per component, ignoring case on Windows only (Linux
+/// folders named `a` and `A` differ), so `C:\a\b` covers `C:\a\b\c` but not `C:\a\bc`.
 /// Split a listing into [`LIST_BATCH`]-sized batches.
 fn batches(entries: Vec<FileEntry>) -> Vec<Vec<FileEntry>> {
     let mut out = Vec::with_capacity(entries.len().div_ceil(LIST_BATCH));
@@ -146,7 +146,14 @@ fn batches(entries: Vec<FileEntry>) -> Vec<Vec<FileEntry>> {
 pub fn without_covered(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     fn key(path: &Path) -> Vec<String> {
         path.components()
-            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .map(|c| {
+                let name = c.as_os_str().to_string_lossy();
+                if cfg!(windows) {
+                    name.to_lowercase()
+                } else {
+                    name.into_owned()
+                }
+            })
             .collect()
     }
     let all: HashSet<Vec<String>> = paths.iter().map(|p| key(p)).collect();
@@ -2583,6 +2590,7 @@ mod tests {
         assert!(!pane.shows_children_of(&a));
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_selected_folder_covers_the_selected_items_inside_it() {
         let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
@@ -2608,6 +2616,17 @@ mod tests {
         pane.click(row_of(&pane, "b.txt"), true, false);
         assert_eq!(pane.selected.len(), 3);
         assert_eq!(pane.action_targets(), vec![a, root.join("b.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_selected_folder_covers_the_selected_items_inside_it_case_sensitively() {
+        let paths = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(
+            without_covered(paths(&["/a/b", "/A/B/c.txt", "/a/bc", "/a/b/sub/deep.txt", "/x.txt"])),
+            paths(&["/a/b", "/A/B/c.txt", "/a/bc", "/x.txt"]),
+            "per component, case-sensitive; order kept"
+        );
     }
 
     #[test]

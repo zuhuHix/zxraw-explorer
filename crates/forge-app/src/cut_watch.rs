@@ -545,6 +545,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::dnd::win;
 
     const A: Identity = Identity::Id {
         dir: false,
@@ -657,12 +658,14 @@ mod tests {
 
     #[test]
     fn follow_rebinds_renamed_items_and_uses_up_moved_ones() {
-        let p = |s: &str| PathBuf::from(s);
+        let p = win;
         let k = IdState::Known(A);
+        // Windows paths compare without case; elsewhere the item is spelled as its pair.
+        let case_item = if cfg!(windows) { r"c:\B\sub\z.jpg" } else { r"C:\b\sub\z.jpg" };
         let cut = [
             (p(r"C:\a\x.jpg"), k),
             (p(r"C:\a\y.jpg"), k),
-            (p(r"c:\B\sub\z.jpg"), k),
+            (p(case_item), k),
             (p(r"C:\c\w.jpg"), k),
             (p(r"C:\bb\v.jpg"), k),
         ];
@@ -690,7 +693,7 @@ mod tests {
 
     #[test]
     fn a_paste_moves_only_items_still_known_to_be_the_cut_ones() {
-        let p = |s: &str| PathBuf::from(s);
+        let p = win;
         let items = [
             (p("same"), IdState::Known(A)),
             (p("replaced"), IdState::Known(A)),
@@ -724,7 +727,7 @@ mod tests {
             observe: scripted,
         };
         assert_eq!(
-            checker.check(1, vec![PathBuf::from(r"W:\paste")], Duration::from_secs(10)),
+            checker.check(1, vec![win(r"W:\paste")], Duration::from_secs(10)),
             Some(vec![Observation::Present(A)])
         );
         // A check of cut 1 hangs on a share: a second one for cut 1 waits for its slot and
@@ -732,7 +735,7 @@ mod tests {
         let hung = std::thread::spawn(move || {
             checker.check(
                 1,
-                vec![PathBuf::from(r"B:\block\p")],
+                vec![win(r"B:\block\p")],
                 Duration::from_millis(300),
             )
         });
@@ -741,14 +744,14 @@ mod tests {
         assert_eq!(
             checker.check(
                 1,
-                vec![PathBuf::from(r"W:\paste")],
+                vec![win(r"W:\paste")],
                 Duration::from_millis(300)
             ),
             None
         );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(
-            checker.check(2, vec![PathBuf::from(r"W:\paste")], Duration::from_secs(2)),
+            checker.check(2, vec![win(r"W:\paste")], Duration::from_secs(2)),
             Some(vec![Observation::Present(A)])
         );
         assert_eq!(hung.join().unwrap(), None, "the hung check itself gave up");
@@ -756,7 +759,7 @@ mod tests {
         let started = Instant::now();
         let cancelled = checker.check_unless(
             3,
-            vec![PathBuf::from(r"B:\block\q")],
+            vec![win(r"B:\block\q")],
             Duration::from_secs(30),
             || started.elapsed() > Duration::from_millis(200),
         );
@@ -768,7 +771,7 @@ mod tests {
 
     /// Answers from `SCRIPT`; a path under `B:\block` hangs well past the test's timeout.
     fn scripted(path: &Path) -> Observation {
-        if path.starts_with(r"B:\block") {
+        if path.starts_with(win(r"B:\block")) {
             std::thread::sleep(Duration::from_secs(3));
         }
         SCRIPT
@@ -781,8 +784,8 @@ mod tests {
 
     fn set(path: &str, seen: Observation) {
         let mut script = SCRIPT.lock().unwrap();
-        script.retain(|(p, _)| p != Path::new(path));
-        script.push((PathBuf::from(path), seen));
+        script.retain(|(p, _)| *p != win(path));
+        script.push((win(path), seen));
     }
 
     fn wait_for(rx: &Receiver<Report>, want: &Report) {
@@ -802,7 +805,7 @@ mod tests {
     /// and an older cut is no longer reported on.
     #[test]
     fn the_watcher_reports_items_as_they_go_and_is_not_held_up_by_a_blocked_check() {
-        let p = PathBuf::from;
+        let p = win;
         set(r"W:\one", Observation::Present(A));
         set(r"W:\two", Observation::Present(B));
         let (tx, rx) = crossbeam_channel::unbounded();

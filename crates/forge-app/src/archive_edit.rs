@@ -639,6 +639,7 @@ pub fn start_update(app: &mut ZxrawApp, request: UpdateRequest) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dnd::win;
     use forge_core::archive::{ArchiveEntry, ArchiveFormat, ArchiveListing};
     use std::sync::Arc;
 
@@ -662,7 +663,7 @@ mod tests {
 
     fn view(names: &[&str]) -> ArchiveView {
         ArchiveView {
-            archive: PathBuf::from(r"D:\x\a.zip"),
+            archive: win(r"D:\x\a.zip"),
             inner: String::new(),
             version: 0,
             index: Arc::new(ArchiveIndex::build(ArchiveListing {
@@ -799,14 +800,14 @@ mod tests {
         let sel = selection_of(
             &v,
             &[
-                PathBuf::from(r"D:\x\a.zip\sub\a.txt"),
-                PathBuf::from(r"D:\x\a.zip\sub\deep"),
+                win(r"D:\x\a.zip\sub\a.txt"),
+                win(r"D:\x\a.zip\sub\deep"),
             ],
         )
         .unwrap();
         assert_eq!(sel.base, "sub/");
         assert_eq!(sel.names, ["sub/a.txt", "sub/deep/"]);
-        assert!(selection_of(&v, &[PathBuf::from(r"D:\x\a.zip\missing")]).is_none());
+        assert!(selection_of(&v, &[win(r"D:\x\a.zip\missing")]).is_none());
     }
 
     #[test]
@@ -839,7 +840,7 @@ mod tests {
     #[test]
     fn existing_names_are_found_in_the_target_folder_ignoring_case() {
         let v = view(&["sub/A.txt", "b.txt"]);
-        let sources = [PathBuf::from(r"C:\in\a.txt"), PathBuf::from(r"C:\in\b.txt")];
+        let sources = [win(r"C:\in\a.txt"), win(r"C:\in\b.txt")];
         assert_eq!(existing_names(&v.index, "sub", &sources), ["a.txt"]);
         assert_eq!(existing_names(&v.index, "", &sources), ["b.txt"]);
     }

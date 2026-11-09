@@ -142,7 +142,11 @@ pub fn address_bar(app: &mut ZxrawApp, ui: &mut Ui) {
         egui::TextEdit::singleline(&mut text)
             .id(id)
             .desired_width(ui.available_width())
-            .hint_text("Type a path, e.g. D:\\Shoots or \\\\server\\share"),
+            .hint_text(if cfg!(windows) {
+                "Type a path, e.g. D:\\Shoots or \\\\server\\share"
+            } else {
+                "Type a path, e.g. /home/you/Pictures"
+            }),
     );
     if app.focus_address {
         r.request_focus();
@@ -228,7 +232,9 @@ mod tests {
     fn local_folders_still_complete() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("Shoots")).unwrap();
-        let text = format!(r"{}\Sh", dir.path().display());
-        assert_eq!(completions(&text), vec![format!(r"{}\Shoots", dir.path().display())]);
+        // Windows splits on `\` or `/`; Linux has only `/` (a `\` is an ordinary name byte).
+        let sep = if cfg!(windows) { r"\" } else { "/" };
+        let text = format!("{}{sep}Sh", dir.path().display());
+        assert_eq!(completions(&text), vec![format!("{}{sep}Shoots", dir.path().display())]);
     }
 }

@@ -96,6 +96,10 @@ fn is_not_found(error: &std::io::Error) -> bool {
 
 /// The drive or share root of `path` (`C:\`, `\\server\share\`), if it has one.
 fn volume_root(path: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        // Unix has one tree: its volume is `/`, which answers whenever the disk is up.
+        return path.is_absolute().then(|| PathBuf::from("/"));
+    }
     let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
         return None;
     };
@@ -416,6 +420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn only_not_found_on_a_reachable_volume_counts_as_missing() {
         use std::io::{Error, ErrorKind};
         let disk = |p: &Path| match p.to_str() {
@@ -485,6 +490,30 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn unix_volume_is_the_root_tree() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(volume_root(Path::new("/home/a")), Some(PathBuf::from("/")));
+        assert_eq!(volume_root(Path::new("relative")), None);
+        let disk = |p: &Path| match p.to_str() {
+            Some("/" | "/home") => Ok(true),
+            Some("/home/a.txt") => Ok(false),
+            _ => Err(Error::from(ErrorKind::NotFound)),
+        };
+        assert_eq!(classify(Path::new("/home"), disk), Found::Folder);
+        assert_eq!(classify(Path::new("/home/a.txt"), disk), Found::File);
+        // A deleted folder on a working disk is Missing, so pins and layouts can drop it.
+        assert_eq!(classify(Path::new("/home/gone"), disk), Found::Missing);
+        // The root itself not found, or the disk not answering: nothing is claimed.
+        let no_disk = |_: &Path| Err(Error::from(ErrorKind::NotFound));
+        assert!(matches!(
+            classify(Path::new("/media/card/DCIM"), no_disk),
+            Found::Unknown(_)
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn volume_roots() {
         assert_eq!(volume_root(Path::new(r"C:\a\b")), Some(PathBuf::from(r"C:\")));
         assert_eq!(

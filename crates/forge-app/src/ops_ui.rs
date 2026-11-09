@@ -2538,6 +2538,7 @@ fn job_progress(ui: &mut Ui, j: &JobHandle, snap: &forge_jobs::ProgressSnapshot,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dnd::win;
 
     fn moved_report(done: &[&Path]) -> OpReport {
         OpReport {
@@ -3079,7 +3080,7 @@ mod tests {
             dir: false,
             id: (1, n),
         };
-        let p = |s: &str| PathBuf::from(s);
+        let p = win;
         let cut = [
             (p(r"C:\a\same.jpg"), id(1)),
             (p(r"C:\a\replaced.jpg"), id(2)),
@@ -3380,6 +3381,8 @@ mod cloud_warning_tests {
         assert!(body.starts_with("Couldn't check all files"), "{body}");
     }
 
+    // Volumes are drive letters and shares here (path text only), so this is Windows-only.
+    #[cfg(windows)]
     #[test]
     fn every_transfer_but_a_same_volume_move_is_checked_on_the_worker() {
         let files = [

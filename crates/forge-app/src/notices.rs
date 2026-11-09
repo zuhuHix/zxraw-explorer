@@ -207,7 +207,7 @@ fn crash_notice(app: &mut ZxrawApp, ctx: &egui::Context) {
                 if ui.button("Show report in Explorer").clicked() {
                     if app.notices.automated {
                         tracing::info!("automated run: not opening Explorer for {}", report.display());
-                    } else if let Err(e) = forge_win::reveal_in_explorer(&report) {
+                    } else if let Err(e) = crate::platform::reveal(&report) {
                         app.toast_err(format!("Cannot open Explorer: {e}"));
                     }
                 }
@@ -260,10 +260,12 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
                 ui.image((logo.id(), egui::vec2(36.0, 36.0)));
                 ui.label("A fast file manager for photographers and videographers.");
             });
-            ui.label(
-                RichText::new("Everything stays on this PC: no account and no telemetry. The only network access is a daily update check (Settings › Updates can turn it off) and the optional FFmpeg download.")
-                    .weak(),
-            );
+            let privacy = if cfg!(windows) {
+                "Everything stays on this PC: no account and no telemetry. The only network access is a daily update check (Settings › Updates can turn it off) and the optional FFmpeg download."
+            } else {
+                "Everything stays on this PC: no account, no telemetry and no network access."
+            };
+            ui.label(RichText::new(privacy).weak());
             ui.add_space(8.0);
 
             ui.heading("Quick setup");
@@ -294,16 +296,23 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             });
             ui.add_space(8.0);
 
-            ui.heading("Default app");
-            ui.label("Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders.");
-            crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
-            ui.add_space(8.0);
+            if cfg!(windows) {
+                ui.heading("Default app");
+                ui.label("Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders.");
+                crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
+                ui.add_space(8.0);
+            }
 
             ui.heading("Video");
             if has_ffmpeg && has_ffprobe {
                 ui.label("FFmpeg found: video thumbnails and clip metadata are on.");
             } else {
-                ui.label("FFmpeg was not found, so video thumbnails and clip metadata are off. ZXraw Explorer does not bundle it: download it here, or install it yourself and point Settings at its folder.");
+                if cfg!(windows) {
+                    ui.label("FFmpeg was not found, so video thumbnails and clip metadata are off. ZXraw Explorer does not bundle it: download it here, or install it yourself and point Settings at its folder.");
+                } else {
+                    ui.label("FFmpeg was not found, so video thumbnails and clip metadata are off. ZXraw Explorer does not bundle it.");
+                    ui.label(egui::RichText::new(crate::ffmpeg_setup::PACKAGE_MANAGER_HINT).weak());
+                }
                 crate::ffmpeg_setup::offer(ui, download, || run = Some(Cmd::DownloadFfmpeg));
                 if !download.running && ui.button("Open Settings…").clicked() {
                     run = Some(Cmd::Settings);

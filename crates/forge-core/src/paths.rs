@@ -38,12 +38,22 @@ pub fn normalize_user_path(input: &str) -> PathBuf {
     }
     let mut owned = s.to_string();
     if let Some(rest) = strip_prefix_ci(&owned, "file:///") {
-        owned = percent_decode(rest);
+        // `file:///C:/x` is `C:/x`; `file:///tmp/x` is the absolute `/tmp/x`.
+        owned = if cfg!(windows) {
+            percent_decode(rest)
+        } else {
+            format!("/{}", percent_decode(rest))
+        };
     } else if let Some(rest) = strip_prefix_ci(&owned, "file://") {
         // file://server/share -> \\server\share
         owned = format!("//{}", percent_decode(rest));
     }
-    let mut expanded = expand_env_vars(&owned);
+    // `%VAR%` is a Windows convention; on Unix a `%` in a folder name is just a character.
+    let mut expanded = if cfg!(windows) {
+        expand_env_vars(&owned)
+    } else {
+        owned
+    };
     if (expanded == "~" || expanded.starts_with("~/") || expanded.starts_with("~\\"))
         && let Some(home) = home_dir()
     {
@@ -85,9 +95,16 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
+/// The user's home folder: `%USERPROFILE%` on Windows, `$HOME` elsewhere.
+pub fn home_dir() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME"]
+    };
+    names
+        .iter()
+        .find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
         .map(PathBuf::from)
 }
 
@@ -550,6 +567,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn user_path_normalization() {
         // SAFETY: tests in this module are the only users of this variable.
         unsafe { std::env::set_var("FORGE_TEST_DIR", "base") };
@@ -563,6 +581,36 @@ mod tests {
         assert_eq!(normalize_user_path("''"), PathBuf::new());
         let f = normalize_user_path("file:///tmp/my%20dir");
         assert!(f.to_string_lossy().contains("my dir"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn user_path_normalization_unix() {
+        assert_eq!(normalize_user_path("''"), PathBuf::new());
+        // No %VAR% expansion on Unix: the percent signs are part of the name.
+        assert_eq!(
+            normalize_user_path("/data/%FORGE_NOT_SET%/a"),
+            Path::new("/data/%FORGE_NOT_SET%/a")
+        );
+        // file:/// URLs keep the leading slash of an absolute path.
+        assert_eq!(
+            normalize_user_path("file:///tmp/my%20dir"),
+            Path::new("/tmp/my dir")
+        );
+        assert_eq!(
+            normalize_user_path("~/x/../y"),
+            home_dir().unwrap().join("y")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn home_dir_comes_from_home_on_unix() {
+        // Read-only: other tests read HOME too, so the environment is not changed here.
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
+        assert_eq!(home_dir(), home);
     }
 
     #[test]
@@ -715,7 +763,9 @@ mod tests {
 /// `std::fs::rename` *replaces* an existing destination on Windows, so every "publish a
 /// finished temp file under its final name" step must use this instead. On Windows this is
 /// `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (atomic on the same volume; no check-
-/// then-rename window). Elsewhere it uses `link` + `unlink`, which also fails if `to` exists.
+/// then-rename window). On Linux it is `renameat2(RENAME_NOREPLACE)`. Other Unix systems use
+/// `link` + `unlink` for files, which also fails if `to` exists, and check-then-rename for
+/// directories.
 pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -742,8 +792,30 @@ pub fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
                 }
             })
     }
+    #[cfg(all(unix, target_os = "linux"))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+        match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            // Filesystems without renameat2 flags answer EINVAL, and old kernels ENOSYS: use the
+            // portable path below instead.
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
     #[cfg(not(windows))]
     {
+        if from.is_dir() {
+            // A directory cannot be hard-linked; check, then rename (not atomic).
+            if to.symlink_metadata().is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ));
+            }
+            return std::fs::rename(from, to);
+        }
         std::fs::hard_link(from, to)?;
         std::fs::remove_file(from)
     }

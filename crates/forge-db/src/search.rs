@@ -429,6 +429,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wp;
     use crate::files::{ImageMeta, NewFile, VideoMeta};
     use crate::{AnnotationChange, FileId};
     use chrono::{Local, TimeZone};
@@ -455,7 +456,7 @@ mod tests {
     fn fixture() -> Fixture {
         let db = Db::open_in_memory().unwrap();
         let mut dir = NewFile {
-            path: PathBuf::from(r"D:\Clients\Acme"),
+            path: PathBuf::from(wp(r"D:\Clients\Acme")),
             kind: EntryKind::Dir,
             size: 0,
             mtime: None,
@@ -463,16 +464,16 @@ mod tests {
         };
         let ids = db
             .upsert_files(&[
-                file(r"D:\Clients\Acme\sunset_001.CR3", 30 << 20, T2024_03),
-                file(r"D:\Clients\Acme\sunset_002.nef", 40 << 20, T2024_03),
-                file(r"D:\Clients\Acme\beach.jpg", 5 << 20, T2023_06),
-                file(r"D:\Clients\Acme\clip_a.mp4", 500 << 20, T2024_03),
-                file(r"D:\Clients\Acme\clip_b.mov", 50 << 20, T2023_06),
-                file(r"D:\Other\notes.txt", 1024, T2023_06),
-                file(r"D:\Other\Фото [1].jpg", 2 << 20, T2024_03),
+                file(&wp(r"D:\Clients\Acme\sunset_001.CR3"), 30 << 20, T2024_03),
+                file(&wp(r"D:\Clients\Acme\sunset_002.nef"), 40 << 20, T2024_03),
+                file(&wp(r"D:\Clients\Acme\beach.jpg"), 5 << 20, T2023_06),
+                file(&wp(r"D:\Clients\Acme\clip_a.mp4"), 500 << 20, T2024_03),
+                file(&wp(r"D:\Clients\Acme\clip_b.mov"), 50 << 20, T2023_06),
+                file(&wp(r"D:\Other\notes.txt"), 1024, T2023_06),
+                file(&wp(r"D:\Other\Фото [1].jpg"), 2 << 20, T2024_03),
             ])
             .unwrap();
-        dir.path = PathBuf::from(r"D:\Clients\Acme");
+        dir.path = PathBuf::from(wp(r"D:\Clients\Acme"));
         db.upsert_files(&[dir]).unwrap();
         db.upsert_image_meta(
             ids[0],
@@ -734,8 +735,9 @@ mod tests {
         );
         assert_eq!(n("-tag:wedding kind:raw"), BTreeSet::new());
         // The big example from the spec compiles and runs.
-        let big = r#"sunset ext:cr3,nef iso:>=1600 rating:>=4 camera:"Canon EOS R5" -label:blue date:2024-01..2024-06 size:>10mb width:>=3840 tag:wedding path:clients\ acme OR beach (a OR b) kind:video missing:gps is:dup"#;
-        assert_eq!(n(big), set(&["sunset_001.CR3"]));
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        let big = format!(r#"sunset ext:cr3,nef iso:>=1600 rating:>=4 camera:"Canon EOS R5" -label:blue date:2024-01..2024-06 size:>10mb width:>=3840 tag:wedding path:clients{sep} acme OR beach (a OR b) kind:video missing:gps is:dup"#);
+        assert_eq!(n(&big), set(&["sunset_001.CR3"]));
     }
 
     #[test]
@@ -783,7 +785,7 @@ mod tests {
 
         let scoped = SearchOptions {
             scope: Some(SearchScope {
-                path: PathBuf::from(r"D:\Clients"),
+                path: PathBuf::from(wp(r"D:\Clients")),
                 recursive: true,
             }),
             ..Default::default()
@@ -791,14 +793,14 @@ mod tests {
         assert_eq!(f.db.count(&q, &scoped).unwrap(), 5);
         let flat = SearchOptions {
             scope: Some(SearchScope {
-                path: PathBuf::from(r"D:\Clients"),
+                path: PathBuf::from(wp(r"D:\Clients")),
                 recursive: false,
             }),
             ..Default::default()
         };
         assert_eq!(f.db.count(&Query::all(), &flat).unwrap(), 1); // just the Acme folder
 
-        f.db.mark_missing(&[PathBuf::from(r"D:\Other")]).unwrap();
+        f.db.mark_missing(&[PathBuf::from(wp(r"D:\Other"))]).unwrap();
         assert_eq!(f.db.count(&q, &SearchOptions::default()).unwrap(), 5);
         assert_eq!(names(&f, "is:offline"), set(&["notes.txt", "Фото [1].jpg"]));
         let all = SearchOptions {
@@ -820,8 +822,8 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         db.upsert_files(&[
-            file(r"C:\r\new.txt", 1, recent),
-            file(r"C:\r\old.txt", 1, old),
+            file(&wp(r"C:\r\new.txt"), 1, recent),
+            file(&wp(r"C:\r\old.txt"), 1, old),
         ])
         .unwrap();
         let n = |q: &str| -> Vec<String> {

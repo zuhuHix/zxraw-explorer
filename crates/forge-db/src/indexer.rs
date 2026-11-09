@@ -32,7 +32,7 @@ use crate::files::{
     normalize_dir, subtree_bounds, system_time_ms, upsert_files_tx, upsert_volume_tx,
 };
 use crate::settings::{IndexRoot, ScanStatus};
-use crate::{Db, now_ms, path_str};
+use crate::{Db, now_ms, path_key, path_str};
 
 pub const DEFAULT_BATCH: usize = 2_000;
 
@@ -435,7 +435,7 @@ impl<'a> Indexer<'a> {
                 let kind = kind_of(&md);
                 match kind {
                     EntryKind::Dir => {
-                        if exclusions.excludes_folder(&path_str(&path).to_lowercase()) {
+                        if exclusions.excludes_folder(&path_key(&path_str(&path))) {
                             continue;
                         }
                         // Cloud placeholder folders are listed: that fetches names, not contents.
@@ -610,7 +610,7 @@ impl<'a> Indexer<'a> {
                 .map_err(|e| DbError::io(&path, e))?;
             let kind = kind_of(&md);
             let excluded = match kind {
-                EntryKind::Dir => exclusions.excludes_folder(&path_str(&path).to_lowercase()),
+                EntryKind::Dir => exclusions.excludes_folder(&path_key(&path_str(&path))),
                 _ => exclusions.excludes_ext(&forge_core::model::ext_of(&path)),
             };
             if !excluded {
@@ -620,7 +620,7 @@ impl<'a> Indexer<'a> {
         let volume = self.volume_for(&dir_path)?;
         let listed: HashSet<String> = rows
             .iter()
-            .map(|r| path_str(&r.path).to_lowercase())
+            .map(|r| path_key(&path_str(&r.path)))
             .collect();
         self.db.with_tx(|tx| {
             upsert_files_tx(tx, &rows, Some(volume), None, &mut VolumeCache::new())?;
@@ -634,7 +634,7 @@ impl<'a> Indexer<'a> {
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
                 .into_iter()
-                .filter(|(p, _)| !listed.contains(&p.to_lowercase()))
+                .filter(|(p, _)| !listed.contains(&path_key(p)))
                 .collect()
             };
             for (p, kind) in gone {

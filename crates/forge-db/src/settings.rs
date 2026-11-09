@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{DbError, Result};
 use crate::files::{SEP, normalize_dir};
-use crate::{Db, now_ms, path_str};
+use crate::{Db, now_ms, path_key, path_str};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexRoot {
@@ -39,7 +39,16 @@ impl ExclusionKind {
     }
 }
 
-/// All exclusions, lowercased, ready for matching.
+/// Stored form of an exclusion value: folders keep their path key (case only matters on
+/// Windows), names and extensions are lowercased.
+fn folder_or_lower(kind: ExclusionKind, value: &str) -> String {
+    match kind {
+        ExclusionKind::Folder => path_key(value.trim()),
+        _ => value.trim().to_lowercase(),
+    }
+}
+
+/// All exclusions, ready for matching: folders as path keys, names and extensions lowercased.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Exclusions {
     pub folders: Vec<String>,
@@ -48,7 +57,7 @@ pub struct Exclusions {
 }
 
 impl Exclusions {
-    /// Is the folder at `path_lc` (lowercased) excluded?
+    /// Is the folder at `path_lc` (a [`path_key`]) excluded?
     pub fn excludes_folder(&self, path_lc: &str) -> bool {
         self.folders.iter().any(|f| {
             path_lc == f
@@ -218,7 +227,7 @@ impl Db {
     // -- exclusions ---------------------------------------------------------------------
 
     pub fn add_exclusion(&self, kind: ExclusionKind, value: &str) -> Result<()> {
-        let mut v = value.trim().to_lowercase();
+        let mut v = folder_or_lower(kind, value);
         match kind {
             ExclusionKind::Folder => v = normalize_dir(&v),
             ExclusionKind::Ext => {
@@ -242,7 +251,7 @@ impl Db {
     }
 
     pub fn remove_exclusion(&self, kind: ExclusionKind, value: &str) -> Result<bool> {
-        let mut v = value.trim().to_lowercase();
+        let mut v = folder_or_lower(kind, value);
         if kind == ExclusionKind::Folder {
             v = normalize_dir(&v);
         }
@@ -348,6 +357,7 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wp;
 
     #[test]
     fn only_unfinished_passes_with_folders_left_are_resumable() {
@@ -363,11 +373,11 @@ mod tests {
             errors: 0,
             last_error: None,
         };
-        assert!(state(ScanStatus::Running, &[r"C:\a"]).is_resumable());
-        assert!(state(ScanStatus::Interrupted, &[r"C:\a"]).is_resumable());
-        assert!(state(ScanStatus::Unavailable, &[r"C:\a"]).is_resumable());
+        assert!(state(ScanStatus::Running, &[&wp(r"C:\a")]).is_resumable());
+        assert!(state(ScanStatus::Interrupted, &[&wp(r"C:\a")]).is_resumable());
+        assert!(state(ScanStatus::Unavailable, &[&wp(r"C:\a")]).is_resumable());
         assert!(!state(ScanStatus::Running, &[]).is_resumable());
-        assert!(!state(ScanStatus::Complete, &[r"C:\a"]).is_resumable());
+        assert!(!state(ScanStatus::Complete, &[&wp(r"C:\a")]).is_resumable());
     }
 
     #[test]
@@ -389,24 +399,34 @@ mod tests {
     #[test]
     fn roots_and_exclusions() {
         let db = Db::open_in_memory().unwrap();
-        let a = db.add_index_root(Path::new(r"D:\Photos\")).unwrap();
+        let a = db.add_index_root(Path::new(&wp(r"D:\Photos\"))).unwrap();
+        // Windows paths are case-insensitive: another spelling of the root is the same row.
+        #[cfg(windows)]
         assert_eq!(db.add_index_root(Path::new(r"d:\photos")).unwrap(), a);
+        #[cfg(not(windows))]
+        {
+            let other = db.add_index_root(Path::new(&wp(r"d:\photos"))).unwrap();
+            assert_ne!(other, a);
+            assert!(db.remove_index_root(other).unwrap());
+        }
         db.set_index_root_enabled(a, false).unwrap();
         assert!(!db.index_roots().unwrap()[0].enabled);
         assert_eq!(
             db.index_roots().unwrap()[0].path,
-            PathBuf::from(r"D:\Photos")
+            PathBuf::from(wp(r"D:\Photos"))
         );
 
-        db.add_exclusion(ExclusionKind::Folder, r"D:\Photos\Cache\")
+        db.add_exclusion(ExclusionKind::Folder, &wp(r"D:\Photos\Cache\"))
             .unwrap();
         db.add_exclusion(ExclusionKind::Ext, "*.TMP").unwrap();
         db.add_exclusion(ExclusionKind::Name, "node_modules")
             .unwrap();
         let ex = db.exclusions().unwrap();
-        assert!(ex.excludes_folder(r"d:\photos\cache"));
-        assert!(ex.excludes_folder(r"d:\photos\cache\x"));
-        assert!(!ex.excludes_folder(r"d:\photos\cache2"));
+        // Folder keys are case-folded on Windows only (see `path_key`).
+        let key = |s: &str| path_key(&wp(s));
+        assert!(ex.excludes_folder(&key(r"D:\Photos\Cache")));
+        assert!(ex.excludes_folder(&key(r"D:\Photos\Cache\x")));
+        assert!(!ex.excludes_folder(&key(r"D:\Photos\Cache2")));
         assert!(ex.excludes_ext("tmp"));
         assert!(!ex.excludes_ext(""));
         assert!(ex.excludes_name("node_modules"));

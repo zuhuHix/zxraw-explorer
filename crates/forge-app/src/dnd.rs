@@ -2,7 +2,9 @@
 //! applications: which items a drop moves, whether it copies or moves, and which folder a
 //! row drops into.
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf, Prefix};
+#[cfg(windows)]
+use std::path::{Component, Prefix};
+use std::path::{Path, PathBuf};
 
 use forge_core::paths::{is_within, paths_equal};
 
@@ -80,12 +82,24 @@ pub fn drop_effect(
 
 /// The volume identity of an existing path (see `forge_win::files::volume_identity`), or
 /// `None` when it cannot be determined.
+#[cfg(not(unix))]
 fn os_volume(path: &Path) -> Option<String> {
     forge_win::files::volume_identity(path).ok()
 }
 
+/// On Linux the volume is the device the path lives on: the nearest existing folder's `st_dev`
+/// (a mount point folder is on its own device, as on Windows). Nothing about the path text.
+#[cfg(unix)]
+fn os_volume(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    path.ancestors()
+        .find_map(|p| std::fs::metadata(p).ok())
+        .map(|md| md.dev().to_string())
+}
+
 /// Are both paths on the same volume? Folder mount points count (a disk mounted
 /// at `C:\Mount` is not `C:`); a volume that cannot be determined counts as another one.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     same_volume_with(a, b, &mut os_volume)
 }
@@ -267,8 +281,16 @@ pub fn row_drop_target(path: &Path, is_dir: bool, depth: usize) -> Option<PathBu
     }
 }
 
+/// Elsewhere there are no drives or shares: every absolute path starts at `/`, and the
+/// device check in `os_volume` tells the volumes apart.
+#[cfg(unix)]
+fn root_key(p: &Path) -> Option<String> {
+    p.has_root().then(|| "/".to_string())
+}
+
 /// The drive or share a path starts with, lowercased, with `\\?\` forms unified
 /// (`\\?\C:` is `c:`, `\\?\UNC\srv\share` is `\\srv\share`).
+#[cfg(windows)]
 fn root_key(p: &Path) -> Option<String> {
     let Some(Component::Prefix(prefix)) = p.components().next() else {
         return None;
@@ -285,12 +307,27 @@ fn root_key(p: &Path) -> Option<String> {
     Some(key.to_lowercase())
 }
 
+/// A path as the Windows test fixtures write it (`C:\x`, `\\srv\share\a`). Elsewhere the same
+/// location with `/` separators and the drive letter as a first folder (`C:\x` is `/C/x`), so
+/// fixtures on different drives stay different locations.
+#[cfg(test)]
+pub(crate) fn win(s: &str) -> PathBuf {
+    if cfg!(windows) {
+        return PathBuf::from(s);
+    }
+    let s = s.strip_prefix(r"\\?\").unwrap_or(s).replace('\\', "/");
+    match s.split_once(':') {
+        Some((drive, rest)) if drive.len() == 1 => PathBuf::from(format!("/{drive}{rest}")),
+        _ => PathBuf::from(s),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn p(s: &str) -> PathBuf {
-        PathBuf::from(s)
+        win(s)
     }
 
     fn kept(paths: &[PathBuf], target: &Path) -> Vec<PathBuf> {
@@ -299,6 +336,7 @@ mod tests {
 
     /// A stand-in for the disk: `C:\Mount` holds another volume, X: cannot be identified,
     /// shares are their own volumes.
+    #[cfg(windows)]
     fn fake_volume(path: &Path) -> Option<String> {
         let root = root_key(path)?;
         if root == "x:" {
@@ -310,10 +348,19 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn copies(sources: &[PathBuf], target: &str, ctrl: bool, shift: bool) -> bool {
         drop_is_copy_with(sources, &p(target), ctrl, shift, &mut fake_volume)
     }
 
+    /// Unix stand-in: `/mnt/disk` is a mount point holding another volume.
+    #[cfg(unix)]
+    fn fake_volume_unix(path: &Path) -> Option<String> {
+        let other = is_within(Path::new("/mnt/disk"), path);
+        Some(if other { "disk" } else { "root" }.into())
+    }
+
+    #[cfg(windows)]
     #[test]
     fn same_volume_compares_roots_then_asks_the_disk() {
         let mut v = fake_volume;
@@ -358,6 +405,23 @@ mod tests {
         assert!(!drop_is_copy(&[file], &sub, false, false));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn drop_is_copy_follows_the_same_rule_on_unix() {
+        let copies = |src: &str, dst: &str, ctrl: bool, shift: bool| {
+            drop_is_copy_with(&[PathBuf::from(src)], Path::new(dst), ctrl, shift, &mut fake_volume_unix)
+        };
+        // Same device: move. Across a mount point: copy. The mount point folder itself lives
+        // on its parent's device, so it moves.
+        assert!(!copies("/src/a.txt", "/dst", false, false));
+        assert!(copies("/src/a.txt", "/mnt/disk/dst", false, false));
+        assert!(copies("/mnt/disk/a.txt", "/dst", false, false));
+        assert!(!copies("/mnt/disk", "/dst", false, false));
+        assert!(copies("/src/a.txt", "/dst", true, false));
+        assert!(!copies("/src/a.txt", "/mnt/disk/dst", false, true));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn drop_is_copy_follows_explorer_rule() {
         let src = vec![p(r"C:\src\a.txt")];
@@ -381,6 +445,7 @@ mod tests {
         assert!(!copies(&[], r"D:\dst", false, false));
     }
 
+    #[cfg(windows)]
     #[test]
     fn drop_is_copy_respects_mount_points_and_unknown_volumes() {
         // Into a folder that holds another disk: copy.
@@ -396,6 +461,19 @@ mod tests {
         assert!(!copies(&[p(r"\\?\C:\src\a.txt")], r"C:\dst", false, false));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn drop_sources_skips_no_op_and_self_drops_on_unix() {
+        let target = p("/dst");
+        assert!(kept(&[p("/dst")], &target).is_empty());
+        assert!(kept(&[p("/dst/file.txt")], &p("/dst/")).is_empty());
+        assert!(kept(&[p("/a")], &p("/a/sub/deep")).is_empty());
+        assert_eq!(kept(&[p("/a/b")], &p("/a/bc")), vec![p("/a/b")]);
+        let keep = vec![p("/src/x.txt")];
+        assert_eq!(kept(&keep, &target), keep);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn drop_sources_skips_no_op_and_self_drops() {
         let target = p(r"C:\dst");
@@ -413,6 +491,7 @@ mod tests {
         assert_eq!(kept(&keep, &target), keep);
     }
 
+    #[cfg(windows)]
     #[test]
     fn drop_sources_sees_through_verbatim_prefixes() {
         // Onto itself, own parent and own descendant, with `\\?\` on either side.
@@ -471,6 +550,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn links_that_involve_a_network_location_are_refused() {
         // A local link to a share.
@@ -510,6 +590,22 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_real_symlink_is_not_dropped_into_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Data");
+        let sub = data.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let link = dir.path().join("Link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(kept(std::slice::from_ref(&link), &sub).is_empty());
+        let elsewhere = dir.path().join("Elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        assert_eq!(kept(std::slice::from_ref(&link), &elsewhere), vec![link]);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn a_real_junction_is_not_dropped_into_its_target() {
         let dir = tempfile::tempdir().unwrap();

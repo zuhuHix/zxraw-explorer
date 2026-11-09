@@ -689,6 +689,7 @@ fn a_destination_through_a_junction_is_resolved_and_pinned_for_the_job() {
     fs::rename(&real, d.path().join("elsewhere")).unwrap();
 }
 
+#[cfg(windows)]
 fn zip_of(path: &Path, files: &[(&str, &[u8])]) {
     let mut zw = ZipWriter::new(File::create(path).unwrap());
     for (name, data) in files {

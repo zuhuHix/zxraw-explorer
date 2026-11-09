@@ -3927,7 +3927,7 @@ mod tests {
 
     #[test]
     fn an_online_only_manifest_needs_consent_and_skip_stops() {
-        let manifest = PathBuf::from(r"C:\shoot\checksums.b3");
+        let manifest = PathBuf::from(r"C:\shoot").join("checksums.b3");
         let totals = OnlineOnlyTotals {
             count: 1,
             bytes: 100,

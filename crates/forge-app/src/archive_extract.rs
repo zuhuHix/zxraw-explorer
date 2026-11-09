@@ -138,7 +138,11 @@ impl ExtractUi {
 
 /// The extract commands' own text for the menu: "Extract to `photos\`" names the folder.
 pub fn named_folder_label(archive: &Path) -> String {
-    format!("Extract to {}\\", archive::archive_stem(archive))
+    format!(
+        "Extract to {}{}",
+        archive::archive_stem(archive),
+        std::path::MAIN_SEPARATOR
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +949,7 @@ fn test_window(app: &mut ZxrawApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dnd::win;
     use forge_core::archive::EntryTest;
     use forge_core::ops::OpIssue;
 
@@ -969,8 +974,8 @@ mod tests {
     #[test]
     fn the_named_label_shows_the_folder() {
         assert_eq!(
-            named_folder_label(Path::new(r"D:\x\Trip 2024.zip")),
-            "Extract to Trip 2024\\"
+            named_folder_label(&win(r"D:\x\Trip 2024.zip")),
+            format!("Extract to Trip 2024{}", std::path::MAIN_SEPARATOR)
         );
     }
 
@@ -1025,8 +1030,8 @@ mod tests {
     #[test]
     fn a_new_folder_is_never_asked_about() {
         let request = |place, selection| ExtractRequest {
-            archive: PathBuf::from(r"D:\x\photos.zip"),
-            parent: PathBuf::from(r"D:\x"),
+            archive: win(r"D:\x\photos.zip"),
+            parent: win(r"D:\x"),
             place,
             selection,
             policy: None,
@@ -1045,11 +1050,11 @@ mod tests {
         assert_eq!(conflict_dest(&request(Place::Smart, None), &many), None);
         assert_eq!(
             conflict_dest(&request(Place::Smart, None), &one),
-            Some(PathBuf::from(r"D:\x"))
+            Some(win(r"D:\x"))
         );
         assert_eq!(
             conflict_dest(&request(Place::Named, None), &many),
-            Some(PathBuf::from(r"D:\x\photos"))
+            Some(win(r"D:\x\photos"))
         );
         let two = archive::Selection::new("", vec!["a.txt".into(), "b.txt".into()]);
         assert_eq!(
@@ -1117,8 +1122,8 @@ mod tests {
     #[test]
     fn files_without_a_checksum_are_extracted_again_only_when_asked() {
         let request = ExtractRequest {
-            archive: PathBuf::from(r"D:\x\secret.7z"),
-            parent: PathBuf::from(r"D:\x"),
+            archive: win(r"D:\x\secret.7z"),
+            parent: win(r"D:\x"),
             place: Place::Smart,
             selection: Some(archive::Selection::new("docs/", vec!["docs/a.txt".into()])),
             policy: None,
@@ -1126,7 +1131,7 @@ mod tests {
             then_remove: None,
         };
         let report = ExtractReport {
-            dest: PathBuf::from(r"D:\x\secret"),
+            dest: win(r"D:\x\secret"),
             unchecked: vec!["docs/a.txt".into(), "docs/b.txt".into()],
             ..Default::default()
         };

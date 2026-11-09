@@ -1505,11 +1505,13 @@ mod tests {
 
     fn entry(path: &str, size: u64, kind: EntryKind, mtime_ms: i64) -> FileEntry {
         let p = PathBuf::from(path);
-        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        // The fixtures are Windows paths: split on both separators, since on Linux
+        // `file_name` would take the whole string.
+        let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
         let ext = if kind == EntryKind::Dir {
             String::new()
         } else {
-            crate::model::ext_of(&p)
+            crate::model::ext_of(std::path::Path::new(&name))
         };
         FileEntry {
             path: p,

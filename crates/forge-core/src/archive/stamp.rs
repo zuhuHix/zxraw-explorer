@@ -105,19 +105,36 @@ fn identity_into(file: &File, h: &mut Xxh3) -> bool {
     read.is_ok()
 }
 
+/// Hashes the Unix file id (`st_dev`, `st_ino`, birth time; see
+/// [`crate::ops::unix_file_id`]): a file written anew gets a new one. Returns whether it was
+/// hashed (not where the file system keeps no birth time).
+#[cfg(unix)]
+fn identity_into(file: &File, h: &mut Xxh3) -> bool {
+    if hide_file_id() {
+        return false;
+    }
+    let Some((volume, id)) = file.metadata().ok().as_ref().and_then(crate::ops::unix_file_id)
+    else {
+        return false;
+    };
+    h.update(&volume.to_le_bytes());
+    h.update(&id);
+    true
+}
+
 /// No file id on this platform: the stamp is weak.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn identity_into(_: &File, _: &mut Xxh3) -> bool {
     false
 }
 
 /// Tests can make the file id unavailable (see `HIDE_FILE_ID`); always false otherwise.
-#[cfg(all(windows, test))]
+#[cfg(all(any(windows, unix), test))]
 fn hide_file_id() -> bool {
     HIDE_FILE_ID.with(std::cell::Cell::get)
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(all(any(windows, unix), not(test)))]
 fn hide_file_id() -> bool {
     false
 }
@@ -197,9 +214,11 @@ mod tests {
         HIDE_FILE_ID.with(|h| h.set(false));
         let weak = weak.unwrap();
         assert!(!weak.strong);
-        #[cfg(windows)]
-        assert!(strong.strong, "NTFS and local volumes report a file id");
-        #[cfg(windows)]
-        assert_ne!(weak, strong, "the weak stamp hashes no file id");
+        // NTFS and local volumes report a file id; Unix ones a birth time with the inode.
+        let has_id = cfg!(windows) || std::fs::metadata(&p).unwrap().created().is_ok();
+        if has_id {
+            assert!(strong.strong, "a local volume reports a file id");
+            assert_ne!(weak, strong, "the weak stamp hashes no file id");
+        }
     }
 }

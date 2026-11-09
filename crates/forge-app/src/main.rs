@@ -306,8 +306,13 @@ fn main() -> eframe::Result {
         let options = eframe::NativeOptions {
             // Sees Ctrl+V even when egui-winit drops it. See `paste_key`.
             event_loop_builder: Some(Box::new(|builder| {
-                use winit::platform::windows::EventLoopBuilderExtWindows;
-                builder.with_msg_hook(paste_key::msg_hook);
+                #[cfg(windows)]
+                {
+                    use winit::platform::windows::EventLoopBuilderExtWindows;
+                    builder.with_msg_hook(paste_key::msg_hook);
+                }
+                #[cfg(not(windows))]
+                let _ = builder;
             })),
             viewport: viewport.clone(),
             persistence_path: persistence_path.clone(),

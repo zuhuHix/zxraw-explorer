@@ -31,6 +31,7 @@ const SCRUB_FRAME_EDGE: u32 = 480;
 const FRAME_CACHE_CAPACITY: usize = 128;
 const STRIP_CACHE_CAPACITY: usize = 12;
 const MAX_SESSION_GAP: Duration = Duration::from_secs(30 * 60);
+#[cfg_attr(not(windows), allow(dead_code))]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ENCODER_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 const RELATED_FOLDER_CACHE_CAPACITY: usize = 16;
@@ -1280,13 +1281,13 @@ pub fn preview(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &FileEntry) {
         match action {
             VideoAction::OpenPlayer(path) => {
                 app.ops.spawn_shell("Open in default player", move || {
-                    forge_win::open_default(&path)
+                    crate::platform::open_default(&path)
                 });
             }
             VideoAction::OpenRelated(path) => crate::actions::open_file(app, &path),
             VideoAction::RevealRelated(path) => {
                 app.ops.spawn_shell("Reveal related file", move || {
-                    forge_win::reveal_in_explorer(&path)
+                    crate::platform::reveal(&path)
                 })
             }
             VideoAction::SelectRelated(path) => app.navigate(path),
@@ -1730,10 +1731,10 @@ fn start_estimate(
                     }
                 }
             }
-            let drives = forge_win::list_drives();
+            let volumes = live_volumes();
             let free_spaces = destinations
                 .iter()
-                .map(|destination| free_space_for(destination, &drives))
+                .map(|destination| free_space_for(destination, &volumes))
                 .collect();
             Ok(ProxyEstimate {
                 durations_s,
@@ -2268,29 +2269,46 @@ fn proxy_space_sufficient(
     (!volumes.is_empty()).then(|| volumes.values().all(|(free, need)| need <= free))
 }
 
-fn free_space_for(path: &Path, drives: &[forge_win::DriveInfo]) -> Option<VolumeSpace> {
-    drives
-        .iter()
-        .filter(|drive| drive.available)
-        .filter_map(|drive| {
-            drive
-                .free_bytes
-                .filter(|_| path_is_within(path, &drive.root))
-                .map(|free_bytes| {
-                    (
-                        drive.root.components().count(),
-                        VolumeSpace {
-                            root: drive.root.clone(),
-                            free_bytes,
-                        },
-                    )
+/// Every volume's free space right now. Windows asks forge-win (a drive counts only when it
+/// reports free space); elsewhere the platform's mounted file systems are the list.
+fn live_volumes() -> Vec<VolumeSpace> {
+    if cfg!(windows) {
+        forge_win::list_drives()
+            .into_iter()
+            .filter(|drive| drive.available)
+            .filter_map(|drive| {
+                Some(VolumeSpace {
+                    root: drive.root,
+                    free_bytes: drive.free_bytes?,
                 })
-        })
-        .max_by_key(|(depth, _)| *depth)
-        .map(|(_, space)| space)
+            })
+            .collect()
+    } else {
+        crate::platform::drives()
+            .into_iter()
+            .filter(|drive| drive.available)
+            .map(|drive| VolumeSpace {
+                root: drive.root,
+                free_bytes: drive.free,
+            })
+            .collect()
+    }
+}
+
+/// The volume holding `path`: the one whose root is the longest prefix of it.
+fn free_space_for(path: &Path, volumes: &[VolumeSpace]) -> Option<VolumeSpace> {
+    volumes
+        .iter()
+        .filter(|volume| path_is_within(path, &volume.root))
+        .max_by_key(|volume| volume.root.components().count())
+        .cloned()
 }
 
 fn path_is_within(path: &Path, root: &Path) -> bool {
+    if !cfg!(windows) {
+        // Case-sensitive, component-wise on Unix (`/a/B` is not inside `/a/b`).
+        return forge_core::paths::is_within(root, path);
+    }
     let path = normalized_path(path);
     let root = normalized_path(root);
     path == root || path.strip_prefix(&root_with_separator(&root)).is_some()
@@ -3429,8 +3447,13 @@ mod tests {
 
     #[test]
     fn a_stopped_ffmpeg_has_exited_before_the_caller_returns() {
-        let mut child = std::process::Command::new("ping")
-            .args(["-n", "30", "127.0.0.1"])
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("ping", &["-n", "30", "127.0.0.1"])
+        } else {
+            ("sleep", &["30"])
+        };
+        let mut child = std::process::Command::new(program)
+            .args(args)
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
@@ -3477,6 +3500,21 @@ mod tests {
         std::fs::write(path, b"fixture").unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn free_space_comes_from_the_longest_mounted_root_on_linux() {
+        let volumes = [
+            VolumeSpace { root: PathBuf::from("/"), free_bytes: 900 },
+            VolumeSpace { root: PathBuf::from("/media/card"), free_bytes: 250 },
+        ];
+        let card = free_space_for(Path::new("/media/card/DCIM/clip.mp4"), &volumes).unwrap();
+        assert_eq!((card.root, card.free_bytes), (PathBuf::from("/media/card"), 250));
+        let home = free_space_for(Path::new("/home/me/clip.mp4"), &volumes).unwrap();
+        assert_eq!(home.free_bytes, 900);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_space_for(dir.path(), &live_volumes()).is_some());
+    }
+
     #[test]
     fn groups_common_camera_sequences_and_gopro_chapters() {
         let entries = [
@@ -3507,7 +3545,7 @@ mod tests {
         assert!(chapter.files[0].to_string_lossy().ends_with("GX010123.MP4"));
         assert!(chapter.files[1].to_string_lossy().ends_with("GX020123.MP4"));
         assert_eq!(
-            clip_label(&entries, Path::new(r"C:\Media\GX020123.MP4")).as_deref(),
+            clip_label(&entries, &PathBuf::from(r"C:\Media").join("GX020123.MP4")).as_deref(),
             Some("Chapter 2 of 2")
         );
         assert!(

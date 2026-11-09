@@ -911,7 +911,7 @@ fn start_open(app: &mut ZxrawApp, request: OpenRequest) {
                     let _ = msgs.send(Msg::Browse { from, path });
                     Ok(())
                 }
-                OpenHow::Default => forge_win::open_default(&path).map_err(|e| e.to_string()),
+                OpenHow::Default => crate::platform::open_default(&path).map_err(|e| e.to_string()),
                 OpenHow::OpenWith => forge_win::open_with_dialog(&path).map_err(|e| e.to_string()),
             },
             Err(CoreError::PasswordRequired(_)) => {
@@ -1192,6 +1192,7 @@ fn cancel_prompt(app: &mut ZxrawApp, prompt: PasswordPrompt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dnd::win;
 
     #[test]
     fn passwords_are_kept_per_archive_ignoring_case() {
@@ -1302,10 +1303,10 @@ mod tests {
 
     #[test]
     fn archive_names_are_found_by_name_only() {
-        assert!(maybe_in_archive(Path::new(r"C:\x\a.zip\sub")));
-        assert!(maybe_in_archive(Path::new(r"C:\x\a.zip")));
-        assert!(!maybe_in_archive(Path::new(r"C:\x\zip\sub")));
-        assert!(!maybe_in_archive(Path::new(r"C:\")));
+        assert!(maybe_in_archive(&win(r"C:\x\a.zip\sub")));
+        assert!(maybe_in_archive(&win(r"C:\x\a.zip")));
+        assert!(!maybe_in_archive(&win(r"C:\x\zip\sub")));
+        assert!(!maybe_in_archive(&win(r"C:\")));
     }
 
     #[test]
@@ -1359,7 +1360,7 @@ mod tests {
     #[test]
     fn inner_paths_of_listed_rows() {
         let view = ArchiveView {
-            archive: PathBuf::from(r"C:\x\a.zip"),
+            archive: win(r"C:\x\a.zip"),
             inner: String::new(),
             version: 0,
             index: Arc::new(ArchiveIndex::build(forge_core::archive::ArchiveListing {
@@ -1369,10 +1370,10 @@ mod tests {
             })),
         };
         assert_eq!(
-            view.inner_of(Path::new(r"C:\x\a.zip\sub\f.txt")).as_deref(),
+            view.inner_of(&win(r"C:\x\a.zip\sub\f.txt")).as_deref(),
             Some("sub/f.txt")
         );
-        assert_eq!(view.inner_of(Path::new(r"C:\x\a.zip")), None);
-        assert_eq!(view.inner_of(Path::new(r"C:\x\b.zip\f.txt")), None);
+        assert_eq!(view.inner_of(&win(r"C:\x\a.zip")), None);
+        assert_eq!(view.inner_of(&win(r"C:\x\b.zip\f.txt")), None);
     }
 }

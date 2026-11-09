@@ -46,6 +46,10 @@ tempfile.workspace = true
 # An independent reader to check the tar files we write.
 tar = "0.4"
 
+[target.'cfg(unix)'.dependencies]
+# renameat2(RENAME_NOREPLACE) for `paths::rename_no_replace` on Linux.
+rustix = { version = "1", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 # Wdk: NtCreateFile, to open a folder or file relative to a pinned folder handle.
 windows = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem"] }

@@ -4,6 +4,8 @@
 //! `schema_migrations`, so a crash mid-migration leaves the previous version intact.
 //! Never edit a released migration; append a new one.
 
+use std::borrow::Cow;
+
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{DbError, Result};
@@ -244,6 +246,17 @@ SELECT 1, max(COALESCE((SELECT MAX(indexed_at) FROM files), 0),
 UPDATE index_state SET pending = '[]' WHERE status <> 'complete';
 "#;
 
+/// Path columns are `COLLATE NOCASE` (ASCII case-insensitive) because Windows paths are.
+/// Linux file systems are case-sensitive, so there `IMG.jpg` and `img.jpg` are two files and
+/// must be two rows; the collation is swapped to `BINARY` when the migration runs.
+fn platform_sql(sql: &'static str) -> Cow<'static, str> {
+    if cfg!(windows) || !sql.contains("COLLATE NOCASE") {
+        Cow::Borrowed(sql)
+    } else {
+        Cow::Owned(sql.replace("COLLATE NOCASE", "COLLATE BINARY"))
+    }
+}
+
 /// Apply all pending migrations. Returns the versions applied by this call.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<Vec<i64>> {
     migrate_with(conn, MIGRATIONS)
@@ -268,7 +281,7 @@ pub(crate) fn migrate_with(conn: &mut Connection, migrations: &[Migration]) -> R
     let mut applied = Vec::new();
     for m in migrations.iter().filter(|m| m.version > current) {
         let tx = conn.transaction()?;
-        tx.execute_batch(m.sql)?;
+        tx.execute_batch(&platform_sql(m.sql))?;
         tx.execute(
             "INSERT INTO schema_migrations(version, description, applied_at) VALUES (?1, ?2, ?3)",
             params![m.version, m.description, now_ms()],

@@ -134,14 +134,20 @@ fn valid_name(name: &str) -> Result<String> {
 
 fn validate_import_path(path: &Path) -> Result<()> {
     let text = path.to_string_lossy();
-    let normalized = text.replace('/', "\\").to_lowercase();
+    // Win32 device namespaces (`\\?\`, `\\.\`) are not special elsewhere.
+    #[cfg(windows)]
+    let device_path = {
+        let normalized = text.replace('/', "\\").to_lowercase();
+        normalized.starts_with("\\\\?\\") || normalized.starts_with("\\\\.\\")
+    };
+    #[cfg(not(windows))]
+    let device_path = false;
     if text.len() > MAX_IMPORTED_PATH_BYTES
         || !path.is_absolute()
         || path
             .components()
             .any(|part| matches!(part, Component::ParentDir))
-        || normalized.starts_with("\\\\?\\")
-        || normalized.starts_with("\\\\.\\")
+        || device_path
     {
         return Err(DbError::Invalid(format!(
             "unsafe or invalid collection item path: {text}"
@@ -706,6 +712,7 @@ fn copy_collection_name_tx(tx: &Transaction<'_>, name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wp;
     use std::path::Path;
 
     fn nf(p: &str) -> NewFile {
@@ -722,7 +729,7 @@ mod tests {
     fn manual_collection_crud_and_order() {
         let db = Db::open_in_memory().unwrap();
         let ids = db
-            .upsert_files(&[nf(r"C:\c\1.jpg"), nf(r"C:\c\2.jpg"), nf(r"C:\c\3.jpg")])
+            .upsert_files(&[nf(&wp(r"C:\c\1.jpg")), nf(&wp(r"C:\c\2.jpg")), nf(&wp(r"C:\c\3.jpg"))])
             .unwrap();
         let c = db.create_manual_collection("Selects").unwrap();
         assert!(db.create_manual_collection(" selects ").is_err());
@@ -747,7 +754,7 @@ mod tests {
         let col = db.collection_by_name("FINAL").unwrap().unwrap();
         assert_eq!((col.id, col.item_count), (c, 2));
         // Offline members stay in the collection.
-        db.mark_missing(&[PathBuf::from(r"C:\c")]).unwrap();
+        db.mark_missing(&[PathBuf::from(wp(r"C:\c"))]).unwrap();
         let files = db.collection_files(c, &SearchOptions::default()).unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().all(|f| !f.present));
@@ -775,8 +782,8 @@ mod tests {
                 kind: CollectionKind::Manual,
                 query: None,
                 items: vec![
-                    PathBuf::from(r"C:\photos\safe.jpg"),
-                    PathBuf::from(r"C:\photos\..\escape.jpg"),
+                    PathBuf::from(wp(r"C:\photos\safe.jpg")),
+                    PathBuf::from(wp(r"C:\photos\..\escape.jpg")),
                 ],
             }],
         };
@@ -798,7 +805,7 @@ mod tests {
         let source = Db::open_in_memory().unwrap();
         let id = source.create_manual_collection("Favorites").unwrap();
         let files = source
-            .upsert_files(&[nf(r"C:\photos\one.jpg"), nf(r"C:\photos\two.jpg")])
+            .upsert_files(&[nf(&wp(r"C:\photos\one.jpg")), nf(&wp(r"C:\photos\two.jpg"))])
             .unwrap();
         source.add_to_collection(id, &files).unwrap();
         let json = source.export_collections_json(&[id]).unwrap();
@@ -831,7 +838,7 @@ mod tests {
     fn smart_collections_and_saved_searches() {
         let db = Db::open_in_memory().unwrap();
         let ids = db
-            .upsert_files(&[nf(r"C:\s\a.jpg"), nf(r"C:\s\b.png")])
+            .upsert_files(&[nf(&wp(r"C:\s\a.jpg")), nf(&wp(r"C:\s\b.png"))])
             .unwrap();
         db.set_rating(&ids[..1], 5).unwrap();
         assert!(matches!(
@@ -867,9 +874,9 @@ mod tests {
         let src = Db::open_in_memory().unwrap();
         let ids = src
             .upsert_files(&[
-                nf(r"E:\shoot\a.cr3"),
-                nf(r"E:\shoot\b.cr3"),
-                nf(r"E:\shoot\日本.cr3"),
+                nf(&wp(r"E:\shoot\a.cr3")),
+                nf(&wp(r"E:\shoot\b.cr3")),
+                nf(&wp(r"E:\shoot\日本.cr3")),
             ])
             .unwrap();
         let m = src.create_manual_collection("Client picks").unwrap();
@@ -879,7 +886,7 @@ mod tests {
         assert!(json.contains("forge-collections"));
 
         let dst = Db::open_in_memory().unwrap();
-        dst.upsert_files(&[nf(r"E:\shoot\a.cr3")]).unwrap();
+        dst.upsert_files(&[nf(&wp(r"E:\shoot\a.cr3"))]).unwrap();
         let rep = dst.import_collections_json(&json).unwrap();
         assert_eq!(rep.collections_created, 2);
         assert_eq!(rep.items_linked, 1);
@@ -894,9 +901,9 @@ mod tests {
         );
         assert!(!files[0].present);
         // The placeholder goes live once the path is indexed.
-        dst.upsert_files(&[nf(r"E:\shoot\日本.cr3")]).unwrap();
+        dst.upsert_files(&[nf(&wp(r"E:\shoot\日本.cr3"))]).unwrap();
         assert!(
-            dst.file_by_path(Path::new(r"E:\shoot\日本.cr3"))
+            dst.file_by_path(Path::new(&wp(r"E:\shoot\日本.cr3")))
                 .unwrap()
                 .unwrap()
                 .present

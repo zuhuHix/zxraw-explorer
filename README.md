@@ -470,6 +470,8 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 
 Requirements: Windows 10 or 11 (64-bit).
 
+On Linux, build from source for now: see [Linux](#linux) under *For developers*.
+
 - **Installer:** `ZXraw-Explorer-<version>-Setup-x64.exe`. Installs for your user only, so no
   admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus, with *Open in new ZXraw window* on Shift+right-click. Two more opt-in tasks register the archive types and add the ZXraw archive menu to Explorer's right-click menu; the uninstaller removes both.
 - **Portable:** `ZXraw-Explorer-<version>-x64.zip`. Unzip anywhere and run `zxraw.exe`.
@@ -518,6 +520,27 @@ Optional: video thumbnails and technical metadata need `ffmpeg.exe` and `ffprobe
 ZXraw Explorer does not bundle FFmpeg. Use **Download FFmpeg…** (in Settings › Video, the
 welcome window or the command palette) to fetch a pinned, checksum-verified build into the
 app's data folder. Alternatively, put the tools on `PATH` or choose their folder in Settings.
+
+### Linux
+
+The app also builds and runs on Linux (X11 and Wayland). There are no Linux packages yet, so
+build it from source. On Debian or Ubuntu:
+
+```sh
+sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+  libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+cargo build --release                     # target/release/zxraw and zxraw-cli
+cargo run -p forge-app                    # launch the UI (debug)
+cargo test --workspace --exclude forge-app && cargo test -p forge-app --bins
+```
+
+At run time, file dialogs go through the XDG desktop portal, so an `xdg-desktop-portal`
+backend (GTK, GNOME or KDE) must be running; any desktop session has one. Video thumbnails need
+`ffmpeg` and `ffprobe` on `PATH` (`sudo apt install ffmpeg`): there is no in-app download on
+Linux. *Open* and *Show in folder* use `xdg-open`. *Open terminal here* tries `$TERMINAL`, then
+`x-terminal-emulator`, GNOME Terminal, Konsole, Xfce Terminal and xterm. Settings and the index
+are kept in `~/.config/zxrawexplorer` and `~/.local/share/zxrawexplorer`. What isn't available
+on Linux yet is listed under [Linux](docs/LIMITATIONS.md#linux) in the known limitations.
 
 ### Docs
 

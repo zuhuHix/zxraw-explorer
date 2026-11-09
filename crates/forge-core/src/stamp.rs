@@ -1,6 +1,8 @@
 //! File identity stamps: size, last-write time, volume and file index, and link count.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
