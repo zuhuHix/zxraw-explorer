@@ -7,6 +7,8 @@
 //! "Open with" and on ZXraw Explorer's Windows Settings page, where the user confirms the
 //! default: archive `UserChoice` values are never written), and the "ZXraw" menu in
 //! Explorer's right-click menu (`forge_win::archive_menu`). Each applies when toggled.
+//!
+//! On Linux the page is [`linux`]: folders, photos and archives through `mimeapps.list`.
 
 use std::time::{Duration, Instant};
 
@@ -15,6 +17,10 @@ use egui::RichText;
 use forge_core::model::{IMAGE_EXTS, RAW_EXTS};
 
 use crate::app::ZxrawApp;
+
+#[cfg(target_os = "linux")]
+#[path = "default_app_linux.rs"]
+pub mod linux;
 
 /// Image types the viewer cannot decode; they keep opening in their current apps.
 const NOT_VIEWABLE: &[&str] = &["psd", "jxl", "ico", "crw", "x3f", "mrw"];
@@ -92,6 +98,7 @@ fn describe(extension: &str) -> String {
 }
 
 /// Which app each offered type opens with.
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 #[derive(Debug, Clone, Default)]
 pub struct Status {
     /// The user opted in (ZXraw Explorer is registered for the types).
@@ -106,8 +113,12 @@ pub struct Status {
     pub archive_types: Vec<(String, Option<String>, bool)>,
     /// The ZXraw menu is in Explorer's right-click menu.
     pub archive_menu: bool,
+    /// Linux: the menu entry and every switch's types.
+    #[cfg(target_os = "linux")]
+    pub linux: Option<linux::LinuxStatus>,
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 fn handlers(types: Vec<forge_win::FileType>) -> Vec<(String, Option<String>, bool)> {
     types
         .into_iter()
@@ -121,6 +132,12 @@ fn handlers(types: Vec<forge_win::FileType>) -> Vec<(String, Option<String>, boo
 
 impl Status {
     fn check() -> Self {
+        #[cfg(target_os = "linux")]
+        return Self {
+            linux: linux::LinuxStatus::check(),
+            ..Self::default()
+        };
+        #[cfg(not(target_os = "linux"))]
         Self {
             registered: forge_win::file_types_registered().unwrap_or(false),
             folders: forge_win::default_folder_handler_enabled().unwrap_or(false),
@@ -131,15 +148,18 @@ impl Status {
         }
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
     pub fn ours(&self) -> usize {
         self.types.iter().filter(|(_, _, ours)| *ours).count()
     }
 
+    #[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
     pub fn archives_ours(&self) -> usize {
         self.archive_types.iter().filter(|(_, _, ours)| *ours).count()
     }
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 /// Background-refreshed [`Status`] for whichever window shows it.
 pub struct State {
     status: Option<Status>,
@@ -192,6 +212,7 @@ impl State {
 }
 
 /// What the user asked for in [`controls`].
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Apply { photos: bool, folders: bool },
@@ -203,11 +224,23 @@ pub enum Action {
     ArchiveDefaults,
     /// Add (true) or remove the ZXraw menu in Explorer's right-click menu.
     ArchiveMenu(bool),
+    /// The Linux page ([`linux::controls`]).
+    #[cfg(target_os = "linux")]
+    Linux(linux::LinuxAction),
 }
 
 /// Status line plus buttons. `compact` (the welcome) leaves out the per-type list and
 /// "Stop using".
 pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mut Option<Action>) {
+    #[cfg(target_os = "linux")]
+    linux::controls(ui, state, compact, action);
+    #[cfg(not(target_os = "linux"))]
+    windows_controls(ui, state, compact, action);
+}
+
+/// The Windows page (elsewhere off Linux too; the page is hidden there).
+#[cfg(not(target_os = "linux"))]
+fn windows_controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mut Option<Action>) {
     let ctx = ui.ctx().clone();
     ui.checkbox(
         &mut state.photos_selected,
@@ -279,6 +312,7 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
     archive_controls(ui, status, action);
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 /// The archive part of Settings > Default app.
 fn archive_controls(ui: &mut egui::Ui, status: &Status, action: &mut Option<Action>) {
     ui.add_space(14.0);
@@ -330,6 +364,7 @@ fn archive_controls(ui: &mut egui::Ui, status: &Status, action: &mut Option<Acti
     type_list(ui, "Archive types", "default-app-archive-types", &status.archive_types);
 }
 
+#[cfg_attr(target_os = "linux", allow(dead_code))] // The Windows page; Linux has its own.
 fn type_list(ui: &mut egui::Ui, title: &str, id: &str, types: &[(String, Option<String>, bool)]) {
     egui::CollapsingHeader::new(format!("{title} ({})", types.len()))
         .id_salt(id)
@@ -354,8 +389,13 @@ fn type_list(ui: &mut egui::Ui, title: &str, id: &str, types: &[(String, Option<
 }
 /// Carries out an [`Action`] from [`controls`].
 pub fn run(app: &mut ZxrawApp, action: Action) {
-    if app.testhook.active() {
-        // Automated runs never change the user's file associations.
+    #[cfg(target_os = "linux")]
+    let sandboxed = linux::automation_may_change_defaults;
+    #[cfg(not(target_os = "linux"))]
+    let sandboxed = || false;
+    if app.testhook.active() && !sandboxed() {
+        // Automated runs never change the user's file associations (on Linux they may, when
+        // both XDG homes are inside the test's sandbox).
         tracing::info!("automated run: not changing file associations ({action:?})");
         return;
     }
@@ -366,6 +406,8 @@ pub fn run(app: &mut ZxrawApp, action: Action) {
         Action::ArchiveTypes(on) => set_archive_types(app, on),
         Action::ArchiveDefaults => archive_defaults(app),
         Action::ArchiveMenu(on) => set_archive_menu(app, on),
+        #[cfg(target_os = "linux")]
+        Action::Linux(action) => linux::apply(app, action),
     }
     app.ops.settings_ui.default_app.invalidate();
 }

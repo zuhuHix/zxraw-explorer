@@ -93,9 +93,13 @@ bundled library. The `.deb` never bundles: linked libraries are package dependen
 first one, so the desktop launches it once per selected file.
 
 **MIME types are an optional handler.** The `MimeType=` list makes ZXraw Explorer appear in
-*Open With* for the photo and RAW types the viewer opens, and for folders (`inode/directory`).
-Installing the package does not make it the default for any type. The user chooses it, or sets it
-with `xdg-mime`. The list is `IMAGE_EXTS` plus `RAW_EXTS` from `crates/forge-core/src/model.rs`,
+*Open With* for the photo and RAW types the viewer opens, the archive types (an archive opens as
+a folder) and folders (`inode/directory`). Installing the package does not make it the default for
+any type. The user chooses it in Settings › Default app (which writes `~/.config/mimeapps.list`
+and can put the previous apps back), in the desktop's own settings, or with `xdg-mime`. The list
+must match `menu_mime_types()` in `crates/forge-app/src/default_app_linux.rs`; a unit test checks
+it. The AppImage installs no entry, but Settings › Default app can write the same one to
+`~/.local/share/applications/zxraw.desktop` with `Exec` set to the AppImage's path. The photo list is `IMAGE_EXTS` plus `RAW_EXTS` from `crates/forge-core/src/model.rs`,
 minus the types the viewer cannot decode (`psd`, `jxl`, `ico`, `crw`, `x3f`, `mrw`, see
 `NOT_VIEWABLE` in `crates/forge-app/src/default_app.rs`). Seven RAW extensions (`srw`, `3fr`,
 `iiq`, `erf`, `mef`, `mos`, `rwl`) have no shared-mime-info type on Ubuntu 24.04, so they are not

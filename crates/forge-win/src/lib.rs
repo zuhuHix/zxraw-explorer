@@ -18,6 +18,7 @@
 //! * [`network`] — connecting to network shares through Windows' own sign-in dialog.
 //! * [`desktop`] — a private, invisible desktop for automated UI runs.
 //! * [`window`] — window placement that never flashes on screen (hidden maximize).
+//! * [`xdg_apps`] — Linux default apps (`mimeapps.list`) and the applications menu entry.
 //! * Opt-in per-user integration: the folder context menu and photo file types
 //!   ("Open with" / Settings > Default apps).
 
@@ -52,6 +53,7 @@ pub mod virtual_files;
 pub mod virtual_source;
 pub mod watch;
 pub mod window;
+pub mod xdg_apps;
 
 pub use clipboard::{
     ClipboardEffect, ClipboardRead, ClipboardToken, clear_if_owned_files, clear_if_token, clipboard_has_text,

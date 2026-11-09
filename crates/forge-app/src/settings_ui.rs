@@ -32,10 +32,10 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
-    /// Whether this page applies here: Default app (file associations and the Explorer menu)
-    /// is Windows-only.
+    /// Whether this page applies here: Default app is on Windows (file associations and the
+    /// Explorer menu) and Linux (`mimeapps.list`).
     fn available(self) -> bool {
-        cfg!(windows) || !matches!(self, Self::DefaultApp)
+        cfg!(any(windows, target_os = "linux")) || !matches!(self, Self::DefaultApp)
     }
 
     const ALL: [(Self, &'static str); 12] = [
@@ -1347,7 +1347,11 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     page_heading(
         ui,
         "Default app",
-        "Choose whether photos, RAW files, archives and filesystem folders open in ZXraw Explorer, and whether Explorer shows the ZXraw menu.",
+        if cfg!(windows) {
+            "Choose whether photos, RAW files, archives and filesystem folders open in ZXraw Explorer, and whether Explorer shows the ZXraw menu."
+        } else {
+            "Choose whether folders, photos, RAW files and archives open in ZXraw Explorer instead of the file manager and the desktop's other apps."
+        },
     );
     ui.add_space(10.0);
     let mut action = None;
@@ -1356,7 +1360,11 @@ fn default_app_page(ui: &mut egui::Ui, state: &mut SettingsUi, intents: &mut Vec
     ui.add_space(12.0);
     ui.label(
         RichText::new(
-            "The choice applies to this Windows account only. Win+E, the taskbar File Explorer button, and other apps' \"Show in folder\" commands still open Windows Explorer. Restore previous apps puts back the apps that were set before.",
+            if cfg!(windows) {
+                "The choice applies to this Windows account only. Win+E, the taskbar File Explorer button, and other apps' \"Show in folder\" commands still open Windows Explorer. Restore previous apps puts back the apps that were set before."
+            } else {
+                "The choice applies to your user account only (~/.config/mimeapps.list) and works on Cinnamon, GNOME, KDE, XFCE and other desktops that follow freedesktop.org. Turning a switch off puts back the apps that were set before. The page re-reads the defaults while it is open, so a change made in the desktop's own settings shows here."
+            },
         )
         .weak(),
     );
@@ -2840,5 +2848,14 @@ mod shortcut_capture_tests {
         let mut events = vec![egui::Event::PointerMoved(egui::Pos2::ZERO)];
         assert_eq!(take_shortcut(&mut events, Modifiers::NONE), None);
         assert_eq!(events.len(), 1);
+    }
+}
+
+impl SettingsUi {
+    /// Opens the window on Settings > Default app (automation: the e2e Default app scenario).
+    #[cfg_attr(not(all(target_os = "linux", any(debug_assertions, feature = "automation"))), allow(dead_code))]
+    pub fn show_default_app_page(&mut self) {
+        self.open = true;
+        self.page = SettingsPage::DefaultApp;
     }
 }

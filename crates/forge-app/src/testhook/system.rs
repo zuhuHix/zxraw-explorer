@@ -50,6 +50,15 @@
 //!   means no cut, as `wait-no-cut`.
 //! - `assert-cut-path <path>`: require that the app's cut contains this path.
 //!
+//! Default app on Linux (needs `XDG_CONFIG_HOME` and `XDG_DATA_HOME` inside the sandbox, else
+//! `default_app::run` refuses to change anything):
+//! - `default-app-page`: open Settings on the Default app page.
+//! - `default-app folders|photos|archives on|off`, `default-app add-menu|remove-menu`: what
+//!   the page's switches and buttons send, through the same `default_app::run`.
+//! - `assert-default-app folders|photos|archives on|off`: wait (10 s) until a fresh read of
+//!   the defaults shows the switch so.
+//! - `assert-menu-entry missing|installed|ours|moved`: the applications menu entry's state.
+//!
 //! Closing with transfers pending:
 //! - `request-close`: arm the close guard for automation and ask the window to close.
 //! - `assert-close-warning`: wait up to 5 s for the "Copies are not finished" warning.
@@ -238,6 +247,56 @@ pub(super) fn step(
                 Ok(Flow::Done)
             } else {
                 Err(format!("the cut does not hold {}: {cut:?}", path.display()))
+            }
+        }
+        #[cfg(target_os = "linux")]
+        "default-app-page" => {
+            app.ops.settings_ui.show_default_app_page();
+            Ok(Flow::Done)
+        }
+        #[cfg(target_os = "linux")]
+        "default-app" => {
+            use crate::default_app::linux::LinuxAction;
+            let mut words = args.split_whitespace();
+            let action = match (words.next(), words.next()) {
+                (Some("add-menu"), None) => LinuxAction::AddMenuEntry,
+                (Some("remove-menu"), None) => LinuxAction::RemoveMenuEntry,
+                (Some(group), Some(state)) => LinuxAction::Group(linux_group(group)?, on_off(state)?),
+                _ => return Err(format!("expected `<group> on|off`, `add-menu` or `remove-menu`, got `{args}`")),
+            };
+            crate::default_app::run(app, crate::default_app::Action::Linux(action));
+            Ok(Flow::Done)
+        }
+        #[cfg(target_os = "linux")]
+        "assert-default-app" => {
+            let mut words = args.split_whitespace();
+            let group = linux_group(words.next().unwrap_or_default())?;
+            let want = on_off(words.next().unwrap_or_default())?;
+            let status = crate::default_app::linux::LinuxStatus::check()
+                .ok_or("the XDG directories could not be read")?;
+            if status.is_on(group) == want {
+                return Ok(Flow::Done);
+            }
+            if elapsed(st) > Duration::from_secs(10) {
+                return Err(format!("{group:?} is {}, expected {args}", if want { "off" } else { "on" }));
+            }
+            Ok(Flow::Wait(format!("waiting for {args}")))
+        }
+        #[cfg(target_os = "linux")]
+        "assert-menu-entry" => {
+            use forge_win::xdg_apps::MenuEntry;
+            let status = crate::default_app::linux::LinuxStatus::check()
+                .ok_or("the XDG directories could not be read")?;
+            let have = match status.menu {
+                MenuEntry::Missing => "missing",
+                MenuEntry::Installed(_) => "installed",
+                MenuEntry::Ours { current: true, .. } => "ours",
+                MenuEntry::Ours { current: false, .. } => "moved",
+            };
+            if have == args.trim() {
+                Ok(Flow::Done)
+            } else {
+                Err(format!("menu entry is {have}, expected {args}"))
             }
         }
         "request-close" => {
@@ -480,4 +539,24 @@ fn position(args: &str, what: &str) -> Result<usize, String> {
 
 fn elapsed(st: &mut StepState) -> Duration {
     st.started.get_or_insert_with(Instant::now).elapsed()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_group(word: &str) -> Result<crate::default_app::linux::Group, String> {
+    use crate::default_app::linux::Group;
+    match word {
+        "folders" => Ok(Group::Folders),
+        "photos" => Ok(Group::Photos),
+        "archives" => Ok(Group::Archives),
+        other => Err(format!("expected folders, photos or archives, got `{other}`")),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn on_off(word: &str) -> Result<bool, String> {
+    match word {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        other => Err(format!("expected on or off, got `{other}`")),
+    }
 }

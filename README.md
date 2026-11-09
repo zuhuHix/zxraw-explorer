@@ -496,7 +496,9 @@ glibc 2.39 or newer (Ubuntu 24.04, Linux Mint 22, Debian 13, Fedora 40 or later)
   Either install it (`sudo apt install libfuse2t64`), or run the AppImage with `--appimage-extract-and-run` instead.
 - **Debian package:** `zxraw_<version>_amd64.deb`. Install it with
   `sudo apt install ./zxraw_<version>_amd64.deb`. It puts `zxraw` in the application menu,
-  registers it for photo and RAW file types, and lists it as an optional folder handler.
+  registers it for photo, RAW and archive file types, and lists it as an optional folder handler.
+  Defaults are set in Settings › Default app. An AppImage has no menu entry of its own, so that
+  page can add one to the applications menu, and remove it again.
 
 Video thumbnails and technical metadata need `ffmpeg` and `ffprobe` on `PATH`
 (`sudo apt install ffmpeg`). The daily update check works on Linux too, but nothing is installed
