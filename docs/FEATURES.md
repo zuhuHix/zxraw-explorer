@@ -795,6 +795,13 @@ The exact commands and limits are in [TESTING.md](TESTING.md) and
   registration restore. A photo passed on the command line
   opens in the viewer with its folder (`a_photo_passed_on_the_command_line_opens_in_the_viewer_with_its_folder`).
   The Default apps fallback page was not exercised.
+* ✅ Default apps on Linux (folders, photos and RAW, archives through `mimeapps.list`; restores the
+  previous apps; AppImage applications-menu entry) — `forge-win/src/xdg_apps.rs`,
+  `forge-app/src/default_app_linux.rs`. Unit tests cover the MIME Apps lookup order, set and
+  restore (including a desktop-specific override and an uninstalled previous app) and the
+  `Exec` quoting; the e2e scenario `system::linux_default_apps_set_restore_and_menu_entry` drives
+  the page against temp XDG folders (add the menu entry, all three switches, restore, a moved
+  AppImage, removal). Not tried on a real desktop session.
 * ✅ Default filesystem folder app (opt-in, same flow) — `forge-win/src/integration.rs` sets only the `Directory`
   and `Drive` shell defaults, leaving `Folder` untouched. An ignored Windows test verified that both associations
   resolve to the built ZXraw executable, then restored the real HKCU values and confirmed the original defaults,

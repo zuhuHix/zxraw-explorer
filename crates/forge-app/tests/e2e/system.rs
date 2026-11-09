@@ -741,3 +741,101 @@ fn a_forwarded_add_zip_with_a_vanished_item_makes_no_archive() {
     assert_no_crash(&profile);
     assert!(archives_in(&shoot, "zip").is_empty(), "no archive of only part of the selection");
 }
+
+/// Settings > Default app on Linux, against temp XDG folders only: the AppImage adds itself to
+/// the applications menu, the three switches take their types over (also from a desktop-specific
+/// `mimeapps.list` that overrides them), turning a switch off puts the previous apps back, a
+/// moved AppImage is noticed, and removing the menu entry leaves nothing pointing at it.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_default_apps_set_restore_and_menu_entry() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let root = sandbox.path();
+    let profile = root.join("profile");
+    let config = root.join("xdg-config");
+    let data = root.join("xdg-data");
+    let system = root.join("usr-share");
+    let entry = |dir: &Path, id: &str, name: &str| {
+        write_file(
+            &dir.join("applications").join(id),
+            format!("[Desktop Entry]\nType=Application\nName={name}\nExec={name}\n").as_bytes(),
+        );
+    };
+    entry(&system, "nemo.desktop", "Files");
+    entry(&system, "xviewer.desktop", "Image Viewer");
+    write_file(
+        &system.join("applications/mimeapps.list"),
+        b"[Default Applications]\ninode/directory=nemo.desktop\nimage/png=xviewer.desktop\n",
+    );
+    let user_list = config.join("mimeapps.list");
+    let user_original = "# kept\n[Default Applications]\ntext/plain=gedit.desktop\n\n[Added Associations]\nimage/png=xviewer.desktop;\n";
+    write_file(&user_list, user_original.as_bytes());
+    let cinnamon = config.join("x-cinnamon-mimeapps.list");
+    let cinnamon_original = "[Default Applications]\nimage/jpeg=xviewer.desktop\n";
+    write_file(&cinnamon, cinnamon_original.as_bytes());
+    let appimage = root.join("Apps/ZXraw Explorer.AppImage");
+    write_file(&appimage, b"not really an AppImage");
+
+    let env = |appimage: &Path| RunOpts {
+        env: vec![
+            ("XDG_CONFIG_HOME".into(), shown(&config)),
+            ("XDG_CONFIG_DIRS".into(), shown(&root.join("etc-xdg"))),
+            ("XDG_DATA_HOME".into(), shown(&data)),
+            ("XDG_DATA_DIRS".into(), shown(&system)),
+            ("XDG_CURRENT_DESKTOP".into(), "X-Cinnamon".into()),
+            ("APPIMAGE".into(), shown(appimage)),
+        ],
+        ..RunOpts::default()
+    };
+    let shots = shots_dir().join("system");
+    std::fs::create_dir_all(&shots).unwrap();
+    let shot = shots.join("linux-default-apps.png");
+    let script = format!(
+        "limit 90\ndismiss-notices\nui system default-app-page\nwait-frames 5\n\
+         ui system assert-menu-entry missing\n\
+         ui system default-app folders on\nui system assert-default-app folders off\n\
+         ui system default-app add-menu\nui system assert-menu-entry ours\n\
+         ui system default-app folders on\nui system default-app photos on\nui system default-app archives on\n\
+         ui system assert-default-app folders on\nui system assert-default-app photos on\n\
+         ui system assert-default-app archives on\nwait-frames 30\nscreenshot {}\n\
+         ui system default-app photos off\nui system assert-default-app photos off\n\
+         ui system default-app folders off\nui system assert-default-app folders off\n\
+         ui system assert-default-app archives on\nexit\n",
+        shown(&shot)
+    );
+    let outcome = run_app_with(&root.join("run1"), &profile, &script, &env(&appimage));
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(shot.is_file(), "missing screenshot {}", shot.display());
+
+    let desktop = data.join("applications/zxraw.desktop");
+    let text = std::fs::read_to_string(&desktop).unwrap();
+    assert!(
+        text.contains(&format!("Exec=\"{}\" %f\n", appimage.display())),
+        "Exec is the AppImage path: {text}"
+    );
+    assert!(data.join("icons/hicolor/256x256/apps/zxraw.png").is_file());
+    // Photos and folders are back as they were; archives are still ours.
+    assert_eq!(std::fs::read_to_string(&cinnamon).unwrap(), cinnamon_original);
+    let list = std::fs::read_to_string(&user_list).unwrap();
+    assert!(list.starts_with("# kept\n[Default Applications]\ntext/plain=gedit.desktop\n"), "{list}");
+    assert!(list.contains("application/zip=zxraw.desktop;\n"), "{list}");
+    assert!(!list.contains("inode/directory=") && !list.contains("image/jpeg="), "{list}");
+    assert!(list.contains("[Added Associations]\nimage/png=xviewer.desktop;\n"), "{list}");
+
+    // The AppImage moves: the page notices, rewrites the entry, then removes it again.
+    let moved = root.join("Elsewhere/ZXraw.AppImage");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&appimage, &moved).unwrap();
+    let script = "limit 60\ndismiss-notices\nui system default-app-page\nwait-frames 5\n\
+                  ui system assert-menu-entry moved\nui system default-app add-menu\n\
+                  ui system assert-menu-entry ours\nui system default-app remove-menu\n\
+                  ui system assert-menu-entry missing\nui system assert-default-app archives off\nexit\n";
+    let outcome = run_app_with(&root.join("run2"), &profile, script, &env(&moved));
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert!(!desktop.exists(), "menu entry removed");
+    assert!(!data.join("icons/hicolor/48x48/apps/zxraw.png").exists(), "icons removed");
+    let list = std::fs::read_to_string(&user_list).unwrap();
+    assert!(!list.contains("zxraw"), "nothing points at the removed entry: {list}");
+}

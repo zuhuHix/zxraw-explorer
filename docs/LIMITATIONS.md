@@ -642,10 +642,16 @@ The Linux build (X11 and Wayland) is new. Browsing, the viewer, culling, metadat
 the index, search, Git badges, copy, move and rename work. Everything Windows-only is hidden
 or refuses with a message; nothing should crash for lack of it.
 
-* Hidden on Linux (menus, command palette and shortcuts): the Default apps page, Explorer menu
+* Hidden on Linux (menus, command palette and shortcuts): Explorer menu
   and file type registration, app icon shortcuts, *Open terminal as administrator*, and the
   FFmpeg download. Install `ffmpeg` with the package manager: there is no versioned,
   checksummed static Linux build to pin the way the Windows one is pinned.
+* Default app (Settings › Default app) uses the freedesktop MIME Apps mechanism. It writes only
+  user-level entries (`~/.config/mimeapps.list`, and a desktop file such as
+  `x-cinnamon-mimeapps.list` if that overrides a type), never `/usr` or `/etc`. Desktops that
+  ignore `mimeapps.list` are not covered. The folder switch only affects apps that ask the MIME
+  system to open a folder; a desktop's own *Files* launcher or shortcut may still open its file
+  manager. Turning a switch off restores the recorded apps, but not uninstalled ones.
 * Through the Linux backends in `forge-win` (see
   [Linux platform behaviour](#linux-platform-behaviour)): the Trash (freedesktop), the file
   clipboard, single instance (a second launch opens a tab in the running window), *Open with*
@@ -784,4 +790,5 @@ Windows in these ways:
   thumbnails are not used (same as WIC). EXIF orientation on HEIF is applied but untested
   for lack of a sample; HEIC decoding was tested on sample files only (no local HEVC encoder).
 - **Shell integration** (context menu, file types, default apps, Explorer verbs, Everything
-  search, shell notifications) is Windows-only.
+  search, shell notifications) is Windows-only. Default apps on Linux are under
+  [Linux](#linux).

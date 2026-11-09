@@ -298,9 +298,13 @@ fn welcome(app: &mut ZxrawApp, ctx: &egui::Context) {
             });
             ui.add_space(8.0);
 
-            if cfg!(windows) {
+            if cfg!(any(windows, target_os = "linux")) {
                 ui.heading("Default app");
-                ui.label("Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders.");
+                ui.label(if cfg!(windows) {
+                    "Choose ZXraw Explorer for your photo and RAW files, and optionally for filesystem folders."
+                } else {
+                    "Open folders, photos and RAW files, or archives with ZXraw Explorer. Settings › Default app lists every type."
+                });
                 crate::default_app::controls(ui, &mut app.ops.settings_ui.default_app, true, &mut default_app);
                 ui.add_space(8.0);
             }
