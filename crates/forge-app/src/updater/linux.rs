@@ -2,19 +2,25 @@
 //! Windows (`updater::download_verified`); this module decides how the running copy was
 //! installed and replaces it.
 //!
-//! * **AppImage** (`$APPIMAGE` names an existing absolute file): the verified file is copied
-//!   to a temporary name in the AppImage's own folder, hashed again, given the old file's mode
-//!   (at least 0755), synced, and renamed over the old path. The rename is atomic, so the path
-//!   always names either the whole old or the whole new AppImage; the running copy keeps its
-//!   own (now unlinked) file through its mount. No `.old` backup is kept: the new file was
-//!   verified before the rename and nothing is ever half written, so a backup would only be
-//!   a 60 MB file to clean up. A folder ZXraw may not write to gets the file in Downloads
-//!   instead.
-//! * **deb** (`/usr/bin/zxraw`, owned by the package `zxraw` according to `dpkg-query`):
-//!   `pkexec /usr/bin/apt-get install -y --no-remove <file>`, which asks for the password
-//!   through the desktop's polkit agent. The file must sit in our own 0700 folder, be ours,
-//!   have one link, and match the checksum again right before pkexec runs. Without pkexec or
-//!   a polkit agent the file is opened in the desktop's package installer instead.
+//! * **AppImage**: this process runs from an AppImage mount (`/proc/self/exe` is inside
+//!   `$APPDIR`), and `$APPIMAGE` is an absolute path to a regular file (not a symlink) of
+//!   ours that starts with the ELF magic and the type 2 AppImage marker. The verified file is
+//!   copied to a temporary name in the AppImage's own folder, hashed again, given the old
+//!   file's mode (at least 0755), synced, and renamed over the old path. The rename is
+//!   atomic, so the path always names either the whole old or the whole new AppImage; the
+//!   running copy keeps its own (now unlinked) file through its mount. No `.old` backup is
+//!   kept: the new file was verified before the rename and nothing is ever half written, so
+//!   a backup would only be a 60 MB file to clean up. A folder ZXraw may not write to, or an
+//!   AppImage owned by another user or group, gets the file in Downloads instead.
+//! * **deb** (`/usr/bin/zxraw`, owned by the package `zxraw` according to `dpkg-query`): the
+//!   file is checked unprivileged first (our private 0700 folder, one link, the checksum, and
+//!   `dpkg-deb -f`: Package zxraw, the offered Version, Architecture amd64), so a wrong file
+//!   never asks for a password. Then `pkexec /usr/lib/zxraw/install-update <file> <sha256>
+//!   <version>` runs the helper the .deb ships (`packaging/linux/zxraw-install-update`): as
+//!   root it copies the file once into a root-only folder and checks and installs only that
+//!   copy, so a program running as the user cannot swap the file after the check. Without
+//!   pkexec, a polkit agent or the helper (a package from before the helper was added), the file is opened
+//!   in the desktop's package installer instead.
 //! * **Other** (a build folder, a copied binary): no install; the release page is opened.
 
 use std::ffi::{OsStr, OsString};
@@ -35,7 +41,9 @@ pub const DEB_PACKAGE: &str = "zxraw";
 pub const DPKG_QUERY: &str = "/usr/bin/dpkg-query";
 /// pkexec needs an absolute program path; so does the program it runs.
 pub const PKEXEC: &str = "/usr/bin/pkexec";
-pub const APT_GET: &str = "/usr/bin/apt-get";
+/// The root helper the .deb installs (`packaging/linux/zxraw-install-update`).
+pub const INSTALL_HELPER: &str = "/usr/lib/zxraw/install-update";
+pub const DPKG_DEB: &str = "/usr/bin/dpkg-deb";
 const DPKG_TIMEOUT: Duration = Duration::from_secs(5);
 /// apt's output kept for an error message (the end of it).
 const MAX_OUTPUT: usize = 256 << 10;
@@ -43,7 +51,7 @@ const MAX_OUTPUT: usize = 256 << 10;
 /// How this copy of ZXraw Explorer was installed, which decides how it is updated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// Started from this AppImage file (`$APPIMAGE`, as given: it may be a symlink).
+    /// Started from this AppImage file (`$APPIMAGE`: a regular file of ours, not a symlink).
     AppImage(PathBuf),
     /// The `zxraw` package's `/usr/bin/zxraw`.
     Deb,
@@ -59,28 +67,28 @@ pub fn detect() -> InstallKind {
     }
     detect_from(
         std::env::var_os("APPIMAGE"),
+        std::env::var_os("APPDIR"),
         std::env::current_exe().ok(),
         Path::new(DEB_EXE),
         |path| dpkg_owner(Path::new(DPKG_QUERY), path, DPKG_TIMEOUT),
     )
 }
 
-/// [`detect`] with its inputs given: the `$APPIMAGE` value, the current exe, the path the
-/// .deb installs, and the package that owns a path.
+/// [`detect`] with its inputs given: `$APPIMAGE`, `$APPDIR`, the current exe (resolved, as
+/// `/proc/self/exe` is), the path the .deb installs, and the package that owns a path.
 ///
-/// `$APPIMAGE` is checked as in `forge_win::xdg_apps::launcher`: absolute and an existing
-/// file. A value that names nothing (the AppImage was moved or deleted while running) is
-/// [`InstallKind::Other`]: this exe lives in the AppImage's temporary mount, so it is not
-/// the deb either.
+/// A set `$APPIMAGE` that fails [`is_our_appimage`] is [`InstallKind::Other`]: it may name
+/// any file, and replacing that file is not ours to do.
 pub fn detect_from(
     appimage: Option<OsString>,
+    appdir: Option<OsString>,
     exe: Option<PathBuf>,
     deb_exe: &Path,
     owner: impl FnOnce(&Path) -> Option<String>,
 ) -> InstallKind {
     if let Some(value) = appimage.filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
-        return if path.is_absolute() && path.is_file() {
+        return if is_our_appimage(&path, appdir.as_deref(), exe.as_deref()) {
             InstallKind::AppImage(path)
         } else {
             InstallKind::Other
@@ -98,6 +106,35 @@ pub fn detect_from(
         Some(package) if package == DEB_PACKAGE => InstallKind::Deb,
         _ => InstallKind::Other,
     }
+}
+
+/// The first bytes of a type 2 AppImage: an ELF file with `AI\x02` at offset 8.
+const ELF_MAGIC: &[u8] = b"\x7fELF";
+const APPIMAGE_TYPE2: &[u8] = b"AI\x02";
+
+/// `path` is the AppImage this process runs from: we run inside its mount (`exe` is under
+/// `appdir`), and it is an absolute path to a regular file (not a symlink) owned by us, with
+/// the ELF magic and the type 2 AppImage marker.
+pub fn is_our_appimage(path: &Path, appdir: Option<&OsStr>, exe: Option<&Path>) -> bool {
+    let (Some(appdir), Some(exe)) = (appdir.filter(|d| !d.is_empty()), exe) else {
+        return false;
+    };
+    let (Ok(appdir), Ok(exe)) = (fs::canonicalize(appdir), fs::canonicalize(exe)) else {
+        return false;
+    };
+    if !path.is_absolute() || !exe.starts_with(&appdir) {
+        return false;
+    }
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.uid() != euid() {
+        return false;
+    }
+    let mut head = [0u8; 11];
+    open_nofollow(path)
+        .and_then(|mut file| file.read_exact(&mut head))
+        .is_ok_and(|()| head.starts_with(ELF_MAGIC) && &head[8..11] == APPIMAGE_TYPE2)
 }
 
 /// The one package `dpkg-query -S <path>` names, run without a shell and stopped after
@@ -172,6 +209,10 @@ pub fn parse_dpkg_owner(text: &str, path: &Path) -> Option<String> {
 
 fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
+}
+
+fn egid() -> u32 {
+    rustix::process::getegid().as_raw()
 }
 
 /// Creates `dir` readable only by us (0700). Fails if it exists.
@@ -256,26 +297,34 @@ pub enum ReplaceError {
     Failed(String),
 }
 
-/// Replaces the AppImage at `appimage` (following a symlink to the real file) with the
-/// verified file `verified`, whose SHA-256 must still be `expected`. Returns the real path
-/// that was replaced. On any failure the old AppImage is untouched and no temporary file
-/// is left behind.
+/// Replaces the AppImage at `appimage` (a regular file, never a symlink) with the verified
+/// file `verified`, whose SHA-256 must still be `expected`. Returns the path that was
+/// replaced. An AppImage owned by another user or group is left alone
+/// ([`ReplaceError::NotWritable`]): the new file would be ours. On any failure the old
+/// AppImage is untouched and no temporary file is left behind.
 pub fn replace_appimage(
     verified: &Path,
     expected: &str,
     appimage: &Path,
 ) -> Result<PathBuf, ReplaceError> {
-    let target = fs::canonicalize(appimage).map_err(|e| {
-        ReplaceError::Failed(format!(
-            "cannot find the AppImage {}: {e}",
-            appimage.display()
-        ))
-    })?;
+    let target = appimage.to_path_buf();
+    if !target.is_absolute() {
+        return Err(ReplaceError::Failed(format!(
+            "unexpected AppImage path {}",
+            target.display()
+        )));
+    }
     let old = fs::symlink_metadata(&target)
         .map_err(|e| ReplaceError::Failed(format!("cannot read {}: {e}", target.display())))?;
     if !old.is_file() {
         return Err(ReplaceError::Failed(format!(
-            "{} is not a file",
+            "{} is not a regular file",
+            target.display()
+        )));
+    }
+    if old.uid() != euid() || old.gid() != egid() {
+        return Err(ReplaceError::NotWritable(format!(
+            "{} belongs to another user or group",
             target.display()
         )));
     }
@@ -417,41 +466,79 @@ pub fn check_deb(deb: &Path, expected: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// How a pkexec apt-get run ended.
+/// The control fields of `deb` must be `Package: zxraw`, `Version: <version>` and
+/// `Architecture: amd64` (`dpkg-deb -f`, unprivileged). Checked before pkexec, so a wrong
+/// file never asks for the password; the root helper checks its own copy again.
+pub fn check_deb_metadata(dpkg_deb: &Path, deb: &Path, version: &str) -> Result<(), String> {
+    let field = |name: &str| -> Result<String, String> {
+        let output = Command::new(dpkg_deb)
+            .arg("-f")
+            .arg(deb)
+            .arg(name)
+            .env("LC_ALL", "C")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("cannot run {}: {e}", dpkg_deb.display()))?;
+        if !output.status.success() {
+            return Err(format!("{} is not a Debian package", deb.display()));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let found = (field("Package")?, field("Version")?, field("Architecture")?);
+    if (found.0.as_str(), found.1.as_str(), found.2.as_str()) != (DEB_PACKAGE, version, "amd64") {
+        return Err(format!(
+            "the download is {} {} ({}), not {DEB_PACKAGE} {version} (amd64); it was not installed",
+            found.0, found.1, found.2
+        ));
+    }
+    Ok(())
+}
+
+/// How a pkexec install-helper run ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DebOutcome {
     Installed,
     /// The polkit dialog was dismissed, or the password was not accepted.
     Cancelled,
-    /// No pkexec, or no polkit agent to ask for the password: use the package installer.
-    NoAgent,
-    /// apt-get failed; its output (the end of it).
+    /// No pkexec, no polkit agent to ask for the password, or no install helper (a package
+    /// from before it was added): open the file in the package installer.
+    PackageInstaller,
+    /// The helper refused the file or apt-get failed; the reason or apt's output (its end).
     Failed(String),
 }
 
+/// The install helper's exit codes (`packaging/linux/zxraw-install-update`).
+pub const HELPER_BAD_ARGS: i32 = 64;
+pub const HELPER_CHECKSUM: i32 = 65;
+pub const HELPER_NOT_OURS: i32 = 66;
+pub const HELPER_COPY: i32 = 67;
+pub const HELPER_APT: i32 = 68;
+
 /// The arguments after `pkexec`.
-pub fn pkexec_args(apt: &Path, deb: &Path) -> Vec<OsString> {
+pub fn pkexec_args(helper: &Path, deb: &Path, sha256: &str, version: &str) -> Vec<OsString> {
     vec![
-        apt.as_os_str().to_owned(),
-        "install".into(),
-        "-y".into(),
-        // An update never removes other packages; apt stops instead of asking.
-        "--no-remove".into(),
+        helper.as_os_str().to_owned(),
         deb.as_os_str().to_owned(),
+        sha256.into(),
+        version.into(),
     ]
 }
 
-/// Runs `pkexec <apt> install -y --no-remove <deb>` without a shell and waits for it (the
+/// Runs `pkexec <helper> <deb> <sha256> <version>` without a shell and waits for it (the
 /// user may take a while to type the password). Call off the UI thread.
-pub fn run_pkexec(pkexec: &Path, apt: &Path, deb: &Path) -> DebOutcome {
-    if !pkexec.is_file() {
-        return DebOutcome::NoAgent;
-    }
-    if !apt.is_file() {
-        return DebOutcome::Failed(format!("{} is missing", apt.display()));
+pub fn run_pkexec(
+    pkexec: &Path,
+    helper: &Path,
+    deb: &Path,
+    sha256: &str,
+    version: &str,
+) -> DebOutcome {
+    if !pkexec.is_file() || !helper.is_file() {
+        return DebOutcome::PackageInstaller;
     }
     let child = Command::new(pkexec)
-        .args(pkexec_args(apt, deb))
+        .args(pkexec_args(helper, deb, sha256, version))
         // pkexec's own messages, which tell "no agent" apart, in English.
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -507,17 +594,30 @@ pub fn run_pkexec(pkexec: &Path, apt: &Path, deb: &Path) -> DebOutcome {
 
 /// pkexec exits 126 when the user dismisses the dialog or authentication fails, and 127
 /// when it could not ask (no agent: "No authentication agent found") or was dismissed on
-/// older polkit versions. Anything else is apt-get's own exit code.
+/// older polkit versions. Anything else is the helper's exit code.
 pub fn map_pkexec(code: Option<i32>, output: &str) -> DebOutcome {
     match code {
         Some(0) => DebOutcome::Installed,
         Some(126) => DebOutcome::Cancelled,
         Some(127) if output.to_ascii_lowercase().contains("authentication agent") => {
-            DebOutcome::NoAgent
+            DebOutcome::PackageInstaller
         }
         Some(127) => DebOutcome::Cancelled,
+        Some(HELPER_CHECKSUM) => DebOutcome::Failed(
+            "the package changed before it could be installed (its SHA-256 no longer matches); nothing was installed".into(),
+        ),
+        Some(HELPER_NOT_OURS) => DebOutcome::Failed(
+            "the package is not the expected ZXraw Explorer version; nothing was installed".into(),
+        ),
+        Some(HELPER_COPY) => DebOutcome::Failed(
+            "the downloaded package could not be read for installing; nothing was installed".into(),
+        ),
+        Some(HELPER_BAD_ARGS) => {
+            DebOutcome::Failed(format!("the install helper refused the request: {}", output_tail(output, HELPER_BAD_ARGS)))
+        }
+        Some(HELPER_APT) => DebOutcome::Failed(output_tail(output, HELPER_APT)),
         Some(code) => DebOutcome::Failed(output_tail(output, code)),
-        None => DebOutcome::Failed("apt-get was stopped before it finished".into()),
+        None => DebOutcome::Failed("the install was stopped before it finished".into()),
     }
 }
 
@@ -530,7 +630,7 @@ fn output_tail(output: &str, code: i32) -> String {
         .collect();
     let tail = &lines[lines.len().saturating_sub(12)..];
     if tail.is_empty() {
-        format!("apt-get failed (exit code {code})")
+        format!("the install failed (exit code {code})")
     } else {
         tail.join("\n")
     }
@@ -606,34 +706,65 @@ mod tests {
         hex(&Sha256::digest(bytes))
     }
 
+    /// The first bytes of a type 2 AppImage.
+    const APPIMAGE_HEAD: &[u8] = b"\x7fELF\x02\x01\x01\x00AI\x02";
+
     #[test]
-    fn an_appimage_is_detected_only_when_its_file_exists() {
+    fn an_appimage_is_detected_only_from_inside_its_mount_with_its_own_file() {
         let tmp = tempfile::tempdir().unwrap();
+        let mount = tmp.path().join(".mount_ZXrawAB");
+        fs::create_dir_all(mount.join("usr/bin")).unwrap();
+        let exe = mount.join("usr/bin/zxraw");
+        fs::write(&exe, b"elf").unwrap();
+        let elsewhere = tmp.path().join("zxraw");
+        fs::write(&elsewhere, b"elf").unwrap();
         let image = tmp.path().join("ZXraw.AppImage");
-        fs::write(&image, b"x").unwrap();
+        fs::write(&image, [APPIMAGE_HEAD, b"payload"].concat()).unwrap();
         let deb = tmp.path().join("usr-bin-zxraw");
         let never = |_: &Path| -> Option<String> { panic!("no dpkg-query for an AppImage") };
+        let detect = |image: &Path, appdir: Option<&Path>, exe: &Path| {
+            detect_from(
+                Some(image.into()),
+                appdir.map(|d| d.into()),
+                Some(exe.into()),
+                &deb,
+                never,
+            )
+        };
         assert_eq!(
-            detect_from(Some(image.clone().into()), None, &deb, never),
+            detect(&image, Some(&mount), &exe),
             InstallKind::AppImage(image.clone())
         );
-        let gone = tmp.path().join("moved.AppImage");
+        // Not running from an AppImage mount: $APPIMAGE could name any file.
+        assert_eq!(detect(&image, None, &exe), InstallKind::Other);
+        assert_eq!(detect(&image, Some(&mount), &elsewhere), InstallKind::Other);
+        // The file itself: gone, relative, a folder, a symlink, not an AppImage.
         assert_eq!(
-            detect_from(Some(gone.into()), None, &deb, never),
+            detect(&tmp.path().join("moved.AppImage"), Some(&mount), &exe),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(Some("rel.AppImage".into()), None, &deb, never),
+            detect(Path::new("ZXraw.AppImage"), Some(&mount), &exe),
             InstallKind::Other
         );
-        assert_eq!(
-            detect_from(Some(tmp.path().into()), None, &deb, never),
-            InstallKind::Other,
-            "a folder"
-        );
+        assert_eq!(detect(tmp.path(), Some(&mount), &exe), InstallKind::Other);
+        let link = tmp.path().join("link.AppImage");
+        std::os::unix::fs::symlink(&image, &link).unwrap();
+        assert_eq!(detect(&link, Some(&mount), &exe), InstallKind::Other);
+        let photo = tmp.path().join("photo.jpg");
+        fs::write(&photo, b"\xff\xd8\xff\xe0 not an AppImage").unwrap();
+        assert_eq!(detect(&photo, Some(&mount), &exe), InstallKind::Other);
+        let type1 = tmp.path().join("type1.AppImage");
+        fs::write(&type1, b"\x7fELF\x02\x01\x01\x00AI\x01rest").unwrap();
+        assert_eq!(detect(&type1, Some(&mount), &exe), InstallKind::Other);
+        let short = tmp.path().join("short.AppImage");
+        fs::write(&short, b"\x7fELF").unwrap();
+        assert_eq!(detect(&short, Some(&mount), &exe), InstallKind::Other);
         // Empty means unset.
         assert_eq!(
-            detect_from(Some("".into()), Some(image.clone()), &deb, |_| None),
+            detect_from(Some("".into()), Some(mount.into()), Some(exe), &deb, |_| {
+                None
+            }),
             InstallKind::Other
         );
     }
@@ -652,27 +783,32 @@ mod tests {
             Some("zxraw".to_string())
         };
         assert_eq!(
-            detect_from(None, Some(deb.clone()), &deb, owned),
+            detect_from(None, None, Some(deb.clone()), &deb, owned),
             InstallKind::Deb
         );
         assert_eq!(
-            detect_from(None, Some(link), &deb, owned),
+            detect_from(None, None, Some(link), &deb, owned),
             InstallKind::Deb,
             "resolved"
         );
         assert_eq!(
-            detect_from(None, Some(other), &deb, owned),
+            detect_from(None, None, Some(other), &deb, owned),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(None, Some(deb.clone()), &deb, |_| Some("zxraw-git".into())),
+            detect_from(None, None, Some(deb.clone()), &deb, |_| Some(
+                "zxraw-git".into()
+            )),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(None, Some(deb.clone()), &deb, |_| None),
+            detect_from(None, None, Some(deb.clone()), &deb, |_| None),
             InstallKind::Other
         );
-        assert_eq!(detect_from(None, None, &deb, owned), InstallKind::Other);
+        assert_eq!(
+            detect_from(None, None, None, &deb, owned),
+            InstallKind::Other
+        );
     }
 
     #[test]
@@ -774,20 +910,34 @@ mod tests {
     }
 
     #[test]
-    fn a_symlinked_appimage_replaces_its_target_and_keeps_the_link() {
+    fn a_symlink_or_an_appimage_of_another_group_is_not_replaced() {
         let tmp = tempfile::tempdir().unwrap();
         let real = fake_appimage(tmp.path(), 0o755);
         let link = tmp.path().join("zxraw.AppImage");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         let (new, hash) = verified(tmp.path(), b"new");
-        replace_appimage(&new, &hash, &link).unwrap();
+        let err = replace_appimage(&new, &hash, &link).unwrap_err();
         assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
+            matches!(&err, ReplaceError::Failed(m) if m.contains("not a regular file")),
+            "{err:?}"
         );
-        assert_eq!(fs::read(&real).unwrap(), b"new");
+        assert_eq!(fs::read(&real).unwrap(), b"old AppImage");
+
+        // A group of ours other than the current one, if we have one.
+        let other_gid = rustix::process::getgroups()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| g.as_raw())
+            .find(|&g| g != egid());
+        if let Some(gid) = other_gid {
+            std::os::unix::fs::chown(&real, None, Some(gid)).unwrap();
+            let err = replace_appimage(&new, &hash, &real).unwrap_err();
+            assert!(
+                matches!(&err, ReplaceError::NotWritable(m) if m.contains("another user or group")),
+                "{err:?}"
+            );
+            assert_eq!(fs::read(&real).unwrap(), b"old AppImage");
+        }
     }
 
     #[test]
@@ -891,29 +1041,41 @@ mod tests {
                 Some(127),
                 "Error executing command as another user: No authentication agent found."
             ),
-            DebOutcome::NoAgent
+            DebOutcome::PackageInstaller
         );
         match map_pkexec(
-            Some(100),
+            Some(HELPER_APT),
             "Reading package lists...\nE: Unable to locate package\n\n",
         ) {
             DebOutcome::Failed(m) => assert!(m.ends_with("E: Unable to locate package"), "{m}"),
             other => panic!("{other:?}"),
         }
+        for (code, words) in [
+            (HELPER_CHECKSUM, "SHA-256"),
+            (HELPER_NOT_OURS, "not the expected"),
+            (HELPER_COPY, "could not be read"),
+            (HELPER_BAD_ARGS, "refused the request"),
+        ] {
+            match map_pkexec(Some(code), "install-update: details") {
+                DebOutcome::Failed(m) => assert!(m.contains(words), "{code}: {m}"),
+                other => panic!("{code}: {other:?}"),
+            }
+        }
         assert_eq!(
             map_pkexec(Some(1), ""),
-            DebOutcome::Failed("apt-get failed (exit code 1)".into())
+            DebOutcome::Failed("the install failed (exit code 1)".into())
         );
         assert!(matches!(map_pkexec(None, ""), DebOutcome::Failed(_)));
     }
 
     #[test]
-    fn pkexec_gets_absolute_paths_and_no_shell() {
+    fn pkexec_runs_the_helper_with_absolute_paths_and_no_shell() {
         let tmp = tempfile::tempdir().unwrap();
         let record = tmp.path().join("args");
-        let apt = tmp.path().join("apt-get");
-        fs::write(&apt, "").unwrap();
+        let helper = tmp.path().join("install-update");
+        fs::write(&helper, "").unwrap();
         let deb = tmp.path().join("my file; rm -rf ~.deb");
+        let sha = "a".repeat(64);
         let stub = |name: &str, body: &str| {
             let path = tmp.path().join(name);
             fs::write(
@@ -928,37 +1090,275 @@ mod tests {
             path
         };
         let ok = stub("ok", "exit 0");
-        assert_eq!(run_pkexec(&ok, &apt, &deb), DebOutcome::Installed);
+        assert_eq!(
+            run_pkexec(&ok, &helper, &deb, &sha, "2.0.0"),
+            DebOutcome::Installed
+        );
         let args = fs::read_to_string(&record).unwrap();
         assert_eq!(
             args.lines().collect::<Vec<_>>(),
             [
-                apt.to_str().unwrap(),
-                "install",
-                "-y",
-                "--no-remove",
-                deb.to_str().unwrap()
+                helper.to_str().unwrap(),
+                deb.to_str().unwrap(),
+                sha.as_str(),
+                "2.0.0"
             ]
         );
         let dismissed = stub("dismissed", "exit 126");
-        assert_eq!(run_pkexec(&dismissed, &apt, &deb), DebOutcome::Cancelled);
+        assert_eq!(
+            run_pkexec(&dismissed, &helper, &deb, &sha, "2.0.0"),
+            DebOutcome::Cancelled
+        );
         let no_agent = stub(
             "noagent",
             "echo 'Error executing command as another user: No authentication agent found.' >&2; exit 127",
         );
-        assert_eq!(run_pkexec(&no_agent, &apt, &deb), DebOutcome::NoAgent);
+        assert_eq!(
+            run_pkexec(&no_agent, &helper, &deb, &sha, "2.0.0"),
+            DebOutcome::PackageInstaller
+        );
         let broken = stub(
             "broken",
-            "echo 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2; exit 100",
+            "echo 'E: Sub-process /usr/bin/dpkg returned an error code (1)' >&2; exit 68",
         );
         assert_eq!(
-            run_pkexec(&broken, &apt, &deb),
+            run_pkexec(&broken, &helper, &deb, &sha, "2.0.0"),
             DebOutcome::Failed("E: Sub-process /usr/bin/dpkg returned an error code (1)".into())
         );
+        // No pkexec, or a package from before the helper: the package installer.
         assert_eq!(
-            run_pkexec(&tmp.path().join("no-pkexec"), &apt, &deb),
-            DebOutcome::NoAgent
+            run_pkexec(&tmp.path().join("no-pkexec"), &helper, &deb, &sha, "2.0.0"),
+            DebOutcome::PackageInstaller
         );
+        assert_eq!(
+            run_pkexec(&ok, &tmp.path().join("no-helper"), &deb, &sha, "2.0.0"),
+            DebOutcome::PackageInstaller
+        );
+    }
+
+    // -- The root install helper, run as this user with a stand-in apt-get. --
+
+    fn helper_script() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/linux/zxraw-install-update")
+    }
+
+    /// The helper tests need dpkg-deb and must not run as root (the helper then ignores the
+    /// test apt-get and would run the real one).
+    fn helper_testable() -> bool {
+        euid() != 0 && Path::new(DPKG_DEB).is_file()
+    }
+
+    fn build_deb(dir: &Path, package: &str, version: &str, arch: &str) -> PathBuf {
+        let root = dir.join(format!("{package}-{version}-{arch}"));
+        fs::create_dir_all(root.join("DEBIAN")).unwrap();
+        fs::write(
+            root.join("DEBIAN/control"),
+            format!(
+                "Package: {package}\nVersion: {version}\nArchitecture: {arch}\n\
+                 Maintainer: Test <test@example.com>\nDescription: test package\n"
+            ),
+        )
+        .unwrap();
+        let out = dir.join(format!("{package}_{version}_{arch}.deb"));
+        let status = Command::new(DPKG_DEB)
+            .args(["--build", "--root-owner-group"])
+            .arg(&root)
+            .arg(&out)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        out
+    }
+
+    fn file_sha(path: &Path) -> String {
+        sha(&fs::read(path).unwrap())
+    }
+
+    /// Runs the helper with `args`, with `apt` as its apt-get when given.
+    fn run_helper(args: &[&OsStr], apt: Option<&Path>) -> (i32, String) {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg(helper_script())
+            .args(args)
+            .env_remove("ZXRAW_INSTALL_UPDATE_TEST_APT");
+        if let Some(apt) = apt {
+            cmd.env("ZXRAW_INSTALL_UPDATE_TEST_APT", apt);
+        }
+        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn the_install_helper_checks_its_arguments_and_its_own_copy() {
+        if !helper_testable() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join("apt-args");
+        let apt = tmp.path().join("apt-get");
+        // Records its arguments and what the file it was given holds at install time.
+        fs::write(
+            &apt,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{0}'\nsha256sum \"$4\" | cut -d ' ' -f 1 >> '{0}'\n",
+                record.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&apt, fs::Permissions::from_mode(0o755)).unwrap();
+        let failing = tmp.path().join("apt-fails");
+        fs::write(
+            &failing,
+            "#!/bin/sh\necho 'E: broken packages' >&2\nexit 100\n",
+        )
+        .unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let good = build_deb(tmp.path(), "zxraw", "2.0.0", "amd64");
+        let hash = file_sha(&good);
+        let os = |s: &str| OsString::from(s);
+        let args = |deb: &Path, sha: &str, version: &str| {
+            vec![deb.as_os_str().to_owned(), os(sha), os(version)]
+        };
+        let run = |a: Vec<OsString>, apt: Option<&Path>| {
+            let refs: Vec<&OsStr> = a.iter().map(OsString::as_os_str).collect();
+            run_helper(&refs, apt)
+        };
+
+        // Installs a copy, not the user's file, and removes the copy afterwards.
+        assert_eq!(run(args(&good, &hash, "2.0.0"), Some(&apt)).0, 0);
+        let recorded = fs::read_to_string(&record).unwrap();
+        let lines: Vec<&str> = recorded.lines().collect();
+        assert_eq!(&lines[..3], ["install", "-y", "--no-remove"]);
+        let copy = Path::new(lines[3]);
+        assert_ne!(copy, good.as_path());
+        assert!(copy.is_absolute());
+        assert_eq!(lines[4], hash, "the copy is the checked file");
+        assert!(
+            !copy.exists() && !copy.parent().unwrap().exists(),
+            "copy removed"
+        );
+        fs::remove_file(&record).unwrap();
+
+        // The copy is checked: checksum, then the package fields.
+        assert_eq!(
+            run(args(&good, &"0".repeat(64), "2.0.0"), Some(&apt)).0,
+            HELPER_CHECKSUM
+        );
+        assert_eq!(
+            run(args(&good, &hash, "2.0.1"), Some(&apt)).0,
+            HELPER_NOT_OURS
+        );
+        for (package, arch) in [("zxraw-git", "amd64"), ("zxraw", "i386")] {
+            let deb = build_deb(tmp.path(), package, "2.0.0", arch);
+            let (code, err) = run(args(&deb, &file_sha(&deb), "2.0.0"), Some(&apt));
+            assert_eq!(code, HELPER_NOT_OURS, "{package} {arch}: {err}");
+        }
+        // Not a regular file: missing, a folder, a symlink.
+        let link = tmp.path().join("link.deb");
+        std::os::unix::fs::symlink(&good, &link).unwrap();
+        for path in [
+            tmp.path().join("missing.deb"),
+            tmp.path().to_path_buf(),
+            link,
+        ] {
+            assert_eq!(
+                run(args(&path, &hash, "2.0.0"), Some(&apt)).0,
+                HELPER_COPY,
+                "{path:?}"
+            );
+        }
+        assert!(!record.exists(), "apt-get never ran for a refused file");
+
+        // Arguments.
+        let bad: Vec<Vec<OsString>> = vec![
+            vec![good.as_os_str().to_owned(), os(&hash)],
+            args(Path::new("zxraw_2.0.0_amd64.deb"), &hash, "2.0.0"),
+            args(&good, &hash.to_uppercase(), "2.0.0"),
+            args(&good, &hash[..63], "2.0.0"),
+            args(&good, &format!("{hash}\n"), "2.0.0"),
+            args(&good, &hash, "2.0"),
+            args(&good, &hash, "2.0.0-1"),
+            args(&good, &hash, "2.0.0\n2.0.0"),
+            args(&tmp.path().join("a\nb.deb"), &hash, "2.0.0"),
+        ];
+        for a in bad {
+            let shown = format!("{a:?}");
+            assert_eq!(run(a, Some(&apt)).0, HELPER_BAD_ARGS, "{shown}");
+        }
+        assert!(!record.exists());
+
+        // apt-get's failure and output come through.
+        let (code, err) = run(args(&good, &hash, "2.0.0"), Some(&failing));
+        assert_eq!(code, HELPER_APT);
+        assert!(err.contains("E: broken packages"), "{err}");
+        // Without the test apt-get, a normal user is refused.
+        assert_eq!(run(args(&good, &hash, "2.0.0"), None).0, 69);
+    }
+
+    #[test]
+    fn the_install_helper_passes_shellcheck() {
+        let Ok(out) = Command::new("shellcheck")
+            .args(["-s", "sh"])
+            .arg(helper_script())
+            .output()
+        else {
+            return; // shellcheck is not installed here (CI has it)
+        };
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn a_wrong_package_is_refused_before_any_password_prompt() {
+        if !helper_testable() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dpkg_deb = Path::new(DPKG_DEB);
+        let good = build_deb(tmp.path(), "zxraw", "2.0.0", "amd64");
+        check_deb_metadata(dpkg_deb, &good, "2.0.0").unwrap();
+        let err = check_deb_metadata(dpkg_deb, &good, "2.0.1").unwrap_err();
+        assert!(err.contains("not zxraw 2.0.1"), "{err}");
+        let other = build_deb(tmp.path(), "zxraw-git", "2.0.0", "amd64");
+        assert!(check_deb_metadata(dpkg_deb, &other, "2.0.0").is_err());
+        let arch = build_deb(tmp.path(), "zxraw", "2.0.0", "arm64");
+        assert!(check_deb_metadata(dpkg_deb, &arch, "2.0.0").is_err());
+        let junk = tmp.path().join("junk.deb");
+        fs::write(&junk, b"not a deb").unwrap();
+        let err = check_deb_metadata(dpkg_deb, &junk, "2.0.0").unwrap_err();
+        assert!(err.contains("not a Debian package"), "{err}");
+
+        // End to end through a stand-in pkexec that runs the real helper as this user.
+        let apt = tmp.path().join("apt-get");
+        fs::write(&apt, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&apt, fs::Permissions::from_mode(0o755)).unwrap();
+        let pkexec = tmp.path().join("pkexec");
+        fs::write(
+            &pkexec,
+            format!(
+                "#!/bin/sh\nZXRAW_INSTALL_UPDATE_TEST_APT='{}' exec /bin/sh \"$@\"\n",
+                apt.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&pkexec, fs::Permissions::from_mode(0o755)).unwrap();
+        let helper = helper_script();
+        let hash = file_sha(&good);
+        assert_eq!(
+            run_pkexec(&pkexec, &helper, &good, &hash, "2.0.0"),
+            DebOutcome::Installed
+        );
+        match run_pkexec(&pkexec, &helper, &good, &"0".repeat(64), "2.0.0") {
+            DebOutcome::Failed(m) => assert!(m.contains("SHA-256"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

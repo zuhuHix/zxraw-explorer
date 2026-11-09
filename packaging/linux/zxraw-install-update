@@ -1,0 +1,93 @@
+#!/bin/sh
+# Installs a ZXraw Explorer update. The .deb installs this as /usr/lib/zxraw/install-update,
+# and the app runs it through pkexec as root:
+#
+#   pkexec /usr/lib/zxraw/install-update <path-to-deb> <sha256> <version>
+#
+# The file the user downloaded may be changed by any program running as that user, so it
+# is copied once into a new root-only folder, and only that copy is checked (SHA-256, then
+# Package zxraw, Version <version>, Architecture amd64) and installed.
+#
+# Exit codes (the app maps them to messages; pkexec itself uses 126 and 127):
+#   0   installed
+#   64  bad arguments
+#   65  the copy does not match <sha256>
+#   66  the copy is not zxraw <version> for amd64
+#   67  the file could not be copied (missing, not a regular file, a symlink)
+#   68  apt-get failed (its output is on stdout/stderr)
+#   69  not run as root
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+apt_get=/usr/bin/apt-get
+
+if [ "$(id -u)" -ne 0 ]; then
+    # Tests only: run as a normal user with a stand-in apt-get. pkexec clears the
+    # environment, so this is never seen as root.
+    if [ -n "${ZXRAW_INSTALL_UPDATE_TEST_APT:-}" ]; then
+        apt_get=$ZXRAW_INSTALL_UPDATE_TEST_APT
+    else
+        echo "install-update: must be run as root (through pkexec)" >&2
+        exit 69
+    fi
+fi
+
+usage() {
+    echo "install-update: $1" >&2
+    echo "usage: install-update <absolute path to .deb> <sha256> <x.y.z>" >&2
+    exit 64
+}
+
+[ "$#" -eq 3 ] || usage "expected 3 arguments, got $#"
+deb=$1
+sha=$2
+version=$3
+newline='
+'
+for arg in "$deb" "$sha" "$version"; do
+    case $arg in
+    *"$newline"*) usage "an argument contains a line break" ;;
+    esac
+done
+case $deb in
+/*) ;;
+*) usage "the package path must be absolute" ;;
+esac
+printf '%s\n' "$sha" | grep -Eqx '[0-9a-f]{64}' || usage "the checksum must be 64 lowercase hex digits"
+printf '%s\n' "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || usage "the version must be x.y.z"
+
+if [ ! -f "$deb" ] || [ -L "$deb" ]; then
+    echo "install-update: $deb is not a regular file" >&2
+    exit 67
+fi
+
+dir=$(mktemp -d)
+trap 'rm -rf "$dir"' EXIT
+copy=$dir/update.deb
+if ! cp --no-dereference -- "$deb" "$copy" || [ -L "$copy" ] || [ ! -f "$copy" ]; then
+    echo "install-update: could not copy $deb" >&2
+    exit 67
+fi
+
+actual=$(sha256sum "$copy" | cut -d ' ' -f 1)
+if [ "$actual" != "$sha" ]; then
+    echo "install-update: checksum mismatch (expected $sha, got $actual)" >&2
+    exit 65
+fi
+
+field() {
+    dpkg-deb -f "$copy" "$1" 2>/dev/null || true
+}
+package=$(field Package)
+package_version=$(field Version)
+arch=$(field Architecture)
+if [ "$package" != zxraw ] || [ "$package_version" != "$version" ] || [ "$arch" != amd64 ]; then
+    echo "install-update: expected zxraw $version (amd64), found ${package:-?} ${package_version:-?} (${arch:-?})" >&2
+    exit 66
+fi
+
+# An update never removes other packages: apt stops instead.
+if ! "$apt_get" install -y --no-remove "$copy"; then
+    exit 68
+fi

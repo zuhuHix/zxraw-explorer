@@ -506,7 +506,9 @@ Video thumbnails and technical metadata need `ffmpeg` and `ffprobe` on `PATH`
 The daily update check works on Linux too. "Update now" installs the new version:
 
 - **AppImage:** the file replaces itself, with no password.
-- **Debian package:** the update runs `apt` through `pkexec`, so your desktop asks for your password.
+- **Debian package:** the package's own install helper runs through `pkexec`, so your desktop
+  asks for your password. It checks the download again as root before `apt` installs it. A .deb
+  from before the helper existed opens the update in the Package Installer once instead.
 
 Then choose "Restart now". A copy that is neither (for example, one built from source) gets the
 release page instead. Features that are Windows-only are listed under

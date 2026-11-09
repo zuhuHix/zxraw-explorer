@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Lets the password prompt say what ZXraw Explorer's "Update now" does. pkexec matches
+     the action by its exec.path annotation; without this file it still works, with the
+     generic prompt. -->
+<policyconfig>
+  <vendor>ZXraw Explorer</vendor>
+  <vendor_url>https://github.com/zuhuHix/zxraw-explorer</vendor_url>
+  <action id="io.github.zuhuhix.zxraw.update">
+    <description>Update ZXraw Explorer</description>
+    <message>Authentication is required to update ZXraw Explorer</message>
+    <icon_name>zxraw</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/zxraw/install-update</annotate>
+  </action>
+</policyconfig>

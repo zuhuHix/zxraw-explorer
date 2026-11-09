@@ -322,9 +322,13 @@ build_deb() {
     local root="$work/deb"
     local maintainer installed_kib
     mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/applications" \
-        "$root/usr/share/doc/zxraw"
+        "$root/usr/share/doc/zxraw" "$root/usr/lib/zxraw" "$root/usr/share/polkit-1/actions"
     install -m755 "$staged_binary" "$root/usr/bin/zxraw"
     install -m755 "$staged_cli" "$root/usr/bin/zxraw-cli"
+    # "Update now" runs it through pkexec; it checks the downloaded .deb again as root.
+    install -m755 "$here/zxraw-install-update" "$root/usr/lib/zxraw/install-update"
+    install -m644 "$here/io.github.zuhuhix.zxraw.update.policy" \
+        "$root/usr/share/polkit-1/actions/io.github.zuhuhix.zxraw.update.policy"
     install -m644 "$desktop_src" "$root/usr/share/applications/zxraw.desktop"
     install_icons "$root/usr/share"
     install_docs "$root/usr/share/doc/zxraw" deb

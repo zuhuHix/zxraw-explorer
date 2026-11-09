@@ -29,7 +29,7 @@
 //! check): an AppImage downloads `SHA256SUMS-linux.txt` and the release's
 //! `ZXraw-Explorer-<version>-x86_64.AppImage` with the same host, size and checksum rules,
 //! then replaces itself in place (an atomic rename, no password); the `.deb` downloads
-//! `zxraw_<version>_amd64.deb` and installs it with `pkexec apt-get`, which asks for the
+//! `zxraw_<version>_amd64.deb` and installs it with `pkexec /usr/lib/zxraw/install-update` (a root helper the .deb ships, which copies and checks the file again before apt-get), which asks for the
 //! password. The notice then offers "Restart now", which starts the new copy once this one
 //! has closed and saved its settings. Any other copy (a build folder, a copied binary) gets
 //! the release page with its packages, as before. See `linux.rs` for the install steps.
@@ -370,7 +370,7 @@ pub enum SelfUpdate {
     Installer,
     /// Linux AppImage: replace the file, no password.
     AppImage,
-    /// Linux .deb: install with pkexec apt-get, which asks for the password.
+    /// Linux .deb: install through pkexec and the install helper, which asks for the password.
     Deb,
     /// A portable or unpackaged copy: open the release page.
     PageOnly,
@@ -441,7 +441,7 @@ pub enum LinuxStatus {
     Installed { restart: PathBuf },
     /// The password dialog was dismissed; the verified package is kept.
     Cancelled { file: PathBuf },
-    /// apt-get failed with this output.
+    /// The install helper refused the file, or apt-get failed with this output.
     Failed { error: String, file: PathBuf },
     /// The AppImage's folder is not writable: the verified AppImage was saved here instead.
     SavedInstead { file: PathBuf, reason: String },
@@ -972,7 +972,7 @@ fn linux_update_now(app: &mut ZxrawApp, update: &UpdateInfo) {
             Err(_) if job.cancel.is_cancelled() => Event::Toast("Update download cancelled".into()),
             Ok(None) => Event::Toast(format!(
                 "Update verified; would run pkexec {}",
-                linux::APT_GET
+                linux::INSTALL_HELPER
             )),
             _ => Event::LinuxUpdate(result.clone().map(|status| status.expect("checked above"))),
         };
@@ -1040,19 +1040,29 @@ fn linux_install(
                 Err(linux::ReplaceError::Failed(error)) => Err(error),
             }
         }
-        _ if automated => Ok(None),
         _ => {
+            // Unprivileged checks first, so a wrong file never asks for the password.
+            linux::check_deb(&file, &digest)?;
+            linux::check_deb_metadata(Path::new(linux::DPKG_DEB), &file, version)?;
+            if automated {
+                return Ok(None);
+            }
             // Kept until the user is done with it (opened, or retried); swept after a day.
             cleanup.0 = None;
             job.progress.set_current(WAITING_FOR_PASSWORD);
-            linux::check_deb(&file, &digest)?;
-            match linux::run_pkexec(Path::new(linux::PKEXEC), Path::new(linux::APT_GET), &file) {
+            match linux::run_pkexec(
+                Path::new(linux::PKEXEC),
+                Path::new(linux::INSTALL_HELPER),
+                &file,
+                &digest,
+                version,
+            ) {
                 linux::DebOutcome::Installed => {
                     let installed = linux::installed_deb_version();
                     if installed.as_deref().is_some_and(|v| v != version) {
                         return Ok(Some(LinuxStatus::Failed {
                             error: format!(
-                                "apt-get finished, but the installed version is {}, not {version}",
+                                "the install finished, but the installed version is {}, not {version}",
                                 installed.unwrap_or_default()
                             ),
                             file,
@@ -1063,11 +1073,11 @@ fn linux_install(
                     Ok(Some(LinuxStatus::Installed { restart: PathBuf::from(linux::DEB_EXE) }))
                 }
                 linux::DebOutcome::Cancelled => Ok(Some(LinuxStatus::Cancelled { file })),
-                linux::DebOutcome::NoAgent => match forge_win::open_default(&file) {
+                linux::DebOutcome::PackageInstaller => match forge_win::open_default(&file) {
                     Ok(()) => Ok(Some(LinuxStatus::PackageInstaller { file })),
                     Err(e) => Ok(Some(LinuxStatus::Failed {
                         error: format!(
-                            "there is no password prompt (pkexec and a polkit agent) and the package could not be opened: {e}"
+                            "there is no password prompt (pkexec, a polkit agent and the install helper) and the package could not be opened: {e}"
                         ),
                         file,
                     })),

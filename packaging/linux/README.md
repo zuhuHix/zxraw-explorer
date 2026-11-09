@@ -64,6 +64,12 @@ Suggests: ffmpeg
 The Recommends list is the runtime-loaded set. An entry is dropped from it if a Depends already
 covers it.
 
+**Update helper.** The `.deb` also installs `/usr/lib/zxraw/install-update` (from
+`zxraw-install-update`) and the polkit action `io.github.zuhuhix.zxraw.update`. The app's
+"Update now" runs the helper through `pkexec`; as root it copies the downloaded package into a new
+root-only folder, checks the copy's SHA-256 and `Package`/`Version`/`Architecture`, and installs
+the copy with `apt-get install -y --no-remove`. The AppImage does not need it.
+
 **Stripping.** The release profile keeps line tables, so the binary is 227 MB. The packaged copy
 is stripped with `strip --strip-debug`, which gives 53 MB. The symbol table stays, so backtraces
 keep function names. `target/release/zxraw` is not changed.
