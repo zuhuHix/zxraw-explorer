@@ -654,7 +654,7 @@ fn play_drop(
     let handle = target.handle.as_ref().unwrap();
     let (display, top, owned) = (display.to_string(), target.top, paths.to_vec());
     let source =
-        std::thread::spawn(move || drop_files_on(&display, top, 40, 50, &owned, ctrl, shift));
+        std::thread::spawn(move || drop_files_on(&display, top, (40, 50), None, &owned, ctrl, shift));
     let mut events = Vec::new();
     let mut keys = None;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -698,6 +698,7 @@ fn drop_target_case(answer: DropEffect, ctrl: bool, shift: bool, expected: DropR
             ctrl: drop_ctrl,
             shift: drop_shift,
             answered,
+            ..
         } => {
             assert_eq!(info.files, paths);
             assert!(virtual_source.is_none());
@@ -774,4 +775,187 @@ fn xdnd_drop_target_ends_the_drag_when_the_source_dies() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(matches!(&handle.take_events()[..], [DropEvent::Leave]));
+}
+
+// ---- One position in flight (XdndStatus has no sequence number) ----
+
+/// What [`spawn_slow_target`] saw.
+#[derive(Debug, Default)]
+struct SlowLog {
+    positions: usize,
+    /// Positions that arrived while an earlier one was still unanswered.
+    overlapped: usize,
+    drops: usize,
+    leaves: usize,
+}
+
+/// A mapped XDND target that answers each position (accepting, Copy) `reply` after it came,
+/// or never with `None`, and finishes a drop with Copy. Before each answer it looks for
+/// positions that came meanwhile: a source with one position in flight sends none.
+fn spawn_slow_target(
+    display: &str,
+    rect: (i16, i16, u16, u16),
+    reply: Option<Duration>,
+) -> (Window, std::thread::JoinHandle<SlowLog>) {
+    let ctl = Ctl::new(display);
+    let window = ctl.window(rect.0, rect.1, rect.2, rect.3, true);
+    let thread = std::thread::spawn(move || {
+        let Ctl { conn, atoms, .. } = ctl;
+        let mut log = SlowLog::default();
+        let mut queue = std::collections::VecDeque::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let event = match queue.pop_front() {
+                Some(event) => event,
+                None => match next_event(&conn, Some(deadline)).unwrap() {
+                    Some(event) => event,
+                    None => return log,
+                },
+            };
+            let Event::ClientMessage(e) = event else {
+                continue;
+            };
+            let l = e.data.as_data32();
+            if e.type_ == atoms.position {
+                log.positions += 1;
+                let Some(delay) = reply else {
+                    continue;
+                };
+                std::thread::sleep(delay);
+                while let Some(event) = conn.poll_for_event().unwrap() {
+                    if matches!(&event, Event::ClientMessage(m) if m.type_ == atoms.position) {
+                        log.overlapped += 1;
+                    }
+                    queue.push_back(event);
+                }
+                send_message(&conn, l[0], l[0], atoms.status, [window, 1 | 2, 0, 0, l[4]]);
+                conn.flush().unwrap();
+            } else if e.type_ == atoms.leave {
+                log.leaves += 1;
+                return log;
+            } else if e.type_ == atoms.drop {
+                log.drops += 1;
+                send_message(
+                    &conn,
+                    l[0],
+                    l[0],
+                    atoms.finished,
+                    [window, 1, atoms.action(Action::Copy), 0, 0],
+                );
+                conn.sync().unwrap();
+                return log;
+            }
+        }
+    });
+    (window, thread)
+}
+
+/// Starts a drag-out with the button held over our own window, then moves over the target.
+fn drag_over_target(x: &X, ctl: &Ctl, paths: &[PathBuf]) -> DragOutSession {
+    let own = ctl.window(200, 0, 200, 300, false);
+    ctl.motion(300, 150);
+    ctl.button1(true);
+    let session = start_drag_out_on(x.name(), own, &items(paths)).unwrap();
+    ctl.motion(100, 100);
+    session
+}
+
+#[test]
+#[ignore = "starts Xvfb"]
+fn xdnd_drag_out_keeps_one_position_in_flight_to_a_slow_target() {
+    let x = X::start();
+    let ctl = Ctl::new(x.name());
+    let (_target, log) =
+        spawn_slow_target(x.name(), (0, 0, 200, 300), Some(Duration::from_millis(150)));
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _) = test_files(dir.path());
+    let session = drag_over_target(&x, &ctl, &paths);
+    // Much faster motion than the target answers: it is coalesced, never queued.
+    for step in 0..40 {
+        ctl.motion(100 + step, 100 + step);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    ctl.button1(false);
+    let result = wait_result(&session, Duration::from_secs(5));
+    assert_eq!(result.unwrap(), DropResult::Copy);
+    let log = log.join().unwrap();
+    assert_eq!(log.overlapped, 0, "{log:?}");
+    assert!(log.positions >= 3, "{log:?}");
+    assert_eq!(log.drops, 1, "{log:?}");
+}
+
+#[test]
+#[ignore = "starts Xvfb"]
+fn xdnd_drag_out_to_a_target_that_never_answers_cancels_at_the_release() {
+    let x = X::start();
+    let ctl = Ctl::new(x.name());
+    let (_target, log) = spawn_slow_target(x.name(), (0, 0, 200, 300), None);
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _) = test_files(dir.path());
+    let session = drag_over_target(&x, &ctl, &paths);
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(session.feedback(), DragFeedback::Refused);
+    ctl.motion(120, 130);
+    std::thread::sleep(Duration::from_millis(100));
+    ctl.button1(false);
+    let result = wait_result(&session, Duration::from_secs(5));
+    assert_eq!(result.unwrap(), DropResult::None);
+    let log = log.join().unwrap();
+    // One position, unanswered; then no more positions, and a leave, never a drop.
+    assert_eq!((log.positions, log.drops, log.leaves), (1, 0, 1), "{log:?}");
+}
+
+#[test]
+#[ignore = "starts Xvfb"]
+fn xdnd_drag_out_never_drops_on_a_late_answer() {
+    let x = X::start();
+    let ctl = Ctl::new(x.name());
+    // Answers after 700 ms, past the source's 500 ms wait.
+    let (_target, log) =
+        spawn_slow_target(x.name(), (0, 0, 200, 300), Some(Duration::from_millis(700)));
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _) = test_files(dir.path());
+    let session = drag_over_target(&x, &ctl, &paths);
+    // The late (accepting) answer arrives meanwhile.
+    std::thread::sleep(Duration::from_millis(1000));
+    ctl.motion(120, 130);
+    std::thread::sleep(Duration::from_millis(100));
+    ctl.button1(false);
+    let result = wait_result(&session, Duration::from_secs(5));
+    assert_eq!(result.unwrap(), DropResult::None);
+    let log = log.join().unwrap();
+    assert_eq!((log.positions, log.drops, log.leaves), (1, 0, 1), "{log:?}");
+}
+
+#[test]
+#[ignore = "starts Xvfb"]
+fn xdnd_drop_target_reports_the_last_position_with_the_drop() {
+    let x = X::start();
+    let ctl = Ctl::new(x.name());
+    let target = register_target(x.name(), &ctl);
+    let dir = tempfile::tempdir().unwrap();
+    let (paths, _) = test_files(dir.path());
+    let handle = target.handle.as_ref().unwrap();
+    let (display, top, owned) = (x.name().to_string(), target.top, paths.clone());
+    // Accepted at (40, 50); then a position at (220, 180) sent together with the drop.
+    let source = std::thread::spawn(move || {
+        drop_files_on(&display, top, (40, 50), Some((220, 180)), &owned, false, false)
+    });
+    let mut events = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !source.is_finished() {
+        assert!(Instant::now() < deadline, "the drop did not finish");
+        events.extend(handle.take_events());
+        if handle.is_dragging() {
+            handle.set_answer(DropEffect::Copy);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(source.join().unwrap().unwrap(), DropResult::Copy);
+    events.extend(handle.take_events());
+    let point = events.iter().find_map(|event| match event {
+        DropEvent::Drop { point, .. } => Some(*point),
+        _ => None,
+    });
+    assert_eq!(point, Some(Some((220, 180))));
 }

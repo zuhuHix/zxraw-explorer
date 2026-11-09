@@ -311,7 +311,9 @@ pub fn tick(app: &mut ZxrawApp, ctx: &egui::Context) {
 /// xdnd-drop <target> | <path>[, <path>…] [| ctrl|shift] (Linux) files dropped through the
 ///                            window's real XDND drop target by a test XDND source on the
 ///                            same X display, at the target's spot; ctrl/shift are held with
-///                            XTEST so the target reads them as it would from a user
+///                            XTEST so the target reads them as it would from a user;
+///                            `<from> -> <to>` as the target: accepted over `from`, then a
+///                            last position over `to` sent together with the drop
 /// assert-drop-reply <effect> [<performed>] the last `drop-shell-item` returned `effect`
 ///                            (none|copy|move) to the source and, if given, set its
 ///                            "Performed DropEffect" to `performed`
@@ -387,9 +389,11 @@ enum Step {
         shift: bool,
     },
     AssertDropReply(u32, Option<u32>),
-    /// Files dropped through the window's XDND drop target by a test source (Linux).
+    /// Files dropped through the window's XDND drop target by a test source (Linux); with
+    /// `to`, the last position (sent with the drop) is over `to`.
     XdndDrop {
         target: DropTarget,
+        to: Option<DropTarget>,
         paths: Vec<PathBuf>,
         modifiers: egui::Modifiers,
     },
@@ -918,18 +922,31 @@ fn parse_step(verb: &str, rest: &str, verbatim: &str, sandbox_root: &Path) -> Re
                 modifiers: drop_modifiers(parts.get(2).copied())?,
             }
         }
-        "xdnd-drop" => match parse_step("drop-files", rest, verbatim, sandbox_root)? {
-            Step::DropFiles {
-                target,
-                paths,
-                modifiers,
-            } => Step::XdndDrop {
-                target,
-                paths,
-                modifiers,
-            },
-            _ => unreachable!("drop-files parses to DropFiles"),
-        },
+        "xdnd-drop" => {
+            let (to, rest) = match rest.split_once(" | ") {
+                Some((targets, tail)) => match targets.split_once(" -> ") {
+                    Some((from, to)) => (
+                        Some(DropTarget::parse(to.trim())?),
+                        format!("{} | {tail}", from.trim()),
+                    ),
+                    None => (None, rest.to_string()),
+                },
+                None => (None, rest.to_string()),
+            };
+            match parse_step("drop-files", &rest, verbatim, sandbox_root)? {
+                Step::DropFiles {
+                    target,
+                    paths,
+                    modifiers,
+                } => Step::XdndDrop {
+                    target,
+                    to,
+                    paths,
+                    modifiers,
+                },
+                _ => unreachable!("drop-files parses to DropFiles"),
+            }
+        }
         "drop-shell-item" => {
             let parts: Vec<&str> = rest.split(" | ").map(str::trim).collect();
             if !(2..=3).contains(&parts.len()) || parts[1].is_empty() {
@@ -1786,20 +1803,30 @@ fn xdnd_drop(
     ctx: &egui::Context,
     st: &mut StepState,
     target: &DropTarget,
+    to: Option<&DropTarget>,
     paths: &[PathBuf],
     modifiers: egui::Modifiers,
 ) -> Result<Flow, String> {
     type Source = std::thread::JoinHandle<Result<String, String>>;
     struct Plan {
         point: egui::Pos2,
+        to: Option<egui::Pos2>,
         source: Option<Source>,
     }
     if st.data.is_none() {
         let Some(point) = target_point(app, ctx, target)? else {
             return Ok(Flow::Wait("the drop target is not on screen".into()));
         };
+        let to = match to {
+            Some(to) => match target_point(app, ctx, to)? {
+                Some(to) => Some(to),
+                None => return Ok(Flow::Wait("the last drop spot is not on screen".into())),
+            },
+            None => None,
+        };
         st.data = Some(Box::new(Plan {
             point,
+            to,
             source: None,
         }));
     }
@@ -1826,11 +1853,12 @@ fn xdnd_drop(
                 return Err("the window has no XDND drop target".into());
             }
             let ppp = ctx.pixels_per_point();
-            let (x, y) = ((point.x * ppp).round() as i32, (point.y * ppp).round() as i32);
+            let px = |p: egui::Pos2| ((p.x * ppp).round() as i32, (p.y * ppp).round() as i32);
+            let (from, to) = (px(point), plan.to.map(px));
             let paths = paths.to_vec();
             let (ctrl, shift) = (modifiers.command, modifiers.shift);
             plan.source = Some(std::thread::spawn(move || {
-                xdnd_test_drop(window, x, y, &paths, ctrl, shift)
+                xdnd_test_drop(window, from, to, &paths, ctrl, shift)
             }));
             st.frames = 3;
             Ok(Flow::Wait("dragging over the window".into()))
@@ -1856,13 +1884,17 @@ fn xdnd_drop(
 #[cfg(target_os = "linux")]
 fn xdnd_test_drop(
     window: u32,
-    x: i32,
-    y: i32,
+    from: (i32, i32),
+    to: Option<(i32, i32)>,
     paths: &[PathBuf],
     ctrl: bool,
     shift: bool,
 ) -> Result<String, String> {
-    match forge_win::xdnd::test_drop_files(window, x, y, paths, ctrl, shift) {
+    let result = match to {
+        Some(to) => forge_win::xdnd::test_drop_files_moving(window, from, to, paths, ctrl, shift),
+        None => forge_win::xdnd::test_drop_files(window, from.0, from.1, paths, ctrl, shift),
+    };
+    match result {
         Ok(forge_win::dragout::DropResult::None) => Err("the target refused the drop".into()),
         Ok(result) => Ok(format!("{result:?}")),
         Err(error) => Err(format!("the XDND drop failed: {error}")),
@@ -1872,8 +1904,8 @@ fn xdnd_test_drop(
 #[cfg(not(target_os = "linux"))]
 fn xdnd_test_drop(
     _window: u32,
-    _x: i32,
-    _y: i32,
+    _from: (i32, i32),
+    _to: Option<(i32, i32)>,
     _paths: &[PathBuf],
     _ctrl: bool,
     _shift: bool,
@@ -2289,9 +2321,10 @@ fn exec(
         } => drop_files(app, ctx, st, target, paths, *modifiers),
         Step::XdndDrop {
             target,
+            to,
             paths,
             modifiers,
-        } => xdnd_drop(app, ctx, st, target, paths, *modifiers),
+        } => xdnd_drop(app, ctx, st, target, to.as_ref(), paths, *modifiers),
         Step::DropShellItem {
             target,
             item,
@@ -2615,10 +2648,15 @@ mod tests {
         ));
         assert!(matches!(
             one("xdnd-drop Target | a.txt | ctrl"),
-            Ok(Step::XdndDrop { target: DropTarget::Entry(t), paths, modifiers })
+            Ok(Step::XdndDrop { target: DropTarget::Entry(t), to: None, paths, modifiers })
                 if t == "Target" && paths == [in_temp("a.txt")] && modifiers.command
         ));
         assert!(one("xdnd-drop Target").is_err());
+        assert!(matches!(
+            one("xdnd-drop A -> B | a.txt"),
+            Ok(Step::XdndDrop { target: DropTarget::Entry(a), to: Some(DropTarget::Entry(b)), .. })
+                if a == "A" && b == "B"
+        ));
         assert!(one("drop-files pin: | a.txt").is_err());
         assert!(one("drop-files Target").is_err());
         assert!(one("drop-files Target |").is_err());

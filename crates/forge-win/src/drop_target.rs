@@ -59,6 +59,10 @@ pub enum DropEvent {
         shift: bool,
         /// What `Drop` told the source (the hover answer at the drop, limited to what it allows).
         answered: DropEffect,
+        /// Where the drop happened, in the window's physical pixels: on Linux the last
+        /// `XdndPosition` before `XdndDrop`. The app hit-tests this, not the pointer of an
+        /// earlier frame. `None` on Windows (the app reads the cursor there).
+        point: Option<(i32, i32)>,
     },
 }
 
@@ -150,7 +154,7 @@ pub struct DropTargetHandle {
     target: windows::Win32::System::Ole::IDropTarget,
     /// The XDND target thread; dropping it removes `XdndProxy` and stops the thread.
     #[cfg(target_os = "linux")]
-    xdnd: crate::xdnd::TargetThread,
+    _xdnd: crate::xdnd::TargetThread,
 }
 
 pub(crate) fn lock(shared: &std::sync::Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -178,17 +182,10 @@ impl DropTargetHandle {
     /// The effect for the pointer's current place, set every frame while dragging.
     pub fn set_answer(&self, effect: DropEffect) {
         let mut shared = lock(&self.shared);
-        #[cfg(target_os = "linux")]
-        let changed = shared.dragging && (!shared.answered_by_app || shared.answer != effect);
         shared.answer = effect;
         shared.answered_by_app = true;
-        // X sources only hear from us in reply to a pointer move: tell the target thread, so
-        // a new answer reaches the source's cursor while the pointer rests.
-        #[cfg(target_os = "linux")]
-        if changed {
-            drop(shared);
-            self.xdnd.answer_changed();
-        }
+        // On X11 the answer goes to the source with the status for its next position (a
+        // status only ever answers a position; see `xdnd`).
     }
 }
 
@@ -327,7 +324,10 @@ pub(crate) fn register_on(
         .ok_or_else(|| crate::WinError::Invalid(format!("not an X11 window id: {hwnd}")))?;
     let shared = std::sync::Arc::new(std::sync::Mutex::new(Shared::default()));
     let xdnd = crate::xdnd::TargetThread::start(display, window, shared.clone(), wake)?;
-    Ok(DropTargetHandle { shared, xdnd })
+    Ok(DropTargetHandle {
+        shared,
+        _xdnd: xdnd,
+    })
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -619,6 +619,7 @@ impl windows::Win32::System::Ole::IDropTarget_Impl for Target_Impl {
             ctrl,
             shift,
             answered,
+            point: None,
         });
         (self.wake)();
 
