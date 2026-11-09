@@ -631,10 +631,9 @@ pub fn open_release_page(app: &mut ZxrawApp, update: &UpdateInfo) {
         app.toast(format!("Would open {}", update.page_url));
         return;
     }
-    let target = PathBuf::from(&update.page_url);
-    app.ops.spawn_shell("Open the release page", move || {
-        crate::platform::open_default(&target)
-    });
+    let url = update.page_url.clone();
+    app.ops
+        .spawn_shell("Open the release page", move || forge_win::open_url(&url));
 }
 
 pub fn skip(app: &mut ZxrawApp, update: &UpdateInfo) {

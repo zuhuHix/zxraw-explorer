@@ -152,6 +152,8 @@ enum SettingsIntent {
     ShowUpdate,
     InstallUpdate,
     OpenReleasesPage,
+    /// Open an `https://` link (a release page or package) in the browser.
+    OpenUrl(String),
 }
 
 struct ShortcutConflict {
@@ -1433,9 +1435,13 @@ fn updates_page(
         // Linux: no in-place install. An available release is a link to its page and packages.
         if let Some(update) = &view.available {
             ui.add_space(6.0);
-            ui.hyperlink_to("Open the release page", &update.page_url);
+            if ui.button("Open the release page").clicked() {
+                intents.push(SettingsIntent::OpenUrl(update.page_url.clone()));
+            }
             for asset in &update.packages {
-                ui.hyperlink_to(format!("Download {}", asset.name), &asset.browser_download_url);
+                if ui.button(format!("Download {}", asset.name)).clicked() {
+                    intents.push(SettingsIntent::OpenUrl(asset.browser_download_url.clone()));
+                }
             }
         }
         ui.add_space(6.0);
@@ -1841,10 +1847,13 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
             SettingsIntent::DetectApps => detect_apps_background(&mut app.ops.settings_ui, ctx),
             SettingsIntent::DefaultApp(action) => crate::default_app::run(app, action),
             SettingsIntent::OpenReleasesPage => {
-                let target = std::path::PathBuf::from(crate::updater::LATEST_PAGE_URL);
                 app.ops.spawn_shell("Open the releases page", move || {
-                    crate::platform::open_default(&target)
+                    forge_win::open_url(crate::updater::LATEST_PAGE_URL)
                 });
+            }
+            SettingsIntent::OpenUrl(url) => {
+                app.ops
+                    .spawn_shell("Open the link", move || forge_win::open_url(&url));
             }
             SettingsIntent::BrowseToolExecutable => {
                 let dialog = rfd::FileDialog::new().set_title("Choose application executable");

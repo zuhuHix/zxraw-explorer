@@ -123,6 +123,41 @@ pub fn open_default(_path: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
 
+/// Is `url` one [`open_url`] opens: `https://` with a host, at most 2048 bytes, and no spaces
+/// or control characters (nothing a handler could read as another argument or scheme)?
+pub fn is_openable_url(url: &str) -> bool {
+    url.len() <= 2048
+        && url
+            .strip_prefix("https://")
+            .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'))
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Opens an `https://` URL in the default browser; anything else is refused with
+/// [`WinError::Invalid`]. Unlike [`open_default`] nothing is looked up on disk. Windows:
+/// `ShellExecute` "open"; Linux: `gio open`, else `xdg-open`.
+pub fn open_url(url: &str) -> Result<()> {
+    if !is_openable_url(url) {
+        return Err(WinError::Invalid(format!("not an https:// URL: {url}")));
+    }
+    open_url_checked(url)
+}
+
+#[cfg(windows)]
+fn open_url_checked(url: &str) -> Result<()> {
+    shell_execute("open", Path::new(url))
+}
+
+#[cfg(target_os = "linux")]
+fn open_url_checked(url: &str) -> Result<()> {
+    linux::open_url(url)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn open_url_checked(_url: &str) -> Result<()> {
+    Err(WinError::Unsupported)
+}
+
 /// Opens a filesystem folder or drive through `explorer.exe` explicitly.
 #[cfg(windows)]
 pub fn open_folder_in_explorer(path: &Path) -> Result<()> {
@@ -644,6 +679,20 @@ pub(crate) mod linux {
                 tracing::debug!("gio cannot open {}: {e}; trying xdg-open", path.display());
                 spawn_detached("xdg-open", &[path.as_os_str()], dir)
                     .map_err(|source| io_error("open", path, source))
+            }
+        }
+    }
+
+    /// Opens a URL [`super::open_url`] already checked: `gio open`, or `xdg-open` when gio
+    /// cannot be started. No existence check: it is not a path.
+    pub(crate) fn open_url(url: &str) -> Result<()> {
+        let arg = OsStr::new(url);
+        match spawn_detached("gio", &[OsStr::new("open"), arg], None) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::debug!("gio cannot open {url}: {e}; trying xdg-open");
+                spawn_detached("xdg-open", &[arg], None)
+                    .map_err(|source| io_error("open", Path::new(url), source))
             }
         }
     }
@@ -1233,5 +1282,39 @@ mod tests {
         assert_eq!(set_shortcut_icon_in(&dirs, &app, 1).unwrap(), 0);
         assert_eq!(set_shortcut_icon_in(&dirs, &app, 0).unwrap(), 1);
         assert_eq!(icon(&app_lnk).1, 0);
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn only_https_urls_are_opened() {
+        for ok in [
+            "https://github.com/zuhuHix/zxraw-explorer/releases/latest",
+            "https://github.com/zuhuHix/zxraw-explorer/releases/download/v1.0.0/a.deb",
+        ] {
+            assert!(is_openable_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://example.com",
+            "file:///etc/passwd",
+            "/home/user/x",
+            "https://",
+            "https:///x",
+            "https://a b",
+            "https://a\nb",
+            "javascript:alert(1)",
+            "--help",
+            "",
+        ] {
+            assert!(!is_openable_url(bad), "{bad:?}");
+            assert!(
+                matches!(open_url(bad), Err(WinError::Invalid(_))),
+                "{bad:?}"
+            );
+        }
+        assert!(!is_openable_url(&format!("https://x/{}", "a".repeat(3000))));
     }
 }
