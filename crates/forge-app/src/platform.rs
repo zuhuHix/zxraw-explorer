@@ -14,13 +14,17 @@ use crate::sidebar::Drive;
 
 
 /// Whether a command only exists on Windows (Explorer's Properties sheet, "Open with" dialog,
-/// the administrator terminal, "Add to Network…" with Windows' own sign-in). Such commands are
-/// left out of the menus elsewhere.
+/// the administrator terminal, "Add to Network…" with Windows' own sign-in, the FFmpeg
+/// download and the updater, which fetch Windows builds). Such commands are left out of the
+/// menus, the command palette and the shortcut list elsewhere, and their shortcuts do nothing.
 pub fn command_available(cmd: Cmd) -> bool {
     match cmd {
-        Cmd::Properties | Cmd::OpenWith | Cmd::OpenTerminalAdmin | Cmd::AddToNetwork => {
-            cfg!(windows)
-        }
+        Cmd::Properties
+        | Cmd::OpenWith
+        | Cmd::OpenTerminalAdmin
+        | Cmd::AddToNetwork
+        | Cmd::DownloadFfmpeg
+        | Cmd::CheckForUpdates => cfg!(windows),
         _ => true,
     }
 }
@@ -280,6 +284,24 @@ fn unix_known_folders() -> Vec<(String, PathBuf)> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_only_commands_are_hidden() {
+        for cmd in [
+            Cmd::Properties,
+            Cmd::OpenWith,
+            Cmd::OpenTerminalAdmin,
+            Cmd::AddToNetwork,
+            Cmd::DownloadFfmpeg,
+            Cmd::CheckForUpdates,
+        ] {
+            assert!(!command_available(cmd), "{cmd:?}");
+        }
+        let shown = Cmd::ALL.iter().filter(|c| command_available(**c)).count();
+        assert_eq!(shown, Cmd::ALL.len() - 6);
+        assert!(command_available(Cmd::OpenTerminal));
+        assert_eq!(Cmd::RevealInExplorer.label(), "Show in file manager");
+    }
 
     #[test]
     fn mount_escapes_are_decoded() {

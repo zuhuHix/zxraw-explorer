@@ -319,10 +319,81 @@ fn open_pinned(path: &Path) -> Result<fs::File> {
     Ok(file)
 }
 
+/// Unix: open the folder itself (`O_NOFOLLOW`) and check through the handle that it is a
+/// real folder. By path: used for `/` only. Unix has no share modes, so nothing stops the
+/// folder from being renamed meanwhile; what is written beneath goes through the handle
+/// instead (see [`open_child`] and [`held_dir`]).
 #[cfg(not(windows))]
 fn open_pinned(path: &Path) -> Result<fs::File> {
-    verify_real_directory(path)?;
-    fs::File::open(path).map_err(|e| CoreError::io(path, e))
+    let fd = rustix::fs::open(path, dir_flags(), rustix::fs::Mode::empty())
+        .map_err(|e| unix_error(path, e))?;
+    check_real_dir_fd(fd, path)
+}
+
+#[cfg(not(windows))]
+fn dir_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// An `openat`/`mkdirat` error for `path`: a link (`ELOOP` under `O_NOFOLLOW`) is unsafe, a
+/// file where a folder was expected is invalid, the rest as [`CoreError::io`].
+#[cfg(not(windows))]
+fn unix_error(path: &Path, e: rustix::io::Errno) -> CoreError {
+    use rustix::io::Errno;
+    match e {
+        Errno::LOOP => CoreError::UnsafePath(format!(
+            "{} is a link; refusing to extract through it",
+            path.display()
+        )),
+        Errno::NOTDIR => {
+            CoreError::Invalid(format!("{} exists and is not a folder", path.display()))
+        }
+        e => CoreError::io(path, e.into()),
+    }
+}
+
+/// Through the descriptor: what was opened is a folder.
+#[cfg(not(windows))]
+fn check_real_dir_fd(fd: std::os::fd::OwnedFd, path: &Path) -> Result<fs::File> {
+    use rustix::fs::FileType;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| unix_error(path, e))?;
+    if FileType::from_raw_mode(stat.st_mode as _) != FileType::Directory {
+        return Err(CoreError::Invalid(format!(
+            "{} exists and is not a folder",
+            path.display()
+        )));
+    }
+    Ok(fs::File::from(fd))
+}
+
+/// A path to the folder open as `dir` that resolves through that descriptor, not through the
+/// folder's name: on Linux `/proc/self/fd/N`, checked to lead to the same folder. Temp files
+/// are created, renamed and deleted beneath it, so swapping a pinned folder (or any folder
+/// above it) for a link or another folder can't send them elsewhere. Without a usable
+/// `/proc` this refuses. Elsewhere `path` itself: on Windows the pinned handles keep the
+/// folders from being renamed or replaced.
+#[cfg(target_os = "linux")]
+pub(crate) fn held_dir(dir: &fs::File, path: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let link = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let held = dir.metadata().map_err(|e| CoreError::io(path, e))?;
+    let same = fs::metadata(&link)
+        .is_ok_and(|seen| seen.is_dir() && (seen.dev(), seen.ino()) == (held.dev(), held.ino()));
+    if !same {
+        return Err(CoreError::UnsafePath(format!(
+            "{}: /proc/self/fd is not available, so the folder can't be written safely",
+            path.display()
+        )));
+    }
+    Ok(link)
+}
+
+/// See the Linux version: the folder's own path.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn held_dir(_dir: &fs::File, path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
 }
 
 /// Through the handle: the object opened is a folder and not a reparse point.
@@ -385,22 +456,28 @@ fn open_child(
     Ok((file, made))
 }
 
+/// Unix: `mkdirat` (with [`Create::Yes`], if missing) and `openat(O_DIRECTORY|O_NOFOLLOW)`
+/// relative to `parent`, then checked through the descriptor to be a real folder. A name that
+/// became a link is refused, never followed.
 #[cfg(not(windows))]
 fn open_child(
-    _parent: &fs::File,
-    _name: &std::ffi::OsStr,
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
     path: &Path,
     create: Create,
 ) -> Result<(fs::File, bool)> {
+    use rustix::fs::{Mode, mkdirat, openat};
+    use rustix::io::Errno;
     let mut made = false;
     if create == Create::Yes {
-        match fs::create_dir(path) {
+        match mkdirat(parent, name, Mode::from_raw_mode(0o777)) {
             Ok(()) => made = true,
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(CoreError::io(path, e)),
+            Err(Errno::EXIST) => {}
+            Err(e) => return Err(unix_error(path, e)),
         }
     }
-    Ok((open_pinned(path)?, made))
+    let fd = openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| unix_error(path, e))?;
+    Ok((check_real_dir_fd(fd, path)?, made))
 }
 
 /// What became of something [`remove_if_same`] was asked to remove.
@@ -480,10 +557,12 @@ pub(crate) fn remove_if_same(
     }
 }
 
-/// Linux: Unix has no delete through a handle, so the entry is opened relative to `parent`
-/// (no following links) and checked, then moved aside under a fresh name, checked again as
-/// the object moved, and deleted there. A mismatch is moved back, so what is deleted is what
-/// was checked, bar a swap of the fresh name itself in the instant before the delete.
+/// Linux: Unix has no delete through a handle. The entry is opened relative to `parent`
+/// (no following links) and checked first; then it is moved into a fresh private folder
+/// (`mkdirat` 0700 beside it), checked again there as the object moved, and only then
+/// deleted. Nothing else can give a name inside that folder to another object, so what is
+/// deleted is what was checked. A mismatch is moved back without replacing anything; if its
+/// name was taken meanwhile it is left in the staging folder and reported.
 #[cfg(all(unix, target_os = "linux"))]
 pub(crate) fn remove_if_same(
     parent: &fs::File,
@@ -491,18 +570,20 @@ pub(crate) fn remove_if_same(
     dir: bool,
     want: Option<FileIdentity>,
 ) -> Removal {
-    use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, openat, renameat_with, unlinkat};
+    use rustix::fs::{
+        AtFlags, Mode, OFlags, RenameFlags, mkdirat, openat, renameat_with, unlinkat,
+    };
     use rustix::io::Errno;
     let Some(want) = want else {
         return Removal::Changed;
     };
     // The entry itself: a link is refused (NOFOLLOW), a folder where a file was is refused.
-    let open = |at: &std::ffi::OsStr| -> std::result::Result<fs::File, Errno> {
+    let open = |at: &dyn std::os::fd::AsFd| -> std::result::Result<fs::File, Errno> {
         let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         if dir {
             flags |= OFlags::DIRECTORY;
         }
-        openat(parent, at, flags, Mode::empty()).map(fs::File::from)
+        openat(at, name, flags, Mode::empty()).map(fs::File::from)
     };
     let identity_of = |file: &fs::File| {
         if dir {
@@ -511,56 +592,78 @@ pub(crate) fn remove_if_same(
             FileIdentity::of(file)
         }
     };
-    let file = match open(name) {
-        Ok(file) => file,
+    match open(parent) {
+        Ok(file) if identity_of(&file) != Some(want) => return Removal::Changed,
+        Ok(_) if !want.is_strong() => return Removal::Unconfirmed,
+        Ok(_) => {}
         Err(Errno::NOENT) => return Removal::Gone,
         Err(Errno::LOOP | Errno::NOTDIR) => return Removal::Changed,
         Err(e) => return Removal::Failed(e.into()),
+    }
+    // A private staging folder beside it (same file system, so the move is a rename).
+    let stage_name =
+        std::ffi::OsString::from(format!(".zxraw-removing-{}", crate::ops::random_hex()));
+    if let Err(e) = mkdirat(parent, &stage_name, Mode::from_raw_mode(0o700)) {
+        return Removal::Failed(e.into());
+    }
+    let stage = match openat(
+        parent,
+        &stage_name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fs::File::from(fd),
+        Err(e) => {
+            let _ = unlinkat(parent, &stage_name, AtFlags::REMOVEDIR);
+            return Removal::Failed(e.into());
+        }
     };
-    if identity_of(&file) != Some(want) {
-        return Removal::Changed;
-    }
-    if !want.is_strong() {
-        return Removal::Unconfirmed;
-    }
-    drop(file);
-    let aside = std::ffi::OsString::from(format!(".zxraw-removing-{}", crate::ops::random_hex()));
-    match renameat_with(parent, name, parent, &aside, RenameFlags::NOREPLACE) {
+    let drop_stage = || {
+        let _ = unlinkat(parent, &stage_name, AtFlags::REMOVEDIR);
+    };
+    match renameat_with(parent, name, &stage, name, RenameFlags::NOREPLACE) {
         Ok(()) => {}
-        Err(Errno::NOENT) => return Removal::Gone,
-        Err(e) => return Removal::Failed(e.into()),
+        Err(Errno::NOENT) => {
+            drop_stage();
+            return Removal::Gone;
+        }
+        Err(e) => {
+            drop_stage();
+            return Removal::Failed(e.into());
+        }
     }
-    // Put the object back under its name, unless something new has taken the name.
-    let restore = || -> io::Result<()> {
-        renameat_with(parent, &aside, parent, name, RenameFlags::NOREPLACE).map_err(io::Error::from)
+    // Back where it was, never over something new; else left in the staging folder.
+    let put_back = |why: Removal| -> Removal {
+        match renameat_with(&stage, name, parent, name, RenameFlags::NOREPLACE) {
+            Ok(()) => {
+                drop_stage();
+                why
+            }
+            Err(e) => Removal::Failed(io::Error::new(
+                io::Error::from(e).kind(),
+                format!(
+                    "{} could not be put back and was left in {}",
+                    Path::new(name).display(),
+                    Path::new(&stage_name).display()
+                ),
+            )),
+        }
     };
-    let moved_ok = open(&aside).is_ok_and(|f| identity_of(&f) == Some(want));
-    if !moved_ok {
-        return match restore() {
-            Ok(()) => Removal::Changed,
-            Err(e) => Removal::Failed(e),
-        };
+    if !open(&stage).is_ok_and(|f| identity_of(&f) == Some(want)) {
+        return put_back(Removal::Changed);
     }
     let flags = if dir {
         AtFlags::REMOVEDIR
     } else {
         AtFlags::empty()
     };
-    match unlinkat(parent, &aside, flags) {
-        Ok(()) => Removal::Removed,
-        Err(e) => {
-            // Not deleted (a folder still holding something, say): it goes back where it was.
-            if let Err(back) = restore() {
-                return Removal::Failed(io::Error::new(
-                    back.kind(),
-                    format!("could not be put back after a failed removal: {back}"),
-                ));
-            }
-            match e {
-                Errno::NOTEMPTY => Removal::NotEmpty,
-                e => Removal::Failed(e.into()),
-            }
+    match unlinkat(&stage, name, flags) {
+        Ok(()) => {
+            drop_stage();
+            Removal::Removed
         }
+        Err(Errno::NOTEMPTY) => put_back(Removal::NotEmpty),
+        Err(e) => put_back(Removal::Failed(e.into())),
     }
 }
 
@@ -682,24 +785,6 @@ mod nt {
         // SAFETY: NtCreateFile succeeded, so `handle` is a new handle we now own.
         let file = unsafe { File::from_raw_handle(handle.0) };
         Ok((file, status_block.Information == FILE_CREATED))
-    }
-}
-
-#[cfg(not(windows))]
-fn verify_real_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| CoreError::io(path, error))?;
-    if metadata.is_dir() && !is_link_or_reparse(&metadata) {
-        Ok(())
-    } else if is_link_or_reparse(&metadata) {
-        Err(CoreError::UnsafePath(format!(
-            "{} is a link; refusing to extract through it",
-            path.display()
-        )))
-    } else {
-        Err(CoreError::Invalid(format!(
-            "{} exists and is not a folder",
-            path.display()
-        )))
     }
 }
 
@@ -925,5 +1010,56 @@ mod tests {
         xz.extend([2, 0, 0x21, 1, 22, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(xz_dictionary(&xz), Some(8 << 20));
         assert_eq!(xz_dictionary(b"not xz"), None);
+    }
+
+    /// Linux: removal goes through a private staging folder; a match is deleted, a replaced
+    /// item is put back untouched, and no staging folder is left either way.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removal_stages_checks_and_cleans_up() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = fs::File::open(d.path()).unwrap();
+        let path = d.path().join("f.txt");
+        fs::write(&path, b"one").unwrap();
+        let want = FileIdentity::of(&fs::File::open(&path).unwrap());
+        if !want.is_some_and(|w| w.is_strong()) {
+            eprintln!("skipped: no birth time on this file system");
+            return;
+        }
+        // Replaced by another file under the same name: kept.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"two").unwrap();
+        let name = std::ffi::OsStr::new("f.txt");
+        assert!(matches!(
+            remove_if_same(&parent, name, false, want),
+            Removal::Changed
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        // The same file: removed.
+        let want = FileIdentity::of(&fs::File::open(&path).unwrap());
+        assert!(matches!(
+            remove_if_same(&parent, name, false, want),
+            Removal::Removed
+        ));
+        assert!(!path.exists());
+        assert!(matches!(
+            remove_if_same(&parent, name, false, want),
+            Removal::Gone
+        ));
+        // A folder still holding something is put back.
+        let dir = d.path().join("d");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("keep"), b"k").unwrap();
+        let want = FileIdentity::of_dir(&fs::File::open(&dir).unwrap());
+        assert!(matches!(
+            remove_if_same(&parent, std::ffi::OsStr::new("d"), true, want),
+            Removal::NotEmpty
+        ));
+        assert!(dir.join("keep").exists());
+        let left: Vec<_> = fs::read_dir(d.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("d")]);
     }
 }

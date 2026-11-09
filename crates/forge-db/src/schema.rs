@@ -259,7 +259,78 @@ fn platform_sql(sql: &'static str) -> Cow<'static, str> {
 
 /// Apply all pending migrations. Returns the versions applied by this call.
 pub(crate) fn migrate(conn: &mut Connection) -> Result<Vec<i64>> {
-    migrate_with(conn, MIGRATIONS)
+    let applied = migrate_with(conn, MIGRATIONS)?;
+    #[cfg(not(windows))]
+    case_sensitive_paths(conn)?;
+    Ok(applied)
+}
+
+/// Tables whose path columns are `COLLATE NOCASE` on Windows (see [`platform_sql`]).
+#[cfg(not(windows))]
+const PATH_TABLES: [&str; 2] = ["files", "index_roots"];
+
+/// Off Windows: a database whose path columns are still `COLLATE NOCASE` (made on Windows and
+/// copied over) has those tables rebuilt with `BINARY`, as a new one gets, so names differing
+/// only in case are two rows. SQLite's own recipe: create the new table, copy the rows, drop
+/// the old one, rename, recreate its indexes; foreign keys are off meanwhile and checked
+/// before the commit. Rows can't collide: `NOCASE` was the stricter key.
+#[cfg(not(windows))]
+fn case_sensitive_paths(conn: &mut Connection) -> Result<()> {
+    for table in PATH_TABLES {
+        let sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(sql) = sql.filter(|s| s.contains("COLLATE NOCASE")) else {
+            continue;
+        };
+        tracing::warn!("{table}: paths are case-insensitive (a Windows database); rebuilding");
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL",
+            )?
+            .query_map([table], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let create = sql
+            .replacen(
+                &format!("CREATE TABLE {table}"),
+                &format!("CREATE TABLE {table}_binary"),
+                1,
+            )
+            .replace("COLLATE NOCASE", "COLLATE BINARY");
+        let keys: bool = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+        conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let rebuilt = (|| -> Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute_batch(&create)?;
+            tx.execute_batch(&format!(
+                "INSERT INTO {table}_binary SELECT * FROM {table};
+                 DROP TABLE {table};
+                 ALTER TABLE {table}_binary RENAME TO {table};"
+            ))?;
+            for index in &indexes {
+                tx.execute_batch(index)?;
+            }
+            let broken: i64 =
+                tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+            if broken != 0 {
+                return Err(rusqlite::Error::InvalidQuery.into());
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if keys {
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        }
+        rebuilt?;
+    }
+    Ok(())
 }
 
 pub(crate) fn migrate_with(conn: &mut Connection, migrations: &[Migration]) -> Result<Vec<i64>> {
@@ -310,6 +381,73 @@ pub(crate) fn current_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A database made on Windows (path columns `COLLATE NOCASE`) is rebuilt case-sensitive
+    /// when opened elsewhere, keeping its rows, child rows and indexes.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_windows_database_gets_case_sensitive_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("forge.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY,
+                     description TEXT NOT NULL, applied_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+            for m in MIGRATIONS {
+                conn.execute_batch(m.sql).unwrap(); // as on Windows: NOCASE kept
+                conn.execute(
+                    "INSERT INTO schema_migrations VALUES (?1, ?2, 0)",
+                    params![m.version, m.description],
+                )
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO volumes(id, root, last_seen) VALUES (1, '/', 0);
+                 INSERT INTO files(id, volume_id, path, path_lc, parent_path, name, name_lc,
+                                   kind, media_kind, indexed_at)
+                 VALUES (1, 1, '/p/IMG.jpg', '/p/img.jpg', '/p', 'IMG.jpg', 'img.jpg',
+                         'file', 'image', 0);
+                 INSERT INTO annotations(file_id, notes, updated_at) VALUES (1, 'kept', 0);
+                 INSERT INTO index_roots(path, added_at) VALUES ('/p', 0);",
+            )
+            .unwrap();
+        }
+        let db = crate::Db::open(&path).unwrap();
+        db.with_conn(|c| {
+            let nocase: i64 = c.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE sql LIKE '%COLLATE NOCASE%'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(nocase, 0);
+            // `img.jpg` is another file now, and the old row and its notes are intact.
+            c.execute(
+                "INSERT INTO files(volume_id, path, path_lc, parent_path, name, name_lc,
+                                   kind, media_kind, indexed_at)
+                 VALUES (1, '/p/img.jpg', '/p/img.jpg', '/p', 'img.jpg', 'img.jpg',
+                         'file', 'image', 0)",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO index_roots(path, added_at) VALUES ('/P', 0)",
+                [],
+            )?;
+            let parent_index: i64 = c.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'idx_files_parent'",
+                [],
+                |r| r.get(0),
+            )?;
+            assert_eq!(parent_index, 1);
+            let keys: bool = c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+            assert!(keys);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(db.annotation(1).unwrap().notes.as_deref(), Some("kept"));
+    }
 
     #[test]
     fn v2_clears_blank_notes_and_indexes_notes_on_upgrade() {

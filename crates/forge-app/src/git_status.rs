@@ -187,6 +187,16 @@ fn norm_key(path: &Path) -> String {
     path.to_string_lossy().trim_end_matches('/').to_string()
 }
 
+/// Is file name `name` the name `want`? Windows names ignore case; Unix ones don't (a `.GIT`
+/// folder there is an ordinary folder, a `.GitIgnore` an ordinary file).
+fn same_name(name: &str, want: &str) -> bool {
+    if cfg!(windows) {
+        name.eq_ignore_ascii_case(want)
+    } else {
+        name == want
+    }
+}
+
 /// A repository-relative path as a status key: lowercase on Windows, whose names are
 /// case-insensitive; unchanged on Unix.
 fn fold(path: &str) -> String {
@@ -1656,7 +1666,7 @@ impl<'a> Walker<'a> {
         // either), and never an online-only file, which opening could download.
         let gitignore = entries
             .iter()
-            .find(|e| e.name.eq_ignore_ascii_case(".gitignore"))
+            .find(|e| same_name(&e.name, ".gitignore"))
             .filter(|e| !e.info.is_dir() && !e.info.is_link() && !e.is_placeholder())
             .cloned();
         let pushed = match &gitignore {
@@ -1664,7 +1674,7 @@ impl<'a> Walker<'a> {
             _ => false,
         };
         for entry in entries {
-            if entry.name.eq_ignore_ascii_case(".git") {
+            if same_name(&entry.name, ".git") {
                 continue;
             }
             let path = format!("{rel}{}", entry.name);
@@ -3690,6 +3700,51 @@ mod tests {
         std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(found, Some(inner.clone()));
         assert!(status.is_ok(), "{status:?}");
+    }
+
+    /// Unix: a name that is not UTF-8 is skipped, never aliased to a lossy (U+FFFD) name that
+    /// another entry may really have.
+    #[cfg(unix)]
+    #[test]
+    fn names_that_are_not_utf8_are_skipped() {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(repo) = fixture_repo() else { return };
+        let root = repo.path();
+        std::fs::write(root.join(std::ffi::OsStr::from_bytes(b"bad\xff.txt")), "x").unwrap();
+        let (fs, top) = fs_at(root, false);
+        let mut names = Vec::new();
+        top.list(|e| {
+            names.push(e.name);
+            true
+        })
+        .unwrap();
+        assert!(!names.iter().any(|n| n.contains('\u{FFFD}')), "{names:?}");
+        assert!(names.iter().any(|n| n == "a.txt"));
+        drop(fs);
+        let status = assert_fast_and_contained(root, "non-UTF-8").expect("status");
+        assert_eq!(
+            status.badge(&root.join("bad\u{FFFD}.txt"), false),
+            None,
+            "no badge for a name nothing has"
+        );
+    }
+
+    /// Unix: `.GIT` and `.GITIGNORE` are ordinary names (Git is case-sensitive there).
+    #[cfg(unix)]
+    #[test]
+    fn dot_git_names_match_exactly_on_unix() {
+        let Some(repo) = fixture_repo() else { return };
+        let root = repo.path();
+        std::fs::create_dir(root.join(".GIT")).unwrap();
+        std::fs::write(root.join(".GIT").join("f"), "x").unwrap();
+        std::fs::write(root.join(".GITIGNORE"), "untracked.txt\n").unwrap();
+        let status = assert_fast_and_contained(root, ".GIT").expect("status");
+        assert_eq!(status.badge(&root.join(".GIT"), true), Some(GitBadge::Added));
+        assert_eq!(
+            status.badge(&root.join("untracked.txt"), false),
+            Some(GitBadge::Added),
+            ".GITIGNORE is not an ignore file"
+        );
     }
 
     /// Unix: network and FUSE file systems are recognised by their `statfs` magic.

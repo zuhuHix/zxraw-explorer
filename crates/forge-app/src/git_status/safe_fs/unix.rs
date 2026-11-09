@@ -1,13 +1,14 @@
 //! The Unix half of [`super`]: `openat` with `O_NOFOLLOW` relative to held folders,
-//! `fstatat(AT_SYMLINK_NOFOLLOW)` lookups, `st_dev` for mount points and `fstatfs` for network
-//! file systems.
+//! `statx`/`fstatat(AT_SYMLINK_NOFOLLOW)` lookups, mount points told by `st_dev`, the mount id
+//! and `STATX_ATTR_MOUNT_ROOT` (so a bind mount of the same device counts too), and `fstatfs`
+//! for network file systems.
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 #[cfg(test)]
@@ -75,9 +76,29 @@ fn io(e: Errno) -> Error {
     }
 }
 
-/// Synthetic Win32-style attributes, size and write time (ns since 1970) from a `stat`.
-fn info_of(stat: &Stat) -> Info {
-    let attributes = match FileType::from_raw_mode(stat.st_mode as _) {
+/// What the scan needs to know of an entry or open handle.
+struct Meta {
+    info: Info,
+    dev: u64,
+    nlink: u64,
+    /// `stx_mnt_id`, where the kernel reports it.
+    mount: Option<u64>,
+    /// `STATX_ATTR_MOUNT_ROOT`: something is mounted here (a bind mount included).
+    mount_root: bool,
+}
+
+impl Meta {
+    /// Is this entry of folder `dev`/`mount` the root of another mount?
+    fn crosses(&self, dev: u64, mount: Option<u64>) -> bool {
+        self.dev != dev
+            || self.mount_root
+            || matches!((self.mount, mount), (Some(a), Some(b)) if a != b)
+    }
+}
+
+/// Synthetic Win32-style attributes, size and write time (ns since 1970).
+fn info_from(mode: u32, size: u64, secs: i64, nanos: i64) -> Info {
+    let attributes = match FileType::from_raw_mode(mode as _) {
         FileType::Directory => ATTR_DIRECTORY,
         FileType::Symlink => ATTR_LINK,
         FileType::RegularFile => ATTR_NORMAL,
@@ -85,11 +106,66 @@ fn info_of(stat: &Stat) -> Info {
     };
     Info {
         attributes,
-        size: stat.st_size.max(0) as u64,
-        mtime: (stat.st_mtime as i64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add(stat.st_mtime_nsec as i64),
+        size,
+        mtime: secs.saturating_mul(1_000_000_000).saturating_add(nanos),
     }
+}
+
+/// `name` in `dirfd` (or `dirfd` itself, with `AtFlags::EMPTY_PATH` and an empty name), never
+/// following a link: `statx` where there is one, else `fstatat` without mount information.
+fn meta<P: rustix::path::Arg + Copy>(
+    dirfd: impl AsFd,
+    name: P,
+    flags: AtFlags,
+) -> Result<Meta, Errno> {
+    let flags = flags | AtFlags::SYMLINK_NOFOLLOW;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use rustix::fs::{StatxAttributes, StatxFlags};
+        match rustix::fs::statx(
+            &dirfd,
+            name,
+            flags,
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+        ) {
+            Ok(x) => {
+                let root = StatxAttributes::MOUNT_ROOT;
+                return Ok(Meta {
+                    info: info_from(
+                        u32::from(x.stx_mode),
+                        x.stx_size,
+                        x.stx_mtime.tv_sec,
+                        i64::from(x.stx_mtime.tv_nsec),
+                    ),
+                    dev: rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
+                    nlink: u64::from(x.stx_nlink),
+                    mount: (x.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(x.stx_mnt_id),
+                    mount_root: x.stx_attributes_mask.contains(root)
+                        && x.stx_attributes.contains(root),
+                });
+            }
+            Err(Errno::NOSYS) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let stat = rustix::fs::statat(&dirfd, name, flags)?;
+    Ok(Meta {
+        info: info_from(
+            stat.st_mode as u32,
+            stat.st_size.max(0) as u64,
+            stat.st_mtime as i64,
+            stat.st_mtime_nsec as i64,
+        ),
+        dev: stat.st_dev as u64,
+        nlink: stat.st_nlink as u64,
+        mount: None,
+        mount_root: false,
+    })
+}
+
+/// [`meta`] of an open handle.
+fn meta_fd(fd: &OwnedFd) -> Result<Meta, Errno> {
+    meta(fd, "", AtFlags::EMPTY_PATH)
 }
 
 /// Opens folder `name` in `dirfd`, refusing a symlink. Reads need `r` on the folder; one with
@@ -111,12 +187,13 @@ fn open_dir(dirfd: impl AsFd, name: &str) -> Result<OwnedFd, Error> {
 }
 
 impl Dir {
-    fn new(handle: Handle, info: Info, dev: u64) -> Dir {
+    fn new(handle: Handle, meta: &Meta) -> Dir {
         Dir {
             handle,
-            info,
+            info: meta.info,
             serial: DIR_SERIAL.fetch_add(1, Ordering::Relaxed),
-            dev,
+            dev: meta.dev,
+            mount: meta.mount,
         }
     }
 }
@@ -128,40 +205,43 @@ impl Fs {
         #[cfg(test)]
         PATH_OPENS.with(|n| n.set(n.get() + 1));
         let handle = open_dir(rustix::fs::CWD, "/")?;
-        let stat = rustix::fs::fstat(&handle).map_err(io)?;
-        let info = info_of(&stat);
-        if !info.is_dir() {
+        let meta = meta_fd(&handle).map_err(io)?;
+        if !meta.info.is_dir() {
             return Err(Error::WrongKind);
         }
         if is_remote_fs(&handle)? {
             return Err(Error::Link);
         }
         let fs = Fs {
-            volume: stat.st_dev as u64,
+            volume: meta.dev,
             narrowed: false,
+            mount: None,
             root_final: String::new(),
             opened: record.then(|| Mutex::new(Vec::new())),
         };
         fs.note("/");
-        Ok((fs, Dir::new(handle, info, stat.st_dev as u64)))
+        Ok((fs, Dir::new(handle, &meta)))
     }
 
     /// Makes `dir`, a folder opened through this `Fs`, the root nothing may leave from now on:
-    /// no handle may be on another device (mount points become links) or outside its path.
+    /// no handle may be on another device or mount (mount points, bind mounts included,
+    /// become links) or outside its path.
     pub fn narrow(&mut self, dir: &Dir) -> Result<(), Error> {
         if let Some(path) = final_path(&dir.handle) {
             self.root_final = path.trim_end_matches('/').to_string();
         }
         self.volume = dir.dev;
+        self.mount = dir.mount;
         self.narrowed = true;
         Ok(())
     }
 
     /// Opens `entry`, listed in `parent`, without following links. Refused before opening:
     /// an entry from another folder's listing, a link, a placeholder, a FIFO or device, the
-    /// wrong kind. Checked on the handle after: the expected kind, on the root's device (once
-    /// narrowed) and not on a network file system, inside the root, one name (files).
-    fn open(&self, parent: &Dir, entry: &Entry, dir: bool) -> Result<(OwnedFd, Info, u64), Error> {
+    /// wrong kind. Checked on the handle after: the expected kind, on the root's device and
+    /// mount and not a mount point (once narrowed), not on a network file system, inside the
+    /// root, one name (files).
+    fn open(&self, parent: &Dir, entry: &Entry, dir: bool) -> Result<(OwnedFd, Meta), Error> {
         let name = entry.name.as_str();
         if entry.parent != parent.serial || !plain_component(name) {
             return Err(Error::BadName);
@@ -196,9 +276,8 @@ impl Fs {
         if let Some(path) = &path {
             self.note(path);
         }
-        let stat = rustix::fs::fstat(&handle).map_err(io)?;
-        let info = info_of(&stat);
-        let dev = stat.st_dev as u64;
+        let meta = meta_fd(&handle).map_err(io)?;
+        let info = meta.info;
         if info.is_link() {
             return Err(Error::Link);
         }
@@ -206,13 +285,13 @@ impl Fs {
             return Err(Error::WrongKind);
         }
         if self.narrowed {
-            if dev != self.volume {
+            if meta.crosses(self.volume, self.mount) {
                 return Err(Error::Link);
             }
-        } else if dev != parent.dev && is_remote_fs(&handle)? {
+        } else if meta.crosses(parent.dev, parent.mount) && is_remote_fs(&handle)? {
             return Err(Error::Link);
         }
-        if !dir && stat.st_nlink > 1 {
+        if !dir && meta.nlink > 1 {
             return Err(Error::Link);
         }
         if info.attributes & PLACEHOLDER != 0 {
@@ -231,7 +310,7 @@ impl Fs {
             // Reads should block normally.
             let _ = rustix::fs::fcntl_setfl(&handle, OFlags::empty());
         }
-        Ok((handle, info, dev))
+        Ok((handle, meta))
     }
 
     /// The entry `name` in folder `parent`, from `fstatat` without following a link; nothing
@@ -240,10 +319,9 @@ impl Fs {
         if !plain_component(name) {
             return Err(Error::BadName);
         }
-        let stat =
-            rustix::fs::statat(&parent.handle, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
-        let mut info = info_of(&stat);
-        if self.narrowed && stat.st_dev as u64 != parent.dev {
+        let found = meta(&parent.handle, name, AtFlags::empty()).map_err(io)?;
+        let mut info = found.info;
+        if self.narrowed && found.crosses(parent.dev, parent.mount) {
             info.attributes |= ATTR_LINK;
         }
         Ok(entry(name.to_string(), info, parent.serial))
@@ -251,16 +329,16 @@ impl Fs {
 
     /// Opens folder `entry`, listed in `parent`.
     pub fn dir(&self, parent: &Dir, entry: &Entry) -> Result<Dir, Error> {
-        let (handle, info, dev) = self.open(parent, entry, true)?;
-        Ok(Dir::new(handle, info, dev))
+        let (handle, meta) = self.open(parent, entry, true)?;
+        Ok(Dir::new(handle, &meta))
     }
 
     /// Opens file `entry`, listed in `parent`.
     pub fn file(&self, parent: &Dir, entry: &Entry) -> Result<File, Error> {
-        let (handle, info, _) = self.open(parent, entry, false)?;
+        let (handle, meta) = self.open(parent, entry, false)?;
         Ok(File {
             file: std::fs::File::from(handle),
-            info,
+            info: meta.info,
         })
     }
 }
@@ -268,7 +346,9 @@ impl Fs {
 impl Dir {
     /// Lists the folder, calling `each` per entry (`.` and `..` skipped) until it returns
     /// false. Symlinks are reported as links, and so are mount points (an entry on another
-    /// device); nothing is opened.
+    /// device or mount, or a mount root: bind mounts too); nothing is opened. A name that is
+    /// not UTF-8 is skipped: the scan works with `str` names, and a lossy one (U+FFFD) could
+    /// alias another entry.
     pub fn list(&self, mut each: impl FnMut(Entry) -> bool) -> Result<(), Error> {
         let mut dir = rustix::fs::Dir::read_from(&self.handle).map_err(io)?;
         while let Some(item) = dir.read() {
@@ -277,17 +357,18 @@ impl Dir {
             if raw == b"." || raw == b".." {
                 continue;
             }
-            let name = String::from_utf8_lossy(raw).into_owned();
-            let stat =
-                match rustix::fs::statat(&self.handle, item.file_name(), AtFlags::SYMLINK_NOFOLLOW)
-                {
-                    Ok(stat) => stat,
-                    // Removed since the listing.
-                    Err(Errno::NOENT) => continue,
-                    Err(e) => return Err(io(e)),
-                };
-            let mut info = info_of(&stat);
-            if stat.st_dev as u64 != self.dev {
+            let Ok(name) = std::str::from_utf8(raw) else {
+                continue;
+            };
+            let name = name.to_string();
+            let found = match meta(&self.handle, item.file_name(), AtFlags::empty()) {
+                Ok(found) => found,
+                // Removed since the listing.
+                Err(Errno::NOENT) => continue,
+                Err(e) => return Err(io(e)),
+            };
+            let mut info = found.info;
+            if found.crosses(self.dev, self.mount) {
                 info.attributes |= ATTR_LINK;
             }
             if !each(entry(name, info, self.serial)) {
@@ -311,4 +392,37 @@ fn final_path(handle: &OwnedFd) -> Option<String> {
     let link = std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())).ok()?;
     let path = link.to_string_lossy().into_owned();
     path.starts_with('/').then_some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mount point (here `/proc`, below `/`) crosses the boundary however it is told: its
+    /// device, its mount id or `STATX_ATTR_MOUNT_ROOT`; a plain folder does not. A bind mount
+    /// of the same device is caught by the last two.
+    #[test]
+    fn mount_points_cross_the_boundary() {
+        let root = open_dir(rustix::fs::CWD, "/").unwrap();
+        let top = meta_fd(&root).unwrap();
+        let proc_ = meta(&root, "proc", AtFlags::empty()).unwrap();
+        assert!(proc_.crosses(top.dev, top.mount));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("plain")).unwrap();
+        let dir = open_dir(rustix::fs::CWD, tmp.path().to_str().unwrap()).unwrap();
+        let here = meta_fd(&dir).unwrap();
+        let plain = meta(&dir, "plain", AtFlags::empty()).unwrap();
+        assert!(!plain.crosses(here.dev, here.mount));
+        // Same device, but another mount, or the root of one: both cross.
+        let bind = Meta {
+            mount: here.mount.map(|m| m + 1),
+            ..meta(&dir, "plain", AtFlags::empty()).unwrap()
+        };
+        assert_eq!(bind.crosses(here.dev, here.mount), here.mount.is_some());
+        let root_of = Meta {
+            mount_root: true,
+            ..meta(&dir, "plain", AtFlags::empty()).unwrap()
+        };
+        assert!(root_of.crosses(here.dev, here.mount));
+    }
 }

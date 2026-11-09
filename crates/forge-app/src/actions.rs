@@ -423,6 +423,10 @@ fn hidden_selection(app: &mut ZxrawApp, verb: &str) -> bool {
 }
 
 pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
+    // A Windows-only command's shortcut does nothing elsewhere (it is in no menu).
+    if !crate::platform::command_available(cmd) {
+        return;
+    }
     let dir = app.pane().path.clone();
     // Tools that read the listed items as files.
     if crate::archive_ui::needs_real_files(cmd)

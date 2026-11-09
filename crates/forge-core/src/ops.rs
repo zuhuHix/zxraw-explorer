@@ -1370,34 +1370,38 @@ fn rename_open_no_replace(file: &File, _from: &Path, to: &Path) -> io::Result<()
 }
 
 /// Unix cannot rename through a handle, so the path is renamed, and then the object now at `to`
-/// is checked against the one `file` is open on. Something else that was at `from` (a save
-/// that replaced it after it was verified) is renamed back and the rename fails. If that
-/// rename back also fails, that object stays under `to`.
+/// is checked against the one `file` is open on: same `st_dev` and `st_ino`. While `file` is
+/// held open its inode can't be freed and reused, so this proves the very object even where
+/// the file system keeps no birth time (NFS, some FUSE, tmpfs), unlike [`FileIdentity`].
+/// Something else that was at `from` (a save that replaced it after it was verified) is
+/// renamed back and the rename fails. If that rename back also fails, that object stays
+/// under `to`.
 #[cfg(not(windows))]
 fn rename_open_no_replace(file: &File, from: &Path, to: &Path) -> io::Result<()> {
     paths::rename_no_replace(from, to)?;
-    let same = match (
-        FileIdentity::of(file),
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // As itself: never through a link, never waiting on a FIFO.
-            let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
-            std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(flags.bits() as i32)
-                .open(to)
-                .ok()
-                .and_then(|moved| FileIdentity::of(&moved))
-        },
-    ) {
-        (Some(open), Some(moved)) => open == moved,
-        _ => false,
-    };
-    if same {
+    if is_open_object(file, to) {
         return Ok(());
     }
     let _ = paths::rename_no_replace(to, from);
     Err(io::Error::other("the object at the path is not the one opened"))
+}
+
+/// Is the object at `path` (opened as itself: never through a link, never waiting on a FIFO)
+/// the one `file` is open on? Compared by `st_dev` and `st_ino`, which can't be reused while
+/// `file` is held.
+#[cfg(unix)]
+pub(crate) fn is_open_object(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+    let Ok(held) = file.metadata() else {
+        return false;
+    };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits() as i32)
+        .open(path)
+        .and_then(|moved| moved.metadata())
+        .is_ok_and(|moved| (moved.dev(), moved.ino()) == (held.dev(), held.ino()))
 }
 
 /// Why [`replace_guarded`] did not publish.
@@ -3190,6 +3194,38 @@ mod tests {
     #[cfg(windows)]
     use std::sync::Arc;
     use std::sync::Mutex;
+
+    /// Unix: the rename is checked against the open file by `st_dev`/`st_ino`, which holds
+    /// where there is no birth time (the weak identity would accept a same-size, same-time
+    /// replacement).
+    #[cfg(unix)]
+    #[test]
+    fn unix_rename_checks_the_open_object_without_birth_times() {
+        let d = tempfile::tempdir().unwrap();
+        HIDE_FILE_ID.with(|h| h.set(true));
+        let (a, b) = (d.path().join("a"), d.path().join("b"));
+        fs::write(&a, b"same").unwrap();
+        let held = File::open(&a).unwrap();
+        assert!(rename_open_no_replace(&held, &a, &b).is_ok());
+        assert_eq!(fs::read(&b).unwrap(), b"same");
+        // The held file is replaced under its name by one of the same size and time.
+        let (c, e) = (d.path().join("c"), d.path().join("e"));
+        fs::write(&c, b"orig").unwrap();
+        let held = File::open(&c).unwrap();
+        let mtime = fs::metadata(&c).unwrap().modified().unwrap();
+        fs::remove_file(&c).unwrap();
+        fs::write(&c, b"evil").unwrap();
+        File::options()
+            .write(true)
+            .open(&c)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        assert!(rename_open_no_replace(&held, &c, &e).is_err());
+        HIDE_FILE_ID.with(|h| h.set(false));
+        assert_eq!(fs::read(&c).unwrap(), b"evil", "put back");
+        assert!(!e.exists());
+    }
 
     struct Fx {
         _d: tempfile::TempDir,
