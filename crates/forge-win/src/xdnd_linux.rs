@@ -31,8 +31,10 @@
 //!   [`set_answer`](crate::drop_target::DropTargetHandle::set_answer) (or the provisional
 //!   answer before it gave one), limited to the source's `XdndActionList`, asking for more
 //!   positions and setting no "quiet" rectangle. X positions carry no modifiers, so every
-//!   position also reads Ctrl / Shift with `QueryPointer` for
-//!   [`keys`](crate::drop_target::DropTargetHandle::keys), and wakes the app. A new answer
+//!   position also reads Ctrl / Shift and the pointer (relative to the toplevel) with
+//!   `QueryPointer` for [`keys`](crate::drop_target::DropTargetHandle::keys) and
+//!   [`pointer`](crate::drop_target::DropTargetHandle::pointer), and wakes the app. The app's
+//!   UI thread reads those; it never makes an X request itself. A new answer
 //!   from the app is sent to the source at once, so its cursor follows while the pointer
 //!   rests.
 //! * `XdndDrop` gives [`DropEvent::Drop`] and `XdndFinished`. A copy is reported as
@@ -50,10 +52,12 @@
 //! for the position, Button1 and the modifiers, and `QueryKeymap` for Escape. The window
 //! under the pointer is found by descending from the root through `QueryPointer`'s `child`
 //! to the first window with `XdndAware` (its `XdndProxy` honoured); our own toplevel is
-//! never a target. Positions wait for the previous `XdndStatus` (or 500 ms). Releasing
-//! Button1 over a window that accepted sends `XdndDrop` and serves `XdndSelection` until
-//! `XdndFinished` (or 30 s); otherwise the drag ends with `XdndLeave` and
-//! [`DropResult::None`]. The `DELETE` target is always refused: we never delete the
+//! never a target. Positions wait for the previous `XdndStatus` (or 500 ms). At the release
+//! of Button1 a last `XdndPosition` goes out with the action for the keys held then (after
+//! any status still in flight), and only an accepting `XdndStatus` for it leads to
+//! `XdndDrop`; the selection is then served until `XdndFinished` (or 30 s). No answer within
+//! 500 ms, or a refusal, ends the drag with `XdndLeave` and [`DropResult::None`]. Setup
+//! (connecting, taking the selection) runs on the worker thread too, never the caller's. The `DELETE` target is always refused: we never delete the
 //! source files, whatever the target asks.
 //!
 //! The cursor: while the button is held, X shows the grab window's cursor (our toplevel's)
@@ -912,7 +916,9 @@ impl Target {
             0,
             64,
         );
-        let pointer = self.conn.query_pointer(self.root);
+        // Relative to our toplevel, so the app gets the pointer in window pixels from here
+        // (`DropTargetHandle::pointer`) and never asks the X server itself.
+        let pointer = self.conn.query_pointer(self.toplevel);
         let list: Vec<Action> = list
             .ok()
             .and_then(|cookie| cookie.reply().ok())
@@ -921,18 +927,17 @@ impl Target {
             .into_iter()
             .filter_map(|atom| self.atoms.action_of(atom))
             .collect();
-        let keys = pointer
-            .ok()
-            .and_then(|cookie| cookie.reply().ok())
-            .map(|reply| {
-                (
-                    reply.mask.contains(KeyButMask::CONTROL),
-                    reply.mask.contains(KeyButMask::SHIFT),
-                )
-            });
+        let pointer = pointer.ok().and_then(|cookie| cookie.reply().ok());
         drag.allowed = allowed_effects(&list, suggested);
-        if let Some(keys) = keys {
-            drop_target::lock(&self.shared).keys = keys;
+        if let Some(reply) = pointer {
+            let mut shared = drop_target::lock(&self.shared);
+            shared.keys = (
+                reply.mask.contains(KeyButMask::CONTROL),
+                reply.mask.contains(KeyButMask::SHIFT),
+            );
+            shared.pointer = reply
+                .same_screen
+                .then_some((i32::from(reply.win_x), i32::from(reply.win_y)));
         }
         if drag.takes && matches!(drag.data, Data::Wanted) {
             self.request_data(time);
@@ -1835,19 +1840,26 @@ pub(crate) fn start_drag_out_on(
     window: u32,
     items: &[DragItem],
 ) -> Result<DragOutSession> {
-    let paths = items.iter().map(|item| item.path.clone()).collect();
-    let source = Source::new(display, paths, offered_actions(Action::Copy))?;
-    let cursor_display = display.to_string();
+    // Everything that talks to the X server (connecting, interning, taking the selection with
+    // a server timestamp) happens on the worker: the caller is the UI thread and only spawns.
+    // A setup failure is the session's result.
+    let paths: Vec<PathBuf> = items.iter().map(|item| item.path.clone()).collect();
+    let display = display.to_string();
     let shared = Arc::new(SessionShared::default());
     let thread_shared = Arc::clone(&shared);
     std::thread::Builder::new()
         .name("zxraw-xdnd-source".to_string())
         .spawn(move || {
-            let cursors = DragCursors::new(&cursor_display, window);
-            let result = run_drag(source, window, &thread_shared, cursors.as_ref());
-            if let Some(cursors) = &cursors {
-                cursors.clear();
-            }
+            let result = Source::new(&display, paths, offered_actions(Action::Copy)).and_then(
+                |source| {
+                    let cursors = DragCursors::new(&display, window);
+                    let result = run_drag(source, window, &thread_shared, cursors.as_ref());
+                    if let Some(cursors) = &cursors {
+                        cursors.clear();
+                    }
+                    result
+                },
+            );
             let mut state = lock(&thread_shared.state);
             state.feedback = DragFeedback::NoTarget;
             state.result = Some(result.map_err(|e| e.to_string()));
@@ -1921,6 +1933,14 @@ impl DragCursors {
     }
 }
 
+/// The action for the modifiers held at the button release.
+fn release_action(mask: KeyButMask) -> Action {
+    action_for_keys(
+        mask.contains(KeyButMask::CONTROL),
+        mask.contains(KeyButMask::SHIFT),
+    )
+}
+
 /// The status a source has from its current target.
 #[derive(Clone, Copy, Default)]
 struct Status {
@@ -1970,7 +1990,7 @@ fn run_drag(
     };
 
     // Hover.
-    let (x, y) = loop {
+    let (x, y, release_mask) = loop {
         while let Some(event) = next_event(&source.conn, Some(tick))? {
             if let Some(Reply::Lost) = handle(&mut source, event, site, &mut status, &mut awaiting)
             {
@@ -1991,7 +2011,7 @@ fn run_drag(
             return Ok(DropResult::None);
         }
         if !mask.contains(KeyButMask::BUTTON1) {
-            break (x, y);
+            break (x, y, mask);
         }
         let under = match cache {
             Some((child, under, at))
@@ -2047,26 +2067,36 @@ fn run_drag(
     let Some(site) = site else {
         return Ok(DropResult::None);
     };
-    if sent.is_some_and(|(sx, sy, _)| (sx, sy) != (x, y)) || awaiting.is_some() {
-        // The release point is where the drop happens: tell the target, and wait for its
-        // answer (briefly).
-        if awaiting.is_none() {
-            source.position(site, x, y, source.action);
-        }
+    // The drop acts as the keys are at the release, not at the last position: a Shift let go
+    // just before the button must not move. A status still in flight answers an older
+    // position, so it is waited out first; then the release position goes out with the
+    // current action, the old answer is forgotten, and only an accepting status for that
+    // position allows the drop. No answer in time, or a refusal: leave, nothing dropped.
+    let action = release_action(release_mask);
+    if action != source.action {
+        source.action = action;
+        source.set_offered(offered_actions(action));
+    }
+    let wait_status = |source: &mut Source, status: &mut Status| -> Result<bool> {
         let deadline = Instant::now() + STATUS_WAIT;
-        awaiting = Some(Instant::now());
+        let mut awaiting = Some(Instant::now());
         while awaiting.is_some() {
             let Some(event) = next_event(&source.conn, Some(deadline))? else {
-                break;
+                return Ok(false);
             };
-            if let Some(Reply::Lost) =
-                handle(&mut source, event, Some(site), &mut status, &mut awaiting)
-            {
-                break;
+            if let Some(Reply::Lost) = handle(source, event, Some(site), status, &mut awaiting) {
+                return Ok(false);
             }
         }
+        Ok(true)
+    };
+    if awaiting.is_some() {
+        let mut stale = Status::default();
+        wait_status(&mut source, &mut stale)?;
     }
-    if !status.accepted {
+    source.position(site, x, y, action);
+    status = Status::default();
+    if !wait_status(&mut source, &mut status)? || !status.accepted {
         source.leave(site);
         return Ok(DropResult::None);
     }
