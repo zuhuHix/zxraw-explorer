@@ -87,6 +87,8 @@ fn video_proxy_conventions_and_external_root_scan_are_visible() {
         "ui related assert-proxies GX010001_Proxy.MOV,GX010001.proxy.720.mp4,GL010001.LRV".into(),
         "ui related assert-no-proxies GX010001.proxy.mp4".into(),
         path_step("screenshot", &shots_local),
+        "ui related wait-preview-settled".into(),
+        "wait-frames 2".into(),
         "pointer 1180 700".into(),
         "scroll 800".into(),
         "wait-frames 2".into(),
