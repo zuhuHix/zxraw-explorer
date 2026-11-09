@@ -43,6 +43,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | atspi | 0.29.0 | Apache-2.0 OR MIT | https://github.com/odilia-app/atspi | Permissive |
 | atspi-common | 0.13.0 | Apache-2.0 OR MIT | https://github.com/odilia-app/atspi | Permissive |
 | atspi-proxies | 0.13.0 | Apache-2.0 OR MIT | https://github.com/odilia-app/atspi | Permissive |
+| base64 | 0.23.1 | MIT OR Apache-2.0 | https://github.com/marshallpierce/rust-base64 | Permissive |
 | bit-set | 0.10.0 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-set | Permissive |
 | bit-vec | 0.9.1 | Apache-2.0 OR MIT | https://github.com/contain-rs/bit-vec | Permissive |
 | bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags | Permissive |
@@ -140,17 +141,19 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate | Permissive |
 | fearless_simd | 0.4.1 | Apache-2.0 OR MIT | https://github.com/linebender/fearless_simd | Permissive |
 | filetime | 0.2.29 | MIT/Apache-2.0 | https://github.com/alexcrichton/filetime | Permissive |
+| fixedbitset | 0.5.9 | MIT OR Apache-2.0 | https://github.com/petgraph/fixedbitset | Permissive |
 | flate2 | 1.1.10 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs | Permissive |
 | fnv | 1.0.7 | Apache-2.0 / MIT | https://github.com/servo/rust-fnv | Permissive |
+| foldhash | 0.1.5 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash | Permissive |
 | font-types | 0.12.6 | MIT OR Apache-2.0 | https://github.com/googlefonts/fontations | Permissive |
-| forge-app | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-cli | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-core | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-db | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-jobs | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-media | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
-| forge-win | 0.10.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-app | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-cli | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-core | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-db | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-jobs | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-media | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
+| forge-win | 0.11.0 | MIT OR Apache-2.0 | Not declared | Permissive |
 | futures-core | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs | Permissive |
 | futures-io | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs | Permissive |
 | futures-lite | 2.6.1 | Apache-2.0 OR MIT | https://github.com/smol-rs/futures-lite | Permissive |
@@ -159,6 +162,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | futures-util | 0.3.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/futures-rs | Permissive |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git | Permissive |
 | gethostname | 1.1.0 | Apache-2.0 | https://codeberg.org/swsnr/gethostname.rs.git | Permissive |
+| getrandom | 0.2.17 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.3.4 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | getrandom | 0.4.3 | MIT OR Apache-2.0 | https://github.com/rust-random/getrandom | Permissive |
 | gif | 0.14.2 | MIT OR Apache-2.0 | https://github.com/image-rs/image-gif | Permissive |
@@ -216,6 +220,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | half | 2.7.1 | MIT OR Apache-2.0 | https://github.com/VoidStarKat/half-rs | Permissive |
 | harfrust | 0.12.0 | MIT | https://github.com/harfbuzz/harfrust | Permissive |
 | hash32 | 0.3.1 | MIT OR Apache-2.0 | https://github.com/japaric/hash32 | Permissive |
+| hashbrown | 0.15.5 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | Permissive |
 | hashbrown | 0.16.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | Permissive |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown | Permissive |
 | hashlink | 0.12.2 | MIT OR Apache-2.0 | https://github.com/djc/hashlink | Permissive |
@@ -223,6 +228,8 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck | Permissive |
 | hex | 0.4.3 | MIT OR Apache-2.0 | https://github.com/KokaKiwi/rust-hex | Permissive |
 | hmac | 0.13.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/MACs | Permissive |
+| http | 1.5.0 | MIT OR Apache-2.0 | https://github.com/hyperium/http | Permissive |
+| httparse | 1.10.1 | MIT OR Apache-2.0 | https://github.com/seanmonstar/httparse | Permissive |
 | hybrid-array | 0.4.15 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hybrid-array | Permissive |
 | iana-time-zone | 0.1.65 | MIT OR Apache-2.0 | https://github.com/strawlab/iana-time-zone | Permissive |
 | image | 0.25.10 | MIT OR Apache-2.0 | https://github.com/image-rs/image | Permissive |
@@ -271,6 +278,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | naga-types | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | Permissive |
 | nix | 0.31.3 | MIT | https://github.com/nix-rust/nix | Permissive |
 | nohash-hasher | 0.2.0 | Apache-2.0 OR MIT | https://github.com/paritytech/nohash-hasher | Permissive |
+| nom | 8.0.0 | MIT | https://github.com/rust-bakery/nom | Permissive |
 | nonempty | 0.12.0 | MIT | https://github.com/cloudhead/nonempty | Permissive |
 | notify | 8.2.0 | CC0-1.0 | https://github.com/notify-rs/notify.git | Permissive |
 | notify-types | 2.1.0 | MIT OR Apache-2.0 | https://github.com/notify-rs/notify.git | Permissive |
@@ -281,6 +289,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | option-ext | 0.2.0 | MPL-2.0 | https://github.com/soc/option-ext.git | FLAG: MPL-2.0 weak copyleft review |
 | ordered-float | 5.5.0 | MIT | https://github.com/reem/rust-ordered-float | Permissive |
 | ordered-stream | 0.2.0 | MIT OR Apache-2.0 | https://github.com/danieldg/ordered-stream | Permissive |
+| os_pipe | 1.2.3 | MIT | https://github.com/oconnor663/os_pipe.rs | Permissive |
 | owned_ttf_parser | 0.25.1 | Apache-2.0 | https://github.com/alexheretic/owned-ttf-parser | Permissive |
 | parking | 2.2.1 | Apache-2.0 OR MIT | https://github.com/smol-rs/parking | Permissive |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 | https://github.com/Amanieu/parking_lot | Permissive |
@@ -288,6 +297,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | pbkdf2 | 0.13.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/password-hashes | Permissive |
 | peniko | 0.6.1 | Apache-2.0 OR MIT | https://github.com/linebender/peniko | Permissive |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 | https://github.com/servo/rust-url/ | Permissive |
+| petgraph | 0.8.3 | MIT OR Apache-2.0 | https://github.com/petgraph/petgraph | Permissive |
 | phf | 0.13.1 | MIT | https://github.com/rust-phf/rust-phf | Permissive |
 | phf_generator | 0.13.1 | MIT | https://github.com/rust-phf/rust-phf | Permissive |
 | phf_macros | 0.13.1 | MIT | https://github.com/rust-phf/rust-phf | Permissive |
@@ -317,12 +327,16 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | regex-syntax | 0.8.11 | MIT OR Apache-2.0 | https://github.com/rust-lang/regex | Permissive |
 | renderdoc-sys | 1.1.0 | MIT OR Apache-2.0 | https://github.com/ebkalderon/renderdoc-rs | Permissive |
 | rfd | 0.17.2 | MIT | https://github.com/PolyMeilex/rfd | Permissive |
+| ring | 0.17.14 | Apache-2.0 AND ISC | https://github.com/briansmith/ring | Permissive |
 | ron | 0.12.2 | MIT OR Apache-2.0 | https://github.com/ron-rs/ron | Permissive |
 | rusqlite | 0.40.2 | MIT | https://github.com/rusqlite/rusqlite | Permissive |
 | rustc-hash | 1.1.0 | Apache-2.0/MIT | https://github.com/rust-lang-nursery/rustc-hash | Permissive |
 | rustc-hash | 2.1.3 | Apache-2.0 OR MIT | https://github.com/rust-lang/rustc-hash | Permissive |
 | rustix | 0.38.44 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | Permissive |
 | rustix | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | https://github.com/bytecodealliance/rustix | Permissive |
+| rustls | 0.23.46 | Apache-2.0 OR ISC OR MIT | https://github.com/rustls/rustls | Permissive |
+| rustls-pki-types | 1.15.1 | MIT OR Apache-2.0 | https://github.com/rustls/pki-types | Permissive |
+| rustls-webpki | 0.103.16 | ISC | https://github.com/rustls/webpki | Permissive |
 | rustversion | 1.0.23 | MIT OR Apache-2.0 | https://github.com/dtolnay/rustversion | Permissive |
 | same-file | 1.0.6 | Unlicense/MIT | https://github.com/BurntSushi/same-file | Permissive |
 | scoped-tls | 1.0.1 | MIT/Apache-2.0 | https://github.com/alexcrichton/scoped-tls | Permissive |
@@ -354,6 +368,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | stable_deref_trait | 1.2.1 | MIT OR Apache-2.0 | https://github.com/storyyeller/stable_deref_trait | Permissive |
 | static_assertions | 1.1.0 | MIT OR Apache-2.0 | https://github.com/nvzqz/static-assertions-rs | Permissive |
 | strsim | 0.11.1 | MIT | https://github.com/rapidfuzz/strsim-rs | Permissive |
+| subtle | 2.6.1 | BSD-3-Clause | https://github.com/dalek-cryptography/subtle | Permissive |
 | symlink | 0.1.0 | MIT/Apache-2.0 | https://gitlab.com/chris-morgan/symlink | Permissive |
 | syn | 2.0.119 | MIT OR Apache-2.0 | https://github.com/dtolnay/syn | Permissive |
 | syn | 3.0.7 | MIT OR Apache-2.0 | https://github.com/dtolnay/syn | Permissive |
@@ -378,6 +393,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | tracing-core | 0.1.36 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | tracing-log | 0.2.0 | MIT | https://github.com/tokio-rs/tracing | Permissive |
 | tracing-subscriber | 0.3.23 | MIT | https://github.com/tokio-rs/tracing | Permissive |
+| tree_magic_mini | 3.2.2 | MIT | https://github.com/mbrubeck/tree_magic/ | Permissive |
 | ttf-parser | 0.25.1 | MIT OR Apache-2.0 | https://github.com/harfbuzz/ttf-parser | Permissive |
 | twox-hash | 2.1.5 | MIT | https://github.com/shepmaster/twox-hash | Permissive |
 | type-map | 0.5.1 | MIT/Apache-2.0 | https://github.com/kardeiz/type-map | Permissive |
@@ -392,6 +408,10 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | unicode-segmentation | 1.13.3 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-segmentation | Permissive |
 | unicode-width | 0.2.2 | MIT OR Apache-2.0 | https://github.com/unicode-rs/unicode-width | Permissive |
 | unrar-ng-sys | 0.7.7 | MIT OR Apache-2.0 | https://github.com/ttys3/unrar.rs | Permissive |
+| untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted | Permissive |
+| ureq | 3.5.1 | MIT OR Apache-2.0 | https://github.com/algesten/ureq | Permissive |
+| ureq-proto | 0.7.1 | MIT OR Apache-2.0 | https://github.com/algesten/ureq-proto | Permissive |
+| utf8-zero | 0.8.1 | MIT OR Apache-2.0 | https://github.com/algesten/utf8-zero | Permissive |
 | utf8parse | 0.2.2 | Apache-2.0 OR MIT | https://github.com/alacritty/vte | Permissive |
 | uuid | 1.28.0 | Apache-2.0 OR MIT | https://github.com/uuid-rs/uuid | Permissive |
 | vello_common | 0.1.0 | Apache-2.0 OR MIT | https://github.com/linebender/vello | Permissive |
@@ -409,6 +429,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | wayland-scanner | 0.31.11 | MIT | https://github.com/smithay/wayland-rs | Permissive |
 | wayland-sys | 0.31.11 | MIT | https://github.com/smithay/wayland-rs | Permissive |
 | web-time | 1.1.0 | MIT OR Apache-2.0 | https://github.com/daxpedda/web-time | Permissive |
+| webpki-roots | 1.0.11 | CDLA-Permissive-2.0 | https://github.com/rustls/webpki-roots | FLAG: license review |
 | weezl | 0.1.12 | MIT OR Apache-2.0 | https://github.com/image-rs/weezl | Permissive |
 | wgpu | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | Permissive |
 | wgpu-core | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | Permissive |
@@ -418,9 +439,12 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 | wgpu-types | 30.0.1 | MIT OR Apache-2.0 | https://github.com/gfx-rs/wgpu | Permissive |
 | winit | 0.30.13 | Apache-2.0 | https://github.com/rust-windowing/winit | Permissive |
 | winnow | 1.0.4 | MIT | https://github.com/winnow-rs/winnow | Permissive |
+| wl-clipboard-rs | 0.9.5 | MIT OR Apache-2.0 | https://github.com/YaLTeR/wl-clipboard-rs | Permissive |
 | x11-dl | 2.21.0 | MIT | https://github.com/AltF02/x11-rs.git | Permissive |
 | x11rb | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | Permissive |
+| x11rb | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | Permissive |
 | x11rb-protocol | 0.13.2 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | Permissive |
+| x11rb-protocol | 0.14.0 | MIT OR Apache-2.0 | https://github.com/psychon/x11rb | Permissive |
 | xcursor | 0.3.11 | MIT | https://github.com/esposm03/xcursor-rs | Permissive |
 | xkbcommon-dl | 0.4.2 | MIT | https://github.com/rust-windowing/xkbcommon-dl | Permissive |
 | xkeysym | 0.2.1 | MIT OR Apache-2.0 OR Zlib | https://github.com/notgull/xkeysym | Permissive |
@@ -452,7 +476,7 @@ Scope: forge-app and forge-cli, plus their resolved normal runtime dependencies;
 
 The report flags missing or non-permissive license expressions for release review. The allowlist recognizes MIT, MIT-0, Apache-2.0, BSD, ISC, Zlib, Unicode, CC0-1.0, BSL-1.0, and Unlicense expressions. SPDX WITH exceptions are reported with their base license.
 MPL-2.0 is weak copyleft with file-level source and notice obligations; any dependency declaring it is flagged for review.
-Flagged dependencies: epaint_default_fonts 0.36.2 (FLAG: license review; (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0); libbz2-rs-sys 0.2.6 (FLAG: license review; bzip2-1.0.6); option-ext 0.2.0 (FLAG: MPL-2.0 weak copyleft review; MPL-2.0); self_cell 1.3.0 (FLAG: license review; Apache-2.0 OR GPL-2.0-only)
+Flagged dependencies: epaint_default_fonts 0.36.2 (FLAG: license review; (MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0); libbz2-rs-sys 0.2.6 (FLAG: license review; bzip2-1.0.6); option-ext 0.2.0 (FLAG: MPL-2.0 weak copyleft review; MPL-2.0); self_cell 1.3.0 (FLAG: license review; Apache-2.0 OR GPL-2.0-only); webpki-roots 1.0.11 (FLAG: license review; CDLA-Permissive-2.0)
 FFmpeg and ffprobe are optional external programs and are not bundled with ZXraw Explorer.
 
 ## UnRAR
