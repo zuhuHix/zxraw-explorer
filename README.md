@@ -481,7 +481,8 @@ so Windows SmartScreen may warn the first time: choose *More info → Run anyway
 
 ## Installing on Linux
 
-Requirements: 64-bit x86 PC, X11 or Wayland, and a Vulkan or OpenGL driver (Mesa is enough).
+Requirements: 64-bit x86 PC, X11 or Wayland, a Vulkan or OpenGL driver (Mesa is enough), and
+glibc 2.39 or newer (Ubuntu 24.04, Linux Mint 22, Debian 13, Fedora 40 or later).
 
 - **AppImage:** `ZXraw-Explorer-<version>-x86_64.AppImage`. Download it from the
   [Releases](../../releases) page, then make it executable and run it:
@@ -492,15 +493,14 @@ Requirements: 64-bit x86 PC, X11 or Wayland, and a Vulkan or OpenGL driver (Mesa
   ```
 
   An AppImage needs FUSE 2 to start, and Ubuntu 22.04 and later don't install it by default.
-  Either install it (`sudo apt install libfuse2t64` on Ubuntu 24.04 and later, `libfuse2` on
-  22.04), or run the AppImage with `--appimage-extract-and-run` instead.
+  Either install it (`sudo apt install libfuse2t64`), or run the AppImage with `--appimage-extract-and-run` instead.
 - **Debian package:** `zxraw_<version>_amd64.deb`. Install it with
   `sudo apt install ./zxraw_<version>_amd64.deb`. It puts `zxraw` in the application menu,
   registers it for photo and RAW file types, and lists it as an optional folder handler.
 
 Video thumbnails and technical metadata need `ffmpeg` and `ffprobe` on `PATH`
-(`sudo apt install ffmpeg`). The in-app updater is not available on Linux; new releases are
-listed on the Releases page. Features that are Windows-only are listed under
+(`sudo apt install ffmpeg`). The daily update check works on Linux too, but nothing is installed
+in place: a new version shows a notice with links to its AppImage and .deb. Features that are Windows-only are listed under
 [Linux](docs/LIMITATIONS.md#linux) in the known limitations.
 
 ---
