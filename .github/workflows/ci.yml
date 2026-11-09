@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_PROFILE_DEV_DEBUG: 0
@@ -30,13 +31,80 @@ jobs:
       - name: Build all targets
         run: cargo build --workspace --all-targets
 
-      # forge-app's e2e target is Windows-only for now and is not run here.
+      # forge-app's e2e target runs in the linux-e2e job, so it is left out here.
       - name: Test (other crates)
         run: cargo test --workspace --exclude forge-app --no-fail-fast
 
       - name: Test (forge-app unit tests)
         if: success() || failure()
         run: cargo test -p forge-app --bins --no-fail-fast
+
+  linux-e2e:
+    name: Linux (e2e under Xvfb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ZXRAW_E2E_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+
+      # Each e2e run starts its own Xvfb, so no xvfb-run wrapper is needed.
+      # Rendering is software (Mesa llvmpipe/lavapipe).
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev \
+            xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1 ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: E2E tests
+        run: cargo test -p forge-app --test e2e --no-fail-fast
+
+      - name: Upload screenshots from failed runs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxraw-e2e-screenshots
+          path: /tmp/zxfr-shots
+          if-no-files-found: ignore
+
+  linux-packages:
+    name: Linux packages (AppImage, .deb)
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build AppImage and .deb
+        run: bash packaging/linux/build-linux.sh
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: zxraw-linux-packages
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
 
   windows:
     name: Windows (build and test)

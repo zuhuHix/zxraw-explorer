@@ -305,6 +305,8 @@ fn layout_whose_folders_are_all_missing_keeps_the_open_tabs() {
     assert_no_crash(&profile);
 }
 
+// Windows-only: UNC shares (`\\host\share`) and their case-insensitive duplicate check.
+#[cfg(windows)]
 #[test]
 fn network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share() {
     let sandbox = tempfile::tempdir().unwrap();

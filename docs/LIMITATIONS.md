@@ -684,7 +684,9 @@ or refuses with a message; nothing should crash for lack of it.
   which Windows' delete-through-handle rules out.
 * Volume identity is per path root, and every Linux path is under `/`. Library roots are not
   told apart by mount, so "offline volume" detection does not work for unplugged drives yet.
-* The `e2e` UI test suite runs on Windows only for now.
+* The `e2e` UI test suite runs on Linux too, each app run on its own `Xvfb`. Scenarios for
+  Windows-only features (OLE drop target, updater, FFmpeg download, network shares, the
+  hidden attribute) are compiled on Windows only; see [TESTING.md](TESTING.md#linux).
 
 ## Verification boundary
 

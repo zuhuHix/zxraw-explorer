@@ -9,8 +9,9 @@
 //! folder inside the profile, never the real Recycle Bin.
 //!
 //! Each app window opens on its own private, invisible desktop (named after the test
-//! process), ignores real input, and uses its own profile, temp folders and ephemeral ports,
-//! so runs are isolated from each other. Up to N app runs execute at once, where N is
+//! process; on Linux, its own `Xvfb` started and stopped by the runner), ignores real input,
+//! and uses its own profile, temp folders and ephemeral ports, so runs are isolated from each
+//! other. Up to N app runs execute at once, where N is
 //! `ZXRAW_E2E_JOBS` (default: `min(3, available_parallelism / 2)`, at least 1; `1` restores
 //! the old one-at-a-time behaviour). A counting gate ([`run_app_with`]) enforces the limit.
 //! Tests whose numbers depend on the machine being otherwise idle (frame timings in `perf`
@@ -184,6 +185,11 @@ pub fn run_app_with(work: &Path, profile: &Path, script: &str, opts: &RunOpts) -
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
+    // Linux: every run gets its own invisible X server, unless the window is to be watched
+    // (`ZXRAW_SHOW_WINDOW=1` keeps the caller's DISPLAY). Dropped (and so stopped) when this
+    // function returns or panics.
+    #[cfg(target_os = "linux")]
+    let _display = private_display(&mut command);
     for (k, v) in &opts.env {
         command.env(k, v);
     }
@@ -221,6 +227,42 @@ pub fn run_app_with(work: &Path, profile: &Path, script: &str, opts: &RunOpts) -
         result: result.trim().to_string(),
         stderr: tail(&stderr_path),
     }
+}
+
+/// Starts a private Xvfb for one run and points `command` at it: `DISPLAY` for that child
+/// only, no `WAYLAND_DISPLAY` (so winit picks X11), and `ZXRAW_PRIVATE_DISPLAY` so the app
+/// knows it is already out of the user's way. With `ZXRAW_SHOW_WINDOW` set, the run uses the
+/// caller's display (still X11) and no server is started.
+#[cfg(target_os = "linux")]
+fn private_display(command: &mut Command) -> Option<forge_win::desktop::PrivateDisplay> {
+    command.env_remove("WAYLAND_DISPLAY");
+    if std::env::var_os("ZXRAW_SHOW_WINDOW").is_some() {
+        return None;
+    }
+    let display = forge_win::desktop::PrivateDisplay::start(1920, 1080).unwrap_or_else(|e| {
+        panic!("cannot start a private X server for the run (is Xvfb installed?): {e}")
+    });
+    command
+        .env("DISPLAY", display.display())
+        .env(forge_win::desktop::PRIVATE_DISPLAY_ENV, display.display());
+    Some(display)
+}
+
+/// `PATH` for an app run that must not find FFmpeg: the caller's `PATH` without the folders
+/// that hold `ffmpeg` or `ffprobe`. Scenarios about missing FFmpeg use it, so they pass on a
+/// machine that has FFmpeg installed (on Linux it is usually in `/usr/bin`).
+pub fn path_without_ffmpeg() -> (String, String) {
+    let exe = std::env::consts::EXE_SUFFIX;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|dir| {
+            !["ffmpeg", "ffprobe"]
+                .iter()
+                .any(|tool| dir.join(format!("{tool}{exe}")).exists())
+        })
+        .collect();
+    let joined = std::env::join_paths(kept).expect("PATH entries without separators");
+    ("PATH".into(), joined.to_string_lossy().into_owned())
 }
 
 /// Asserts that the script ran to the end without a step failing.

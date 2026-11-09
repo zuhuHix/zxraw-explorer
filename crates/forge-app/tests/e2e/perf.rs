@@ -263,8 +263,11 @@ fn five_thousand_burst_photos_keep_frames_short_while_grouping_and_scrolling() {
         ("selection", &selection),
     ] {
         let report = read_report(report);
+        // The scroll phases are 120 scroll steps each. The analysis lasts as long as the
+        // machine needs: a fast one finishes it in under 50 frames.
+        let min_frames = if name == "analysis" { 10 } else { 50 };
         assert!(
-            report["work_ms"]["count"].as_u64().unwrap_or(0) >= 50,
+            report["work_ms"]["count"].as_u64().unwrap_or(0) >= min_frames,
             "{name}: too few frames recorded: {report}"
         );
         let work = p95(&report, "work_ms");

@@ -135,6 +135,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+// Windows-only: the FFmpeg download (Windows builds) is hidden on Linux.
+#[cfg(windows)]
 #[test]
 fn download_ffmpeg_installs_the_tools_and_points_settings_at_them() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -180,6 +182,8 @@ fn download_ffmpeg_installs_the_tools_and_points_settings_at_them() {
     );
 }
 
+// Windows-only: the FFmpeg download (Windows builds) is hidden on Linux.
+#[cfg(windows)]
 #[test]
 fn download_ffmpeg_with_a_bad_checksum_installs_nothing_and_says_why() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -289,6 +293,8 @@ fn update_opts(base: &str) -> RunOpts {
     }
 }
 
+// Windows-only: the in-app updater installs the Windows setup and is hidden on Linux.
+#[cfg(windows)]
 #[test]
 fn update_check_offers_a_newer_release_and_verifies_the_installer() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -316,6 +322,8 @@ fn update_check_offers_a_newer_release_and_verifies_the_installer() {
     );
 }
 
+// Windows-only: the in-app updater installs the Windows setup and is hidden on Linux.
+#[cfg(windows)]
 #[test]
 fn update_with_a_tampered_installer_is_refused() {
     let sandbox = tempfile::tempdir().unwrap();

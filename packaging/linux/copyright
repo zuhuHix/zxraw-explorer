@@ -1,0 +1,24 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: ZXraw Explorer
+Source: https://github.com/zuhuHix/zxraw-explorer
+
+Files: *
+Copyright: ZXraw Explorer contributors
+License: MIT OR Apache-2.0
+ ZXraw Explorer is distributed under either the MIT License or the Apache License,
+ Version 2.0, at your option. The full text of the MIT License is in
+ /usr/share/doc/zxraw/LICENSE-MIT. The Apache License, Version 2.0 is in
+ /usr/share/common-licenses/Apache-2.0 and /usr/share/doc/zxraw/LICENSE-APACHE.
+ .
+ The licenses of the bundled dependencies are listed in
+ /usr/share/doc/zxraw/THIRD_PARTY.md, with a review flag for each one.
+
+Files: (UnRAR source code, compiled in through the unrar-ng-sys crate)
+Copyright: Alexander L. Roshal
+License: UnRAR
+ The UnRAR licence is in /usr/share/doc/zxraw/LICENSE-UNRAR.txt. It allows the source
+ to be used to handle RAR archives, but not to develop a RAR (WinRAR) compatible
+ archiver or to re-create the RAR compression algorithm. ZXraw Explorer only opens and
+ extracts RAR archives.
+ .
+ See /usr/share/doc/zxraw/LICENSES-NOTE.md for the release license notes.
