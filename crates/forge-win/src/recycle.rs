@@ -280,7 +280,22 @@ fn run_shell(
     imp::run(paths, expected, mode, observer)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[path = "recycle_linux.rs"]
+mod linux;
+
+/// Linux: the freedesktop.org Trash for a recycle, an in-process delete otherwise.
+#[cfg(target_os = "linux")]
+fn run_shell(
+    paths: &[PathBuf],
+    expected: &[Option<ItemIdentity>],
+    mode: Mode,
+    observer: DeleteObserver,
+) -> DeleteReport {
+    linux::run(paths, expected, mode, observer)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn run_shell(
     paths: &[PathBuf],
     _expected: &[Option<ItemIdentity>],
@@ -367,7 +382,7 @@ fn refuses_permanent_delete(mode: Mode, flags: u32) -> bool {
 
 /// Which of a pass's items (lowercase keys) `path` is, or lies inside. `None` when the path
 /// belongs to none of them.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 fn item_of(keys: &[String], path: &str) -> Option<usize> {
     item_of_lower(keys, &path.to_lowercase())
 }
