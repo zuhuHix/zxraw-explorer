@@ -28,21 +28,25 @@ use crate::integration::{registry, shell_command};
 use crate::{Result, WinError};
 
 /// The name shown in Settings > Default apps (and the `RegisteredApplications` value name).
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 const APP_NAME: &str = "ZXraw Explorer";
 #[cfg(windows)]
 const APP_DESCRIPTION: &str =
     "A fast file manager and viewer for photos, RAW files, video and archives.";
+#[cfg(any(windows, test))]
 const PROG_ID_PREFIX: &str = "ZXrawExplorer.";
+#[cfg(any(windows, test))]
 const ARCHIVE_PROG_ID_PREFIX: &str = "ZXrawExplorer.Archive.";
 
 /// Which registration a ProgID belongs to.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Group {
     Photos,
     Archives,
 }
 
+#[cfg(any(windows, test))]
 impl Group {
     fn prefix(self) -> &'static str {
         match self {
@@ -56,6 +60,7 @@ impl Group {
     /// that would override the system's handler (`.zip` is `CompressedFolder` in HKLM) for
     /// Explorer and older programs before the user confirmed anything in Settings. They get
     /// only `OpenWithProgids` and the Capabilities entries.
+    #[cfg(windows)]
     fn takes_class_default(self) -> bool {
         matches!(self, Self::Photos)
     }
@@ -312,6 +317,7 @@ fn prog_id(group: Group, extension: &str) -> String {
 
 /// Our ProgIDs, or the key Windows creates when the user picked this exe through
 /// "Open with > Choose another app".
+#[cfg(any(windows, test))]
 fn is_own_prog_id(prog_id: &str) -> bool {
     prog_id
         .get(..PROG_ID_PREFIX.len())
@@ -320,6 +326,7 @@ fn is_own_prog_id(prog_id: &str) -> bool {
 }
 
 /// Lower-cased extension, or an error if it could escape its registry key.
+#[cfg(any(windows, test))]
 fn checked_extension(extension: &str) -> Result<String> {
     let valid = (1..=16).contains(&extension.len())
         && extension.bytes().all(|byte| byte.is_ascii_alphanumeric());

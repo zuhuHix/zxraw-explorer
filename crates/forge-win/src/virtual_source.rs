@@ -69,6 +69,7 @@ pub struct TargetReport {
     pub all_served: bool,
 }
 
+#[cfg(any(windows, test))]
 const EFFECT_COPY: u32 = 1;
 const EFFECT_MOVE: u32 = 2;
 
@@ -107,6 +108,7 @@ pub fn own_paths(bytes: &[u8]) -> Option<Vec<PathBuf>> {
     (!paths.is_empty()).then_some(paths)
 }
 
+#[cfg(any(windows, test))]
 fn own_bytes(paths: &[PathBuf]) -> Vec<u8> {
     let mut bytes = std::process::id().to_le_bytes().to_vec();
     for p in paths {

@@ -87,3 +87,30 @@ Dependency rule: `forge-jobs` ← `forge-core` ← (`forge-db`, `forge-media`) �
 7. External tools are launched with argument vectors, never through a shell string.
 8. Metadata edits (ratings/labels/tags) are stored in the DB and/or XMP sidecars; original
    media files are not rewritten.
+
+## Platform layer on Linux
+
+`forge-win` keeps one public API on every platform. On Linux each module has a real backend
+behind `#[cfg(target_os = "linux")]` (or `unix` where plain POSIX is enough); the Windows code is
+unchanged. Large backends live next to their module (`recycle_linux.rs`, `clipboard_linux.rs`,
+`drives_linux.rs`). Desktop integration goes through standard tools and protocols, not toolkit
+bindings: `gio`, `gdbus`/`dbus-send`, `xdg-open` and the XDG portal are run directly, never
+through a shell, with timeouts.
+
+| Module | Linux backend |
+|---|---|
+| `recycle` | freedesktop.org Trash spec 1.0, written in-house: home trash (`$XDG_DATA_HOME/Trash`), `$topdir/.Trash/$uid` (sticky, not a link) or `$topdir/.Trash-$uid` on other mounts, exclusive `.trashinfo` first then `renameat2(RENAME_NOREPLACE)`, `directorysizes` kept. Recycle only renames; an item with no usable trash is `NotRecyclable`, never copied or destroyed. Permanent delete uses `openat(O_NOFOLLOW)`/`unlinkat`. Same report, progress (`TELL_EVERY`) and cancel semantics as Windows. |
+| `shell` | open: `gio open`, then `xdg-open`. Reveal and properties: D-Bus `org.freedesktop.FileManager1` `ShowItems` / `ShowItemProperties`; reveal falls back to opening the parent. Open with: the XDG portal `OpenURI` with `ask=true`, falling back to the default app. Known folders: `user-dirs.dirs`. |
+| `drives`, `watch`, `files` | Mounts from `/proc/self/mountinfo` (pseudo and system mounts filtered), kind from `/sys/dev/block` (`removable`, USB), labels from `/dev/disk/by-label`, space from `statvfs` on worker threads bounded by `QUERY_TIMEOUT`. `DriveWatcher` polls the mount set. File id = (folded `st_dev`, `st_ino`), volume serial = folded `st_dev`. |
+| `process`, `restart` | `Command` without a shell, own process group, reaped in the background. File holders: one scan of `/proc/*/fd`, matched by device/inode or path. |
+| `single_instance` | Unix domain socket in `$XDG_RUNTIME_DIR` (or a checked 0700 `/tmp/zxraw-explorer-<uid>`), same request/reply/commit protocol, timeouts and limits. Peers are checked with `SO_PEERCRED` (same uid) and `/proc/<pid>/exe` (same binary). |
+| `http` | `ureq` + rustls (bundled Mozilla roots), redirects followed one hop at a time through the same URL rules as WinHTTP, proxy from `HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`. |
+| `clipboard` | X11 through `x11rb` (no libxcb): an unmapped owner window and one thread serving `CLIPBOARD` requests (INCR for large values). Wayland through `wl-clipboard-rs` (data-control protocol), falling back to XWayland. Offers `x-special/gnome-copied-files`, `text/uri-list`, `application/x-kde-cutselection`, text, and our owner token. |
+| `network` | `gio mount smb://host/share` (60 s limit). |
+| `window` | `uncloak` is a no-op; `maximize_hidden` stays unsupported (the app maximizes through egui). |
+| `dragout`, `drop_target`, `virtual_files`, `desktop` | Unsupported (see LIMITATIONS). Drops *into* the app are left to `forge-app` (winit file-drop events, X11 only). |
+| Registry/Explorer modules | `archive_menu`, `file_types`, `user_choice`, `integration`, `shell_verb_server`, `ext_search`, `shell_notify`: stubs; Windows-only helpers are `cfg`-gated. |
+
+`forge-media`'s `wic` module decodes HEIF/HEIC/AVIF on Linux through `libheif-rs` when the
+`heif` cargo feature is on (off by default; needs libheif ≥ 1.17 development files, found with
+pkg-config, plus its aom/dav1d plugins for AVIF). Without it the stubs return `Unsupported`.

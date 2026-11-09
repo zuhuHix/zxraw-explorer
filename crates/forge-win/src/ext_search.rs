@@ -471,6 +471,7 @@ At line:1
     use super::*;
 
     #[test]
+    #[cfg(windows)] // Windows path syntax (drive letters, backslashes)
     fn es_args_put_query_last_and_scope_before_it() {
         let args = es_args("ext:jpg", Some(Path::new(r"C:\Photos")), 50).unwrap();
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -525,6 +526,7 @@ At line:1
     }
 
     #[test]
+    #[cfg(windows)] // Windows path syntax (drive letters, backslashes)
     fn windows_sql_scope_cannot_break_out() {
         let scope = Path::new(r"C:\Users\O'Brien\x' OR '1'='1");
         let sql = windows_search_sql("doc", Some(scope), 20).unwrap();
@@ -586,6 +588,7 @@ At line:1
     }
 
     #[test]
+    #[cfg(windows)] // Windows path syntax (drive letters, backslashes)
     fn es_candidates_try_path_then_program_files() {
         let c = es_candidates(r"C:\bin;D:\tools", Some(r"C:\PF"), Some(r"C:\PF86"));
         assert_eq!(c[0], Path::new(r"C:\bin").join("es.exe"));
