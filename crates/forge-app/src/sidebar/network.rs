@@ -796,14 +796,17 @@ mod tests {
         assert!(status.can_connect(), "an offline location offers Connect…");
     }
 
+    #[cfg(windows)]
     static CONNECT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+    #[cfg(windows)]
     fn slow_connect(_owner: isize, _share: &Path) -> Result<Connect, String> {
         CONNECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(200));
         Ok(Connect::Connected)
     }
 
+    #[cfg(windows)]
     #[test]
     fn one_sign_in_at_a_time_and_aliases_of_a_share_share_it() {
         let mut connector = Connector::new(slow_connect, None);
@@ -829,6 +832,7 @@ mod tests {
         assert_eq!(connector.request(0, PathBuf::from(r"\\other\x")), Request::Started);
     }
 
+    #[cfg(windows)]
     #[test]
     fn locations_are_added_validated_renamed_and_deduplicated() {
         let mut locations = Vec::new();

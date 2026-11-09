@@ -184,7 +184,7 @@ pub fn panel(app: &mut ZxrawApp, ui: &mut egui::Ui, entry: &forge_core::FileEntr
                                 Ok(url) => {
                                     let target = PathBuf::from(url);
                                     app.ops.spawn_shell("Open in maps", move || {
-                                        forge_win::open_default(&target)
+                                        crate::platform::open_default(&target)
                                     });
                                 }
                                 Err(error) => app.toast_err(error),

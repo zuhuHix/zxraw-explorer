@@ -1281,6 +1281,24 @@ mod tests {
         assert_eq!(validation.computations, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn folder_root_uses_listed_kind_then_disk_for_local_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("photos.d");
+        std::fs::create_dir(&folder).unwrap();
+        let file = dir.path().join("a.jpg");
+        std::fs::write(&file, b"x").unwrap();
+        // No listing: a local path is a folder when the disk says so.
+        assert!(is_folder_root(&folder, None, false));
+        assert!(!is_folder_root(&file, None, false));
+        // The listed kind wins over the disk and the name.
+        assert!(!is_folder_root(&folder, Some(EntryKind::File), false));
+        assert!(is_folder_root(&file, Some(EntryKind::Dir), false));
+        assert!(is_folder_root(&file, None, true));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn folder_root_uses_listed_kind_then_lexical_rule_for_network_paths() {
         let share_folder = Path::new(r"\\192.0.2.1\x\photos\2024");

@@ -406,15 +406,20 @@ fn open_child(
 /// What became of something [`remove_if_same`] was asked to remove.
 #[derive(Debug)]
 pub(crate) enum Removal {
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Removed,
     /// Nothing has that name any more.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Gone,
     /// What has that name now is not what was recorded (or could not be identified).
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Changed,
     /// It matches, but only by the weak identity (no file id), which can't prove it is the
     /// same item: never removed.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     Unconfirmed,
     /// A folder still holding something.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     NotEmpty,
     Failed(io::Error),
 }
@@ -475,7 +480,91 @@ pub(crate) fn remove_if_same(
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: Unix has no delete through a handle, so the entry is opened relative to `parent`
+/// (no following links) and checked, then moved aside under a fresh name, checked again as
+/// the object moved, and deleted there. A mismatch is moved back, so what is deleted is what
+/// was checked, bar a swap of the fresh name itself in the instant before the delete.
+#[cfg(all(unix, target_os = "linux"))]
+pub(crate) fn remove_if_same(
+    parent: &fs::File,
+    name: &std::ffi::OsStr,
+    dir: bool,
+    want: Option<FileIdentity>,
+) -> Removal {
+    use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags, openat, renameat_with, unlinkat};
+    use rustix::io::Errno;
+    let Some(want) = want else {
+        return Removal::Changed;
+    };
+    // The entry itself: a link is refused (NOFOLLOW), a folder where a file was is refused.
+    let open = |at: &std::ffi::OsStr| -> std::result::Result<fs::File, Errno> {
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        if dir {
+            flags |= OFlags::DIRECTORY;
+        }
+        openat(parent, at, flags, Mode::empty()).map(fs::File::from)
+    };
+    let identity_of = |file: &fs::File| {
+        if dir {
+            FileIdentity::of_dir(file)
+        } else {
+            FileIdentity::of(file)
+        }
+    };
+    let file = match open(name) {
+        Ok(file) => file,
+        Err(Errno::NOENT) => return Removal::Gone,
+        Err(Errno::LOOP | Errno::NOTDIR) => return Removal::Changed,
+        Err(e) => return Removal::Failed(e.into()),
+    };
+    if identity_of(&file) != Some(want) {
+        return Removal::Changed;
+    }
+    if !want.is_strong() {
+        return Removal::Unconfirmed;
+    }
+    drop(file);
+    let aside = std::ffi::OsString::from(format!(".zxraw-removing-{}", crate::ops::random_hex()));
+    match renameat_with(parent, name, parent, &aside, RenameFlags::NOREPLACE) {
+        Ok(()) => {}
+        Err(Errno::NOENT) => return Removal::Gone,
+        Err(e) => return Removal::Failed(e.into()),
+    }
+    // Put the object back under its name, unless something new has taken the name.
+    let restore = || -> io::Result<()> {
+        renameat_with(parent, &aside, parent, name, RenameFlags::NOREPLACE).map_err(io::Error::from)
+    };
+    let moved_ok = open(&aside).is_ok_and(|f| identity_of(&f) == Some(want));
+    if !moved_ok {
+        return match restore() {
+            Ok(()) => Removal::Changed,
+            Err(e) => Removal::Failed(e),
+        };
+    }
+    let flags = if dir {
+        AtFlags::REMOVEDIR
+    } else {
+        AtFlags::empty()
+    };
+    match unlinkat(parent, &aside, flags) {
+        Ok(()) => Removal::Removed,
+        Err(e) => {
+            // Not deleted (a folder still holding something, say): it goes back where it was.
+            if let Err(back) = restore() {
+                return Removal::Failed(io::Error::new(
+                    back.kind(),
+                    format!("could not be put back after a failed removal: {back}"),
+                ));
+            }
+            match e {
+                Errno::NOTEMPTY => Removal::NotEmpty,
+                e => Removal::Failed(e.into()),
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, all(unix, target_os = "linux"))))]
 pub(crate) fn remove_if_same(
     _parent: &fs::File,
     _name: &std::ffi::OsStr,

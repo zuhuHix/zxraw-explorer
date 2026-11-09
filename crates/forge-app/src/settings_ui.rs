@@ -32,6 +32,12 @@ enum SettingsPage {
 }
 
 impl SettingsPage {
+    /// Whether this page applies here: Default app (file associations and the Explorer menu)
+    /// is Windows-only.
+    fn available(self) -> bool {
+        cfg!(windows) || !matches!(self, Self::DefaultApp)
+    }
+
     const ALL: [(Self, &'static str); 12] = [
         (Self::Appearance, "Appearance"),
         (Self::Browsing, "Browsing"),
@@ -145,6 +151,7 @@ enum SettingsIntent {
     CheckForUpdates,
     ShowUpdate,
     InstallUpdate,
+    OpenReleasesPage,
 }
 
 struct ShortcutConflict {
@@ -407,7 +414,10 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
                     ui.vertical(|ui| {
                         ui.set_min_width(154.0);
                         ui.add_space(4.0);
-                        for (page, label) in SettingsPage::ALL {
+                        for (page, label) in SettingsPage::ALL
+                            .into_iter()
+                            .filter(|(page, _)| page.available())
+                        {
                             if ui.selectable_label(state.page == page, label).clicked() {
                                 state.page = page;
                             }
@@ -532,11 +542,13 @@ fn appearance_page(ui: &mut egui::Ui, settings: &mut Settings) {
         }
     });
     ui.label(
-        RichText::new(
+        RichText::new(if cfg!(windows) {
             "ℹ The window and its taskbar button change right away. Windows caches pinned \
              taskbar and Start menu icons, so those may keep the old icon until you sign out \
-             or restart your PC.",
-        )
+             or restart your PC."
+        } else {
+            "ℹ The window icon changes right away. Desktop launcher icons are not changed here."
+        })
         .small(),
     );
 }
@@ -653,7 +665,11 @@ fn browsing_page(ui: &mut egui::Ui, settings: &mut Settings) {
             .selected_text(settings.terminal.label())
             .show_ui(ui, |ui| {
                 settings.terminal.edit(|terminal| {
-                    for choice in crate::terminal::TerminalChoice::ALL {
+                    // Off Windows the one terminal emulator found is used (see `terminal::pick`).
+                    for choice in crate::terminal::TerminalChoice::ALL
+                        .into_iter()
+                        .filter(|c| cfg!(windows) || *c == crate::terminal::TerminalChoice::Auto)
+                    {
                         ui.selectable_value(terminal, choice, choice.label());
                     }
                 });
@@ -1139,12 +1155,14 @@ fn external_tools_page(
         if ui.button("Add application").clicked() {
             add_new = true;
         }
-        if ui
-            .add_enabled(
-                !state.detecting_apps,
-                egui::Button::new("Detect installed apps"),
-            )
-            .clicked()
+        // Looks in the Windows install folders only.
+        if cfg!(windows)
+            && ui
+                .add_enabled(
+                    !state.detecting_apps,
+                    egui::Button::new("Detect installed apps"),
+                )
+                .clicked()
         {
             intents.push(SettingsIntent::DetectApps);
         }
@@ -1268,7 +1286,11 @@ fn external_tools_page(
         ui.horizontal(|ui| {
             ui.label("Executable");
             let exe_label = if draft.exe.as_os_str().is_empty() {
-                "Choose an .exe file…".to_owned()
+                if cfg!(windows) {
+                    "Choose an .exe file…".to_owned()
+                } else {
+                    "Choose a program…".to_owned()
+                }
             } else {
                 draft.exe.display().to_string()
             };
@@ -1368,6 +1390,20 @@ fn updates_page(
         crate::updater::CURRENT
     ));
     ui.add_space(6.0);
+    if !cfg!(windows) {
+        // No update check and no installer here: the releases page has the downloads.
+        ui.label(
+            RichText::new(
+                "On Linux ZXraw Explorer does not check for updates or install them. New releases, with a package for your system where one exists, are on the releases page.",
+            )
+            .weak(),
+        );
+        ui.add_space(6.0);
+        if ui.button("Open the releases page").clicked() {
+            intents.push(SettingsIntent::OpenReleasesPage);
+        }
+        return;
+    }
     ui.checkbox(
         &mut settings.check_updates,
         "Check for updates automatically",
@@ -1807,12 +1843,21 @@ fn handle_intents(app: &mut ZxrawApp, ctx: &egui::Context, intents: Vec<Settings
             SettingsIntent::CheckIntegrity => check_integrity(app, ctx),
             SettingsIntent::DetectApps => detect_apps_background(&mut app.ops.settings_ui, ctx),
             SettingsIntent::DefaultApp(action) => crate::default_app::run(app, action),
+            SettingsIntent::OpenReleasesPage => {
+                let target = std::path::PathBuf::from(crate::updater::LATEST_PAGE_URL);
+                app.ops.spawn_shell("Open the releases page", move || {
+                    crate::platform::open_default(&target)
+                });
+            }
             SettingsIntent::BrowseToolExecutable => {
-                if let Some(path) = crate::dialogs::pick_file(
-                    rfd::FileDialog::new()
-                        .set_title("Choose application executable")
-                        .add_filter("Applications", &["exe"]),
-                ) && let Some(draft) = &mut app.ops.settings_ui.tool_draft
+                let dialog = rfd::FileDialog::new().set_title("Choose application executable");
+                let dialog = if cfg!(windows) {
+                    dialog.add_filter("Applications", &["exe"])
+                } else {
+                    dialog
+                };
+                if let Some(path) = crate::dialogs::pick_file(dialog)
+                    && let Some(draft) = &mut app.ops.settings_ui.tool_draft
                 {
                     draft.exe = path;
                     draft.error = None;
@@ -2484,6 +2529,9 @@ fn replace_dir(argument: &str, dir: &Path) -> OsString {
 }
 
 fn same_executable(left: &Path, right: &Path) -> bool {
+    if !cfg!(windows) {
+        return left == right;
+    }
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
@@ -2499,7 +2547,7 @@ fn start_tool_launch(
     let tx = app.ops.tx.clone();
     let repaint = ctx.clone();
     std::thread::spawn(move || {
-        if let Err(error) = forge_win::launch(&tool.exe, &args, Some(&folder)) {
+        if let Err(error) = crate::platform::launch(&tool.exe, &args, Some(&folder)) {
             let _ = tx.send(crate::actions::Event::Error(format!(
                 "Could not open in {}: {error}",
                 tool.name

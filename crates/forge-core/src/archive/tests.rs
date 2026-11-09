@@ -1,5 +1,6 @@
 //! Extraction and creation tests carried over from the single-file module, plus new ones.
 
+#[cfg(windows)]
 use super::safety::BEFORE_PARENT_CREATE;
 use super::*;
 use forge_jobs::{CancelToken, Progress};

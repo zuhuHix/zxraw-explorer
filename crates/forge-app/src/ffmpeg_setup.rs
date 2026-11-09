@@ -3,7 +3,8 @@
 //! folder, then points Settings › Video at it.
 //!
 //! Besides the daily update check (`updater`), this is the app's only network access, and
-//! it happens only after the user confirms.
+//! it happens only after the user confirms. The download is Windows-only: the build is a
+//! Windows zip, and Linux users install FFmpeg with their package manager instead.
 //! The build is pinned (URL, size and checksum are compiled in), so a changed or
 //! tampered file on the server is refused rather than installed. Nothing is written
 //! outside `<data>\tools`, and a failed or cancelled download leaves nothing behind.
@@ -117,9 +118,17 @@ pub struct Status {
     pub fraction: Option<f32>,
 }
 
+/// What to do instead of the download on Linux and other non-Windows systems.
+pub const PACKAGE_MANAGER_HINT: &str = "Install FFmpeg with your package manager, for example `sudo apt install ffmpeg`, `sudo dnf install ffmpeg` or `sudo pacman -S ffmpeg`. If it is not on PATH, point Settings › Video at its folder.";
+
 /// The "Download FFmpeg…" offer shared by Settings, the welcome window and the video
 /// panel: a progress line while downloading, otherwise a short note and the button.
+/// Off Windows there is no download: the note says how to install FFmpeg instead.
 pub fn offer(ui: &mut egui::Ui, status: Status, on_click: impl FnOnce()) {
+    if !cfg!(windows) {
+        ui.label(egui::RichText::new(PACKAGE_MANAGER_HINT).weak());
+        return;
+    }
     if status.running {
         ui.horizontal(|ui| {
             match status.fraction {
@@ -156,6 +165,10 @@ fn megabytes(bytes: u64) -> String {
 
 /// Asks before downloading (the `DownloadFfmpeg` command).
 pub fn confirm(app: &mut ZxrawApp) {
+    if !cfg!(windows) {
+        app.toast(PACKAGE_MANAGER_HINT);
+        return;
+    }
     if app.ops.ffmpeg_setup.is_running() {
         app.toast("FFmpeg is already downloading — see Operations");
         return;
@@ -190,7 +203,7 @@ pub fn confirm(app: &mut ZxrawApp) {
 
 /// Starts the download job after the user confirmed.
 pub fn start(app: &mut ZxrawApp) {
-    if app.ops.ffmpeg_setup.is_running() {
+    if !cfg!(windows) || app.ops.ffmpeg_setup.is_running() {
         return;
     }
     let package = package();
@@ -431,6 +444,7 @@ mod tests {
     use std::io::Cursor;
     use std::net::TcpListener;
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn zip_with(root: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
         for (name, data) in files {
@@ -445,6 +459,7 @@ mod tests {
     }
 
     /// Serves `body` to every request; returns the URL.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn serve(body: Vec<u8>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -464,6 +479,7 @@ mod tests {
         format!("http://127.0.0.1:{port}/ffmpeg.zip")
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn package_for(body: &[u8], url: String) -> Package {
         Package {
             version: "test".into(),
@@ -474,10 +490,12 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn job() -> JobHandle {
         forge_jobs::JobRegistry::new().spawn("test", "test", |_| Ok(()))
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn leftovers(tools: &Path) -> Vec<String> {
         fs::read_dir(tools)
             .map(|d| {
@@ -489,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn installs_only_the_tools_and_licence() {
         let body = zip_with(
             "ffmpeg-test",
@@ -524,6 +543,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_checksum_mismatch_installs_nothing() {
         let body = zip_with(
             "ffmpeg-test",
@@ -540,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_wrong_size_installs_nothing() {
         let body = zip_with(
             "ffmpeg-test",
@@ -562,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn a_zip_without_the_tools_installs_nothing() {
         let body = zip_with("ffmpeg-test", &[("bin/ffmpeg.exe", b"x")]);
         let package = package_for(&body, serve(body.clone()));
@@ -574,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn cancelling_stops_and_cleans_up() {
         let body = zip_with(
             "ffmpeg-test",

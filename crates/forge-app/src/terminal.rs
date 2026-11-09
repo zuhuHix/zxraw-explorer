@@ -1,6 +1,6 @@
 //! "Open terminal here": picks a terminal, builds its argument string and starts it in a folder.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +57,8 @@ pub enum Shell {
     WindowsPowerShell,
     /// Command Prompt (`cmd.exe`).
     Cmd,
+    /// A Linux terminal emulator (see [`Installed::emulator`]).
+    Emulator,
 }
 
 impl Shell {
@@ -67,6 +69,7 @@ impl Shell {
             Shell::Pwsh => "PowerShell 7 (pwsh)",
             Shell::WindowsPowerShell => "Windows PowerShell",
             Shell::Cmd => "Command Prompt (cmd)",
+            Shell::Emulator => "terminal",
         }
     }
 }
@@ -82,10 +85,52 @@ pub struct Installed {
     pub powershell: Option<PathBuf>,
     /// `cmd.exe`, if found.
     pub cmd: Option<PathBuf>,
+    /// On Linux and other Unix systems: the terminal emulator to start (`$TERMINAL`, then the
+    /// first of the common ones on `PATH`).
+    pub emulator: Option<PathBuf>,
+}
+
+/// Terminal emulators tried in order when `$TERMINAL` is not set or not installed.
+const EMULATORS: &[&str] = &[
+    "x-terminal-emulator",
+    "gnome-terminal",
+    "konsole",
+    "xfce4-terminal",
+    "mate-terminal",
+    "lxterminal",
+    "tilix",
+    "alacritty",
+    "kitty",
+    "wezterm",
+    "xterm",
+];
+
+/// The emulator to start on Unix: `$TERMINAL` when it names an installed program (its first
+/// word, so `"foo --bar"` finds `foo`), otherwise the first of [`EMULATORS`] on `PATH`.
+fn detect_emulator(env: &dyn Fn(&str) -> Option<OsString>, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let configured = env("TERMINAL").and_then(|value| {
+        value
+            .to_string_lossy()
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+    });
+    if let Some(name) = configured.filter(|n| !n.is_empty()) {
+        let found = if Path::new(&name).is_absolute() {
+            Some(PathBuf::from(&name)).filter(|p| present(p))
+        } else {
+            find_on_path(dirs, &name)
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    EMULATORS.iter().find_map(|name| find_on_path(dirs, name))
 }
 
 impl Installed {
-    /// Looks on this PC (env vars LOCALAPPDATA, PATH, ProgramFiles, SystemRoot, ComSpec).
+    /// Looks on this PC (env vars LOCALAPPDATA, PATH, ProgramFiles, SystemRoot, ComSpec), or on
+    /// Linux for a terminal emulator.
     pub fn detect() -> Self {
         let env = |k: &str| std::env::var_os(k);
         Self::detect_with(&env)
@@ -94,6 +139,12 @@ impl Installed {
     /// Testable: `env` returns an environment variable.
     pub fn detect_with(env: &dyn Fn(&str) -> Option<OsString>) -> Self {
         let dirs = path_dirs(env);
+        if !cfg!(windows) {
+            return Self {
+                emulator: detect_emulator(env, &dirs),
+                ..Self::default()
+            };
+        }
         let local = env("LOCALAPPDATA").map(PathBuf::from);
         let program_files = env("ProgramFiles").map(PathBuf::from);
         let system_root = env("SystemRoot").map(PathBuf::from);
@@ -123,6 +174,7 @@ impl Installed {
             pwsh,
             powershell,
             cmd,
+            emulator: None,
         }
     }
 
@@ -133,6 +185,7 @@ impl Installed {
             Shell::Pwsh => self.pwsh.as_deref(),
             Shell::WindowsPowerShell => self.powershell.as_deref(),
             Shell::Cmd => self.cmd.as_deref(),
+            Shell::Emulator => self.emulator.as_deref(),
         }
     }
 }
@@ -202,7 +255,18 @@ pub fn plain_path(dir: &Path) -> PathBuf {
 }
 
 /// Which terminal to use for `dir`. Err is a user-facing message.
+///
+/// Off Windows only the emulator is available, so every choice other than Automatic falls back
+/// to it (a settings file copied from Windows still works).
 pub fn pick(choice: TerminalChoice, installed: &Installed, dir: &Path) -> Result<Shell, String> {
+    if !cfg!(windows) {
+        let _ = (choice, dir);
+        return if installed.emulator.is_some() {
+            Ok(Shell::Emulator)
+        } else {
+            Err("No terminal emulator was found. Set the TERMINAL environment variable to one, or install gnome-terminal, konsole, xfce4-terminal or xterm.".to_string())
+        };
+    }
     let dir = plain_path(dir);
     let explicit = match choice {
         TerminalChoice::Auto => None,
@@ -253,6 +317,8 @@ pub fn build(
     let unc = is_unc(&dir);
     let (params, cwd) = match shell {
         Shell::WindowsTerminal => (join_args(&["-d".to_string(), escape_wt(&d)]), dir.clone()),
+        // The emulator is started by `open` with its own arguments (see `emulator_args`).
+        Shell::Emulator => (String::new(), dir.clone()),
         Shell::Pwsh | Shell::WindowsPowerShell => {
             let script = format!("Set-Location -LiteralPath {}", ps_literal(&d));
             let args = [
@@ -385,6 +451,9 @@ pub fn open(choice: TerminalChoice, dir: &Path, elevated: bool) -> Result<Launch
     if !dir.is_dir() {
         return Err(format!("{} is not a folder on disk", dir.display()));
     }
+    if elevated && !cfg!(windows) {
+        return Err("Opening a terminal as administrator is only available on Windows".into());
+    }
     let installed = INSTALLED.get_or_init(Installed::detect);
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
@@ -399,14 +468,84 @@ pub fn open(choice: TerminalChoice, dir: &Path, elevated: bool) -> Result<Launch
         *RECORDED.lock() = Some(launch.clone());
         return Ok(launch);
     }
-    forge_win::process::launch_console(
-        &launch.exe,
-        &launch.params,
-        Some(&launch.cwd),
-        launch.elevated,
-    )
-    .map_err(|e| e.to_string())?;
+    if cfg!(windows) {
+        forge_win::process::launch_console(
+            &launch.exe,
+            &launch.params,
+            Some(&launch.cwd),
+            launch.elevated,
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        spawn_emulator(&launch.exe, &launch.cwd)
+            .map_err(|e| format!("could not start {}: {e}", launch.exe.display()))?;
+    }
     Ok(launch)
+}
+
+/// The arguments that make `emulator` start in `dir`. Most emulators also take the working
+/// directory from the process, which [`spawn_emulator`] sets; the ones with their own flag get
+/// it too, since some ignore the inherited directory. Unknown emulators get no arguments.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn emulator_args(emulator: &str, dir: &Path) -> Vec<OsString> {
+    let dir = dir.as_os_str();
+    let flag = |flag: &str, value: &OsStr| -> Vec<OsString> {
+        vec![OsString::from(flag), value.to_os_string()]
+    };
+    match emulator {
+        "gnome-terminal" | "mate-terminal" | "xfce4-terminal" | "lxterminal" | "tilix" => {
+            let mut arg = OsString::from("--working-directory=");
+            arg.push(dir);
+            vec![arg]
+        }
+        "konsole" => flag("--workdir", dir),
+        "alacritty" => flag("--working-directory", dir),
+        "kitty" => flag("--directory", dir),
+        "wezterm" => vec!["start".into(), "--cwd".into(), dir.to_os_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// The program a file name belongs to: `gnome-terminal.wrapper` is `gnome-terminal`.
+#[cfg(not(windows))]
+fn emulator_program(file_name: &str) -> &str {
+    file_name.split('.').next().unwrap_or(file_name)
+}
+
+/// Starts the terminal emulator at `exe` in `dir`, detached. The emulator is named by the
+/// file name of `exe`, so a symlink such as `x-terminal-emulator` gets its own arguments only
+/// when the name it was resolved to is known.
+#[cfg(not(windows))]
+fn spawn_emulator(exe: &Path, dir: &Path) -> std::io::Result<()> {
+    // The name the user sees (`x-terminal-emulator`) may resolve to a wrapper
+    // (`gnome-terminal.wrapper`), so the arguments are chosen by either name.
+    let resolved = std::fs::canonicalize(exe).ok();
+    let args = [Some(exe), resolved.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.file_name())
+        .map(|n| emulator_args(emulator_program(&n.to_string_lossy()), dir))
+        .find(|args| !args.is_empty())
+        .unwrap_or_default();
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_emulator(_exe: &Path, _dir: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "terminal emulators are not used on Windows",
+    ))
 }
 
 #[cfg_attr(not(any(debug_assertions, feature = "automation")), allow(dead_code))]
@@ -424,6 +563,7 @@ pub fn recorded() -> Option<Launch> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::collections::HashMap;
 
     /// CommandLineToArgvW rules for the arguments produced by this module.
@@ -604,6 +744,9 @@ mod tests {
                             );
                             assert_eq!(l.cwd, plain, "{ctx}");
                         }
+                        Shell::Emulator => {
+                            assert!(res.is_ok(), "{ctx}");
+                        }
                         Shell::Cmd => {
                             if plain_s.contains('%') && (unc || elevated) {
                                 let err = res.expect_err(&ctx);
@@ -669,16 +812,19 @@ mod tests {
         assert_eq!(ps_literal("a\u{201A}b"), "'a\u{201A}\u{201A}b'");
     }
 
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn installed_all() -> Installed {
         Installed {
             wt: Some(PathBuf::from("wt.exe")),
             pwsh: Some(PathBuf::from("pwsh.exe")),
             powershell: Some(PathBuf::from("powershell.exe")),
             cmd: Some(PathBuf::from("cmd.exe")),
+            emulator: None,
         }
     }
 
     #[test]
+    #[cfg(windows)]
     fn pick_prefers_windows_terminal_for_local_folders() {
         let dir = Path::new(r"C:\Users\zuhu");
         assert_eq!(
@@ -688,6 +834,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn pick_prefers_pwsh_for_unc_folders() {
         let dir = Path::new(r"\\server\share\Shoot 1");
         assert_eq!(
@@ -703,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn pick_explicit_missing_is_an_error() {
         let installed = Installed {
             wt: None,
@@ -723,6 +871,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn pick_nothing_installed_is_an_error() {
         let err = pick(
             TerminalChoice::Auto,
@@ -734,6 +883,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn detect_finds_fake_terminals() {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
@@ -765,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn relative_path_entries_are_ignored() {
         // "." or "bin" would find a program in whatever folder is current, e.g. a browsed one.
         let env = |k: &str| (k == "PATH").then(|| OsString::from(r".;bin;;C:\Tools;.\x"));
@@ -787,6 +938,117 @@ mod tests {
             plain_path(Path::new(r"\\srv\share")),
             PathBuf::from(r"\\srv\share")
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn emulator_is_picked_from_terminal_or_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let konsole = bin.join("konsole");
+        std::fs::write(&konsole, b"x").unwrap();
+        let path = OsString::from(bin.as_os_str());
+        let env = |k: &str| match k {
+            "PATH" => Some(path.clone()),
+            _ => None,
+        };
+        // Without $TERMINAL the first common emulator on PATH is used.
+        let found = Installed::detect_with(&env);
+        assert_eq!(found.emulator, Some(konsole.clone()));
+        assert_eq!(found.wt, None);
+        // $TERMINAL wins, and its first word is the program (arguments are ignored).
+        let env = |k: &str| match k {
+            "PATH" => Some(path.clone()),
+            "TERMINAL" => Some(OsString::from("konsole --new-tab")),
+            _ => None,
+        };
+        assert_eq!(Installed::detect_with(&env).emulator, Some(konsole));
+        // A $TERMINAL that is not installed falls back to the list.
+        let env = |k: &str| match k {
+            "PATH" => Some(path.clone()),
+            "TERMINAL" => Some(OsString::from("zxraw-no-such-terminal")),
+            _ => None,
+        };
+        assert!(Installed::detect_with(&env).emulator.is_some());
+        // Nothing installed: nothing found, and the error names the fix.
+        let none = |_: &str| None;
+        let installed = Installed::detect_with(&none);
+        let err = pick(TerminalChoice::Auto, &installed, tmp.path()).unwrap_err();
+        assert!(err.contains("TERMINAL"), "{err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_always_uses_the_emulator_whatever_the_choice() {
+        let installed = Installed {
+            emulator: Some(PathBuf::from("/usr/bin/xterm")),
+            ..Installed::default()
+        };
+        for choice in TerminalChoice::ALL {
+            assert_eq!(
+                pick(choice, &installed, Path::new("/home/zuhu")),
+                Ok(Shell::Emulator),
+                "{choice:?}"
+            );
+        }
+        let launch = build(
+            Shell::Emulator,
+            Path::new("/usr/bin/xterm"),
+            Path::new("/home/zuhu"),
+            false,
+            Path::new("/"),
+        )
+        .unwrap();
+        assert_eq!(launch.cwd, PathBuf::from("/home/zuhu"));
+        assert_eq!(launch.params, "");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn emulator_arguments_name_the_folder_for_known_emulators() {
+        let dir = Path::new("/home/zuhu/My Pics");
+        assert_eq!(
+            emulator_args("gnome-terminal", dir),
+            vec![OsString::from("--working-directory=/home/zuhu/My Pics")]
+        );
+        assert_eq!(
+            emulator_args("konsole", dir),
+            vec![
+                OsString::from("--workdir"),
+                OsString::from("/home/zuhu/My Pics")
+            ]
+        );
+        assert_eq!(
+            emulator_args("wezterm", dir),
+            vec![
+                OsString::from("start"),
+                OsString::from("--cwd"),
+                OsString::from("/home/zuhu/My Pics"),
+            ]
+        );
+        // xterm and unknown emulators only get the working directory of the process.
+        assert!(emulator_args("xterm", dir).is_empty());
+        assert!(emulator_args("some-other-term", dir).is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn wrapper_names_select_the_emulator_arguments() {
+        assert_eq!(emulator_program("gnome-terminal.wrapper"), "gnome-terminal");
+        assert_eq!(emulator_program("konsole"), "konsole");
+        assert_eq!(
+            emulator_args(emulator_program("gnome-terminal.wrapper"), Path::new("/x")),
+            vec![OsString::from("--working-directory=/x")]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn elevated_terminal_is_refused_on_unix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = open(TerminalChoice::Auto, tmp.path(), true).unwrap_err();
+        assert!(err.contains("only available on Windows"), "{err}");
     }
 
     #[test]

@@ -99,6 +99,7 @@ struct FindInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindError {
     NotFound,
+    #[cfg_attr(not(windows), allow(dead_code))]
     Other,
 }
 
@@ -169,6 +170,7 @@ fn find_info(path: &Path) -> Result<FindInfo, FindError> {
     })
 }
 
+#[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
 /// Is `tag` one of the Cloud Files reparse tags (`IO_REPARSE_TAG_CLOUD` to `_CLOUD_F`)?
@@ -395,6 +397,7 @@ fn first_page_has_online_only(dir: &Path, limit: usize) -> bool {
 
 /// Expands `%NAME%` references in a `REG_EXPAND_SZ` value from the environment. An unknown
 /// name is left as written (the path then matches nothing, as Windows would leave it).
+#[cfg_attr(not(windows), allow(dead_code))]
 fn expand_environment(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -601,6 +604,8 @@ mod tests {
         );
     }
 
+    // Windows paths and their case-insensitive comparison: Windows only.
+    #[cfg(windows)]
     #[test]
     fn only_folders_positively_outside_cloud_locations_skip_the_walk() {
         let local = |_: &Path| Some((0x10, 0));
@@ -825,6 +830,42 @@ mod tests {
         assert!(background_read_allowed(&f));
     }
 
+    /// The same walk rules with Unix paths, which run everywhere.
+    #[test]
+    fn folder_walk_rules_hold_for_unix_paths() {
+        let local = |_: &Path| Some((0x10, 0));
+        let roots = [PathBuf::from("/home/a/OneDrive")];
+        let shoot = Path::new("/mnt/shoots/2026");
+        assert!(!folder_may_hold_cloud_files_with(shoot, Some(&roots), &local, &no_sample));
+        // A sync root inside the selected folder (copying the whole home folder).
+        assert!(folder_may_hold_cloud_files_with(
+            Path::new("/home"),
+            Some(&roots),
+            &local,
+            &no_sample
+        ));
+        // Inside the sync root.
+        assert!(folder_may_hold_cloud_files_with(
+            Path::new("/home/a/OneDrive/Pictures"),
+            Some(&roots),
+            &local,
+            &no_sample
+        ));
+        assert!(folder_may_hold_cloud_files_with(shoot, None, &local, &no_sample));
+        let tagged = |p: &Path| {
+            if p == Path::new("/mnt/shoots") {
+                Some((0x410, 0x9000_301A))
+            } else {
+                Some((0x10, 0))
+            }
+        };
+        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &tagged, &no_sample));
+        assert!(folder_may_hold_cloud_files_with(shoot, Some(&[]), &|_| None, &no_sample));
+    }
+
+    // Windows paths and their case-insensitive comparison: Windows only (the Unix form is
+    // `sync_root_check_looks_at_every_ancestor_unix`).
+    #[cfg(windows)]
     #[test]
     fn sync_root_check_looks_at_every_ancestor() {
         let cloud = |p: &Path| {
@@ -867,5 +908,43 @@ mod tests {
         );
         assert!(is_cloud_reparse_tag(0x9000_001A) && is_cloud_reparse_tag(0x9000_F01A));
         assert!(!is_cloud_reparse_tag(0xA000_000C));
+    }
+
+    #[test]
+    fn sync_root_check_looks_at_every_ancestor_unix() {
+        let cloud = |p: &Path| {
+            Some(if p == Path::new("/home/me/OneDrive") {
+                (0x10 | 0x400, 0x9000_701A)
+            } else {
+                (0x10, 0)
+            })
+        };
+        assert!(in_cloud_sync_root_with(
+            Path::new("/home/me/OneDrive/code/repo"),
+            &cloud
+        ));
+        assert!(in_cloud_sync_root_with(
+            Path::new("/home/me/OneDrive"),
+            &cloud
+        ));
+        assert!(!in_cloud_sync_root_with(
+            Path::new("/home/me/code/repo"),
+            &cloud
+        ));
+        let recall = |p: &Path| {
+            Some((
+                if p.ends_with("repo") {
+                    0x10 | 0x0040_0000
+                } else {
+                    0x10
+                },
+                0,
+            ))
+        };
+        assert!(in_cloud_sync_root_with(Path::new("/x/repo"), &recall));
+        assert!(
+            in_cloud_sync_root_with(Path::new("/x/repo"), &|_| None),
+            "fails closed"
+        );
     }
 }

@@ -686,7 +686,8 @@ thread_local! {
 /// name (deleted and re-created, or renamed over) is a different one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileIdentity {
-    /// The volume serial and 128-bit file id (`FILE_ID_INFO`).
+    /// The volume serial and 128-bit file id (`FILE_ID_INFO`). On Unix: `st_dev`, and
+    /// `st_ino` with the birth time (an inode number alone is reused at once after a delete).
     Id { volume: u64, id: [u8; 16] },
     /// Where the volume gives no file id (some FAT and network volumes): creation time,
     /// last write time and size (both 0 for a folder, whose write time changes with its
@@ -754,6 +755,10 @@ impl FileIdentity {
     #[cfg(not(windows))]
     fn read(file: &File, dir: bool) -> Option<Self> {
         let md = file.metadata().ok()?;
+        #[cfg(unix)]
+        if let Some((volume, id)) = unix_file_id(&md) {
+            return Some(Self::Id { volume, id });
+        }
         let nanos = |t: std::io::Result<SystemTime>| {
             t.ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -765,6 +770,24 @@ impl FileIdentity {
             size: if dir { 0 } else { md.len() },
         })
     }
+}
+
+/// Unix file id for [`FileIdentity::Id`]: `st_dev`, and 16 bytes of `st_ino` then the birth
+/// time in nanoseconds. `None` where the file system keeps no birth time (`statx` without
+/// `STATX_BTIME`): the inode number alone could belong to a file re-created under it. Tests
+/// can hide it (see `HIDE_FILE_ID`).
+#[cfg(unix)]
+pub(crate) fn unix_file_id(md: &std::fs::Metadata) -> Option<(u64, [u8; 16])> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(test)]
+    if HIDE_FILE_ID.with(std::cell::Cell::get) {
+        return None;
+    }
+    let born = md.created().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64;
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&md.ino().to_le_bytes());
+    id[8..].copy_from_slice(&born.to_le_bytes());
+    Some((md.dev(), id))
 }
 
 /// A finished temp file not published yet (see [`write_stream_held`]). Its handle stays
@@ -1346,9 +1369,35 @@ fn rename_open_no_replace(file: &File, _from: &Path, to: &Path) -> io::Result<()
     })
 }
 
+/// Unix cannot rename through a handle, so the path is renamed, and then the object now at `to`
+/// is checked against the one `file` is open on. Something else that was at `from` (a save
+/// that replaced it after it was verified) is renamed back and the rename fails. If that
+/// rename back also fails, that object stays under `to`.
 #[cfg(not(windows))]
-fn rename_open_no_replace(_file: &File, from: &Path, to: &Path) -> io::Result<()> {
-    paths::rename_no_replace(from, to)
+fn rename_open_no_replace(file: &File, from: &Path, to: &Path) -> io::Result<()> {
+    paths::rename_no_replace(from, to)?;
+    let same = match (
+        FileIdentity::of(file),
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // As itself: never through a link, never waiting on a FIFO.
+            let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(flags.bits() as i32)
+                .open(to)
+                .ok()
+                .and_then(|moved| FileIdentity::of(&moved))
+        },
+    ) {
+        (Some(open), Some(moved)) => open == moved,
+        _ => false,
+    };
+    if same {
+        return Ok(());
+    }
+    let _ = paths::rename_no_replace(to, from);
+    Err(io::Error::other("the object at the path is not the one opened"))
 }
 
 /// Why [`replace_guarded`] did not publish.
@@ -3138,7 +3187,9 @@ pub(crate) mod leftover_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    #[cfg(windows)]
+    use std::sync::Arc;
+    use std::sync::Mutex;
 
     struct Fx {
         _d: tempfile::TempDir,

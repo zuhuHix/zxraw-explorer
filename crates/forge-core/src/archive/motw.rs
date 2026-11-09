@@ -2,9 +2,14 @@
 //! (ZoneId 3 = Internet, 4 = Restricted), and extracted files inherit it like Explorer does.
 //! Everything goes through the NTFS alternate data stream `<path>:Zone.Identifier`.
 
+use std::io;
+use std::path::Path;
+#[cfg(windows)]
 use std::fs::{self, File};
-use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(windows)]
+use std::path::PathBuf;
 
 /// Zones at or above this id (Internet and Restricted) are marked.
 #[cfg(windows)]
@@ -109,6 +114,7 @@ pub(crate) fn copy_zone_stream(_from: &Path, _to: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]

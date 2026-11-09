@@ -2,7 +2,9 @@
 //! resume, missing-file sweep, annotations surviving offline + relink, reconcile, links.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use forge_core::query::{ColorLabel, PickState, Query};
@@ -80,7 +82,9 @@ fn exclusions_are_honoured() {
     touch(&root.join("deep/y.jpg"), 1);
     let db = Db::open_in_memory().unwrap();
     let rid = db.add_index_root(&root).unwrap();
-    db.add_exclusion(ExclusionKind::Folder, &root.join("CACHE").to_string_lossy())
+    // Folder exclusions match the folder's case only where paths are case-insensitive.
+    let cache = if cfg!(windows) { "CACHE" } else { "cache" };
+    db.add_exclusion(ExclusionKind::Folder, &root.join(cache).to_string_lossy())
         .unwrap();
     db.add_exclusion(ExclusionKind::Ext, ".TMP").unwrap();
     db.add_exclusion(ExclusionKind::Name, "node_modules")

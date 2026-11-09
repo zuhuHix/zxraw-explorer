@@ -636,6 +636,43 @@ that back each line, is in [FEATURES.md](FEATURES.md).
 * The colour-contrast tests cover the selected row, hyperlinks, and the focus ring. Other colours in
   the UI are not covered by a test.
 
+## Linux
+
+The Linux build (X11 and Wayland) is new. Browsing, the viewer, culling, metadata, archives,
+the index, search, Git badges, copy, move and rename work. Everything Windows-only is hidden
+or refuses with a message; nothing should crash for lack of it.
+
+* Hidden on Linux: the Default apps page, Explorer menu and file type registration, app icon
+  shortcuts, *Properties*, *Open with*, *Open terminal as administrator*, network locations
+  (the Network section and *Add network location*), and the in-app updater and FFmpeg download
+  (install `ffmpeg` with the package manager; the Updates page links to the releases page).
+* Not available yet (each needs a Linux backend in `forge-win`): moving to the Recycle Bin
+  (freedesktop trash), the file clipboard (copy/cut/paste of files with other apps), dragging
+  files out of the app and dropping files in from other apps, single instance (a second launch
+  opens a second window), and drive listing beyond `/` and mounts under `/media`, `/run/media`
+  and `/mnt`. The command palette still lists some Windows-only commands, which then report
+  that they are unsupported.
+* File dialogs need a running `xdg-desktop-portal` with a FileChooser backend; without one they
+  don't open.
+* Names are case-sensitive: `IMG.jpg` and `img.jpg` are two files everywhere (index, notes,
+  tags, collections, Git badges, pins). Hidden files are names that start with `.`.
+* Git badges: a repository is read with `openat` and `O_NOFOLLOW` one name at a time from `/`.
+  Symlinks are never followed, mount points inside the repository are skipped like links,
+  FIFOs and devices are never opened, and folders on network or FUSE file systems (NFS, SMB,
+  sshfs, rclone and others) show no badges. Without `/proc`, the check that every opened
+  folder is still inside the repository is skipped; the walk still opens only single names
+  relative to folders it holds.
+* File identity (archive stamps, safe cleanup after a cancelled extraction, replace checks)
+  uses device, inode and birth time. On a file system without birth times it falls back to the
+  weak identity, so cleanup reports what it left instead of removing it.
+* Unix has no share modes and no rename or delete through a handle. A file the app holds open
+  can still be changed, renamed or deleted by other programs; safe removal and replace check
+  the object before and after a rename, which leaves a short race window that Windows doesn't
+  have.
+* Volume identity is per path root, and every Linux path is under `/`. Library roots are not
+  told apart by mount, so "offline volume" detection does not work for unplugged drives yet.
+* The `e2e` UI test suite runs on Windows only for now.
+
 ## Verification boundary
 
 * The unit and integration suites verify the tested engine paths and UI logic. They do not verify

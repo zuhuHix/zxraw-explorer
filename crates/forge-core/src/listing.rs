@@ -304,6 +304,21 @@ mod tests {
         assert_eq!(all[1].ext, "txt");
     }
 
+    #[cfg(all(test, unix))]
+    #[test]
+    fn dot_names_are_hidden_on_unix() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join(".gitignore"), b"x").unwrap();
+        fs::write(d.path().join("photo.jpg"), b"x").unwrap();
+        fs::create_dir(d.path().join(".cache")).unwrap();
+        let hidden = |name: &str| entry_for_path(&d.path().join(name)).unwrap().hidden;
+        assert!(hidden(".gitignore"));
+        assert!(hidden(".cache"), "hidden folders too");
+        assert!(!hidden("photo.jpg"));
+        // Unix has no system attribute.
+        assert!(!entry_for_path(&d.path().join(".gitignore")).unwrap().system);
+    }
+
     #[cfg(windows)]
     #[test]
     fn junctions_are_links() {

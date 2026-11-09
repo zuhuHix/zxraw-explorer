@@ -22,6 +22,7 @@ pub fn note_press() {
 }
 
 /// Message hook for the winit event loop. Never consumes the message.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn msg_hook(msg: *const std::ffi::c_void) -> bool {
     if forge_win::is_paste_keydown(msg) {
         note_press();

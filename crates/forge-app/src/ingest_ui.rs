@@ -543,7 +543,7 @@ impl IngestState {
                         } else {
                             destination_free_space(
                                 &spec.dest_root,
-                                &forge_win::list_drives(),
+                                &live_free_drives(),
                                 &cached_drives,
                             )
                         };
@@ -1190,30 +1190,42 @@ struct FreeDrive {
     available: bool,
 }
 
-fn destination_free_space(
-    destination: &Path,
-    windows: &[forge_win::DriveInfo],
-    cached: &[FreeDrive],
-) -> Option<u64> {
-    let mut matches: Vec<(usize, u64)> = windows
-        .iter()
-        .filter(|drive| drive.available)
-        .filter_map(|drive| {
-            drive
-                .free_bytes
-                .filter(|_| path_is_within(destination, &drive.root))
-                .map(|free| (drive.root.components().count(), free))
-        })
-        .collect();
-    matches.extend(
-        cached
-            .iter()
+/// Every drive's free space right now, for the destination lookup. Windows asks forge-win
+/// (a drive counts only when it reports free space); elsewhere the platform's mounted file
+/// systems are the list.
+fn live_free_drives() -> Vec<FreeDrive> {
+    if cfg!(windows) {
+        forge_win::list_drives()
+            .into_iter()
             .filter(|drive| drive.available)
-            .filter(|drive| path_is_within(destination, &drive.root))
-            .map(|drive| (drive.root.components().count(), drive.free)),
-    );
-    matches
-        .into_iter()
+            .filter_map(|drive| {
+                Some(FreeDrive {
+                    root: drive.root,
+                    free: drive.free_bytes?,
+                    available: true,
+                })
+            })
+            .collect()
+    } else {
+        crate::platform::drives()
+            .into_iter()
+            .map(|drive| FreeDrive {
+                root: drive.root,
+                free: drive.free,
+                available: drive.available,
+            })
+            .collect()
+    }
+}
+
+/// Free space of the drive holding `destination`: the drive whose root is the longest prefix
+/// of it wins (`/media/card` over `/`).
+fn destination_free_space(destination: &Path, live: &[FreeDrive], cached: &[FreeDrive]) -> Option<u64> {
+    live.iter()
+        .chain(cached)
+        .filter(|drive| drive.available)
+        .filter(|drive| path_is_within(destination, &drive.root))
+        .map(|drive| (drive.root.components().count(), drive.free))
         .max_by_key(|(depth, _)| *depth)
         .map(|(_, free)| free)
 }
@@ -1519,6 +1531,13 @@ mod tests {
         );
         state.poll();
         assert!(state.report.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn destination_space_is_known_on_linux_from_the_mounted_file_systems() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(destination_free_space(dir.path(), &live_free_drives(), &[]).is_some());
     }
 
     #[test]

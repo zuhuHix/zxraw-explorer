@@ -19,6 +19,12 @@
 //!   the copy only. Then the original is opened again (sharing reading and deleting, so it
 //!   can be replaced), checked again, and the edited copy is renamed over it through the
 //!   copy's own handle. Entries are only ever removed from a verified copy of the original.
+//!
+//! On Unix there are no share modes, so nothing stops another program from writing, renaming
+//! or deleting an archive while it is held. The identity is the device and inode numbers
+//! (standing in for the volume serial and file id), and the checks still catch a change
+//! before any entry is removed; a change between the last check and the rename is not
+//! refused there, and the edited copy then replaces whatever is at the path.
 
 use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
@@ -46,12 +52,14 @@ pub const WRITER_WAIT: Duration = Duration::from_secs(10);
 const FILE_SHARE_READ: u32 = 0x1;
 const FILE_SHARE_DELETE: u32 = 0x4;
 /// `DELETE` access, needed to rename a file through its handle.
+#[cfg_attr(not(windows), allow(dead_code))]
 const DELETE: u32 = 0x0001_0000;
 /// `ERROR_SHARING_VIOLATION`: another program has the file open in a way ours conflicts with.
 const SHARING_VIOLATION: i32 = 32;
 /// `ERROR_ACCESS_DENIED`: also what replacing a file gives while another program has it
 /// open without sharing deleting, or mapped (as a virus scanner does with a file just
 /// written).
+#[cfg_attr(not(windows), allow(dead_code))]
 const ACCESS_DENIED: i32 = 5;
 /// How long [`PrivateCopy::replace`] keeps trying again when the rename is refused that way,
 /// checking the original again before each try; the pause between tries doubles from
@@ -67,14 +75,54 @@ pub fn read(path: &Path) -> Result<ArchiveIdentity, String> {
     of_file(&mut file)
 }
 
-fn of_file(file: &mut File) -> Result<ArchiveIdentity, String> {
+/// What [`of_file`] reads from a handle.
+struct HandleInfo {
+    volume: u64,
+    file_id: u128,
+    size: u64,
+    last_write: u64,
+    /// Hard links left: 0 once the last name was removed while the handle stayed open.
+    links: u32,
+}
+
+#[cfg(windows)]
+fn handle_info(file: &File) -> Result<HandleInfo, String> {
     let id = forge_win::files::handle_identity(file).map_err(|e| e.to_string())?;
-    let directory = directory_hash(file, id.size).map_err(|e| e.to_string())?;
-    Ok(ArchiveIdentity {
+    Ok(HandleInfo {
         volume: id.volume,
         file_id: id.file_id,
         size: id.size,
         last_write: id.last_write,
+        links: id.links,
+    })
+}
+
+/// Unix: the device and inode numbers are the volume and file id, and the write time is kept
+/// in nanoseconds (wrapping only far beyond any real date).
+#[cfg(unix)]
+fn handle_info(file: &File) -> Result<HandleInfo, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    Ok(HandleInfo {
+        volume: meta.dev(),
+        file_id: u128::from(meta.ino()),
+        size: meta.size(),
+        last_write: (meta.mtime() as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(meta.mtime_nsec() as u64),
+        links: u32::try_from(meta.nlink()).unwrap_or(u32::MAX),
+    })
+}
+
+fn of_file(file: &mut File) -> Result<ArchiveIdentity, String> {
+    let info = handle_info(file)?;
+    let directory = directory_hash(file, info.size).map_err(|e| e.to_string())?;
+    Ok(ArchiveIdentity {
+        volume: info.volume,
+        file_id: info.file_id,
+        size: info.size,
+        last_write: info.last_write,
         directory,
     })
 }
@@ -209,26 +257,42 @@ fn zip_directory(file: &mut File, size: u64) -> std::io::Result<Option<ZipDirect
 
 /// Opens `path` for reading with `share`, waiting up to `wait` for a program writing to it.
 fn open_waiting(path: &Path, share: u32, access: u32, wait: Duration) -> Result<File, String> {
-    use std::os::windows::fs::OpenOptionsExt;
-
     let until = Instant::now() + wait;
     loop {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).share_mode(share);
-        if access != 0 {
-            options.access_mode(access);
-        }
-        match options.open(path) {
+        match open_sharing(path, share, access) {
             Ok(file) => return Ok(file),
-            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) && Instant::now() < until => {
+            Err(e) if is_sharing_violation(&e) && Instant::now() < until => {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => {
+            Err(e) if is_sharing_violation(&e) => {
                 return Err("another program is writing to it".into());
             }
             Err(e) => return Err(e.to_string()),
         }
     }
+}
+
+/// Only Windows has share modes, so only there can another program's open be in conflict.
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error() == Some(SHARING_VIOLATION)
+}
+
+#[cfg(windows)]
+fn open_sharing(path: &Path, share: u32, access: u32) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).share_mode(share);
+    if access != 0 {
+        options.access_mode(access);
+    }
+    options.open(path)
+}
+
+/// Unix has no share modes: the file is opened for reading as it is.
+#[cfg(not(windows))]
+fn open_sharing(path: &Path, _share: u32, _access: u32) -> std::io::Result<File> {
+    File::open(path)
 }
 
 /// The archive held while its items are read: nobody can write, rename or delete it.
@@ -271,28 +335,31 @@ impl Held {
     /// Copies the held original, through its handle, to a new temp file next to it, with
     /// its "downloaded from the internet" mark; closes the original once copied.
     pub fn copy_to_private(mut self) -> Result<PrivateCopy, String> {
-        use std::os::windows::fs::OpenOptionsExt;
-
         let dir = self.path.parent().ok_or("the archive has no folder")?;
         let copy = PrivateCopy {
             path: dir.join(forge_core::ops::partial_name()),
             placed: false,
         };
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
         // Nobody else may open it while it is written.
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .share_mode(0)
-            .open(&copy.path)
-            .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        let mut out = options.open(&copy.path).map_err(|e| e.to_string())?;
         self.file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
         std::io::copy(&mut self.file, &mut out).map_err(|e| e.to_string())?;
         out.sync_all().map_err(|e| e.to_string())?;
         drop(out);
         // The mark is a stream of its own, which the edit then keeps on its result.
-        let zone = |p: &Path| PathBuf::from(format!("{}:Zone.Identifier", p.display()));
-        if let Ok(mark) = std::fs::read(zone(&self.path)) {
-            let _ = std::fs::write(zone(&copy.path), mark);
+        #[cfg(windows)]
+        {
+            let zone = |p: &Path| PathBuf::from(format!("{}:Zone.Identifier", p.display()));
+            if let Ok(mark) = std::fs::read(zone(&self.path)) {
+                let _ = std::fs::write(zone(&copy.path), mark);
+            }
         }
         drop(self);
         Ok(copy)
@@ -367,8 +434,7 @@ impl PrivateCopy {
             match self.rename_over(original) {
                 Ok(()) => {
                     self.placed = true;
-                    let replaced =
-                        forge_win::files::handle_identity(&held).is_ok_and(|id| id.links == 0);
+                    let replaced = handle_info(&held).is_ok_and(|info| info.links == 0);
                     return Ok(if replaced {
                         Replaced::Original
                     } else {
@@ -385,7 +451,15 @@ impl PrivateCopy {
         }
     }
 
+    /// Renames this copy over `original`. Unix has no refusal for a file another program has
+    /// open, so a failure is final.
+    #[cfg(not(windows))]
+    fn rename_over(&self, original: &Path) -> Result<(), Rename> {
+        std::fs::rename(&self.path, original).map_err(|e| Rename::Failed(e.to_string()))
+    }
+
     /// Renames this copy over `original` through its own handle.
+    #[cfg(windows)]
     fn rename_over(&self, original: &Path) -> Result<(), Rename> {
         use std::os::windows::fs::OpenOptionsExt;
 
@@ -408,12 +482,14 @@ impl PrivateCopy {
 }
 
 /// Why a rename of the copy failed.
+#[cfg_attr(not(windows), allow(dead_code))]
 enum Rename {
     /// Another program has one of the files open or mapped: it may pass.
     Busy(String),
     Failed(String),
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl Rename {
     fn of(code: Option<i32>, message: String) -> Self {
         match code {
@@ -570,6 +646,7 @@ mod tests {
         assert!(hold_unchanged(&zip, &before, Duration::ZERO).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
     fn while_its_items_are_read_the_archive_cant_be_written_renamed_or_deleted() {
         let dir = tempfile::tempdir().unwrap();
@@ -586,6 +663,7 @@ mod tests {
         std::fs::rename(&zip, dir.path().join("away.zip")).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_writer_keeps_the_hold_waiting_then_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -706,6 +784,7 @@ mod tests {
 
     /// Opens `path` sharing only reading, as a virus scanner may: it can't be replaced
     /// while this is open.
+    #[cfg(windows)]
     fn scanner_open(path: &Path) -> File {
         use std::os::windows::fs::OpenOptionsExt;
         File::options()
@@ -716,6 +795,7 @@ mod tests {
     }
 
     /// Runs `each_try(n)` (n from 1) at every try of the rename, after its check.
+    #[cfg(windows)]
     fn on_each_try(each_try: impl Fn(usize) + 'static) -> std::rc::Rc<std::cell::Cell<usize>> {
         let tries = std::rc::Rc::new(std::cell::Cell::new(0));
         let counter = tries.clone();
@@ -728,6 +808,7 @@ mod tests {
         tries
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_rename_refused_for_a_moment_is_tried_again() {
         let dir = tempfile::tempdir().unwrap();
@@ -749,6 +830,7 @@ mod tests {
         assert!(partials_in(dir.path()).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_rename_refused_for_longer_than_the_wait_fails() {
         let dir = tempfile::tempdir().unwrap();
@@ -772,6 +854,7 @@ mod tests {
         assert!(partials_in(dir.path()).is_empty());
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_substitute_held_at_the_rename_is_checked_again_and_left_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -804,5 +887,52 @@ mod tests {
         assert_eq!(std::fs::read(&zip).unwrap(), substitute, "nothing removed from it");
         assert_eq!(std::fs::read(&away).unwrap(), original);
         assert!(partials_in(dir.path()).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_the_identity_is_the_device_and_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt"]);
+        let meta = std::fs::metadata(&zip).unwrap();
+        let before = read(&zip).unwrap();
+        assert_eq!(before.volume, meta.dev());
+        assert_eq!(before.file_id, u128::from(meta.ino()));
+        assert_eq!(before.size, meta.size());
+        // Another name for the same file is the same archive.
+        let link = dir.path().join("b.zip");
+        std::fs::hard_link(&zip, &link).unwrap();
+        assert_eq!(read(&link).unwrap(), before);
+        assert_eq!(handle_info(&File::open(&zip).unwrap()).unwrap().links, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_held_archive_whose_last_name_is_removed_has_no_links_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt"]);
+        let file = File::open(&zip).unwrap();
+        assert_eq!(handle_info(&file).unwrap().links, 1);
+        std::fs::remove_file(&zip).unwrap();
+        assert_eq!(handle_info(&file).unwrap().links, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_writer_does_not_keep_the_hold_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("a.zip");
+        zip_of(&zip, &["one.txt"]);
+        let expected = read(&zip).unwrap();
+        // Without share modes the hold opens at once, and checks the identity on its handle.
+        let _writer = File::options().write(true).open(&zip).unwrap();
+        let started = Instant::now();
+        let held = hold_unchanged(&zip, &expected, Duration::from_secs(5)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
     }
 }

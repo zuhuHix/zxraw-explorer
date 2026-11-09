@@ -833,6 +833,7 @@ impl State {
     /// below that path (see `purge`). O(depth): no cache scan.
     /// Returns (what `get` shows changed, a worker must look: a new debounce or purge).
     #[cfg(test)]
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn invalidate_path(&mut self, path: &Path, change: Change, now: Instant) -> (bool, bool) {
         self.try_invalidate_path(path, change, true, now)
             .unwrap_or_default()
@@ -1416,6 +1417,7 @@ fn registrar(shared: Arc<Shared>, rx: Receiver<Vec<PathBuf>>) {
 /// Is `path` a folder? Reads the attributes its directory entry holds
 /// (`GetFileAttributesW`) without opening it: opening a file that was just written can make
 /// the virus scanner check it first, which on a busy volume costs more than everything else.
+#[cfg(windows)]
 fn is_dir_entry(path: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Storage::FileSystem::{
@@ -1425,6 +1427,14 @@ fn is_dir_entry(path: &Path) -> bool {
     // SAFETY: `wide` is a NUL-terminated UTF-16 string that outlives the call.
     let attrs = unsafe { GetFileAttributesW(windows::core::PCWSTR(wide.as_ptr())) };
     attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+}
+
+/// Is `path` a folder? Unix has no directory-entry attribute to read, so this stats the path
+/// without opening it (as above), following a symlink the way the Windows directory bit
+/// does for a link to a folder.
+#[cfg(not(windows))]
+fn is_dir_entry(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// Is `path` on a network location? UNC paths are lexical; a drive letter's answer is asked
@@ -1805,6 +1815,7 @@ mod tests {
         assert!(!st.cache.contains_key(Path::new("u1")));
     }
 
+    #[cfg(windows)] // Drive-letter paths: a single relative component off Windows.
     #[test]
     fn a_folder_reappearing_drops_the_totals_kept_below_it() {
         let fs = real(quick());
@@ -2144,6 +2155,7 @@ mod tests {
         assert_eq!(roots, vec![pane]);
     }
 
+    #[cfg(windows)] // Drive-letter paths: a single relative component off Windows.
     #[test]
     fn busy_folders_and_drive_roots_are_measured_less_often() {
         let fs = real(quick());
@@ -2177,6 +2189,7 @@ mod tests {
         assert!(queued(&st, r"D:\busy") && queued(&st, r"C:\x"));
     }
 
+    #[cfg(windows)] // Drive-letter paths: a single relative component off Windows.
     #[test]
     fn repeated_events_on_a_folder_neither_wake_workers_nor_scan() {
         let fs = real(quick());
@@ -2243,5 +2256,21 @@ mod tests {
             st.purge.is_empty(),
             "no total kept at the path: nothing to purge"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_unix_a_folder_entry_is_a_folder_and_a_link_to_one_follows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("folder");
+        let file = dir.path().join("file.txt");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        assert!(is_dir_entry(&folder));
+        assert!(!is_dir_entry(&file));
+        assert!(is_dir_entry(&link), "a link to a folder is a folder");
+        assert!(!is_dir_entry(&dir.path().join("missing")));
     }
 }

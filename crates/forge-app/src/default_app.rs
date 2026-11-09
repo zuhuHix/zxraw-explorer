@@ -556,6 +556,7 @@ fn set_archive_menu(app: &mut ZxrawApp, on: bool) {
 
 /// Re-points the archive types and the ZXraw menu at this executable after it moved or was
 /// updated, for whichever the user turned on.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn refresh_archive_registration() {
     let current_exe = match std::env::current_exe() {
         Ok(exe) => exe,
@@ -577,6 +578,7 @@ pub fn refresh_archive_registration() {
 }
 
 /// Re-points the registration at this executable after it moved, if the user opted in.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn refresh_registration() {
     let current_exe = match std::env::current_exe() {
         Ok(exe) => exe,

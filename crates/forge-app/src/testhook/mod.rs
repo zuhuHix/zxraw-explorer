@@ -2420,6 +2420,8 @@ mod tests {
         assert!(
             matches!(one(r"wait-exists x y | 5"), Ok(Step::WaitExists(p, d)) if p == in_temp("x y") && d.as_secs() == 5)
         );
+        // `\` separates path parts only on Windows; elsewhere `..\escape` is one file name.
+        #[cfg(windows)]
         assert!(
             one(r"dialog ..\escape").is_err(),
             "dialog answers stay inside the sandbox"
@@ -2484,6 +2486,7 @@ mod tests {
         assert!(one("drop-files Target |").is_err());
         assert!(one("drop-files | a.txt").is_err());
         assert!(one("drop-files Target | a.txt | alt").is_err());
+        #[cfg(windows)]
         assert!(one(r"drop-files Target | ..\escape.txt").is_err());
         assert!(
             matches!(one("assert-selection a.txt, b.txt"), Ok(Step::AssertSelection(names)) if names == ["a.txt", "b.txt"])

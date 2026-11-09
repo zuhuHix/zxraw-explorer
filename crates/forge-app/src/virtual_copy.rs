@@ -569,8 +569,31 @@ mod tests {
         );
     }
 
+    /// Off Windows, names that differ only in case are different names, and all are copied.
+    #[cfg(unix)]
+    #[test]
+    fn names_that_differ_only_in_case_are_all_copied_on_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (staging, dest) = (dir.path().join("staging"), dir.path().join("dest"));
+        std::fs::create_dir_all(&staging).unwrap();
+        let fake = Fake::new(vec![
+            ("a.txt", false, Some(b"first")),
+            ("A.TXT", false, Some(b"second")),
+            ("Sub", true, None),
+            ("SUB", false, Some(b"a file")),
+        ]);
+        let extracted = run_extract(&fake, &staging, &dest);
+        assert!(extracted.failed.is_empty(), "{:?}", extracted.failed);
+        assert!(extracted.skipped.is_empty(), "{:?}", extracted.skipped);
+        assert_eq!(std::fs::read(staging.join("a.txt")).unwrap(), b"first");
+        assert_eq!(std::fs::read(staging.join("A.TXT")).unwrap(), b"second");
+        assert!(staging.join("Sub").is_dir());
+        assert_eq!(std::fs::read(staging.join("SUB")).unwrap(), b"a file");
+    }
+
     /// Names that Windows takes as the same (letter case, as the file system folds it) are
     /// copied once, the first one offered.
+    #[cfg(windows)]
     #[test]
     fn names_windows_takes_as_equal_are_copied_once() {
         let dir = tempfile::tempdir().unwrap();

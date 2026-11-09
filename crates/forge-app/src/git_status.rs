@@ -12,7 +12,9 @@ mod odb;
 mod safe_fs;
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf, Prefix};
+use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::path::Prefix;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
@@ -107,7 +109,7 @@ impl RepoStatus {
     /// Records a staged change (index against HEAD) next to the worktree one already there.
     /// A file new to HEAD shows as new even if edited since staging; a conflict always wins.
     fn add_staged(&mut self, path: &str, badge: GitBadge) {
-        match self.entries.get(&path.to_lowercase()) {
+        match self.entries.get(&fold(path)) {
             Some(GitBadge::Conflicted) => {}
             Some(existing) if badge != GitBadge::Added && existing.rank() >= badge.rank() => {}
             _ => self.add(path, badge),
@@ -116,7 +118,7 @@ impl RepoStatus {
 
     /// Records one entry and rolls its badge up into the parent folders.
     fn add(&mut self, path: &str, badge: GitBadge) {
-        let key = path.to_lowercase();
+        let key = fold(path);
         if badge != GitBadge::Ignored {
             rollup_into(&mut self.rollup, &key, badge);
         }
@@ -170,11 +172,29 @@ fn rollup_into(map: &mut HashMap<String, GitBadge>, key: &str, badge: GitBadge) 
 }
 
 /// Lowercase path with `/` separators and no trailing `/`, for comparisons.
+#[cfg(windows)]
 fn norm_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "/")
         .trim_end_matches('/')
         .to_lowercase()
+}
+
+/// Path without a trailing `/`, for comparisons (Unix names are case-sensitive and may hold
+/// `\\`).
+#[cfg(unix)]
+fn norm_key(path: &Path) -> String {
+    path.to_string_lossy().trim_end_matches('/').to_string()
+}
+
+/// A repository-relative path as a status key: lowercase on Windows, whose names are
+/// case-insensitive; unchanged on Unix.
+fn fold(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 /// The deepest folder from `dir` up that contains a `.git` (a folder, or a file as used by
@@ -242,7 +262,7 @@ fn locate(dir: &Path, record: bool, over: &dyn Fn() -> bool) -> Result<Located, 
     let (fs, top) = Fs::open_volume(letter, record).map_err(meta)?;
     let mut levels = vec![top];
     let mut attributes = HashMap::new();
-    let mut at = PathBuf::from(format!("{letter}:\\"));
+    let mut at = safe_fs::volume_root(letter);
     for name in &names {
         if over() {
             return Err(Failure::TooBig);
@@ -1527,12 +1547,23 @@ fn same_as_blob(
 }
 
 /// Windows `FILETIME` as Unix seconds and nanoseconds, as Git for Windows stores them.
+#[cfg(windows)]
 fn unix_time(filetime: i64) -> (u32, u32) {
     const EPOCH: i64 = 116_444_736_000_000_000;
     let since = filetime - EPOCH;
     (
         since.div_euclid(10_000_000) as u32,
         (since.rem_euclid(10_000_000) * 100) as u32,
+    )
+}
+
+/// Nanoseconds since 1970 (what [`safe_fs::Info::mtime`] holds on Unix) as Unix seconds and
+/// nanoseconds, as Git stores them.
+#[cfg(unix)]
+fn unix_time(nanos: i64) -> (u32, u32) {
+    (
+        nanos.div_euclid(1_000_000_000) as u32,
+        nanos.rem_euclid(1_000_000_000) as u32,
     )
 }
 
@@ -1573,7 +1604,7 @@ impl<'a> Walker<'a> {
     ) -> Self {
         let mut tracked: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, entry) in index.entries().iter().enumerate() {
-            let path = entry.path(index).to_string().to_lowercase();
+            let path = fold(&entry.path(index).to_string());
             tracked.entry(path).or_default().push(i);
         }
         let mut sorted: Vec<String> = tracked.keys().cloned().collect();
@@ -1637,7 +1668,7 @@ impl<'a> Walker<'a> {
                 continue;
             }
             let path = format!("{rel}{}", entry.name);
-            let key = path.to_lowercase();
+            let key = fold(&path);
             if let Some(ids) = self.tracked.get(&key).cloned() {
                 self.compare(dir, &entry, &ids, &path);
                 continue;
@@ -1762,8 +1793,13 @@ impl<'a> Walker<'a> {
 fn resolve(base: &Path, value: &str, root: &Path) -> Option<PathBuf> {
     let value = Path::new(value);
     let joined = match value.components().next()? {
+        #[cfg(windows)]
         Component::Prefix(_) => value.to_path_buf(),
+        #[cfg(windows)]
         Component::RootDir => return None,
+        // One tree: an absolute path is as good as a drive-qualified one on Windows.
+        #[cfg(unix)]
+        Component::RootDir => value.to_path_buf(),
         _ => base.join(value),
     };
     let path = lexical(&joined)?;
@@ -1774,7 +1810,10 @@ fn resolve(base: &Path, value: &str, root: &Path) -> Option<PathBuf> {
 /// against the process's current directory.
 fn absolute(value: &str, root: &Path) -> Option<PathBuf> {
     match Path::new(value).components().next()? {
+        #[cfg(windows)]
         Component::Prefix(_) => resolve(root, value, root),
+        #[cfg(unix)]
+        Component::RootDir => resolve(root, value, root),
         _ => None,
     }
 }
@@ -1783,6 +1822,7 @@ fn absolute(value: &str, root: &Path) -> Option<PathBuf> {
 /// prefix, by text alone. `None` for relative paths, device paths (`\\.\`, `\\?\` other than
 /// a drive or share) and names Windows would change on open (trailing dots or spaces, `:`,
 /// reserved device names).
+#[cfg(windows)]
 fn lexical(path: &Path) -> Option<PathBuf> {
     let mut parts = path.components();
     let mut out = match parts.next()? {
@@ -1817,8 +1857,37 @@ fn lexical(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// `path` with `.` and `..` resolved, by text alone (no link is followed, and the scan then
+/// refuses any symlink on the way). `None` for relative paths and names that are not UTF-8.
+#[cfg(unix)]
+fn lexical(path: &Path) -> Option<PathBuf> {
+    let mut parts = path.components();
+    if parts.next()? != Component::RootDir {
+        return None;
+    }
+    let mut out = PathBuf::from("/");
+    for part in parts {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(name) if plain_name(name) => out.push(name),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A UTF-8 file name that is one plain component (on Unix only `/` and NUL are special).
+#[cfg(unix)]
+fn plain_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(safe_fs::plain_component)
+}
+
 /// A file name Windows opens as written: not empty, no trailing dot or space (stripped on
 /// open, so `.. ` would mean the parent), no `:` (streams), no wildcards, not a device.
+#[cfg(windows)]
 fn plain_name(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
@@ -1847,8 +1916,16 @@ fn plain_name(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Lowercase text form of a [`lexical`] path without a trailing `\`, for comparisons.
+#[cfg(windows)]
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().trim_end_matches('\\').to_lowercase()
+}
+
+/// Text form of a [`lexical`] path without a trailing `/`, for comparisons (Unix names are
+/// case-sensitive).
+#[cfg(unix)]
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().trim_end_matches('/').to_string()
 }
 
 /// The drive or share of a [`lexical`] path, lowercase.
@@ -1865,7 +1942,7 @@ fn inside(path: &Path, dir: &Path) -> bool {
     path == dir
         || path
             .strip_prefix(&dir)
-            .is_some_and(|rest| rest.starts_with('\\'))
+            .is_some_and(|rest| rest.starts_with(std::path::MAIN_SEPARATOR))
 }
 
 #[cfg(test)]
@@ -1873,7 +1950,8 @@ mod tests {
     use super::*;
 
     fn status_of(entries: &[(&str, GitBadge)]) -> RepoStatus {
-        let mut status = RepoStatus::new(PathBuf::from(r"C:\repo"), Some("main".into()));
+        let root = if cfg!(windows) { r"C:\repo" } else { "/repo" };
+        let mut status = RepoStatus::new(PathBuf::from(root), Some("main".into()));
         for (path, badge) in entries {
             status.add(path, *badge);
         }
@@ -1892,8 +1970,13 @@ mod tests {
         ])
     }
 
+    /// `s` (written with `\`) below the sample repository.
     fn p(s: &str) -> PathBuf {
-        PathBuf::from(format!(r"C:\repo\{s}"))
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\repo\{s}"))
+        } else {
+            PathBuf::from(format!("/repo/{}", s.replace('\\', "/")))
+        }
     }
 
     #[test]
@@ -1903,10 +1986,13 @@ mod tests {
             status.badge(&p(r"src\my file.rs"), false),
             Some(GitBadge::Modified)
         );
-        assert_eq!(
-            status.badge(&p(r"SRC\My File.rs"), false),
+        // Unix names are case-sensitive.
+        let other_case = if cfg!(windows) {
             Some(GitBadge::Modified)
-        );
+        } else {
+            None
+        };
+        assert_eq!(status.badge(&p(r"SRC\My File.rs"), false), other_case);
         assert_eq!(status.badge(&p("added.rs"), false), Some(GitBadge::Added));
         assert_eq!(
             status.badge(&p("conflict.rs"), false),
@@ -2223,19 +2309,37 @@ mod tests {
     /// it from its drive's root.
     fn assert_contained(opened: &[String], root_final: &str, what: &str) {
         assert!(!opened.is_empty(), "{what}: nothing recorded");
+        let sep = std::path::MAIN_SEPARATOR;
         for path in opened {
-            let key = path.to_lowercase();
-            let key = key.trim_end_matches('\\');
+            let key = fold(path);
+            let key = key.trim_end_matches(sep);
             assert!(
                 key == root_final
-                    || key.starts_with(&format!("{root_final}\\"))
-                    || root_final.starts_with(&format!("{key}\\")),
+                    || key.starts_with(&format!("{root_final}{sep}"))
+                    || root_final.starts_with(&format!("{key}{sep}")),
                 "{what}: opened {path} outside {root_final}"
             );
         }
     }
 
+    /// Removes a link made by [`junction`] (a folder on Windows, a file-like symlink on Unix).
+    fn remove_junction(link: &Path) -> std::io::Result<()> {
+        if cfg!(windows) {
+            std::fs::remove_dir(link)
+        } else {
+            std::fs::remove_file(link)
+        }
+    }
+
+    /// Makes `link` a junction to `target`. Needs no rights; false if it failed. (On Unix, a
+    /// directory symlink, the nearest thing.)
+    #[cfg(unix)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
     /// Makes `link` a junction to `target`. Needs no rights; false if it failed.
+    #[cfg(windows)]
     fn junction(link: &Path, target: &Path) -> bool {
         std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
@@ -2250,6 +2354,12 @@ mod tests {
     /// Makes `link` a directory or file symlink to `target`. Needs developer mode or admin
     /// rights; tests skip their symlink part without them.
     fn symlink(link: &Path, target: &str, dir: bool) -> bool {
+        #[cfg(unix)]
+        let made = {
+            let _ = dir;
+            std::os::unix::fs::symlink(target, link)
+        };
+        #[cfg(windows)]
         let made = if dir {
             std::os::windows::fs::symlink_dir(target, link)
         } else {
@@ -2266,6 +2376,14 @@ mod tests {
     /// targets, but the file system stores any. Needs no rights; false if it failed. (Windows
     /// itself refuses to follow a mount point to a share; symlinks, which need developer mode,
     /// are what reach one. Both are refused unfollowed.)
+    #[cfg(unix)]
+    fn net_junction(_link: &Path) -> bool {
+        eprintln!("skipped: no network junctions on Unix");
+        false
+    }
+
+    /// See the Windows version.
+    #[cfg(windows)]
     fn net_junction(link: &Path) -> bool {
         use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::{CloseHandle, GENERIC_WRITE};
@@ -2370,6 +2488,25 @@ mod tests {
         format!("\"{}\"", path.to_string_lossy().replace('\\', "/"))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_paths_are_resolved_by_text_alone() {
+        let root = Path::new("/work/repo");
+        let git_dir = Path::new("/work/repo/.git");
+        let ok = |base: &Path, v: &str| resolve(base, v, root).map(|p| path_key(&p));
+        assert_eq!(ok(root, "../main/.git").as_deref(), Some("/work/main/.git"));
+        assert_eq!(ok(git_dir, "..").as_deref(), Some("/work/repo"));
+        assert_eq!(ok(git_dir, "/work/repo/./x/../").as_deref(), Some("/work/repo"));
+        assert_eq!(ok(git_dir, "/elsewhere/x").as_deref(), Some("/elsewhere/x"));
+        assert_eq!(ok(git_dir, "a\\b:c").as_deref(), Some("/work/repo/.git/a\\b:c"));
+        assert_eq!(absolute("info/exclude", root), None);
+        assert!(absolute("/work/repo/.git/info/x", root).is_some());
+        assert!(inside(Path::new("/work/repo/.git/x"), git_dir));
+        assert!(!inside(Path::new("/work/repo/.gitx"), git_dir));
+        assert!(!inside(Path::new("/work/Repo/.git/x"), git_dir));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn paths_are_resolved_by_text_alone() {
         let root = Path::new(r"C:\work\repo");
@@ -2484,7 +2621,7 @@ mod tests {
         std::fs::remove_file(plain.path().join(".git")).unwrap();
         if junction(&plain.path().join(".git"), &target) {
             assert_refused(plain.path(), ".git junction");
-            std::fs::remove_dir(plain.path().join(".git")).unwrap();
+            remove_junction(&plain.path().join(".git")).unwrap();
         }
         if net_junction(&plain.path().join(".git")) {
             assert_refused(plain.path(), ".git junction to a share");
@@ -2584,7 +2721,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&info);
         assert!(junction(&info, outside.path()));
         assert_refused(tmp.path(), "info junction");
-        let _ = std::fs::remove_dir(&info);
+        let _ = remove_junction(&info);
         if net_junction(&info) {
             assert_refused(tmp.path(), "info junction to a share");
         }
@@ -2641,13 +2778,13 @@ mod tests {
         std::fs::rename(&pack, &moved).unwrap();
         assert!(junction(&pack, &moved));
         assert_refused(tmp.path(), "pack folder junction");
-        let _ = std::fs::remove_dir(&pack);
+        let _ = remove_junction(&pack);
         if net_junction(&pack) {
             assert_refused(tmp.path(), "pack folder junction to a share");
         }
 
         // A pack index that is a link to a share.
-        let _ = std::fs::remove_dir(&pack);
+        let _ = remove_junction(&pack);
         std::fs::rename(&moved, &pack).unwrap();
         let idx = std::fs::read_dir(&pack)
             .unwrap()
@@ -2657,7 +2794,7 @@ mod tests {
         std::fs::remove_file(&idx).unwrap();
         if net_junction(&idx) {
             assert_refused(tmp.path(), "pack index junction to a share");
-            std::fs::remove_dir(&idx).unwrap();
+            remove_junction(&idx).unwrap();
         }
         if symlink(&idx, &format!("{NET}\\pack.idx"), false) {
             assert_refused(tmp.path(), "pack index symlink to a share");
@@ -2688,12 +2825,12 @@ mod tests {
         assert!(git(root, &["rm", "-q", "--cached", "d2/f7.txt"]));
         let status = read_status(root).expect("status");
         let badge = |p: &str| status.badge(&root.join(p), false);
-        assert_eq!(badge(r"d1\f3.txt"), Some(GitBadge::Modified));
-        assert_eq!(badge(r"d2\added.txt"), Some(GitBadge::Added));
+        assert_eq!(badge("d1/f3.txt"), Some(GitBadge::Modified));
+        assert_eq!(badge("d2/added.txt"), Some(GitBadge::Added));
         // Removed from the index: a staged deletion, which outranks "untracked".
-        assert_eq!(badge(r"d2\f7.txt"), Some(GitBadge::Modified));
-        assert_eq!(badge(r"d1\f4.txt"), None);
-        assert_eq!(badge(r"d2\f8.txt"), None);
+        assert_eq!(badge("d2/f7.txt"), Some(GitBadge::Modified));
+        assert_eq!(badge("d1/f4.txt"), None);
+        assert_eq!(badge("d2/f8.txt"), None);
     }
 
     #[test]
@@ -2839,7 +2976,7 @@ mod tests {
         }
         let status = assert_fast_and_contained(root, "junction on a tracked path").expect("status");
         assert_eq!(
-            status.badge(&root.join(r"folder\file.txt"), false),
+            status.badge(&root.join("folder/file.txt"), false),
             Some(GitBadge::Modified)
         );
         // The junction itself is an untracked entry, as Git lists it.
@@ -2852,7 +2989,7 @@ mod tests {
         if net_junction(&root.join("net")) || symlink(&root.join("net"), NET, true) {
             let status = assert_fast_and_contained(root, "symlink to a share").expect("status");
             assert_eq!(
-                status.badge(&root.join(r"net\file.txt"), false),
+                status.badge(&root.join("net/file.txt"), false),
                 Some(GitBadge::Modified)
             );
         }
@@ -2894,11 +3031,11 @@ mod tests {
             return;
         }
         assert_refused(root, "ref chain through a junction");
-        std::fs::remove_dir(refs.join("remotes")).unwrap();
+        remove_junction(&refs.join("remotes")).unwrap();
         std::fs::create_dir_all(refs.join("remotes")).unwrap();
         if net_junction(&origin) {
             assert_refused(root, "ref chain through a junction to a share");
-            std::fs::remove_dir(&origin).unwrap();
+            remove_junction(&origin).unwrap();
         }
 
         // The end of the chain a symlink to a share.
@@ -3012,7 +3149,12 @@ mod tests {
         assert_eq!(fs.file_named(&a, "f.txt").err(), Some(safe_fs::Error::Link));
 
         // Names that are not one plain component are never passed to the system.
-        for bad in ["..", ".", "a/b", r"a\b", "f.txt:stream", ""] {
+        let bad_names: &[&str] = if cfg!(windows) {
+            &["..", ".", "a/b", r"a\b", "f.txt:stream", ""]
+        } else {
+            &["..", ".", "a/b", ""]
+        };
+        for &bad in bad_names {
             assert_eq!(
                 fs.file_named(&top, bad).err(),
                 Some(safe_fs::Error::BadName),
@@ -3065,6 +3207,7 @@ mod tests {
 
     /// Review item 1: a folder on a share, or on no local drive, is refused before anything
     /// is opened.
+    #[cfg(windows)]
     #[test]
     fn remote_roots_are_refused_before_any_probe() {
         let never = || false;
@@ -3191,6 +3334,7 @@ mod tests {
 
     /// Review item 5: every relative open asks not to follow links, and every file open not
     /// to recall a cloud placeholder.
+    #[cfg(windows)]
     #[test]
     fn every_open_asks_for_no_recall_and_no_link_following() {
         use windows::Wdk::Storage::FileSystem::{FILE_OPEN_NO_RECALL, FILE_OPEN_REPARSE_POINT};
@@ -3205,6 +3349,7 @@ mod tests {
 
     /// Review r2 item 1: a SUBST drive is an alias for a folder path, which could hold links;
     /// it is refused before anything is opened.
+    #[cfg(windows)]
     #[test]
     fn subst_drives_are_refused() {
         assert!(safe_fs::is_volume_device(r"\Device\HarddiskVolume3"));
@@ -3470,5 +3615,99 @@ mod tests {
         junk.extend(*b"\xff\xff\xff");
         write_index(root, &[b"f".to_vec()], &junk);
         assert!(read_status(root).is_ok());
+    }
+
+    /// Unix: a FIFO or device node in the work tree is listed but never opened (opening a FIFO
+    /// would block the scan until a writer came), and a tracked path that became one shows as
+    /// modified without stalling.
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_never_opened() {
+        let Some(repo) = fixture_repo() else { return };
+        let root = repo.path();
+        std::fs::remove_file(root.join("a.txt")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &root.join("a.txt"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let (fs, top) = fs_at(root, false);
+        let entry = fs.lookup(&top, "a.txt").unwrap();
+        assert_ne!(entry.info.attributes & safe_fs::ATTR_SPECIAL, 0);
+        assert_eq!(fs.file(&top, &entry).err(), Some(safe_fs::Error::WrongKind));
+        let status = assert_fast_and_contained(root, "fifo").expect("status");
+        assert_eq!(
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+    }
+
+    /// Unix: names are case-sensitive and may hold `\` and `:`; badges follow the exact name.
+    #[cfg(unix)]
+    #[test]
+    fn unix_names_are_case_sensitive_and_may_hold_backslashes() {
+        let Some(repo) = fixture_repo() else { return };
+        let root = repo.path();
+        for name in [r"back\slash.txt", "co:lon.txt", "A.txt"] {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+        assert!(git(root, &["add", r"back\slash.txt", "co:lon.txt"]));
+        assert!(git(root, &["commit", "-q", "-m", "names"]));
+        std::fs::write(root.join("co:lon.txt"), "changed").unwrap();
+        let status = assert_fast_and_contained(root, "names").expect("status");
+        assert_eq!(status.badge(&root.join(r"back\slash.txt"), false), None);
+        assert_eq!(
+            status.badge(&root.join("co:lon.txt"), false),
+            Some(GitBadge::Modified)
+        );
+        // `A.txt` is untracked; `a.txt` (tracked, edited) is a different file.
+        assert_eq!(status.badge(&root.join("A.txt"), false), Some(GitBadge::Added));
+        assert_eq!(
+            status.badge(&root.join("a.txt"), false),
+            Some(GitBadge::Modified)
+        );
+    }
+
+    /// Unix: an ancestor folder that may be searched but not listed (`--x`) does not stop
+    /// discovery or the scan.
+    #[cfg(unix)]
+    #[test]
+    fn search_only_ancestors_are_crossed() {
+        use std::os::unix::fs::PermissionsExt;
+        let outer = tempfile::tempdir().unwrap();
+        let gate = outer.path().join("gate");
+        std::fs::create_dir(&gate).unwrap();
+        let Some(repo) = fixture_repo() else { return };
+        let inner = gate.join("repo");
+        // Both temporary folders are in the same place, so this is a plain rename.
+        std::fs::rename(repo.path(), &inner).unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let found = find(&inner.join("ud"));
+        let status = read_status(&inner);
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(found, Some(inner.clone()));
+        assert!(status.is_ok(), "{status:?}");
+    }
+
+    /// Unix: network and FUSE file systems are recognised by their `statfs` magic.
+    #[cfg(unix)]
+    #[test]
+    fn remote_file_systems_are_recognised() {
+        for magic in [0x6969u64, 0xFF53_4D42, 0xFE53_4D42, 0x6573_5546, 0x517B] {
+            assert!(safe_fs::is_remote_magic(magic), "{magic:#x}");
+        }
+        // ext4, btrfs, tmpfs, xfs
+        for magic in [0xEF53u64, 0x9123_683E, 0x0102_1994, 0x5846_5342] {
+            assert!(!safe_fs::is_remote_magic(magic), "{magic:#x}");
+        }
+        // A sign-extended f_type still matches.
+        assert!(safe_fs::is_remote_magic(0xFFFF_FFFF_FF53_4D42));
+        assert_eq!(safe_fs::local_drive(Path::new("/home")), Some('/'));
+        assert_eq!(safe_fs::local_drive(Path::new("rel/path")), None);
+        assert_eq!(lexical(Path::new("/a/./b/../c")), Some(PathBuf::from("/a/c")));
+        assert_eq!(lexical(Path::new("a/b")), None);
     }
 }

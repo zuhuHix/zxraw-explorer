@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (build and test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build all targets
+        run: cargo build --workspace --all-targets
+
+      # forge-app's e2e target is Windows-only for now and is not run here.
+      - name: Test (other crates)
+        run: cargo test --workspace --exclude forge-app --no-fail-fast
+
+      - name: Test (forge-app unit tests)
+        run: cargo test -p forge-app --bins --no-fail-fast
+
+  windows:
+    name: Windows (build and test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build all targets
+        run: cargo build --workspace --all-targets
+
+      # forge-app's e2e target is not run here.
+      - name: Test (other crates)
+        run: cargo test --workspace --exclude forge-app --no-fail-fast
+
+      - name: Test (forge-app unit tests)
+        run: cargo test -p forge-app --bins --no-fail-fast

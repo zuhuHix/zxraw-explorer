@@ -1453,6 +1453,7 @@ fn archive_pane_lists_folders_and_up_returns_to_the_zip() {
     assert_no_crash(&profile);
 }
 
+#[cfg(windows)]
 #[test]
 fn archive_items_copied_to_a_folder_are_extracted() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1564,6 +1565,7 @@ fn archive_f6_out_removes_the_entries_once_the_move_is_accepted() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn archive_cut_here_and_pasted_in_the_other_pane_moves_out_once_accepted() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1605,6 +1607,7 @@ fn archive_cut_here_and_pasted_in_the_other_pane_moves_out_once_accepted() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn archive_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1652,6 +1655,7 @@ fn archive_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn archive_cut_and_shell_pasted_asks_to_finish_the_move_and_removes_on_accept() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1710,6 +1714,7 @@ fn zip_with_link(dir: &Path) -> PathBuf {
     path
 }
 
+#[cfg(windows)]
 #[test]
 fn a_folder_moved_out_keeps_its_link_and_itself_in_the_archive() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1746,6 +1751,7 @@ fn a_folder_moved_out_keeps_its_link_and_itself_in_the_archive() {
     assert_eq!(zip_names(&zip), ["docs/", "docs/link", "top.txt"]);
 }
 
+#[cfg(windows)]
 #[test]
 fn an_archive_changed_while_the_move_prompt_is_open_keeps_every_entry() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1790,6 +1796,7 @@ fn an_archive_changed_while_the_move_prompt_is_open_keeps_every_entry() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn an_archive_replaced_by_an_identical_copy_while_the_move_prompt_is_open_keeps_every_entry() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1828,6 +1835,7 @@ fn an_archive_replaced_by_an_identical_copy_while_the_move_prompt_is_open_keeps_
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn names_differing_only_in_case_are_copied_out_and_nothing_is_removed() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1868,6 +1876,7 @@ fn names_differing_only_in_case_are_copied_out_and_nothing_is_removed() {
     assert_eq!(zip_names(&zip), ["A.txt", "a.txt", "top.txt"]);
 }
 
+#[cfg(windows)]
 #[test]
 fn archive_cut_then_archive_changed_shell_paste_gives_out_and_removes_nothing() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -2322,6 +2331,7 @@ fn tar_zst_extract_to_folder_and_single_gz_extract_here() {
     assert_eq!(fs::read(zips.join("notes.txt")).unwrap(), b"compressed notes");
 }
 
+#[cfg(windows)]
 #[test]
 fn seven_zip_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -2364,6 +2374,7 @@ fn seven_zip_folder_copied_and_shell_pasted_is_extracted_byte_identical() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn encrypted_archive_copy_asks_for_the_password_before_the_copy_is_published() {
     let sandbox = tempfile::tempdir().unwrap();

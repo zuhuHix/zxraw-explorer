@@ -349,6 +349,7 @@ fn menu_items(ui: &mut Ui, items: &[Option<Cmd>], menu: &MenuCtx, out: &mut Vec<
                 ui.separator();
             }
             Some(Cmd::AddToNetwork) if !menu.network => {}
+            Some(c) if !crate::platform::command_available(*c) => {}
             Some(c) => item(ui, *c, c.label()),
         }
     }

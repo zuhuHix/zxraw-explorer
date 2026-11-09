@@ -1114,6 +1114,7 @@ fn assert_zip_sub_copied(dest: &Path, big: &[u8]) {
 /// The reported bug: items selected in a zip folder in Explorer and copied (virtual files:
 /// no file list on the clipboard) said "Nothing to paste". They are copied out instead, the
 /// folder structure kept, and the zip is left as it was.
+#[cfg(windows)]
 #[test]
 fn items_copied_in_an_explorer_zip_folder_paste_into_the_folder() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1259,14 +1260,17 @@ fn dropping_a_folder_onto_its_own_child_does_nothing() {
     expect_ok(&drop_script_run(sandbox.path(), &script));
 }
 
+#[cfg(windows)]
 #[path = "../../../forge-win/src/clipboard_test_support.rs"]
 mod clipboard_test_support;
 
+#[cfg(windows)]
 use clipboard_test_support::{ClipboardLock, Snapshot};
 
 /// Scenarios that use the real Windows clipboard run one at a time, also against other
 /// test processes (forge-win's clipboard unit tests, e2e runs in other worktrees): see
 /// [`ClipboardLock`].
+#[cfg(windows)]
 pub(crate) fn clipboard_lock() -> ClipboardLock {
     ClipboardLock::acquire()
 }
@@ -1282,6 +1286,7 @@ pub(crate) fn clipboard_lock() -> ClipboardLock {
 /// copy the user makes during the test is kept, and nothing is restored. Remaining window: a
 /// user copy that lands between two of the test's own clipboard writes less than one
 /// watcher poll (50 ms) apart, or a user emptying the clipboard, looks like the test's own.
+#[cfg(windows)]
 pub(crate) fn clipboard_guard(sandbox: &Path) -> Option<ClipboardGuard> {
     let lock = clipboard_lock();
     let saved = match Snapshot::save() {
@@ -1312,6 +1317,7 @@ pub(crate) fn clipboard_guard(sandbox: &Path) -> Option<ClipboardGuard> {
 
 /// Checks every clipboard change after sequence `start` until `stop`. Returns whether one
 /// was not the test's, and the last sequence seen that was.
+#[cfg(windows)]
 fn watch_clipboard(
     sandbox: &Path,
     start: u32,
@@ -1332,6 +1338,7 @@ fn watch_clipboard(
     (false, seen)
 }
 
+#[cfg(windows)]
 pub(crate) struct ClipboardGuard {
     saved: Snapshot,
     sandbox: PathBuf,
@@ -1340,6 +1347,7 @@ pub(crate) struct ClipboardGuard {
     _lock: ClipboardLock,
 }
 
+#[cfg(windows)]
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1369,11 +1377,13 @@ impl Drop for ClipboardGuard {
 }
 
 /// The current clipboard text (empty if it has none), or `None` if it cannot be saved.
+#[cfg(windows)]
 fn clipboard_text() -> Option<String> {
     Snapshot::save().ok().map(|s| s.text().unwrap_or_default())
 }
 
 /// The guard puts the user's clipboard back after a test that left its own cut there.
+#[cfg(windows)]
 #[test]
 fn clipboard_guard_restores_the_clipboard_after_a_test_cut() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1399,6 +1409,7 @@ fn clipboard_guard_restores_the_clipboard_after_a_test_cut() {
 }
 
 /// It leaves alone a clipboard that something else changed during the test.
+#[cfg(windows)]
 #[test]
 fn clipboard_guard_keeps_a_newer_clipboard() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1419,6 +1430,7 @@ fn clipboard_guard_keeps_a_newer_clipboard() {
 }
 
 /// A clipboard holding files is never overwritten: the guard refuses to start.
+#[cfg(windows)]
 #[test]
 fn clipboard_guard_refuses_a_clipboard_holding_files() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1442,6 +1454,7 @@ fn clipboard_guard_refuses_a_clipboard_holding_files() {
     assert!(unchanged, "the guard wrote to the clipboard");
 }
 /// Two folders with a file each under `<sandbox>/Desktop`, and an empty `<sandbox>/work`.
+#[cfg(windows)]
 fn clipboard_fixture(sandbox: &Path) -> (PathBuf, PathBuf, [PathBuf; 2]) {
     let desktop = sandbox.join("Desktop");
     let work = sandbox.join("work");
@@ -1455,6 +1468,7 @@ fn clipboard_fixture(sandbox: &Path) -> (PathBuf, PathBuf, [PathBuf; 2]) {
     (desktop, work, folders)
 }
 
+#[cfg(windows)]
 fn assert_folders_moved(work: &Path, folders: &[PathBuf; 2]) {
     for folder in folders {
         assert!(!folder.exists(), "{} was not moved away", folder.display());
@@ -1472,6 +1486,7 @@ fn assert_folders_moved(work: &Path, folders: &[PathBuf; 2]) {
 /// The reported bug: folders cut in Explorer (`CF_HDROP` + "Preferred DropEffect" = move, and
 /// no text) and pasted with a real Ctrl+V on the same volume. egui-winit drops Ctrl+V when
 /// the clipboard has no text, so nothing happened at all.
+#[cfg(windows)]
 #[test]
 fn explorer_cut_of_two_folders_pastes_with_ctrl_v() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1502,6 +1517,7 @@ fn explorer_cut_of_two_folders_pastes_with_ctrl_v() {
 
 /// The same with Shift+Insert, before anything in the window was clicked, and a copy rather
 /// than a cut: the sources stay.
+#[cfg(windows)]
 #[test]
 fn explorer_copy_pastes_with_shift_insert_without_a_click() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1538,6 +1554,7 @@ fn explorer_copy_pastes_with_shift_insert_without_a_click() {
 }
 
 /// Cut and paste inside ZXraw with the real shortcuts: a file and a folder.
+#[cfg(windows)]
 #[test]
 fn in_app_cut_pastes_with_ctrl_v() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1577,6 +1594,7 @@ fn in_app_cut_pastes_with_ctrl_v() {
 /// The reported bug: a cut made in ZXraw and pasted in Explorer (here its real "paste" verb,
 /// as on the Desktop) moved the folder, but ZXraw kept showing "1 cut" and the stale cut
 /// stayed on the Windows clipboard. Explorer drops its own cut after such a paste.
+#[cfg(windows)]
 #[test]
 fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1652,6 +1670,7 @@ fn a_cut_pasted_in_explorer_is_used_up_in_zxraw() {
 }
 
 /// Waits (up to 60 s) until the Windows clipboard holds a cut of exactly `paths`.
+#[cfg(windows)]
 fn wait_for_move_cut(paths: Vec<PathBuf>) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -1669,6 +1688,7 @@ fn wait_for_move_cut(paths: Vec<PathBuf>) -> bool {
 
 /// Explorer moves one of two cut folders away: ZXraw drops it from the cut and the clipboard
 /// keeps only the item that is still there.
+#[cfg(windows)]
 #[test]
 fn an_item_moved_away_leaves_the_rest_of_the_cut() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1714,6 +1734,7 @@ fn an_item_moved_away_leaves_the_rest_of_the_cut() {
 
 /// Explorer replaces a cut folder with a different one of the same name (a new file ID). The
 /// cut must drop it rather than move the replacement.
+#[cfg(windows)]
 #[test]
 fn a_replaced_cut_item_is_never_moved() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1772,6 +1793,7 @@ fn a_replaced_cut_item_is_never_moved() {
 }
 
 /// Renaming a cut item in ZXraw (F2) keeps the cut on the new name, so a later paste moves it.
+#[cfg(windows)]
 #[test]
 fn renaming_a_cut_item_in_zxraw_keeps_it_cut() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1825,6 +1847,7 @@ fn renaming_a_cut_item_in_zxraw_keeps_it_cut() {
 
 /// An older ZXraw copy must not shadow a newer cut from Explorer. Paste here is the
 /// command the background context menu runs.
+#[cfg(windows)]
 #[test]
 fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1863,6 +1886,7 @@ fn explorer_cut_after_an_in_app_copy_pastes_the_explorer_items() {
 
 /// Ctrl+Shift+V is another shortcut: with text on the clipboard egui still reports it as a
 /// paste, but it must not paste files. Ctrl+V then does.
+#[cfg(windows)]
 #[test]
 fn ctrl_shift_v_does_not_paste_files() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1898,11 +1922,13 @@ fn ctrl_shift_v_does_not_paste_files() {
 }
 
 /// The files of the folder tree that the cut-to-Desktop scenarios cut, relative to it.
+#[cfg(windows)]
 const TREE_FILES: [&str; 4] = ["one.txt", "two.bin", "sub/three.txt", "sub/deeper/four.txt"];
 
 /// `<sandbox>/source` with `Shoot C` (files and nested subfolders, see [`TREE_FILES`]) and
 /// `Shoot D`, and empty `<sandbox>/Desktop` and `<sandbox>/elsewhere` folders. The
 /// "Desktop" is a temp folder, never the real one.
+#[cfg(windows)]
 fn tree_fixture(sandbox: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let source = sandbox.join("source");
     for (i, file) in TREE_FILES.iter().enumerate() {
@@ -1918,6 +1944,7 @@ fn tree_fixture(sandbox: &Path) -> (PathBuf, PathBuf, PathBuf) {
 
 /// `Shoot C` left `source` and arrived in `dest` byte for byte; `Shoot D` stayed,
 /// `elsewhere` is still empty and the clipboard no longer holds the cut.
+#[cfg(windows)]
 fn assert_tree_moved(source: &Path, dest: &Path, elsewhere: &Path) {
     assert!(
         !source.join("Shoot C").exists(),
@@ -1952,6 +1979,7 @@ fn assert_tree_moved(source: &Path, dest: &Path, elsewhere: &Path) {
 
 /// After the cut was used up: a later Ctrl+V in `elsewhere` must paste nothing and show
 /// no error ("Left out", a failed move), only that there is nothing to paste.
+#[cfg(windows)]
 fn later_ctrl_v_steps(elsewhere: &Path) -> String {
     format!(
         "navigate {elsewhere}\n\
@@ -1974,6 +2002,7 @@ fn later_ctrl_v_steps(elsewhere: &Path) -> String {
 ///
 /// The clipboard is shared with the user's session, so this refuses to move anything
 /// unless the clipboard holds exactly the test's own cut.
+#[cfg(windows)]
 mod desktop {
     use std::path::{Path, PathBuf};
 
@@ -2176,6 +2205,7 @@ mod desktop {
 /// Cut a folder tree in ZXraw, let `paste` paste the cut (the paths it is given, all inside
 /// the sandbox) into the "Desktop" folder once the cut is on the clipboard, then press
 /// Ctrl+V in ZXraw somewhere else.
+#[cfg(windows)]
 fn cut_pasted_on_the_desktop(
     paste: impl FnOnce(&Path, &[PathBuf]) -> Result<String, String> + Send + 'static,
 ) {
@@ -2223,18 +2253,21 @@ fn cut_pasted_on_the_desktop(
 
 /// The user's report: Ctrl+X on a folder in ZXraw, paste on the Desktop. Here the Desktop
 /// leaves the clipboard alone, so ZXraw must notice by itself that its cut was used up.
+#[cfg(windows)]
 #[test]
 fn a_folder_cut_in_zxraw_pastes_on_the_desktop() {
     cut_pasted_on_the_desktop(|dest, cut| desktop::paste(dest, cut, false));
 }
 
 /// The same when the shell empties the clipboard after the paste.
+#[cfg(windows)]
 #[test]
 fn a_folder_cut_in_zxraw_pastes_on_a_desktop_that_clears_the_clipboard() {
     cut_pasted_on_the_desktop(|dest, cut| desktop::paste(dest, cut, true));
 }
 
 /// The same tree cut and pasted inside ZXraw; a later Ctrl+V pastes nothing.
+#[cfg(windows)]
 #[test]
 fn a_folder_tree_cut_in_zxraw_pastes_once_in_zxraw() {
     let sandbox = tempfile::tempdir().unwrap();

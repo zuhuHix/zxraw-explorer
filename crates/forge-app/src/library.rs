@@ -902,17 +902,23 @@ fn has_note(notes: Option<&str>) -> bool {
 }
 
 /// The new location of `path` when `old` (a file or folder) was moved to `new`. Components
-/// are compared case-insensitively, so `C:\Shoot` matches `c:\shoot\a.jpg`, while
-/// `C:\Shoot2` does not match `C:\Shoot`.
+/// are compared case-insensitively on Windows, so `C:\Shoot` matches `c:\shoot\a.jpg`; on
+/// Linux `/Shoot` and `/shoot` are different folders and must not match. `C:\Shoot2` never
+/// matches `C:\Shoot`.
 pub(crate) fn moved_path(path: &Path, old: &Path, new: &Path) -> Option<PathBuf> {
     let mut parts = path.components();
     for old_part in old.components() {
         let part = parts.next()?;
-        if !part
-            .as_os_str()
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&old_part.as_os_str().to_string_lossy())
-        {
+        let (name, old_name) = (
+            part.as_os_str().to_string_lossy(),
+            old_part.as_os_str().to_string_lossy(),
+        );
+        let same = if cfg!(windows) {
+            name.eq_ignore_ascii_case(&old_name)
+        } else {
+            name == old_name
+        };
+        if !same {
             return None;
         }
     }
@@ -1874,6 +1880,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(windows)]
     #[test]
     fn moved_path_matches_whole_components_case_insensitively() {
         let old = Path::new(r"C:\Shoot");
@@ -1885,6 +1892,20 @@ mod tests {
         assert_eq!(moved_path(Path::new(r"C:\Shoot"), old, new), Some(new.to_path_buf()));
         assert_eq!(moved_path(Path::new(r"C:\Shoot2\a.jpg"), old, new), None);
         assert_eq!(moved_path(Path::new(r"C:\Other\a.jpg"), old, new), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn moved_path_matches_whole_components_case_sensitively() {
+        let old = Path::new("/data/Shoot");
+        let new = Path::new("/archive/Shoot");
+        assert_eq!(
+            moved_path(Path::new("/data/Shoot/day1/a.jpg"), old, new),
+            Some(PathBuf::from("/archive/Shoot/day1/a.jpg"))
+        );
+        assert_eq!(moved_path(Path::new("/data/Shoot"), old, new), Some(new.to_path_buf()));
+        assert_eq!(moved_path(Path::new("/data/shoot/day1/a.jpg"), old, new), None);
+        assert_eq!(moved_path(Path::new("/data/Shoot2/a.jpg"), old, new), None);
     }
 
     #[test]

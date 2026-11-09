@@ -41,13 +41,14 @@ use crate::app::ZxrawApp;
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 /// Named mutex the app holds while running; `packaging/zxraw.iss` names it in `AppMutex`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const APP_MUTEX: &str = "ZXrawExplorerRunning";
 
 const API_URL: &str = "https://api.github.com/repos/zuhuHix/zxraw-explorer/releases/latest";
 const RELEASES_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/";
 const DOWNLOAD_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/download/";
 /// Redirects to the latest stable release's tag page; not subject to the API's rate limit.
-const LATEST_PAGE_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/latest";
+pub const LATEST_PAGE_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/latest";
 const TAG_URL: &str = "https://github.com/zuhuHix/zxraw-explorer/releases/tag/";
 /// Hosts GitHub redirects release downloads to.
 const DOWNLOAD_CDN_HOSTS: &[&str] = &[
@@ -273,6 +274,10 @@ fn unix_now() -> i64 {
 /// local test server). Debug and automation builds accept `ZXRAW_UPDATE_API` so tests can
 /// point the check at a local listener; release builds always ask GitHub.
 fn api_url(automated: bool) -> Option<String> {
+    // The check downloads through WinHTTP, which only Windows has (see `forge_win::http`).
+    if !cfg!(windows) {
+        return None;
+    }
     #[cfg(any(debug_assertions, feature = "automation"))]
     if let Ok(url) = std::env::var("ZXRAW_UPDATE_API") {
         return Some(url);
@@ -425,6 +430,12 @@ pub fn tick(app: &mut ZxrawApp) {
 /// "Check for updates" (Settings button and the command palette).
 pub fn check_now(app: &mut ZxrawApp) {
     if app.ops.updater.checking() {
+        return;
+    }
+    if !cfg!(windows) {
+        app.toast(format!(
+            "Update checks are not available on Linux; see {LATEST_PAGE_URL}"
+        ));
         return;
     }
     if api_url(app.testhook.active()).is_none() {
@@ -605,7 +616,7 @@ pub fn open_release_page(app: &mut ZxrawApp, update: &UpdateInfo) {
     }
     let target = PathBuf::from(&update.page_url);
     app.ops.spawn_shell("Open the release page", move || {
-        forge_win::open_default(&target)
+        crate::platform::open_default(&target)
     });
 }
 
@@ -1154,6 +1165,7 @@ mod tests {
         )
     }
 
+#[cfg_attr(not(windows), allow(dead_code))]
     fn sums_for(body: &[u8]) -> Vec<u8> {
         let hash: String = Sha256::digest(body)
             .iter()
@@ -1167,6 +1179,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
     fn a_verified_installer_is_kept_and_a_tampered_one_refused() {
         let good = b"MZ pretend installer".to_vec();
         let mut tampered = good.clone();
@@ -1268,6 +1281,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
     fn a_rate_limited_check_falls_back_to_the_release_page() {
         let good = b"MZ pretend installer".to_vec();
         let base = serve(vec![
@@ -1315,6 +1329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
     fn only_a_rate_limited_api_uses_the_release_page() {
         let answer = |status: &str| {
             format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -1361,6 +1376,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)] // Downloads through WinHTTP, which only Windows has.
     fn an_installer_of_unknown_size_still_needs_its_checksum() {
         let good = b"MZ pretend installer".to_vec();
         let mut tampered = good.clone();

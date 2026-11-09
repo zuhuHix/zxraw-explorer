@@ -59,6 +59,26 @@ pub(crate) fn path_str(p: &Path) -> String {
     }
 }
 
+/// Key form of a stored path for comparisons outside SQL. Windows paths are case-insensitive,
+/// so keys are lowercased there; Linux paths are case-sensitive and used as-is.
+pub(crate) fn path_key(s: &str) -> String {
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s.to_string()
+    }
+}
+
+/// ASCII case folding for path equality in relink (SQLite `NOCASE` also folds ASCII only).
+/// Windows only; Linux paths compare exactly.
+pub(crate) fn fold_ascii(s: &str) -> std::borrow::Cow<'_, str> {
+    if cfg!(windows) {
+        std::borrow::Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 /// Handle to the ZXraw Explorer database.
 pub struct Db {
     conn: Mutex<Connection>,
@@ -324,6 +344,21 @@ fn move_aside(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(aside)
+}
+
+/// Test fixture path in the local platform's syntax. Fixtures are written as Windows paths
+/// (`C:\photos\a.jpg`); elsewhere they become `/C/photos/a.jpg`, so the same logic runs on
+/// absolute paths with a drive-like top level.
+#[cfg(test)]
+pub(crate) fn wp(s: &str) -> String {
+    if cfg!(windows) {
+        return s.to_string();
+    }
+    let (drive, rest) = match s.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => (format!("/{}", *d as char), &s[2..]),
+        _ => (String::new(), s),
+    };
+    format!("{drive}{}", rest.replace('\\', "/"))
 }
 
 #[cfg(test)]

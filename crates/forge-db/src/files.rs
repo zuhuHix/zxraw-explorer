@@ -10,7 +10,7 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{DbError, Result};
-use crate::{Db, now_ms, path_str};
+use crate::{Db, fold_ascii, now_ms, path_str};
 
 pub type FileId = i64;
 pub type VolumeId = i64;
@@ -1080,15 +1080,11 @@ fn relink_paths(old: &Path, new: &Path) -> Result<Option<(String, String)>> {
     if old_s.is_empty() || new_s.is_empty() {
         return Err(DbError::Invalid("relink paths must not be empty".into()));
     }
-    if old_s.eq_ignore_ascii_case(&new_s) {
+    if fold_ascii(&old_s) == fold_ascii(&new_s) {
         return Ok(None);
     }
     let (lo, _) = subtree_bounds(&old_s);
-    if new_s.len() > old_s.len()
-        && new_s
-            .to_ascii_lowercase()
-            .starts_with(&lo.to_ascii_lowercase())
-    {
+    if new_s.len() > old_s.len() && fold_ascii(&new_s).starts_with(fold_ascii(&lo).as_ref()) {
         return Err(DbError::Invalid(
             "cannot relink a folder into itself".into(),
         ));
@@ -1119,7 +1115,7 @@ fn relink_tx(
     };
     // Parents before children keeps parent_path consistent at every step.
     rows.sort_by_key(|(_, p, _)| p.len());
-    let new_volume = if old_root.eq_ignore_ascii_case(&new_root) {
+    let new_volume = if fold_ascii(&old_root) == fold_ascii(&new_root) {
         None
     } else {
         Some(VolumeCache::new().get(tx, Path::new(&new_s))?)
@@ -1186,6 +1182,7 @@ fn relink_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wp;
 
     fn nf(p: &str, size: u64, mtime: i64) -> NewFile {
         NewFile {
@@ -1201,19 +1198,19 @@ mod tests {
     fn folders_under_lists_each_folder_below_the_root_once() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_files(&[
-            nf(r"C:\shoot\a.jpg", 1, 1),
-            nf(r"C:\shoot\day1\b.jpg", 1, 1),
-            nf(r"C:\shoot\day2\deep\c.jpg", 1, 1),
-            nf(r"C:\shoot\day2\deep\d.jpg", 1, 1),
-            nf(r"C:\other\e.jpg", 1, 1),
+            nf(&wp(r"C:\shoot\a.jpg"), 1, 1),
+            nf(&wp(r"C:\shoot\day1\b.jpg"), 1, 1),
+            nf(&wp(r"C:\shoot\day2\deep\c.jpg"), 1, 1),
+            nf(&wp(r"C:\shoot\day2\deep\d.jpg"), 1, 1),
+            nf(&wp(r"C:\other\e.jpg"), 1, 1),
         ])
         .unwrap();
         assert_eq!(
-            db.folders_under(Path::new(r"C:\shoot")).unwrap(),
+            db.folders_under(Path::new(&wp(r"C:\shoot"))).unwrap(),
             [
-                PathBuf::from(r"C:\shoot"),
-                PathBuf::from(r"C:\shoot\day1"),
-                PathBuf::from(r"C:\shoot\day2\deep"),
+                PathBuf::from(wp(r"C:\shoot")),
+                PathBuf::from(wp(r"C:\shoot\day1")),
+                PathBuf::from(wp(r"C:\shoot\day2\deep")),
             ]
         );
     }
@@ -1248,43 +1245,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn roots_and_bounds() {
-        assert_eq!(volume_root_of(Path::new(r"C:\a\b.txt")), r"C:\");
+        assert_eq!(volume_root_of(Path::new(&wp(r"C:\a\b.txt"))), wp(r"C:\"));
         assert_eq!(volume_root_of(Path::new(r"\\srv\share\x")), r"\\srv\share\");
-        assert_eq!(normalize_dir(r"C:\a\"), r"C:\a");
-        assert_eq!(normalize_dir(r"C:\"), r"C:\");
+        assert_eq!(normalize_dir(&wp(r"C:\a\")), wp(r"C:\a"));
+        assert_eq!(normalize_dir(&wp(r"C:\")), wp(r"C:\"));
         assert_eq!(
-            subtree_bounds(r"C:\a"),
-            (r"C:\a\".to_string(), r"C:\a]".to_string())
+            subtree_bounds(&wp(r"C:\a")),
+            (wp(r"C:\a\").to_string(), wp(r"C:\a]").to_string())
         );
         assert_eq!(
-            subtree_bounds(r"C:\"),
-            (r"C:\".to_string(), r"C:]".to_string())
+            subtree_bounds(&wp(r"C:\")),
+            (wp(r"C:\").to_string(), r"C:]".to_string())
         );
+    }
+
+    /// The portable part of `roots_and_bounds`: Linux has one volume root, `/`.
+    #[test]
+    #[cfg(not(windows))]
+    fn roots_and_bounds_unix() {
+        assert_eq!(volume_root_of(Path::new("/a/b.txt")), "/");
+        assert_eq!(volume_root_of(Path::new("/")), "/");
+        assert_eq!(normalize_dir("/a/"), "/a");
+        assert_eq!(normalize_dir("/"), "/");
+        assert_eq!(subtree_bounds("/a"), ("/a/".to_string(), "/a0".to_string()));
+        assert_eq!(subtree_bounds("/"), ("/".to_string(), "0".to_string()));
     }
 
     #[test]
     fn upsert_is_idempotent_and_invalidates_hashes() {
         let db = Db::open_in_memory().unwrap();
         let ids = db
-            .upsert_files(&[nf(r"C:\p\a.JPG", 10, 1), nf(r"C:\p\b.mov", 20, 1)])
+            .upsert_files(&[nf(&wp(r"C:\p\a.JPG"), 10, 1), nf(&wp(r"C:\p\b.mov"), 20, 1)])
             .unwrap();
-        let ids2 = db.upsert_files(&[nf(r"C:\p\a.JPG", 10, 1)]).unwrap();
+        let ids2 = db.upsert_files(&[nf(&wp(r"C:\p\a.JPG"), 10, 1)]).unwrap();
         assert_eq!(ids[0], ids2[0]);
         let r = db.file(ids[0]).unwrap().unwrap();
         assert_eq!(r.ext, "jpg");
         assert_eq!(r.media_kind, MediaKind::Image);
-        assert_eq!(r.parent_path, PathBuf::from(r"C:\p"));
+        assert_eq!(r.parent_path, PathBuf::from(wp(r"C:\p")));
         // Same path, different ASCII case → same row (Windows semantics).
+        #[cfg(windows)]
         assert_eq!(db.file_id(Path::new(r"c:\P\A.jpg")).unwrap(), Some(ids[0]));
+        // Linux file names are case-sensitive: another case is a different, unindexed file.
+        #[cfg(not(windows))]
+        assert_eq!(db.file_id(Path::new(&wp(r"C:\p\A.JPG"))).unwrap(), None);
 
         db.set_hashes(ids[0], Some("pp"), Some("ff")).unwrap();
-        db.upsert_files(&[nf(r"C:\p\a.JPG", 10, 1)]).unwrap();
+        db.upsert_files(&[nf(&wp(r"C:\p\a.JPG"), 10, 1)]).unwrap();
         assert_eq!(
             db.file(ids[0]).unwrap().unwrap().full_hash.as_deref(),
             Some("ff")
         );
-        db.upsert_files(&[nf(r"C:\p\a.JPG", 11, 2)]).unwrap();
+        db.upsert_files(&[nf(&wp(r"C:\p\a.JPG"), 11, 2)]).unwrap();
         let r = db.file(ids[0]).unwrap().unwrap();
         assert_eq!(r.full_hash, None);
         assert_eq!(r.partial_hash, None);
@@ -1292,14 +1306,28 @@ mod tests {
         assert_eq!(db.volumes().unwrap().len(), 1);
     }
 
+    /// Linux file names are case-sensitive, so names that differ only by case are two files
+    /// and must not share a row (the path column is `BINARY` there, see `schema.rs`).
+    #[test]
+    #[cfg(not(windows))]
+    fn case_differing_names_are_distinct_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let ids = db
+            .upsert_files(&[nf(&wp(r"C:\p\IMG.jpg"), 1, 1), nf(&wp(r"C:\p\img.jpg"), 2, 1)])
+            .unwrap();
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(db.file(ids[1]).unwrap().unwrap().size, 2);
+        assert_eq!(db.file(ids[0]).unwrap().unwrap().size, 1);
+    }
+
     #[test]
     fn metadata_roundtrip_and_staleness() {
         let db = Db::open_in_memory().unwrap();
         let ids = db
             .upsert_files(&[
-                nf(r"C:\m\a.cr3", 1, 5),
-                nf(r"C:\m\b.mp4", 1, 5),
-                nf(r"C:\m\c.txt", 1, 5),
+                nf(&wp(r"C:\m\a.cr3"), 1, 5),
+                nf(&wp(r"C:\m\b.mp4"), 1, 5),
+                nf(&wp(r"C:\m\c.txt"), 1, 5),
             ])
             .unwrap();
         assert_eq!(db.files_needing_meta(10).unwrap().len(), 2);
@@ -1322,7 +1350,7 @@ mod tests {
         assert_eq!(db.image_meta(ids[0]).unwrap(), Some(im));
         assert_eq!(db.video_meta(ids[1]).unwrap(), Some(vm));
         assert!(db.files_needing_meta(10).unwrap().is_empty());
-        db.upsert_files(&[nf(r"C:\m\a.cr3", 1, 6)]).unwrap();
+        db.upsert_files(&[nf(&wp(r"C:\m\a.cr3"), 1, 6)]).unwrap();
         let need = db.files_needing_meta(10).unwrap();
         assert_eq!(need.len(), 1);
         assert_eq!(need[0].id, ids[0]);
@@ -1333,10 +1361,10 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut files = Vec::with_capacity(610);
         for i in 0..600 {
-            files.push(nf(&format!(r"C:\queue\video-{i:03}.mp4"), 1, i));
+            files.push(nf(&wp(&format!(r"C:\queue\video-{i:03}.mp4")), 1, i));
         }
         for i in 0..10 {
-            files.push(nf(&format!(r"C:\queue\image-{i:02}.jpg"), 1, 700 + i));
+            files.push(nf(&wp(&format!(r"C:\queue\image-{i:02}.jpg")), 1, 700 + i));
         }
         let ids = db.upsert_files(&files).unwrap();
 
@@ -1374,27 +1402,46 @@ mod tests {
         assert!(found.windows(2).all(|ids| ids[0] < ids[1]));
     }
 
+    /// Portable part: a serial identifies a volume whatever its root is at the moment.
     #[test]
+    fn serial_identity_survives_root_change() {
+        let db = Db::open_in_memory().unwrap();
+        let info = |root: &str| VolumeInfo {
+            serial: Some("ABCD".into()),
+            label: Some("Card".into()),
+            root: wp(root),
+        };
+        let a = db.upsert_volume(&info(r"E:\")).unwrap();
+        let b = db.upsert_volume(&info(r"F:\")).unwrap();
+        assert_eq!(a, b);
+        let vols = db.volumes().unwrap();
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].root, wp(r"F:\"));
+    }
+
+    /// Windows: files resolve to the volume whose drive letter they are on.
+    #[test]
+    #[cfg(windows)]
     fn volumes_by_serial_survive_letter_change() {
         let db = Db::open_in_memory().unwrap();
         let a = db
             .upsert_volume(&VolumeInfo {
                 serial: Some("ABCD".into()),
                 label: Some("Card".into()),
-                root: r"E:\".into(),
+                root: wp(r"E:\").into(),
             })
             .unwrap();
         let b = db
             .upsert_volume(&VolumeInfo {
                 serial: Some("ABCD".into()),
                 label: Some("Card".into()),
-                root: r"F:\".into(),
+                root: wp(r"F:\").into(),
             })
             .unwrap();
         assert_eq!(a, b);
-        assert_eq!(db.volumes().unwrap()[0].root, r"F:\");
+        assert_eq!(db.volumes().unwrap()[0].root, wp(r"F:\"));
         // Files on F:\ resolve to the serial volume.
-        let ids = db.upsert_files(&[nf(r"F:\DCIM\x.jpg", 1, 1)]).unwrap();
+        let ids = db.upsert_files(&[nf(&wp(r"F:\DCIM\x.jpg"), 1, 1)]).unwrap();
         assert_eq!(db.file(ids[0]).unwrap().unwrap().volume_id, a);
         assert_eq!(db.mark_volume_offline(a).unwrap(), 1);
         assert!(!db.file(ids[0]).unwrap().unwrap().present);
@@ -1405,9 +1452,9 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let ids = db
             .upsert_files(&[
-                nf(r"C:\d\a", 5, 1),
-                nf(r"C:\d\b", 5, 1),
-                nf(r"C:\d\c", 5, 1),
+                nf(&wp(r"C:\d\a"), 5, 1),
+                nf(&wp(r"C:\d\b"), 5, 1),
+                nf(&wp(r"C:\d\c"), 5, 1),
             ])
             .unwrap();
         db.set_hashes(ids[0], None, Some("h")).unwrap();
@@ -1415,7 +1462,7 @@ mod tests {
         let g = db.duplicate_groups(10).unwrap();
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].len(), 2);
-        db.mark_missing(&[PathBuf::from(r"C:\d")]).unwrap();
+        db.mark_missing(&[PathBuf::from(wp(r"C:\d"))]).unwrap();
         db.set_rating(&[ids[0]], 3).unwrap();
         assert_eq!(db.purge_offline(true).unwrap(), 2);
         assert!(db.file(ids[0]).unwrap().is_some());
@@ -1429,8 +1476,8 @@ mod tests {
         use forge_core::query::{ColorLabel, PickState};
 
         let db = Db::open_in_memory().unwrap();
-        let source_path = PathBuf::from(r"C:\old\photo.jpg");
-        let destination_path = PathBuf::from(r"D:\new\photo.jpg");
+        let source_path = PathBuf::from(wp(r"C:\old\photo.jpg"));
+        let destination_path = PathBuf::from(wp(r"D:\new\photo.jpg"));
         let ids = db
             .upsert_files(&[
                 nf(source_path.to_str().unwrap(), 10, 1),
@@ -1526,8 +1573,8 @@ mod tests {
     #[test]
     fn relink_reports_missing_destination_offline() {
         let db = Db::open_in_memory().unwrap();
-        let source = PathBuf::from(r"C:\offline\photo.jpg");
-        let destination = PathBuf::from(r"D:\recovered\photo.jpg");
+        let source = PathBuf::from(wp(r"C:\offline\photo.jpg"));
+        let destination = PathBuf::from(wp(r"D:\recovered\photo.jpg"));
         let id = db
             .upsert_files(&[nf(source.to_str().unwrap(), 1, 1)])
             .unwrap()[0];

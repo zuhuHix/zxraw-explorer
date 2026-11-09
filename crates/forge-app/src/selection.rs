@@ -111,8 +111,13 @@ pub fn removal_successors(listed: &[&Path], removed: &HashSet<PathBuf>) -> Vec<P
 mod tests {
     use super::*;
 
+    /// `name` uses `/` between components; the fixture root is a Windows or Unix path.
     fn p(name: &str) -> PathBuf {
-        PathBuf::from(format!(r"C:\fixture\{name}"))
+        let mut path = PathBuf::from(if cfg!(windows) { r"C:\fixture" } else { "/fixture" });
+        for part in name.split('/') {
+            path.push(part);
+        }
+        path
     }
 
     fn successors(listed: &[&str], removed: &[&str]) -> Vec<PathBuf> {
@@ -156,7 +161,7 @@ mod tests {
 
     #[test]
     fn rows_inside_a_removed_folder_count_as_removed() {
-        let got = successors(&["x", r"x\1", r"x\2", "y"], &["x"]);
+        let got = successors(&["x", "x/1", "x/2", "y"], &["x"]);
         assert_eq!(got, expect(&["y"]));
     }
 

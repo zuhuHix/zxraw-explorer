@@ -330,6 +330,31 @@ mod tests {
         pins.iter().map(|p| pin(p)).collect()
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn add_appends_in_order_and_skips_duplicates_case_sensitively() {
+        let mut pins = Vec::new();
+        let added = add_pins(
+            &mut pins,
+            vec![
+                (PathBuf::from("/a"), false),
+                (PathBuf::from("/b"), true),
+                (PathBuf::from("/A"), false),
+                (PathBuf::from("/b"), false),
+                (PathBuf::from("/c"), false),
+            ],
+        );
+        // `/A` is another folder on Linux, so it is added; the second `/b` is a duplicate.
+        assert_eq!(added, 4);
+        assert_eq!(
+            paths(&pins),
+            vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/A"), PathBuf::from("/c")]
+        );
+        assert!(pins[1].file);
+        assert_eq!(add_pins(&mut pins, vec![(PathBuf::from("/A"), false)]), 0);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn add_appends_in_order_and_skips_duplicates() {
         let mut pins = Vec::new();
@@ -395,6 +420,18 @@ mod tests {
         assert_eq!(pins.len(), 1);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rename_sets_and_clears_label_case_sensitively() {
+        let mut pins = pins_of(&["/a"]);
+        assert!(set_label(&mut pins, Path::new("/a"), "  Work  "));
+        assert_eq!(pins[0].label.as_deref(), Some("Work"));
+        assert!(set_label(&mut pins, Path::new("/a"), "   "));
+        assert_eq!(pins[0].label, None);
+        assert!(!set_label(&mut pins, Path::new("/A"), "x"), "another folder on Linux");
+    }
+
+    #[cfg(windows)]
     #[test]
     fn rename_sets_and_clears_label() {
         let mut pins = pins_of(&[r"C:\a"]);

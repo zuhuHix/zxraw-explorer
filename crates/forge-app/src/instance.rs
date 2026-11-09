@@ -140,6 +140,10 @@ fn forward_only() -> bool {
 /// receives later launches.
 pub fn startup(launch: &Launch, settings: &crate::settings::Settings) -> Decision {
     let none = Decision::Run { inbox: None, server: None };
+    if !cfg!(windows) {
+        // Single-window launches go through a named pipe, which only Windows has here.
+        return none;
+    }
     let automated = crate::testhook::env_requests_automation();
     let Some(tag) = tag(automated) else {
         return none;

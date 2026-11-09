@@ -1268,6 +1268,8 @@ fn held(dest: &Path, data: &[u8], overwrite: bool, keep_both: bool) -> ops::Held
     .1
 }
 
+/// Share modes: other programs are refused write, rename and delete access (Windows only).
+#[cfg(windows)]
 #[test]
 fn a_held_file_cant_be_written_renamed_or_deleted_by_others() {
     let d = tempfile::tempdir().unwrap();
@@ -1288,6 +1290,23 @@ fn a_held_file_cant_be_written_renamed_or_deleted_by_others() {
     assert_eq!(fs::read(&dest).unwrap(), b"held data");
     assert!(!tmp.exists());
     // Dropped unpublished: deleted through its handle.
+    let h = held(&d.path().join("gone.txt"), b"x", false, false);
+    let tmp = h.temp_path().to_path_buf();
+    drop(h);
+    assert!(!tmp.exists() && !d.path().join("gone.txt").exists());
+}
+
+#[test]
+fn a_held_file_publishes_or_drops_without_a_trace() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = d.path().join("out.txt");
+    let h = held(&dest, b"held data", false, false);
+    let tmp = h.temp_path().to_path_buf();
+    assert!(tmp.exists());
+    let placed = h.publish().unwrap();
+    assert_eq!(placed, dest);
+    assert_eq!(fs::read(&dest).unwrap(), b"held data");
+    assert!(!tmp.exists());
     let h = held(&d.path().join("gone.txt"), b"x", false, false);
     let tmp = h.temp_path().to_path_buf();
     drop(h);
@@ -1320,7 +1339,8 @@ fn held_files_publish_under_each_conflict_policy() {
 }
 
 /// Three 8-byte files in folders s1/, s2/ and s3/, stored in one block whose only checksum
-/// is the block's.
+/// is the block's. Used by the Windows-only folder pin test.
+#[cfg(windows)]
 fn block_crc_only_in_folders_7z() -> Vec<u8> {
     let mut h = vec![0x01, 0x04];
     h.extend([0x06, 0x00, 0x01, 0x09, 0x18, 0x00]);
@@ -1342,6 +1362,8 @@ fn block_crc_only_in_folders_7z() -> Vec<u8> {
     raw_7z(&BLOCK_DATA, &h)
 }
 
+/// A folder with a held file in it can't be renamed while the file waits: Windows only.
+#[cfg(windows)]
 #[test]
 fn a_held_files_folder_stays_pinned_until_it_is_published() {
     let d = tempfile::tempdir().unwrap();

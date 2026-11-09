@@ -2159,6 +2159,10 @@ fn count_relink_matches(paths: &[PathBuf], old: &Path) -> u64 {
 }
 
 fn path_matches_prefix(path: &Path, old: &Path) -> bool {
+    if !cfg!(windows) {
+        // Case-sensitive and component-wise on Unix.
+        return forge_core::paths::is_within(old, path);
+    }
     let normalize = |path: &Path| {
         let mut text = path.to_string_lossy().replace('/', "\\");
         while text.len() > 3 && text.ends_with('\\') {
@@ -2205,6 +2209,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn relink_preview_counts_exact_prefix_case_sensitively_on_unix() {
+        let paths = [
+            PathBuf::from("/data/shoot/a.cr3"),
+            PathBuf::from("/data/shoot/sub/b.jpg"),
+            PathBuf::from("/data/shoot-2/c.jpg"),
+            PathBuf::from("/data/Shoot/d.jpg"),
+            PathBuf::from("/other/shoot/e.jpg"),
+        ];
+        assert_eq!(count_relink_matches(&paths, Path::new("/data/shoot")), 2);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn relink_preview_counts_exact_prefix_and_not_siblings() {
         let paths = [
             PathBuf::from(r"E:\Shoot\a.cr3"),

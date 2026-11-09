@@ -7,6 +7,19 @@ use std::path::{Path, PathBuf};
 use forge_core::model::EntryKind;
 use forge_db::{Db, NewFile, SearchOptions};
 
+/// Fixture path in the local platform's syntax: Windows paths (`D:\Shoot\a.jpg`) stay as
+/// they are on Windows and become `/D/Shoot/a.jpg` elsewhere.
+fn wp(s: &str) -> String {
+    if cfg!(windows) {
+        return s.to_string();
+    }
+    let (drive, rest) = match s.as_bytes() {
+        [d, b':', ..] if d.is_ascii_alphabetic() => (format!("/{}", *d as char), &s[2..]),
+        _ => (String::new(), s),
+    };
+    format!("{drive}{}", rest.replace('\\', "/"))
+}
+
 fn file(p: &str) -> NewFile {
     NewFile {
         path: PathBuf::from(p),
@@ -37,7 +50,7 @@ fn set(v: &[&str]) -> BTreeSet<String> {
 #[test]
 fn notes_round_trip_and_blank_means_none() {
     let db = Db::open_in_memory().unwrap();
-    let id = add(&db, r"D:\Shoot\a.jpg");
+    let id = add(&db, &wp(r"D:\Shoot\a.jpg"));
     assert_eq!(db.annotation(id).unwrap().notes, None);
     assert!(!db.file(id).unwrap().unwrap().has_notes);
 
@@ -45,7 +58,7 @@ fn notes_round_trip_and_blank_means_none() {
     assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("Client proof"));
     let rec = db.file(id).unwrap().unwrap();
     assert!(rec.has_notes);
-    let dir = db.children(Path::new(r"D:\Shoot"), false).unwrap();
+    let dir = db.children(Path::new(&wp(r"D:\Shoot")), false).unwrap();
     assert_eq!(dir.len(), 1);
     assert!(dir[0].has_notes);
 
@@ -57,48 +70,48 @@ fn notes_round_trip_and_blank_means_none() {
     db.set_notes(&[id], Some("again")).unwrap();
     db.set_notes(&[id], None).unwrap();
     assert_eq!(db.annotation(id).unwrap().notes, None);
-    assert!(!db.children(Path::new(r"D:\Shoot"), false).unwrap()[0].has_notes);
+    assert!(!db.children(Path::new(&wp(r"D:\Shoot")), false).unwrap()[0].has_notes);
 }
 
 #[test]
 fn note_survives_single_file_rename_with_rating() {
     let db = Db::open_in_memory().unwrap();
-    let old = add(&db, r"D:\Old\a.jpg");
+    let old = add(&db, &wp(r"D:\Old\a.jpg"));
     db.set_rating(&[old], 4).unwrap();
     db.set_notes(&[old], Some("keep me")).unwrap();
 
     let report = db
-        .relink(Path::new(r"D:\Old\a.jpg"), Path::new(r"D:\New\b.jpg"), None)
+        .relink(Path::new(&wp(r"D:\Old\a.jpg")), Path::new(&wp(r"D:\New\b.jpg")), None)
         .unwrap();
     assert_eq!(report.moved, 1);
     assert_eq!(report.merged, 0);
     assert!(report.conflicts.is_empty());
 
-    let new = db.file_id(Path::new(r"D:\New\b.jpg")).unwrap().unwrap();
+    let new = db.file_id(Path::new(&wp(r"D:\New\b.jpg"))).unwrap().unwrap();
     assert_eq!(new, old);
     let ann = db.annotation(new).unwrap();
     assert_eq!(ann.notes.as_deref(), Some("keep me"));
     assert_eq!(ann.rating, 4);
-    assert!(db.file_id(Path::new(r"D:\Old\a.jpg")).unwrap().is_none());
+    assert!(db.file_id(Path::new(&wp(r"D:\Old\a.jpg"))).unwrap().is_none());
 }
 
 #[test]
 fn note_survives_folder_move() {
     let db = Db::open_in_memory().unwrap();
-    let a = add(&db, r"D:\Old\Trip\a.jpg");
-    let b = add(&db, r"D:\Old\Trip\Day 2\b.jpg");
+    let a = add(&db, &wp(r"D:\Old\Trip\a.jpg"));
+    let b = add(&db, &wp(r"D:\Old\Trip\Day 2\b.jpg"));
     db.set_notes(&[a], Some("top shot")).unwrap();
     db.set_notes(&[b], Some("second take")).unwrap();
 
     let report = db
-        .relink(Path::new(r"D:\Old\Trip"), Path::new(r"D:\Moved\Trip"), None)
+        .relink(Path::new(&wp(r"D:\Old\Trip")), Path::new(&wp(r"D:\Moved\Trip")), None)
         .unwrap();
     assert_eq!(report.moved, 2);
     assert_eq!(report.merged, 0);
 
-    let a2 = db.file_id(Path::new(r"D:\Moved\Trip\a.jpg")).unwrap().unwrap();
+    let a2 = db.file_id(Path::new(&wp(r"D:\Moved\Trip\a.jpg"))).unwrap().unwrap();
     let b2 = db
-        .file_id(Path::new(r"D:\Moved\Trip\Day 2\b.jpg"))
+        .file_id(Path::new(&wp(r"D:\Moved\Trip\Day 2\b.jpg")))
         .unwrap()
         .unwrap();
     assert_eq!(db.annotation(a2).unwrap().notes.as_deref(), Some("top shot"));
@@ -108,14 +121,14 @@ fn note_survives_folder_move() {
 #[test]
 fn relink_into_existing_row_merges_notes() {
     let db = Db::open_in_memory().unwrap();
-    let src = add(&db, r"D:\Old\a.jpg");
-    let dst = add(&db, r"D:\Dst\a.jpg");
+    let src = add(&db, &wp(r"D:\Old\a.jpg"));
+    let dst = add(&db, &wp(r"D:\Dst\a.jpg"));
     db.set_rating(&[src], 4).unwrap();
     db.set_notes(&[src], Some("source note")).unwrap();
     db.set_notes(&[dst], Some("destination note")).unwrap();
 
     let report = db
-        .relink(Path::new(r"D:\Old\a.jpg"), Path::new(r"D:\Dst\a.jpg"), None)
+        .relink(Path::new(&wp(r"D:\Old\a.jpg")), Path::new(&wp(r"D:\Dst\a.jpg")), None)
         .unwrap();
     assert_eq!(report.merged, 1);
     assert_eq!(report.moved, 0);
@@ -135,12 +148,12 @@ fn relink_into_existing_row_merges_notes() {
 #[test]
 fn relink_into_existing_row_keeps_the_only_note() {
     let db = Db::open_in_memory().unwrap();
-    let src = add(&db, r"D:\Old\a.jpg");
-    let dst = add(&db, r"D:\Dst\a.jpg");
+    let src = add(&db, &wp(r"D:\Old\a.jpg"));
+    let dst = add(&db, &wp(r"D:\Dst\a.jpg"));
     db.set_notes(&[src], Some("only in source")).unwrap();
 
     let report = db
-        .relink(Path::new(r"D:\Old\a.jpg"), Path::new(r"D:\Dst\a.jpg"), None)
+        .relink(Path::new(&wp(r"D:\Old\a.jpg")), Path::new(&wp(r"D:\Dst\a.jpg")), None)
         .unwrap();
     assert_eq!(report.merged, 1);
     assert!(report.conflicts.is_empty());
@@ -153,12 +166,12 @@ fn relink_into_existing_row_keeps_the_only_note() {
 #[test]
 fn search_matches_notes_and_has_missing_notes() {
     let db = Db::open_in_memory().unwrap();
-    add(&db, r"D:\Shoot\IMG_001.jpg");
-    add(&db, r"D:\Shoot\IMG_002.jpg");
-    add(&db, r"D:\Shoot\IMG_003.jpg");
-    add(&db, r"D:\Shoot\proof_scan.jpg");
+    add(&db, &wp(r"D:\Shoot\IMG_001.jpg"));
+    add(&db, &wp(r"D:\Shoot\IMG_002.jpg"));
+    add(&db, &wp(r"D:\Shoot\IMG_003.jpg"));
+    add(&db, &wp(r"D:\Shoot\proof_scan.jpg"));
     let ids = db
-        .file_ids(&[PathBuf::from(r"D:\Shoot\IMG_001.jpg"), PathBuf::from(r"D:\Shoot\IMG_002.jpg")])
+        .file_ids(&[PathBuf::from(wp(r"D:\Shoot\IMG_001.jpg")), PathBuf::from(wp(r"D:\Shoot\IMG_002.jpg"))])
         .unwrap();
     for (path, id) in &ids {
         let note = if path.ends_with("IMG_001.jpg") {
@@ -202,8 +215,8 @@ fn note_at(db: &Db, p: &str) -> Option<String> {
 #[test]
 fn relink_many_swaps_two_names_without_mixing_notes() {
     let db = Db::open_in_memory().unwrap();
-    let a = add(&db, r"D:\Shoot\a.jpg");
-    let b = add(&db, r"D:\Shoot\b.jpg");
+    let a = add(&db, &wp(r"D:\Shoot\a.jpg"));
+    let b = add(&db, &wp(r"D:\Shoot\b.jpg"));
     db.set_notes(&[a], Some("note of a")).unwrap();
     db.set_notes(&[b], Some("note of b")).unwrap();
     db.set_rating(&[a], 5).unwrap();
@@ -211,18 +224,18 @@ fn relink_many_swaps_two_names_without_mixing_notes() {
     // A batch rename that swaps the two names.
     let report = db
         .relink_many(&[
-            (PathBuf::from(r"D:\Shoot\a.jpg"), PathBuf::from(r"D:\Shoot\b.jpg")),
-            (PathBuf::from(r"D:\Shoot\b.jpg"), PathBuf::from(r"D:\Shoot\a.jpg")),
+            (PathBuf::from(wp(r"D:\Shoot\a.jpg")), PathBuf::from(wp(r"D:\Shoot\b.jpg"))),
+            (PathBuf::from(wp(r"D:\Shoot\b.jpg")), PathBuf::from(wp(r"D:\Shoot\a.jpg"))),
         ])
         .unwrap();
     assert_eq!(report.moved, 2);
     assert_eq!(report.merged, 0);
     assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
 
-    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("note of a"));
-    assert_eq!(note_at(&db, r"D:\Shoot\a.jpg").as_deref(), Some("note of b"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\b.jpg")).as_deref(), Some("note of a"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\a.jpg")).as_deref(), Some("note of b"));
     // Row identities moved with their files.
-    assert_eq!(db.file_id(Path::new(r"D:\Shoot\b.jpg")).unwrap(), Some(a));
+    assert_eq!(db.file_id(Path::new(&wp(r"D:\Shoot\b.jpg"))).unwrap(), Some(a));
     assert_eq!(db.annotation(a).unwrap().rating, 5);
     assert_eq!(db.annotation(b).unwrap().rating, 0);
 }
@@ -231,16 +244,16 @@ fn relink_many_swaps_two_names_without_mixing_notes() {
 fn relink_many_rotates_a_three_cycle() {
     let db = Db::open_in_memory().unwrap();
     for (name, note) in [("a", "first"), ("b", "second"), ("c", "third")] {
-        let id = add(&db, &format!(r"D:\Shoot\{name}.jpg"));
+        let id = add(&db, &wp(&format!(r"D:\Shoot\{name}.jpg")));
         db.set_notes(&[id], Some(note)).unwrap();
     }
-    let p = |n: &str| PathBuf::from(format!(r"D:\Shoot\{n}.jpg"));
+    let p = |n: &str| PathBuf::from(wp(&format!(r"D:\Shoot\{n}.jpg")));
     // a→b, b→c, c→a in one batch.
     db.relink_many(&[(p("a"), p("b")), (p("b"), p("c")), (p("c"), p("a"))])
         .unwrap();
-    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("first"));
-    assert_eq!(note_at(&db, r"D:\Shoot\c.jpg").as_deref(), Some("second"));
-    assert_eq!(note_at(&db, r"D:\Shoot\a.jpg").as_deref(), Some("third"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\b.jpg")).as_deref(), Some("first"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\c.jpg")).as_deref(), Some("second"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\a.jpg")).as_deref(), Some("third"));
     // No temporary rows are left behind.
     // Every row is back under its real name; no parked temporary row is left behind.
     let all: BTreeSet<PathBuf> = db
@@ -263,12 +276,12 @@ fn relink_many_rotates_a_three_cycle() {
 #[test]
 fn relink_many_applies_a_case_only_rename() {
     let db = Db::open_in_memory().unwrap();
-    let id = add(&db, r"D:\Shoot\img.jpg");
+    let id = add(&db, &wp(r"D:\Shoot\img.jpg"));
     db.set_notes(&[id], Some("keep")).unwrap();
-    db.relink_many(&[(PathBuf::from(r"D:\Shoot\img.jpg"), PathBuf::from(r"D:\Shoot\IMG.jpg"))])
+    db.relink_many(&[(PathBuf::from(wp(r"D:\Shoot\img.jpg")), PathBuf::from(wp(r"D:\Shoot\IMG.jpg")))])
         .unwrap();
     let rec = db.file(id).unwrap().unwrap();
-    assert_eq!(rec.path, PathBuf::from(r"D:\Shoot\IMG.jpg"));
+    assert_eq!(rec.path, PathBuf::from(wp(r"D:\Shoot\IMG.jpg")));
     assert_eq!(rec.name, "IMG.jpg");
     assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some("keep"));
 }
@@ -277,29 +290,29 @@ fn relink_many_applies_a_case_only_rename() {
 fn relink_many_never_touches_a_real_path_that_looks_like_a_staging_name() {
     let db = Db::open_in_memory().unwrap();
     // A real file named like a plausible staging name must survive a batch rename untouched.
-    let decoy = add(&db, r"D:\.zxraw-relink-1-0");
+    let decoy = add(&db, &wp(r"D:\.zxraw-relink-1-0"));
     db.set_notes(&[decoy], Some("decoy")).unwrap();
-    let a = add(&db, r"D:\Shoot\a.jpg");
-    let b = add(&db, r"D:\Shoot\b.jpg");
+    let a = add(&db, &wp(r"D:\Shoot\a.jpg"));
+    let b = add(&db, &wp(r"D:\Shoot\b.jpg"));
     db.set_notes(&[a], Some("A")).unwrap();
     db.relink_many(&[
-        (PathBuf::from(r"D:\Shoot\a.jpg"), PathBuf::from(r"D:\Shoot\b.jpg")),
-        (PathBuf::from(r"D:\Shoot\b.jpg"), PathBuf::from(r"D:\Shoot\a.jpg")),
+        (PathBuf::from(wp(r"D:\Shoot\a.jpg")), PathBuf::from(wp(r"D:\Shoot\b.jpg"))),
+        (PathBuf::from(wp(r"D:\Shoot\b.jpg")), PathBuf::from(wp(r"D:\Shoot\a.jpg"))),
     ])
     .unwrap();
     assert_eq!(db.annotation(decoy).unwrap().notes.as_deref(), Some("decoy"));
     assert_eq!(
         db.file(decoy).unwrap().unwrap().path,
-        PathBuf::from(r"D:\.zxraw-relink-1-0")
+        PathBuf::from(wp(r"D:\.zxraw-relink-1-0"))
     );
-    assert_eq!(note_at(&db, r"D:\Shoot\b.jpg").as_deref(), Some("A"));
+    assert_eq!(note_at(&db, &wp(r"D:\Shoot\b.jpg")).as_deref(), Some("A"));
     assert_eq!(db.annotation(b).unwrap().notes, None);
 }
 
 #[test]
 fn non_ascii_notes_round_trip_and_are_searchable() {
     let db = Db::open_in_memory().unwrap();
-    let id = add(&db, r"D:\Shoot\portrait.jpg");
+    let id = add(&db, &wp(r"D:\Shoot\portrait.jpg"));
     let note = "Café crème à Zürich — 🎉 Ünïcode ✓ 東京";
     db.set_notes(&[id], Some(note)).unwrap();
     assert_eq!(db.annotation(id).unwrap().notes.as_deref(), Some(note));

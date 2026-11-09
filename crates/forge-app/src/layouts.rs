@@ -836,6 +836,7 @@ mod tests {
         assert_eq!(saved["tabs"][1]["right_view"], "Timeline");
     }
 
+    #[cfg(windows)]
     #[test]
     fn overwriting_a_layout_matches_tab_folders_ignoring_case() {
         let json = r#"{"name": "Work", "tabs": [
@@ -847,6 +848,20 @@ mod tests {
         assert_eq!(saved["tabs"][0]["zoom"], 2);
         assert_eq!(saved["tabs"][0]["view"], "Filmstrip");
         assert_eq!(saved["tabs"][0]["left"], r"c:\shoots\2024");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overwriting_a_layout_matches_tab_folders_case_sensitively() {
+        let json = r#"{"name": "Work", "tabs": [
+            {"left": "/shoots/2024", "view": "Filmstrip", "zoom": 2}
+        ]}"#;
+        let mut list = vec![serde_json::from_str::<Layout>(json).unwrap()];
+        // `/Shoots/2024` is another folder on Linux, so the old tab's fields are not kept.
+        assert!(upsert(&mut list, layout(vec![tab("/Shoots/2024", None)], 0)));
+        let saved = serde_json::to_value(&list[0]).unwrap();
+        assert!(saved["tabs"][0].get("zoom").is_none());
+        assert_eq!(saved["tabs"][0]["left"], "/Shoots/2024");
     }
 
     #[test]

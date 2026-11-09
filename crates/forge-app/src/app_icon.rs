@@ -69,8 +69,12 @@ pub fn apply_to_window(ctx: &egui::Context, icon: AppIcon) {
 }
 
 /// Points the user's shortcuts to this exe at `icon`, on a background thread. Shortcuts to
-/// other programs are never touched; failures are only logged.
+/// other programs are never touched; failures are only logged. Windows only: Linux desktop
+/// entries carry no icon of this kind.
 pub fn apply_to_shortcuts(icon: AppIcon) {
+    if !cfg!(windows) {
+        return;
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
