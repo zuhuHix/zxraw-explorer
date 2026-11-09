@@ -1300,3 +1300,58 @@ fn on_linux_a_held_folders_parent_swapped_for_a_symlink_gets_nothing() {
     assert!(is_empty_dir(&victim.join("a")), "{report:?}");
     assert_eq!(fs::read(moved.join("b/x.txt")).unwrap(), b"inside");
 }
+
+/// Linux: the folder `extract_into_folder` makes is made through its pinned parent's handle:
+/// a parent swapped for a symlink just before gets nothing, the moved parent gets the files.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_the_new_folder_is_made_in_the_pinned_parent() {
+    let d = tempfile::tempdir().unwrap();
+    let parent = fresh_dest(d.path(), "parent");
+    let victim = fresh_dest(d.path(), "victim");
+    let archive = d.path().join("photos.zip");
+    zip_of(&archive, &[("x.txt", b"inside")]);
+    let (parent_h, victim_h, moved) = (parent.clone(), victim.clone(), d.path().join("moved"));
+    let moved_h = moved.clone();
+    let hook = Hook::set(&super::safety::BEFORE_DEST_CREATE, move |_| {
+        fs::rename(&parent_h, &moved_h).unwrap();
+        std::os::unix::fs::symlink(&victim_h, &parent_h).unwrap();
+    });
+    let (cancel, progress) = (CancelToken::new(), Progress::default());
+    let ctx = JobCtx::new(&cancel, &progress);
+    let report = extract_to(
+        &archive,
+        &parent,
+        ExtractTarget::NamedFolder,
+        &ExtractOptions::default(),
+        &ctx,
+    );
+    drop(hook);
+    let report = report.unwrap();
+    assert!(is_empty_dir(&victim), "{report:?}");
+    assert_eq!(fs::read(moved.join("photos/x.txt")).unwrap(), b"inside");
+}
+
+/// Linux: taking back a folder the job made removes it only while it is that very folder.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_a_new_folder_is_taken_back_only_if_unchanged() {
+    let d = tempfile::tempdir().unwrap();
+    let base = super::safety::PinnedBase::open(d.path()).unwrap();
+    let name = std::ffi::OsStr::new("made");
+    let made = super::safety::create_child_dir(&base, name).unwrap();
+    if !made.is_some_and(|m| m.is_strong()) {
+        eprintln!("skipped: no birth time on this file system");
+        return;
+    }
+    // Replaced by another folder of the same name: left alone.
+    fs::remove_dir(d.path().join("made")).unwrap();
+    fs::create_dir(d.path().join("made")).unwrap();
+    super::safety::remove_new_child_dir(&base, name, made);
+    assert!(d.path().join("made").is_dir());
+    // The folder it made: removed.
+    fs::remove_dir(d.path().join("made")).unwrap();
+    let made = super::safety::create_child_dir(&base, name).unwrap();
+    super::safety::remove_new_child_dir(&base, name, made);
+    assert!(!d.path().join("made").exists());
+}

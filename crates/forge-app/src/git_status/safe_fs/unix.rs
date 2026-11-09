@@ -85,15 +85,29 @@ struct Meta {
     mount: Option<u64>,
     /// `STATX_ATTR_MOUNT_ROOT`: something is mounted here (a bind mount included).
     mount_root: bool,
+    /// Did the kernel report both the mount id and `STATX_ATTR_MOUNT_ROOT`? Without them a
+    /// bind mount of the same device can't be told from a plain folder.
+    mount_known: bool,
 }
 
 impl Meta {
-    /// Is this entry of folder `dev`/`mount` the root of another mount?
+    /// Is this entry of folder `dev`/`mount` the root of another mount? A folder whose mount
+    /// can't be established (no `statx`, or one that reports neither the mount id nor
+    /// `STATX_ATTR_MOUNT_ROOT`) counts as one: fail closed, so the scan inside a repository
+    /// enters no folder it can't vouch for. On such old kernels badges are then missing, never
+    /// read through a bind mount.
     fn crosses(&self, dev: u64, mount: Option<u64>) -> bool {
         self.dev != dev
             || self.mount_root
             || matches!((self.mount, mount), (Some(a), Some(b)) if a != b)
+            || (!self.mount_known && self.info.is_dir())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`meta`] behaves as without `statx` (the `fstatat` fallback) on this thread.
+    pub static NO_STATX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Synthetic Win32-style attributes, size and write time (ns since 1970).
@@ -122,14 +136,25 @@ fn meta<P: rustix::path::Arg + Copy>(
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::{StatxAttributes, StatxFlags};
-        match rustix::fs::statx(
-            &dirfd,
-            name,
-            flags,
-            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
-        ) {
+        // Tests can force the fallback below (see `NO_STATX`).
+        #[cfg(test)]
+        let skip = NO_STATX.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let skip = false;
+        let got = if skip {
+            Err(Errno::NOSYS)
+        } else {
+            rustix::fs::statx(
+                &dirfd,
+                name,
+                flags,
+                StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+            )
+        };
+        match got {
             Ok(x) => {
                 let root = StatxAttributes::MOUNT_ROOT;
+                let has_mnt_id = x.stx_mask & StatxFlags::MNT_ID.bits() != 0;
                 return Ok(Meta {
                     info: info_from(
                         u32::from(x.stx_mode),
@@ -139,9 +164,10 @@ fn meta<P: rustix::path::Arg + Copy>(
                     ),
                     dev: rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
                     nlink: u64::from(x.stx_nlink),
-                    mount: (x.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(x.stx_mnt_id),
+                    mount: has_mnt_id.then_some(x.stx_mnt_id),
                     mount_root: x.stx_attributes_mask.contains(root)
                         && x.stx_attributes.contains(root),
+                    mount_known: has_mnt_id && x.stx_attributes_mask.contains(root),
                 });
             }
             Err(Errno::NOSYS) => {}
@@ -160,6 +186,7 @@ fn meta<P: rustix::path::Arg + Copy>(
         nlink: stat.st_nlink as u64,
         mount: None,
         mount_root: false,
+        mount_known: false,
     })
 }
 
@@ -424,5 +451,23 @@ mod tests {
             ..meta(&dir, "plain", AtFlags::empty()).unwrap()
         };
         assert!(root_of.crosses(here.dev, here.mount));
+    }
+
+    /// Without mount information (no `statx`: forced here), every folder counts as a possible
+    /// mount point, so a same-device bind mount can't be entered unseen; files don't.
+    #[test]
+    fn without_mount_information_folders_fail_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("plain")).unwrap();
+        std::fs::write(tmp.path().join("f"), "x").unwrap();
+        NO_STATX.with(|n| n.set(true));
+        let dir = open_dir(rustix::fs::CWD, tmp.path().to_str().unwrap()).unwrap();
+        let here = meta_fd(&dir).unwrap();
+        let plain = meta(&dir, "plain", AtFlags::empty()).unwrap();
+        let file = meta(&dir, "f", AtFlags::empty()).unwrap();
+        NO_STATX.with(|n| n.set(false));
+        assert!(!plain.mount_known);
+        assert!(plain.crosses(here.dev, here.mount));
+        assert!(!file.crosses(here.dev, here.mount));
     }
 }

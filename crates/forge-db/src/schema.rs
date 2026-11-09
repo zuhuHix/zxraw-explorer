@@ -274,6 +274,8 @@ const PATH_TABLES: [&str; 2] = ["files", "index_roots"];
 /// only in case are two rows. SQLite's own recipe: create the new table, copy the rows, drop
 /// the old one, rename, recreate its indexes; foreign keys are off meanwhile and checked
 /// before the commit. Rows can't collide: `NOCASE` was the stricter key.
+/// Assumes the tables have no triggers or views on them (true of this schema): only their
+/// indexes are recreated, so a trigger or view added later must be recreated here too.
 #[cfg(not(windows))]
 fn case_sensitive_paths(conn: &mut Connection) -> Result<()> {
     for table in PATH_TABLES {
