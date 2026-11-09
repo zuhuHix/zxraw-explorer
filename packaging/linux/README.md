@@ -6,7 +6,7 @@ Nothing here needs root, system-wide installs or pwsh; the Windows installer and
 
 | File | What it is |
 | --- | --- |
-| `build-linux.sh` | Release build (`cargo build --release --no-default-features -p forge-app`), then the AppImage, the `.deb` and the checksums in `dist/`. `--skip-build` packages the existing binary. |
+| `build-linux.sh` | Release build (`cargo build --release --no-default-features -p forge-app -p forge-cli`), then the AppImage (`zxraw` and `zxraw-cli`, as in the Windows zip), the `.deb` and the checksums in `dist/`. `--skip-build` packages the existing binary. |
 | `../release-linux.sh` | `release-linux.sh <x.y.z>`: checks the tree version, runs `build-linux.sh`, prints the `gh release upload` command. Never uploads, tags or pushes. |
 | `zxraw.desktop` | Desktop entry, shipped in both packages. See *Desktop entry* below. |
 | `make-icons.sh`, `icons/hicolor/` | hicolor PNGs made from `assets/zxraw.png`. The output is committed, so builds need none of the tools. |
@@ -17,7 +17,7 @@ Nothing here needs root, system-wide installs or pwsh; the Windows installer and
 
 ```sh
 packaging/linux/build-linux.sh                 # build, then dist/ (needs ~5 min on 12 cores)
-packaging/linux/build-linux.sh --skip-build    # package the existing target/release/zxraw
+packaging/linux/build-linux.sh --skip-build    # package the existing target/release/zxraw and zxraw-cli
 CARGO_TARGET_DIR=/some/dir packaging/linux/build-linux.sh
 ```
 
@@ -79,19 +79,10 @@ minus the types the viewer cannot decode (`psd`, `jxl`, `ico`, `crw`, `x3f`, `mr
 `iiq`, `erf`, `mef`, `mos`, `rwl`) have no shared-mime-info type on Ubuntu 24.04, so they are not
 listed.
 
-**Window class.** The app does not set a window class. winit's X11 default is the file name of
-`argv[0]`, so an X11 window has `WM_CLASS` `zxraw`, which matches `StartupWMClass=zxraw`. On
-Wayland, eframe sets the app id to the `run_native` name, `ZXraw Explorer`. That does not match the
-desktop file, so taskbars and docks will not link the window to its icon. The fix is a single line
-in `crates/forge-app/src/main.rs`, not in this packaging:
-
-```rust
-let mut viewport = egui::ViewportBuilder::default()
-    .with_title("ZXraw Explorer")
-    .with_app_id("zxraw")  // matches zxraw.desktop on Wayland
-```
-
-Until that is changed, the Wayland app id stays `ZXraw Explorer`.
+**Window class.** On X11, winit uses the file name of `argv[0]` as `WM_CLASS`, so the window
+class is `zxraw`, which matches `StartupWMClass=zxraw`. On Wayland the app sets the app id `zxraw`
+(`with_app_id` in `crates/forge-app/src/main.rs`, Linux only), so docks link the window to this
+desktop file too.
 
 ## Icons
 
