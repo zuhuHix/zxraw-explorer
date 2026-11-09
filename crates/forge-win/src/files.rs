@@ -102,7 +102,47 @@ pub fn handle_identity(file: &std::fs::File) -> Result<HandleIdentity> {
     })
 }
 
-#[cfg(not(windows))]
+/// Identity fields from metadata (`fstat` for a handle, `lstat` for a path). The file id is
+/// the inode number; the volume is the raw `st_dev`.
+#[cfg(unix)]
+fn identity_of(md: &std::fs::Metadata) -> HandleIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    HandleIdentity {
+        volume: md.dev(),
+        file_id: u128::from(md.ino()),
+        links: u32::try_from(md.nlink()).unwrap_or(u32::MAX),
+        size: md.size(),
+        last_write: filetime_ticks(md.mtime(), md.mtime_nsec()),
+    }
+}
+
+/// FILETIME ticks (100 ns since 1601-01-01 UTC) of a Unix time.
+#[cfg(unix)]
+fn filetime_ticks(secs: i64, nsec: i64) -> u64 {
+    const UNIX_EPOCH_IN_FILETIME_SECS: i64 = 11_644_473_600;
+    let secs = (secs + UNIX_EPOCH_IN_FILETIME_SECS).max(0) as u64;
+    secs * 10_000_000 + nsec.max(0) as u64 / 100
+}
+
+/// `st_dev` folded to the 32-bit volume serial the Windows API reports.
+#[cfg(unix)]
+pub(crate) fn fold_dev(dev: u64) -> u32 {
+    (dev ^ (dev >> 32)) as u32
+}
+
+/// The identity of the file `file` has open (see [`HandleIdentity`]), read with `fstat`.
+#[cfg(unix)]
+pub fn handle_identity(file: &std::fs::File) -> Result<HandleIdentity> {
+    let md = file.metadata().map_err(|source| WinError::Io {
+        op: "read file identity",
+        path: std::path::PathBuf::new(),
+        source,
+    })?;
+    Ok(identity_of(&md))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn handle_identity(_file: &std::fs::File) -> Result<HandleIdentity> {
     Err(WinError::Unsupported)
 }
@@ -126,7 +166,18 @@ pub fn path_identity(path: &Path) -> Result<HandleIdentity> {
     handle_identity(&file)
 }
 
-#[cfg(not(windows))]
+/// The identity of the file at `path`, not following a link at the end (`lstat`).
+#[cfg(unix)]
+pub fn path_identity(path: &Path) -> Result<HandleIdentity> {
+    let md = std::fs::symlink_metadata(path).map_err(|source| WinError::Io {
+        op: "read an identity",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(identity_of(&md))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn path_identity(_path: &Path) -> Result<HandleIdentity> {
     Err(WinError::Unsupported)
 }
@@ -170,7 +221,59 @@ pub fn rename_open_file_over(file: &std::fs::File, target: &Path) -> Result<()> 
     .map_err(|e| crate::api_err("SetFileInformationByHandle(FileRenameInfoEx)", e))
 }
 
-#[cfg(not(windows))]
+/// Renames the file `file` has open to `target`, replacing what is there.
+///
+/// Approximation: Linux cannot rename through a descriptor. This takes the name the kernel
+/// has for the open file (`/proc/self/fd/N`) and renames that. It refuses when the file has
+/// no name left or when the name no longer refers to the open file. A rename of another
+/// file between those checks and the rename is not excluded.
+#[cfg(target_os = "linux")]
+pub fn rename_open_file_over(file: &std::fs::File, target: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::AsRawFd;
+
+    const OP: &str = "rename open file";
+    let held = file.metadata().map_err(|source| WinError::Io {
+        op: OP,
+        path: target.to_path_buf(),
+        source,
+    })?;
+    if held.nlink() == 0 {
+        return Err(WinError::Io {
+            op: OP,
+            path: target.to_path_buf(),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+    }
+    let link = format!("/proc/self/fd/{}", file.as_raw_fd());
+    let current = std::fs::read_link(&link).map_err(|source| WinError::Io {
+        op: OP,
+        path: Path::new(&link).to_path_buf(),
+        source,
+    })?;
+    let named = std::fs::symlink_metadata(&current).map_err(|source| WinError::Io {
+        op: OP,
+        path: current.clone(),
+        source,
+    })?;
+    if named.dev() != held.dev() || named.ino() != held.ino() {
+        return Err(WinError::Io {
+            op: OP,
+            path: current,
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the name no longer refers to the open file",
+            ),
+        });
+    }
+    std::fs::rename(&current, target).map_err(|source| WinError::Io {
+        op: OP,
+        path: current.clone(),
+        source,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn rename_open_file_over(_file: &std::fs::File, _target: &Path) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -182,7 +285,12 @@ pub fn hard_link_count(path: &Path) -> Result<u32> {
     Ok(handle_info(path)?.nNumberOfLinks)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn hard_link_count(path: &Path) -> Result<u32> {
+    Ok(path_identity(path)?.links)
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn hard_link_count(_path: &Path) -> Result<u32> {
     Err(WinError::Unsupported)
 }
@@ -193,7 +301,12 @@ pub fn volume_serial(path: &Path) -> Result<u32> {
     Ok(handle_info(path)?.dwVolumeSerialNumber)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+pub fn volume_serial(path: &Path) -> Result<u32> {
+    Ok(fold_dev(path_identity(path)?.volume))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn volume_serial(_path: &Path) -> Result<u32> {
     Err(WinError::Unsupported)
 }
@@ -208,7 +321,14 @@ pub fn file_id(path: &Path) -> Result<(u32, u64)> {
     Ok((info.dwVolumeSerialNumber, index))
 }
 
-#[cfg(not(windows))]
+/// On Unix the volume part is the folded `st_dev` and the index part the inode number.
+#[cfg(unix)]
+pub fn file_id(path: &Path) -> Result<(u32, u64)> {
+    let id = path_identity(path)?;
+    Ok((fold_dev(id.volume), id.file_id as u64))
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn file_id(_path: &Path) -> Result<(u32, u64)> {
     Err(WinError::Unsupported)
 }
@@ -244,7 +364,14 @@ pub fn network_root(path: &Path) -> Option<String> {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: the `//host/share` of a CIFS/SMB mount that holds `path`, from the mount table.
+/// Other network file systems (NFS, sshfs) have no share name here and give `None`.
+#[cfg(target_os = "linux")]
+pub fn network_root(path: &Path) -> Option<String> {
+    crate::drives::linux::network_share_of(path).ok().flatten()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn network_root(_path: &Path) -> Option<String> {
     None
 }
@@ -283,7 +410,18 @@ pub fn volume_identity(path: &Path) -> Result<String> {
     Ok(String::from_utf16_lossy(&name[..len]).to_lowercase())
 }
 
-#[cfg(not(windows))]
+/// Linux: `uuid:<UUID>` of the file system that holds `path` (from `/dev/disk/by-uuid`), or
+/// `dev:<major>:<minor>` when the device has no UUID. Symlinks in `path` are not followed.
+#[cfg(target_os = "linux")]
+pub fn volume_identity(path: &Path) -> Result<String> {
+    crate::drives::linux::volume_identity(path).map_err(|source| WinError::Io {
+        op: "volume identity",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn volume_identity(_path: &Path) -> Result<String> {
     Err(WinError::Unsupported)
 }
@@ -310,7 +448,18 @@ pub fn is_removable(path: &Path) -> Result<bool> {
     Ok(kind == DRIVE_REMOVABLE)
 }
 
-#[cfg(not(windows))]
+/// Linux: true if the mount that holds `path` is a removable or USB device (see
+/// `drives::linux`). Uses the mount table and sysfs only.
+#[cfg(target_os = "linux")]
+pub fn is_removable(path: &Path) -> Result<bool> {
+    crate::drives::linux::path_is_removable(path).map_err(|source| WinError::Io {
+        op: "removable check",
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn is_removable(_path: &Path) -> Result<bool> {
     Err(WinError::Unsupported)
 }
@@ -434,7 +583,41 @@ pub fn set_attributes(path: &Path, readonly: bool, hidden: bool) -> Result<()> {
         .map_err(|e| crate::api_err("SetFileAttributesW", e))
 }
 
-#[cfg(not(windows))]
+/// Unix: `readonly` removes every write bit (`true`) or adds the owner's (`false`). Linux
+/// and macOS have no hidden attribute (a hidden file is one whose name starts with a dot),
+/// and renaming a file to hide it is not done, so `hidden` is accepted and ignored. A symbolic
+/// link is left alone: its permission bits are not used.
+#[cfg(unix)]
+pub fn set_attributes(path: &Path, readonly: bool, _hidden: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let md = std::fs::symlink_metadata(path).map_err(|source| WinError::Io {
+        op: "read attributes",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if md.file_type().is_symlink() {
+        return Ok(());
+    }
+    let mode = md.permissions().mode() & 0o7777;
+    let wanted = if readonly {
+        mode & !0o222
+    } else {
+        mode | 0o200
+    };
+    if wanted == mode {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted)).map_err(|source| {
+        WinError::Io {
+            op: "set attributes",
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
 pub fn set_attributes(_path: &Path, _readonly: bool, _hidden: bool) -> Result<()> {
     Err(WinError::Unsupported)
 }
@@ -556,5 +739,126 @@ mod tests {
         std::fs::write(&a, b"x").unwrap();
         assert_ne!(file_id(&a).unwrap(), first, "a new file has a new identity");
         assert!(file_id(d.path()).is_ok(), "folders have an identity too");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode()
+    }
+
+    #[test]
+    fn file_id_differs_between_files_and_is_stable() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let first = file_id(&a).unwrap();
+        assert_eq!(file_id(&a).unwrap(), first);
+        assert_ne!(file_id(&b).unwrap(), first);
+    }
+
+    #[test]
+    fn hard_links_share_a_file_id_and_count_two() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        assert_eq!(hard_link_count(&a).unwrap(), 1);
+        std::fs::hard_link(&a, &b).unwrap();
+        assert_eq!(file_id(&a).unwrap(), file_id(&b).unwrap());
+        assert_eq!(hard_link_count(&a).unwrap(), 2);
+        assert_eq!(hard_link_count(&b).unwrap(), 2);
+    }
+
+    #[test]
+    fn volume_serial_is_shared_in_one_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        assert_eq!(volume_serial(&a).unwrap(), volume_serial(&b).unwrap());
+        assert_eq!(volume_serial(&a).unwrap(), file_id(&a).unwrap().0);
+    }
+
+    #[test]
+    fn handle_and_path_identity_agree() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        std::fs::write(&a, b"hello").unwrap();
+        let f = std::fs::File::open(&a).unwrap();
+        let by_handle = handle_identity(&f).unwrap();
+        assert_eq!(by_handle, path_identity(&a).unwrap());
+        assert_eq!(by_handle.size, 5);
+        assert_eq!(by_handle.links, 1);
+        assert!(by_handle.last_write > 0);
+        assert_eq!(by_handle.file_id, u128::from(file_id(&a).unwrap().1));
+    }
+
+    #[test]
+    fn set_attributes_readonly_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("ro.txt");
+        std::fs::write(&f, b"x").unwrap();
+        set_attributes(&f, true, false).unwrap();
+        assert!(std::fs::metadata(&f).unwrap().permissions().readonly());
+        assert_eq!(mode_of(&f) & 0o222, 0);
+        set_attributes(&f, false, false).unwrap();
+        assert!(!std::fs::metadata(&f).unwrap().permissions().readonly());
+        assert_ne!(mode_of(&f) & 0o200, 0);
+    }
+
+    #[test]
+    fn hidden_flag_is_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("visible.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let before = mode_of(&f);
+        set_attributes(&f, false, true).unwrap();
+        assert!(f.exists(), "no rename happens");
+        assert_eq!(mode_of(&f), before);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn rename_open_file_over_replaces_the_target() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("edited.tmp");
+        let target = d.path().join("original.txt");
+        std::fs::write(&src, b"new").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+        let held = std::fs::File::open(&target).unwrap();
+        let edited = std::fs::File::open(&src).unwrap();
+        rename_open_file_over(&edited, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        assert!(!src.exists());
+        assert_eq!(
+            handle_identity(&held).unwrap().links,
+            0,
+            "the replaced file lost its name"
+        );
+    }
+
+    #[test]
+    fn volume_identity_is_shared_by_siblings() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        let b = d.path().join("b.txt");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        let v = volume_identity(&a).unwrap();
+        assert!(v.starts_with("uuid:") || v.starts_with("dev:"), "{v}");
+        assert_eq!(volume_identity(&b).unwrap(), v);
+        assert!(is_removable(&a).is_ok());
     }
 }
