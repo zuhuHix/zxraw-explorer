@@ -658,7 +658,8 @@ or refuses with a message; nothing should crash for lack of it.
   tags, collections, Git badges, pins). Hidden files are names that start with `.`.
 * Git badges: a repository is read with `openat` and `O_NOFOLLOW` one name at a time from `/`.
   Symlinks are never followed, and mount points inside the repository are skipped like links
-  (another device, another mount id or `STATX_ATTR_MOUNT_ROOT`, so bind mounts too). FIFOs and
+  (another device, another mount id or `STATX_ATTR_MOUNT_ROOT`, so bind mounts too). On a
+  kernel that reports neither (before Linux 5.8) no folder is entered and no badges show. FIFOs and
   devices are never opened. Folders on network or FUSE file systems (NFS, SMB, sshfs, rclone
   and others) show no badges. File names that are not UTF-8 are skipped, so such a file gets
   no badge. Without `/proc`, the check that every opened folder is still inside the

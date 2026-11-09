@@ -1542,10 +1542,12 @@ pub fn extract_into_folder(
     let name = std::ffi::OsStr::new(folder.name);
     let shown_dest = folder.parent.join(name);
     let parent = safety::PinnedBase::open(folder.parent)?;
-    let real = parent.root().join(name);
-    let created = match fs::create_dir(&real) {
-        Ok(()) => true,
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.reuse => false,
+    #[cfg(test)]
+    safety::run_hook(&safety::BEFORE_DEST_CREATE, &parent.root().join(name));
+    // Made through the parent's handle, never by path (see `safety::create_child_dir`).
+    let (created, made) = match safety::create_child_dir(&parent, name) {
+        Ok(made) => (true, made),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && folder.reuse => (false, None),
         Err(e) => return Err(CoreError::io(&shown_dest, e)),
     };
     // Checked by handle (not a link) and pinned from here on.
@@ -1553,7 +1555,7 @@ pub fn extract_into_folder(
         Ok(dest) => dest,
         Err(e) => {
             if created {
-                let _ = fs::remove_dir(&real); // only if nothing is in it
+                safety::remove_new_child_dir(&parent, name, made);
             }
             return Err(e);
         }

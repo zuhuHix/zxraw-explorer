@@ -3747,6 +3747,22 @@ mod tests {
         );
     }
 
+    /// Unix: where the kernel can't tell mounts apart (no `statx`, forced here), the scan
+    /// enters no folder inside the repository, `.git` included: it fails closed rather than
+    /// risk reading through a bind mount.
+    #[cfg(unix)]
+    #[test]
+    fn without_mount_information_the_scan_fails_closed() {
+        let Some(repo) = fixture_repo() else { return };
+        safe_fs::NO_STATX.with(|n| n.set(true));
+        let (result, opened, root_final) = scan_recorded(repo.path(), LIMITS);
+        safe_fs::NO_STATX.with(|n| n.set(false));
+        assert_eq!(result.unwrap_err(), Failure::Unsafe);
+        assert_contained(&opened, &root_final, "no statx");
+        // With mount information the same repository reads fine.
+        assert!(read_status(repo.path()).is_ok());
+    }
+
     /// Unix: network and FUSE file systems are recognised by their `statfs` magic.
     #[cfg(unix)]
     #[test]

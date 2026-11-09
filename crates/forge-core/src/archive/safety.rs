@@ -30,6 +30,10 @@ thread_local! {
     /// of that path are pinned.
     pub(crate) static BEFORE_BASE_PIN: RefCell<Option<BeforeParentCreateHook>> =
         const { RefCell::new(None) };
+    /// Tests: runs with the folder's path once its parent is pinned, before
+    /// `extract_into_folder` makes the folder.
+    pub(crate) static BEFORE_DEST_CREATE: RefCell<Option<BeforeParentCreateHook>> =
+        const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -478,6 +482,50 @@ fn open_child(
     }
     let fd = openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| unix_error(path, e))?;
     Ok((check_real_dir_fd(fd, path)?, made))
+}
+
+/// Make the folder `name` in the pinned folder `parent`. Windows: by path, which the pinned
+/// handles keep from leading anywhere else. Unix: `mkdirat` relative to `parent`'s handle (mode
+/// 0777 less the umask, as any new folder), then the identity of what was made, opened
+/// relative to that handle without following a link (`None` if that failed). An existing
+/// name is `AlreadyExists`.
+pub(crate) fn create_child_dir(
+    parent: &PinnedBase,
+    name: &std::ffi::OsStr,
+) -> io::Result<Option<FileIdentity>> {
+    #[cfg(windows)]
+    {
+        fs::create_dir(parent.root().join(name))?;
+        Ok(None)
+    }
+    #[cfg(not(windows))]
+    {
+        use rustix::fs::{Mode, mkdirat, openat};
+        mkdirat(parent.handle(), name, Mode::from_raw_mode(0o777))?;
+        Ok(openat(parent.handle(), name, dir_flags(), Mode::empty())
+            .ok()
+            .and_then(|fd| FileIdentity::of_dir(&fs::File::from(fd))))
+    }
+}
+
+/// Take back a folder [`create_child_dir`] made (`made` is what it returned) that nothing was
+/// written into. Windows: by path, if empty. Unix: only if what has the name now is that very
+/// folder, checked and removed relative to `parent`'s handle (see [`remove_if_same`]);
+/// otherwise it is left alone.
+pub(crate) fn remove_new_child_dir(
+    parent: &PinnedBase,
+    name: &std::ffi::OsStr,
+    made: Option<FileIdentity>,
+) {
+    #[cfg(windows)]
+    {
+        let _ = made;
+        let _ = fs::remove_dir(parent.root().join(name)); // only if nothing is in it
+    }
+    #[cfg(not(windows))]
+    if made.is_some() {
+        let _ = remove_if_same(parent.handle(), name, true, made);
+    }
 }
 
 /// What became of something [`remove_if_same`] was asked to remove.
