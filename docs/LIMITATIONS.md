@@ -688,7 +688,10 @@ Windows in these ways:
   the mount table, by a different device, or by `statx`'s mount-root flag) makes the delete of
   that folder fail; nothing under the mount point is deleted. When the mount is only found
   partway through (it appeared after the delete started), entries deleted before it was
-  reached stay deleted and the rest is moved back.
+  reached stay deleted and the rest is moved back. If neither the mount table can be read nor
+  the kernel reports mount roots (`STATX_ATTR_MOUNT_ROOT`, Linux 5.8+), folders are not
+  deleted permanently at all (files still are). If the empty staging folder can't be removed
+  after a successful delete, it is listed as a separate failure under its own path.
 - **Clipboard:** X11 and Wayland clipboards belong to the running app, so copied files vanish
   from the clipboard when ZXraw Explorer exits unless a clipboard manager keeps a copy.
   There is no system clipboard sequence number: the sequence is a hash of the owner window,

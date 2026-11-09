@@ -7,6 +7,7 @@
 //! copied across devices and nothing is destroyed, so the app can ask "delete permanently
 //! instead?" in its own dialog, as on Windows.
 
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
@@ -223,6 +224,8 @@ fn delete_all(
             report.failed.push((p.clone(), why));
         } else if outcome.gone {
             report.done.push(p.clone());
+            // Reported under the staging folder's own path, so the item still counts as done.
+            report.failed.extend(outcome.leftover);
         } else if t.stopped {
             report.cancelled = true;
             if outcome.stranded {
@@ -271,6 +274,8 @@ struct Destroyed {
     /// What is left of the item could not be moved back from its staging folder; `error`
     /// says where it is.
     stranded: bool,
+    /// After a successful delete, the empty staging folder that could not be removed.
+    leftover: Option<(PathBuf, DeleteFailure)>,
     /// The item at the path was not the confirmed one; nothing was removed.
     changed: bool,
     /// Something inside the item was removed.
@@ -309,6 +314,10 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// Test seam: display paths (as `tick` sees them) the delete must take for mount points.
     static FAKE_MOUNTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Test seam: act as if neither the mount table nor `STATX_ATTR_MOUNT_ROOT` is available.
+    static NO_MOUNT_INFO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test seam: make removing the empty staging folder fail.
+    static KEEP_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -344,6 +353,40 @@ fn fake_mount(_path: &Path) -> bool {
     false
 }
 
+fn no_mount_info() -> bool {
+    #[cfg(test)]
+    return NO_MOUNT_INFO.with(|c| c.get());
+    #[cfg(not(test))]
+    false
+}
+
+/// The mount table, or `None` when it cannot be read.
+fn mount_table() -> Option<Vec<u8>> {
+    if no_mount_info() {
+        return None;
+    }
+    fs::read("/proc/self/mountinfo").ok()
+}
+
+/// Whether `statx` can report `STATX_ATTR_MOUNT_ROOT` for `name` in `dir` (kernel 5.8+).
+fn mount_root_known_at(dir: RawFd, name: &CStr) -> bool {
+    if no_mount_info() {
+        return false;
+    }
+    // SAFETY: valid fd, NUL-terminated name, zeroed plain-data out value.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::statx(
+            dir,
+            name.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+            &mut stx,
+        )
+    };
+    r == 0 && stx.stx_attributes_mask & libc::STATX_ATTR_MOUNT_ROOT as u64 != 0
+}
+
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in the open folder `dir`. `Ok(None)` only when
 /// the name does not exist (`ENOENT`); any other failure leaves the answer unknown.
 fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Option<libc::stat>> {
@@ -364,6 +407,9 @@ fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Option<libc::stat>> {
 /// (which also catches a bind mount of the same device). `false` where the kernel or file
 /// system cannot say; the device comparison still applies there.
 fn is_mount_root_at(dir: RawFd, name: &CStr) -> bool {
+    if no_mount_info() {
+        return false;
+    }
     // SAFETY: valid fd, NUL-terminated name, zeroed plain-data out value.
     let mut stx: libc::statx = unsafe { std::mem::zeroed() };
     let r = unsafe {
@@ -466,6 +512,7 @@ fn destroy_checked(
         changed: false,
         removed_inside: false,
         error: Some(why),
+        leftover: None,
     };
     // Never destroy anything during a recycle (see `refuses_permanent_delete`).
     if refuses_permanent_delete(mode, 0) {
@@ -497,12 +544,28 @@ fn destroy_checked(
     };
     let dir = parent_fd.as_raw_fd();
 
-    // A volume mounted inside the item: refuse before anything moves.
-    if let Ok(resolved_parent) = fs::read_link(format!("/proc/self/fd/{dir}"))
-        && let Ok(table) = fs::read("/proc/self/mountinfo")
-        && let Some(inner) = mount_inside(&table, &resolved_parent.join(name))
-    {
-        return fail(mount_failure(&inner));
+    // A volume mounted inside the item: refuse before anything moves. When neither the
+    // mount table nor statx's mount-root flag is available, a same-device bind mount could
+    // not be seen, so a folder is refused (fail closed); a plain file has nothing inside.
+    let table = fs::read_link(format!("/proc/self/fd/{dir}"))
+        .ok()
+        .zip(mount_table());
+    match table {
+        Some((resolved_parent, table)) => {
+            if let Some(inner) = mount_inside(&table, &resolved_parent.join(name)) {
+                return fail(mount_failure(&inner));
+            }
+        }
+        None => {
+            let is_dir = matches!(stat_at(dir, &name_c), Ok(Some(st)) if st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+            if is_dir && !mount_root_known_at(dir, &name_c) {
+                return fail(DeleteFailure::Other(
+                    "can't tell whether a volume is mounted inside it (the mount table can't be \
+                     read and the kernel doesn't report mount points), so it was not deleted"
+                        .into(),
+                ));
+            }
+        }
     }
 
     // Pin the object: move it into a new private folder, then check it there.
@@ -512,18 +575,23 @@ fn destroy_checked(
         Err(e) => return fail(classify(&e)),
     };
     let sdir = staging_fd.as_raw_fd();
-    let remove_staging = || {
+    let staging_path = parent.join(OsStr::from_bytes(staged.to_bytes()));
+    // Removes the (empty) staging folder; `Some(why)` when it is left behind.
+    let remove_staging = || -> Option<String> {
+        #[cfg(test)]
+        if KEEP_STAGING.with(|c| c.get()) {
+            return Some("kept by the test".into());
+        }
         // SAFETY: valid fd and NUL-terminated name.
         if unsafe { libc::unlinkat(dir, staged.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-            tracing::warn!(
-                dir = %parent.join(OsStr::from_bytes(staged.to_bytes())).display(),
-                error = %io::Error::last_os_error(),
-                "could not remove an empty staging folder"
-            );
+            let e = io::Error::last_os_error();
+            tracing::warn!(dir = %staging_path.display(), error = %e, "could not remove an empty staging folder");
+            return Some(e.to_string());
         }
+        None
     };
     if let Err(e) = rename_at(dir, &name_c, sdir, &name_c) {
-        remove_staging();
+        let _ = remove_staging();
         return fail(classify(&e));
     }
     let left_at = parent.join(OsStr::from_bytes(staged.to_bytes())).join(name);
@@ -534,7 +602,7 @@ fn destroy_checked(
         seam("put back", path);
         match put_back_at(sdir, dir, &name_c) {
             Ok(()) => {
-                remove_staging();
+                let _ = remove_staging();
                 Ok(())
             }
             Err(e) => {
@@ -608,13 +676,21 @@ fn destroy_checked(
     };
     if gone {
         drop(staging_fd);
-        remove_staging();
+        let leftover = remove_staging().map(|why| {
+            (
+                staging_path.clone(),
+                DeleteFailure::Other(format!(
+                    "the item was deleted, but its empty staging folder was left behind ({why})"
+                )),
+            )
+        });
         return Destroyed {
             gone: true,
             stranded: false,
             changed: false,
             removed_inside: d.removed > 1,
             error: None,
+            leftover,
         };
     }
     let mut error = match &d.mount {
@@ -630,6 +706,7 @@ fn destroy_checked(
         changed: false,
         removed_inside: d.removed > 0,
         error,
+        leftover: None,
     }
 }
 
@@ -834,9 +911,30 @@ fn list_dir(fd: &OwnedFd) -> io::Result<Vec<(CString, u8)>> {
 /// Folders on another device (a mount inside) are counted as one entry, not walked: the
 /// delete never goes into them either.
 fn count_tree(path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> u64 {
+    /// Whether the folder `path` (resolved as `real`) is a mount: another device, in the
+    /// mount table, or a mount root by statx.
+    fn is_mount(
+        path: &Path,
+        real: Option<&Path>,
+        md: &fs::Metadata,
+        dev: Option<u64>,
+        mounts: &HashSet<PathBuf>,
+    ) -> bool {
+        if dev.is_some_and(|d| d != md.dev()) || fake_mount(path) {
+            return true;
+        }
+        if dev.is_some() && real.is_some_and(|r| mounts.contains(r)) {
+            return true;
+        }
+        dev.is_some()
+            && cstring(path.as_os_str().as_bytes())
+                .is_ok_and(|c| is_mount_root_at(libc::AT_FDCWD, &c))
+    }
     fn walk(
         path: &Path,
+        real: Option<PathBuf>,
         dev: Option<u64>,
+        mounts: &HashSet<PathBuf>,
         tick: &mut dyn FnMut(&Path) -> bool,
         n: &mut u64,
     ) -> bool {
@@ -846,19 +944,29 @@ fn count_tree(path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> u64 {
         }
         if let Ok(md) = fs::symlink_metadata(path)
             && md.is_dir()
-            && dev.is_none_or(|d| d == md.dev())
+            && !is_mount(path, real.as_deref(), &md, dev, mounts)
             && let Ok(rd) = fs::read_dir(path)
         {
             for entry in rd.flatten() {
-                if !walk(&entry.path(), Some(md.dev()), tick, n) {
+                let child_real = real.as_ref().map(|r| r.join(entry.file_name()));
+                if !walk(&entry.path(), child_real, Some(md.dev()), mounts, tick, n) {
                     return false;
                 }
             }
         }
         true
     }
+    let mounts: HashSet<PathBuf> = mount_table()
+        .map(|t| {
+            crate::drives::linux::parse_mountinfo(t)
+                .into_iter()
+                .map(|m| m.mount_point)
+                .collect()
+        })
+        .unwrap_or_default();
+    let real = fs::canonicalize(path).ok();
     let mut n = 0;
-    walk(path, None, tick, &mut n);
+    walk(path, real, None, &mounts, tick, &mut n);
     n
 }
 
@@ -2363,5 +2471,87 @@ mod tests {
             stat_at(fd.as_raw_fd(), &cstring(&long).unwrap()).is_err(),
             "ENAMETOOLONG"
         );
+    }
+    fn with_flag(flag: &'static std::thread::LocalKey<std::cell::Cell<bool>>, body: impl FnOnce()) {
+        flag.with(|c| c.set(true));
+        body();
+        flag.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn without_any_mount_information_folders_are_refused_and_files_still_go() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        fx.file("d/inner.txt", b"keep");
+        let f = fx.file("plain.txt", b"x");
+        let mut report = None;
+        with_flag(&NO_MOUNT_INFO, || {
+            report = Some(run_with(
+                &[d.clone(), f.clone()],
+                &[],
+                Mode::Permanent,
+                quiet(),
+                &fx.env(),
+            ));
+        });
+        let report = report.unwrap();
+        assert_eq!(report.done, vec![f.clone()], "{report:?}");
+        let [(p, DeleteFailure::Other(m))] = report.failed.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert_eq!(p, &d);
+        assert!(
+            m.contains("can't tell whether a volume is mounted inside it"),
+            "{m}"
+        );
+        assert_eq!(fs::read(d.join("inner.txt")).unwrap(), b"keep");
+        assert!(!f.exists());
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn counting_does_not_walk_into_a_mount() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        for i in 0..5 {
+            fx.file(&format!("d/backup/f{i}"), b"x");
+        }
+        fx.file("d/a", b"x");
+        let mut n = 0;
+        with_fake_mounts(vec![d.join("backup")], || {
+            n = count_tree(&d, &mut |_| true);
+        });
+        assert_eq!(n, 3, "d, d/a and d/backup itself, not its contents");
+        assert_eq!(count_tree(&d, &mut |_| true), 8);
+    }
+
+    #[test]
+    fn a_staging_folder_left_after_a_delete_is_reported_without_failing_the_item() {
+        let fx = Fixture::new();
+        let f = fx.file("f.txt", b"x");
+        let mut report = None;
+        with_flag(&KEEP_STAGING, || {
+            report = Some(run_with(
+                &[f.clone()],
+                &[],
+                Mode::Permanent,
+                quiet(),
+                &fx.env(),
+            ));
+        });
+        let report = report.unwrap();
+        assert_eq!(report.done, vec![f.clone()]);
+        let [(p, DeleteFailure::Other(m))] = report.failed.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert!(
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("f.txt.zxraw-deleting-"),
+            "{p:?}"
+        );
+        assert!(p.is_dir() && fs::read_dir(p).unwrap().next().is_none());
+        assert!(m.contains("staging folder was left behind"), "{m}");
     }
 }
