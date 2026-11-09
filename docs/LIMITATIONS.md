@@ -657,18 +657,26 @@ or refuses with a message; nothing should crash for lack of it.
 * Names are case-sensitive: `IMG.jpg` and `img.jpg` are two files everywhere (index, notes,
   tags, collections, Git badges, pins). Hidden files are names that start with `.`.
 * Git badges: a repository is read with `openat` and `O_NOFOLLOW` one name at a time from `/`.
-  Symlinks are never followed, mount points inside the repository are skipped like links,
-  FIFOs and devices are never opened, and folders on network or FUSE file systems (NFS, SMB,
-  sshfs, rclone and others) show no badges. Without `/proc`, the check that every opened
-  folder is still inside the repository is skipped; the walk still opens only single names
-  relative to folders it holds.
+  Symlinks are never followed, and mount points inside the repository are skipped like links
+  (another device, another mount id or `STATX_ATTR_MOUNT_ROOT`, so bind mounts too). FIFOs and
+  devices are never opened. Folders on network or FUSE file systems (NFS, SMB, sshfs, rclone
+  and others) show no badges. File names that are not UTF-8 are skipped, so such a file gets
+  no badge. Without `/proc`, the check that every opened folder is still inside the
+  repository is skipped; the walk still opens only single names relative to folders it holds.
+* Extraction creates every folder with `mkdirat`/`openat(O_NOFOLLOW)` relative to the folder
+  above it, and writes, renames and deletes its temp files through `/proc/self/fd` paths of
+  those held folders. Without a usable `/proc` it refuses to extract.
+* A library database copied from Windows is rebuilt case-sensitive the first time it is
+  opened on Linux.
 * File identity (archive stamps, safe cleanup after a cancelled extraction, replace checks)
   uses device, inode and birth time. On a file system without birth times it falls back to the
   weak identity, so cleanup reports what it left instead of removing it.
 * Unix has no share modes and no rename or delete through a handle. A file the app holds open
-  can still be changed, renamed or deleted by other programs; safe removal and replace check
-  the object before and after a rename, which leaves a short race window that Windows doesn't
-  have.
+  can still be changed, renamed or deleted by other programs. Publishing a finished file checks
+  afterwards that the object renamed is the one held open (device and inode) and renames it
+  back otherwise. Safe removal moves the item into a private staging folder, checks it there,
+  then deletes it; another program of the same user could still interfere inside that folder,
+  which Windows' delete-through-handle rules out.
 * Volume identity is per path root, and every Linux path is under `/`. Library roots are not
   told apart by mount, so "offline volume" detection does not work for unplugged drives yet.
 * The `e2e` UI test suite runs on Windows only for now.

@@ -1044,8 +1044,12 @@ fn extract_pinned(
     // Each held file keeps its open handle and the pins of the folders it goes into until it
     // is published or dropped: neither it nor its folders can be swapped meanwhile.
     // Also whether it replaces a file already there.
-    let held: std::cell::RefCell<Vec<(ops::HeldFile, PathBuf, safety::PinnedDirs, bool)>> =
-        Default::default();
+    // The real folder it goes into is kept too: the held file's own path is through the
+    // folder's handle (see `safety::held_dir`).
+    #[allow(clippy::type_complexity)]
+    let held: std::cell::RefCell<
+        Vec<(ops::HeldFile, PathBuf, PathBuf, safety::PinnedDirs, bool)>,
+    > = Default::default();
     let settled: std::cell::RefCell<(Vec<PathBuf>, Vec<OpIssue>)> = Default::default();
     let mut visit = |entry: &ArchiveEntry, reader: Result<&mut dyn Read>| -> Result<()> {
         ctx.cancel.check()?;
@@ -1091,8 +1095,22 @@ fn extract_pinned(
                 return Ok(());
             }
         };
-        let (dest, overwrite, keep_both) = match fs::symlink_metadata(&target) {
-            Err(_) => (target, false, false),
+        // Every temp file and rename below goes through the pinned folder's handle (see
+        // `safety::held_dir`), never through `target`'s path; `real` maps a name back.
+        let folder = pinned.last().unwrap_or_else(|| base.handle());
+        let target_dir = target.parent().unwrap_or(root).to_path_buf();
+        let at = match safety::held_dir(folder, &target_dir) {
+            Ok(dir) => dir.join(target.file_name().unwrap_or_default()),
+            Err(e) => {
+                report
+                    .failed
+                    .push(OpIssue::new(shown(&target), e.to_string()));
+                return Ok(());
+            }
+        };
+        let real = |placed: &Path| target_dir.join(placed.file_name().unwrap_or_default());
+        let (dest, overwrite, keep_both) = match fs::symlink_metadata(&at) {
+            Err(_) => (at, false, false),
             Ok(md) if node_kind(&md) != NodeKind::File => {
                 report.failed.push(OpIssue::new(
                     shown(&target),
@@ -1101,9 +1119,9 @@ fn extract_pinned(
                 return Ok(());
             }
             Ok(_) => match opts.policy {
-                ConflictPolicy::Overwrite => (target, true, false),
+                ConflictPolicy::Overwrite => (at, true, false),
                 // The name is re-checked at publish time; a racing file gets the next name.
-                ConflictPolicy::KeepBoth => (target, false, true),
+                ConflictPolicy::KeepBoth => (at, false, true),
                 _ => {
                     report
                         .skipped
@@ -1128,21 +1146,27 @@ fn extract_pinned(
                 Ok((out, file)) => {
                     remaining = remaining.saturating_sub(out.bytes);
                     report.bytes += out.bytes;
-                    held.borrow_mut()
-                        .push((file, shown(&dest), pinned, overwrite));
+                    held.borrow_mut().push((
+                        file,
+                        shown(&target),
+                        target_dir.clone(),
+                        pinned,
+                        overwrite,
+                    ));
                     Ok(())
                 }
                 Err(CoreError::Cancelled) => Err(CoreError::Cancelled),
                 Err(e) => {
                     report
                         .failed
-                        .push(OpIssue::new(shown(&dest), data_error(&p.entry, e)));
+                        .push(OpIssue::new(shown(&target), data_error(&p.entry, e)));
                     Ok(())
                 }
             };
         }
         match ops::write_stream_placed(reader, &label, &dest, sopts, keep_both, ctx) {
             Ok((out, placed, identity)) => {
+                let placed = real(&placed);
                 // `overwrite` only when a file had the name: else publishing never replaces.
                 record(&placed, identity, false, overwrite);
                 remaining = remaining.saturating_sub(out.bytes);
@@ -1159,7 +1183,7 @@ fn extract_pinned(
             Err(e) => {
                 report
                     .failed
-                    .push(OpIssue::new(shown(&dest), data_error(&p.entry, e)));
+                    .push(OpIssue::new(shown(&target), data_error(&p.entry, e)));
                 Ok(())
             }
         }
@@ -1168,7 +1192,7 @@ fn extract_pinned(
     let mut block_end = |outcome: Result<()>| -> Result<()> {
         let waiting = std::mem::take(&mut *held.borrow_mut());
         let mut settled = settled.borrow_mut();
-        for (file, label, pinned, replaced) in waiting {
+        for (file, label, real_dir, pinned, replaced) in waiting {
             if outcome.is_err() {
                 drop(file); // deleted through its handle
                 settled.1.push(OpIssue::new(label, BLOCK_CHECK_FAILED));
@@ -1180,6 +1204,7 @@ fn extract_pinned(
             drop(pinned);
             match published {
                 Ok(placed) => {
+                    let placed = real_dir.join(placed.file_name().unwrap_or_default());
                     record(&placed, identity, false, replaced);
                     if let Some(zone) = &zone
                         && let Err(e) = motw::write_zone(&placed, zone, archive)
@@ -1909,7 +1934,9 @@ const LEFTOVER_AGE: Duration = Duration::from_secs(3600);
 /// and from each folder of `planned` that files are written into, when the folder already
 /// exists. A missing folder is never created here. Each folder is pinned while it is cleaned.
 fn remove_leftovers(base: &safety::PinnedBase, planned: &[Planned]) {
-    ops::remove_stale_partials(base.root(), LEFTOVER_AGE);
+    if let Ok(at) = safety::held_dir(base.handle(), base.root()) {
+        ops::remove_stale_partials(&at, LEFTOVER_AGE);
+    }
     let folders: HashSet<&Path> = planned
         .iter()
         .filter(|p| !p.entry.is_dir)
@@ -1922,8 +1949,11 @@ fn remove_leftovers(base: &safety::PinnedBase, planned: &[Planned]) {
             continue;
         }
         // Held while cleaned: the folder cannot be swapped for a link meanwhile.
-        if let Ok(_pinned) = safety::pin_dirs(base, rel) {
-            ops::remove_stale_partials(&path, LEFTOVER_AGE);
+        if let Ok(pinned) = safety::pin_dirs(base, rel)
+            && let Some(folder) = pinned.last()
+            && let Ok(at) = safety::held_dir(folder, &path)
+        {
+            ops::remove_stale_partials(&at, LEFTOVER_AGE);
         }
     }
 }

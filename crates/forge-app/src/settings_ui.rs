@@ -1584,7 +1584,7 @@ fn shortcuts_page(ui: &mut egui::Ui, settings: &mut Settings, state: &mut Settin
             ui.label("");
             ui.label("");
             ui.end_row();
-            for &cmd in Cmd::ALL {
+            for &cmd in Cmd::ALL.iter().filter(|c| crate::platform::command_available(**c)) {
                 let text = cmd.binding_text(&settings.keybindings);
                 if !filter.is_empty()
                     && !cmd.label().to_lowercase().contains(&filter)

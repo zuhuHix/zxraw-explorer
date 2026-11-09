@@ -53,6 +53,7 @@ impl Palette {
         let mut items: Vec<(i32, Cmd)> = Cmd::ALL
             .iter()
             .filter(|c| **c != Cmd::CommandPalette)
+            .filter(|c| crate::platform::command_available(**c))
             .filter_map(|c| fuzzy_score(c.label(), &self.query).map(|s| (s, *c)))
             .collect();
         items.sort_by(|a, b| b.0.cmp(&a.0));

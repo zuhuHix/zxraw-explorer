@@ -689,7 +689,6 @@ fn a_destination_through_a_junction_is_resolved_and_pinned_for_the_job() {
     fs::rename(&real, d.path().join("elsewhere")).unwrap();
 }
 
-#[cfg(windows)]
 fn zip_of(path: &Path, files: &[(&str, &[u8])]) {
     let mut zw = ZipWriter::new(File::create(path).unwrap());
     for (name, data) in files {
@@ -709,15 +708,12 @@ fn junction(link: &Path, target: &Path) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-#[cfg(windows)]
 type HookKey =
     std::thread::LocalKey<std::cell::RefCell<Option<super::safety::BeforeParentCreateHook>>>;
 
 /// Sets a safety hook for the life of the guard.
-#[cfg(windows)]
 struct Hook(&'static HookKey);
 
-#[cfg(windows)]
 impl Hook {
     fn set(key: &'static HookKey, f: impl Fn(&Path) + 'static) -> Self {
         key.with(|h| *h.borrow_mut() = Some(Box::new(f)));
@@ -725,7 +721,6 @@ impl Hook {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Hook {
     fn drop(&mut self) {
         self.0.with(|h| *h.borrow_mut() = None);
@@ -1229,4 +1224,79 @@ fn zipcrypto_entries_with_another_password_are_not_parsed_with_this_one() {
         return;
     }
     panic!("no header failed the check in 64 tries");
+}
+
+/// Unix twin of `the_destination_is_pinned_before_the_archive_is_planned`: nothing stops the
+/// destination from being renamed there, but what is written goes through its pinned handle,
+/// so a symlink put in its place gets nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_a_destination_swapped_for_a_symlink_gets_nothing_through_it() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = fresh_dest(d.path(), "dest");
+    let victim = fresh_dest(d.path(), "victim");
+    zip_of(
+        &d.path().join("a.zip"),
+        &[("x.txt", b"inside"), ("sub/y.txt", b"deeper")],
+    );
+    let (dest_h, moved) = (dest.clone(), d.path().join("moved"));
+    let victim_h = victim.clone();
+    let moved_h = moved.clone();
+    let hook = Hook::set(&super::safety::AFTER_DEST_PINNED, move |_| {
+        fs::rename(&dest_h, &moved_h).unwrap();
+        std::os::unix::fs::symlink(&victim_h, &dest_h).unwrap();
+    });
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    let report = report.unwrap();
+    assert!(is_empty_dir(&victim), "{report:?}");
+    assert_eq!(fs::read(moved.join("x.txt")).unwrap(), b"inside");
+    assert_eq!(fs::read(moved.join("sub/y.txt")).unwrap(), b"deeper");
+}
+
+/// Linux: a folder the extraction is about to create, swapped for a symlink first, is
+/// refused (`O_NOFOLLOW`), never followed.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_a_symlink_raced_in_for_a_new_folder_is_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = fresh_dest(d.path(), "dest");
+    let victim = fresh_dest(d.path(), "victim");
+    zip_of(&d.path().join("a.zip"), &[("sub/x.txt", b"inside")]);
+    let victim_h = victim.clone();
+    let hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |cur| {
+        let _ = std::os::unix::fs::symlink(&victim_h, cur);
+    });
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    let report = report.unwrap();
+    assert!(is_empty_dir(&victim), "{report:?}");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    assert!(report.extracted.is_empty(), "{report:?}");
+}
+
+/// Linux: a folder held while files are written into it, whose parent is swapped for a
+/// symlink meanwhile, still gets the files; the symlink's target gets nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn on_linux_a_held_folders_parent_swapped_for_a_symlink_gets_nothing() {
+    let d = tempfile::tempdir().unwrap();
+    let dest = fresh_dest(d.path(), "dest");
+    let victim = fresh_dest(d.path(), "victim");
+    fs::create_dir_all(victim.join("a")).unwrap();
+    zip_of(&d.path().join("a.zip"), &[("a/b/x.txt", b"inside")]);
+    let (dest_h, victim_h, moved) = (dest.clone(), victim.clone(), d.path().join("moved-a"));
+    let moved_h = moved.clone();
+    // Runs before `a/b` is made, while `a` is held.
+    let hook = Hook::set(&super::safety::BEFORE_PARENT_CREATE, move |cur| {
+        if cur.ends_with("a/b") && !moved_h.exists() {
+            fs::rename(dest_h.join("a"), &moved_h).unwrap();
+            std::os::unix::fs::symlink(victim_h.join("a"), dest_h.join("a")).unwrap();
+        }
+    });
+    let report = ctx_run(&d.path().join("a.zip"), &dest, &ExtractOptions::default());
+    drop(hook);
+    let report = report.unwrap();
+    assert!(is_empty_dir(&victim.join("a")), "{report:?}");
+    assert_eq!(fs::read(moved.join("b/x.txt")).unwrap(), b"inside");
 }

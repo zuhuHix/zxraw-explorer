@@ -152,6 +152,9 @@ pub struct Fs {
     /// crossing a mount point is allowed.
     #[cfg(unix)]
     narrowed: bool,
+    /// Unix: the root's mount id once narrowed (`statx` `stx_mnt_id`), where known.
+    #[cfg(unix)]
+    mount: Option<u64>,
     /// Final path of the root (lowercase on Windows), without a trailing separator.
     root_final: String,
     /// Final paths of every handle opened, in tests.
@@ -166,6 +169,10 @@ pub struct Dir {
     /// The folder's `st_dev`: an entry on another device is a mount point.
     #[cfg(unix)]
     dev: u64,
+    /// The folder's mount id (`statx` `stx_mnt_id`), where known: an entry on another mount
+    /// (a bind mount of the same device) is a mount point too.
+    #[cfg(unix)]
+    mount: Option<u64>,
 }
 
 impl Dir {
