@@ -468,7 +468,7 @@ impl ToolWindow {
                             state.selected.clear();
                         }
                         self.notice =
-                            Some("Copies moved to the Recycle Bin; refreshing results…".into());
+                            Some(format!("Copies moved to the {}; refreshing results…", crate::platform::TRASH));
                         self.initial_pending = true;
                     }
                     Err(error) => self.notice = Some(error),
@@ -1489,8 +1489,9 @@ fn launch_action(
             checks,
         } => {
             let title = format!(
-                "Moving {} duplicate copy/copies to the Recycle Bin",
-                targets.len()
+                "Moving {} duplicate copy/copies to the {}",
+                targets.len(),
+                crate::platform::TRASH
             );
             let result_tx = result_tx.clone();
             let ctx = ctx.clone();
@@ -1516,13 +1517,13 @@ fn launch_action(
                     return Ok(());
                 }
                 job.progress
-                    .set_current("Moving selected copies to the Recycle Bin");
+                    .set_current(format!("Moving selected copies to the {}", crate::platform::TRASH));
                 let result = forge_win::recycle(&targets).map_err(|error| error.to_string());
                 job.progress.add_items(targets.len() as u64);
                 job.progress.add_bytes(bytes);
                 if let Err(error) = &result {
                     job.progress.add_error();
-                    let _ = tx.send(Event::Error(format!("Recycle Bin move failed: {error}")));
+                    let _ = tx.send(Event::Error(format!("{} move failed: {error}", crate::platform::TRASH)));
                 } else {
                     let mut parents: Vec<PathBuf> = targets
                         .iter()
@@ -1534,8 +1535,9 @@ fn launch_action(
                         let _ = tx.send(Event::Changed(dir));
                     }
                     let _ = tx.send(Event::Toast(format!(
-                        "Moved {} duplicate copy/copies to the Recycle Bin",
-                        targets.len()
+                        "Moved {} duplicate copy/copies to the {}",
+                        targets.len(),
+                        crate::platform::TRASH
                     )));
                 }
                 let err = result.as_ref().err().cloned();
@@ -2451,7 +2453,7 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
             format_size(target_bytes)
         ));
         let safe = targets.is_some() && target_count > 0;
-        let move_ticked = ui.add_enabled(safe, egui::Button::new("Move ticked to Recycle Bin"));
+        let move_ticked = ui.add_enabled(safe, egui::Button::new(format!("Move ticked to {}", crate::platform::TRASH)));
         register_click_target(
             ui.ctx(),
             "duplicates:Move ticked to Recycle Bin",
@@ -2467,15 +2469,15 @@ fn render_duplicates(id: u64, state: &mut DuplicatesState, ui: &mut egui::Ui) ->
     if state.confirming {
         if let Some((paths, bytes)) = selected_duplicate_targets(&report.groups, &state.selected) {
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.label(RichText::new("Confirm Recycle Bin move").strong());
-                ui.label(format!("Move {} selected file(s), totaling {}, to the Recycle Bin? Every duplicate group will retain at least one copy.", paths.len(), format_size(bytes)));
+                ui.label(RichText::new(format!("Confirm {} move", crate::platform::TRASH)).strong());
+                ui.label(format!("Move {} selected file(s), totaling {}, to the {}? Every duplicate group will retain at least one copy.", paths.len(), format_size(bytes), crate::platform::TRASH));
                 egui::ScrollArea::vertical().max_height(100.0).show(ui, |ui| {
                     for path in paths.iter().take(40) { ui.label(path.display().to_string()); }
                     if paths.len() > 40 { ui.label(format!("… and {} more", paths.len() - 40)); }
                 });
                 ui.horizontal(|ui| {
                     let move_confirm = ui.button(
-                        RichText::new("Move to Recycle Bin")
+                        RichText::new(format!("Move to {}", crate::platform::TRASH))
                             .color(Color32::WHITE)
                             .strong(),
                     );
@@ -3151,7 +3153,11 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
     });
     for help in [
         "Update: copies new and left-newer files; never deletes or overwrites a newer right file.",
-        "Mirror: makes right identical to left; right-only items go to the Recycle Bin after confirmation.",
+        if cfg!(windows) {
+            "Mirror: makes right identical to left; right-only items go to the Recycle Bin after confirmation."
+        } else {
+            "Mirror: makes right identical to left; right-only items go to the Trash after confirmation."
+        },
         "Two-way: copies missing items both ways and the newer file over the older; same-time conflicts are skipped; never deletes.",
     ] {
         ui.label(RichText::new(help).weak());
@@ -3261,7 +3267,7 @@ fn render_compare(id: u64, state: &mut CompareState, ui: &mut egui::Ui) -> Optio
             if state.confirming_mirror {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.colored_label(ui.visuals().error_fg_color, RichText::new("Confirm Mirror deletions").strong());
-                    ui.label(format!("{} destination item(s) will be moved to the Recycle Bin. Review the exact list below before continuing.", deletes));
+                    ui.label(format!("{} destination item(s) will be moved to the {}. Review the exact list below before continuing.", deletes, crate::platform::TRASH));
                     egui::ScrollArea::vertical().max_height(130.0).show(ui, |ui| {
                         for action in &plan.actions {
                             if let SyncAction::Delete { rel, is_dir, .. } = action {

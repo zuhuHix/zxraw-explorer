@@ -537,7 +537,8 @@ cargo test --workspace --exclude forge-app && cargo test -p forge-app --bins
 At run time, file dialogs go through the XDG desktop portal, so an `xdg-desktop-portal`
 backend (GTK, GNOME or KDE) must be running; any desktop session has one. Video thumbnails need
 `ffmpeg` and `ffprobe` on `PATH` (`sudo apt install ffmpeg`): there is no in-app download on
-Linux. *Open* and *Show in folder* use `xdg-open`. *Open terminal here* tries `$TERMINAL`, then
+Linux. *Open*, *Open with*, *Properties* and *Show in file manager* go through `xdg-open`, the
+XDG portal and the file manager's D-Bus interface; deleting moves items to the Trash. *Open terminal here* tries `$TERMINAL`, then
 `x-terminal-emulator`, GNOME Terminal, Konsole, Xfce Terminal and xterm. Settings and the index
 are kept in `~/.config/zxrawexplorer` and `~/.local/share/zxrawexplorer`. What isn't available
 on Linux yet is listed under [Linux](docs/LIMITATIONS.md#linux) in the known limitations.

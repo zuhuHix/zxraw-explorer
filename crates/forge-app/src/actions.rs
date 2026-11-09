@@ -491,9 +491,10 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             }
             app.ops.modal = Some(Modal::Confirm(Confirm {
                 body: format!(
-                    "Permanently delete {} item(s)?\n\n{}\n\nThis bypasses the Recycle Bin and cannot be undone.",
+                    "Permanently delete {} item(s)?\n\n{}\n\nThis bypasses the {} and cannot be undone.",
                     targets.len(),
-                    modal::describe_items(&targets)
+                    modal::describe_items(&targets),
+                    crate::platform::TRASH
                 ),
                 kind: ConfirmKind::DeletePermanently(targets),
                 title: "Delete permanently".into(),
@@ -510,15 +511,16 @@ pub fn run(app: &mut ZxrawApp, cmd: Cmd, _ctx: &egui::Context) {
             if app.settings.confirm_recycle {
                 app.ops.modal = Some(Modal::Confirm(Confirm {
                     body: format!(
-                        "Move {} item(s) to the Recycle Bin?
+                        "Move {} item(s) to the {}?
 
 {}",
                         targets.len(),
+                        crate::platform::TRASH,
                         modal::describe_items(&targets)
                     ),
                     kind: ConfirmKind::Recycle(targets),
                     title: "Delete".into(),
-                    confirm_label: "Move to Recycle Bin".into(),
+                    confirm_label: format!("Move to {}", crate::platform::TRASH),
                     danger: false,
                 }));
             } else {
