@@ -680,9 +680,11 @@ fn delete_key_recycles_into_the_sandbox_not_the_real_recycle_bin() {
         // Recycling asks for confirmation only when `confirm_recycle` is on (off by default).
         "navigate {dir}\nselect binned.txt\nkey Delete\nwait-jobs 20\n\
          wait-missing {binned}\nwait-no-entry binned.txt | 10\nassert-entry kept.txt\n\
-         assert-toast Recycle Bin\nassert-no-error-toast\nexit\n",
+         assert-toast {bin}\nassert-no-error-toast\nexit\n",
         dir = shown(&dir),
         binned = shown(&dir.join("binned.txt")),
+        // The app's name for it (`platform::TRASH`).
+        bin = if cfg!(windows) { "Recycle Bin" } else { "Trash" },
     );
 
     let outcome = run_app(sandbox.path(), &profile, &script);

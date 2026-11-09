@@ -1212,7 +1212,12 @@ fn key_for_identity(path: &Path, md: &std::fs::Metadata) -> Option<crate::platfo
 #[cfg(unix)]
 fn key_without_birth_time(md: &std::fs::Metadata) -> Option<crate::platform::FileKey> {
     use std::os::unix::fs::MetadataExt;
-    Some(crate::platform::FileKey::new(md.dev(), md.ino()))
+    // No birth time: 0, as `FileKey::new` (test and Windows only) would give.
+    Some(crate::platform::FileKey {
+        volume: md.dev(),
+        index: md.ino(),
+        born: 0,
+    })
 }
 
 #[cfg(not(unix))]
