@@ -82,6 +82,8 @@ fn run(work: &Path, profile: &Path, text: &str) -> Outcome {
     let text = format!("limit 240\n{text}");
     let opts = RunOpts {
         limit: Some(Duration::from_secs(270)),
+        // Video scenarios here expect FFmpeg to be absent (see `path_without_ffmpeg`).
+        env: vec![path_without_ffmpeg()],
         ..Default::default()
     };
     run_app_with(work, profile, &text, &opts)

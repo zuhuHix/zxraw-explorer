@@ -73,20 +73,21 @@ fn video_proxy_conventions_and_external_root_scan_are_visible() {
     let shots_dji = shot("video-related-dji.png");
     let shots_external = shot("video-related-located.png");
     // Scrolls move by fixed amounts, so each one waits for `wait-preview-settled`: the
-    // thumbnail, metadata and scans that load in the background change the layout.
+    // thumbnail, metadata and scans that load in the background change the layout. The
+    // pointer must be over the preview pane, inside the 1360-point-wide window.
     let steps = vec![
         path_step("navigate", &videos),
         "cmd TogglePreview".into(),
         "select GX010001.MP4".into(),
         "ui related wait-preview-settled".into(),
         "wait-frames 2".into(),
-        "pointer 1400 700".into(),
+        "pointer 1180 700".into(),
         "scroll -600".into(),
         "wait-frames 2".into(),
         "ui related assert-proxies GX010001_Proxy.MOV,GX010001.proxy.720.mp4,GL010001.LRV".into(),
         "ui related assert-no-proxies GX010001.proxy.mp4".into(),
         path_step("screenshot", &shots_local),
-        "pointer 1400 700".into(),
+        "pointer 1180 700".into(),
         "scroll 800".into(),
         "wait-frames 2".into(),
         "ui related assert-proxies GX010001_proxy.mp4".into(),

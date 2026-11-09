@@ -468,9 +468,7 @@ When you plug in a camera card, ZXraw Explorer offers to import it:
 
 ## Download
 
-Requirements: Windows 10 or 11 (64-bit).
-
-On Linux, build from source for now: see [Linux](#linux) under *For developers*.
+Requirements: Windows 10 or 11 (64-bit). For Linux, see [Installing on Linux](#installing-on-linux).
 
 - **Installer:** `ZXraw-Explorer-<version>-Setup-x64.exe`. Installs for your user only, so no
   admin rights are needed. Optionally adds *Open in ZXraw Explorer* to folder right-click menus, with *Open in new ZXraw window* on Shift+right-click. Two more opt-in tasks register the archive types and add the ZXraw archive menu to Explorer's right-click menu; the uninstaller removes both.
@@ -478,6 +476,32 @@ On Linux, build from source for now: see [Linux](#linux) under *For developers*.
 
 Builds will be published on the [Releases](../../releases) page. The app isn't code-signed yet,
 so Windows SmartScreen may warn the first time: choose *More info → Run anyway*.
+
+---
+
+## Installing on Linux
+
+Requirements: 64-bit x86 PC, X11 or Wayland, and a Vulkan or OpenGL driver (Mesa is enough).
+
+- **AppImage:** `ZXraw-Explorer-<version>-x86_64.AppImage`. Download it from the
+  [Releases](../../releases) page, then make it executable and run it:
+
+  ```sh
+  chmod +x ZXraw-Explorer-<version>-x86_64.AppImage
+  ./ZXraw-Explorer-<version>-x86_64.AppImage
+  ```
+
+  An AppImage needs FUSE 2 to start, and Ubuntu 22.04 and later don't install it by default.
+  Either install it (`sudo apt install libfuse2t64` on Ubuntu 24.04 and later, `libfuse2` on
+  22.04), or run the AppImage with `--appimage-extract-and-run` instead.
+- **Debian package:** `zxraw_<version>_amd64.deb`. Install it with
+  `sudo apt install ./zxraw_<version>_amd64.deb`. It puts `zxraw` in the application menu,
+  registers it for photo and RAW file types, and lists it as an optional folder handler.
+
+Video thumbnails and technical metadata need `ffmpeg` and `ffprobe` on `PATH`
+(`sudo apt install ffmpeg`). The in-app updater is not available on Linux; new releases are
+listed on the Releases page. Features that are Windows-only are listed under
+[Linux](docs/LIMITATIONS.md#linux) in the known limitations.
 
 ---
 
@@ -523,8 +547,8 @@ app's data folder. Alternatively, put the tools on `PATH` or choose their folder
 
 ### Linux
 
-The app also builds and runs on Linux (X11 and Wayland). There are no Linux packages yet, so
-build it from source. On Debian or Ubuntu:
+The app also builds and runs on Linux (X11 and Wayland). For packages, see
+[Installing on Linux](#installing-on-linux). To build from source on Debian or Ubuntu:
 
 ```sh
 sudo apt install build-essential pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
@@ -533,6 +557,20 @@ cargo build --release                     # target/release/zxraw and zxraw-cli
 cargo run -p forge-app                    # launch the UI (debug)
 cargo test --workspace --exclude forge-app && cargo test -p forge-app --bins
 ```
+
+**Running the e2e tests on Linux.** Install `xvfb` and Mesa
+(`sudo apt install xvfb mesa-vulkan-drivers libgl1-mesa-dri libegl1`), then run
+`cargo test -p forge-app --test e2e -- <area>::`. Each run starts its own invisible Xvfb
+display, so no desktop session is needed. To watch a run on your own display, use
+`ZXRAW_SHOW_WINDOW=1 ZXRAW_E2E_JOBS=1`. Details are in [Testing & benchmarks](docs/TESTING.md).
+
+**Affected tests.** `scripts/test-affected.sh` is the bash version of `scripts/test-affected.ps1`.
+It runs only the crates and e2e areas your change reaches. It takes the same `--dry-run`,
+`--base` and `--all` options.
+
+**Building the packages.** `packaging/linux/build-linux.sh` builds a release `zxraw` and writes
+an AppImage, a `.deb` and `SHA256SUMS-linux.txt` to `dist/`. See
+[packaging/linux/README.md](packaging/linux/README.md).
 
 At run time, file dialogs go through the XDG desktop portal, so an `xdg-desktop-portal`
 backend (GTK, GNOME or KDE) must be running; any desktop session has one. Video thumbnails need

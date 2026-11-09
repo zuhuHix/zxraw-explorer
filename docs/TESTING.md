@@ -2,7 +2,8 @@
 
 ## Running tests
 
-- While iterating, run `scripts/test-affected.ps1` (PowerShell 5.1). It diffs against the
+- While iterating, run `scripts/test-affected.ps1` (PowerShell 5.1), or on Linux
+  `scripts/test-affected.sh` (bash 5; same logic, options `--dry-run`, `--base <ref>`, `--all`). It diffs against the
   merge-base with `origin/main`, plus uncommitted and untracked files, then runs the unit tests of
   the changed crates and the crates that depend on them, and only the e2e areas the change
   reaches. The plan is printed first. `-DryRun` prints the plan without running anything,
@@ -432,6 +433,43 @@ rather than stderr when running a release binary.
 
 A failing scenario that exposes a real application bug stays in the suite and is marked
 `#[ignore = "bug: …"]` until the bug is fixed.
+
+### Linux
+
+The suite runs on Linux under X11. The runner (`private_display` in `tests/e2e/main.rs`) starts
+one `Xvfb` per app run through `forge_win::desktop::PrivateDisplay`: `Xvfb -displayfd 1` picks a
+free display number, the child gets `DISPLAY=:N` and `ZXRAW_PRIVATE_DISPLAY=:N`, and
+`WAYLAND_DISPLAY` is removed so winit uses X11. When the run ends, only that server is stopped
+(SIGTERM by PID, so it removes its socket and lock; SIGKILL after 3 s). Each run also gets its own
+X clipboard. Rendering is software (Mesa llvmpipe), so frame times are higher than on a GPU.
+
+Requirements: `xvfb` and Mesa (`mesa-vulkan-drivers` or `libgl1-mesa-dri`). There is no need for
+`xvfb-run` or a running desktop session.
+
+```bash
+export CARGO_PROFILE_DEV_DEBUG=0 ZXRAW_E2E_JOBS=3
+cargo test -p forge-app --test e2e -- viewer::        # one area
+ZXRAW_SHOW_WINDOW=1 ZXRAW_E2E_JOBS=1 cargo test -p forge-app --test e2e -- core::   # watch it on your own display (X11)
+```
+
+Scenarios for Windows-only features are compiled only on Windows (`#[cfg(windows)]`, with the
+reason above each test):
+
+| Test | Reason |
+|---|---|
+| `core::a_file_dropped_into_its_own_folder_is_refused_to_the_source` | OLE drop target |
+| `core::a_file_dropped_through_the_drop_target_moves_as_an_optimized_move` | OLE drop target |
+| `core::a_file_dropped_through_the_drop_target_with_ctrl_copies` | OLE drop target |
+| `core::items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row` | OLE drop target |
+| `system::download_ffmpeg_installs_the_tools_and_points_settings_at_them` | FFmpeg download is hidden on Linux |
+| `system::download_ffmpeg_with_a_bad_checksum_installs_nothing_and_says_why` | FFmpeg download is hidden on Linux |
+| `system::update_check_offers_a_newer_release_and_verifies_the_installer` | updater is hidden on Linux |
+| `system::update_with_a_tampered_installer_is_refused` | updater is hidden on Linux |
+| `sidebar::network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share` | UNC network shares |
+| `browser::hidden_burst_member_is_not_selected_or_copied_with_its_stack` | `attrib +h` (hidden attribute) |
+
+Scenarios about missing FFmpeg run the app with `path_without_ffmpeg()`, a `PATH` without the
+folders that hold `ffmpeg`/`ffprobe`, since Linux machines usually have it in `/usr/bin`.
 
 ### Tests that touch the real system (opt-in)
 

@@ -250,6 +250,8 @@ fn hide(path: &Path) {
     assert!(status.success(), "attrib +h failed for {}", path.display());
 }
 
+// Windows-only: hides a file with `attrib +h` (the Windows hidden attribute).
+#[cfg(windows)]
 #[test]
 fn hidden_burst_member_is_not_selected_or_copied_with_its_stack() {
     let (_temp, work, profile, root) = fixture();

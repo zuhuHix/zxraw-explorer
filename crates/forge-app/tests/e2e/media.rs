@@ -214,7 +214,12 @@ fn exports_csv_and_json_and_never_replaces_an_existing_output() {
         json_path = shown(&json_path),
         existing_path = shown(&existing_path),
     );
-    let outcome = run_app(sandbox.path(), &profile, &script);
+    // The video note below expects ffprobe to be absent.
+    let opts = RunOpts {
+        env: vec![path_without_ffmpeg()],
+        ..Default::default()
+    };
+    let outcome = run_app_with(sandbox.path(), &profile, &script, &opts);
     expect_ok(&outcome);
     assert_no_crash(&profile);
     assert!(

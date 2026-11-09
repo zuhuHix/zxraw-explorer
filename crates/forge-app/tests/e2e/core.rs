@@ -1148,6 +1148,8 @@ fn items_copied_in_an_explorer_zip_folder_paste_into_the_folder() {
 
 /// The same items dragged out of the zip folder and dropped on a folder row: copied into
 /// that folder, and the source is told it was a copy.
+// Windows-only: drops through the window's OLE drop target, which only exists on Windows.
+#[cfg(windows)]
 #[test]
 fn items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1171,6 +1173,8 @@ fn items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row() {
 /// alone, by a rename, and the source is told so ("optimized move": `DROPEFFECT_NONE` back,
 /// "Performed DropEffect" none), so it neither deletes anything itself nor waits for its
 /// own file watcher to see that the item left.
+// Windows-only: drops through the window's OLE drop target, which only exists on Windows.
+#[cfg(windows)]
 #[test]
 fn a_file_dropped_through_the_drop_target_moves_as_an_optimized_move() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1188,6 +1192,8 @@ fn a_file_dropped_through_the_drop_target_moves_as_an_optimized_move() {
 }
 
 /// With Ctrl the drop copies, and the source hears "copy".
+// Windows-only: drops through the window's OLE drop target, which only exists on Windows.
+#[cfg(windows)]
 #[test]
 fn a_file_dropped_through_the_drop_target_with_ctrl_copies() {
     let sandbox = tempfile::tempdir().unwrap();
@@ -1205,6 +1211,8 @@ fn a_file_dropped_through_the_drop_target_with_ctrl_copies() {
 
 /// Dropping an item into the folder it is already in does nothing, and the drag cursor said
 /// so: the source hears "none" and keeps the item.
+// Windows-only: drops through the window's OLE drop target, which only exists on Windows.
+#[cfg(windows)]
 #[test]
 fn a_file_dropped_into_its_own_folder_is_refused_to_the_source() {
     let sandbox = tempfile::tempdir().unwrap();

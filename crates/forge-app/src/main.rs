@@ -280,6 +280,12 @@ fn main() -> eframe::Result {
         .with_min_inner_size([640.0, 400.0])
         .with_icon(app_icon::icon_data(*startup.app_icon))
         .with_drag_and_drop(true);
+    // Wayland app id, matching packaging/linux/zxraw.desktop (X11 uses WM_CLASS `zxraw`, from
+    // the binary name). Linux only: eframe also derives its storage folder from the app id.
+    #[cfg(target_os = "linux")]
+    {
+        viewport = viewport.with_app_id("zxraw");
+    }
     let hidden = testhook::hide_window();
     if hidden {
         // Automated runs open on a private desktop that is never shown, so nobody can see or
