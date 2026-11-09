@@ -22,9 +22,10 @@ CARGO_TARGET_DIR=/some/dir packaging/linux/build-linux.sh
 ```
 
 The version comes from `[workspace.package]` in `Cargo.toml`. The `.deb` build uses `dpkg-deb`
-directly, so `cargo-deb` is not needed. The AppImage build downloads `appimagetool` into
-`${XDG_CACHE_HOME:-$HOME/.cache}/zxraw-packaging/` once and reuses it. It is not installed.
-`dist/` is git-ignored.
+directly, so `cargo-deb` is not needed. The AppImage build downloads pinned releases of
+`appimagetool` and the AppImage runtime into `${XDG_CACHE_HOME:-$HOME/.cache}/zxraw-packaging/`
+once and reuses them (see *AppImage tools* below). Nothing is installed. `dist/` is git-ignored.
+The script builds x86_64/amd64 packages only and stops on any other host (`uname -m`).
 
 Outputs (version `0.10.0` shown):
 
@@ -62,13 +63,29 @@ covers it.
 is stripped with `strip --strip-debug`, which gives 53 MB. The symbol table stays, so backtraces
 keep function names. `target/release/zxraw` is not changed.
 
-**AppImage runtime.** `appimagetool` downloads its runtime from GitHub while it builds the image.
-It is run with `APPIMAGE_EXTRACT_AND_RUN=1` when FUSE or `libfuse2` is missing. Neither the tool nor
-the runtime is checksum-pinned yet; the tool is the `continuous` build.
+**AppImage tools.** Both are exact releases, checked against a SHA-256 written in `build-linux.sh`
+before every run (also when cached). A mismatch stops the build. To update, change the URL and the
+hash together; GitHub shows each asset's `sha256` digest on its release page.
+
+| Tool | Release | SHA-256 |
+| --- | --- | --- |
+| `appimagetool-x86_64.AppImage` | AppImage/appimagetool 1.9.1 | `ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0` |
+| `runtime-x86_64` | AppImage/type2-runtime 20251108 | `2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d` |
+
+The runtime is passed with `--runtime-file`, so `appimagetool` downloads nothing itself. linuxdeploy
+is not used. The tool runs with `APPIMAGE_EXTRACT_AND_RUN=1` when FUSE or `libfuse2` is missing.
+
+**Licenses of system libraries.** The crate inventory (`THIRD_PARTY.md`) covers the Rust code. A
+system library copied into the AppImage (none today; for example `libheif` if the `heif` feature
+links it) is shipped with its package's `/usr/share/doc/<package>/copyright`, unchanged, under
+`/usr/share/doc/zxraw/third-party/<package>/`. The generated `copyright` file has one stanza per
+bundled library. The `.deb` never bundles: linked libraries are package dependencies, and the
+`copyright` file says so.
 
 ## Desktop entry
 
-`zxraw.desktop` has `Exec=zxraw %U`; the app takes its paths as plain command-line arguments.
+`zxraw.desktop` has `Exec=zxraw %f`: the app takes a plain path (not a URI) and opens only the
+first one, so the desktop launches it once per selected file.
 
 **MIME types are an optional handler.** The `MimeType=` list makes ZXraw Explorer appear in
 *Open With* for the photo and RAW types the viewer opens, and for folders (`inode/directory`).
