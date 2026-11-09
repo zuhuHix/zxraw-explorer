@@ -1,5 +1,7 @@
-//! Downloads over HTTPS through WinHTTP, so they use the system TLS stack, certificate
-//! store and proxy settings and the app ships no networking code of its own.
+//! Downloads over HTTPS. On Windows they go through WinHTTP, so they use the system TLS
+//! stack, certificate store and proxy settings. On Linux they go through `ureq` with rustls
+//! (bundled Mozilla root certificates) and take the proxy from the environment; see
+//! [`download_with`].
 //!
 //! Only `https://` URLs are accepted, except plain `http://` to the loopback address (used
 //! by tests that serve files from a local listener). Redirects are followed, but never
@@ -11,8 +13,12 @@ use std::ops::ControlFlow;
 use crate::{Result, WinError};
 
 /// Total time allowed to resolve, connect and send, and the longest silence while reading.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const TIMEOUT_MS: i32 = 30_000;
+
+/// Redirects followed before giving up (WinHTTP's default).
+#[cfg(target_os = "linux")]
+const MAX_REDIRECTS: usize = 10;
 
 /// A parsed download URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,7 +224,133 @@ pub fn download_with(
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: the same rules as WinHTTP, implemented with `ureq` (rustls).
+///
+/// - Timeouts: WinHTTP's single 30 s setting maps to `timeout_resolve`, `timeout_connect`,
+///   `timeout_per_write` and `timeout_per_read`. Those restart on each operation, as
+///   WinHTTP's do. There is no total-time limit, as on Windows, so `timeout_recv_body` and
+///   `timeout_global` are not used.
+/// - Redirects: followed by hand, one hop at a time (`ureq` would follow them itself, and
+///   would send the request to an HTTP address before any check). A hop from HTTPS to HTTP
+///   fails, as on Windows, and each hop must pass the same URL rules as the first one.
+/// - Proxy: `ureq`'s `Proxy::try_from_env()`, which reads `ALL_PROXY`, `HTTPS_PROXY`,
+///   `HTTP_PROXY` (and lower-case forms) and `NO_PROXY`. Loopback addresses never use a
+///   proxy.
+/// - Status: anything but 200 fails with the same message as on Windows, after the final-URL
+///   check. Transport errors are [`WinError::Api`] with code 0 (or the OS errno).
+/// - Size: `options` has no size limit (none on Windows either). A caller that wants one
+///   stops from `on_data`, which fails with [`WinError::Aborted`].
+#[cfg(target_os = "linux")]
+pub fn download_with(
+    url: &str,
+    options: &Options<'_>,
+    mut on_data: impl FnMut(&[u8]) -> ControlFlow<()>,
+) -> Result<u64> {
+    use std::io::Read;
+    use std::time::Duration;
+
+    use ureq::Proxy;
+    use ureq::config::AutoHeaderValue;
+    use ureq::http::header::LOCATION;
+
+    header_block(options.headers)?;
+    let start = parse_url(url)?;
+
+    let timeout = Some(Duration::from_millis(TIMEOUT_MS as u64));
+    let agent = |proxy: Option<Proxy>| {
+        ureq::Agent::new_with_config(
+            ureq::Agent::config_builder()
+                .user_agent(concat!("ZXraw-Explorer/", env!("CARGO_PKG_VERSION")))
+                // WinHTTP does not decompress, so ask for no encoding either.
+                .accept_encoding(AutoHeaderValue::None)
+                .proxy(proxy)
+                .http_status_as_error(false)
+                // Redirects are followed by hand below, so the 3xx is returned as is.
+                .max_redirects(0)
+                .max_redirects_will_error(false)
+                .timeout_resolve(timeout)
+                .timeout_connect(timeout)
+                .timeout_per_write(timeout)
+                .timeout_per_read(timeout)
+                .build(),
+        )
+    };
+    let proxied = agent(Proxy::try_from_env());
+    let direct = agent(None);
+
+    let mut current = url.to_string();
+    let mut redirects = 0;
+    let response = loop {
+        let hop = parse_url(&current)?;
+        let agent = if matches!(hop.host.as_str(), "127.0.0.1" | "localhost") {
+            &direct
+        } else {
+            &proxied
+        };
+        let mut request = agent.get(current.as_str());
+        for (name, value) in options.headers {
+            request = request.header(*name, *value);
+        }
+        let response = request.call().map_err(transport_error)?;
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if let (true, Some(location)) = (
+            matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308),
+            location,
+        ) {
+            if redirects == MAX_REDIRECTS {
+                return Err(WinError::Api {
+                    op: "download",
+                    code: 0,
+                    message: "the download was redirected too many times".into(),
+                });
+            }
+            current = redirect_target(&current, &location)?;
+            redirects += 1;
+            continue;
+        }
+        break response;
+    };
+
+    if let Some(allowed) = options.final_url {
+        if !allowed(&current) {
+            return Err(WinError::Invalid(format!(
+                "the download was redirected to an unexpected address: {current}"
+            )));
+        }
+    }
+
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(WinError::Invalid(format!(
+            "the server answered HTTP {status} for {}",
+            start.host
+        )));
+    }
+
+    let mut body = response;
+    let mut reader = body.body_mut().as_reader();
+    // Unlimited: `as_reader` has no size cap, unlike `Body::read_to_vec` (10 MB).
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(body_error(e)),
+        };
+        total += read as u64;
+        if on_data(&buf[..read]).is_break() {
+            return Err(WinError::Aborted { op: "download" });
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn download_with(
     url: &str,
     options: &Options<'_>,
@@ -227,6 +359,95 @@ pub fn download_with(
     header_block(options.headers)?;
     parse_url(url)?;
     Err(WinError::Unsupported)
+}
+
+/// The absolute URL a redirect points to, checked like the first URL. Refuses a HTTPS to
+/// HTTP hop with WinHTTP's message. Relative `Location`s are resolved against `current`.
+#[cfg(any(target_os = "linux", test))]
+fn redirect_target(current: &str, location: &str) -> Result<String> {
+    let base = parse_url(current)?;
+    let scheme = if base.secure { "https" } else { "http" };
+    let next = if location.starts_with("https://") || location.starts_with("http://") {
+        location.to_string()
+    } else if let Some(rest) = location.strip_prefix("//") {
+        format!("{scheme}://{rest}")
+    } else {
+        let default_port = if base.secure { 443 } else { 80 };
+        let authority = if base.port == default_port {
+            base.host.clone()
+        } else {
+            format!("{}:{}", base.host, base.port)
+        };
+        let path = if location.starts_with('/') {
+            location.to_string()
+        } else {
+            // Relative to the directory of the current path (query dropped).
+            let no_query = base.path.split('?').next().unwrap_or("/");
+            let dir_end = no_query.rfind('/').map_or(0, |i| i + 1);
+            format!("{}{location}", &no_query[..dir_end])
+        };
+        format!("{scheme}://{authority}{path}")
+    };
+    if base.secure && next.starts_with("http://") {
+        return Err(WinError::Api {
+            op: "download",
+            code: 0,
+            message: "the server tried to redirect to an insecure address".into(),
+        });
+    }
+    parse_url(&next)?;
+    Ok(next)
+}
+
+/// Maps a `ureq` error to the WinHTTP error shapes, with WinHTTP's wording for the common
+/// cases.
+#[cfg(target_os = "linux")]
+fn transport_error(err: ureq::Error) -> WinError {
+    let (code, message) = match &err {
+        ureq::Error::Timeout(_) => (0, "the connection timed out".to_string()),
+        ureq::Error::HostNotFound => (
+            0,
+            "the server name could not be resolved (are you online?)".to_string(),
+        ),
+        ureq::Error::ConnectionFailed => (0, "could not connect to the server".to_string()),
+        ureq::Error::Io(e) => {
+            let message = match e.kind() {
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                    "the connection timed out".to_string()
+                }
+                std::io::ErrorKind::ConnectionRefused => "could not connect to the server".into(),
+                _ => e.to_string(),
+            };
+            (e.raw_os_error().unwrap_or(0) as u32, message)
+        }
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => (
+            0,
+            format!("the server's security certificate could not be verified ({err})"),
+        ),
+        other => (0, other.to_string()),
+    };
+    WinError::Api {
+        op: "download",
+        code,
+        message,
+    }
+}
+
+/// A read error from the response body. `ureq` wraps its own errors in `io::Error`.
+#[cfg(target_os = "linux")]
+fn body_error(err: std::io::Error) -> WinError {
+    if err.get_ref().is_some_and(|inner| inner.is::<ureq::Error>()) {
+        if let Some(Ok(inner)) = err
+            .into_inner()
+            .map(|inner| inner.downcast::<ureq::Error>())
+        {
+            return transport_error(*inner);
+        }
+        return transport_error(ureq::Error::Io(std::io::Error::other(
+            "the response body could not be read",
+        )));
+    }
+    transport_error(ureq::Error::Io(err))
 }
 
 /// `Name: value\r\n` lines for WinHTTP. Names and values must not break the header block.
@@ -360,7 +581,7 @@ mod tests {
     }
 
     /// Serves one request with `response` and returns what the client sent.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn serve_once(response: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -375,7 +596,7 @@ mod tests {
         (format!("http://127.0.0.1:{port}/latest"), server)
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn sends_headers_and_checks_the_final_url() {
         let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_vec();
@@ -397,12 +618,13 @@ mod tests {
         .unwrap();
         assert_eq!(got, b"{}");
         assert_eq!(seen.take(), url);
-        let request = server.join().unwrap();
+        // Header names are case-insensitive (ureq sends them lowercase).
+        let request = server.join().unwrap().to_ascii_lowercase();
         assert!(
-            request.contains("Accept: application/vnd.github+json\r\n"),
+            request.contains("accept: application/vnd.github+json\r\n"),
             "{request}"
         );
-        assert!(request.contains("User-Agent: ZXraw-Explorer/"), "{request}");
+        assert!(request.contains("user-agent: zxraw-explorer/"), "{request}");
 
         let (url, server) = serve_once(ok);
         let refuse = |_: &str| false;
@@ -421,7 +643,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn downloads_from_a_local_server_and_stops_when_asked() {
         use std::io::{Read, Write};
@@ -468,5 +690,188 @@ mod tests {
         let missing = download(&url, |_| ControlFlow::Continue(())).unwrap_err();
         assert!(missing.to_string().contains("HTTP 404"), "{missing}");
         server.join().unwrap();
+    }
+
+    /// A complete `200 OK` response carrying `body`.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn ok_response(body: &[u8]) -> Vec<u8> {
+        let mut r = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        r.extend_from_slice(body);
+        r
+    }
+
+    /// Serves one connection per entry of `responses`, in order, and returns the port and
+    /// the request lines the client sent.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn serve_sequence(responses: Vec<Vec<u8>>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let n = stream.read(&mut request).unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&request[..n]).into_owned());
+                let _ = stream.write_all(&response);
+            }
+            requests
+        });
+        (port, server)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn stops_at_a_size_limit_the_caller_sets() {
+        let body = vec![7u8; 700_000];
+        let (url, server) = serve_once(ok_response(&body));
+        const LIMIT: u64 = 100_000;
+        let mut total = 0u64;
+        let result = download(&url, |chunk| {
+            total += chunk.len() as u64;
+            if total > LIMIT {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        });
+        assert!(
+            matches!(result, Err(WinError::Aborted { .. })),
+            "{result:?}"
+        );
+        assert!(total > LIMIT && total < body.len() as u64, "{total}");
+        let _ = server.join();
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_non_200_status_is_an_error_with_no_data() {
+        let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\nConnection: close\r\n\r\noops".to_vec();
+        let (url, server) = serve_once(response);
+        let mut received = 0usize;
+        let err = download(&url, |chunk| {
+            received += chunk.len();
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, WinError::Invalid(_)), "{err:?}");
+        assert!(err.to_string().contains("HTTP 500"), "{err}");
+        assert_eq!(received, 0);
+        server.join().unwrap();
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn follows_a_redirect_to_an_allowed_address() {
+        let (port, server) = serve_sequence(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            ok_response(b"done"),
+        ]);
+        let url = format!("http://127.0.0.1:{port}/start");
+        let mut got = Vec::new();
+        let final_ok = |u: &str| u.ends_with("/final");
+        let options = Options {
+            headers: &[],
+            final_url: Some(&final_ok),
+        };
+        download_with(&url, &options, |chunk| {
+            got.extend_from_slice(chunk);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(got, b"done");
+        let requests = server.join().unwrap();
+        assert!(requests[1].starts_with("GET /final "), "{requests:?}");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn refuses_a_redirect_to_a_disallowed_address() {
+        let (port, server) = serve_sequence(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+            ok_response(b"secret"),
+        ]);
+        let url = format!("http://127.0.0.1:{port}/start");
+        let final_ok = |u: &str| u.ends_with("/start");
+        let options = Options {
+            headers: &[],
+            final_url: Some(&final_ok),
+        };
+        let mut received = 0usize;
+        let err = download_with(&url, &options, |chunk| {
+            received += chunk.len();
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("unexpected address"), "{err}");
+        assert_eq!(received, 0);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirect_targets_follow_the_url_rules() {
+        // HTTPS may never be redirected to HTTP, not even to a loopback address.
+        assert!(redirect_target("https://a.example/x", "http://a.example/y").is_err());
+        assert!(redirect_target("https://a.example/x", "http://127.0.0.1:9/y").is_err());
+        assert!(redirect_target("https://a.example/x", "https://user@evil.example/").is_err());
+        assert_eq!(
+            redirect_target("https://a.example/x", "https://b.example/p?q=1").unwrap(),
+            "https://b.example/p?q=1"
+        );
+        assert_eq!(
+            redirect_target("https://a.example/x/y.zip?q=1", "/z").unwrap(),
+            "https://a.example/z"
+        );
+        assert_eq!(
+            redirect_target("https://a.example:8443/x/y", "z.zip").unwrap(),
+            "https://a.example:8443/x/z.zip"
+        );
+        assert_eq!(
+            redirect_target("https://a.example/x", "//b.example/p").unwrap(),
+            "https://b.example/p"
+        );
+        assert_eq!(
+            redirect_target("http://127.0.0.1:9/a", "http://127.0.0.1:9/b").unwrap(),
+            "http://127.0.0.1:9/b"
+        );
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_closed_loopback_port_fails_quickly() {
+        // Nothing listens on the port any more, so the connect is refused at once.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let started = std::time::Instant::now();
+        let err = download(&format!("http://127.0.0.1:{port}/x"), |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(matches!(err, WinError::Api { .. }), "{err:?}");
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    #[ignore = "network"]
+    fn downloads_over_https_from_example_com() {
+        let mut body = Vec::new();
+        let n = download("https://example.com/", |chunk| {
+            body.extend_from_slice(chunk);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert!(String::from_utf8_lossy(&body).contains("Example Domain"));
     }
 }
