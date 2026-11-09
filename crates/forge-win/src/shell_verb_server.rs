@@ -67,6 +67,7 @@ impl Dropped {
         self.paths.is_empty() && self.unresolved.is_empty() && self.failure.is_none()
     }
 
+    #[cfg(any(windows, test))]
     fn failed(why: impl Into<String>) -> Self {
         Self {
             failure: Some(why.into()),
@@ -76,6 +77,7 @@ impl Dropped {
 }
 
 /// One selected item as the shell lists it.
+#[cfg(any(windows, test))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SelectedItem {
     /// Its file system path; `None` when it has none.
@@ -85,6 +87,7 @@ pub(crate) struct SelectedItem {
 }
 
 /// A selection as Explorer's shell item array lists it (a trait so tests can make it fail).
+#[cfg(any(windows, test))]
 pub(crate) trait Selection {
     fn count(&self) -> std::result::Result<u32, String>;
     fn item(&self, index: u32) -> std::result::Result<SelectedItem, String>;
@@ -94,6 +97,7 @@ pub(crate) trait Selection {
 /// obtained, nothing falls back to a smaller list: an item that cannot be read, or has no
 /// file system path, is reported in `unresolved`, and a list that cannot be counted (or
 /// is empty) is a `failure`, so the command never runs on part of the selection.
+#[cfg(any(windows, test))]
 pub(crate) fn collect(selection: &dyn Selection) -> Dropped {
     let count = match selection.count() {
         Ok(0) => return Dropped::failed("Explorer passed an empty selection"),

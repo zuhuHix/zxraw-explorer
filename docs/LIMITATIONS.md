@@ -663,3 +663,55 @@ These limitations from the earlier version of this list no longer apply:
   `f67d83c`).
 * Collection relink did not merge annotations on a path collision, and collection import conflicts
   were not reported. Relink now merges them and import reports conflicts (commit `e99b827`).
+
+## Linux platform behaviour
+
+The Linux port of the platform layer (`forge-win`, plus HEIF in `forge-media`) differs from
+Windows in these ways:
+
+- **Trash:** items on a mount with no usable trash directory (no writable `$topdir`, or a
+  `.Trash` that is not sticky and no way to create `.Trash-$uid`) are reported as not
+  recyclable, and the app asks before deleting permanently. If the home trash is on the item's
+  filesystem but can't take it, there is no fallback to a mount trash. A folder that contains
+  the trash can't be recycled. Recycle progress is per item (each item is one rename).
+- **Clipboard:** X11 and Wayland clipboards belong to the running app, so copied files vanish
+  from the clipboard when ZXraw Explorer exits unless a clipboard manager keeps a copy.
+  There is no system clipboard sequence number: the sequence is a hash of the owner window,
+  its ownership time and an in-process counter (Wayland: the offered formats and owner token).
+  Two foreign copies from the same window can look the same if the owner doesn't answer within
+  250 ms. Compare-and-swap calls (`set_files_if_unchanged`, `replace_files_if_token`) are atomic
+  only within our process. Relative paths are rejected. The Wayland backend needs the
+  data-control protocol (wlroots compositors, KDE; not GNOME Mutter, where it falls back to
+  XWayland) and has not been run against a real compositor yet.
+- **Open with:** there is no portable "Open with" dialog. The XDG desktop portal's chooser is
+  used when available, otherwise the file opens with its default app.
+- **Properties / reveal:** need a file manager that implements `org.freedesktop.FileManager1`
+  (Nemo, Nautilus, Dolphin, Caja, Thunar do). Reveal falls back to opening the parent folder;
+  properties has no fallback and reports the error.
+- **Network shares:** `gio mount` can't prompt for a password, so shares that need a login
+  fail with an error that says so; mount them once in the file manager first. Drive-letter
+  mappings don't exist (`mapped_share` is `None`). Only CIFS/SMB mounts count as network roots
+  (NFS and sshfs are treated as local by the drag-and-drop network check).
+- **Drives:** each device is listed once (btrfs subvolumes show as `/` and `/home` only). The
+  drive serial comes from mountinfo; on btrfs `st_dev` differs per subvolume, so a file's
+  volume serial can differ from its drive's serial. `physical_disks` is not implemented.
+- **File attributes:** Linux has no hidden attribute (hidden means a dot-file), so `hidden` is
+  ignored; read-only maps to the write permission bits. `rename_open_file_over` resolves the
+  open file through `/proc/self/fd` and renames by path, so it is not atomic against a rename
+  of the same file by someone else in between.
+- **File holders:** "in use" means "open by some process" (Linux has no mandatory locks);
+  processes of other users are skipped.
+- **Single instance:** forwarded paths that are not valid UTF-8 are passed lossily, since the
+  payload format is shared with Windows. Session and integrity-level checks have no equivalent.
+- **Downloads:** TLS trusts the bundled Mozilla roots, not the system store, so a corporate
+  TLS-intercepting proxy's certificate is not trusted.
+- **Drag and drop out, virtual files, private desktop:** not implemented on Linux and return
+  `Unsupported`. XDND drag sources need toolkit support that winit doesn't provide. Drops *into*
+  the app are left to `forge-app`, which can use winit's file-drop events (X11 only: winit 0.30
+  has no drag-and-drop on Wayland).
+- **Window placement:** `maximize_hidden` is unsupported; the app maximizes through egui.
+- **HEIF/HEIC/AVIF:** only with the `heif` cargo feature and libheif installed. Embedded HEIF
+  thumbnails are not used (same as WIC). EXIF orientation on HEIF is applied but untested
+  for lack of a sample; HEIC decoding was tested on sample files only (no local HEVC encoder).
+- **Shell integration** (context menu, file types, default apps, Explorer verbs, Everything
+  search, shell notifications) is Windows-only.

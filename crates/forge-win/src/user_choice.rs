@@ -4,15 +4,21 @@
 //! hash format currently observed on Windows 11 25H2 and is deliberately guarded against
 //! `UserChoiceLatest`; an OS change that prevents a write is reported for that extension.
 
+#[cfg(any(windows, test))]
 use md5::{Digest, Md5};
 
 use crate::{FileType, Result, WinError};
 
+#[cfg(windows)]
 const PROG_ID_PREFIX: &str = "ZXrawExplorer.";
+#[cfg(windows)]
 const BACKUP_KEY: &str = "Software\\ZXrawExplorerDefaultState\\FileTypes";
+#[cfg(windows)]
 const USER_CHOICE_ROOT: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts";
+#[cfg(any(windows, test))]
 const EXPERIENCE_SALT: &str =
     "User Choice set via Windows User Experience {D18B6DD5-6124-4341-9318-804003BAFA0B}";
+#[cfg(any(windows, test))]
 const TICKS_PER_MINUTE: u64 = 60 * 10_000_000;
 
 /// Result for one offered extension after attempting to set or restore its default app.
@@ -369,6 +375,7 @@ fn is_zxraw_prog_id(prog_id: &str) -> bool {
         || prog_id.eq_ignore_ascii_case("Applications\\zxraw.exe")
 }
 
+#[cfg(windows)]
 fn failed(extension: &str, message: String) -> FileTypeDefaultResult {
     FileTypeDefaultResult {
         extension: extension.trim_start_matches('.').to_ascii_lowercase(),
@@ -379,6 +386,7 @@ fn failed(extension: &str, message: String) -> FileTypeDefaultResult {
 
 /// Hash the UTF-16LE input using the currently observed Windows `UserChoice` v1 scheme.
 /// `last_write_filetime` is the raw FILETIME value reported by RegQueryInfoKey.
+#[cfg(any(windows, test))]
 fn generate_hash(extension: &str, sid: &str, prog_id: &str, last_write_filetime: u64) -> String {
     let rounded = last_write_filetime - last_write_filetime % TICKS_PER_MINUTE;
     let high = (rounded >> 32) as u32;
@@ -468,10 +476,12 @@ fn generate_hash(extension: &str, sid: &str, prog_id: &str, last_write_filetime:
     base64_eight_bytes(&result)
 }
 
+#[cfg(any(windows, test))]
 fn word_swap(value: u32) -> u32 {
     value.rotate_left(16)
 }
 
+#[cfg(any(windows, test))]
 fn base64_eight_bytes(bytes: &[u8; 8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(12);

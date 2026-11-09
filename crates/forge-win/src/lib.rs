@@ -1,6 +1,9 @@
 //! Windows shell integration for ZXraw Explorer.
 //!
-//! Every public function compiles on every platform. On non-Windows targets the
+//! Every public function compiles on every platform. Linux has real backends for the
+//! Recycle Bin (freedesktop.org Trash), shell open/reveal/properties, drives and file ids,
+//! processes, single instance, HTTP and the file clipboard; see "Platform layer on Linux" in
+//! docs/ARCHITECTURE.md. Elsewhere, and for the Windows-only integration modules, the
 //! fallible functions return [`WinError::Unsupported`] and the infallible ones return an
 //! empty result, so the rest of the workspace can call them unconditionally.
 //!

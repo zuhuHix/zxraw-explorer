@@ -1,9 +1,12 @@
 //! OLE drag-out of files to other applications.
 
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 
 use crate::{Result, WinError};
 
+#[cfg(windows)]
 const DRAG_IMAGE_EDGE: u32 = 128;
 
 /// Cached RGBA pixels supplied by the app for a drag preview.
