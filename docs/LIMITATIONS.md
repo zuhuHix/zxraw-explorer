@@ -674,6 +674,21 @@ Windows in these ways:
   recyclable, and the app asks before deleting permanently. If the home trash is on the item's
   filesystem but can't take it, there is no fallback to a mount trash. A folder that contains
   the trash can't be recycled. Recycle progress is per item (each item is one rename).
+- **Permanent delete (staging and recovery):** each item is first moved into a new private
+  folder next to it, named `<name>.zxraw-deleting-<pid>-<n>` (visible, not a dot file), and
+  deleted there, so a file put at the old path meanwhile is never touched. If the delete is
+  cancelled or fails part way, what is left is moved back under its name. If that name was
+  taken in the meantime (or the move back fails), the item is left in the staging folder and
+  the failure message names the exact path. After a crash or power loss mid-delete, any
+  `*.zxraw-deleting-*` folder holds what was not yet deleted: move its contents back (or
+  delete the folder) by hand. Accepted risk: on file systems without `RENAME_NOREPLACE`
+  (vfat, exFAT and some network file systems), the move back checks that the name is free and
+  then renames, so something created at that name in the few system calls between the check
+  and the rename would be replaced. A volume mounted inside a folder being deleted (found in
+  the mount table, by a different device, or by `statx`'s mount-root flag) makes the delete of
+  that folder fail; nothing under the mount point is deleted. When the mount is only found
+  partway through (it appeared after the delete started), entries deleted before it was
+  reached stay deleted and the rest is moved back.
 - **Clipboard:** X11 and Wayland clipboards belong to the running app, so copied files vanish
   from the clipboard when ZXraw Explorer exits unless a clipboard manager keeps a copy.
   There is no system clipboard sequence number: the sequence is a hash of the owner window,
