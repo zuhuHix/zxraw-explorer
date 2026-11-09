@@ -8,6 +8,12 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Linux: mount table, sysfs and `statvfs` (see `drives_linux.rs`). Shared with `files` and
+/// `watch`.
+#[cfg(target_os = "linux")]
+#[path = "drives_linux.rs"]
+pub(crate) mod linux;
+
 /// Per-drive deadline for all of its queries.
 pub const QUERY_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -46,7 +52,9 @@ pub struct DriveInfo {
 /// Lists logical drives with their type, label, file system, serial and space.
 ///
 /// Never blocks longer than roughly [`QUERY_TIMEOUT`] per drive, all drives in parallel.
-/// Returns an empty list on non-Windows targets.
+/// On Linux the drives are the user-visible mounts of `/proc/self/mountinfo` (the root, the
+/// home mount, and `/media`, `/mnt`, `/run/media` file systems); `available` is false for a
+/// mount whose space query did not finish in time. Empty on other targets.
 #[cfg(windows)]
 pub fn list_drives() -> Vec<DriveInfo> {
     use std::sync::mpsc;
@@ -98,7 +106,12 @@ pub fn list_drives() -> Vec<DriveInfo> {
         .collect()
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub fn list_drives() -> Vec<DriveInfo> {
+    linux::list_drives()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn list_drives() -> Vec<DriveInfo> {
     Vec::new()
 }
@@ -209,6 +222,30 @@ fn query_drive(root: &PathBuf) -> DriveInfo {
 fn wide_to_string(buf: &[u16]) -> String {
     let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn list_drives_includes_root_with_space() {
+        let start = std::time::Instant::now();
+        let drives = list_drives();
+        assert!(
+            start.elapsed() < QUERY_TIMEOUT * 4,
+            "took {:?}",
+            start.elapsed()
+        );
+        let root = drives
+            .iter()
+            .find(|d| d.root == std::path::Path::new("/"))
+            .unwrap_or_else(|| panic!("/ missing from {drives:?}"));
+        assert!(root.available);
+        assert!(root.total_bytes.is_some_and(|t| t > 0));
+        assert!(!root.label.is_empty());
+        assert!(!root.fs_name.is_empty());
+    }
 }
 
 #[cfg(all(test, windows))]
