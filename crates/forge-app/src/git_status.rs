@@ -3284,9 +3284,11 @@ mod tests {
         // 16 names for the same subtree, six levels deep: 16.7 million paths from 7 trees.
         let run = |args: &[&str], input: &str| -> String {
             use std::io::Write;
+            // An identity of its own, as `git` uses: `commit-tree` fails without one (CI).
             let mut child = std::process::Command::new("git")
                 .arg("-C")
                 .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(args)
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
