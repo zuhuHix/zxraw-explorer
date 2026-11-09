@@ -219,12 +219,19 @@ fn delete_all(
         });
         t.progress.items_done += 1;
         if outcome.changed {
-            report.failed.push((p.clone(), DeleteFailure::Changed));
+            let why = outcome.error.unwrap_or(DeleteFailure::Changed);
+            report.failed.push((p.clone(), why));
         } else if outcome.gone {
             report.done.push(p.clone());
         } else if t.stopped {
             report.cancelled = true;
-            if outcome.removed_inside {
+            if outcome.stranded {
+                // What is left could not go back under its name: say where it is.
+                let why = outcome
+                    .error
+                    .unwrap_or(DeleteFailure::Other("it was partly deleted".into()));
+                report.failed.push((p.clone(), why));
+            } else if outcome.removed_inside {
                 report.partly_deleted.push(p.clone());
             } else {
                 report.not_started.push(p.clone());
@@ -261,6 +268,9 @@ fn classify(e: &io::Error) -> DeleteFailure {
 struct Destroyed {
     /// The item itself was removed.
     gone: bool,
+    /// What is left of the item could not be moved back from its staging folder; `error`
+    /// says where it is.
+    stranded: bool,
     /// The item at the path was not the confirmed one; nothing was removed.
     changed: bool,
     /// Something inside the item was removed.
@@ -297,108 +307,170 @@ thread_local! {
     /// Test seam: runs at the points named by [`Seam`], with the item's path.
     static SEAM: std::cell::RefCell<Option<Box<dyn FnMut(Seam, &Path)>>> =
         const { std::cell::RefCell::new(None) };
+    /// Test seam: display paths (as `tick` sees them) the delete must take for mount points.
+    static FAKE_MOUNTS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Seam {
-    /// Before the item is moved to its staging name (the item could still be swapped).
+    /// Before the item is moved into its staging folder (the item could still be swapped).
     BeforeStage,
     /// After it was staged and checked, before anything is removed.
     AfterCheck,
+    /// Just before the item is moved back from its staging folder.
+    BeforePutBack,
 }
 
 fn seam(_at: &'static str, _path: &Path) {
     #[cfg(test)]
     SEAM.with(|s| {
         if let Some(f) = s.borrow_mut().as_mut() {
-            let at = if _at == "stage" {
-                Seam::BeforeStage
-            } else {
-                Seam::AfterCheck
+            let at = match _at {
+                "stage" => Seam::BeforeStage,
+                "check" => Seam::AfterCheck,
+                _ => Seam::BeforePutBack,
             };
             f(at, _path);
         }
     });
 }
 
-/// Unique private names for items being deleted, in the item's own folder.
-fn staging_name(parent: RawFd) -> io::Result<CString> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    cstring(format!(".zxraw-deleting-{}-{n}-{parent}", std::process::id()).as_bytes())
+/// Whether the test seam declares `path` a mount point.
+fn fake_mount(_path: &Path) -> bool {
+    #[cfg(test)]
+    return FAKE_MOUNTS.with(|m| m.borrow().iter().any(|p| p == _path));
+    #[cfg(not(test))]
+    false
 }
 
-/// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in the open folder `dir`.
-fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` of `name` in the open folder `dir`. `Ok(None)` only when
+/// the name does not exist (`ENOENT`); any other failure leaves the answer unknown.
+fn stat_at(dir: RawFd, name: &CStr) -> io::Result<Option<libc::stat>> {
     // SAFETY: valid fd, NUL-terminated name, and a zeroed plain-data out value.
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        (libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0).then_some(st)
-    }
-}
-
-/// `renameat2(RENAME_NOREPLACE)` within one folder handle.
-fn rename_at_noreplace(dir: RawFd, from: &CStr, to: &CStr) -> io::Result<()> {
-    // SAFETY: valid fd and NUL-terminated names.
-    let r =
-        unsafe { libc::renameat2(dir, from.as_ptr(), dir, to.as_ptr(), libc::RENAME_NOREPLACE) };
-    if r == 0 {
-        return Ok(());
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0 {
+        return Ok(Some(st));
     }
     let e = io::Error::last_os_error();
-    match e.raw_os_error() {
-        // The file system cannot refuse to replace: check first, then rename.
-        Some(libc::EINVAL | libc::ENOSYS) => {
-            if stat_at(dir, to).is_some() {
-                return Err(io::Error::from_raw_os_error(libc::EEXIST));
-            }
-            // SAFETY: as above.
-            if unsafe { libc::renameat(dir, from.as_ptr(), dir, to.as_ptr()) } == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        }
-        _ => Err(e),
+    if e.raw_os_error() == Some(libc::ENOENT) {
+        Ok(None)
+    } else {
+        Err(e)
     }
 }
 
-/// The identity of `name` inside the open folder `dir` (not following links). Read through
-/// `/proc/self/fd`, so the folder is the one we hold open, whatever its path names now.
-fn identity_at(dir: RawFd, name: &CStr) -> Option<ItemIdentity> {
-    let mut p = PathBuf::from(format!("/proc/self/fd/{dir}"));
-    p.push(OsStr::from_bytes(name.to_bytes()));
-    ItemIdentity::of(&p)
+/// Whether `name` in `dir` is the root of a mount, by `statx`'s `STATX_ATTR_MOUNT_ROOT`
+/// (which also catches a bind mount of the same device). `false` where the kernel or file
+/// system cannot say; the device comparison still applies there.
+fn is_mount_root_at(dir: RawFd, name: &CStr) -> bool {
+    // SAFETY: valid fd, NUL-terminated name, zeroed plain-data out value.
+    let mut stx: libc::statx = unsafe { std::mem::zeroed() };
+    let r = unsafe {
+        libc::statx(
+            dir,
+            name.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+            libc::STATX_BASIC_STATS,
+            &mut stx,
+        )
+    };
+    let bit = libc::STATX_ATTR_MOUNT_ROOT as u64;
+    r == 0 && stx.stx_attributes_mask & bit != 0 && stx.stx_attributes & bit != 0
 }
 
-/// [`destroy`] with a check of what is being deleted. The item is first renamed to a
-/// private staging name in its own folder (through a handle on the folder), and only that
-/// staged object is checked and deleted: whatever is put at the old path meanwhile is never
-/// touched. If the staged object is not the expected one it is moved back and nothing is
-/// removed (`changed`); a delete that stops early moves what is left back as well.
+/// `renameat` from one folder handle to another (or the same).
+fn rename_at(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr) -> io::Result<()> {
+    // SAFETY: valid fds and NUL-terminated names.
+    if unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// The staging folder's name: `<name>.zxraw-deleting-<pid>-<n>`, the item's name shortened
+/// (on a character boundary when it is text) so the whole fits in 255 bytes. Visible, not
+/// a dot file, so an item left there by a crash can be seen and recovered.
+fn staging_name(name: &OsStr, n: u64) -> io::Result<CString> {
+    let suffix = format!(".zxraw-deleting-{}-{n}", std::process::id());
+    let room = 255 - suffix.len();
+    let bytes = name.as_bytes();
+    let mut end = bytes.len().min(room);
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+    }
+    let mut out = bytes[..end].to_vec();
+    out.extend_from_slice(suffix.as_bytes());
+    cstring(&out)
+}
+
+/// Makes a fresh private (0700) staging folder in `parent`. `mkdirat` is atomic and
+/// exclusive, so the folder is new and ours; an item moved into it under its own name
+/// cannot replace anything, whatever the file system supports.
+fn make_staging(parent: RawFd, name: &OsStr) -> io::Result<(CString, OwnedFd)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..100 {
+        let staged = staging_name(name, NEXT.fetch_add(1, Ordering::Relaxed))?;
+        // SAFETY: valid fd and NUL-terminated name.
+        if unsafe { libc::mkdirat(parent, staged.as_ptr(), 0o700) } != 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                continue;
+            }
+            return Err(e);
+        }
+        let fd = match open_dir_at(parent, &staged, true) {
+            Ok(fd) => fd,
+            Err(e) => {
+                // SAFETY: as above.
+                unsafe { libc::unlinkat(parent, staged.as_ptr(), libc::AT_REMOVEDIR) };
+                return Err(e);
+            }
+        };
+        return Ok((staged, fd));
+    }
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
+}
+
+/// The mount points strictly inside `dir` (an absolute, resolved path), from the mount
+/// table. The first one found, or `None`.
+fn mount_inside(mountinfo: &[u8], dir: &Path) -> Option<PathBuf> {
+    crate::drives::linux::parse_mountinfo(mountinfo)
+        .into_iter()
+        .map(|m| m.mount_point)
+        .find(|m| m != dir && m.starts_with(dir))
+}
+
+/// [`destroy`] with a check of what is being deleted.
+///
+/// The item is first moved, through a handle on its folder, into a fresh private staging
+/// folder next to it (`<name>.zxraw-deleting-<pid>-<n>/<name>`), and only that staged
+/// object is checked and deleted: whatever is put at the old path meanwhile is never
+/// touched. If the staged object is not the expected one, or the delete stops early or
+/// fails, what is left is moved back. Nothing under a mount point inside the item is ever
+/// deleted: a mount found in the mount table before the delete refuses the whole item, and
+/// one met on the way (another device, or a mount root by `statx`) stops the delete there.
 fn destroy_checked(
     mode: Mode,
     path: &Path,
     check: &Check,
     tick: &mut dyn FnMut(&Path) -> bool,
 ) -> Destroyed {
-    // Never destroy anything during a recycle (see `refuses_permanent_delete`).
-    if refuses_permanent_delete(mode, 0) {
-        return Destroyed {
-            gone: false,
-            changed: false,
-            removed_inside: false,
-            error: Some(DeleteFailure::NotRecyclable),
-        };
-    }
     let fail = |why| Destroyed {
         gone: false,
+        stranded: false,
         changed: false,
         removed_inside: false,
         error: Some(why),
     };
+    // Never destroy anything during a recycle (see `refuses_permanent_delete`).
+    if refuses_permanent_delete(mode, 0) {
+        return fail(DeleteFailure::NotRecyclable);
+    }
     if matches!(check, Check::Unknown) {
         return Destroyed {
             changed: true,
@@ -425,56 +497,184 @@ fn destroy_checked(
     };
     let dir = parent_fd.as_raw_fd();
 
-    // Pin the object: move it to a private name, then check that name.
+    // A volume mounted inside the item: refuse before anything moves.
+    if let Ok(resolved_parent) = fs::read_link(format!("/proc/self/fd/{dir}"))
+        && let Ok(table) = fs::read("/proc/self/mountinfo")
+        && let Some(inner) = mount_inside(&table, &resolved_parent.join(name))
+    {
+        return fail(mount_failure(&inner));
+    }
+
+    // Pin the object: move it into a new private folder, then check it there.
     seam("stage", path);
-    let staged = match staging_name(dir) {
-        Ok(n) => n,
+    let (staged, staging_fd) = match make_staging(dir, name) {
+        Ok(s) => s,
         Err(e) => return fail(classify(&e)),
     };
-    if let Err(e) = rename_at_noreplace(dir, &name_c, &staged) {
-        return fail(classify(&e));
-    }
-    let put_back = || {
-        if let Err(e) = rename_at_noreplace(dir, &staged, &name_c) {
+    let sdir = staging_fd.as_raw_fd();
+    let remove_staging = || {
+        // SAFETY: valid fd and NUL-terminated name.
+        if unsafe { libc::unlinkat(dir, staged.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
             tracing::warn!(
-                path = %path.display(),
-                staged = %String::from_utf8_lossy(staged.to_bytes()),
-                error = %e,
-                "could not move a partly deleted item back to its name"
+                dir = %parent.join(OsStr::from_bytes(staged.to_bytes())).display(),
+                error = %io::Error::last_os_error(),
+                "could not remove an empty staging folder"
             );
         }
     };
+    if let Err(e) = rename_at(dir, &name_c, sdir, &name_c) {
+        remove_staging();
+        return fail(classify(&e));
+    }
+    let left_at = parent.join(OsStr::from_bytes(staged.to_bytes())).join(name);
+    // Moves the staged item back to its name. `Err` carries the failure to report: the
+    // item stays in the staging folder and the message says where.
+    let stranded = std::cell::Cell::new(false);
+    let put_back = || -> Result<(), DeleteFailure> {
+        seam("put back", path);
+        match put_back_at(sdir, dir, &name_c) {
+            Ok(()) => {
+                remove_staging();
+                Ok(())
+            }
+            Err(e) => {
+                stranded.set(true);
+                tracing::warn!(path = %path.display(), left_at = %left_at.display(), error = %e,
+                    "could not move an item back from its staging folder");
+                Err(DeleteFailure::Other(format!(
+                    "it could not be put back under its name ({e}); what is left of it is in {}",
+                    left_at.display()
+                )))
+            }
+        }
+    };
+
     if let Check::Same(then) = check
-        && identity_at(dir, &staged).as_ref() != Some(then)
+        && identity_at(sdir, &name_c).as_ref() != Some(then)
     {
-        put_back();
+        let error = put_back().err().unwrap_or(DeleteFailure::Changed);
         return Destroyed {
             changed: true,
-            ..fail(DeleteFailure::Changed)
+            stranded: stranded.get(),
+            ..fail(error)
         };
     }
     seam("check", path);
 
+    let top = match stat_at(sdir, &name_c) {
+        Ok(Some(st)) => st,
+        Ok(None) => {
+            let why = put_back().err().unwrap_or(DeleteFailure::Missing);
+            return Destroyed {
+                stranded: stranded.get(),
+                ..fail(why)
+            };
+        }
+        Err(e) => {
+            let why = put_back().err().unwrap_or_else(|| classify(&e));
+            return Destroyed {
+                stranded: stranded.get(),
+                ..fail(why)
+            };
+        }
+    };
     let mut d = Destroyer {
         tick,
         removed: 0,
         error: None,
         stopped: false,
+        top_dev: top.st_dev,
+        mount: None,
     };
-    let top_dir =
-        stat_at(dir, &staged).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-    d.remove_at(dir, &staged, path, top_dir);
-    let gone = stat_at(dir, &staged).is_none();
-    if !gone {
-        put_back();
+    let top_dir = top.st_mode & libc::S_IFMT == libc::S_IFDIR;
+    d.remove_at(sdir, &name_c, path, top_dir);
+    let gone = match stat_at(sdir, &name_c) {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(e) => {
+            // Unknown: never reported as deleted.
+            let why = match put_back() {
+                Ok(()) => {
+                    DeleteFailure::Other(format!("it could not be checked after the delete: {e}"))
+                }
+                Err(why) => why,
+            };
+            return Destroyed {
+                removed_inside: d.removed > 0,
+                stranded: stranded.get(),
+                ..fail(why)
+            };
+        }
+    };
+    if gone {
+        drop(staging_fd);
+        remove_staging();
+        return Destroyed {
+            gone: true,
+            stranded: false,
+            changed: false,
+            removed_inside: d.removed > 1,
+            error: None,
+        };
     }
-    // The item itself counts once if it went; anything more was inside it.
+    let mut error = match &d.mount {
+        Some(inner) => Some(mount_failure(inner)),
+        None => d.error.as_ref().map(classify),
+    };
+    if let Err(why) = put_back() {
+        error = Some(why);
+    }
     Destroyed {
-        gone,
+        gone: false,
+        stranded: stranded.get(),
         changed: false,
-        removed_inside: d.removed > usize::from(gone),
-        error: d.error.as_ref().map(classify),
+        removed_inside: d.removed > 0,
+        error,
     }
+}
+
+fn mount_failure(inner: &Path) -> DeleteFailure {
+    DeleteFailure::Other(format!(
+        "a volume is mounted inside it at {}; nothing under it was deleted",
+        inner.display()
+    ))
+}
+
+/// Moves `name` from the staging folder back into its own folder, never over something.
+/// With `RENAME_NOREPLACE` the kernel refuses an existing target. On a file system without
+/// it (vfat, exFAT...) the name is checked first and the item stays staged when it is taken.
+/// Accepted risk: on such a file system, something created at the name between that check
+/// and the rename is replaced (the window is a few system calls wide).
+fn put_back_at(sdir: RawFd, dir: RawFd, name: &CStr) -> io::Result<()> {
+    // SAFETY: valid fds and NUL-terminated names.
+    let r = unsafe {
+        libc::renameat2(
+            sdir,
+            name.as_ptr(),
+            dir,
+            name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS) => match stat_at(dir, name)? {
+            Some(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+            None => rename_at(sdir, name, dir, name),
+        },
+        _ => Err(e),
+    }
+}
+
+/// The identity of `name` inside the open folder `dir` (not following links). Read through
+/// `/proc/self/fd`, so the folder is the one we hold open, whatever its path names now.
+fn identity_at(dir: RawFd, name: &CStr) -> Option<ItemIdentity> {
+    let mut p = PathBuf::from(format!("/proc/self/fd/{dir}"));
+    p.push(OsStr::from_bytes(name.to_bytes()));
+    ItemIdentity::of(&p)
 }
 
 struct Destroyer<'a> {
@@ -482,6 +682,10 @@ struct Destroyer<'a> {
     removed: usize,
     error: Option<io::Error>,
     stopped: bool,
+    /// The device of the item being deleted; nothing on another device is touched.
+    top_dev: libc::dev_t,
+    /// A mount point met inside the item (display path); the delete stopped there.
+    mount: Option<PathBuf>,
 }
 
 impl Destroyer<'_> {
@@ -499,6 +703,20 @@ impl Destroyer<'_> {
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    /// Whether the folder `fd` (entry `name` of `parent`) is on another device or is the
+    /// root of a mount. Unknown counts as a mount.
+    fn is_mount(&self, parent: RawFd, name: &CStr, fd: &OwnedFd, path: &Path) -> bool {
+        if fake_mount(path) {
+            return true;
+        }
+        // SAFETY: valid fd, zeroed plain-data out value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+            return true;
+        }
+        st.st_dev != self.top_dev || is_mount_root_at(parent, name)
     }
 
     fn remove_at(&mut self, parent: RawFd, name: &CStr, path: &Path, maybe_dir: bool) {
@@ -528,6 +746,12 @@ impl Destroyer<'_> {
             }
             Err(e) => return self.note(e),
         };
+        // Never into another volume: stop the whole delete before listing it.
+        if self.is_mount(parent, name, &fd, path) {
+            self.mount = Some(path.to_path_buf());
+            self.stopped = true;
+            return;
+        }
         let entries = match list_dir(&fd) {
             Ok(entries) => entries,
             Err(e) => return self.note(e),
@@ -607,17 +831,26 @@ fn list_dir(fd: &OwnedFd) -> io::Result<Vec<(CString, u8)>> {
 
 /// Counts `path` and everything in it (links not followed). `tick` hears about each entry
 /// and stops the count by returning false.
+/// Folders on another device (a mount inside) are counted as one entry, not walked: the
+/// delete never goes into them either.
 fn count_tree(path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> u64 {
-    fn walk(path: &Path, tick: &mut dyn FnMut(&Path) -> bool, n: &mut u64) -> bool {
+    fn walk(
+        path: &Path,
+        dev: Option<u64>,
+        tick: &mut dyn FnMut(&Path) -> bool,
+        n: &mut u64,
+    ) -> bool {
         *n += 1;
         if !tick(path) {
             return false;
         }
-        if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        if let Ok(md) = fs::symlink_metadata(path)
+            && md.is_dir()
+            && dev.is_none_or(|d| d == md.dev())
             && let Ok(rd) = fs::read_dir(path)
         {
             for entry in rd.flatten() {
-                if !walk(&entry.path(), tick, n) {
+                if !walk(&entry.path(), Some(md.dev()), tick, n) {
                     return false;
                 }
             }
@@ -625,7 +858,7 @@ fn count_tree(path: &Path, tick: &mut dyn FnMut(&Path) -> bool) -> u64 {
         true
     }
     let mut n = 0;
-    walk(path, tick, &mut n);
+    walk(path, None, tick, &mut n);
     n
 }
 
@@ -1064,11 +1297,11 @@ fn deletion_date(at: std::time::SystemTime) -> String {
 }
 
 /// The mount point of the file system holding `dir` (an absolute, resolved path), from
-/// `/proc/self/mountinfo`, or by walking up while the device stays the same.
+/// `/proc/self/mountinfo` (read as bytes, so any mount point name works), or by walking up
+/// while the device stays the same.
 fn mount_point_of(dir: &Path) -> Option<PathBuf> {
     if let Ok(bytes) = fs::read("/proc/self/mountinfo")
-        && let Ok(text) = String::from_utf8(bytes)
-        && let Some(top) = mount_point_in(&text, dir)
+        && let Some(top) = mount_point_in(&bytes, dir)
     {
         return Some(top);
     }
@@ -1083,39 +1316,11 @@ fn mount_point_of(dir: &Path) -> Option<PathBuf> {
     Some(top)
 }
 
-/// The longest mount point in a `mountinfo` text that holds `dir`.
-fn mount_point_in(mountinfo: &str, dir: &Path) -> Option<PathBuf> {
-    mountinfo
-        .lines()
-        .filter_map(|line| line.split(' ').nth(4))
-        .map(|field| PathBuf::from(OsString::from_vec(unescape_mount(field))))
-        .filter(|m| dir.starts_with(m))
-        // The last of equal length wins: it is mounted over the earlier ones.
-        .fold(None::<PathBuf>, |best, m| match best {
-            Some(b) if b.as_os_str().len() > m.as_os_str().len() => Some(b),
-            _ => Some(m),
-        })
-}
-
-/// Undoes the `\ooo` octal escapes of `mountinfo` fields.
-fn unescape_mount(field: &str) -> Vec<u8> {
-    let b = field.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'\\'
-            && i + 3 < b.len()
-            && let Ok(v) =
-                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 4]).unwrap_or("x"), 8)
-        {
-            out.push(v);
-            i += 4;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    out
+/// The longest mount point in a `mountinfo` table that holds `dir` (the last of equal
+/// length wins: it is mounted over the earlier ones).
+fn mount_point_in(mountinfo: impl AsRef<[u8]>, dir: &Path) -> Option<PathBuf> {
+    let mounts = crate::drives::linux::parse_mountinfo(mountinfo);
+    crate::drives::linux::mount_for_path(&mounts, dir).map(|m| m.mount_point.clone())
 }
 
 #[cfg(test)]
@@ -1927,5 +2132,236 @@ mod tests {
                 .unwrap();
             assert_eq!(tree_size(&d), du);
         }
+    }
+    fn with_fake_mounts(paths: Vec<PathBuf>, body: impl FnOnce()) {
+        FAKE_MOUNTS.with(|m| *m.borrow_mut() = paths);
+        body();
+        FAKE_MOUNTS.with(|m| m.borrow_mut().clear());
+    }
+
+    #[test]
+    fn a_mount_met_inside_stops_the_delete_and_nothing_under_it_goes() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        fx.file("d/backup/precious.txt", b"keep");
+        fx.file("d/backup/deeper/also.txt", b"keep");
+        fx.file("d/zz.txt", b"x");
+        let mut report = None;
+        with_fake_mounts(vec![d.join("backup")], || {
+            report = Some(run_with(
+                &[d.clone()],
+                &[],
+                Mode::Permanent,
+                quiet(),
+                &fx.env(),
+            ));
+        });
+        let report = report.unwrap();
+        assert!(report.done.is_empty(), "{report:?}");
+        let [(p, DeleteFailure::Other(msg))] = report.failed.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert_eq!(p, &d);
+        assert!(msg.contains("mounted inside it"), "{msg}");
+        assert_eq!(fs::read(d.join("backup/precious.txt")).unwrap(), b"keep");
+        assert_eq!(fs::read(d.join("backup/deeper/also.txt")).unwrap(), b"keep");
+        assert!(d.join("backup").is_dir(), "the mount point itself stays");
+        no_staging_left(fx.root());
+    }
+
+    #[test]
+    fn a_mount_in_the_mount_table_refuses_the_item_before_anything_moves() {
+        let line = |mp: &str| format!("36 25 8:33 / {mp} rw shared:1 - ext4 /dev/sdc1 rw\n");
+        let table = [
+            line("/"),
+            line("/home/u/d/backup\\040drive"),
+            line("/home/u/dx"),
+        ]
+        .concat();
+        assert_eq!(
+            mount_inside(table.as_bytes(), Path::new("/home/u/d")),
+            Some(PathBuf::from("/home/u/d/backup drive"))
+        );
+        assert_eq!(
+            mount_inside(table.as_bytes(), Path::new("/home/u/dx")),
+            None,
+            "itself is not inside"
+        );
+        assert_eq!(mount_inside(table.as_bytes(), Path::new("/home/u/e")), None);
+    }
+
+    #[test]
+    fn a_device_change_counts_as_a_mount() {
+        // The real check: fstat device differs from the item's. Use /proc (another device)
+        // seen through a handle: `is_mount` must say yes for it against our temp folder's device.
+        let fx = Fixture::new();
+        let top = fs::symlink_metadata(fx.root()).unwrap().dev();
+        let mut tick = |_: &Path| true;
+        let d = Destroyer {
+            tick: &mut tick,
+            removed: 0,
+            error: None,
+            stopped: false,
+            top_dev: top as libc::dev_t,
+            mount: None,
+        };
+        let root = cstring(b"/").unwrap();
+        let proc_ = cstring(b"proc").unwrap();
+        let rfd = open_dir_at(libc::AT_FDCWD, &root, false).unwrap();
+        let pfd = open_dir_at(rfd.as_raw_fd(), &proc_, true).unwrap();
+        assert!(d.is_mount(rfd.as_raw_fd(), &proc_, &pfd, Path::new("/proc")));
+        // A plain folder on the same device is not a mount.
+        fs::create_dir(fx.root().join("sub")).unwrap();
+        let here = cstring(fx.root().as_os_str().as_bytes()).unwrap();
+        let hfd = open_dir_at(libc::AT_FDCWD, &here, true).unwrap();
+        let sub = cstring(b"sub").unwrap();
+        let sfd = open_dir_at(hfd.as_raw_fd(), &sub, true).unwrap();
+        assert!(!d.is_mount(hfd.as_raw_fd(), &sub, &sfd, &fx.root().join("sub")));
+        // /proc is the root of a mount by statx where the kernel reports the attribute.
+        let mut probe: libc::statx = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::statx(
+                rfd.as_raw_fd(),
+                proc_.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                libc::STATX_BASIC_STATS,
+                &mut probe,
+            )
+        } == 0;
+        if ok && probe.stx_attributes_mask & libc::STATX_ATTR_MOUNT_ROOT as u64 != 0 {
+            assert!(is_mount_root_at(rfd.as_raw_fd(), &proc_));
+            assert!(!is_mount_root_at(hfd.as_raw_fd(), &sub));
+        }
+    }
+
+    #[test]
+    fn a_put_back_onto_a_taken_name_leaves_the_item_staged_and_says_where() {
+        let fx = Fixture::new();
+        let d = fx.root().join("d");
+        for i in 0..5 {
+            fx.file(&format!("d/f{i}"), b"x");
+        }
+        let d2 = d.clone();
+        let mut seen = 0;
+        let mut out = None;
+        with_seam(
+            move |at, _| {
+                if at == Seam::BeforePutBack {
+                    fs::create_dir(&d2).unwrap();
+                    fs::write(d2.join("newcomer"), b"new").unwrap();
+                }
+            },
+            || {
+                out = Some(destroy(Mode::Permanent, &d, &mut |_| {
+                    seen += 1;
+                    seen < 3
+                }));
+            },
+        );
+        let out = out.unwrap();
+        assert!(!out.gone);
+        assert!(out.stranded);
+        let Some(DeleteFailure::Other(msg)) = &out.error else {
+            panic!("{:?}", out.error)
+        };
+        // The newcomer is untouched, and the rest is where the message says.
+        assert_eq!(fs::read(d.join("newcomer")).unwrap(), b"new");
+        let staged: Vec<PathBuf> = fs::read_dir(fx.root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains(".zxraw-deleting-"))
+            .collect();
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        let name = staged[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.starts_with("d.zxraw-deleting-"),
+            "visible, named after the item: {name}"
+        );
+        let left = staged[0].join("d");
+        assert!(msg.contains(&left.display().to_string()), "{msg}");
+        assert!(fs::read_dir(&left).unwrap().count() > 0);
+    }
+
+    #[test]
+    fn a_cancel_with_a_stranded_item_is_reported_as_a_failure_with_its_place() {
+        let fx = Fixture::new();
+        for i in 0..20 {
+            fx.file(&format!("tree/f{i}"), b"x");
+        }
+        let tree = fx.root().join("tree");
+        let after = fx.file("after", b"x");
+        let t2 = tree.clone();
+        let mut report = None;
+        with_seam(
+            move |at, _| {
+                if at == Seam::BeforePutBack {
+                    fs::create_dir(&t2).unwrap();
+                }
+            },
+            || {
+                let observer: DeleteObserver = Box::new(|p| {
+                    std::thread::sleep(TELL_EVERY);
+                    p.stage != DeleteStage::Deleting || p.work_done < 5
+                });
+                report = Some(run_with(
+                    &[tree.clone(), after.clone()],
+                    &[],
+                    Mode::Permanent,
+                    observer,
+                    &fx.env(),
+                ));
+            },
+        );
+        let report = report.unwrap();
+        assert!(report.cancelled, "{report:?}");
+        assert!(report.partly_deleted.is_empty(), "{report:?}");
+        assert_eq!(report.not_started, vec![after.clone()]);
+        let [(p, DeleteFailure::Other(m))] = report.failed.as_slice() else {
+            panic!("{report:?}");
+        };
+        assert_eq!(p, &tree);
+        assert!(m.contains("tree.zxraw-deleting-"), "{m}");
+    }
+
+    #[test]
+    fn staging_names_fit_and_keep_characters_whole() {
+        let long = "é".repeat(200);
+        let n = staging_name(OsStr::new(&long), 7).unwrap();
+        let b = n.to_bytes();
+        assert!(b.len() <= 255);
+        assert!(std::str::from_utf8(b).is_ok());
+        assert!(
+            std::str::from_utf8(b)
+                .unwrap()
+                .ends_with(&format!(".zxraw-deleting-{}-7", std::process::id()))
+        );
+        assert_eq!(
+            staging_name(OsStr::new("a b"), 1).unwrap().to_bytes(),
+            format!("a b.zxraw-deleting-{}-1", std::process::id()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn stat_errors_other_than_missing_are_not_gone() {
+        let fx = Fixture::new();
+        let here = cstring(fx.root().as_os_str().as_bytes()).unwrap();
+        let fd = open_dir_at(libc::AT_FDCWD, &here, true).unwrap();
+        assert!(matches!(
+            stat_at(fd.as_raw_fd(), &cstring(b"nope").unwrap()),
+            Ok(None)
+        ));
+        // ENOTDIR (a component is a file) is an error, not "missing".
+        fx.file("plain", b"x");
+        assert!(stat_at(fd.as_raw_fd(), &cstring(b"plain/x").unwrap()).is_err());
+        let long = vec![b'a'; 300];
+        assert!(
+            stat_at(fd.as_raw_fd(), &cstring(&long).unwrap()).is_err(),
+            "ENAMETOOLONG"
+        );
     }
 }
