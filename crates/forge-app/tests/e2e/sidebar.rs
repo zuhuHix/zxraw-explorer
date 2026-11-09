@@ -347,6 +347,9 @@ fn network_locations_are_added_renamed_and_removed_without_freezing_on_an_offlin
     assert_eq!(saved.as_array().map(Vec::len), Some(0), "{saved}");
 }
 
+// Windows-only: goes to UNC share paths; Linux has no such paths, so it would pass without
+// exercising anything.
+#[cfg(windows)]
 #[test]
 fn going_to_an_offline_share_path_never_waits_on_the_ui_thread() {
     let sandbox = tempfile::tempdir().unwrap();

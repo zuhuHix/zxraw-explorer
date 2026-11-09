@@ -175,6 +175,9 @@ fn new_folder_and_file_suggest_a_free_name_from_the_listing() {
     assert_eq!(fs::read(dir.join("New file.txt")).unwrap(), b"keep");
 }
 
+// Windows-only: drives a UNC share (`\\host\share`); Linux has no such paths, so it would
+// pass without exercising anything.
+#[cfg(windows)]
 #[test]
 fn rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread() {
     let sandbox = tempfile::tempdir().unwrap();
