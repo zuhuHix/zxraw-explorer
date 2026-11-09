@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use egui::RichText;
-use forge_win::xdg_apps::{self, MenuEntry, XdgDirs};
+use forge_win::xdg_apps::{self, Launcher, MenuEntry, XdgDirs};
 
 use super::{Action, State, brief_error};
 use crate::app::ZxrawApp;
@@ -141,7 +141,7 @@ pub struct TypeStatus {
 pub struct LinuxStatus {
     pub menu: MenuEntry,
     /// Where the entry should point: the AppImage file, else this executable.
-    pub launcher: Option<PathBuf>,
+    pub launcher: Launcher,
     /// One per [`Group::ALL`].
     pub groups: Vec<Vec<TypeStatus>>,
 }
@@ -149,11 +149,13 @@ pub struct LinuxStatus {
 impl LinuxStatus {
     pub fn check() -> Option<Self> {
         let dirs = XdgDirs::from_env()?;
-        let launcher = xdg_apps::launcher_path();
-        let menu = launcher
-            .as_deref()
-            .map(|exe| xdg_apps::menu_entry(&dirs, exe))
-            .unwrap_or(MenuEntry::Missing);
+        let launcher = xdg_apps::launcher();
+        // With no usable path, any entry of ours counts as out of date.
+        let exe = match &launcher {
+            Launcher::Path(exe) => exe.as_path(),
+            Launcher::AppImageGone(_) | Launcher::Unknown => Path::new(""),
+        };
+        let menu = xdg_apps::menu_entry(&dirs, exe);
         let groups = Group::ALL
             .iter()
             .map(|group| {
@@ -203,12 +205,23 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
         return;
     };
     let mut send = |a: LinuxAction| *action = Some(Action::Linux(a));
+    // The AppImage moved while running: the new path is unknown until it is started again.
+    let moved_while_running = matches!(status.launcher, Launcher::AppImageGone(_));
+    let warn = |ui: &mut egui::Ui, text: &str| {
+        ui.label(RichText::new(text).color(ui.visuals().warn_fg_color));
+    };
 
     match &status.menu {
         MenuEntry::Missing => {
             ui.label("ZXraw Explorer is not in the applications menu yet, so the desktop cannot open files with it. Add it first.");
+            if moved_while_running {
+                warn(ui, MOVED_WHILE_RUNNING);
+            }
             if ui
-                .button("Add ZXraw to the applications menu")
+                .add_enabled(
+                    !moved_while_running,
+                    egui::Button::new("Add ZXraw to the applications menu"),
+                )
                 .on_hover_text(
                     "Writes ~/.local/share/applications/zxraw.desktop and the icon. It starts this copy of ZXraw Explorer.",
                 )
@@ -219,14 +232,17 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
             ui.add_space(6.0);
         }
         MenuEntry::Ours { path, current } => {
-            if !current {
-                ui.label(
-                    RichText::new("ZXraw moved; update the menu entry")
-                        .color(ui.visuals().warn_fg_color),
-                );
+            if moved_while_running {
+                warn(ui, MOVED_WHILE_RUNNING);
+            } else if !current {
+                warn(ui, "ZXraw moved; update the menu entry");
             }
             ui.horizontal(|ui| {
-                if !current && ui.button("Update the menu entry").clicked() {
+                if !current
+                    && ui
+                        .add_enabled(!moved_while_running, egui::Button::new("Update the menu entry"))
+                        .clicked()
+                {
                     send(LinuxAction::AddMenuEntry);
                 }
                 if !compact
@@ -241,7 +257,7 @@ pub fn controls(ui: &mut egui::Ui, state: &mut State, compact: bool, action: &mu
                     send(LinuxAction::RemoveMenuEntry);
                 }
             });
-            if let (true, Some(launcher)) = (*current && !compact, &status.launcher) {
+            if let (true, Launcher::Path(launcher)) = (*current && !compact, &status.launcher) {
                 ui.label(
                     RichText::new(format!("In the applications menu; starts {}", launcher.display()))
                         .weak(),
@@ -308,7 +324,15 @@ pub fn record_path(config: &Path) -> PathBuf {
     config.join("linux-default-apps.tsv")
 }
 
+/// Shown when `$APPIMAGE` no longer exists.
+const MOVED_WHILE_RUNNING: &str =
+    "ZXraw was moved while running: start it again from its new location, then update the menu entry";
+
+/// The toast for a record file that was refused (`xdg_apps::is_damaged_record`).
+const DAMAGED_RECORD: &str = "Can't restore previous defaults; set them in System Settings";
+
 /// The icon sizes in `packaging/linux/icons/hicolor`.
+#[cfg(test)]
 const ICON_SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 
 fn icons() -> Vec<(u32, &'static [u8])> {
@@ -339,29 +363,47 @@ fn icons() -> Vec<(u32, &'static [u8])> {
 pub fn run(config: &Path, action: LinuxAction) -> Result<String, String> {
     let dirs = XdgDirs::from_env().ok_or("The desktop's default apps could not be read here")?;
     let record = record_path(config);
+    // The full error goes to the log (see `apply`); these are what the user reads.
+    let explain = |what: &str| {
+        let what = what.to_string();
+        move |error: forge_win::WinError| {
+            tracing::warn!("{what}: {error}");
+            if xdg_apps::is_damaged_record(&error) {
+                DAMAGED_RECORD.to_string()
+            } else if xdg_apps::is_changed_by_another_program(&error) {
+                "Settings changed by another program; try again".to_string()
+            } else {
+                format!("{what}: {error}")
+            }
+        }
+    };
     match action {
         LinuxAction::Group(group, true) => {
             xdg_apps::set_defaults(&dirs, &group.mime_types(), &record)
-                .map_err(|e| format!("Could not set the default: {e}"))?;
+                .map_err(explain("Could not set the default"))?;
             Ok(format!("{} now open with ZXraw Explorer", group.noun()))
         }
         LinuxAction::Group(group, false) => {
             xdg_apps::restore_defaults(&dirs, &group.mime_types(), &record)
-                .map_err(|e| format!("Could not restore the previous app: {e}"))?;
+                .map_err(explain("Could not restore the previous app"))?;
             Ok(format!("{}: previous apps restored", group.noun()))
         }
         LinuxAction::AddMenuEntry => {
-            let launcher = xdg_apps::launcher_path().ok_or("Could not find this program's path")?;
+            let launcher = match xdg_apps::launcher() {
+                Launcher::Path(path) => path,
+                Launcher::AppImageGone(_) => return Err(MOVED_WHILE_RUNNING.into()),
+                Launcher::Unknown => return Err("Could not find this program's path".into()),
+            };
             xdg_apps::install_menu_entry(&dirs, &launcher, &menu_mime_types(), &icons())
-                .map_err(|e| format!("Could not add the menu entry: {e}"))?;
+                .map_err(explain("Could not add the menu entry"))?;
             Ok("ZXraw Explorer added to the applications menu".into())
         }
         LinuxAction::RemoveMenuEntry => {
             // Nothing may be left pointing at the entry about to go.
             xdg_apps::restore_defaults(&dirs, &menu_mime_types(), &record)
-                .map_err(|e| format!("Could not restore the previous apps: {e}"))?;
-            xdg_apps::remove_menu_entry(&dirs, &ICON_SIZES)
-                .map_err(|e| format!("Could not remove the menu entry: {e}"))?;
+                .map_err(explain("Could not restore the previous apps"))?;
+            xdg_apps::remove_menu_entry(&dirs, &icons())
+                .map_err(explain("Could not remove the menu entry"))?;
             Ok("ZXraw Explorer removed from the applications menu; previous apps restored".into())
         }
     }
@@ -410,10 +452,11 @@ mod tests {
             .expect("MimeType line");
         let packaged: Vec<&str> = line.split(';').filter(|m| !m.is_empty()).collect();
         assert_eq!(packaged, menu_mime_types());
-        // The generated entry carries everything the packaged one has, except Exec.
+        // The generated entry carries everything the packaged one has, except Exec and Icon.
         let generated = xdg_apps::desktop_entry_text(Path::new("/x/ZXraw.AppImage"), &menu_mime_types());
         for line in entry.lines().filter(|l| l.contains('=') && !l.starts_with('#')) {
-            if !line.starts_with("Exec=") {
+            // Exec is the AppImage's path; Icon is ZXraw's own name, never a package's `zxraw`.
+            if !line.starts_with("Exec=") && !line.starts_with("Icon=") {
                 assert!(generated.lines().any(|g| g == line), "{line} missing from the generated entry");
             }
         }

@@ -814,7 +814,8 @@ fn linux_default_apps_set_restore_and_menu_entry() {
         text.contains(&format!("Exec=\"{}\" %f\n", appimage.display())),
         "Exec is the AppImage path: {text}"
     );
-    assert!(data.join("icons/hicolor/256x256/apps/zxraw.png").is_file());
+    assert!(data.join("icons/hicolor/256x256/apps/zxraw-appimage.png").is_file());
+    assert!(text.contains("Icon=zxraw-appimage\n"), "{text}");
     // Photos and folders are back as they were; archives are still ours.
     assert_eq!(std::fs::read_to_string(&cinnamon).unwrap(), cinnamon_original);
     let list = std::fs::read_to_string(&user_list).unwrap();
@@ -823,10 +824,27 @@ fn linux_default_apps_set_restore_and_menu_entry() {
     assert!(!list.contains("inode/directory=") && !list.contains("image/jpeg="), "{list}");
     assert!(list.contains("[Added Associations]\nimage/png=xviewer.desktop;\n"), "{list}");
 
-    // The AppImage moves: the page notices, rewrites the entry, then removes it again.
+    // The AppImage moves while running ($APPIMAGE is gone): the entry is not rewritten to the
+    // temporary mount. A damaged record refuses the restore and says so.
     let moved = root.join("Elsewhere/ZXraw.AppImage");
     std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
     std::fs::rename(&appimage, &moved).unwrap();
+    let record = profile.join("config/linux-default-apps.tsv");
+    let good_record = std::fs::read_to_string(&record).expect("archives are recorded");
+    std::fs::write(&record, format!("{good_record}not a record line\n")).unwrap();
+    let script = "limit 60\ndismiss-notices\nui system default-app-page\nwait-frames 5\n\
+                  ui system assert-menu-entry moved\nui system default-app add-menu\n\
+                  assert-toast ZXraw was moved while running\nui system assert-menu-entry moved\n\
+                  ui system default-app archives off\n\
+                  assert-toast Can't restore previous defaults; set them in System Settings\n\
+                  ui system assert-default-app archives on\nexit\n";
+    let outcome = run_app_with(&root.join("run-stale"), &profile, script, &env(&appimage));
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read_to_string(&desktop).unwrap(), text, "entry untouched");
+    std::fs::write(&record, &good_record).unwrap();
+
+    // Started again from its new place: the page rewrites the entry, then removes it.
     let script = "limit 60\ndismiss-notices\nui system default-app-page\nwait-frames 5\n\
                   ui system assert-menu-entry moved\nui system default-app add-menu\n\
                   ui system assert-menu-entry ours\nui system default-app remove-menu\n\
