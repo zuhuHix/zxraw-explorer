@@ -5,8 +5,7 @@
 # Usage: packaging/release-linux.sh <x.y.z> [--skip-build]
 #
 # 1. Checks that [workspace.package] version in Cargo.toml equals <x.y.z>. This script does NOT
-#    bump the version: packaging/release.ps1 does that on Windows, and the Linux build runs on the
-#    same bumped tree.
+#    bump the version: packaging/bump-version.sh (or release.ps1 on Windows) does that.
 # 2. Runs packaging/linux/build-linux.sh (AppImage, .deb, SHA256SUMS-linux.txt in dist/).
 # 3. Prints the `gh release upload` command. It never runs gh, never commits, tags, pushes or
 #    uploads anything itself.
@@ -42,7 +41,7 @@ with open("Cargo.toml", "rb") as f:
     print(tomllib.load(f)["workspace"]["package"]["version"])
 ')"
 if [[ "$tree_version" != "$VERSION" ]]; then
-    die "Cargo.toml has version $tree_version, not $VERSION. Bump the version (release.ps1 does this on Windows) and commit it before the Linux build."
+    die "Cargo.toml has version $tree_version, not $VERSION. Run packaging/bump-version.sh $VERSION and commit it before the Linux build."
 fi
 
 "$here/linux/build-linux.sh" "${build_args[@]}"

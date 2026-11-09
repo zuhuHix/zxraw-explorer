@@ -1,0 +1,320 @@
+# Builds a release from a version tag and puts it in a DRAFT GitHub release.
+#
+#   git push origin vX.Y.Z      -> builds vX.Y.Z and creates or updates its draft release
+#   Actions > Release > Run     -> the same for an existing tag (input "tag")
+#   ... with dry_run checked    -> builds the branch you run it on, checks the version against
+#                                  the "tag" input, uploads the files as run artifacts, and does
+#                                  not touch any release or tag
+#
+# The draft is never published here. Check it, then publish it by hand:
+#   gh release edit vX.Y.Z --draft=false --notes-file notes.md
+# Steps: packaging/RELEASING.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to build, e.g. v0.11.0 (must exist unless dry_run is set)
+        required: true
+        type: string
+      dry_run:
+        description: Build the selected branch instead of the tag; no release, no tag
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  prepare:
+    name: Resolve tag and version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - name: Resolve tag, version and the commit to build
+        id: resolve
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_TAG: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == push ]]; then
+            tag="$PUSH_TAG"; ref="refs/tags/$tag"; publish=true
+          elif [[ "$DRY_RUN" == true ]]; then
+            tag="$INPUT_TAG"; ref="$SHA"; publish=false
+          else
+            tag="$INPUT_TAG"; ref="refs/tags/$tag"; publish=true
+          fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+            { echo "::error::tag must look like v1.2.3, got '$tag'"; exit 1; }
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "ref=$ref"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "Tag $tag, version ${tag#v}, building $ref, publish=$publish"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          persist-credentials: false
+
+      - name: Check that Cargo.toml has the tag's version
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          tree="$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          [[ "$tree" == "$VERSION" ]] ||
+            { echo "::error::Cargo.toml has version $tree, the tag says $VERSION. Run packaging/bump-version.sh $VERSION and tag that commit."; exit 1; }
+          echo "Cargo.toml version $tree matches"
+
+  windows:
+    name: Windows (zip, installer, SHA256SUMS.txt)
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      # Same as ci.yml: the runner's %TEMP% is an 8.3 short path, which breaks tests that compare
+      # it with the long paths the shell reports. RUNNER_TEMP has no short components.
+      - name: Use a long-named temp folder
+        shell: pwsh
+        run: |
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11-09
+        with:
+          toolchain: stable
+
+      # Inno Setup 6.7.4 from jrsoftware/issrc, checked against its SHA-256 before it runs, and
+      # installed per user (%LOCALAPPDATA%\Programs\Inno Setup 6, where release.ps1 looks first).
+      # Skipped when the image already has an Inno Setup 6 ISCC.exe.
+      - name: Install Inno Setup 6 if missing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+          )
+          $found = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $found) {
+            $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe"
+            $want = "a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c"
+            $exe = Join-Path $env:RUNNER_TEMP "innosetup-6.7.4.exe"
+            Invoke-WebRequest -Uri $url -OutFile $exe
+            $got = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -ne $want) { throw "Inno Setup SHA-256 mismatch: expected $want, got $got" }
+            $p = Start-Process -FilePath $exe -Wait -PassThru -ArgumentList @(
+              "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-", "/CURRENTUSER")
+            if ($p.ExitCode -ne 0) { throw "Inno Setup installer exited with $($p.ExitCode)" }
+            $found = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $found) { throw "ISCC.exe not found after installing Inno Setup" }
+          }
+          Write-Host "Using $found ($((Get-Item -LiteralPath $found).VersionInfo.ProductVersion))"
+
+      # The tests release.ps1 runs (cargo test --workspace), minus what the hosted runner cannot
+      # run, as in ci.yml's Windows job: forge-app's e2e target (needs a desktop) and the HEIF/AVIF
+      # WIC test (the image has no HEIF/AV1 codecs). release.ps1 then runs with -SkipTests.
+      - name: Test (other crates)
+        shell: bash
+        run: >
+          cargo test --workspace --exclude forge-app --no-fail-fast --
+          --skip wic::tests::wic_encodes_and_decodes_available_heif_and_avif_fixtures
+
+      - name: Test (forge-app unit tests)
+        if: success() || failure()
+        run: cargo test -p forge-app --bins --no-fail-fast
+
+      # The bump in release.ps1 is a no-op here, since the tag already carries the version; the
+      # next step checks that.
+      - name: Build zip, installer and SHA256SUMS.txt (release.ps1)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\packaging\release.ps1 -Version $env:VERSION -SkipTests
+          if (-not $?) { throw "release.ps1 failed" }
+
+      - name: Check that the version bump changed nothing
+        shell: bash
+        run: |
+          git status --short
+          git diff --exit-code -- Cargo.toml Cargo.lock packaging/zxraw.iss ||
+            { echo "::error::release.ps1 changed version files; the tagged tree is not at $VERSION"; exit 1; }
+
+      - name: Upload Windows files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-windows
+          path: |
+            dist/ZXraw-Explorer-${{ needs.prepare.outputs.version }}-x64.zip
+            dist/ZXraw-Explorer-${{ needs.prepare.outputs.version }}-Setup-x64.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  linux:
+    name: Linux (AppImage, .deb, SHA256SUMS-linux.txt)
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-11-09
+        with:
+          toolchain: stable
+
+      - name: Build AppImage and .deb
+        run: bash packaging/linux/build-linux.sh
+
+      - name: Upload Linux files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux
+          path: |
+            dist/ZXraw-Explorer-${{ needs.prepare.outputs.version }}-x86_64.AppImage
+            dist/zxraw_${{ needs.prepare.outputs.version }}_amd64.deb
+            dist/SHA256SUMS-linux.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Draft GitHub release
+    needs: [prepare, windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          persist-credentials: false
+          sparse-checkout: Cargo.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Check that the tag version equals the Cargo.toml workspace version
+        run: |
+          tree="$(python3 -I -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')"
+          [[ "$tree" == "$VERSION" ]] ||
+            { echo "::error::Cargo.toml has version $tree, tag $TAG says $VERSION"; exit 1; }
+          echo "Tag $TAG matches Cargo.toml version $tree"
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the six files and their checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          files=(
+            "ZXraw-Explorer-$VERSION-Setup-x64.exe"
+            "ZXraw-Explorer-$VERSION-x64.zip"
+            "SHA256SUMS.txt"
+            "ZXraw-Explorer-$VERSION-x86_64.AppImage"
+            "zxraw_${VERSION}_amd64.deb"
+            "SHA256SUMS-linux.txt"
+          )
+          for f in "${files[@]}"; do
+            [[ -s "$f" ]] || { echo "::error::missing or empty: $f"; exit 1; }
+          done
+          # Windows writes SHA256SUMS.txt with LF endings in sha256sum format.
+          sha256sum -c SHA256SUMS.txt
+          sha256sum -c SHA256SUMS-linux.txt
+          grep -q "  ZXraw-Explorer-$VERSION-Setup-x64.exe$" SHA256SUMS.txt ||
+            { echo "::error::SHA256SUMS.txt does not list the installer (the in-app updater needs it)"; exit 1; }
+          {
+            echo "### Release files for $TAG"
+            echo
+            echo "| File | Bytes |"
+            echo "| --- | ---: |"
+            for f in "${files[@]}"; do echo "| \`$f\` | $(stat -c %s "$f") |"; done
+            echo
+            if [[ "$PUBLISH" == true ]]; then
+              echo "Draft release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG (check it, then publish it by hand)"
+            else
+              echo "Dry run: no release or tag was created or changed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls -l "${files[@]}"
+
+      - name: Create or update the draft release
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # The tag must already exist; this job never creates one.
+          gh api "repos/$GH_REPO/git/ref/tags/$TAG" --silent ||
+            { echo "::error::tag $TAG does not exist"; exit 1; }
+          files=(
+            "dist/ZXraw-Explorer-$VERSION-Setup-x64.exe"
+            "dist/ZXraw-Explorer-$VERSION-x64.zip"
+            "dist/SHA256SUMS.txt"
+            "dist/ZXraw-Explorer-$VERSION-x86_64.AppImage"
+            "dist/zxraw_${VERSION}_amd64.deb"
+            "dist/SHA256SUMS-linux.txt"
+          )
+          if is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$is_draft" != true ]]; then
+              echo "::error::release $TAG is already published; this workflow only updates drafts"
+              exit 1
+            fi
+            echo "Updating the files of draft release $TAG"
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            echo "Creating draft release $TAG"
+            gh release create "$TAG" "${files[@]}" --draft --verify-tag \
+              --title "ZXraw Explorer $VERSION" --generate-notes
+          fi

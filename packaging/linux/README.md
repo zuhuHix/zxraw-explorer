@@ -1,8 +1,9 @@
 # Linux packaging
 
 Builds the Linux release files: an AppImage and a `.deb` for amd64, plus `SHA256SUMS-linux.txt`.
-Nothing here needs root, system-wide installs or pwsh; the Windows installer and zip are built by
-`packaging/release.ps1` as before.
+Nothing here needs root, system-wide installs or pwsh. Releases are normally built by the Release
+workflow, which runs `build-linux.sh` on `ubuntu-24.04` (see `packaging/RELEASING.md`); the
+Windows installer and zip come from `packaging/release.ps1` in the same workflow.
 
 | File | What it is |
 | --- | --- |
@@ -127,16 +128,18 @@ cosmetic gap for the AppImage tool, not a failure.
 
 ## Linux release steps
 
-The Windows release comes first. The Linux files are added to the same GitHub release.
+The Release workflow builds the Linux files together with the Windows ones and puts all six in a
+draft release; see `packaging/RELEASING.md`. The version is set with
+`packaging/bump-version.sh x.y.z`.
 
-1. Bump the version as on Windows (`[workspace.package] version` in `Cargo.toml`) and commit it as
-   "Release x.y.z". The Windows `packaging/release.ps1` does the bump; on Linux, bump it by hand.
+To build and upload the Linux files by hand instead (for example to replace them in a draft):
+
+1. Set the version with `packaging/bump-version.sh x.y.z`, commit it as "Release x.y.z", tag and
+   push it.
 2. `packaging/release-linux.sh x.y.z` builds and checks the version. It prints the upload command.
-3. Tag and push the commit, then `gh release create` for the Windows files (see
-   `packaging/release.ps1`), or let the release exist already.
-4. Run the printed `gh release upload v<x.y.z> dist/... --clobber` command. Check the printed
+3. Run the printed `gh release upload v<x.y.z> dist/... --clobber` command. Check the printed
    `SHA256SUMS-linux.txt` against the files first.
-5. Keep the Linux checksums in their own file. The Windows in-app updater reads `SHA256SUMS.txt`;
+4. Keep the Linux checksums in their own file. The Windows in-app updater reads `SHA256SUMS.txt`;
    `SHA256SUMS-linux.txt` is separate and is not read by it.
 
 Nothing in this folder publishes anything by itself.
