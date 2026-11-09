@@ -71,24 +71,32 @@ pub fn detect() -> InstallKind {
         std::env::current_exe().ok(),
         Path::new(DEB_EXE),
         |path| dpkg_owner(Path::new(DPKG_QUERY), path, DPKG_TIMEOUT),
+        |appimage, appdir| {
+            let ppid = rustix::process::getppid().map(|p| p.as_raw_nonzero().get() as u32);
+            runtime_is_running(Path::new("/proc"), appimage, appdir, ppid)
+        },
     )
 }
 
 /// [`detect`] with its inputs given: `$APPIMAGE`, `$APPDIR`, the current exe (resolved, as
 /// `/proc/self/exe` is), the path the .deb installs, and the package that owns a path.
 ///
-/// A set `$APPIMAGE` that fails [`is_our_appimage`] is [`InstallKind::Other`]: it may name
-/// any file, and replacing that file is not ours to do.
+/// A set `$APPIMAGE` that fails [`is_our_appimage`], or whose runtime is not running
+/// (`runtime`, given the AppImage and `$APPDIR`; see [`runtime_is_running`]), is
+/// [`InstallKind::Other`]: it may name any file, and replacing that file is not ours to do.
 pub fn detect_from(
     appimage: Option<OsString>,
     appdir: Option<OsString>,
     exe: Option<PathBuf>,
     deb_exe: &Path,
     owner: impl FnOnce(&Path) -> Option<String>,
+    runtime: impl FnOnce(&Path, &Path) -> bool,
 ) -> InstallKind {
     if let Some(value) = appimage.filter(|value| !value.is_empty()) {
         let path = PathBuf::from(value);
-        return if is_our_appimage(&path, appdir.as_deref(), exe.as_deref()) {
+        let ours = is_our_appimage(&path, appdir.as_deref(), exe.as_deref())
+            && appdir.is_some_and(|dir| runtime(&path, Path::new(&dir)));
+        return if ours {
             InstallKind::AppImage(path)
         } else {
             InstallKind::Other
@@ -135,6 +143,98 @@ pub fn is_our_appimage(path: &Path, appdir: Option<&OsStr>, exe: Option<&Path>) 
     open_nofollow(path)
         .and_then(|mut file| file.read_exact(&mut head))
         .is_ok_and(|()| head.starts_with(ELF_MAGIC) && &head[8..11] == APPIMAGE_TYPE2)
+}
+
+/// The AppImage's own runtime is running this process, so `$APPIMAGE` and `$APPDIR` were not
+/// just set by whoever started us. `proc_root` is `/proc` (a stand-in in tests), `ppid` our
+/// parent's pid. Either:
+///
+/// * the parent runs the AppImage file (same device and inode as `appimage`): the type 2
+///   runtime in extract-and-run mode (`--appimage-extract-and-run`,
+///   `APPIMAGE_EXTRACT_AND_RUN=1`) stays our parent while the app runs; or
+/// * `appdir` is a FUSE mount point of ours (`/proc/self/mountinfo`) and a process of ours
+///   runs the AppImage file. With the normal FUSE mount the runtime execs into the app and
+///   leaves a detached process (whose parent is init) serving the mount, so the parent is
+///   the launcher, not the runtime.
+pub fn runtime_is_running(
+    proc_root: &Path,
+    appimage: &Path,
+    appdir: &Path,
+    ppid: Option<u32>,
+) -> bool {
+    let Ok(target) = fs::metadata(appimage) else {
+        return false;
+    };
+    // `/proc/<pid>/exe` follows to the running file, even when its name is gone.
+    let runs_it = |exe: PathBuf| {
+        fs::metadata(exe).is_ok_and(|m| m.dev() == target.dev() && m.ino() == target.ino())
+    };
+    if ppid.is_some_and(|ppid| runs_it(proc_root.join(ppid.to_string()).join("exe"))) {
+        return true;
+    }
+    let Ok(appdir) = fs::canonicalize(appdir) else {
+        return false;
+    };
+    let mountinfo = fs::read_to_string(proc_root.join("self/mountinfo")).unwrap_or_default();
+    if !is_fuse_mount_of(&mountinfo, &appdir, euid()) {
+        return false;
+    }
+    let me = std::process::id().to_string();
+    let Ok(entries) = fs::read_dir(proc_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let pid = name.to_string_lossy();
+        !pid.is_empty()
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && pid != me
+            && entry.metadata().is_ok_and(|m| m.uid() == euid())
+            && runs_it(entry.path().join("exe"))
+    })
+}
+
+/// Is `dir` a FUSE mount point mounted by `uid`, according to `mountinfo`
+/// (`/proc/self/mountinfo`: `… <mount point> <options> [tags] - <fstype> <source> <super options>`)?
+pub fn is_fuse_mount_of(mountinfo: &str, dir: &Path, uid: u32) -> bool {
+    let user = format!("user_id={uid}");
+    mountinfo.lines().any(|line| {
+        let Some((left, right)) = line.split_once(" - ") else {
+            return false;
+        };
+        let Some(point) = left.split(' ').nth(4) else {
+            return false;
+        };
+        let mut right = right.split(' ');
+        let fstype = right.next().unwrap_or("");
+        let options = right.nth(1).unwrap_or("");
+        (fstype == "fuse" || fstype.starts_with("fuse."))
+            && options.split(',').any(|o| o == user)
+            && Path::new(&unescape_mountinfo(point)) == dir
+    })
+}
+
+/// mountinfo writes space, tab, newline and backslash as `\ooo` octal escapes.
+fn unescape_mountinfo(text: &str) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).filter(|digits| {
+            digits
+                .iter()
+                .all(|b| (b'0'..=b'3').contains(&digits[0]) && (b'0'..=b'7').contains(b))
+        });
+        if let (b'\\', Some(digits)) = (bytes[i], octal) {
+            out.push((digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0'));
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    OsString::from_vec(out)
 }
 
 /// The one package `dpkg-query -S <path>` names, run without a shell and stopped after
@@ -514,6 +614,8 @@ pub const HELPER_CHECKSUM: i32 = 65;
 pub const HELPER_NOT_OURS: i32 = 66;
 pub const HELPER_COPY: i32 = 67;
 pub const HELPER_APT: i32 = 68;
+pub const HELPER_NOT_ROOT: i32 = 69;
+pub const HELPER_CHANGED: i32 = 70;
 
 /// The arguments after `pkexec`.
 pub fn pkexec_args(helper: &Path, deb: &Path, sha256: &str, version: &str) -> Vec<OsString> {
@@ -615,6 +717,12 @@ pub fn map_pkexec(code: Option<i32>, output: &str) -> DebOutcome {
         Some(HELPER_BAD_ARGS) => {
             DebOutcome::Failed(format!("the install helper refused the request: {}", output_tail(output, HELPER_BAD_ARGS)))
         }
+        Some(HELPER_CHANGED) => DebOutcome::Failed(
+            "the update file changed while installing; try again".into(),
+        ),
+        Some(HELPER_NOT_ROOT) => DebOutcome::Failed(
+            "the install helper did not get administrator rights; nothing was installed".into(),
+        ),
         Some(HELPER_APT) => DebOutcome::Failed(output_tail(output, HELPER_APT)),
         Some(code) => DebOutcome::Failed(output_tail(output, code)),
         None => DebOutcome::Failed("the install was stopped before it finished".into()),
@@ -729,11 +837,27 @@ mod tests {
                 Some(exe.into()),
                 &deb,
                 never,
+                |_, _| true,
             )
         };
         assert_eq!(
             detect(&image, Some(&mount), &exe),
             InstallKind::AppImage(image.clone())
+        );
+        // Everything checks out, but no runtime of that AppImage is running.
+        assert_eq!(
+            detect_from(
+                Some(image.clone().into()),
+                Some(mount.clone().into()),
+                Some(exe.clone()),
+                &deb,
+                never,
+                |img, dir| {
+                    assert_eq!((img, dir), (image.as_path(), mount.as_path()));
+                    false
+                }
+            ),
+            InstallKind::Other
         );
         // Not running from an AppImage mount: $APPIMAGE could name any file.
         assert_eq!(detect(&image, None, &exe), InstallKind::Other);
@@ -762,11 +886,112 @@ mod tests {
         assert_eq!(detect(&short, Some(&mount), &exe), InstallKind::Other);
         // Empty means unset.
         assert_eq!(
-            detect_from(Some("".into()), Some(mount.into()), Some(exe), &deb, |_| {
-                None
-            }),
+            detect_from(
+                Some("".into()),
+                Some(mount.into()),
+                Some(exe),
+                &deb,
+                |_| None,
+                |_, _| true
+            ),
             InstallKind::Other
         );
+    }
+
+    /// A stand-in `/proc` with `self/mountinfo` and `<pid>/exe` links.
+    struct FakeProc(PathBuf);
+
+    impl FakeProc {
+        fn new(root: &Path) -> Self {
+            fs::create_dir_all(root.join("self")).unwrap();
+            fs::write(root.join("self/mountinfo"), "").unwrap();
+            Self(root.to_path_buf())
+        }
+        fn process(&self, pid: u32, exe: &Path) {
+            let dir = self.0.join(pid.to_string());
+            fs::create_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(exe, dir.join("exe")).unwrap();
+        }
+        fn mount(&self, line: &str) {
+            fs::write(self.0.join("self/mountinfo"), format!("{line}\n")).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_appimage_runtime_must_be_running_this_app() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("ZXraw.AppImage");
+        fs::write(&image, APPIMAGE_HEAD).unwrap();
+        let mount = tmp.path().join("mount point");
+        fs::create_dir(&mount).unwrap();
+        let mount = fs::canonicalize(&mount).unwrap();
+        let shell = tmp.path().join("bash");
+        fs::write(&shell, b"elf").unwrap();
+        let uid = euid();
+        let fuse = format!(
+            "712 34 0:59 / {} ro,nosuid,nodev,relatime shared:687 - fuse.ZXraw.AppImage ZXraw.AppImage ro,user_id={uid},group_id=1000",
+            mount.display().to_string().replace(' ', "\\040")
+        );
+
+        // Extract-and-run: the parent is the runtime.
+        let proc = FakeProc::new(&tmp.path().join("proc1"));
+        proc.process(40, &image);
+        assert!(runtime_is_running(&proc.0, &image, &mount, Some(40)));
+        // A copy of the AppImage is another file: not the runtime of this one.
+        let copy = tmp.path().join("copy.AppImage");
+        fs::copy(&image, &copy).unwrap();
+        let proc = FakeProc::new(&tmp.path().join("proc2"));
+        proc.process(40, &copy);
+        assert!(!runtime_is_running(&proc.0, &image, &mount, Some(40)));
+
+        // Mounted: the parent is the launcher; a detached runtime serves the FUSE mount.
+        let proc = FakeProc::new(&tmp.path().join("proc3"));
+        proc.process(40, &shell);
+        proc.process(41, &image);
+        proc.mount(&fuse);
+        assert!(runtime_is_running(&proc.0, &image, &mount, Some(40)));
+        // No runtime process, or $APPDIR not a FUSE mount, or someone else's mount.
+        let proc = FakeProc::new(&tmp.path().join("proc4"));
+        proc.process(40, &shell);
+        proc.mount(&fuse);
+        assert!(!runtime_is_running(&proc.0, &image, &mount, Some(40)));
+        let proc = FakeProc::new(&tmp.path().join("proc5"));
+        proc.process(41, &image);
+        assert!(
+            !runtime_is_running(&proc.0, &image, &mount, Some(40)),
+            "not mounted"
+        );
+        proc.mount(&fuse.replace(" - fuse.ZXraw.AppImage", " - ext4"));
+        assert!(
+            !runtime_is_running(&proc.0, &image, &mount, Some(40)),
+            "not FUSE"
+        );
+        proc.mount(&fuse.replace(&format!("user_id={uid},"), "user_id=4242,"));
+        assert!(
+            !runtime_is_running(&proc.0, &image, &mount, Some(40)),
+            "another user's"
+        );
+        proc.mount(&fuse);
+        assert!(
+            !runtime_is_running(&proc.0, &image, &tmp.path().join("proc5"), Some(40)),
+            "another folder"
+        );
+        assert!(runtime_is_running(&proc.0, &image, &mount, None));
+        assert!(!runtime_is_running(
+            &proc.0,
+            &tmp.path().join("gone"),
+            &mount,
+            None
+        ));
+    }
+
+    #[test]
+    fn mountinfo_points_are_unescaped() {
+        let line = "1 2 0:5 / /tmp/a\\040b\\134c rw - fuse.x x rw,user_id=7";
+        assert!(is_fuse_mount_of(line, Path::new("/tmp/a b\\c"), 7));
+        assert!(!is_fuse_mount_of(line, Path::new("/tmp/a\\040b\\134c"), 7));
+        assert!(!is_fuse_mount_of("garbage", Path::new("/tmp"), 7));
+        assert_eq!(unescape_mountinfo("\\777x\\"), OsString::from("\\777x\\"));
     }
 
     #[test]
@@ -783,30 +1008,35 @@ mod tests {
             Some("zxraw".to_string())
         };
         assert_eq!(
-            detect_from(None, None, Some(deb.clone()), &deb, owned),
+            detect_from(None, None, Some(deb.clone()), &deb, owned, |_, _| true),
             InstallKind::Deb
         );
         assert_eq!(
-            detect_from(None, None, Some(link), &deb, owned),
+            detect_from(None, None, Some(link), &deb, owned, |_, _| true),
             InstallKind::Deb,
             "resolved"
         );
         assert_eq!(
-            detect_from(None, None, Some(other), &deb, owned),
+            detect_from(None, None, Some(other), &deb, owned, |_, _| true),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(None, None, Some(deb.clone()), &deb, |_| Some(
-                "zxraw-git".into()
-            )),
+            detect_from(
+                None,
+                None,
+                Some(deb.clone()),
+                &deb,
+                |_| Some("zxraw-git".into()),
+                |_, _| true
+            ),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(None, None, Some(deb.clone()), &deb, |_| None),
+            detect_from(None, None, Some(deb.clone()), &deb, |_| None, |_, _| true),
             InstallKind::Other
         );
         assert_eq!(
-            detect_from(None, None, None, &deb, owned),
+            detect_from(None, None, None, &deb, owned, |_, _| true),
             InstallKind::Other
         );
     }
@@ -1055,6 +1285,8 @@ mod tests {
             (HELPER_NOT_OURS, "not the expected"),
             (HELPER_COPY, "could not be read"),
             (HELPER_BAD_ARGS, "refused the request"),
+            (HELPER_CHANGED, "changed while installing; try again"),
+            (HELPER_NOT_ROOT, "administrator rights"),
         ] {
             match map_pkexec(Some(code), "install-update: details") {
                 DebOutcome::Failed(m) => assert!(m.contains(words), "{code}: {m}"),
@@ -1296,7 +1528,7 @@ mod tests {
         assert_eq!(code, HELPER_APT);
         assert!(err.contains("E: broken packages"), "{err}");
         // Without the test apt-get, a normal user is refused.
-        assert_eq!(run(args(&good, &hash, "2.0.0"), None).0, 69);
+        assert_eq!(run(args(&good, &hash, "2.0.0"), None).0, HELPER_NOT_ROOT);
     }
 
     #[test]
