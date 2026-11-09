@@ -1108,6 +1108,27 @@ fn xdnd_drop_with_ctrl_copies_into_the_folder_under_the_pointer() {
     expect_ok(&drop_script_run(sandbox.path(), &script));
 }
 
+/// The XDND target is accepting over folder `A`; then the last position, over `B`, comes
+/// together with the drop (one frame). The drop lands where that position said: in `B`.
+#[cfg(target_os = "linux")]
+#[test]
+fn xdnd_drop_lands_where_the_last_position_said() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let (list, outside) = drop_sandbox(sandbox.path());
+    fs::create_dir_all(list.join("A")).unwrap();
+    fs::create_dir_all(list.join("B")).unwrap();
+    let script = format!(
+        "limit 120\nnavigate {list}\ncmd ViewDetails\nwait-entry B\nwait-frames 5\n\
+         xdnd-drop A -> B | {file}\nwait-exists {in_b}\nwait-jobs\n\
+         assert-missing {in_a}\nassert-missing {file}\nassert-no-error-toast\nexit\n",
+        list = shown(&list),
+        file = shown(&outside.join("a.txt")),
+        in_a = shown(&list.join("A").join("a.txt")),
+        in_b = shown(&list.join("B").join("a.txt")),
+    );
+    expect_ok(&drop_script_run(sandbox.path(), &script));
+}
+
 /// `t.zip` in `dir` as Explorer shows it: `a.txt`, and `sub` holding `b.txt` and
 /// `deeper/c.bin` (3 MB, so it is streamed in many reads). Every entry is dated 2020-05-06.
 fn zip_fixture(dir: &Path) -> (PathBuf, Vec<u8>) {

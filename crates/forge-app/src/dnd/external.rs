@@ -170,6 +170,8 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
     let mut keys = None;
     let mut virtual_files = None;
     let mut told = None;
+    // Where the drop happened, by the drop target (the last XDND position before the drop).
+    let mut drop_point = None;
     let events = os
         .handle
         .as_ref()
@@ -185,8 +187,10 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
                 ctrl,
                 shift,
                 answered,
+                point,
             } => {
                 os.drag = None;
+                drop_point = point;
                 keys = Some((ctrl, shift));
                 told = Some(answered);
                 if !info.files.is_empty() {
@@ -202,8 +206,18 @@ pub fn raw_input(ctx: &egui::Context, raw: &mut egui::RawInput, from_os: bool, o
     }
     hovering |= os.is_dragging();
     let dropping = !paths.is_empty() || virtual_files.is_some();
+    // A drop is hit-tested where it happened: the drop's own point, not the pointer of an
+    // earlier frame (the last position can come with the drop, after the frame that lit up
+    // another folder). This frame then draws the highlight there too. It holds for scripted
+    // runs as well: the point comes from the drop target, not from the script.
+    let drop_pos = drop_point.and_then(|(x, y)| pixels_to_points(ctx, raw, x, y));
+    if let Some(pos) = drop_pos {
+        raw.events.push(egui::Event::PointerMoved(pos));
+    }
     if from_os && (hovering || dropping) {
-        if let Some(pos) = cursor_pos(ctx, raw, os) {
+        if drop_pos.is_none()
+            && let Some(pos) = cursor_pos(ctx, raw, os)
+        {
             raw.events.push(egui::Event::PointerMoved(pos));
         }
         if keys.is_none() {
@@ -289,6 +303,16 @@ fn cursor_pos(
 #[cfg(target_os = "linux")]
 fn cursor_pos(ctx: &egui::Context, raw: &egui::RawInput, os: &OsDrop) -> Option<egui::Pos2> {
     let (x, y) = os.handle.as_ref()?.pointer()?;
+    pixels_to_points(ctx, raw, x, y)
+}
+
+/// Physical window pixels to egui points.
+fn pixels_to_points(
+    ctx: &egui::Context,
+    raw: &egui::RawInput,
+    x: i32,
+    y: i32,
+) -> Option<egui::Pos2> {
     let native = raw
         .viewports
         .get(&raw.viewport_id)?
@@ -297,7 +321,6 @@ fn cursor_pos(ctx: &egui::Context, raw: &egui::RawInput, os: &OsDrop) -> Option<
 }
 
 /// Physical window pixels to egui points at `ppp` pixels per point.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn window_point(x: i32, y: i32, ppp: f32) -> egui::Pos2 {
     egui::pos2(x as f32 / ppp, y as f32 / ppp)
 }

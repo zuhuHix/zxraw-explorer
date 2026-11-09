@@ -34,10 +34,11 @@
 //!   position also reads Ctrl / Shift and the pointer (relative to the toplevel) with
 //!   `QueryPointer` for [`keys`](crate::drop_target::DropTargetHandle::keys) and
 //!   [`pointer`](crate::drop_target::DropTargetHandle::pointer), and wakes the app. The app's
-//!   UI thread reads those; it never makes an X request itself. A new answer
-//!   from the app is sent to the source at once, so its cursor follows while the pointer
-//!   rests.
-//! * `XdndDrop` gives [`DropEvent::Drop`] and `XdndFinished`. A copy is reported as
+//!   UI thread reads those; it never makes an X request itself. A status only ever answers
+//!   a position (a source keeping one position in flight takes the next status as the
+//!   answer to its last one), so a new answer from the app goes out with the next position.
+//! * `XdndDrop` gives [`DropEvent::Drop`] (with the last position, in window pixels, as
+//!   its `point`: the app hit-tests that) and `XdndFinished`. A copy is reported as
 //!   `XdndActionCopy`; a move as **`XdndActionPrivate`**: the app moves the files itself
 //!   (like the optimized move on Windows), so a source that deletes its originals after a
 //!   reported move can never race our move job.
@@ -52,12 +53,17 @@
 //! for the position, Button1 and the modifiers, and `QueryKeymap` for Escape. The window
 //! under the pointer is found by descending from the root through `QueryPointer`'s `child`
 //! to the first window with `XdndAware` (its `XdndProxy` honoured); our own toplevel is
-//! never a target. Positions wait for the previous `XdndStatus` (or 500 ms). At the release
-//! of Button1 a last `XdndPosition` goes out with the action for the keys held then (after
-//! any status still in flight), and only an accepting `XdndStatus` for it leads to
-//! `XdndDrop`; the selection is then served until `XdndFinished` (or 30 s). No answer within
-//! 500 ms, or a refusal, ends the drag with `XdndLeave` and [`DropResult::None`]. Setup
-//! (connecting, taking the selection) runs on the worker thread too, never the caller's. The `DELETE` target is always refused: we never delete the
+//! never a target. `XdndStatus` carries no sequence number, so (as in GTK and Qt) at most
+//! one `XdndPosition` per target is unanswered at a time, and pointer motion meanwhile is
+//! coalesced into the next one. A target that leaves a position unanswered for 500 ms is
+//! unresponsive: it gets no more positions, and a release over it leaves without a drop
+//! (a late status could otherwise pass for an answer). At the release, a position still in
+//! flight is waited for (same 500 ms, else leave), then a last position goes out with the
+//! action for the keys held at the release; the next status answers it, and only an
+//! acceptance leads to `XdndDrop`. The selection is then served until `XdndFinished` (or
+//! 30 s); otherwise the drag ends with `XdndLeave` and [`DropResult::None`]. A new target
+//! starts afresh. Setup (connecting, taking the selection) runs on the worker thread too,
+//! never the caller's. The `DELETE` target is always refused: we never delete the
 //! source files, whatever the target asks.
 //!
 //! The cursor: while the button is held, X shows the grab window's cursor (our toplevel's)
@@ -337,7 +343,6 @@ atoms! {
     data1 = "_ZXRAW_XDND_DATA1",
     time_prop = "_ZXRAW_XDND_TIME",
     stop = "_ZXRAW_XDND_STOP",
-    wake = "_ZXRAW_XDND_WAKE",
 }
 
 impl Atoms {
@@ -546,13 +551,12 @@ fn pointer_on(display: &str, window: u32) -> Option<PointerState> {
 /// The XDND target thread of a [`crate::drop_target::DropTargetHandle`]. Dropping it removes
 /// `XdndProxy` from the toplevel and stops the thread (which destroys the proxy window).
 pub(crate) struct TargetThread {
-    /// The handle's own connection, for notes to the thread and the cleanup.
+    /// The handle's own connection, for stopping the thread and the cleanup.
     conn: RustConnection,
     toplevel: Window,
     proxy: Window,
     proxy_atom: Atom,
     stop_atom: Atom,
-    wake_atom: Atom,
     done: mpsc::Receiver<()>,
 }
 
@@ -613,7 +617,7 @@ impl TargetThread {
         .map_err(|e| api_err("ChangeProperty(XdndProxy)", e))?;
 
         let (handle_conn, _) = connect(display)?;
-        let (proxy_atom, stop_atom, wake_atom) = (atoms.proxy, atoms.stop, atoms.wake);
+        let (proxy_atom, stop_atom) = (atoms.proxy, atoms.stop);
         let (done_tx, done) = mpsc::channel();
         let mut target = Target {
             conn,
@@ -639,7 +643,6 @@ impl TargetThread {
             proxy,
             proxy_atom,
             stop_atom,
-            wake_atom,
             done,
         };
         if let Err(e) = spawned {
@@ -648,13 +651,6 @@ impl TargetThread {
             return Err(api_err("spawn(XDND target)", e));
         }
         Ok(thread)
-    }
-
-    /// The app's answer changed: the thread tells the source, if it differs from the last
-    /// status.
-    pub(crate) fn answer_changed(&self) {
-        send_message(&self.conn, self.proxy, self.proxy, self.wake_atom, [0; 5]);
-        let _ = self.conn.flush();
     }
 }
 
@@ -710,6 +706,8 @@ struct TargetDrag {
     drop: Option<Instant>,
     /// The app got `Enter` for this drag.
     entered: bool,
+    /// The root coordinates of the latest `XdndPosition`: where a drop happens.
+    at: Option<(i16, i16)>,
 }
 
 struct Target {
@@ -749,8 +747,6 @@ impl Target {
                 let l = e.data.as_data32();
                 if e.type_ == a.stop && e.window == self.proxy {
                     return false;
-                } else if e.type_ == a.wake {
-                    self.answer_changed();
                 } else if e.type_ == a.enter {
                     self.enter(l);
                 } else if e.type_ == a.position {
@@ -886,6 +882,7 @@ impl Target {
             last_message: Instant::now(),
             drop: None,
             entered: false,
+            at: None,
         });
     }
 
@@ -906,6 +903,7 @@ impl Target {
             return;
         }
         drag.last_message = Instant::now();
+        drag.at = Some(((l[2] >> 16) as u16 as i16, l[2] as u16 as i16));
         let (time, suggested) = (l[3], self.atoms.action_of(l[4]));
         // The action list (it may change with the modifiers) and the keys: one round trip.
         let list = self.conn.get_property(
@@ -987,18 +985,6 @@ impl Target {
         drag.status = Some(effect);
     }
 
-    fn answer_changed(&mut self) {
-        let Some(drag) = &self.drag else {
-            return;
-        };
-        if drag.status.is_none() || drag.drop.is_some() {
-            return;
-        }
-        let effect = self.effect();
-        if self.drag.as_ref().and_then(|d| d.status) != Some(effect) {
-            self.send_status(effect);
-        }
-    }
 
     fn request_data(&mut self, time: u32) {
         let Some(drag) = self.drag.as_mut() else {
@@ -1189,6 +1175,18 @@ impl Target {
         let Some(drag) = self.drag.take() else {
             return;
         };
+        // The drop lands where the last position said, in window pixels.
+        let point = drag.at.and_then(|(x, y)| {
+            let reply = self
+                .conn
+                .translate_coordinates(self.root, self.toplevel, x, y)
+                .ok()?
+                .reply()
+                .ok()?;
+            reply
+                .same_screen
+                .then_some((i32::from(reply.dst_x), i32::from(reply.dst_y)))
+        });
         let files = match drag.data {
             Data::Received(files) => files,
             _ => Vec::new(),
@@ -1200,6 +1198,9 @@ impl Target {
         };
         let mut shared = drop_target::lock(&self.shared);
         shared.dragging = false;
+        if point.is_some() {
+            shared.pointer = point;
+        }
         let (ctrl, shift) = shared.keys;
         let woke = if !files.is_empty() {
             if !drag.entered {
@@ -1217,6 +1218,7 @@ impl Target {
                 ctrl,
                 shift,
                 answered,
+                point,
             });
             true
         } else if drag.entered {
@@ -1963,8 +1965,13 @@ fn run_drag(
     };
     let mut site: Option<Site> = None;
     let mut status = Status::default();
-    // When the last position went out without a status yet.
+    // XdndStatus carries no sequence number, so (as GTK and Qt do) at most one position is
+    // unanswered at a time: then the next status from the target answers it. `awaiting` is
+    // when that position went out; motion meanwhile is coalesced into the next one.
     let mut awaiting: Option<Instant> = None;
+    // The target let a position go unanswered for `STATUS_WAIT`: no more positions to it
+    // (a late status could not be told from an answer to a newer one), and no drop on it.
+    let mut unresponsive = false;
     let mut sent: Option<(i16, i16, Action)> = None;
     let mut cache: Option<(Window, Under, Instant)> = None;
     let mut tick = Instant::now();
@@ -2039,6 +2046,7 @@ fn run_drag(
             site = new_site;
             status = Status::default();
             awaiting = None;
+            unresponsive = false;
             sent = None;
         }
         let action = action_for_keys(
@@ -2050,14 +2058,17 @@ fn run_drag(
             source.set_offered(offered_actions(action));
         }
         if let Some(site) = site {
-            let stale = awaiting.is_some_and(|at| at.elapsed() > STATUS_WAIT);
-            if sent != Some((x, y, action)) && (awaiting.is_none() || stale) {
+            if awaiting.is_some_and(|at| at.elapsed() > STATUS_WAIT) {
+                unresponsive = true;
+            }
+            if !unresponsive && awaiting.is_none() && sent != Some((x, y, action)) {
                 source.position(site, x, y, action);
                 sent = Some((x, y, action));
                 awaiting = Some(Instant::now());
             }
         }
         set_feedback(match under {
+            Under::Site(_) if unresponsive => DragFeedback::Refused,
             Under::Site(_) => feedback_of(status.accepted, source.atoms.action_of(status.action)),
             _ => DragFeedback::NoTarget,
         });
@@ -2068,18 +2079,25 @@ fn run_drag(
         return Ok(DropResult::None);
     };
     // The drop acts as the keys are at the release, not at the last position: a Shift let go
-    // just before the button must not move. A status still in flight answers an older
-    // position, so it is waited out first; then the release position goes out with the
-    // current action, the old answer is forgotten, and only an accepting status for that
-    // position allows the drop. No answer in time, or a refusal: leave, nothing dropped.
+    // just before the button must not move. With one position in flight at most:
+    //  1. a target that let a position go unanswered is never dropped on;
+    //  2. a position still in flight is waited for (until `STATUS_WAIT` after it went out;
+    //     no answer by then: leave, nothing dropped);
+    //  3. the release position goes out with the release's action, and the next status from
+    //     the target answers it (nothing else is in flight); only an acceptance drops.
+    if unresponsive {
+        source.leave(site);
+        return Ok(DropResult::None);
+    }
     let action = release_action(release_mask);
     if action != source.action {
         source.action = action;
         source.set_offered(offered_actions(action));
     }
-    let wait_status = |source: &mut Source, status: &mut Status| -> Result<bool> {
-        let deadline = Instant::now() + STATUS_WAIT;
-        let mut awaiting = Some(Instant::now());
+    // Waits for the status answering the position sent at `sent_at`.
+    let wait_status = |source: &mut Source, status: &mut Status, sent_at: Instant| -> Result<bool> {
+        let deadline = sent_at + STATUS_WAIT;
+        let mut awaiting = Some(sent_at);
         while awaiting.is_some() {
             let Some(event) = next_event(&source.conn, Some(deadline))? else {
                 return Ok(false);
@@ -2090,13 +2108,15 @@ fn run_drag(
         }
         Ok(true)
     };
-    if awaiting.is_some() {
-        let mut stale = Status::default();
-        wait_status(&mut source, &mut stale)?;
+    if let Some(sent_at) = awaiting
+        && !wait_status(&mut source, &mut status, sent_at)?
+    {
+        source.leave(site);
+        return Ok(DropResult::None);
     }
     source.position(site, x, y, action);
     status = Status::default();
-    if !wait_status(&mut source, &mut status)? || !status.accepted {
+    if !wait_status(&mut source, &mut status, Instant::now())? || !status.accepted {
         source.leave(site);
         return Ok(DropResult::None);
     }
@@ -2164,14 +2184,30 @@ pub fn test_drop_files(
     shift: bool,
 ) -> Result<DropResult> {
     let display = display_name().ok_or(WinError::Unsupported)?;
-    drop_files_on(&display, window, x, y, paths, ctrl, shift)
+    drop_files_on(&display, window, (x, y), None, paths, ctrl, shift)
+}
+
+/// For e2e tests: like [`test_drop_files`], but once the target accepts at `from`, a last
+/// position goes out at `to` immediately followed by the drop, with no wait for its status
+/// (as a fast release does), so the target sees the drop's place only in that position.
+#[doc(hidden)]
+pub fn test_drop_files_moving(
+    window: u32,
+    from: (i32, i32),
+    to: (i32, i32),
+    paths: &[PathBuf],
+    ctrl: bool,
+    shift: bool,
+) -> Result<DropResult> {
+    let display = display_name().ok_or(WinError::Unsupported)?;
+    drop_files_on(&display, window, from, Some(to), paths, ctrl, shift)
 }
 
 pub(crate) fn drop_files_on(
     display: &str,
     window: u32,
-    x: i32,
-    y: i32,
+    (x, y): (i32, i32),
+    end: Option<(i32, i32)>,
     paths: &[PathBuf],
     ctrl: bool,
     shift: bool,
@@ -2208,7 +2244,7 @@ pub(crate) fn drop_files_on(
     }
     let result = result
         .and_then(|()| source.conn.sync().map_err(|e| api_err("XSync", e)))
-        .and_then(|()| test_drop(&mut source, window, x, y));
+        .and_then(|()| test_drop(&mut source, window, (x, y), end));
     for &code in pressed.iter().rev() {
         let _ = fake(&source, KEY_RELEASE, code);
     }
@@ -2216,7 +2252,12 @@ pub(crate) fn drop_files_on(
     result
 }
 
-fn test_drop(source: &mut Source, window: u32, x: i32, y: i32) -> Result<DropResult> {
+fn test_drop(
+    source: &mut Source,
+    window: u32,
+    (x, y): (i32, i32),
+    end: Option<(i32, i32)>,
+) -> Result<DropResult> {
     let version = source
         .aware_version(window)
         .ok_or_else(|| WinError::Invalid(format!("window {window:#x} is not XdndAware")))?;
@@ -2224,13 +2265,17 @@ fn test_drop(source: &mut Source, window: u32, x: i32, y: i32) -> Result<DropRes
         .site(window, version)
         .ok_or_else(|| WinError::Invalid(format!("window {window:#x} speaks XDND {version}")))?;
     let clamp = |v: i32| v.clamp(i16::MIN.into(), i16::MAX.into()) as i16;
-    let point = source
-        .conn
-        .translate_coordinates(window, source.root, clamp(x), clamp(y))
-        .map_err(|e| api_err("TranslateCoordinates", e))?
-        .reply()
-        .map_err(|e| api_err("TranslateCoordinates", e))?;
-    let (rx, ry) = (point.dst_x, point.dst_y);
+    let to_root = |source: &Source, (x, y): (i32, i32)| -> Result<(i16, i16)> {
+        let point = source
+            .conn
+            .translate_coordinates(window, source.root, clamp(x), clamp(y))
+            .map_err(|e| api_err("TranslateCoordinates", e))?
+            .reply()
+            .map_err(|e| api_err("TranslateCoordinates", e))?;
+        Ok((point.dst_x, point.dst_y))
+    };
+    let (rx, ry) = to_root(source, (x, y))?;
+    let end = end.map(|end| to_root(source, end)).transpose()?;
     let action = source.action;
     source.enter(site);
 
@@ -2274,6 +2319,9 @@ fn test_drop(source: &mut Source, window: u32, x: i32, y: i32) -> Result<DropRes
                 }
             }
         }
+    }
+    if let Some((ex, ey)) = end {
+        source.position(site, ex, ey, action);
     }
     source.drop_on(site);
     let deadline = Instant::now() + FINISH_WAIT;
