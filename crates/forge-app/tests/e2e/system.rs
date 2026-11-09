@@ -360,10 +360,21 @@ fn folder_context_menu_opens_a_terminal_in_that_folder() {
         shown(&folder),
     );
     // Generous limits: the whole e2e suite runs several app windows at once.
-    let opts = RunOpts {
+    #[allow(unused_mut)]
+    let mut opts = RunOpts {
         limit: Some(std::time::Duration::from_secs(150)),
         ..Default::default()
     };
+    // Unix: the emulator comes from $TERMINAL or PATH, and a CI runner has none installed.
+    // A stub stands in; the automated run records the launch and never starts it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let stub = sandbox.path().join("fake-terminal");
+        std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        opts.env.push(("TERMINAL".into(), shown(&stub)));
+    }
     let outcome = run_app_with(sandbox.path(), &profile, &script, &opts);
     expect_ok(&outcome);
     assert_no_crash(&profile);
