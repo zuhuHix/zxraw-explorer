@@ -29,13 +29,16 @@ pub const TRASH: &str = if cfg!(windows) { "Recycle Bin" } else { "Trash" };
 
 /// What tells an item from another one later created under the same name: on Windows the
 /// volume serial and file index (`forge_win::file_id`); on Unix `st_dev`, `st_ino` and the
-/// birth time, since an inode number is reused at once after a delete (`forge_win::file_id`
-/// alone would take a re-created file for the old one).
+/// birth time (else the inode change time), since an inode number is reused at once after a
+/// delete (`forge_win::file_id` alone would take a re-created file for the old one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileKey {
     pub volume: u64,
     pub index: u64,
-    /// Unix: birth time in nanoseconds since 1970; 0 on Windows.
+    /// Unix: birth time in nanoseconds since 1970, or where the file system keeps none the
+    /// inode change time (`st_ctime`): a reused inode always gets a new one, and a rename or
+    /// permission change also changes it, which only makes the item count as another (the
+    /// safe side). 0 on Windows.
     pub born: u64,
 }
 
@@ -52,7 +55,7 @@ impl FileKey {
 }
 
 /// The [`FileKey`] of the item at `path`, not following a link at the end. `None` when it
-/// can't be read, or (Unix) the file system keeps no birth time.
+/// can't be read.
 #[cfg(windows)]
 pub fn file_key(path: &Path) -> Option<FileKey> {
     forge_win::file_id(path)
@@ -65,12 +68,32 @@ pub fn file_key(path: &Path) -> Option<FileKey> {
 pub fn file_key(path: &Path) -> Option<FileKey> {
     use std::os::unix::fs::MetadataExt;
     let md = std::fs::symlink_metadata(path).ok()?;
-    let born = md.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    #[cfg(test)]
+    let hidden = NO_BIRTH_TIME.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let hidden = false;
+    let born = md
+        .created()
+        .ok()
+        .filter(|_| !hidden)
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_else(|| {
+            (md.ctime() as u64)
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(md.ctime_nsec() as u64)
+        });
     Some(FileKey {
         volume: md.dev(),
         index: md.ino(),
-        born: born.as_nanos() as u64,
+        born,
     })
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Tests: [`file_key`] acts as on a file system without birth times, on this thread.
+    pub static NO_BIRTH_TIME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -282,6 +305,34 @@ fn unix_known_folders() -> Vec<(String, PathBuf)> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Without birth times the key falls back to the inode change time: a file re-created
+    /// under the same name (whose inode may be reused) gets another key, and so does one whose
+    /// permissions changed (the safe side); an untouched one keeps its key.
+    #[test]
+    fn file_keys_without_birth_time_use_the_change_time() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.txt");
+        std::fs::write(&f, "a").unwrap();
+        NO_BIRTH_TIME.with(|n| n.set(true));
+        let first = file_key(&f).expect("a key without birth time");
+        assert_eq!(file_key(&f), Some(first));
+        // Timestamps can be coarse (a clock tick): step past one before each change.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let chmod = file_key(&f).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::remove_file(&f).unwrap();
+        std::fs::write(&f, "a").unwrap();
+        let recreated = file_key(&f).unwrap();
+        let gone = file_key(&d.path().join("missing"));
+        NO_BIRTH_TIME.with(|n| n.set(false));
+        assert_ne!(chmod, first);
+        assert_ne!(recreated, first);
+        assert_ne!(recreated, chmod);
+        assert_eq!(gone, None);
+    }
 
     #[test]
     fn windows_only_commands_are_hidden() {

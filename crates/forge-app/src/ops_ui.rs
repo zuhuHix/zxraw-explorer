@@ -914,6 +914,14 @@ enum SourceIdentity {
     },
 }
 
+impl SourceIdentity {
+    /// Can this tell the item from another one? Not a fallback without a modified time
+    /// (kind and size alone): such an identity never counts as a match.
+    fn verifiable(&self) -> bool {
+        !matches!(self, Self::Meta { modified: None, .. })
+    }
+}
+
 /// Splits a queued job's sources into those to act on, those replaced since they were
 /// queued, and those with no identity recorded at queue time that exist now (a move fails
 /// closed on them). `identities` is empty for copies, which keep every source. Sources
@@ -927,6 +935,10 @@ fn screen_queued_sources(
     for (i, source) in sources.into_iter().enumerate() {
         let now = current(&source);
         match (identities.get(i), now) {
+            // Present then and now, but either identity tells nothing: never a match.
+            (Some(Some(then)), Some(now)) if !then.verifiable() || !now.verifiable() => {
+                unverified.push(source)
+            }
             (Some(Some(then)), Some(now)) if now != *then => changed.push(source),
             (Some(None), Some(_)) => unverified.push(source),
             _ => keep.push(source),
@@ -3129,7 +3141,7 @@ mod tests {
         SourceIdentity::Meta {
             kind: std::fs::symlink_metadata(dir.path()).unwrap().file_type(),
             len,
-            modified: None,
+            modified: Some(std::time::UNIX_EPOCH),
         }
     }
 
@@ -3158,6 +3170,31 @@ mod tests {
         assert_eq!(keep, paths(&["same", "no-baseline-gone", "gone"]));
         assert_eq!(changed, paths(&["replaced"]));
         assert_eq!(unverified, paths(&["no-baseline"]));
+    }
+
+    /// A source present then and now whose identity tells nothing (no file key, no modified
+    /// time) is never taken for the same item, even when the two look alike.
+    #[test]
+    fn an_unknown_identity_never_matches() {
+        let unknown = |len| match meta(len) {
+            SourceIdentity::Meta { kind, len, .. } => SourceIdentity::Meta {
+                kind,
+                len,
+                modified: None,
+            },
+            other => other,
+        };
+        let sources = paths(&["then-unknown", "now-unknown", "known"]);
+        let identities = vec![Some(unknown(1)), Some(meta(2)), Some(meta(3))];
+        let now = |p: &Path| match p.to_str().unwrap() {
+            "then-unknown" => Some(unknown(1)),
+            "now-unknown" => Some(unknown(2)),
+            _ => Some(meta(3)),
+        };
+        let (keep, changed, unverified) = screen_queued_sources(sources, &identities, now);
+        assert_eq!(keep, paths(&["known"]));
+        assert!(changed.is_empty());
+        assert_eq!(unverified, paths(&["then-unknown", "now-unknown"]));
     }
 
     #[test]
