@@ -10,7 +10,9 @@
   run in 5) while the preview was still loading; it now waits for `ui related wait-preview-settled`.
   If it fails again, rerun it alone and report it.
 - Never kill the `zxraw.exe` under `AppData\Local\Programs`: it is the user's installed copy.
-- Releases: `packaging/release.ps1 -Version x.y.z`, then commit "Release x.y.z", tag `vx.y.z`,
-  push, and `gh release create` with user-facing notes and the three `dist` files.
+- Releases ([packaging/RELEASING.md](packaging/RELEASING.md)): `packaging/bump-version.sh x.y.z`
+  (or `release.ps1 -Version x.y.z` on Windows), commit "Release x.y.z", tag `vx.y.z`, push. The
+  Release workflow builds the Windows and Linux files into a draft release. Check it, then
+  `gh release edit vx.y.z --draft=false` with user-facing notes.
 - Linux e2e: every app run gets its own `Xvfb` (needs `xvfb` and Mesa). Never kill an `Xvfb` or
   `zxraw` you did not start; `:0` is the user's display.

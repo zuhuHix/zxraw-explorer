@@ -534,11 +534,17 @@ packaging\build-release.ps1    # tested release build + portable zip in dist\
 
 The installer is built from `packaging\zxraw.iss` with Inno Setup 6.
 
-To cut a release, run `packaging\release.ps1 -Version 1.2.3` (add `-SkipTests` to skip the
-test run, `-Draft` for a draft release). It sets the version in `Cargo.toml`, `Cargo.lock`
-and `zxraw.iss`, builds the zip and the installer, writes `dist\SHA256SUMS.txt` and prints the
-`gh release create` command to publish them. Publish all three files: the in-app updater
-refuses an installer that `SHA256SUMS.txt` doesn't list.
+To cut a release, set the version with `packaging/bump-version.sh 1.2.3` (or
+`packaging\release.ps1 -Version 1.2.3` on Windows), commit it as "Release 1.2.3", tag it
+`v1.2.3` and push. The Release workflow builds the zip, the installer, the AppImage, the `.deb`
+and both checksum files into a draft GitHub release, which is checked and then published by hand.
+The in-app updater refuses an installer that `SHA256SUMS.txt` doesn't list. Details:
+[packaging/RELEASING.md](packaging/RELEASING.md).
+
+`packaging\release.ps1 -Version 1.2.3` still builds a whole Windows release locally (add
+`-SkipTests` to skip the test run): it sets the version in `Cargo.toml`, `Cargo.lock` and
+`zxraw.iss`, builds the zip and the installer, writes `dist\SHA256SUMS.txt` and prints the
+`gh release create` command.
 
 Optional: video thumbnails and technical metadata need `ffmpeg.exe` and `ffprobe.exe`.
 ZXraw Explorer does not bundle FFmpeg. Use **Download FFmpeg…** (in Settings › Video, the
