@@ -16,6 +16,8 @@
 #   67  the file could not be copied (missing, not a regular file, a symlink)
 #   68  apt-get failed (its output is on stdout/stderr)
 #   69  not run as root
+#   70  the file changed while it was copied (no regular file came out, or the copy took
+#       longer than 120 s, as a FIFO put in its place would)
 set -eu
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -65,9 +67,15 @@ fi
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 copy=$dir/update.deb
-if ! cp --no-dereference -- "$deb" "$copy" || [ -L "$copy" ] || [ ! -f "$copy" ]; then
-    echo "install-update: could not copy $deb" >&2
-    exit 67
+# Bounded: the file was checked above, but it can be replaced (by a FIFO, say) before cp
+# opens it, and a root cp must not wait forever.
+if ! /usr/bin/timeout 120 cp --no-dereference -- "$deb" "$copy"; then
+    echo "install-update: $deb changed while it was copied" >&2
+    exit 70
+fi
+if [ ! -f "$copy" ] || [ -L "$copy" ]; then
+    echo "install-update: $deb changed while it was copied" >&2
+    exit 70
 fi
 
 actual=$(sha256sum "$copy" | cut -d ' ' -f 1)

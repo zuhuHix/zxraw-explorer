@@ -378,20 +378,21 @@ fn fake_linux_release(genuine: &[u8], served: Vec<u8>) -> String {
     })
 }
 
-/// What the fake AppImage holds: the type 2 AppImage header, so the app accepts it.
-#[cfg(target_os = "linux")]
-const OLD_APPIMAGE: &[u8] = b"\x7fELF\x02\x01\x01\x00AI\x02 old AppImage";
-
 /// A fake AppImage in the sandbox (never the user's), and the environment that makes the
-/// app run as that AppImage against the fake release at `base`. `$APPDIR` is the test
-/// binary's folder, so the app sees itself as running from the AppImage's mount.
+/// app run as that AppImage against the fake release at `base`. The fake is a copy of
+/// `timeout` with the type 2 AppImage marker (`AI\x02` at offset 8, which the kernel
+/// ignores): it starts the app and waits for it, as the real runtime does in
+/// extract-and-run mode, so the app finds its runtime as its parent. `$APPDIR` is the test
+/// binary's folder, as the extracted AppImage's would be. Returns the AppImage and its bytes.
 #[cfg(target_os = "linux")]
-fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, RunOpts) {
+fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, Vec<u8>, RunOpts) {
     use std::os::unix::fs::PermissionsExt;
     let apps = root.join("Apps");
     std::fs::create_dir_all(&apps).unwrap();
     let appimage = apps.join("ZXraw-Explorer-1.0.0-x86_64.AppImage");
-    std::fs::write(&appimage, OLD_APPIMAGE).unwrap();
+    let mut old = std::fs::read("/usr/bin/timeout").unwrap();
+    old[8..11].copy_from_slice(b"AI\x02");
+    std::fs::write(&appimage, &old).unwrap();
     std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755)).unwrap();
     let home = root.join("home");
     std::fs::create_dir_all(home.join("Downloads")).unwrap();
@@ -406,9 +407,10 @@ fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, RunOpts) {
             ("HOME".into(), shown(&home)),
             ("XDG_CONFIG_HOME".into(), shown(&home.join(".config"))),
         ],
+        launcher: vec![appimage.clone().into(), "--kill-after=5".into(), "300".into()],
         ..Default::default()
     };
-    (appimage, opts)
+    (appimage, old, opts)
 }
 
 #[cfg(target_os = "linux")]
@@ -419,7 +421,7 @@ fn linux_appimage_update_replaces_the_appimage_and_offers_a_restart() {
     let profile = sandbox.path().join("profile");
     let new = noise(300_000, 9);
     let base = fake_linux_release(&new, new.clone());
-    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let (appimage, _, opts) = fake_appimage_run(sandbox.path(), &base);
     let shots = shots_dir().join("system");
     std::fs::create_dir_all(&shots).unwrap();
     let script = format!(
@@ -445,6 +447,25 @@ fn linux_appimage_update_replaces_the_appimage_and_offers_a_restart() {
     assert_eq!(left.len(), 1, "no temporary or backup file: {left:?}");
 }
 
+/// `$APPIMAGE` and `$APPDIR` set by hand, with no AppImage runtime running the app: the
+/// file is not replaced; "Update now" opens the release page.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_appimage_variables_without_the_runtime_only_open_the_release_page() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let new = noise(1000, 5);
+    let base = fake_linux_release(&new, new.clone());
+    let (appimage, old, mut opts) = fake_appimage_run(sandbox.path(), &base);
+    opts.launcher.clear();
+    let script = "limit 90\ndismiss-notices\nui system wait-update 99.0.0\nui system update-now\n\
+                  wait-frames 5\nassert-toast Would open\nui system assert-update-status none\nexit\n";
+    let outcome = run_app_with(sandbox.path(), &profile, script, &opts);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read(&appimage).unwrap(), old);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_appimage_update_with_a_tampered_download_is_refused() {
@@ -454,7 +475,7 @@ fn linux_appimage_update_with_a_tampered_download_is_refused() {
     let mut tampered = genuine.clone();
     tampered[1000] ^= 0x55;
     let base = fake_linux_release(&genuine, tampered);
-    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let (appimage, old, opts) = fake_appimage_run(sandbox.path(), &base);
     let script = "limit 90\ndismiss-notices\nui system wait-update 99.0.0\nui system update-now\n\
                   wait-jobs 30\nwait-frames 5\n\
                   assert-toast does not match its SHA-256 checksum, so it was not installed\n\
@@ -462,7 +483,7 @@ fn linux_appimage_update_with_a_tampered_download_is_refused() {
     let outcome = run_app_with(sandbox.path(), &profile, script, &opts);
     expect_ok(&outcome);
     assert_no_crash(&profile);
-    assert_eq!(std::fs::read(&appimage).unwrap(), OLD_APPIMAGE);
+    assert_eq!(std::fs::read(&appimage).unwrap(), old);
 }
 
 #[cfg(target_os = "linux")]
@@ -473,7 +494,7 @@ fn linux_appimage_in_a_read_only_folder_is_saved_to_downloads() {
     let profile = sandbox.path().join("profile");
     let new = noise(200_000, 3);
     let base = fake_linux_release(&new, new.clone());
-    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let (appimage, old, opts) = fake_appimage_run(sandbox.path(), &base);
     let apps = appimage.parent().unwrap().to_path_buf();
     std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o555)).unwrap();
     if std::fs::File::create(apps.join("probe")).is_ok() {
@@ -488,7 +509,7 @@ fn linux_appimage_in_a_read_only_folder_is_saved_to_downloads() {
     std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).unwrap();
     expect_ok(&outcome);
     assert_no_crash(&profile);
-    assert_eq!(std::fs::read(&appimage).unwrap(), OLD_APPIMAGE, "left alone");
+    assert_eq!(std::fs::read(&appimage).unwrap(), old, "left alone");
     let saved = sandbox
         .path()
         .join("home/Downloads/ZXraw-Explorer-99.0.0-x86_64.AppImage");

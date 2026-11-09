@@ -143,6 +143,9 @@ pub struct RunOpts {
     pub env: Vec<(String, String)>,
     /// Command-line arguments for the app (e.g. a folder to open).
     pub args: Vec<OsString>,
+    /// A program (and its arguments) that starts the app and waits for it, standing in for
+    /// a parent such as the AppImage runtime; the app's path follows them. Empty: none.
+    pub launcher: Vec<OsString>,
 }
 
 /// Folder scenarios save screenshots into (`%TEMP%\zxfr-shots`), created on demand.
@@ -169,7 +172,14 @@ pub fn run_app_with(work: &Path, profile: &Path, script: &str, opts: &RunOpts) -
     let stderr_path = work.join("stderr.log");
     let stderr = fs::File::create(&stderr_path).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_zxraw"));
+    let mut command = match opts.launcher.split_first() {
+        Some((program, args)) => {
+            let mut command = Command::new(program);
+            command.args(args).arg(env!("CARGO_BIN_EXE_zxraw"));
+            command
+        }
+        None => Command::new(env!("CARGO_BIN_EXE_zxraw")),
+    };
     command
         .env("ZXRAW_SCRIPT", &script_path)
         .env("ZXRAW_SCRIPT_RESULT", &result_path)
