@@ -63,23 +63,18 @@ pub struct PrivateDisplay {
     display: String,
 }
 
+/// How long [`PrivateDisplay::start`] waits for the server to report its display.
+#[cfg(target_os = "linux")]
+const STARTUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(target_os = "linux")]
 impl PrivateDisplay {
     /// Starts `Xvfb` on the first free display number (`-displayfd`) with one
     /// `width`x`height` 24-bit screen and no TCP listener, and waits until it accepts
     /// clients (it prints its display number only then).
     pub fn start(width: u32, height: u32) -> Result<Self> {
-        use std::io::Read;
-        use std::process::{Command, Stdio};
-
-        let io_err = |op: &'static str, source: std::io::Error| crate::WinError::Io {
-            op,
-            path: "Xvfb".into(),
-            source,
-        };
-        // `-displayfd 1`: the server writes the display number it picked to its stdout, a
-        // pipe we read. Its log goes to stderr, which is dropped.
-        let mut child = Command::new("Xvfb")
+        let mut command = std::process::Command::new("Xvfb");
+        command
             .args([
                 "-displayfd",
                 "1",
@@ -89,33 +84,72 @@ impl PrivateDisplay {
                 "-screen",
                 "0",
             ])
-            .arg(format!("{width}x{height}x24"))
+            .arg(format!("{width}x{height}x24"));
+        Self::start_command(command, STARTUP_LIMIT)
+    }
+
+    /// Runs `command` (an X server told to write its display number to stdout) and waits up
+    /// to `limit` for the number. On failure or timeout our child is killed and reaped.
+    fn start_command(
+        mut command: std::process::Command,
+        limit: std::time::Duration,
+    ) -> Result<Self> {
+        use std::io::Read;
+        use std::process::Stdio;
+
+        let io_err = |op: &'static str, source: std::io::Error| crate::WinError::Io {
+            op,
+            path: "Xvfb".into(),
+            source,
+        };
+        // `-displayfd 1`: the server writes the display number it picked to its stdout, a
+        // pipe we read. Its log goes to stderr, which is dropped.
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| io_err("start Xvfb", e))?;
         let mut stdout = child.stdout.take().expect("piped stdout");
-        let mut number = String::new();
-        let mut byte = [0u8; 1];
-        // Reads until the newline after the number; EOF means the server gave up.
-        loop {
-            match stdout.read(&mut byte) {
-                Ok(1) if byte[0] == b'\n' => break,
-                Ok(1) => number.push(byte[0] as char),
-                Ok(_) => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(io_err("read the Xvfb display number", e));
+        // The read runs on its own thread so the wait is bounded. Killing the server on a
+        // timeout closes the pipe, which ends the thread.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut number = String::new();
+            let mut byte = [0u8; 1];
+            // Reads until the newline after the number; EOF means the server gave up.
+            let result = loop {
+                match stdout.read(&mut byte) {
+                    Ok(1) if byte[0] == b'\n' => break Ok(number),
+                    Ok(1) => number.push(byte[0] as char),
+                    Ok(_) => break Ok(number),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => break Err(e),
                 }
+            };
+            let _ = tx.send(result);
+        });
+        let stop = |child: &mut std::process::Child| {
+            let _ = child.kill();
+            child.wait().ok()
+        };
+        let number = match rx.recv_timeout(limit) {
+            Ok(Ok(number)) => number,
+            Ok(Err(e)) => {
+                stop(&mut child);
+                return Err(io_err("read the Xvfb display number", e));
             }
-        }
+            Err(_) => {
+                stop(&mut child);
+                return Err(crate::WinError::Invalid(format!(
+                    "Xvfb reported no display number within {} s",
+                    limit.as_secs()
+                )));
+            }
+        };
         let number = number.trim();
         if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-            let _ = child.kill();
-            let status = child.wait().ok();
+            let status = stop(&mut child);
             return Err(crate::WinError::Invalid(format!(
                 "Xvfb did not report a display number (exit {status:?}, output {number:?})"
             )));
@@ -175,6 +209,34 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;
+
+    #[test]
+    fn a_server_that_reports_no_display_is_stopped_after_the_limit() {
+        // Stands in for an X server that hangs before printing its display number.
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", "echo $$ > \"$0\"; exec sleep 60"]);
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        command.arg(&pid_file);
+        let started = std::time::Instant::now();
+        let error = PrivateDisplay::start_command(command, std::time::Duration::from_millis(500))
+            .err()
+            .expect("a silent server must fail");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{error}"
+        );
+        assert!(error.to_string().contains("no display number"), "{error}");
+        // Our child was killed and reaped: its pid is gone (no zombie left behind).
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "pid {pid} still exists"
+        );
+    }
 
     #[test]
     fn a_private_display_starts_and_stops() {

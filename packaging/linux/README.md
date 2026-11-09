@@ -15,6 +15,10 @@ Nothing here needs root, system-wide installs or pwsh; the Windows installer and
 
 ## Build
 
+The scripts are committed as executable (mode `100755`). A checkout made on Windows often has
+`core.fileMode=false`, which ignores the bit: after adding a script there, set it with
+`git update-index --chmod=+x <script>`.
+
 ```sh
 packaging/linux/build-linux.sh                 # build, then dist/ (needs ~5 min on 12 cores)
 packaging/linux/build-linux.sh --skip-build    # package the existing target/release/zxraw and zxraw-cli

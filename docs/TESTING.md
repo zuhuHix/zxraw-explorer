@@ -466,6 +466,8 @@ reason above each test):
 | `system::update_check_offers_a_newer_release_and_verifies_the_installer` | updater is hidden on Linux |
 | `system::update_with_a_tampered_installer_is_refused` | updater is hidden on Linux |
 | `sidebar::network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share` | UNC network shares |
+| `sidebar::going_to_an_offline_share_path_never_waits_on_the_ui_thread` | UNC network shares |
+| `core::rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread` | UNC network shares |
 | `browser::hidden_burst_member_is_not_selected_or_copied_with_its_stack` | `attrib +h` (hidden attribute) |
 
 Scenarios about missing FFmpeg run the app with `path_without_ffmpeg()`, a `PATH` without the
