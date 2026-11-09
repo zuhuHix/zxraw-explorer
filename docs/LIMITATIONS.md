@@ -481,7 +481,7 @@ that back each line, is in [FEATURES.md](FEATURES.md).
   checked against `SHA256SUMS.txt` from the same GitHub release, which protects against a
   corrupted or swapped download but not against someone who controls the release itself; the
   installer is not code-signed.
-* An in-app update closes the app and runs the installer silently. If another ZXraw Explorer
+* On Windows, an in-app update closes the app and runs the installer silently. If another ZXraw Explorer
   window is still open after 30 seconds, the installer stops without changing anything, and
   the app has to be started again by hand.
 * The FFmpeg download is pinned to one build (9.0.2). A newer FFmpeg needs a new app release
@@ -663,8 +663,20 @@ or refuses with a message; nothing should crash for lack of it.
   (XDG portal, else the default app), *Properties* (`FileManager1.ShowItemProperties`), *Show in
   file manager*, and network locations (`gio mount`; shares that need a login fail with an
   error that says so: mount them once in the file manager).
-* Updates: the daily check works, but nothing is installed in place. A new version shows a
-  notice with the release page and its AppImage and .deb downloads.
+* Updates: the daily check works. "Update now" installs the new version on Linux in two cases:
+  for an AppImage, which replaces itself with no password, and for the `zxraw` .deb, which asks
+  for your password through the desktop's polkit agent. Any other copy (a build folder, a copied
+  binary, an AppImage moved while it runs, a non-x86_64 PC) gets the release page, as before.
+  Nothing installs by itself. After an install, "Restart now" closes the window through the normal
+  shutdown (settings and session are saved) and starts the new copy.
+* An AppImage is replaced by renaming the verified new file over the old path, which is atomic.
+  No `.old` backup is kept. The file name keeps the old version number, but the path stays the
+  same, so a menu entry made in Settings › Default app keeps working. If the folder is not
+  writable, the verified file is saved in Downloads (or your home folder) and the notice offers
+  to open that folder. Both installs check the download's SHA-256 again just before installing.
+  Accepted risk: apt opens the .deb by path after that check, so a program running as the same
+  user could swap the file during that short window. The download folder is private (0700), so
+  only that user can do it. Dismissing the password dialog keeps the .deb for opening by hand.
 * Drag and drop works on X11 (see [Linux platform behaviour](#linux-platform-behaviour)).
   winit has no drag and drop on Wayland: turn on Settings › File operations › *Use XWayland
   (enables drag and drop)*, or start with `ZXRAW_X11=1`, and restart. The app then runs as an
@@ -700,8 +712,8 @@ or refuses with a message; nothing should crash for lack of it.
 * Volume identity is per path root, and every Linux path is under `/`. Library roots are not
   told apart by mount, so "offline volume" detection does not work for unplugged drives yet.
 * The `e2e` UI test suite runs on Linux too, each app run on its own `Xvfb`. Scenarios for
-  Windows-only features (OLE drop target, updater, FFmpeg download, network shares, the
-  hidden attribute) are compiled on Windows only; see [TESTING.md](TESTING.md#linux).
+  Windows-only features (OLE drop target, the Windows installer update, FFmpeg download, network
+  shares, the hidden attribute) are compiled on Windows only; see [TESTING.md](TESTING.md#linux).
 
 ## Verification boundary
 

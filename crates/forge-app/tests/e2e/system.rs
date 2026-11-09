@@ -340,6 +340,154 @@ fn update_with_a_tampered_installer_is_refused() {
     assert_no_crash(&profile);
 }
 
+/// A fake GitHub "latest release" for 99.0.0 with Linux packages: the AppImage download
+/// serves `served` while SHA256SUMS-linux.txt lists the checksum of `genuine`.
+#[cfg(target_os = "linux")]
+fn fake_linux_release(genuine: &[u8], served: Vec<u8>) -> String {
+    let appimage = "ZXraw-Explorer-99.0.0-x86_64.AppImage";
+    let deb = "zxraw_99.0.0_amd64.deb";
+    let sums = format!(
+        "{}  {appimage}\n{}  {deb}\n",
+        sha256_hex(genuine),
+        sha256_hex(b"deb")
+    )
+    .into_bytes();
+    let size = genuine.len();
+    serve_routes(|base| {
+        let release = serde_json::json!({
+            "tag_name": "v99.0.0",
+            "html_url": format!("{base}/release"),
+            "draft": false,
+            "prerelease": false,
+            "body": "Fixture release",
+            "assets": [
+                {"name": appimage, "size": size,
+                 "browser_download_url": format!("{base}/download/{appimage}")},
+                {"name": deb, "size": 3,
+                 "browser_download_url": format!("{base}/download/{deb}")},
+                {"name": "SHA256SUMS-linux.txt", "size": sums.len(),
+                 "browser_download_url": format!("{base}/download/SHA256SUMS-linux.txt")},
+            ],
+        });
+        vec![
+            ("/api".into(), release.to_string().into_bytes()),
+            (format!("/download/{appimage}"), served),
+            (format!("/download/{deb}"), b"deb".to_vec()),
+            ("/download/SHA256SUMS-linux.txt".into(), sums),
+        ]
+    })
+}
+
+/// A fake AppImage in the sandbox (never the user's), and the environment that makes the
+/// app run as that AppImage against the fake release at `base`.
+#[cfg(target_os = "linux")]
+fn fake_appimage_run(root: &Path, base: &str) -> (PathBuf, RunOpts) {
+    use std::os::unix::fs::PermissionsExt;
+    let apps = root.join("Apps");
+    std::fs::create_dir_all(&apps).unwrap();
+    let appimage = apps.join("ZXraw-Explorer-1.0.0-x86_64.AppImage");
+    std::fs::write(&appimage, b"old AppImage").unwrap();
+    std::fs::set_permissions(&appimage, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let home = root.join("home");
+    std::fs::create_dir_all(home.join("Downloads")).unwrap();
+    let opts = RunOpts {
+        env: vec![
+            ("ZXRAW_UPDATE_API".into(), format!("{base}/api")),
+            ("APPIMAGE".into(), shown(&appimage)),
+            ("HOME".into(), shown(&home)),
+            ("XDG_CONFIG_HOME".into(), shown(&home.join(".config"))),
+        ],
+        ..Default::default()
+    };
+    (appimage, opts)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_appimage_update_replaces_the_appimage_and_offers_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let new = noise(300_000, 9);
+    let base = fake_linux_release(&new, new.clone());
+    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let shots = shots_dir().join("system");
+    std::fs::create_dir_all(&shots).unwrap();
+    let script = format!(
+        "limit 90\ndismiss-notices\nui system wait-update 99.0.0\nwait-frames 10\nscreenshot {}\n\
+         ui system update-now\nwait-jobs 30\nwait-frames 5\nassert-no-error-toast\n\
+         assert-toast Update installed; restart ZXraw Explorer to use it\n\
+         ui system assert-update-status installed\nwait-frames 10\nscreenshot {}\n\
+         ui system update-restart\nassert-toast Update installed; would restart\n\
+         ui system assert-no-update\nexit\n",
+        shown(&shots.join("linux-update-notice.png")),
+        shown(&shots.join("linux-update-installed.png")),
+    );
+    let outcome = run_app_with(sandbox.path(), &profile, &script, &opts);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read(&appimage).unwrap(), new, "the AppImage was replaced");
+    let mode = std::fs::metadata(&appimage).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+    let left: Vec<_> = std::fs::read_dir(appimage.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left.len(), 1, "no temporary or backup file: {left:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_appimage_update_with_a_tampered_download_is_refused() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let genuine = noise(300_000, 9);
+    let mut tampered = genuine.clone();
+    tampered[1000] ^= 0x55;
+    let base = fake_linux_release(&genuine, tampered);
+    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let script = "limit 90\ndismiss-notices\nui system wait-update 99.0.0\nui system update-now\n\
+                  wait-jobs 30\nwait-frames 5\n\
+                  assert-toast does not match its SHA-256 checksum, so it was not installed\n\
+                  ui system assert-update-status none\nexit\n";
+    let outcome = run_app_with(sandbox.path(), &profile, script, &opts);
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read(&appimage).unwrap(), b"old AppImage");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_appimage_in_a_read_only_folder_is_saved_to_downloads() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = tempfile::tempdir().unwrap();
+    let profile = sandbox.path().join("profile");
+    let new = noise(200_000, 3);
+    let base = fake_linux_release(&new, new.clone());
+    let (appimage, opts) = fake_appimage_run(sandbox.path(), &base);
+    let apps = appimage.parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::File::create(apps.join("probe")).is_ok() {
+        // Running as root: modes do not stop writes, so there is nothing to test.
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let script = "limit 90\ndismiss-notices\nui system wait-update 99.0.0\nui system update-now\n\
+                  wait-jobs 30\nwait-frames 5\nassert-no-error-toast\n\
+                  ui system assert-update-status saved-instead\nexit\n";
+    let outcome = run_app_with(sandbox.path(), &profile, script, &opts);
+    std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o755)).unwrap();
+    expect_ok(&outcome);
+    assert_no_crash(&profile);
+    assert_eq!(std::fs::read(&appimage).unwrap(), b"old AppImage", "left alone");
+    let saved = sandbox
+        .path()
+        .join("home/Downloads/ZXraw-Explorer-99.0.0-x86_64.AppImage");
+    assert_eq!(std::fs::read(&saved).unwrap(), new);
+    let mode = std::fs::metadata(&saved).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755, "ready to run");
+}
+
 #[test]
 fn folder_context_menu_opens_a_terminal_in_that_folder() {
     let sandbox = tempfile::tempdir().unwrap();

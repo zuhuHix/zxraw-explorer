@@ -463,8 +463,8 @@ reason above each test):
 | `core::items_dragged_from_an_explorer_zip_folder_drop_into_a_folder_row` | OLE drop target |
 | `system::download_ffmpeg_installs_the_tools_and_points_settings_at_them` | FFmpeg download is hidden on Linux |
 | `system::download_ffmpeg_with_a_bad_checksum_installs_nothing_and_says_why` | FFmpeg download is hidden on Linux |
-| `system::update_check_offers_a_newer_release_and_verifies_the_installer` | updater is hidden on Linux |
-| `system::update_with_a_tampered_installer_is_refused` | updater is hidden on Linux |
+| `system::update_check_offers_a_newer_release_and_verifies_the_installer` | Windows installer update; Linux runs `system::linux_appimage_*` instead |
+| `system::update_with_a_tampered_installer_is_refused` | Windows installer update; Linux runs `system::linux_appimage_*` instead |
 | `sidebar::network_locations_are_added_renamed_and_removed_without_freezing_on_an_offline_share` | UNC network shares |
 | `sidebar::going_to_an_offline_share_path_never_waits_on_the_ui_thread` | UNC network shares |
 | `core::rename_undo_and_create_on_an_offline_share_never_wait_on_the_ui_thread` | UNC network shares |

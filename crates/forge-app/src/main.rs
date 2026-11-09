@@ -377,14 +377,18 @@ fn main() -> eframe::Result {
         )
     };
     let dx12_only = startup::dx12_only_by_default();
-    let result = run(dx12_only);
+    let mut result = run(dx12_only);
     if startup::retry_with_default_backends(dx12_only, app_args.borrow().is_none(), &result) {
         if let Err(error) = &result {
             tracing::warn!(
                 "DX12 graphics setup failed ({error}); retrying with the default graphics backends"
             );
         }
-        return run(false);
+        result = run(false);
     }
+    // "Restart now" after an update: the new copy starts once this window has closed, its
+    // settings are saved and its single-instance pipe is gone, so it opens its own window.
+    drop(_instance_server);
+    updater::relaunch_after_exit();
     result
 }

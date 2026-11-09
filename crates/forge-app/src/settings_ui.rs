@@ -394,8 +394,9 @@ fn show_settings_window(app: &mut ZxrawApp, ctx: &egui::Context) {
         last_result: app.ops.updater.last_result.clone(),
         available: app.ops.updater.available.clone(),
         downloading: app.ops.updater.download_status().running,
-        ready: app.ops.updater.ready.is_some(),
+        ready: app.ops.updater.restart_ready(),
         busy: app.ops.jobs.running_count() > 0,
+        installs: crate::updater::self_update().installs(),
     };
 
     {
@@ -1390,6 +1391,8 @@ struct UpdatesView {
     downloading: bool,
     ready: bool,
     busy: bool,
+    /// "Update now" installs in place (Windows setup copy, Linux AppImage or .deb).
+    installs: bool,
 }
 
 fn updates_page(
@@ -1451,8 +1454,9 @@ fn updates_page(
             }
         }
     });
-    if !cfg!(windows) {
-        // Linux: no in-place install. An available release is a link to its page and packages.
+    if !cfg!(windows) && !view.installs {
+        // Linux, not from the AppImage or the .deb: no in-place install. An available release
+        // is a link to its page and packages.
         if let Some(update) = &view.available {
             ui.add_space(6.0);
             if ui.button("Open the release page").clicked() {
@@ -1472,8 +1476,9 @@ fn updates_page(
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             if view.ready {
+                let restart = if cfg!(windows) { "Restart and update" } else { "Restart now" };
                 if ui
-                    .add_enabled(!view.busy, egui::Button::new("Restart and update"))
+                    .add_enabled(!view.busy, egui::Button::new(restart))
                     .on_disabled_hover_text("Wait for the running operations to finish")
                     .clicked()
                 {

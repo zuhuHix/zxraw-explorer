@@ -100,6 +100,9 @@ pub enum Event {
     UpdateChecked(crate::updater::Checked),
     /// "Update now" downloaded and verified the installer, or failed.
     UpdateDownloaded(Result<PathBuf, String>),
+    /// A Linux "Update now" installed the update, or stopped (see `LinuxStatus`), or failed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    LinuxUpdate(Result<crate::updater::LinuxStatus, String>),
 }
 
 /// Operations that can genuinely be reverted. Copies, overwrites and permanent deletes are
@@ -1897,6 +1900,7 @@ pub fn poll(app: &mut ZxrawApp) -> bool {
             Event::AskConfirm(confirm) => crate::ops_ui::ask(app, confirm),
             Event::UpdateChecked(checked) => crate::updater::checked(app, checked),
             Event::UpdateDownloaded(result) => crate::updater::downloaded(app, result),
+            Event::LinuxUpdate(result) => crate::updater::linux_finished(app, result),
             Event::Undo(u) => {
                 if let UndoEntry::Ops(records) = &u {
                     follow_moves(app, undo_record_moves(records));
