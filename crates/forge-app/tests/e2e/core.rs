@@ -1629,6 +1629,70 @@ fn explorer_copy_pastes_with_shift_insert_without_a_click() {
     let _ = forge_win::clear_if_owned_files(&folders, None);
 }
 
+/// Linux: Ctrl+V and Shift+Insert paste files once per press, with the keys as egui-winit
+/// delivers them there (no message hook; Ctrl+V only as a paste event or a bare release).
+/// The bug: right-click Paste worked, the shortcuts did nothing. Ctrl+Shift+V pastes nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn paste_shortcuts_paste_files_once_on_linux() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let source = sandbox.path().join("drive");
+    let (one, two) = (sandbox.path().join("one"), sandbox.path().join("two"));
+    write_file(&source.join("shot.jpg"), b"shot");
+    write_file(&source.join("Card").join("b.txt"), b"card");
+    fs::create_dir_all(&one).unwrap();
+    fs::create_dir_all(&two).unwrap();
+    let script = format!(
+        "navigate {source}\n\
+         select shot.jpg, Card\n\
+         key ctrl+C\n\
+         navigate {one}\n\
+         click-empty\n\
+         key ctrl+shift+V\n\
+         wait-frames 20\n\
+         sleep 500\n\
+         assert-missing {one_shot}\n\
+         key ctrl+V\n\
+         wait-exists {one_card}\n\
+         wait-jobs 20\n\
+         navigate {two}\n\
+         key shift+Insert\n\
+         wait-exists {two_card}\n\
+         wait-jobs 20\n\
+         wait-frames 20\n\
+         assert-no-error-toast\n\
+         exit\n",
+        source = shown(&source),
+        one = shown(&one),
+        two = shown(&two),
+        one_shot = shown(&one.join("shot.jpg")),
+        one_card = shown(&one.join("Card").join("b.txt")),
+        two_card = shown(&two.join("Card").join("b.txt")),
+    );
+
+    let outcome = run_app(sandbox.path(), &sandbox.path().join("profile"), &script);
+
+    expect_ok(&outcome);
+    for dir in [&one, &two] {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Card", "shot.jpg"],
+            "one paste into {}",
+            dir.display()
+        );
+        assert_eq!(fs::read(dir.join("shot.jpg")).unwrap(), b"shot");
+    }
+    assert!(
+        source.join("Card").join("b.txt").is_file(),
+        "a copy keeps the source"
+    );
+}
+
 /// Cut and paste inside ZXraw with the real shortcuts: a file and a folder.
 #[cfg(windows)]
 #[test]
