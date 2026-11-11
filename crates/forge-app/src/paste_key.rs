@@ -58,19 +58,25 @@ pub fn take_file_paste() -> bool {
 ///
 /// - Ctrl+V (any Ctrl+V chord) never arrives as a key press: it becomes `Event::Paste` when
 ///   the clipboard has text, again for every auto-repeat, and nothing at all otherwise. Its
-///   key release still arrives. So the first paste event while V is up is a press; with no
-///   text, a V release with no press seen before it is one.
+///   key release still arrives. So the first paste event with Ctrl held while V is up is a
+///   press; with no text, a V release with no press seen before it is one, judged by every
+///   modifier held together with Ctrl (Ctrl+Shift+V stays Ctrl+Shift+V when Shift is let go
+///   first).
 /// - Shift+Insert is an ordinary key on Linux: a press while Insert is up.
 #[cfg_attr(windows, allow(dead_code))]
 struct KeyWatch {
-    /// V went down (as a paste or as a plain key) and has not been released yet.
+    /// V went down (as a Ctrl+V paste or as a plain key) and has not been released yet.
     v_down: bool,
     insert_down: bool,
     /// The modifiers held, from `ModifiersChanged` (a paste event carries none).
     mods: egui::Modifiers,
-    /// The last modifiers with Ctrl held: what a dropped press was made with when Ctrl is
-    /// let go before V.
-    command_mods: egui::Modifiers,
+    /// While Ctrl is held: every modifier pressed with it since Ctrl went down or since the
+    /// last other key, so a press dropped by egui-winit is judged by the whole chord. Unknown
+    /// after the window gains focus with Ctrl already down.
+    chord: Option<egui::Modifiers>,
+    /// The chord Ctrl was let go from, while nothing but modifier changes followed: what a
+    /// dropped press was made with when Ctrl is let go before V.
+    released_chord: Option<egui::Modifiers>,
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -80,8 +86,22 @@ impl KeyWatch {
             v_down: false,
             insert_down: false,
             mods: egui::Modifiers::NONE,
-            command_mods: egui::Modifiers::NONE,
+            chord: None,
+            released_chord: None,
         }
+    }
+
+    /// Something other than a modifier change or V happened: a later bare V release is no
+    /// longer the end of the chord seen so far.
+    /// Modifiers held now still count through the V release's own modifiers; ones pressed
+    /// from here on are added to the chord.
+    fn other_input(&mut self) {
+        self.chord = self.mods.command.then_some(egui::Modifiers {
+            alt: false,
+            shift: false,
+            ..self.mods
+        });
+        self.released_chord = None;
     }
 
     fn presses(&mut self, events: &[egui::Event]) -> u32 {
@@ -90,12 +110,19 @@ impl KeyWatch {
         for event in events {
             match event {
                 Event::ModifiersChanged(m) => {
-                    self.mods = *m;
-                    if m.command {
-                        self.command_mods = *m;
+                    match (self.mods.command, m.command) {
+                        (false, true) => {
+                            self.chord = Some(*m);
+                            self.released_chord = None;
+                        }
+                        (true, true) => self.chord = self.chord.map(|c| c | *m),
+                        (true, false) => self.released_chord = self.chord,
+                        (false, false) => {}
                     }
+                    self.mods = *m;
                 }
-                Event::Paste(_) => {
+                // Also sent for a dedicated Paste key, with no Ctrl: that is no Ctrl+V.
+                Event::Paste(_) if self.mods.command => {
                     if !self.v_down && self.mods.matches_exact(Modifiers::COMMAND) {
                         presses += 1;
                     }
@@ -109,12 +136,19 @@ impl KeyWatch {
                 } => {
                     if *pressed {
                         self.v_down = true;
+                        self.other_input();
                     } else {
-                        let at_press = if m.command { *m } else { self.command_mods };
-                        if !self.v_down && at_press.matches_exact(Modifiers::COMMAND) {
+                        let at_press = if m.command {
+                            self.chord.map(|c| c | *m)
+                        } else {
+                            self.released_chord
+                        };
+                        let exact = at_press.is_some_and(|c| c.matches_exact(Modifiers::COMMAND));
+                        if !self.v_down && exact {
                             presses += 1;
                         }
                         self.v_down = false;
+                        self.other_input();
                     }
                 }
                 Event::Key {
@@ -127,12 +161,21 @@ impl KeyWatch {
                         presses += 1;
                     }
                     self.insert_down = *pressed;
+                    self.other_input();
                 }
-                // A release made in another window never reaches this one.
-                Event::WindowFocused(false) => {
+                Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_) => {
+                    self.other_input()
+                }
+                // A release made in another window never reaches this one, and a key held
+                // when the window gains focus was pressed elsewhere.
+                Event::WindowFocused(focused) => {
                     self.v_down = false;
                     self.insert_down = false;
-                    self.mods = Modifiers::NONE;
+                    if !focused {
+                        self.mods = Modifiers::NONE;
+                    }
+                    self.chord = None;
+                    self.released_chord = None;
                 }
                 _ => {}
             }
@@ -218,6 +261,66 @@ mod tests {
         assert_eq!(w.presses(&[mods(ctrl), paste()]), 1);
         assert_eq!(w.presses(&[Event::WindowFocused(false)]), 0);
         assert_eq!(w.presses(&[mods(ctrl), paste()]), 1);
+        assert_eq!(w.presses(&[v_up(ctrl), mods(none)]), 0);
+    }
+
+    /// Bare V releases that are not the end of a Ctrl+V: chords whose extra modifier is let
+    /// go first, a stale chord, a V held into the window, and a dedicated Paste key.
+    #[test]
+    fn the_key_watch_judges_a_bare_release_by_the_whole_chord() {
+        use egui::{Event, Key, Modifiers};
+        let (none, ctrl, shift) = (Modifiers::NONE, Modifiers::COMMAND, Modifiers::SHIFT);
+        let (cs, ca) = (ctrl | shift, ctrl | Modifiers::ALT);
+        let mods = Event::ModifiersChanged;
+        let paste = || Event::Paste("text".into());
+        let v_up = |m| key(Key::V, false, m);
+        let mut w = KeyWatch::new();
+        // Ctrl+Shift+V and Ctrl+Alt+V, no text, the extra modifier let go before V.
+        assert_eq!(
+            w.presses(&[mods(ctrl), mods(cs), mods(ctrl), v_up(ctrl)]),
+            0
+        );
+        assert_eq!(w.presses(&[mods(none)]), 0);
+        assert_eq!(
+            w.presses(&[mods(ctrl), mods(ca), mods(ctrl), v_up(ctrl)]),
+            0
+        );
+        assert_eq!(w.presses(&[mods(none)]), 0);
+        // ... and with Ctrl let go last, before V.
+        let shift_first = [mods(ctrl), mods(cs), mods(ctrl), mods(none), v_up(none)];
+        assert_eq!(w.presses(&shift_first), 0);
+        // A new chord starts from Ctrl going down: plain Ctrl+V counts again.
+        assert_eq!(w.presses(&[mods(ctrl), v_up(ctrl), mods(none)]), 1);
+        // A chord is judged once: a later bare release is no Ctrl+V.
+        assert_eq!(w.presses(&[mods(ctrl), mods(none), v_up(none)]), 1);
+        assert_eq!(w.presses(&[v_up(none)]), 0);
+        // Other input after Ctrl was let go ends the chord.
+        let typed = [Event::Text("a".into()), key(Key::A, true, none)];
+        assert_eq!(
+            w.presses(&[mods(ctrl), mods(none), typed[0].clone(), v_up(none)]),
+            0
+        );
+        assert_eq!(
+            w.presses(&[mods(ctrl), mods(none), typed[1].clone(), v_up(none)]),
+            0
+        );
+        // Ctrl+Shift+A, Shift let go, then Ctrl+V with no text: counts.
+        let ctrl_a = key(Key::A, true, cs);
+        assert_eq!(
+            w.presses(&[mods(cs), ctrl_a, mods(ctrl), v_up(ctrl), mods(none)]),
+            1
+        );
+        // V held while the window gains focus: its release is no paste.
+        let focus = Event::WindowFocused(true);
+        assert_eq!(
+            w.presses(&[mods(ctrl), focus.clone(), v_up(ctrl), mods(none)]),
+            0
+        );
+        assert_eq!(w.presses(&[mods(ctrl), mods(none), focus, v_up(none)]), 0);
+        // A dedicated Paste key sends a paste with no Ctrl: it neither counts nor hides the
+        // next Ctrl+V.
+        assert_eq!(w.presses(&[paste()]), 0);
+        assert_eq!(w.presses(&[mods(ctrl), paste(), v_up(ctrl), mods(none)]), 1);
     }
 
     #[test]
