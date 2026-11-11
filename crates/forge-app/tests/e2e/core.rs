@@ -1632,16 +1632,20 @@ fn explorer_copy_pastes_with_shift_insert_without_a_click() {
 /// Linux: Ctrl+V and Shift+Insert paste files once per press, with the keys as egui-winit
 /// delivers them there (no message hook; Ctrl+V only as a paste event or a bare release).
 /// The bug: right-click Paste worked, the shortcuts did nothing. Ctrl+Shift+V pastes nothing.
+/// Also with files another app put on the clipboard without text, where egui-winit reports no
+/// paste for Ctrl+V at all, only the key release.
 #[cfg(target_os = "linux")]
 #[test]
 fn paste_shortcuts_paste_files_once_on_linux() {
     let sandbox = tempfile::tempdir().unwrap();
     let source = sandbox.path().join("drive");
     let (one, two) = (sandbox.path().join("one"), sandbox.path().join("two"));
+    let three = sandbox.path().join("three");
     write_file(&source.join("shot.jpg"), b"shot");
     write_file(&source.join("Card").join("b.txt"), b"card");
     fs::create_dir_all(&one).unwrap();
     fs::create_dir_all(&two).unwrap();
+    fs::create_dir_all(&three).unwrap();
     let script = format!(
         "navigate {source}\n\
          select shot.jpg, Card\n\
@@ -1659,12 +1663,21 @@ fn paste_shortcuts_paste_files_once_on_linux() {
          key shift+Insert\n\
          wait-exists {two_card}\n\
          wait-jobs 20\n\
+         ui system clipboard-files copy {source_shot}\n\
+         navigate {three}\n\
+         click-empty\n\
+         key ctrl+V\n\
+         wait-exists {three_shot}\n\
+         wait-jobs 20\n\
          wait-frames 20\n\
          assert-no-error-toast\n\
          exit\n",
         source = shown(&source),
         one = shown(&one),
         two = shown(&two),
+        three = shown(&three),
+        source_shot = shown(&source.join("shot.jpg")),
+        three_shot = shown(&three.join("shot.jpg")),
         one_shot = shown(&one.join("shot.jpg")),
         one_card = shown(&one.join("Card").join("b.txt")),
         two_card = shown(&two.join("Card").join("b.txt")),
@@ -1687,6 +1700,8 @@ fn paste_shortcuts_paste_files_once_on_linux() {
         );
         assert_eq!(fs::read(dir.join("shot.jpg")).unwrap(), b"shot");
     }
+    let pasted: Vec<_> = fs::read_dir(&three).unwrap().collect();
+    assert_eq!(pasted.len(), 1, "one paste of the files-only clipboard");
     assert!(
         source.join("Card").join("b.txt").is_file(),
         "a copy keeps the source"
