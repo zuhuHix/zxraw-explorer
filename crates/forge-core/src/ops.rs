@@ -4282,6 +4282,32 @@ mod tests {
     }
 
     #[test]
+    fn copy_progress_totals_match_the_real_size() {
+        // The copy popup shows bytes_done / bytes_total: execute must count the plan once.
+        let f = fx();
+        let dir = f.src.join("tree");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("a.bin"), vec![1u8; 3000]).unwrap();
+        fs::write(dir.join("sub").join("b.bin"), vec![2u8; 5000]).unwrap();
+        let cancel = CancelToken::new();
+        let progress = Progress::default();
+        let p = plan(
+            OpKind::Copy,
+            std::slice::from_ref(&dir),
+            &f.dst,
+            OpOptions::default(),
+            &cancel,
+        )
+        .unwrap();
+        let r = execute_with(&p, &JobCtx::new(&cancel, &progress), &mut SkipConflicts);
+        assert!(r.failed.is_empty() && !r.cancelled);
+        let s = progress.snapshot();
+        assert_eq!(s.bytes_total, 8000);
+        assert_eq!(s.bytes_done, 8000);
+        assert_eq!(s.items_done, s.items_total);
+    }
+
+    #[test]
     fn cancel_mid_copy_leaves_no_partial_files() {
         let f = fx();
         let s = f.src.join("huge.bin");

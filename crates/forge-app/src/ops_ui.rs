@@ -813,9 +813,8 @@ fn start_transfer_with(
                 return Err(e.to_string());
             }
         };
-        job.progress.add_total_items(plan.files + plan.links);
-        job.progress.add_total_bytes(plan.bytes);
-
+        // `ops::execute` adds the plan's item and byte totals to the job's progress itself;
+        // adding them here too made the popup show twice the real size.
         let mut resolver = conflict_resolver(&tx, &ctx, title2.clone(), &job.cancel);
         let mut report = ops::execute(&plan, job, &mut resolver);
         for path in vanished {
