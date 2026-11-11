@@ -61,7 +61,7 @@ pub fn take_file_paste() -> bool {
 ///   key release still arrives. So the first paste event with Ctrl held while V is up is a
 ///   press; with no text, a V release with no press seen before it is one, judged by every
 ///   modifier held together with Ctrl (Ctrl+Shift+V stays Ctrl+Shift+V when Shift is let go
-///   first).
+///   first). A dropped V press is judged by the chord since Ctrl went down.
 /// - Shift+Insert is an ordinary key on Linux: a press while Insert is up.
 #[cfg_attr(windows, allow(dead_code))]
 struct KeyWatch {
@@ -77,6 +77,9 @@ struct KeyWatch {
     /// The chord Ctrl was let go from, while nothing but modifier changes followed: what a
     /// dropped press was made with when Ctrl is let go before V.
     released_chord: Option<egui::Modifiers>,
+    /// The window just gained focus: winit reports the modifiers already held next, and
+    /// those were pressed in another window, so they start no chord.
+    syncing_mods: bool,
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -88,6 +91,7 @@ impl KeyWatch {
             mods: egui::Modifiers::NONE,
             chord: None,
             released_chord: None,
+            syncing_mods: false,
         }
     }
 
@@ -108,7 +112,9 @@ impl KeyWatch {
         use egui::{Event, Key, Modifiers};
         let mut presses = 0;
         for event in events {
+            let syncing = std::mem::take(&mut self.syncing_mods);
             match event {
+                Event::ModifiersChanged(m) if syncing => self.mods = *m,
                 Event::ModifiersChanged(m) => {
                     match (self.mods.command, m.command) {
                         (false, true) => {
@@ -163,9 +169,12 @@ impl KeyWatch {
                     self.insert_down = *pressed;
                     self.other_input();
                 }
-                Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_) => {
-                    self.other_input()
-                }
+                Event::Key { .. }
+                | Event::Text(_)
+                | Event::Ime(_)
+                | Event::Copy
+                | Event::Cut
+                | Event::Paste(_) => self.other_input(),
                 // A release made in another window never reaches this one, and a key held
                 // when the window gains focus was pressed elsewhere.
                 Event::WindowFocused(focused) => {
@@ -176,6 +185,7 @@ impl KeyWatch {
                     }
                     self.chord = None;
                     self.released_chord = None;
+                    self.syncing_mods = *focused;
                 }
                 _ => {}
             }
@@ -312,11 +322,17 @@ mod tests {
         );
         // V held while the window gains focus: its release is no paste.
         let focus = Event::WindowFocused(true);
+        // winit's order: focus, the modifiers already held, then the V release.
+        assert_eq!(w.presses(&[Event::WindowFocused(false)]), 0);
+        let held_in = [focus.clone(), mods(ctrl), v_up(ctrl), mods(none)];
+        assert_eq!(w.presses(&held_in), 0);
         assert_eq!(
-            w.presses(&[mods(ctrl), focus.clone(), v_up(ctrl), mods(none)]),
+            w.presses(&[mods(ctrl), mods(none), focus.clone(), v_up(none)]),
             0
         );
-        assert_eq!(w.presses(&[mods(ctrl), mods(none), focus, v_up(none)]), 0);
+        // After that sync, a fresh Ctrl+V still counts.
+        assert_eq!(w.presses(&[focus, mods(ctrl), mods(none)]), 0);
+        assert_eq!(w.presses(&[mods(ctrl), v_up(ctrl), mods(none)]), 1);
         // A dedicated Paste key sends a paste with no Ctrl: it neither counts nor hides the
         // next Ctrl+V.
         assert_eq!(w.presses(&[paste()]), 0);
