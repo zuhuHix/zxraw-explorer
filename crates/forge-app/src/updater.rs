@@ -1249,6 +1249,27 @@ fn fetch_small(
     }
 }
 
+/// Creates the file a download is written to. On Linux it is private (0600) whatever the
+/// umask: the `.deb` is refused before pkexec if group or others could write to it, and a
+/// umask of 002 (common on Linux desktops) would otherwise leave it group-writable.
+fn create_download(part: &Path) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(part)?;
+    // `mode` only applies to a new file; a leftover one keeps its old bits otherwise.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 /// Streams `asset` into `part`; returns its SHA-256 once exactly `asset.size` bytes came
 /// (any amount up to [`MAX_INSTALLER_BYTES`] when the size is unknown).
 fn fetch_to_file(
@@ -1257,7 +1278,7 @@ fn fetch_to_file(
     test: bool,
     job: &JobHandle,
 ) -> Result<String, String> {
-    let file = File::create(part).map_err(|e| format!("cannot create {}: {e}", part.display()))?;
+    let file = create_download(part).map_err(|e| format!("cannot create {}: {e}", part.display()))?;
     let mut out = BufWriter::with_capacity(1 << 20, file);
     let mut hasher = Sha256::new();
     let mut received = 0u64;
@@ -1354,6 +1375,28 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
+
+    /// The 0.11.3 updater wrote the `.deb` with the umask's bits, so with umask 002 it was
+    /// group-writable and `check_deb` refused it ("is not the file ZXraw Explorer
+    /// downloaded"). A download file is private whatever was there before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_downloaded_deb_passes_the_pre_install_check() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("zxraw-update-1");
+        linux::create_private_dir(&private).unwrap();
+        let deb = private.join("zxraw_2.0.0_amd64.deb");
+        // What umask 002 leaves: a group-writable file.
+        fs::write(&deb, b"old").unwrap();
+        fs::set_permissions(&deb, fs::Permissions::from_mode(0o664)).unwrap();
+        let mut file = create_download(&deb).unwrap();
+        file.write_all(b"deb").unwrap();
+        drop(file);
+        assert_eq!(fs::metadata(&deb).unwrap().permissions().mode() & 0o777, 0o600);
+        let digest = format!("{:x}", Sha256::digest(b"deb"));
+        linux::check_deb(&deb, &digest).unwrap();
+    }
 
     const FIXTURE: &str = r##"{
         "url": "https://api.github.com/repos/zuhuHix/zxraw-explorer/releases/1",
