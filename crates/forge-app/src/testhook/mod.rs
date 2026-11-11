@@ -1187,15 +1187,33 @@ fn parse_key(rest: &str) -> Result<Vec<egui::Event>, String> {
         .collect())
 }
 
-/// Key events as egui-winit delivers them from a real keyboard: Ctrl+X/C/V (and the
-/// Shift+Delete, Ctrl+Insert, Shift+Insert forms) become `Cut`, `Copy` and `Paste` with no key
-/// press, and a paste is reported only when the clipboard holds text (its content is not
-/// used). Also returns the number of paste presses the Win32 message hook would see.
+/// Key events as egui-winit delivers them from a real keyboard: Ctrl+X/C/V (on Windows also
+/// the Shift+Delete, Ctrl+Insert, Shift+Insert forms) become `Cut`, `Copy` and `Paste` with no
+/// key press, and a paste is reported only when the clipboard holds text (its content is not
+/// used). Also returns the number of paste presses the Win32 message hook would see (none
+/// elsewhere: `paste_key` reads them from these events, as from a real keyboard).
 fn as_winit_delivers(events: &[egui::Event], clipboard_has_text: bool) -> (Vec<egui::Event>, u32) {
+    as_winit_delivers_on(cfg!(windows), events, clipboard_has_text)
+}
+
+fn as_winit_delivers_on(
+    windows: bool,
+    events: &[egui::Event],
+    clipboard_has_text: bool,
+) -> (Vec<egui::Event>, u32) {
     use egui::Key;
     let mut out = Vec::new();
     let mut pastes = 0;
+    // Off Windows `paste_key` reads the modifiers from these, as egui-winit sends them.
+    let mut held = egui::Modifiers::NONE;
     for event in events {
+        if let egui::Event::Key { modifiers, .. } = event
+            && !windows
+            && *modifiers != held
+        {
+            held = *modifiers;
+            out.push(egui::Event::ModifiersChanged(held));
+        }
         let egui::Event::Key {
             key,
             pressed: true,
@@ -1207,15 +1225,15 @@ fn as_winit_delivers(events: &[egui::Event], clipboard_has_text: bool) -> (Vec<e
             continue;
         };
         let (key, m) = (*key, *m);
-        if (m.command && key == Key::X) || (m.shift && key == Key::Delete) {
+        if (m.command && key == Key::X) || (windows && m.shift && key == Key::Delete) {
             out.push(egui::Event::Cut);
-        } else if (m.command && key == Key::C) || (m.ctrl && key == Key::Insert) {
+        } else if (m.command && key == Key::C) || (windows && m.ctrl && key == Key::Insert) {
             out.push(egui::Event::Copy);
-        } else if (m.command && key == Key::V) || (m.shift && key == Key::Insert) {
+        } else if (m.command && key == Key::V) || (windows && m.shift && key == Key::Insert) {
             // The message hook counts exactly Ctrl+V and Shift+Insert.
             let exact = !m.alt
                 && ((key == Key::V && !m.shift) || (key == Key::Insert && !m.ctrl));
-            if exact {
+            if windows && exact {
                 pastes += 1;
             }
             if clipboard_has_text {
@@ -1224,6 +1242,9 @@ fn as_winit_delivers(events: &[egui::Event], clipboard_has_text: bool) -> (Vec<e
         } else {
             out.push(event.clone());
         }
+    }
+    if held != egui::Modifiers::NONE {
+        out.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
     }
     (out, pastes)
 }
